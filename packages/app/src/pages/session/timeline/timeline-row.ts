@@ -15,6 +15,18 @@ export namespace TimelineRow {
     userMessageID: string
     anchor: boolean
   }> {}
+  /**
+   * Server-injected context attached to this turn (`synthetic: true` text
+   * parts). Carries only SCALARS: the segment texts live in the part store and
+   * are read by the mounted row, exactly like AssistantPart's streamed text.
+   * `signature` is the joined injection part IDs, so the row stays reference-
+   * equal across reconstruction until the injection set really changes.
+   */
+  export class SystemInjection extends Data.TaggedClass("SystemInjection")<{
+    userMessageID: string
+    signature: string
+    count: number
+  }> {}
   export class TurnDivider extends Data.TaggedClass("TurnDivider")<{
     userMessageID: string
     label: "compaction" | "interrupted"
@@ -52,6 +64,7 @@ export namespace TimelineRow {
     | TurnGap
     | CommentStrip
     | UserMessage
+    | SystemInjection
     | TurnDivider
     | AssistantPart
     | Thinking
@@ -82,6 +95,8 @@ export namespace TimelineRow {
         return `comment-strip:${row.userMessageID}`
       case "UserMessage":
         return `user-message:${row.userMessageID}`
+      case "SystemInjection":
+        return `system-injection:${row.userMessageID}`
       case "TurnDivider":
         return `turn-divider:${row.userMessageID}:${row.label}`
       case "AssistantPart":

@@ -1,6 +1,19 @@
 import { describe, expect, test } from "bun:test"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
-import { normalizeSessionMessages } from "./session-message"
+import {
+  hasSessionMessageStateSemantics,
+  isSessionMessageStateProjection,
+  type SessionMessageInfo,
+} from "./session-message-info"
+import { UserTurnSource } from "@opencode-ai/schema/session-v1"
+import {
+  isSemanticUserMessage,
+  isStateProjectionMessage,
+  hasStateSemanticsMessage,
+  isConversationParentMessage,
+  latestRestorableUserMessage,
+  normalizeSessionMessages,
+  userTurnPresentation,
+} from "./session-message"
 
 describe("normalizeSessionMessages", () => {
   test("projects current turns into stable legacy rendering records", () => {
@@ -78,7 +91,9 @@ describe("normalizeSessionMessages", () => {
       role: "user",
       agent: "build",
       model: { providerID: "anthropic", modelID: "claude", variant: "high" },
+      provenance: { owner: "user", source: "prompt" },
     })
+    expect(isSemanticUserMessage(result.messages[0]!)).toBe(true)
     expect(result.messages[1]).toMatchObject({ id: "msg_4", role: "assistant", parentID: "msg_3", cost: 0.1 })
     expect(result.parts.get("msg_3")?.map((part) => part.id)).toEqual([
       "msg_3:text:0",
@@ -135,9 +150,15 @@ describe("normalizeSessionMessages", () => {
     const result = normalizeSessionMessages("ses_1", source)
 
     expect(result.messages).toEqual([
-      expect.objectContaining({ id: "msg_shell", role: "user" }),
+      expect.objectContaining({
+        id: "msg_shell",
+        role: "user",
+        provenance: { owner: "user", source: "shell" },
+      }),
       expect.objectContaining({ id: "msg_shell:assistant", role: "assistant", parentID: "msg_shell" }),
     ])
+    expect(userTurnPresentation(result.messages[0]!)).toBe("shell")
+    expect(isSemanticUserMessage(result.messages[0]!)).toBe(false)
     expect(result.parts.get("msg_shell")).toEqual([expect.objectContaining({ type: "text", text: "printf hello" })])
     expect(result.parts.get("msg_shell:assistant")).toEqual([
       expect.objectContaining({
@@ -151,6 +172,172 @@ describe("normalizeSessionMessages", () => {
         }),
       }),
     ])
+  })
+
+  test("projects current synthetic messages as host-owned compatibility turns", () => {
+    const source = [
+      {
+        id: "msg_synthetic",
+        type: "synthetic",
+        sessionID: "ses_1",
+        text: "Continue from the prior checkpoint.",
+        time: { created: 1 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = normalizeSessionMessages("ses_1", source)
+    const message = result.messages[0]
+
+    expect(message).toMatchObject({
+      id: "msg_synthetic",
+      role: "user",
+      provenance: { owner: "host", source: "v2.synthetic" },
+    })
+    expect(userTurnPresentation(message!)).toBe("synthetic")
+    expect(isSemanticUserMessage(message!)).toBe(false)
+  })
+
+  test("preserves native current user and synthetic provenance without compatibility rewriting", () => {
+    const source = [
+      {
+        id: "msg_host",
+        type: "user",
+        text: "scheduled work",
+        provenance: { owner: "host", source: UserTurnSource.HostPrompt },
+        time: { created: 1 },
+      },
+      {
+        id: "msg_goal",
+        type: "synthetic",
+        sessionID: "ses_1",
+        text: "continue after audit",
+        provenance: {
+          owner: "host",
+          source: UserTurnSource.GoalContinuation,
+          sourceMessageID: "msg_host",
+          ref: "reservation-1",
+        },
+        time: { created: 2 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = normalizeSessionMessages("ses_1", source)
+    expect(result.messages).toMatchObject([
+      {
+        id: "msg_host",
+        provenance: { owner: "host", source: UserTurnSource.HostPrompt },
+      },
+      {
+        id: "msg_goal",
+        provenance: {
+          owner: "host",
+          source: UserTurnSource.GoalContinuation,
+          sourceMessageID: "msg_host",
+          ref: "reservation-1",
+        },
+      },
+    ])
+    expect(userTurnPresentation(result.messages[0]!)).toBe("host")
+    expect(userTurnPresentation(result.messages[1]!)).toBe("synthetic")
+  })
+
+  test("keeps current state projections transparent to assistant parenting", () => {
+    const source = [
+      {
+        id: "msg_root",
+        type: "user",
+        text: "root request",
+        provenance: { owner: "user", source: UserTurnSource.Prompt },
+        time: { created: 1 },
+      },
+      {
+        id: "msg_state",
+        type: "synthetic",
+        sessionID: "ses_1",
+        text: '<goal_progress state="current" />',
+        provenance: { owner: "host", source: UserTurnSource.GoalProgress, ref: "goal-state:test" },
+        time: { created: 2 },
+      },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "response" }],
+        time: { created: 3, completed: 4 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = normalizeSessionMessages("ses_1", source)
+    const state = result.messages.find((message) => message.id === "msg_state")
+    const assistant = result.messages.find((message) => message.id === "msg_assistant")
+    expect(state && isStateProjectionMessage(state)).toBe(true)
+    expect(state && isConversationParentMessage(state)).toBe(false)
+    expect(isConversationParentMessage(result.messages[0]!)).toBe(true)
+    expect(assistant).toMatchObject({ role: "assistant", parentID: "msg_root" })
+  })
+
+  test("historical state-shaped records remain history instead of becoming live STATE", () => {
+    const source = [
+      {
+        id: "msg_root",
+        type: "user",
+        text: "root request",
+        provenance: { owner: "user", source: UserTurnSource.Prompt },
+        time: { created: 0 },
+      },
+      {
+        id: "msg_historical_state",
+        type: "synthetic",
+        sessionID: "ses_1",
+        text: "old Goal progress",
+        provenance: {
+          owner: "host",
+          source: UserTurnSource.GoalProgress,
+          lifetime: "historical",
+          ref: "goal-state:old",
+        },
+        time: { created: 1 },
+      },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "response" }],
+        time: { created: 2, completed: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    expect(isSessionMessageStateProjection(source[1]!)).toBe(false)
+    expect(hasSessionMessageStateSemantics(source[1]!)).toBe(true)
+    const result = normalizeSessionMessages("ses_1", source)
+    const historical = result.messages.find((message) => message.id === "msg_historical_state")!
+    const assistant = result.messages.find((message) => message.id === "msg_assistant")
+    expect(isStateProjectionMessage(historical)).toBe(false)
+    expect(hasStateSemanticsMessage(historical)).toBe(true)
+    expect(isConversationParentMessage(historical)).toBe(false)
+    expect(assistant).toMatchObject({ role: "assistant", parentID: "msg_root" })
+  })
+
+  test("historical semantic users cannot restore current Session model state", () => {
+    const live = {
+      id: "msg_live_restore",
+      sessionID: "ses_1",
+      role: "user",
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: "test", modelID: "live" },
+      provenance: { owner: "user" as const, source: UserTurnSource.Prompt },
+    } as any
+    const historical = {
+      ...live,
+      id: "msg_historical_restore",
+      model: { providerID: "test", modelID: "stale" },
+      provenance: { ...live.provenance, lifetime: "historical" as const },
+    }
+
+    expect(latestRestorableUserMessage([live, historical])?.id).toBe(live.id)
   })
 
   test("adapts current edit fields for the legacy edit renderer", () => {

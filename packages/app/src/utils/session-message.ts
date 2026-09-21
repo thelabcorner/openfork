@@ -1,16 +1,83 @@
 import type {
   SessionMessageAssistant,
   SessionMessageAssistantTool,
-  SessionMessageInfo,
   SessionMessageShell,
-  SessionMessageUser,
 } from "@opencode-ai/client/promise"
 import type { AssistantMessage, FilePart, Message, Part, ToolPart, UserMessage } from "@opencode-ai/sdk/v2"
+import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import { Option, Schema } from "effect"
+import type { SessionMessageInfo } from "./session-message-info"
+
+type SessionMessageUser = Extract<SessionMessageInfo, { type: "user" }>
 
 const emptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
 const emptyModel: { id: string; providerID: string; variant?: string } = { id: "", providerID: "" }
 const decodeToolInput = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
+const legacyCurrentSyntheticSource = "v2.synthetic"
+
+export type UserTurnPresentation = "user" | "shell" | "host" | "compaction" | "synthetic"
+
+/**
+ * Browser-safe presentation classification for V1 user-role messages.
+ *
+ * Provider role is deliberately not ownership: V1 stores host continuations,
+ * compaction markers and direct shell turns as `role: "user"`. Explicit
+ * provenance is authoritative; unstamped historical rows retain the old user
+ * interpretation because the browser does not own Core's part-based legacy
+ * inference policy.
+ */
+export function userTurnPresentation(message: Message): UserTurnPresentation | undefined {
+  if (message.role !== "user") return
+  const kind = SessionTurnProvenance.semanticKindInfo(message)
+  if (kind === "user") return "user"
+  if (kind === "shell") return "shell"
+  if (kind === "compaction") return "compaction"
+  if (SessionTurnProvenance.isHostPromptInfo(message)) return "host"
+  return "synthetic"
+}
+
+export function isSemanticUserMessage(message: Message): message is UserMessage {
+  return userTurnPresentation(message) === "user"
+}
+
+/**
+ * Browser-safe counterpart to Core's worker-prompt selector. Explicit
+ * provenance is authoritative; unstamped historical user-role rows retain the
+ * legacy interpretation because the browser does not hydrate parts solely to
+ * reconstruct provenance.
+ */
+export function isWorkerPromptMessage(message: Message): boolean {
+  return message.role === "user" && SessionTurnProvenance.isWorkerPromptInfo(message)
+}
+
+export function latestRestorableUserMessage(messages: readonly UserMessage[]) {
+  return messages.findLast(isWorkerPromptMessage)
+}
+
+export function isStateProjectionMessage(message: Message): boolean {
+  return message.role === "user" && SessionTurnProvenance.isStateProjectionInfo(message)
+}
+
+/**
+ * STATE-shaped semantic record, regardless of lifetime. Historical/imported
+ * Goal STATE remains renderable history but is still structurally transparent:
+ * losing live STATE authority must not turn it into a conversation parent.
+ */
+export function hasStateSemanticsMessage(message: Message): boolean {
+  if (message.role !== "user") return false
+  const provenance = message.provenance
+  return provenance?.owner === "host" && SessionTurnProvenance.isStateKind(provenance.source)
+}
+
+/**
+ * Provider-user messages may parent assistants, including host continuations.
+ * STATE-shaped records are transparent to conversation parentage even when a
+ * historical/imported lifetime means they are no longer the current mutable
+ * STATE projection.
+ */
+export function isConversationParentMessage(message: Message): message is UserMessage {
+  return message.role === "user" && !hasStateSemanticsMessage(message)
+}
 
 export function compareMessages(a: Pick<Message, "id" | "time">, b: Pick<Message, "id" | "time">) {
   const left = messageKey(a)
@@ -74,8 +141,14 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
       parts.set(message.id, userParts(sessionID, message))
       return
     }
-    if (message.type === "synthetic" && message.description?.trim()) {
-      parentID = message.id
+    if (message.type === "synthetic" && message.text.trim()) {
+      const provenance = message.provenance ?? { owner: "host" as const, source: legacyCurrentSyntheticSource }
+      // Current/V2 STATE is normalized to SDK role=user for compatibility, but
+      // STATE semantics remain structurally transparent even after import makes
+      // the record historical and therefore non-live.
+      if (!(provenance.owner === "host" && SessionTurnProvenance.isStateKind(provenance.source))) {
+        parentID = message.id
+      }
       const normalized = {
         id: message.id,
         sessionID,
@@ -83,10 +156,14 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
         time: message.time,
         agent,
         model: { providerID: model.providerID, modelID: model.id, variant: model.variant },
+        // Current/V2 now persists first-class provenance. Preserve it exactly;
+        // synthesize the historical generic source only for rows created before
+        // the provenance contract existed.
+        provenance,
       } satisfies UserMessage
       messages.push(normalized)
       messagesByID.set(normalized.id, normalized)
-      parts.set(message.id, [textPart(sessionID, message.id, 0, message.description, true)])
+      parts.set(message.id, [textPart(sessionID, message.id, 0, message.text, true)])
       return
     }
     if (message.type === "shell") {
@@ -147,6 +224,7 @@ function shellMessages(
       time: { created: message.time.created },
       agent,
       model: { providerID: model.providerID, modelID: model.id, variant: model.variant },
+      provenance: { owner: "user", source: SessionTurnProvenance.Source.Shell },
     },
     {
       id: `${message.id}:assistant`,
@@ -212,6 +290,10 @@ function userMessage(
     time: message.time,
     agent,
     model: { providerID: model.providerID, modelID: model.id, variant: model.variant },
+    // Current/V2 User is a provider-facing structural bucket, not proof of
+    // human ownership. Preserve trusted host/user provenance when present and
+    // infer Prompt only for pre-provenance rows.
+    provenance: message.provenance ?? { owner: "user", source: SessionTurnProvenance.Source.Prompt },
   }
 }
 

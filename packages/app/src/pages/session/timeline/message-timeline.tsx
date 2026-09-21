@@ -42,6 +42,7 @@ import { DialogFooter, DialogHeader, DialogTitleGroup, DialogV2 } from "@opencod
 import { InlineInput } from "@opencode-ai/ui/inline-input"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { SessionRetry } from "@opencode-ai/session-ui/session-retry"
+import { SystemInjectionCardV2 } from "@opencode-ai/session-ui/v2/system-injection-v2"
 import { isScrollKeyTarget, scrollKey, scrollKeyOwner, ScrollView } from "@opencode-ai/ui/scroll-view"
 import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { TextField } from "@opencode-ai/ui/text-field"
@@ -76,13 +77,16 @@ import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { sessionTitle } from "@/utils/session-title"
+import { isSemanticUserMessage } from "@/utils/session-message"
 import { scheduleConnectedMeasure } from "./measure"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
+import { systemInjectionPreview, systemInjectionSegments } from "./system-injection"
 import { collectVirtualItems, filterVirtualIndexes } from "./virtual-items"
 import { textLayoutMode } from "@/lib/text-layout"
 import { TIMELINE_FALLBACK_SIZE, TimelineRowEstimator, type RowEstimateInput } from "./estimation"
+import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -94,7 +98,11 @@ type FramedTimelineRow = Exclude<TimelineRow.TimelineRow, { _tag: "TurnGap" }>
 type TimelineRowByTag<T extends TimelineRow.TimelineRow["_tag"]> = Extract<TimelineRow.TimelineRow, { _tag: T }>
 
 const timelineFallbackItemSize = TIMELINE_FALLBACK_SIZE
-const timelineCache = new Map<string, { measurements: VirtualItem[]; toolOpen: Record<string, boolean | undefined> }>()
+type TimelineOpenState = Record<string, boolean | undefined>
+const timelineCache = new Map<
+  string,
+  { measurements: VirtualItem[]; toolOpen: TimelineOpenState; injectionOpen: TimelineOpenState }
+>()
 
 // Process-global estimator: priors/history learning persists across sessions;
 // per-row measurements are keyed by row key (session-scoped) and never leak.
@@ -296,6 +304,11 @@ export function MessageTimeline(props: {
 
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
   const sessionID = createMemo(() => params.id)
+  const resolveVisualArtifact = (input: Parameters<typeof browserHostClient.visualArtifactPreviewFor>[1]) => {
+    const id = sessionID()
+    if (!id) return Promise.resolve(null)
+    return browserHostClient.visualArtifactPreviewFor({ sessionId: id, directory: sdk().directory }, input)
+  }
   const sessionStatus = createMemo(() => {
     const id = sessionID()
     if (!id) return idle
@@ -306,7 +319,7 @@ export function MessageTimeline(props: {
     const id = sessionID()
     if (!id) return []
     const visible = new Set(props.userMessages.map((message) => message.id))
-    const boundary = sessionMessages().find((message) => message.role === "user" && !visible.has(message.id))?.id
+    const boundary = sessionMessages().find((message) => isSemanticUserMessage(message) && !visible.has(message.id))?.id
     const messages = sync().data.session_message[id] ?? []
     if (!boundary) return messages
     const index = messages.findIndex((message) => message.id === boundary)
@@ -358,6 +371,7 @@ export function MessageTimeline(props: {
     parts: getMsgParts,
     status: sessionStatus,
     showReasoningSummaries: settings.general.showReasoningSummaries,
+    showSystemInjections: settings.general.showSystemInjections,
     inlineComments: settings.general.newLayoutDesigns,
   })
   const activeMessageID = projection.activeMessageID
@@ -382,10 +396,17 @@ export function MessageTimeline(props: {
       let text: string | undefined
       if (row._tag === "UserMessage") {
         const parts = getMsgParts(row.userMessageID)
-        text = parts
-          .filter((part): part is Extract<PartType, { type: "text" }> => part.type === "text" && !!part.text)
-          .map((part) => part.text)
-          .join("\n") || undefined
+        text =
+          parts
+            // Synthetic parts are server injections: the bubble has never drawn
+            // them, and they now own a row of their own, so folding their text
+            // into this estimate only over-predicts the bubble's height.
+            .filter(
+              (part): part is Extract<PartType, { type: "text" }> =>
+                part.type === "text" && !!part.text && !part.synthetic,
+            )
+            .map((part) => part.text)
+            .join("\n") || undefined
       } else if (row._tag === "AssistantPart" && row.group.type === "part") {
         const part = getMsgPart(row.group.ref.messageID, row.group.ref.partID)
         if (part?.type === "text" && part.text) text = part.text
@@ -472,7 +493,27 @@ export function MessageTimeline(props: {
     prependAnchorFrame = requestAnimationFrame(apply)
   }
 
-  const [toolOpen, setToolOpen] = createStore<Record<string, boolean | undefined>>(cached?.toolOpen ?? {})
+  const [toolOpen, setToolOpen] = createStore<TimelineOpenState>(cached?.toolOpen ?? {})
+  // Expanded system-injection rows, keyed by row key and owned HERE rather than
+  // by the row component: the virtualizer unmounts off-screen rows, so
+  // component-local state would silently collapse a card the moment it scrolled
+  // out of view (and again on tab switch, which restores from timelineCache).
+  const [injectionOpen, setInjectionOpen] = createStore<TimelineOpenState>(cached?.injectionOpen ?? {})
+  const [injectionCopied, setInjectionCopied] = createSignal<string>()
+  let injectionCopyTimer: ReturnType<typeof setTimeout> | undefined
+  const copyInjection = (rowKey: string, text: string) => {
+    void navigator.clipboard.writeText(text).then(
+      () => {
+        setInjectionCopied(rowKey)
+        if (injectionCopyTimer !== undefined) clearTimeout(injectionCopyTimer)
+        injectionCopyTimer = setTimeout(() => setInjectionCopied(undefined), 2000)
+      },
+      () => {},
+    )
+  }
+  onCleanup(() => {
+    if (injectionCopyTimer !== undefined) clearTimeout(injectionCopyTimer)
+  })
   const [renderOverscan, setRenderOverscan] = createSignal(initialMeasurements?.length || coldBottomMount ? 6 : 20)
   let resizePinnedIndexes: number[] = []
   let resizePinFrame: number | undefined
@@ -669,7 +710,11 @@ export function MessageTimeline(props: {
   onCleanup(() => {
     clearPrependAnchor()
     timelineCache.delete(activeSessionKey)
-    timelineCache.set(activeSessionKey, { measurements: virtualizer.takeSnapshot(), toolOpen: { ...toolOpen } })
+    timelineCache.set(activeSessionKey, {
+      measurements: virtualizer.takeSnapshot(),
+      toolOpen: { ...toolOpen },
+      injectionOpen: { ...injectionOpen },
+    })
     while (timelineCache.size > 16) timelineCache.delete(timelineCache.keys().next().value!)
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
@@ -1226,6 +1271,7 @@ export function MessageTimeline(props: {
                 deferToolContent
                 virtualizeDiff={false}
                 onContentRendered={onSizeChange}
+                resolveVisualArtifact={resolveVisualArtifact}
               />
             )}
           </Show>
@@ -1315,7 +1361,7 @@ export function MessageTimeline(props: {
         const userMessageRow = row as Accessor<TimelineRowByTag<"UserMessage">>
         const message = createMemo(() => {
           const m = messageByID().get(userMessageRow().userMessageID)
-          if (m?.role === "user") return m
+          if (m && isSemanticUserMessage(m)) return m
         })
         const messageComments = createMemo(() => {
           if (!settings.general.newLayoutDesigns()) return []
@@ -1338,6 +1384,40 @@ export function MessageTimeline(props: {
                 </div>
               )}
             </Show>
+          </TimelineRowFrame>
+        )
+      }
+      case "SystemInjection": {
+        const injectionRow = row as Accessor<TimelineRowByTag<"SystemInjection">>
+        const rowKey = createMemo(() => TimelineRow.key(injectionRow()))
+        // Same shape as the CommentStrip row: the descriptor carries identity,
+        // the text is read from the part store at render time. `signature` is
+        // read so a later injection on the same turn re-derives the segments.
+        const segments = createMemo(() => {
+          injectionRow().signature
+          return systemInjectionSegments(getMsgParts(injectionRow().userMessageID))
+        })
+        const open = () => injectionOpen[rowKey()] === true
+        return (
+          <TimelineRowFrame row={injectionRow}>
+            <div data-slot="session-turn-system-injection" class="w-full px-4 md:px-5 pt-1.5">
+              <SystemInjectionCardV2
+                badge={language.t("session.messages.systemInjection.badge")}
+                preview={systemInjectionPreview(segments())}
+                segments={segments()}
+                open={open()}
+                onOpenChange={(next) => {
+                  setInjectionOpen(rowKey(), next)
+                  onSizeChange?.()
+                }}
+                expandLabel={language.t("session.messages.systemInjection.expand")}
+                collapseLabel={language.t("session.messages.systemInjection.collapse")}
+                copyLabel={language.t("session.messages.systemInjection.copy")}
+                copiedLabel={language.t("session.messages.systemInjection.copied")}
+                copied={injectionCopied() === rowKey()}
+                onCopy={(text) => copyInjection(rowKey(), text)}
+              />
+            </div>
           </TimelineRowFrame>
         )
       }

@@ -68,6 +68,7 @@ describe("createTimelineProjection: per-turn reactive memoization", () => {
         parts,
         status,
         showReasoningSummaries: () => true,
+        showSystemInjections: () => false,
         inlineComments: () => true,
       })
 
@@ -98,11 +99,12 @@ describe("createTimelineProjection: per-turn reactive memoization", () => {
       // Equivalence: the memoized projection's final rows must match a from-scratch,
       // non-memoized rebuild (Timeline.constructSessionMessageRows) over the same final state.
       const messageByID = new Map(messageStore.list.map((m) => [m.id, m] as const))
-      const fresh = Timeline.constructSessionMessageRows(
-        sessionMessages(),
-        (id) => messageByID.get(id) as UserMessage,
-        (id) => partStore.map[id] ?? [],
-        true,
+      const fresh = Timeline.constructSessionMessageRows(
+        sessionMessages(),
+        (id) => messageByID.get(id) as UserMessage,
+        (id) => partStore.map[id] ?? [],
+        true,
+        false,
         "busy",
         true,
         messageStore.list.filter((m) => m.role === "user"),
@@ -139,6 +141,7 @@ describe("createTimelineProjection: per-turn reactive memoization", () => {
         parts,
         status,
         showReasoningSummaries: () => true,
+        showSystemInjections: () => false,
         inlineComments: () => true,
       })
 
@@ -185,6 +188,7 @@ describe("createTimelineProjection: per-turn reactive memoization", () => {
         parts: (id) => partStore.map[id] ?? [],
         status,
         showReasoningSummaries: () => true,
+        showSystemInjections: () => false,
         inlineComments: () => true,
       })
 
@@ -238,6 +242,7 @@ describe("createTimelineProjection: per-turn reactive memoization", () => {
         parts,
         status,
         showReasoningSummaries: () => true,
+        showSystemInjections: () => false,
         inlineComments: () => true,
       })
 

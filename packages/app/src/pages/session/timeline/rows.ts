@@ -1,11 +1,17 @@
 import { parseCommentNote, readCommentMetadata } from "@/utils/comment-note"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 import { AssistantMessage, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
 import { groupParts, renderable, type PartGroup } from "@opencode-ai/session-ui/message-part"
 import { estimateMarkdownHeight, MARKDOWN_WIDTH_FALLBACK } from "@/pages/session/v2/project-explorer-markdown-height"
 import { TimelineRow, type SummaryDiff } from "./timeline-row"
 import { uniqueSummaryDiffs } from "./summary-diffs"
-import { compareMessages } from "@/utils/session-message"
+import { systemInjectionSignature } from "./system-injection"
+import {
+  compareMessages,
+  isStateProjectionMessage,
+  isWorkerPromptMessage,
+  userTurnPresentation,
+} from "@/utils/session-message"
 
 export { TimelineRow, type SummaryDiff } from "./timeline-row"
 
@@ -17,6 +23,11 @@ export type TimelineRowMap = {
   UserMessage: {
     userMessageID: string
     anchor: boolean
+  }
+  SystemInjection: {
+    userMessageID: string
+    signature: string
+    count: number
   }
   TurnDivider: {
     userMessageID: string
@@ -35,13 +46,14 @@ export type TimelineRowMap = {
 }
 
 export namespace Timeline {
-  export type TurnGroup = { user: UserMessage; assistants: AssistantMessage[] }
+  export type TurnGroup = { user: UserMessage; assistants: AssistantMessage[]; showUserMessage: boolean }
 
   export function constructSessionMessageRows(
     messages: SessionMessageInfo[],
     getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
     getMessageParts: (messageID: string) => Part[],
     showReasoning: boolean,
+    showSystemInjections: boolean,
     status: SessionStatus["type"],
     inlineComments: boolean,
     projectedUserMessages: UserMessage[],
@@ -56,9 +68,12 @@ export namespace Timeline {
           turn.assistants,
           index,
           showReasoning,
+          showSystemInjections,
           status,
           turn.user.id === activeMessageID,
           inlineComments,
+          undefined,
+          { showUserMessage: turn.showUserMessage },
         ),
       ),
     }
@@ -75,38 +90,93 @@ export namespace Timeline {
   ) {
     const turns: TurnGroup[] = []
     const turnByUserID = new Map<string, (typeof turns)[number]>()
+    let currentTurn: TurnGroup | undefined
     messages.forEach((message) => {
       const projected = getMessage(message.id)
       if (message.type === "shell" && projected?.role === "user") {
         const assistant = getMessage(`${message.id}:assistant`)
-        const turn = { user: projected, assistants: assistant?.role === "assistant" ? [assistant] : [] }
+        const turn = {
+          user: projected,
+          assistants: assistant?.role === "assistant" ? [assistant] : [],
+          showUserMessage: true,
+        }
         turns.push(turn)
         turnByUserID.set(projected.id, turn)
+        currentTurn = undefined
         return
       }
       if (projected?.role === "user") {
         if (turnByUserID.has(projected.id)) return
-        const turn = { user: projected, assistants: [] }
+        // Replaceable STATE is context, not a hidden turn root. Keep the current
+        // causal turn intact even when a paginated/replayed window begins with a
+        // state projection.
+        if (isStateProjectionMessage(projected)) return
+        const presentation = userTurnPresentation(projected)
+        const currentSynthetic = message.type === "synthetic"
+        if (presentation === "synthetic") {
+          const provenance = projected.provenance
+          const sourceMessageID =
+            provenance?.owner === "host" && "sourceMessageID" in provenance ? provenance.sourceMessageID : undefined
+          if (sourceMessageID) {
+            // Modern current/V2 continuation lineage is explicit. Attach the
+            // structural continuation id to its canonical worker turn so its
+            // assistant output follows causality rather than transcript adjacency.
+            const causalTurn = turnByUserID.get(sourceMessageID)
+            if (causalTurn) {
+              turnByUserID.set(projected.id, causalTurn)
+              currentTurn = causalTurn
+              return
+            }
+            // Explicit lineage whose root is outside the active projection must
+            // not borrow an unrelated adjacent turn. Fall through and create a
+            // hidden structural root so assistant output remains representable.
+          } else if (isWorkerPromptMessage(projected)) {
+            // V1 persists trusted host worker roots (for example scheduled-task
+            // runs) as role/type=user. Their semantic Synthetic provenance, not
+            // the storage-generation shape, establishes a hidden worker root.
+          } else if (currentTurn) {
+            // Pre-provenance current/V2 Synthetic compatibility: preserve the
+            // historical adjacency attachment only when lineage is unavailable.
+            turnByUserID.set(projected.id, currentTurn)
+            return
+          } else if (!currentSynthetic) {
+            return
+          }
+        }
+        const turn = {
+          user: projected,
+          assistants: [],
+          showUserMessage: presentation === "user" && message.type === "user",
+        }
         turns.push(turn)
         turnByUserID.set(projected.id, turn)
+        currentTurn = turn
         return
       }
       if (projected?.role !== "assistant") return
+      if (currentTurn) {
+        currentTurn.assistants.push(projected)
+        return
+      }
       const existing = turnByUserID.get(projected.parentID)
       if (existing) {
         existing.assistants.push(projected)
+        currentTurn = existing
         return
       }
       const user = getMessage(projected.parentID)
       if (user?.role !== "user") return
-      const turn = { user, assistants: [projected] }
+      const presentation = userTurnPresentation(user)
+      if (presentation === "synthetic" && !isWorkerPromptMessage(user)) return
+      const turn = { user, assistants: [projected], showUserMessage: presentation === "user" }
       turns.push(turn)
       turnByUserID.set(user.id, turn)
+      currentTurn = turn
     })
     const missingTurns: typeof turns = []
     projectedUserMessages.forEach((user) => {
       if (turnByUserID.has(user.id)) return
-      const turn = { user, assistants: [] }
+      const turn = { user, assistants: [], showUserMessage: true }
       missingTurns.push(turn)
       turnByUserID.set(user.id, turn)
     })
@@ -143,6 +213,9 @@ export namespace Timeline {
     assistantMessages: AssistantMessage[],
     index: number,
     showReasoning: boolean,
+    // Reveals the turn's server-injected (`synthetic`) text parts as their own
+    // row. Off by default; when off the injection scan never runs at all.
+    showSystemInjections: boolean,
     status: SessionStatus["type"],
     isActive: boolean,
     // v2 renders comments inside the user message attachments row instead of a strip row
@@ -152,6 +225,7 @@ export namespace Timeline {
     // object means "do not inspect live reasoning text here", including when
     // the current derived heading is undefined.
     live?: { reasoningHeading?: string },
+    presentation?: { showUserMessage?: boolean },
   ) {
     const rows: TimelineRow.TimelineRow[] = []
 
@@ -197,13 +271,29 @@ export namespace Timeline {
         }),
       )
 
-    rows.push(
-      new TimelineRow.UserMessage({
-        userMessageID: userMessage.id,
-        anchor: inlineComments || comments.length === 0,
-      }),
-    )
+    if (presentation?.showUserMessage !== false)
+      rows.push(
+        new TimelineRow.UserMessage({
+          userMessageID: userMessage.id,
+          anchor: inlineComments || comments.length === 0,
+        }),
+      )
 
+    // Sits directly under the prompt it was appended to, because that is what
+    // the model actually received for this turn. Gated first so the scan is not
+    // even attempted while the setting is off.
+    if (showSystemInjections) {
+      const injections = systemInjectionSignature(userParts)
+      if (injections.count > 0) {
+        rows.push(
+          new TimelineRow.SystemInjection({
+            userMessageID: userMessage.id,
+            signature: injections.signature,
+            count: injections.count,
+          }),
+        )
+      }
+    }
     if (compaction) {
       rows.push(
         new TimelineRow.TurnDivider({

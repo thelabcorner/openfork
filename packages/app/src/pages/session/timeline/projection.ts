@@ -1,4 +1,4 @@
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 import type { AssistantMessage, Message, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
 import { createMemo, mapArray, type Accessor } from "solid-js"
 import { phaseTrace } from "@/context/phase-trace"
@@ -31,6 +31,7 @@ export function createTimelineProjection(input: {
   parts: (messageID: string) => Part[]
   status: Accessor<SessionStatus>
   showReasoningSummaries: Accessor<boolean>
+  showSystemInjections: Accessor<boolean>
   inlineComments: Accessor<boolean>
 }) {
   const messageByID = createMemo(() => new Map(input.messages().map((message) => [message.id, message] as const)))
@@ -91,6 +92,7 @@ export function createTimelineProjection(input: {
       emptyIDs,
       { equals: arraysShallowEqual },
     )
+    const showUserMessage = createMemo(() => grouped().turnByUserID.get(userMessageID)?.showUserMessage !== false)
     // A message append rebuilds messageByID(), so these tiny lookup memos wake,
     // but each lookup is O(1) and default reference equality prevents unchanged
     // messages from propagating into row construction. The previous implementation
@@ -128,6 +130,13 @@ export function createTimelineProjection(input: {
     return createMemo<TimelineRow.TimelineRow[]>((previous) => {
       const started = phaseTrace.enabled ? performance.now() : 0
       const user = userMessage()
+      // groupTurns() is the single authority for whether a projected user-role
+      // row establishes a timeline turn. That includes hidden host-owned
+      // synthetic roots (special agents, scheduled work, etc.) whose assistant
+      // output must remain inspectable even though the root itself is not a
+      // semantic human-user turn. Re-classifying semantics here creates a
+      // contradictory second filter: grouped() can own a valid turn that the
+      // row projector then silently erases.
       if (user?.role !== "user") return emptyRows
       const views = assistantViews()
       const assistants = views
@@ -146,10 +155,12 @@ export function createTimelineProjection(input: {
         assistants,
         isFirstTurn() ? 0 : 1,
         input.showReasoningSummaries(),
+        input.showSystemInjections(),
         status,
         active,
         input.inlineComments(),
         working ? { reasoningHeading: liveReasoningHeading() } : undefined,
+        { showUserMessage: showUserMessage() },
       )
       // Streamed text/reasoning lives in the part store and is consumed by the
       // mounted row component directly; it is deliberately absent from the row

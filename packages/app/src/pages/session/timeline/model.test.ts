@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import type { AssistantMessage, Message, UserMessage } from "@opencode-ai/sdk/v2"
-import { isTimelineReady, loadOlderTimeline, selectUserMessages, selectVisibleUserMessages } from "./model"
+import { UserTurnSource } from "@opencode-ai/schema/session-v1"
+import {
+  isTimelineReady,
+  loadOlderTimeline,
+  selectUserMessages,
+  selectVisibleUserMessages,
+} from "./model"
 
 const user = (id: string) => ({ id, role: "user" }) as UserMessage
 const assistant = (id: string) => ({ id, role: "assistant" }) as AssistantMessage
@@ -15,10 +21,50 @@ describe("timeline model", () => {
     expect(selectVisibleUserMessages(users)).toBe(users)
   })
 
+  test("excludes explicit V1 orchestration turns from semantic user navigation", () => {
+    const messages: Message[] = [
+      user("msg_user"),
+      {
+        ...user("msg_goal"),
+        provenance: { owner: "host", source: UserTurnSource.GoalContinuation, sourceMessageID: "msg_user" },
+      },
+      {
+        ...user("msg_host"),
+        provenance: { owner: "host", source: UserTurnSource.HostPrompt },
+      },
+      {
+        ...user("msg_scheduled"),
+        provenance: { owner: "host", source: UserTurnSource.ScheduledTaskRun, ref: "str_test" },
+      },
+      {
+        ...user("msg_plan"),
+        provenance: { owner: "user", source: UserTurnSource.PlanApproval },
+      },
+      assistant("msg_assistant"),
+    ]
+
+    expect(selectUserMessages(messages).map((message) => message.id)).toEqual(["msg_user"])
+    expect(isTimelineReady(messages.slice(1), true)).toBe(false)
+  })
+
   test("waits for an assistant-only load to hydrate its user root", () => {
     expect(isTimelineReady([assistant("msg_2")], true)).toBe(false)
     expect(isTimelineReady([user("msg_1"), assistant("msg_2")], true)).toBe(true)
     expect(isTimelineReady([], false)).toBe(true)
+  })
+
+  test("historical semantic users stay visible but cannot restore live model state", () => {
+    const live = {
+      ...user("msg_live"),
+      provenance: { owner: "user" as const, source: UserTurnSource.Prompt },
+    }
+    const historical = {
+      ...user("msg_imported"),
+      provenance: { owner: "user" as const, source: UserTurnSource.Prompt, lifetime: "historical" as const },
+    }
+    const users = selectUserMessages([live, historical])
+
+    expect(users.map((message) => message.id)).toEqual(["msg_live", "msg_imported"])
   })
 
   test("loads exactly one opaque cursor page", async () => {

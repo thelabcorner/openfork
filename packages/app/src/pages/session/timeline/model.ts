@@ -1,4 +1,5 @@
 import type { Message, UserMessage } from "@opencode-ai/sdk/v2"
+import { isSemanticUserMessage, latestRestorableUserMessage } from "@/utils/session-message"
 import { createEffect, createMemo, createResource, on, onCleanup, untrack, type Accessor } from "solid-js"
 import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
@@ -148,7 +149,10 @@ export function createTimelineModel(input: {
 
   return {
     history: { loadOlder, loading, more },
-    lastUserMessage: createMemo(() => visibleUserMessages().at(-1)),
+    // Composer/model restoration is live execution state, not presentation.
+    // Historical imported semantic-user rows remain visible in the timeline but
+    // cannot become the model/agent account of record for a current Session.
+    lastUserMessage: createMemo(() => latestRestorableUserMessage(visibleUserMessages())),
     messages,
     ready,
     resource,
@@ -165,11 +169,11 @@ export function createTimelineModel(input: {
 }
 
 export function selectUserMessages(messages: Message[]) {
-  return messages.filter((message): message is UserMessage => message.role === "user")
+  return messages.filter(isSemanticUserMessage)
 }
 
 export function isTimelineReady(messages: Message[] | undefined, loading: boolean) {
-  return messages !== undefined && (messages.some((message) => message.role === "user") || !loading)
+  return messages !== undefined && (messages.some(isSemanticUserMessage) || !loading)
 }
 
 export function selectVisibleUserMessages(messages: UserMessage[], revertMessageID?: string) {
