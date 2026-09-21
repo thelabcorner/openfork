@@ -174,6 +174,18 @@ describe("tool.grep", () => {
     }),
   )
 
+  it.instance("refuses a missing exact path instead of widening to its parent directory", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "sibling.txt"), "needle must not leak"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: path.join(test.directory, "missing.txt") }, ctx).pipe(Effect.exit)
+
+      expect(result._tag).toBe("Failure")
+    }),
+  )
+
   it.instance("does not mark exactly 100 matches as truncated", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

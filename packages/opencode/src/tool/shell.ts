@@ -1,5 +1,4 @@
 import { Effect, Stream } from "effect"
-import { Duration } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import { readFile } from "node:fs/promises"
@@ -22,37 +21,25 @@ import * as Truncate from "./truncate"
 import { TRUNCATION_DIR } from "./truncation-dir"
 import { Plugin } from "@/plugin"
 import { ChildProcess } from "effect/unstable/process"
-import type { CommandInput, StdinConfig } from "effect/unstable/process/ChildProcess"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
 import { BackgroundJob } from "@/background/job"
-import {
-  ShellJobs,
-  jobLogPath,
-  jobMetaPath,
-  jobLogPathLegacy,
-  jobMetaPathLegacy,
-} from "@/background/shell-jobs"
+import { ShellJobs, jobLogPath, jobMetaPath, jobLogPathLegacy, jobMetaPathLegacy } from "@/background/shell-jobs"
 import { withBackgroundProcessSlot } from "@/background/process-concurrency"
 import { Snapshot } from "@/snapshot"
 import { Identifier } from "@/id/id"
-import type { TaskPromptOps } from "./task"
+import type { SessionPromptOps } from "@/session/prompt-contract"
 import { Scope } from "effect"
-import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
+import { ShellLaunch } from "./shell/launch"
 import { withShellSlot } from "./shell-concurrency"
-import { brotliCompress, brotliDecompress } from "node:zlib"
-import { promisify } from "node:util"
 import { userChildEnvironment } from "@/util/javascript-runtime"
+import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { MessageID } from "@/session/schema"
 import treeWasmAsset from "web-tree-sitter/tree-sitter.wasm" with { type: "wasm" }
 import bashWasmAsset from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "wasm" }
 import psWasmAsset from "tree-sitter-powershell/tree-sitter-powershell.wasm" with { type: "wasm" }
-
-// Async brotli for the output sidecar merge below: the sync variants block the
-// single event loop for the whole (de)compression of potentially megabytes of
-// tool output on every large tool completion.
-const brotliCompressAsync = promisify(brotliCompress)
-const brotliDecompressAsync = promisify(brotliDecompress)
 
 export { Parameters } from "./shell/prompt"
 
@@ -126,40 +113,140 @@ type Chunk = {
  */
 export interface ChunkWindow {
   readonly cut: boolean
+  readonly totalBytes: number
+  readonly totalLines: number
   push(text: string): void
   text(): string
+  snapshot(): { head: string; tail: string; cut: boolean; totalBytes: number; totalLines: number }
 }
 
 export function makeChunkWindow(keepBytes: number): ChunkWindow {
-  const list: Chunk[] = []
-  let head = 0
-  let used = 0
+  const capacity = Math.max(0, Math.floor(keepBytes))
+  const headBudget = Math.ceil(capacity / 2)
+  const tailBudget = Math.floor(capacity / 2)
+  const fixed: string[] = []
+  const tail: Chunk[] = []
+  let fixedBytes = 0
+  let fixedSealed = headBudget === 0
+  let tailHead = 0
+  let tailBytes = 0
+  let totalBytes = 0
+  let totalLines = 1
   let cut = false
+
+  const compactTail = () => {
+    if (tailHead > 1024 && tailHead * 2 > tail.length) {
+      tail.splice(0, tailHead)
+      tailHead = 0
+    }
+  }
+
+  const pushTail = (text: string) => {
+    if (!text) return
+    const size = Buffer.byteLength(text, "utf-8")
+    if (tailBudget <= 0) {
+      cut = true
+      return
+    }
+    tail.push({ text, size })
+    tailBytes += size
+    while (tailBytes > tailBudget && tailHead < tail.length) {
+      const item = tail[tailHead]!
+      const excess = tailBytes - tailBudget
+      if (item.size <= excess) {
+        tailBytes -= item.size
+        tailHead++
+        cut = true
+        continue
+      }
+      const kept = ToolOutputProjection.takeSuffixBytes(item.text, item.size - excess)
+      const keptBytes = Buffer.byteLength(kept, "utf-8")
+      tailBytes -= item.size - keptBytes
+      item.text = kept
+      item.size = keptBytes
+      cut = true
+      break
+    }
+    compactTail()
+  }
+
   return {
     get cut() {
       return cut
     },
+    get totalBytes() {
+      return totalBytes
+    },
+    get totalLines() {
+      return totalLines
+    },
     push(text: string) {
       const size = Buffer.byteLength(text, "utf-8")
-      list.push({ text, size })
-      used += size
-      while (used > keepBytes && list.length - head > 1) {
-        used -= list[head]!.size
-        head++
-        cut = true
+      totalBytes += size
+      let from = 0
+      while (true) {
+        const at = text.indexOf("\n", from)
+        if (at === -1) break
+        totalLines++
+        from = at + 1
       }
-      if (head > 1024 && head * 2 > list.length) {
-        list.splice(0, head)
-        head = 0
+
+      let remainder = text
+      if (!fixedSealed && fixedBytes < headBudget) {
+        const prefix = ToolOutputProjection.takePrefixBytes(remainder, headBudget - fixedBytes)
+        if (prefix) {
+          fixed.push(prefix)
+          fixedBytes += Buffer.byteLength(prefix, "utf-8")
+          remainder = remainder.slice(prefix.length)
+        }
+        if (remainder.length > 0 || fixedBytes >= headBudget) fixedSealed = true
       }
+      pushTail(remainder)
     },
     text() {
-      return list
-        .slice(head)
+      const headText = fixed.join("")
+      const tailText = tail
+        .slice(tailHead)
         .map((item) => item.text)
         .join("")
+      if (!cut) return headText + tailText
+      return [headText, "... [middle output omitted] ...", tailText].filter(Boolean).join("\n")
+    },
+    snapshot() {
+      return {
+        head: fixed.join(""),
+        tail: tail
+          .slice(tailHead)
+          .map((item) => item.text)
+          .join(""),
+        cut,
+        totalBytes,
+        totalLines,
+      }
     },
   }
+}
+
+function projectChunkWindow(
+  window: ChunkWindow,
+  limits: { maxLines: number; maxBytes: number },
+  marker: string,
+) {
+  const snapshot = window.snapshot()
+  const sample = snapshot.head + snapshot.tail
+  const analysis: ToolOutputProjection.Analysis = {
+    originalLines: snapshot.totalLines,
+    originalBytes: snapshot.totalBytes,
+    overLines: snapshot.totalLines > limits.maxLines,
+    overBytes: snapshot.totalBytes > limits.maxBytes,
+    truncated: snapshot.cut || snapshot.totalLines > limits.maxLines || snapshot.totalBytes > limits.maxBytes,
+  }
+  if (!analysis.truncated) return sample
+  return ToolOutputProjection.project(
+    sample,
+    { ...limits, marker, strategy: "balanced" },
+    analysis,
+  ).content
 }
 
 const resolveWasm = (asset: string) => {
@@ -181,8 +268,8 @@ const loadParserAssets = () =>
     readFile(resolveWasm(bashWasmAsset)),
     readFile(resolveWasm(psWasmAsset)),
   ]).then(
-    ([tree, bash, ps]) => ({ tree, bash, ps } as const),
-    (error) => ({ error } as const),
+    ([tree, bash, ps]) => ({ tree, bash, ps }) as const,
+    (error) => ({ error }) as const,
   )
 
 let parserAssetBytes = loadParserAssets()
@@ -465,34 +552,6 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
   })
 })
 
-function cmd(
-  shell: string,
-  command: string,
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-  stdin: CommandInput | StdinConfig = "ignore",
-  options: { forceKillAfter?: Duration.Input } = {},
-) {
-  if (process.platform === "win32" && Shell.ps(shell)) {
-    const powershellCommand = rewriteBashHeredocsForPowerShell(command)
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand], {
-      cwd,
-      env,
-      stdin,
-      detached: false,
-      ...options,
-    })
-  }
-
-  return ChildProcess.make(command, [], {
-    shell,
-    cwd,
-    env,
-    stdin,
-    detached: process.platform !== "win32",
-    ...options,
-  })
-}
 const parser = lazy(async () => {
   try {
     const { Parser } = await import("web-tree-sitter")
@@ -619,68 +678,18 @@ export const ShellTool = Tool.define(
       let full = ""
       let last = ""
       let file = ""
-      let sink: ReturnType<typeof createWriteStream> | undefined
+      let spill: Truncate.Writer | undefined
       let cut = false
       let expired = false
       let aborted = false
       const startedAt = Date.now()
 
-      const closeSink = Effect.fnUntraced(function* () {
-        const stream = sink
-        if (!stream) return
-        sink = undefined
-        if (stream.destroyed || stream.closed) return
-        yield* Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              let settled = false
-              const done = () => {
-                if (settled) return
-                settled = true
-                stream.off("close", done)
-                stream.off("error", done)
-                stream.off("finish", done)
-                resolve()
-              }
-              stream.once("close", done)
-              stream.once("error", done)
-              stream.once("finish", done)
-              stream.end(done)
-            }),
-        ).pipe(Effect.catch(() => Effect.void))
-        const sidecar = (stream as unknown as Record<string, unknown>).__brSidecar as string | undefined
-        const target = (stream as unknown as Record<string, unknown>).__brTarget as string | undefined
-        if (sidecar && target) {
-          yield* Effect.tryPromise({
-            try: async () => {
-              const fs = await import("node:fs/promises")
-              const zlib = await import("node:zlib")
-              let sidecarData = ""
-              try {
-                sidecarData = await fs.readFile(sidecar, "utf-8")
-              } catch {}
-              if (!sidecarData) {
-                await fs.rm(sidecar, { force: true }).catch(() => {})
-                return
-              }
-              let base = ""
-              try {
-                const brData = await fs.readFile(target)
-                base = (await brotliDecompressAsync(brData as unknown as Buffer)).toString("utf-8")
-              } catch {}
-              const combined = base + sidecarData
-              const compressed = await brotliCompressAsync(Buffer.from(combined, "utf-8"), {
-                params: {
-                  [zlib.constants.BROTLI_PARAM_QUALITY]: 4,
-                  [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
-                },
-              })
-              await fs.writeFile(target, compressed)
-              await fs.rm(sidecar, { force: true }).catch(() => {})
-            },
-            catch: () => undefined,
-          }).pipe(Effect.catch(() => Effect.void))
-        }
+      const closeSpill = Effect.fnUntraced(function* () {
+        const current = spill
+        if (!current) return
+        spill = undefined
+        yield* current.close
+        if (!current.healthy()) file = ""
       })
 
       yield* ctx.metadata({
@@ -702,41 +711,18 @@ export const ShellTool = Tool.define(
         input.command,
         Effect.scoped(
           Effect.gen(function* () {
-            yield* Effect.addFinalizer(closeSink)
-            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+            yield* Effect.addFinalizer(closeSpill)
+            const handle = yield* spawner.spawn(ShellLaunch.command(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              window.push(chunk)
-              if (window.cut) cut = true
+            yield* Effect.forkScoped(
+              Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+                window.push(chunk)
+                if (window.cut) cut = true
 
-              last = preview(last + chunk)
+                last = preview(last + chunk)
 
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        // ToolOutputStore now returns .br (brotli) — streaming append to .br would corrupt it.
-                        // Keep the sink as plain text during the run and compress on close; the final .br is created by ToolOutputStore on first write, subsequent chunks go to a plain sidecar that will be merged and compressed on close.
-                        if (next.endsWith(".br")) {
-                          const plainSidecar = next.slice(0, -3)
-                          // Seed the plain sidecar with the already-compressed content's decompressed form is not needed — the .br already contains `full`. New chunks go to plain sidecar and will be appended and recompressed on close.
-                          sink = createWriteStream(plainSidecar, { flags: "a" })
-                          // Remember the sidecar path for close
-                          ;(sink as unknown as Record<string, unknown>).__brSidecar = plainSidecar
-                          ;(sink as unknown as Record<string, unknown>).__brTarget = next
-                        } else {
-                          sink = createWriteStream(next, { flags: "a" })
-                        }
-                        full = ""
-                      }),
-                    ),
+                if (spill) {
+                  return spill.write(chunk).pipe(
                     Effect.andThen(
                       ctx.metadata({
                         metadata: {
@@ -747,44 +733,66 @@ export const ShellTool = Tool.define(
                       }),
                     ),
                   )
+                } else {
+                  full += chunk
+                  if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                    return trunc.writer(full).pipe(
+                      Effect.andThen((next) =>
+                        Effect.sync(() => {
+                          spill = next
+                          file = next.outputPath ?? ""
+                          cut = true
+                          full = ""
+                        }),
+                      ),
+                      Effect.andThen(
+                        ctx.metadata({
+                          metadata: {
+                            output: last,
+                            timeout: input.timeout,
+                            startedAt,
+                          },
+                        }),
+                      ),
+                    )
+                  }
                 }
-              }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  timeout: input.timeout,
-                  startedAt,
-                },
-              })
-            }),
-          )
+                return ctx.metadata({
+                  metadata: {
+                    output: last,
+                    timeout: input.timeout,
+                    startedAt,
+                  },
+                })
+              }),
+            )
 
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
+            const abort = Effect.callback<void>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.void)
+              const handler = () => resume(Effect.void)
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
 
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+            const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
+            const exit = yield* Effect.raceAll([
+              handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+              timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            ])
 
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
+            if (exit.kind === "abort") {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+            if (exit.kind === "timeout") {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
 
-          return exit.kind === "exit" ? exit.code : null
+            return exit.kind === "exit" ? exit.code : null
           }),
         ),
       ).pipe(Effect.orDie)
@@ -796,19 +804,28 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
-      const raw = window.text()
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut) {
-        file = yield* trunc.write(raw)
+      const snapshot = window.snapshot()
+      if (window.cut || snapshot.totalBytes > limits.maxBytes || snapshot.totalLines > limits.maxLines) cut = true
+      if (!file && (cut || snapshot.totalBytes > limits.maxBytes || snapshot.totalLines > limits.maxLines)) {
+        // This path is only reachable when the retained reservoir detected a
+        // line-bound overflow before the byte-triggered streaming spill. The
+        // reservoir is still complete while cut=false; retain that complete
+        // source before projecting it.
+        if (!snapshot.cut)
+          file = yield* trunc.write(snapshot.head + snapshot.tail).pipe(
+            Effect.catchDefect((defect) =>
+              Effect.logWarning("failed to retain line-truncated shell output; continuing with bounded preview", {
+                defect: String(defect),
+              }).pipe(Effect.as("")),
+            ),
+          )
       }
 
-      let output = end.text
+      const marker = file
+        ? `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). Full output saved to ${file}. Use archive({action:"read", path:"${file}"}) to inspect it. ...`
+        : `... shell output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). ...`
+      let output = projectChunkWindow(window, limits, marker)
       if (!output) output = "(no output)"
-
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
 
       if (meta.length > 0) {
         output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
@@ -828,14 +845,30 @@ export const ShellTool = Tool.define(
       }
     })
 
-    const inject = Effect.fn("ShellTool.injectBackgroundResult")(function* (ctx: Tool.Context, text: string) {
-      const ops = ctx.extra?.promptOps as TaskPromptOps | undefined
+    const inject = Effect.fn("ShellTool.injectBackgroundResult")(function* (
+      ctx: Tool.Context,
+      jobID: string,
+      text: string,
+    ) {
+      const ops = ctx.extra?.promptOps as SessionPromptOps | undefined
       if (!ops) return
+      const workerRootMessageID = ctx.extra?.workerRootMessageID
+      if (typeof workerRootMessageID !== "string" || workerRootMessageID.length === 0) {
+        yield* Effect.logWarning("dropping background shell notification without a launch worker root", {
+          sessionID: ctx.sessionID,
+          jobID,
+        })
+        return
+      }
       yield* ops
         .prompt({
           sessionID: ctx.sessionID,
           agent: ctx.agent,
           parts: [{ type: "text", synthetic: true, text }],
+        }, {
+          source: SessionTurnProvenance.Source.BackgroundShellSummary,
+          sourceMessageID: MessageID.make(workerRootMessageID),
+          ref: jobID,
         })
         .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
     })
@@ -901,9 +934,9 @@ export const ShellTool = Tool.define(
       }
 
       const previewText = Effect.fnUntraced(function* () {
-        const raw = window.text()
-        const end = tail(raw, limits.maxLines, limits.maxBytes)
-        return end.text || "(no output)"
+        const snapshot = window.snapshot()
+        const marker = `... background output truncated (original: ${snapshot.totalLines} lines, ${snapshot.totalBytes} bytes; showing beginning + end). Full log: ${input.logPath}. Use Read with offset/limit to inspect specific sections. ...`
+        return projectChunkWindow(window, limits, marker) || "(no output)"
       })
 
       const code: number | null = yield* Effect.scoped(
@@ -911,14 +944,14 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           sink = createWriteStream(input.logPath, { flags: "a" })
           const handle = yield* spawner.spawn(
-            cmd(
+            ShellLaunch.command(
               input.shell,
               input.command,
               input.cwd,
               input.env,
               { stream: "pipe", endOnDone: false },
               {
-              forceKillAfter: "3 seconds",
+                forceKillAfter: "3 seconds",
               },
             ),
           )
@@ -964,7 +997,7 @@ export const ShellTool = Tool.define(
             timedOut = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
             if (input.notify) {
-              yield* inject(ctx, renderTimeout(meta, yield* previewText()))
+                yield* inject(ctx, input.jobId, renderTimeout(meta, yield* previewText()))
             }
             yield* background.cancel(input.jobId).pipe(Effect.ignore)
           }
@@ -1009,12 +1042,12 @@ export const ShellTool = Tool.define(
       yield* background.wait({ id: input.jobId }).pipe(
         Effect.flatMap((result) => {
           if (result.info?.status === "completed") {
-            return inject(ctx, renderCompleted(meta, result.info.output ?? "", 0))
+            return inject(ctx, input.jobId, renderCompleted(meta, result.info.output ?? "", 0))
           }
           if (result.info?.status === "error") {
             return readLogTail(input.logPath).pipe(
               Effect.flatMap((preview) =>
-                inject(ctx, renderError(meta, result.info?.error ?? "Command failed", preview, null)),
+                inject(ctx, input.jobId, renderError(meta, result.info?.error ?? "Command failed", preview, null)),
               ),
             )
           }
@@ -1030,28 +1063,34 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(shell, process.platform, limits, defaultTimeoutMs)
         yield* Effect.logInfo("shell tool using shell", { shell })
 
-          return {
-            description: prompt.description,
-            parameters: prompt.parameters,
-            execute: (params: Parameters, ctx: Tool.Context) =>
-              Effect.gen(function* () {
-                const instanceCtx = yield* InstanceState.context
-                const cwd = params.workdir
-                  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
-                  : instanceCtx.directory
-                if (params.timeout !== undefined && params.timeout < 0) {
-                  throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
-                }
-                const timeout = params.timeout ?? defaultTimeoutMs
-                const ps = Shell.ps(shell)
-                yield* Effect.scoped(
-                  Effect.gen(function* () {
-                    const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
-                      Effect.sync(() => tree.delete()),
-                    )
+        return {
+          description: prompt.description,
+          parameters: prompt.parameters,
+          execute: (params: Parameters, ctx: Tool.Context) =>
+            Effect.gen(function* () {
+              const instanceCtx = yield* InstanceState.context
+              const cwd = params.workdir
+                ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+                : instanceCtx.directory
+              if (params.timeout !== undefined && params.timeout < 0) {
+                throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
+              }
+              const timeout = params.timeout ?? defaultTimeoutMs
+              const ps = Shell.ps(shell)
+              // Validate the exact execution contract before asking for
+              // permission. This prevents an unsupported compatibility form
+              // (notably an expanding Bash heredoc on PowerShell) from prompting
+              // the user for a command that the launcher will deterministically
+              // refuse. Permission patterns still describe the source command.
+              ShellLaunch.plan(shell, params.command)
+              yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
+                    Effect.sync(() => tree.delete()),
+                  )
                   const safetyKind = ps ? "powershell" : ShellID.toKind(name) === "cmd" ? "cmd" : "bash"
                   for (const node of commands(tree.rootNode)) {
                     const reason = catastrophicDeleteReason(
@@ -1060,75 +1099,80 @@ export const ShellTool = Tool.define(
                     )
                     if (reason) throw new Error(reason)
                   }
-                    const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
-                    if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
-                    yield* ask(ctx, scan, params)
-                  }),
-                )
+                  const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
+                  if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                  yield* ask(ctx, scan, params)
+                }),
+              )
 
-                const env = yield* shellEnv(ctx, cwd)
+              const env = yield* shellEnv(ctx, cwd)
+              // shell.env is the authoritative child environment. cmd.exe can
+              // silently treat an inherited >8191-character value as empty when
+              // authored source expands %NAME%; refuse that transport before
+              // creating a background job or spawning the foreground process.
+              Shell.validateInvocationEnvironment(shell, params.command, env)
 
-                if (params.background === true) {
-                  const jobId = params.id ?? Identifier.ascending("job")
-                  if (params.id) {
-                    if (!/^[A-Za-z0-9_-]+$/.test(params.id)) {
-                      throw new Error(
-                        `Invalid job id: ${params.id}. Must match ^[A-Za-z0-9_-]+$ (letters, digits, _ and -).`,
-                      )
-                    }
-                    const registered = yield* background.get(params.id)
-                    if (registered) {
-                      throw new Error(`job id "${params.id}" is already in use`)
-                    }
-                    const logExists = yield* fs.existsSafe(jobLogPath(params.id))
-                    const metaExists = yield* fs.existsSafe(jobMetaPath(params.id))
+              if (params.background === true) {
+                const jobId = params.id ?? Identifier.ascending("job")
+                if (params.id) {
+                  if (!/^[A-Za-z0-9_-]+$/.test(params.id)) {
+                    throw new Error(
+                      `Invalid job id: ${params.id}. Must match ^[A-Za-z0-9_-]+$ (letters, digits, _ and -).`,
+                    )
+                  }
+                  const registered = yield* background.get(params.id)
+                  if (registered) {
+                    throw new Error(`job id "${params.id}" is already in use`)
+                  }
+                  const logExists = yield* fs.existsSafe(jobLogPath(params.id))
+                  const metaExists = yield* fs.existsSafe(jobMetaPath(params.id))
                   const legacyLogExists = yield* fs.existsSafe(jobLogPathLegacy(params.id))
                   const legacyMetaExists = yield* fs.existsSafe(jobMetaPathLegacy(params.id))
                   if (logExists || metaExists || legacyLogExists || legacyMetaExists) {
-                      throw new Error(
-                        `job id "${params.id}" is already in use (a stale log exists on disk; pick a new id)`,
-                      )
-                    }
+                    throw new Error(
+                      `job id "${params.id}" is already in use (a stale log exists on disk; pick a new id)`,
+                    )
                   }
+                }
 
-                  const logPath = jobLogPath(jobId)
-                  const metaPath = jobMetaPath(jobId)
-                  const wantsNotify = params.notify ?? true
-                  const timeoutMs = params.timeout
-                  const startedAt = Date.now()
-                  const metadata: Record<string, unknown> = {
-                    background: true,
-                    jobId,
-                    logPath,
-                    notify: wantsNotify,
-                    kind: "shell",
+                const logPath = jobLogPath(jobId)
+                const metaPath = jobMetaPath(jobId)
+                const wantsNotify = params.notify ?? true
+                const timeoutMs = params.timeout
+                const startedAt = Date.now()
+                const metadata: Record<string, unknown> = {
+                  background: true,
+                  jobId,
+                  logPath,
+                  notify: wantsNotify,
+                  kind: "shell",
                   delivery: wantsNotify ? { mode: "completion", ownerSessionID: ctx.sessionID } : { mode: "none" },
-                    startedAt,
-                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-                  }
+                  startedAt,
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                }
 
                 yield* fs.ensureDir(path.dirname(logPath))
-                  yield* fs.writeFileString(logPath, "")
-                  const shellMetaDelivery = wantsNotify
-                    ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
-                    : { mode: "none" as const }
-                  yield* fs.writeJson(metaPath, {
-                    id: jobId,
-                    command: params.command,
-                    shell,
-                    cwd,
-                    startedAt,
-                    notify: wantsNotify,
-                    kind: "shell",
-                    delivery: shellMetaDelivery,
-                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-                  })
+                yield* fs.writeFileString(logPath, "")
+                const shellMetaDelivery = wantsNotify
+                  ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
+                  : { mode: "none" as const }
+                yield* fs.writeJson(metaPath, {
+                  id: jobId,
+                  command: params.command,
+                  shell,
+                  cwd,
+                  startedAt,
+                  notify: wantsNotify,
+                  kind: "shell",
+                  delivery: shellMetaDelivery,
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                })
 
-                  yield* background.start({
-                    id: jobId,
-                    type: "shell",
-                    title: params.command,
-                    metadata,
+                yield* background.start({
+                  id: jobId,
+                  type: "shell",
+                  title: params.command,
+                  metadata,
                   run: snapshot.withMutation(
                     withBackgroundProcessSlot(
                       runBackground(
@@ -1148,33 +1192,33 @@ export const ShellTool = Tool.define(
                     ),
                     "tool:shell:background",
                   ),
-                  })
-                  // The run effect (forked by start) registers the handle in
-                  // ShellJobs; wait briefly so the manager tool's kill/send can
-                  // resolve the handle without racing the launch. If the process
-                  // dies before registration (spawn failure), settle quickly.
-                  yield* pollUntilRegistered(jobId)
-                  if (wantsNotify) yield* notify({ jobId, command: params.command, logPath, notify: wantsNotify }, ctx)
+                })
+                // The run effect (forked by start) registers the handle in
+                // ShellJobs; wait briefly so the manager tool's kill/send can
+                // resolve the handle without racing the launch. If the process
+                // dies before registration (spawn failure), settle quickly.
+                yield* pollUntilRegistered(jobId)
+                if (wantsNotify) yield* notify({ jobId, command: params.command, logPath, notify: wantsNotify }, ctx)
 
-                  return {
-                    title: params.command,
-                    metadata,
-                    output: renderRunning({ jobId, command: params.command, logPath, notify: wantsNotify, timeoutMs }),
-                  }
+                return {
+                  title: params.command,
+                  metadata,
+                  output: renderRunning({ jobId, command: params.command, logPath, notify: wantsNotify, timeoutMs }),
                 }
+              }
 
-                return yield* run(
-                  {
-                    shell,
-                    command: params.command,
-                    cwd,
-                    env,
-                    timeout,
-                  },
-                  ctx,
-                )
-              }).pipe(Effect.orDie),
-          }
-        })
+              return yield* run(
+                {
+                  shell,
+                  command: params.command,
+                  cwd,
+                  env,
+                  timeout,
+                },
+                ctx,
+              )
+            }).pipe(Effect.orDie),
+        }
+      })
   }),
 )

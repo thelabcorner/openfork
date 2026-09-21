@@ -21,7 +21,7 @@ import { assertSpansExplain } from "../../src/tool/edit/invariant"
 import { resolveMatch, resolveReplacement } from "../../src/tool/edit/match"
 import { absorbDeletionNewline, healInput, stripCodeFence, stripReadPrefix } from "../../src/tool/edit/heal"
 import { enforce as enforcePriorRead, globalReadCache, ReadCache } from "../../src/tool/edit/prior-read"
-import { withRollback } from "../../src/tool/patch/rollback"
+import { RollbackConflictError, withRollback } from "../../src/tool/patch/rollback"
 import { applyTextEdits } from "../../src/tool/refactor"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { LSP } from "@/lsp/lsp"
@@ -421,14 +421,21 @@ describe("patch rollback (pure)", () => {
   test("withRollback restores the journal in reverse on failure", async () => {
     const writes: Array<[string, string]> = []
     const removed: string[] = []
+    const current = new Map<string, Uint8Array>([
+      ["/a.txt", new TextEncoder().encode("new-a")],
+      ["/b.txt", new TextEncoder().encode("new-b")],
+    ])
     const stub = {
+      readFile: (p: string) => Effect.succeed(current.get(p)!),
       writeWithDirs: (p: string, c: string) =>
         Effect.sync(() => {
           writes.push([p, c])
+          current.set(p, new TextEncoder().encode(c))
         }),
       remove: (p: string) =>
         Effect.sync(() => {
           removed.push(p)
+          current.delete(p)
         }),
     } as never
     const error = await Effect.runPromise(
@@ -436,8 +443,24 @@ describe("patch rollback (pure)", () => {
         withRollback(
           stub,
           [
-            { filePath: "/a.txt", existedBefore: true, contentBefore: "old-a", bom: false },
-            { filePath: "/b.txt", existedBefore: false, contentBefore: "", bom: false },
+            {
+              filePath: "/a.txt",
+              existedBefore: true,
+              contentBefore: "old-a",
+              bom: false,
+              committed: true,
+              expectedExists: true,
+              expectedContent: new TextEncoder().encode("new-a"),
+            },
+            {
+              filePath: "/b.txt",
+              existedBefore: false,
+              contentBefore: "",
+              bom: false,
+              committed: true,
+              expectedExists: true,
+              expectedContent: new TextEncoder().encode("new-b"),
+            },
           ],
           Effect.fail(new Error("boom")),
         ),
@@ -448,8 +471,46 @@ describe("patch rollback (pure)", () => {
     expect(writes).toEqual([["/a.txt", "old-a"]])
   })
 
+  test("withRollback never overwrites a newer external edit", async () => {
+    const current = new Map<string, Uint8Array>([
+      ["/a.txt", new TextEncoder().encode("external-newer")],
+    ])
+    const writes: string[] = []
+    const stub = {
+      readFile: (p: string) => Effect.succeed(current.get(p)!),
+      writeWithDirs: (p: string, c: string) =>
+        Effect.sync(() => {
+          writes.push(c)
+          current.set(p, new TextEncoder().encode(c))
+        }),
+      remove: () => Effect.void,
+    } as never
+    const error = await Effect.runPromise(
+      Effect.flip(
+        withRollback(
+          stub,
+          [{
+            filePath: "/a.txt",
+            existedBefore: true,
+            contentBefore: "before",
+            bom: false,
+            committed: true,
+            expectedExists: true,
+            expectedContent: new TextEncoder().encode("patch-write"),
+          }],
+          Effect.fail(new Error("later file failed")),
+        ),
+      ),
+    )
+    expect(error).toBeInstanceOf(RollbackConflictError)
+    expect((error as RollbackConflictError).paths).toEqual(["/a.txt"])
+    expect(writes).toEqual([])
+    expect(new TextDecoder().decode(current.get("/a.txt"))).toBe("external-newer")
+  })
+
   test("withRollback passes success through untouched", async () => {
     const stub = {
+      readFile: () => Effect.succeed(new Uint8Array()),
       writeWithDirs: () => Effect.void,
       remove: () => Effect.void,
     } as never

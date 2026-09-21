@@ -4,6 +4,7 @@ import { SessionIngress, type SessionIngressEvent } from "@/session/ingress"
 import { BackgroundJob } from "@/background/job"
 import { ShellJobs } from "@/background/shell-jobs"
 import { Effect, Fiber, Layer, Context, SynchronizedRef, Scope } from "effect"
+import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 
 let eventCounter = 0
 function fastEventId(): string {
@@ -52,14 +53,14 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/MonitorDelivery") {}
 
-function truncateLine(line: string): { text: string; truncated: boolean } {
+const LINE_TRUNCATION_MARKER = "…[truncated]"
+const LINE_TRUNCATION_MARKER_BYTES = Buffer.byteLength(LINE_TRUNCATION_MARKER, "utf-8")
+
+export function truncateMonitorLine(line: string): { text: string; truncated: boolean } {
   const bytes = Buffer.byteLength(line, "utf-8")
   if (bytes <= MAX_LINE_BYTES) return { text: line, truncated: false }
-  // truncate to MAX_LINE_BYTES preserving utf-8 boundaries
-  const buf = Buffer.from(line, "utf-8")
-  let end = MAX_LINE_BYTES - 20 // reserve for marker
-  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--
-  const truncated = buf.subarray(0, end).toString("utf-8") + "…[truncated]"
+  const prefix = ToolOutputProjection.takePrefixBytes(line, MAX_LINE_BYTES - LINE_TRUNCATION_MARKER_BYTES)
+  const truncated = prefix + LINE_TRUNCATION_MARKER
   return { text: truncated, truncated: true }
 }
 
@@ -74,7 +75,7 @@ function frameLines(partial: string, chunk: string): { lines: string[]; remainin
     if (trimmed.length === 0) continue
     // Check NUL-heavy binary: if contains NUL or >30% non-printable
     if (trimmed.includes("\0")) continue
-    const { text } = truncateLine(trimmed)
+    const { text } = truncateMonitorLine(trimmed)
     lines.push(text)
   }
   return { lines, remaining }
@@ -255,7 +256,7 @@ const layer = Layer.effect(
       if (state.partial.trim().length > 0) {
         const trimmed = state.partial.trimEnd()
         if (trimmed.length > 0 && !trimmed.includes("\0")) {
-          const { text } = truncateLine(trimmed)
+          const { text } = truncateMonitorLine(trimmed)
           state.pendingLines.push(text)
           state.pendingBytes += Buffer.byteLength(text, "utf-8")
         }

@@ -1,5 +1,4 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Shell } from "@opencode-ai/core/shell"
 import { Identifier } from "@/id/id"
 import { BackgroundJob } from "@/background/job"
 import {
@@ -16,17 +15,23 @@ import { MonitorDelivery } from "@/background/monitor-delivery"
 import { TRUNCATION_DIR } from "@/tool/truncation-dir"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { Effect, Layer, Context, Stream, Scope } from "effect"
 import { createWriteStream } from "node:fs"
 import path from "node:path"
 import * as Truncate from "@/tool/truncate"
-import type { SessionID } from "@/session/schema"
-import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
+import { MessageID, type SessionID } from "@/session/schema"
+import { ShellLaunch } from "@/tool/shell/launch"
 import { Snapshot } from "@/snapshot"
+import type { SessionPromptOps } from "@/session/prompt-contract"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 const previewBound = (text: string, max = 30_000) => (text.length <= max ? text : "...\n\n" + text.slice(-max))
+
+export type ShellJobOutputStream = "stdout" | "stderr"
+
+/** Monitor wake payloads are observations, not diagnostics. */
+export const shouldPublishMonitorStream = (stream: ShellJobOutputStream) => stream === "stdout"
 
 function tail(text: string, maxLines: number, maxBytes: number) {
   const lines = text.split("\n")
@@ -55,34 +60,6 @@ function escapeXML(text: string) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
-function cmd(
-  shell: string,
-  command: string,
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-  stdin: any = "ignore",
-  options: any = {},
-) {
-  if (process.platform === "win32" && Shell.ps(shell)) {
-    const powershellCommand = rewriteBashHeredocsForPowerShell(command)
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand], {
-      cwd,
-      env,
-      stdin,
-      detached: false,
-      ...options,
-    })
-  }
-  return ChildProcess.make(command, [], {
-    shell,
-    cwd,
-    env,
-    stdin,
-    detached: process.platform !== "win32",
-    ...options,
-  })
-}
-
 export type LaunchInput = {
   id?: string
   command: string
@@ -104,8 +81,8 @@ export type LaunchResult = {
 export interface Interface {
   readonly launch: (
     input: LaunchInput,
-    ctx: { sessionID: SessionID; callID: string; extra?: any; abort?: AbortSignal },
-  ) => Effect.Effect<LaunchResult, Error, unknown>
+    ctx: { sessionID: SessionID; callID?: string; agent?: string; extra?: unknown; abort?: AbortSignal },
+  ) => Effect.Effect<LaunchResult, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ShellJobService") {}
@@ -147,20 +124,6 @@ const layer = Layer.effect(
         yield* Effect.sleep("10 millis")
         waited += 10
       }
-    })
-
-    const injectCompletion = Effect.fn("ShellJob.injectCompletion")(function* (
-      jobId: string,
-      command: string,
-      logPath: string,
-      ctx: any,
-    ) {
-      const ops = ctx.extra?.promptOps
-      if (!ops) return
-      const limits = yield* trunc.limits()
-      const info = yield* background.wait({ id: jobId }).pipe(Effect.flatMap((result) => Effect.succeed(result.info)))
-      // This is old logic for completion delivery; but now we handle via ingress? Keep for shell completion mode
-      // For V1 we keep synthetic injection for shell completion, monitor uses ingress
     })
 
     const launch: Interface["launch"] = Effect.fn("ShellJob.launch")(function* (input, ctx) {
@@ -260,7 +223,7 @@ const layer = Layer.effect(
             yield* Effect.addFinalizer(closeSink)
             sink = createWriteStream(logPath, { flags: "a" })
             const handle = yield* spawner.spawn(
-              cmd(
+              ShellLaunch.command(
                 input.shell,
                 input.command,
                 input.cwd,
@@ -288,33 +251,43 @@ const layer = Layer.effect(
             })
             yield* Effect.addFinalizer(() => jobs.remove(jobId).pipe(Effect.ignore))
 
-            // pump output: fanout to log/preview and optionally monitor delivery
-            yield* Effect.forkScoped(
-              Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-                const size = Buffer.byteLength(chunk, "utf-8")
-                list.push({ text: chunk, size })
-                used += size
-                while (used > keep && list.length > 1) {
-                  const item = list.shift()
-                  if (!item) break
-                  used -= item.size
-                }
-                last = previewBound(last + chunk)
-                sink?.write(chunk)
-                // If monitor, also feed delivery (only stdout events per spec, but we fanout all for V1 — stderr is still diagnostic but we treat as events? Keep spec: stdout only.
-                // handle.all includes both; to respect spec we should check if chunk came from stdout vs stderr, but Stream.decodeText(handle.all) is merged.
-                // For V1 we treat all as potential events, but monitor delivery will frame lines and ignore empty; stderr noise will still be events if not filtered.
-                // To be spec-compliant, we should use handle.stdout if available. We'll feed all for now and document diagnostic separation via log read.
-                if (delivery.mode === "events") {
-                  return monitor.ingest(jobId, chunk)
-                }
-                return Effect.void
-              }),
-            )
+            const recordChunk = (chunk: string) => {
+              const size = Buffer.byteLength(chunk, "utf-8")
+              list.push({ text: chunk, size })
+              used += size
+              while (used > keep && list.length > 1) {
+                const item = list.shift()
+                if (!item) break
+                used -= item.size
+              }
+              last = previewBound(last + chunk)
+              sink?.write(chunk)
+            }
 
-            // Also, if monitor, we could optionally fork a separate stdout-only stream if handle.stdout exists
-            // Try to consume stdout separately for stricter spec compliance (but handle.all already captures)
-            // No additional handling needed.
+            if (delivery.mode === "events") {
+              // Monitor wake semantics are stdout-only by contract. Keep stderr
+              // in the diagnostic log/preview, but never publish it as an
+              // external observation that can wake the model.
+              yield* Effect.forkScoped(
+                Stream.runForEach(Stream.decodeText(handle.stdout), (chunk) => {
+                  recordChunk(chunk)
+                  return shouldPublishMonitorStream("stdout") ? monitor.ingest(jobId, chunk) : Effect.void
+                }),
+              )
+              yield* Effect.forkScoped(
+                Stream.runForEach(Stream.decodeText(handle.stderr), (chunk) => {
+                  recordChunk(chunk)
+                  return shouldPublishMonitorStream("stderr") ? monitor.ingest(jobId, chunk) : Effect.void
+                }),
+              )
+            } else {
+              yield* Effect.forkScoped(
+                Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+                  recordChunk(chunk)
+                  return Effect.void
+                }),
+              )
+            }
 
             const exit = yield* timeoutMs !== undefined
               ? Effect.raceAll([
@@ -364,7 +337,7 @@ const layer = Layer.effect(
 
       // For completion delivery, schedule notify wake (existing behavior)
       if (delivery.mode === "completion") {
-        const ops = ctx.extra?.promptOps
+        const ops = (ctx.extra as { promptOps?: SessionPromptOps } | undefined)?.promptOps
         if (ops) {
           // fire-and-forget background waiter that injects completion result
           yield* Effect.gen(function* () {
@@ -400,12 +373,24 @@ const layer = Layer.effect(
               injection = undefined
             }
             if (injection) {
+              const workerRootMessageID = (ctx.extra as { workerRootMessageID?: unknown } | undefined)?.workerRootMessageID
+              if (typeof workerRootMessageID !== "string" || workerRootMessageID.length === 0) {
+                yield* Effect.logWarning("dropping background shell-job notification without a launch worker root", {
+                  sessionID: ctx.sessionID,
+                  jobID: jobId,
+                })
+                return
+              }
               yield* ops
                 .prompt({
-                  sessionID: ctx.sessionID as any,
-                  agent: (ctx as any).agent ?? "build",
+                  sessionID: ctx.sessionID,
+                  agent: ctx.agent ?? "build",
                   parts: [{ type: "text", synthetic: true, text: injection }],
-                } as any)
+                }, {
+                  source: SessionTurnProvenance.Source.BackgroundShellSummary,
+                  sourceMessageID: MessageID.make(workerRootMessageID),
+                  ref: jobId,
+                })
                 .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
             }
           }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)

@@ -21,6 +21,7 @@ const pluginLayer = Layer.succeed(
     init: () => Effect.void,
     list: () => Effect.succeed([]),
     trigger: ((_name: unknown, _input: unknown, output: unknown) => Effect.succeed(output)) as Plugin.Interface["trigger"],
+    transformChatMessages: (messages) => Effect.succeed(messages),
   }),
 )
 
@@ -59,6 +60,19 @@ describe("tool.find", () => {
     }),
   )
 
+  it.instance("ignores empty default fields on glob searches", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
+      const info = yield* FindTool
+      const find = yield* info.init()
+      const result = yield* find.execute({ glob: "*.ts", grep: "", path: test.directory, include: "" }, ctx)
+
+      expect(result.metadata.action).toBe("glob")
+      expect(result.output).toContain(path.join(test.directory, "a.ts"))
+    }),
+  )
+
   it.instance("routes grep searches and supports exact file paths", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -75,6 +89,25 @@ describe("tool.find", () => {
       expect(result.metadata.matches).toBe(1)
       expect(result.output).toContain(file)
       expect(result.output).not.toContain(sibling)
+    }),
+  )
+
+  it.instance("uses grep when a stray glob default accompanies a grep-only include", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "target.md"), "needle\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "other.ts"), "needle\n"))
+      const info = yield* FindTool
+      const find = yield* info.init()
+      const result = yield* find.execute(
+        { glob: "*.md", grep: "needle", path: test.directory, include: "*.md" },
+        ctx,
+      )
+
+      expect(result.metadata.action).toBe("grep")
+      expect(result.metadata.delegatedTool).toBe("grep")
+      expect(result.output).toContain(path.join(test.directory, "target.md"))
+      expect(result.output).not.toContain(path.join(test.directory, "other.ts"))
     }),
   )
 

@@ -170,4 +170,18 @@ describe("user child environment", () => {
       ELECTRON_RUN_AS_NODE: "1",
     })
   })
+
+  test("Windows shell environment overrides are case-insensitive and explicit casing wins", () => {
+    if (process.platform !== "win32") return
+    expect(userChildEnvironment({ OPENFORK_ENV_CASE: "base" }, { openfork_env_case: "override" })).toEqual({
+      openfork_env_case: "override",
+    })
+  })
+
+  test("Windows shell environment hook can opt into run-as-node with different casing", () => {
+    if (process.platform !== "win32") return
+    expect(userChildEnvironment({ ELECTRON_RUN_AS_NODE: "host" }, { electron_run_as_node: "plugin" })).toEqual({
+      electron_run_as_node: "plugin",
+    })
+  })
 })

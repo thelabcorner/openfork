@@ -23,6 +23,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
 import { BackgroundJob } from "@/background/job"
 import { ShellJobs } from "@/background/shell-jobs"
+import { Snapshot } from "@/snapshot"
+import { brotliDecompressSync } from "node:zlib"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -36,6 +38,7 @@ const shellLayer = Layer.mergeAll(
       RuntimeFlags.node,
       BackgroundJob.node,
       ShellJobs.node,
+      Snapshot.node,
     ]),
   ),
   testInstanceStoreLayer,
@@ -198,6 +201,76 @@ describe("tool.shell", () => {
     ),
   )
 
+  each("inherits the owned Git EOL policy while preserving explicit git -c precedence", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const resolved = yield* run({ command: "git config --get core.autocrlf" })
+        expect(resolved.metadata.exit).toBe(0)
+        expect(resolved.output.trim()).toBe("false")
+
+        const override = yield* run({ command: "git -c core.autocrlf=true config --get core.autocrlf" })
+        expect(override.metadata.exit).toBe(0)
+        expect(override.output.trim()).toBe("true")
+      }),
+    ),
+  )
+
+  each("handles intentional multiline shell programs without silent partial execution", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const label = sh()
+        const command = label === "powershell" || label === "pwsh"
+          ? "Write-Output 'line-one'\nWrite-Output 'line-two'"
+          : label === "cmd"
+            ? "echo line-one\necho line-two"
+            : "printf 'line-one\\n'\nprintf 'line-two\\n'"
+        if (label === "cmd") {
+          const error = yield* fail({ command })
+          expect(error.message).toContain("Cannot execute a multiline cmd.exe program")
+          return
+        }
+        const result = yield* run({ command })
+        expect(result.metadata.exit).toBe(0)
+        expect(result.output).toContain("line-one")
+        expect(result.output).toContain("line-two")
+      }),
+    ),
+  )
+
+  if (cmdShell) {
+    it.live("rejects cmd expansion of an inherited environment value beyond cmd's limit", () =>
+      withShell(
+        cmdShell,
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const key = "OPENFORK_CMD_ENV_LIMIT_INTEGRATION"
+            const previous = process.env[key]
+            process.env[key] = "x".repeat(Shell.CMD_INHERITED_ENV_LIMIT + 1)
+            return { key, previous }
+          }),
+          ({ key }) =>
+            runIn(
+              projectRoot,
+              Effect.gen(function* () {
+                const error = yield* fail({
+                  command: `if "%${key}%"=="" (echo SILENT-WRONG-BRANCH) else (echo expected)`,
+                })
+                expect(error.message).toContain("Cannot execute this cmd.exe script faithfully")
+                expect(error.message).toContain(key)
+              }),
+            ),
+          ({ key, previous }) =>
+            Effect.sync(() => {
+              if (previous === undefined) delete process.env[key]
+              else process.env[key] = previous
+            }),
+        ),
+      ),
+    )
+  }
+
   it.live("falls back from terminal-only configured shell", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped({ config: { shell: "fish" } })
@@ -208,6 +281,8 @@ describe("tool.shell", () => {
           const fallback = Shell.name(Shell.acceptable("fish"))
           expect(fallback).not.toBe("fish")
           expect(bash.description).toContain(fallback)
+          expect(bash.description).toContain("shell SCRIPT STRING, not an argv array")
+          expect(bash.description).toContain("Every tool call starts a fresh shell process")
 
           const result = yield* bash.execute(
             {
@@ -220,6 +295,298 @@ describe("tool.shell", () => {
         }),
       )
     }),
+  )
+
+  for (const item of ps) {
+    it.live(`rejects expanding Bash heredocs before requesting permission [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const error = yield* fail(
+              { command: "python - <<PY\nprint('$HOME')\nPY" },
+              capture(requests),
+            )
+            expect(error.message).toContain("Cannot execute an unquoted Bash heredoc")
+            expect(requests).toHaveLength(0)
+          }),
+        ),
+      ),
+    )
+  }
+
+  for (const item of ps) {
+    it.live(`rejects quoted Bash heredocs rather than newline-normalizing LF bytes [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const body = "alpha\nβeta ☃\n"
+            const command = `${bin} test/fixture/shell-stdin-sentinel.ts - <<'EOF'\n${body}EOF`
+            const error = yield* fail({ command }, capture(requests))
+            expect(error.message).toContain("Cannot safely translate a quoted Bash heredoc through PowerShell")
+            expect(requests).toHaveLength(0)
+          }),
+        ),
+      ),
+    )
+  }
+
+  for (const item of ps) {
+    it.live(`rejects quoted Bash heredocs even when authored with CRLF [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const body = "alpha\r\nβeta ☃\r\n$HOME\r\n"
+            const command = `${bin} test/fixture/shell-stdin-sentinel.ts - <<'EOF'\r\n${body}EOF\r\n`
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const error = yield* fail({ command }, capture(requests))
+            expect(error.message).toContain("Cannot safely translate a quoted Bash heredoc through PowerShell")
+            expect(requests).toHaveLength(0)
+          }),
+        ),
+      ),
+    )
+  }
+
+  for (const item of ps) {
+    it.live(`transports oversized Windows PowerShell source without exposing transport environment [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const command = [
+              `#${"x".repeat(Shell.POWERSHELL_INLINE_SCRIPT_LIMIT + 5_000)}`,
+              "Write-Output 'large-powershell-ok'",
+              `Write-Output ([bool](Get-ChildItem Env:${Shell.POWERSHELL_SCRIPT_SOURCE_ENV_PREFIX}* -ErrorAction SilentlyContinue))`,
+            ].join("\n")
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output.trim().replaceAll("\r\n", "\n")).toBe("large-powershell-ok\nFalse")
+          }),
+        ),
+      ),
+    )
+
+    it.live(`rejects NUL PowerShell source before requesting permission [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const error = yield* fail({ command: "Write-Output before\0after" }, capture(requests))
+            expect(error.message).toContain("NUL bytes")
+            expect(requests).toHaveLength(0)
+          }),
+        ),
+      ),
+    )
+  }
+
+  for (const item of shells) {
+    it.live(`preserves quote-sensitive native argv with the shell-specific safe form [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const command =
+              item.label === "powershell"
+                ? `& ${bin} --% test/fixture/shell-argv-sentinel.ts "a b" "say \\"hi\\"" "C:\\path\\tail\\\\" "$HOME" "snowman-☃" "" "semi;pipe|amp&redir>" "percent%literal%" "caret^bang!"`
+                : item.label === "pwsh"
+                  ? `& ${bin} 'test/fixture/shell-argv-sentinel.ts' 'a b' 'say "hi"' 'C:\\path\\tail\\' '$HOME' '雪☃' '' 'semi;pipe|amp&redir>' 'percent%literal%' 'caret^bang!'`
+                  : item.label === "cmd"
+                    ? `node test/fixture/shell-argv-sentinel.ts "a b" "say \\"hi\\"" C:\\path\\tail\\ "$HOME" "snowman-☃" "" "semi;pipe|amp&redir>" "percent-literal" "caret^bang!"`
+                    : `${bin} 'test/fixture/shell-argv-sentinel.ts' 'a b' 'say "hi"' 'C:\\path\\tail\\' '$HOME' '雪☃' '' 'semi;pipe|amp&redir>' 'percent%literal%' 'caret^bang!'`
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(JSON.parse(result.output.trim())).toEqual([
+              "a b",
+              'say "hi"',
+              "C:\\path\\tail\\",
+              "$HOME",
+              item.label === "powershell" || item.label === "cmd" ? "snowman-☃" : "雪☃",
+              "",
+              "semi;pipe|amp&redir>",
+              item.label === "cmd" ? "percent-literal" : "percent%literal%",
+              "caret^bang!",
+            ])
+          }),
+        ),
+      ),
+    )
+  }
+
+  for (const item of ps) {
+    it.live(`preserves quote-sensitive native argv through large PowerShell environment transport [${item.label}]`, () =>
+      withShell(
+        item,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const native =
+              item.label === "powershell"
+                ? `& ${bin} --% test/fixture/shell-argv-sentinel.ts "a b" "say \\"hi\\"" "C:\\path\\tail\\\\" "$HOME" "snowman-☃" "" "semi;pipe|amp&redir>" "percent%literal%" "caret^bang!"`
+                : `& ${bin} 'test/fixture/shell-argv-sentinel.ts' 'a b' 'say "hi"' 'C:\\path\\tail\\' '$HOME' '雪☃' '' 'semi;pipe|amp&redir>' 'percent%literal%' 'caret^bang!'`
+            const command = `#${"x".repeat(Shell.POWERSHELL_INLINE_SCRIPT_LIMIT + 5_000)}\n${native}`
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(JSON.parse(result.output.trim())).toEqual([
+              "a b",
+              'say "hi"',
+              "C:\\path\\tail\\",
+              "$HOME",
+              item.label === "powershell" ? "snowman-☃" : "雪☃",
+              "",
+              "semi;pipe|amp&redir>",
+              "percent%literal%",
+              "caret^bang!",
+            ])
+          }),
+        ),
+      ),
+    )
+  }
+
+  const gitBash = shells.find((item) => item.label === "bash")
+  if (process.platform === "win32" && gitBash) {
+    it.live("Git Bash preserves literal Windows-path data while accepting forward-slash path operands", () =>
+      withShell(
+        gitBash,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const literal = "C:\\Users\\Name\\Folder With Space\\tail\\"
+            const argv = yield* run({
+              command: `${bin} 'test/fixture/shell-argv-sentinel.ts' '${literal}' 'C:/Users/Name/Folder With Space/tail'`,
+            })
+            expect(argv.metadata.exit).toBe(0)
+            expect(JSON.parse(argv.output.trim())).toEqual([
+              literal,
+              "C:/Users/Name/Folder With Space/tail",
+            ])
+
+            const msys = yield* run({ command: "test -d /c/Windows && printf 'msys-ok'" })
+            expect(msys.metadata.exit).toBe(0)
+            expect(msys.output.trim()).toBe("msys-ok")
+          }),
+        ),
+      ),
+    )
+
+    it.live("Git Bash preserves quoted-heredoc bytes with quotes, dollars, and doubled backslashes", () =>
+      withShell(
+        gitBash,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const body = "alpha \'single\' `backtick` $HOME a\\\\b\nβeta ☃\n"
+            const command = `${bin} test/fixture/shell-stdin-sentinel.ts - <<'EOF'\n${body}EOF`
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output.trim()).toBe(Buffer.from(body, "utf8").toString("hex"))
+          }),
+        ),
+      ),
+    )
+
+
+    it.live("Git Bash transports command strings beyond the old ~8 KiB argv boundary without corruption", () =>
+      withShell(
+        gitBash,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const size = 10_000
+            const command = `X=${"x".repeat(size)}; printf '%s' "\${#X}"`
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output.trim()).toBe(String(size))
+          }),
+        ),
+      ),
+    )
+
+    it.live("Git Bash environment transport preserves path-looking source and restores transport environment", () =>
+      withShell(
+        gitBash,
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const before = process.env.MSYS2_ENV_CONV_EXCL
+            process.env.MSYS2_ENV_CONV_EXCL = "KEEP_ME"
+            return before
+          }),
+          () =>
+            runIn(
+              projectRoot,
+              Effect.gen(function* () {
+                const sourceRef = `\${${Shell.MSYS_SCRIPT_SOURCE_ENV}-unset}`
+                const result = yield* run({
+                  command: `printf '%s|%s|%s' "${sourceRef}" "\${MSYS2_ENV_CONV_EXCL-unset}" '/foo:/bar'`,
+                })
+                expect(result.metadata.exit).toBe(0)
+                expect(result.output.trim()).toBe("unset|KEEP_ME|/foo:/bar")
+              }),
+            ),
+          (before) =>
+            Effect.sync(() => {
+              if (before === undefined) delete process.env.MSYS2_ENV_CONV_EXCL
+              else process.env.MSYS2_ENV_CONV_EXCL = before
+            }),
+        ),
+      ),
+    )
+
+    it.live("Git Bash environment transport remains correct well above the old argv boundary", () =>
+      withShell(
+        gitBash,
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const size = 25_000
+            const command = `X=${"x".repeat(size)}; printf '%s' "\${#X}"`
+            const result = yield* run({ command })
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output.trim()).toBe(String(size))
+          }),
+        ),
+      ),
+    )
+  }
+
+  each("starts every invocation from fresh shell process state", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const label = sh()
+        const set =
+          label === "powershell" || label === "pwsh"
+            ? "$env:OPENFORK_SHELL_STATE='leaked'"
+            : label === "cmd"
+              ? "set OPENFORK_SHELL_STATE=leaked"
+              : "export OPENFORK_SHELL_STATE=leaked"
+        const read =
+          label === "powershell" || label === "pwsh"
+            ? "if ($env:OPENFORK_SHELL_STATE) { Write-Output $env:OPENFORK_SHELL_STATE } else { Write-Output clean }"
+            : label === "cmd"
+              ? 'if defined OPENFORK_SHELL_STATE (echo %OPENFORK_SHELL_STATE%) else (echo clean)'
+              : 'printf "%s\\n" "${OPENFORK_SHELL_STATE:-clean}"'
+
+        const first = yield* run({ command: set })
+        expect(first.metadata.exit).toBe(0)
+        const second = yield* run({ command: read })
+        expect(second.metadata.exit).toBe(0)
+        expect(second.output.trim()).toBe("clean")
+      }),
+    ),
   )
 })
 
@@ -1145,8 +1512,11 @@ describe("tool.shell truncation", () => {
           command: fill("lines", lineCount),
         })
         mustTruncate(result)
-        expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
-        expect(result.output).toMatch(/Full output saved to:\s+\S+/)
+        expect(result.output).toContain("shell output truncated")
+        expect(result.output).toContain("Full output saved to ")
+        expect(result.output.startsWith("1\n")).toBe(true)
+        expect(result.output.trimEnd()).toEndWith(String(lineCount))
+        expect(result.output.split("\n").length).toBeLessThanOrEqual(Truncate.MAX_LINES)
       }),
     ),
   )
@@ -1160,8 +1530,9 @@ describe("tool.shell truncation", () => {
           command: fill("bytes", byteCount),
         })
         mustTruncate(result)
-        expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
-        expect(result.output).toMatch(/Full output saved to:\s+\S+/)
+        expect(result.output).toContain("shell output truncated")
+        expect(result.output).toContain("Full output saved to ")
+        expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(Truncate.MAX_BYTES)
       }),
     ),
   )
@@ -1192,7 +1563,8 @@ describe("tool.shell truncation", () => {
         const filepath = (result.metadata as { outputPath?: string }).outputPath
         expect(filepath).toBeTruthy()
 
-        const saved = yield* (yield* FSUtil.Service).readFileString(filepath!)
+        const compressed = yield* (yield* FSUtil.Service).readFile(filepath!)
+        const saved = brotliDecompressSync(compressed as unknown as Buffer).toString("utf-8")
         const lines = saved.trim().split(/\r?\n/)
         expect(lines.length).toBe(lineCount)
         expect(lines[0]).toBe("1")

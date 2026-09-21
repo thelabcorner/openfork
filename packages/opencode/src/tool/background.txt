@@ -1,4 +1,4 @@
-Manages background jobs and starts event-driven monitors. Ordinary long-running commands are launched with `bash background=true`; condition/event watches are launched here with `action:"monitor"`.
+Manages background jobs and starts event-driven monitors. Ordinary long-running commands are launched with the `bash` tool using `background=true`; condition/event watches are launched here with `action:"monitor"`. The compatibility tool id is `bash`; the actual interpreter/dialect is stated in the runtime profile below.
 
 Actions (use the `action` parameter):
 

@@ -1,24 +1,20 @@
 import { describe, expect, test } from "bun:test"
 import { makeChunkWindow } from "../../src/tool/shell"
+import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 
-// Reference implementation of the pre-optimization Array.shift() eviction,
-// kept here to prove behavioral equivalence of the head-index window.
-function reference(chunks: string[], keepBytes: number): { text: string; cut: boolean } {
-  const list: Array<{ text: string; size: number }> = []
-  let used = 0
-  let cut = false
-  for (const text of chunks) {
-    const size = Buffer.byteLength(text, "utf-8")
-    list.push({ text, size })
-    used += size
-    while (used > keepBytes && list.length > 1) {
-      const item = list.shift()
-      if (!item) break
-      used -= item.size
-      cut = true
-    }
+function reference(chunks: string[], keepBytes: number) {
+  const all = chunks.join("")
+  const bytes = Buffer.byteLength(all, "utf-8")
+  const headBudget = Math.ceil(keepBytes / 2)
+  const tailBudget = Math.floor(keepBytes / 2)
+  if (bytes <= keepBytes) {
+    return { all, cut: false }
   }
-  return { text: list.map((item) => item.text).join(""), cut }
+  return {
+    head: ToolOutputProjection.takePrefixBytes(all, headBudget),
+    tail: ToolOutputProjection.takeSuffixBytes(all, tailBudget),
+    cut: true,
+  }
 }
 
 function mulberry(seed: number) {
@@ -41,24 +37,25 @@ describe("chunk window", () => {
     expect(window.text()).toBe("hello world")
   })
 
-  test("evicts oldest chunks beyond budget but always keeps one", () => {
+  test("retains deterministic head and tail beyond budget", () => {
     const window = makeChunkWindow(10)
     window.push("aaaaa")
     window.push("bbbbb")
     window.push("ccccc")
     expect(window.cut).toBe(true)
-    // Two newest 5-byte chunks fit exactly; the oldest is gone.
-    expect(window.text()).toBe("bbbbbccccc")
+    expect(window.snapshot()).toMatchObject({ head: "aaaaa", tail: "ccccc", totalBytes: 15 })
+    expect(window.text()).toContain("middle output omitted")
   })
 
-  test("keeps a single oversized chunk alone without cutting", () => {
+  test("bounds a single oversized chunk and preserves both edges", () => {
     const window = makeChunkWindow(4)
     window.push("way-too-long")
-    expect(window.cut).toBe(false)
-    expect(window.text()).toBe("way-too-long")
+    expect(window.cut).toBe(true)
+    expect(window.snapshot()).toMatchObject({ head: "wa", tail: "ng", totalBytes: 12 })
+    expect(Buffer.byteLength(window.snapshot().head + window.snapshot().tail, "utf-8")).toBeLessThanOrEqual(4)
   })
 
-  test("matches the legacy shift algorithm on scripted workloads", () => {
+  test("matches the bounded head-tail reference on scripted workloads", () => {
     const workloads: Array<{ chunks: string[]; keep: number }> = [
       { chunks: [], keep: 100 },
       { chunks: ["a"], keep: 100 },
@@ -72,11 +69,17 @@ describe("chunk window", () => {
       const window = makeChunkWindow(keep)
       for (const chunk of chunks) window.push(chunk)
       const expected = reference(chunks, keep)
-      expect({ text: window.text(), cut: window.cut }).toEqual(expected)
+      const snapshot = window.snapshot()
+      if (expected.cut) expect(snapshot).toMatchObject(expected)
+      else {
+        expect(snapshot.cut).toBe(false)
+        expect(snapshot.head + snapshot.tail).toBe(expected.all!)
+      }
+      expect(Buffer.byteLength(window.snapshot().head + window.snapshot().tail, "utf-8")).toBeLessThanOrEqual(keep)
     }
   })
 
-  test("matches the legacy shift algorithm on seeded random workloads", () => {
+  test("matches the bounded head-tail reference on seeded random workloads", () => {
     const random = mulberry(42)
     for (let trial = 0; trial < 20; trial++) {
       const keep = 1 + Math.floor(random() * 500)
@@ -88,7 +91,21 @@ describe("chunk window", () => {
       const window = makeChunkWindow(keep)
       for (const chunk of chunks) window.push(chunk)
       const expected = reference(chunks, keep)
-      expect({ text: window.text(), cut: window.cut }).toEqual(expected)
+      const snapshot = window.snapshot()
+      if (expected.cut) expect(snapshot).toMatchObject(expected)
+      else {
+        expect(snapshot.cut).toBe(false)
+        expect(snapshot.head + snapshot.tail).toBe(expected.all!)
+      }
+      expect(Buffer.byteLength(window.snapshot().head + window.snapshot().tail, "utf-8")).toBeLessThanOrEqual(keep)
     }
+  })
+
+  test("tracks total lines independently of retained memory", () => {
+    const window = makeChunkWindow(8)
+    window.push("one\ntwo\n")
+    window.push("three\nfour")
+    expect(window.totalLines).toBe(4)
+    expect(window.totalBytes).toBe(Buffer.byteLength("one\ntwo\nthree\nfour"))
   })
 })

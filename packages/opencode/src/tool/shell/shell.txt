@@ -1,12 +1,23 @@
 ${intro}
 
-Be aware: OS: ${os}, Shell: ${shell}
+Runtime shell profile:
+- Host OS: ${os}
+- Actual interpreter: ${shell}
+- Dialect: ${dialect}
+- Invocation protocol: ${invocationProtocol}
+- Path environment: ${pathEnvironment}
+- Native argument mode: ${nativeArgMode}
+- `command` is a shell SCRIPT STRING, not an argv array.
+- Every tool call starts a fresh shell process; `cd`, variables, aliases, functions, and other shell state do not persist across calls.
+- Do not wrap the command in another same-shell `bash -c`, `pwsh -Command`, `powershell -Command`, or `cmd /c` merely for grouping. Each extra shell adds another quoting/parsing boundary.
+- For quote-dense or multiline data (Markdown, JSON, source code, regexes), prefer a dedicated tool, a temporary file, or the target program's `--file`/stdin interface instead of embedding the data through nested shell quoting.
+- Repository text bytes are governed by repository attributes and the dedicated mutation tools. OpenFork-owned child processes enforce deterministic Git defaults (`core.autocrlf=false`, `core.eol=lf`), but intentional target-file CRLF/mixed terminators are preserved by Write/Edit/Patch. Do not use shell newline conversion or Git config changes to "fix" a file's line endings.
 
 ${workdirSection}
 
 Use `${tmp}` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.
 
-IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead.
+IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO NOT use it for file operations (reading, writing, editing, searching, finding files) - use the specialized tools for this instead. When exact text bytes or line endings matter, this is a correctness requirement, not merely a convenience.
 
 ${commandSection}
 
@@ -20,4 +31,5 @@ ${backgroundSection}
 - If a commit fails or hooks reject it, fix the issue and create a new commit; do not amend the failed commit.
 - Before creating a PR, inspect status, diff, remote tracking, recent commits, and the diff from the base branch.
 - Review all commits included in the PR, not just the latest commit.
+- For multiline PR bodies, use the dedicated Write tool to create a temporary body file, then pass it with `gh pr create --body-file <file>` instead of embedding Markdown through command substitution/heredoc quoting layers.
 - Use `gh` for GitHub tasks, including PRs, issues, checks, and releases; return the PR URL when done.

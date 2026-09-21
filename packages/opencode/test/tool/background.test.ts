@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit } from "effect"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import type { Tool } from "../../src/tool/tool"
 import { Shell } from "@opencode-ai/core/shell"
@@ -11,6 +11,8 @@ import { disposeAllInstances } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { testEffect, pollWithTimeout } from "../lib/effect"
 import { TRUNCATION_DIR } from "../../src/tool/truncation-dir"
+import { shouldPublishMonitorStream } from "@/background/shell-job"
+import type { SessionPrompt } from "@/session/prompt"
 
 const baseCtx: Omit<Tool.Context, "ask" | "extra"> = {
   sessionID: SessionID.make("ses_test"),
@@ -28,11 +30,17 @@ afterEach(async () => {
 
 const it = testEffect(LayerNode.compile(LayerNode.group([ToolRegistry.node])))
 
+test("monitor stream policy publishes stdout and suppresses stderr", () => {
+  expect(shouldPublishMonitorStream("stdout")).toBe(true)
+  expect(shouldPublishMonitorStream("stderr")).toBe(false)
+})
+
 type Ask = Omit<PermissionV1.Request, "id" | "sessionID" | "tool">
 type PromptCall = {
   sessionID: string
   agent: string | undefined
   parts: { type: string; synthetic: boolean; text: string }[]
+  provenance?: SessionPrompt.HostPromptProvenance
 }
 
 const harness = (extra: Record<string, unknown> = {}) => {
@@ -45,19 +53,20 @@ const harness = (extra: Record<string, unknown> = {}) => {
       sessionID: SessionID
       agent?: string
       parts: { type: "text"; synthetic: boolean; text: string }[]
-    }) =>
+    }, provenance?: SessionPrompt.HostPromptProvenance) =>
       Effect.sync(() => {
         prompts.push({
           sessionID: String(input.sessionID),
           agent: input.agent,
           parts: input.parts,
+          provenance,
         })
         return {} as never
       }),
   }
   const ctx: Tool.Context = {
     ...baseCtx,
-    extra: { promptOps, ...extra },
+    extra: { promptOps, workerRootMessageID: MessageID.make("msg_worker_root"), ...extra },
     ask: (req: Ask) =>
       Effect.sync(() => {
         asks.push(req)
@@ -78,10 +87,35 @@ const toolByID = (registry: ToolRegistry.Interface, id: string) =>
 const bin = `"${process.execPath.replaceAll("\\", "/")}"`
 const shName = () => Shell.name(Shell.acceptable())
 const evalarg = (text: string) => (shName() === "cmd" ? `"${text}"` : `'${text}'`)
+const powershells =
+  process.platform === "win32"
+    ? [Bun.which("pwsh"), Bun.which("powershell")]
+        .filter((item): item is string => Boolean(item))
+        .map((shell) => ({ shell, label: Shell.name(shell) }))
+    : []
 const command = (code: string) => {
   const text = `${bin} -e ${evalarg(code)}`
   return ["pwsh", "powershell"].includes(shName()) ? `& ${text}` : text
 }
+
+const withShell = <A, E, R>(shell: string, self: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.SHELL
+      process.env.SHELL = shell
+      Shell.acceptable.reset()
+      Shell.preferred.reset()
+      return previous
+    }),
+    () => self,
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env.SHELL
+        else process.env.SHELL = previous
+        Shell.acceptable.reset()
+        Shell.preferred.reset()
+      }),
+  )
 
 // Long-running script: prints a marker, then waits ~30s so the job stays running.
 const slow = command(`console.log("slow-start"); setTimeout(() => {}, 30000)`)
@@ -105,6 +139,106 @@ const shell = () =>
   })
 
 describe("tool.background", () => {
+  it.instance("advertises the same resolved shell contract used by monitor execution", () =>
+    Effect.gen(function* () {
+      const { backgroundTool } = yield* shell()
+      const resolved = Shell.acceptable()
+      expect(backgroundTool.description).toContain(`Actual interpreter: ${Shell.name(resolved)} (${resolved})`)
+      expect(backgroundTool.description).toContain("Invocation protocol:")
+      expect(backgroundTool.description).toContain("monitor.command is a shell SCRIPT STRING, not argv")
+      expect(backgroundTool.description).toContain("Each monitor starts a fresh shell process")
+    }),
+  )
+
+  if (["pwsh", "powershell"].includes(shName())) {
+    it.instance("rejects unsupported monitor heredocs before permission", () =>
+      Effect.gen(function* () {
+        const { backgroundTool } = yield* shell()
+        const { asks, ctx } = harness()
+        const exit = yield* backgroundTool
+          .execute(
+            {
+              action: "monitor",
+              command: "python - <<PY\nprint('$HOME')\nPY",
+              description: "invalid heredoc monitor",
+            },
+            ctx,
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(String(Cause.squash(exit.cause))).toContain("Cannot execute an unquoted Bash heredoc")
+        }
+        expect(asks).toHaveLength(0)
+      }),
+    )
+  }
+
+  for (const item of powershells) {
+    it.instance(`transports oversized PowerShell source for detached jobs [${item.label}]`, () =>
+      withShell(
+        item.shell,
+        Effect.gen(function* () {
+          const { shellTool, backgroundTool } = yield* shell()
+          const { ctx } = harness()
+          const source = [
+            `#${"x".repeat(Shell.POWERSHELL_INLINE_SCRIPT_LIMIT + 5_000)}`,
+            "Write-Output 'background-large-ok'",
+            `Write-Output ([bool](Get-ChildItem Env:${Shell.POWERSHELL_SCRIPT_SOURCE_ENV_PREFIX}* -ErrorAction SilentlyContinue))`,
+          ].join("\n")
+
+          const start = yield* shellTool.execute({ command: source, background: true, notify: false }, ctx)
+          const jobId = start.metadata.jobId as string
+          yield* pollWithTimeout(
+            Effect.gen(function* () {
+              const status = yield* backgroundTool.execute({ action: "status", id: jobId }, ctx)
+              return status.metadata.status === "completed" ? true : undefined
+            }),
+            `large PowerShell job ${jobId} never completed`,
+          )
+          const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+          expect(read.output.replaceAll("\r\n", "\n")).toContain("background-large-ok\nFalse")
+        }),
+      ),
+    )
+
+    it.instance(
+      `transports oversized PowerShell source for monitor jobs [${item.label}]`,
+      () =>
+        withShell(
+          item.shell,
+          Effect.gen(function* () {
+            const { backgroundTool } = yield* shell()
+            const { ctx } = harness()
+            const source = [
+              `#${"x".repeat(Shell.POWERSHELL_INLINE_SCRIPT_LIMIT + 5_000)}`,
+              "Write-Output 'monitor-large-ok'",
+              `Write-Output ([bool](Get-ChildItem Env:${Shell.POWERSHELL_SCRIPT_SOURCE_ENV_PREFIX}* -ErrorAction SilentlyContinue))`,
+              "Start-Sleep -Seconds 30",
+            ].join("\n")
+
+            const start = yield* backgroundTool.execute(
+              { action: "monitor", command: source, description: "large PowerShell monitor", persistent: true },
+              ctx,
+            )
+            const jobId = start.metadata.jobId as string
+            const output = yield* pollWithTimeout(
+              Effect.gen(function* () {
+                const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+                return read.output.includes("monitor-large-ok") && read.output.includes("False") ? read.output : undefined
+              }),
+              `large PowerShell monitor ${jobId} never produced output`,
+            )
+            expect(output.replaceAll("\r\n", "\n")).toContain("monitor-large-ok\nFalse")
+            const killed = yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
+            expect(killed.metadata.status).toBe("cancelled")
+          }),
+        ),
+      15_000,
+    )
+  }
+
   it.instance("starts monitor jobs with event delivery on the shared background runtime", () =>
     Effect.gen(function* () {
       const { backgroundTool } = yield* shell()
@@ -146,6 +280,47 @@ describe("tool.background", () => {
       const killed = yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
       expect(killed.metadata.status).toBe("cancelled")
     }),
+  )
+
+  it.instance(
+    "keeps monitor stderr in diagnostics while declaring stdout-only delivery",
+    () =>
+      Effect.gen(function* () {
+        const { backgroundTool } = yield* shell()
+        const { ctx } = harness()
+        const watch = command(`console.log("stdout-event"); console.error("stderr-noise"); setTimeout(() => {}, 30000)`)
+
+        const start = yield* backgroundTool.execute(
+          {
+            action: "monitor",
+            command: watch,
+            description: "stdout boundary test",
+            persistent: true,
+          },
+          ctx,
+        )
+        const jobId = start.metadata.jobId as string
+
+        const logged = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+            return read.output.includes("stdout-event") && read.output.includes("stderr-noise")
+              ? read.output
+              : undefined
+          }),
+          `monitor ${jobId} never logged stdout/stderr`,
+        )
+        expect(logged).toContain("stderr-noise")
+        const delivery = start.metadata.delivery as { eventStream: string }
+        expect(delivery.eventStream).toBe("stdout")
+
+        const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+        expect(read.output).toContain("stdout-event")
+        expect(read.output).toContain("stderr-noise")
+
+        yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
+      }),
+    15_000,
   )
 
   it.instance("starts a background job, returns immediately, and completes", () =>
@@ -218,6 +393,30 @@ describe("tool.background", () => {
       expect(injected).toContain(`state="completed"`)
       expect(injected).toContain("Background command completed")
       expect(injected).toContain("fast-done")
+      const call = prompts.find((p) => p.parts.some((part) => part.text.includes(`job="${jobId}"`)))
+      expect(call?.provenance).toEqual({
+        source: "background.shell.summary",
+        sourceMessageID: MessageID.make("msg_worker_root"),
+        ref: jobId,
+      })
+    }),
+  )
+
+  it.instance("drops completion notification when launch-time worker provenance is unavailable", () =>
+    Effect.gen(function* () {
+      const { shellTool, backgroundTool } = yield* shell()
+      const { prompts, ctx } = harness({ workerRootMessageID: undefined })
+      const start = yield* shellTool.execute({ command: fast, background: true, notify: true }, ctx)
+      const jobId = start.metadata.jobId as string
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const status = yield* backgroundTool.execute({ action: "status", id: jobId }, ctx)
+          return status.metadata.status === "completed" ? true : undefined
+        }),
+        `job ${jobId} never completed`,
+      )
+      yield* Effect.sleep("100 millis")
+      expect(prompts).toHaveLength(0)
     }),
   )
 
@@ -273,10 +472,7 @@ describe("tool.background", () => {
     Effect.gen(function* () {
       const { shellTool, backgroundTool } = yield* shell()
       const { prompts, ctx } = harness()
-      const start = yield* shellTool.execute(
-        { command: slow, background: true, notify: true, timeout: 400 },
-        ctx,
-      )
+      const start = yield* shellTool.execute({ command: slow, background: true, notify: true, timeout: 400 }, ctx)
       const jobId = start.metadata.jobId as string
 
       const injected = yield* pollWithTimeout(
@@ -338,6 +534,86 @@ describe("tool.background", () => {
     }),
   )
 
+  if (process.platform === "win32") {
+    it.instance(
+      "large Git Bash source transport bypasses argv limits and leaves background-job stdin available",
+      () => {
+        const gitBash = Shell.gitbash()
+        if (!gitBash) return Effect.void
+        return withShell(
+          gitBash,
+          Effect.gen(function* () {
+            const { shellTool, backgroundTool } = yield* shell()
+            const { ctx } = harness()
+            const readCommand =
+              `PAD='${"x".repeat(20_000)}'; ` +
+              command(
+              `let d=""; process.stdin.on("data", c => { d += c; process.stdout.write("gitbash-echo:" + d.split("\\n").filter(Boolean).join("|")) })`,
+              )
+            const start = yield* shellTool.execute({ command: readCommand, background: true, notify: false }, ctx)
+            const jobId = start.metadata.jobId as string
+
+            yield* pollWithTimeout(
+              Effect.gen(function* () {
+                const state = yield* backgroundTool.execute({ action: "status", id: jobId }, ctx)
+                return state.metadata.status === "running" ? true : undefined
+              }),
+              `Git Bash job ${jobId} never became running`,
+            )
+
+            yield* backgroundTool.execute({ action: "send", id: jobId, input: "hello-from-stdin" }, ctx)
+            const output = yield* pollWithTimeout(
+              Effect.gen(function* () {
+                const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+                return read.output.includes("gitbash-echo:hello-from-stdin") ? read.output : undefined
+              }),
+              `Git Bash stdin echo never appeared for ${jobId}`,
+            )
+            expect(output).toContain("gitbash-echo:hello-from-stdin")
+            yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
+          }),
+        )
+      },
+      15_000,
+    )
+
+    it.instance(
+      "Git Bash monitor transports large source through the shared launcher",
+      () => {
+        const gitBash = Shell.gitbash()
+        if (!gitBash) return Effect.void
+        return withShell(
+          gitBash,
+          Effect.gen(function* () {
+            const { backgroundTool } = yield* shell()
+            const { ctx } = harness()
+            const watch = `PAD='${"x".repeat(20_000)}'; printf 'monitor-large-source\\n'; sleep 30`
+            const start = yield* backgroundTool.execute(
+              {
+                action: "monitor",
+                command: watch,
+                description: "large Git Bash monitor",
+                persistent: true,
+              },
+              ctx,
+            )
+            const jobId = start.metadata.jobId as string
+            const output = yield* pollWithTimeout(
+              Effect.gen(function* () {
+                const read = yield* backgroundTool.execute({ action: "read", id: jobId }, ctx)
+                return read.output.includes("monitor-large-source") ? read.output : undefined
+              }),
+              `large Git Bash monitor ${jobId} never produced output`,
+            )
+            expect(output).toContain("monitor-large-source")
+            yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
+          }),
+        )
+      },
+      15_000,
+    )
+  }
+
   it.instance("read returns (no output yet) for an empty log and respects offset/limit", () =>
     Effect.gen(function* () {
       const { shellTool, backgroundTool } = yield* shell()
@@ -379,15 +655,13 @@ describe("tool.background", () => {
 
   it.instance("custom id collisions are rejected", () =>
     Effect.gen(function* () {
-      const { shellTool } = yield* shell()
+      const { shellTool, backgroundTool } = yield* shell()
       const { ctx } = harness()
 
       // Pre-create a stale log on disk so the custom id is rejected at launch.
       yield* Effect.promise(() => Bun.write(path.join(TRUNCATION_DIR, "job_custom1.log"), "stale"))
 
-      const exit = yield* shellTool
-        .execute({ command: fast, background: true, id: "custom1" }, ctx)
-        .pipe(Effect.exit)
+      const exit = yield* shellTool.execute({ command: fast, background: true, id: "custom1" }, ctx).pipe(Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) {
         const error = Cause.squash(exit.cause)
@@ -403,6 +677,11 @@ describe("tool.background", () => {
         const error = Cause.squash(second.cause)
         expect(error instanceof Error ? error.message : String(error)).toContain("already in use")
       }
+      // Do not leak the successful first launch into instance teardown. The
+      // collision assertions are complete; explicitly settle the owned job so
+      // this test measures id semantics rather than background-scope cleanup.
+      const settled = yield* backgroundTool.execute({ action: "wait", id: "bg2", timeout: 10_000 }, ctx)
+      expect(settled.metadata.status).toBe("completed")
     }),
   )
 

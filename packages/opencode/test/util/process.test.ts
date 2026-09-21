@@ -121,6 +121,23 @@ describe("util.process", () => {
     expect(out.stdout.toString()).toBe("set")
   })
 
+  test("pins Git EOL config across the legacy process boundary while preserving explicit -c overrides", async () => {
+    const inherited = {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.autocrlf",
+      GIT_CONFIG_VALUE_0: "true",
+    }
+    const pinned = await Process.run(["git", "config", "--get", "core.autocrlf"], { env: inherited })
+    expect(pinned.code).toBe(0)
+    expect(pinned.stdout.toString().trim()).toBe("false")
+
+    const explicit = await Process.run(["git", "-c", "core.autocrlf=true", "config", "--get", "core.autocrlf"], {
+      env: inherited,
+    })
+    expect(explicit.code).toBe(0)
+    expect(explicit.stdout.toString().trim()).toBe("true")
+  })
+
   test("uses shell in run on Windows", async () => {
     if (process.platform !== "win32") return
 
