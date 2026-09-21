@@ -6,12 +6,14 @@ import type { Config } from "../config"
 import type { EventV2 } from "../event"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
+import { SessionTurnProvenance } from "./turn-provenance"
 import { SessionSchema } from "./schema"
 import { Token } from "../util/token"
+import { ToolOutputProjection } from "../tool-output-projection"
 
 const DEFAULT_BUFFER = 10_000
 const DEFAULT_KEEP_TOKENS = 4_000
-const TOOL_OUTPUT_MAX_CHARS = 500
+const TOOL_OUTPUT_MAX_BYTES = 500
 const SUMMARY_OUTPUT_TOKENS = 2_000
 export const DEFAULT_COMPACTION_PROMPT = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
@@ -80,12 +82,18 @@ type Input = {
   readonly entries: readonly Entry[]
   readonly model: Model
   readonly request: LLMRequest
+  readonly sourceMessageID: SessionMessage.ID
 }
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
 
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
+export const compactToolOutput = (value: string) =>
+  ToolOutputProjection.project(value, {
+    maxLines: Number.MAX_SAFE_INTEGER,
+    maxBytes: TOOL_OUTPUT_MAX_BYTES,
+    marker: "[tool output truncated; showing beginning + end]",
+    strategy: "balanced",
+  }).content
 
 export const serializeToolContent = (content: SessionMessage.ToolStateCompleted["content"]) =>
   content
@@ -108,7 +116,7 @@ const serialize = (message: SessionMessage.Message) => {
         if (part.state.status === "completed")
           return [
             `[Assistant tool call]: ${part.name}(${input})`,
-            `[Tool result]: ${truncate(serializeToolContent(part.state.content))}`,
+            `[Tool result]: ${compactToolOutput(serializeToolContent(part.state.content))}`,
           ]
         if (part.state.status === "error")
           return [`[Assistant tool call]: ${part.name}(${input})`, `[Tool error]: ${part.state.error.message}`]
@@ -117,8 +125,13 @@ const serialize = (message: SessionMessage.Message) => {
       .join("\n")
   }
   if (message.type === "system") return `[System update]: ${message.text}`
-  if (message.type === "synthetic") return `[Synthetic context]: ${message.text}`
-  if (message.type === "shell") return `[Shell]: ${message.command}\n${truncate(message.output)}`
+  // STATE-shaped domain records are structurally transparent even after import
+  // revokes their live lifetime. Summarizing either current or historical Goal
+  // STATE would fossilize a mutable projection into an immutable checkpoint.
+  // The runner reprojects current authoritative state after the boundary.
+  if (message.type === "synthetic")
+    return SessionTurnProvenance.hasStateSemantics(message) ? "" : `[Synthetic context]: ${message.text}`
+  if (message.type === "shell") return `[Shell]: ${message.command}\n${compactToolOutput(message.output)}`
   return ""
 }
 
@@ -207,11 +220,15 @@ export const make = (dependencies: Dependencies) => {
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
     if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
     const messageID = SessionMessage.ID.create()
+    const provenance = SessionTurnProvenance.host(SessionTurnProvenance.Source.Compaction, {
+      sourceMessageID: input.sourceMessageID,
+    })
     yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
       sessionID: input.sessionID,
       messageID,
       timestamp: yield* DateTime.now,
       reason: "auto",
+      provenance,
     })
 
     const chunks: string[] = []
@@ -244,6 +261,7 @@ export const make = (dependencies: Dependencies) => {
       reason: "auto",
       text: summary,
       recent: selected.recent,
+      provenance,
     })
     return true
   })

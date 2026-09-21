@@ -254,6 +254,14 @@ const decodeBaseStored = Effect.fnUntraced(function* (db: DatabaseService, row: 
   )
 })
 
+/** Decode immutable/base message data without lifecycle or tool sidecar reads. */
+export const decodeBaseRow = Effect.fn("SessionMessageProjection.decodeBaseRow")(function* (
+  db: DatabaseService,
+  row: Row,
+) {
+  return yield* decodeBaseStored(db, row)
+})
+
 /**
  * Decode the mutable assistant base without materializing tool-output overlays.
  *

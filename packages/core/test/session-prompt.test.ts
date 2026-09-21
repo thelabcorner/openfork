@@ -16,6 +16,7 @@ import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { testEffect } from "./lib/effect"
@@ -158,7 +159,53 @@ describe("SessionV2.prompt", () => {
         sessionID,
         prompt: { text: "Fix the failing tests" },
         delivery: "steer",
+        provenance: { owner: "user", source: "prompt" },
       })
+    }),
+  )
+
+  it.effect("keeps trusted host admission distinct from semantic user authority", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const hostID = SessionMessage.ID.make("msg_host_prompt_provenance")
+
+      const admittedHost = yield* session.hostPrompt({
+        id: hostID,
+        sessionID,
+        prompt: Prompt.make({ text: "Run scheduled work" }),
+        resume: false,
+      })
+      expect(admittedHost.provenance).toEqual({ owner: "host", source: "host.prompt" })
+
+      yield* SessionInput.promoteSteers(db, events, sessionID, Number.MAX_SAFE_INTEGER)
+      const projected = (yield* session.messages({ sessionID })).find((message) => message.id === hostID)
+      expect(projected).toMatchObject({
+        id: hostID,
+        type: "user",
+        provenance: { owner: "host", source: "host.prompt" },
+      })
+      if (!projected) throw new Error("host prompt was not projected")
+      expect(SessionTurnProvenance.isWorkerPromptTurn(projected)).toBe(true)
+      expect(SessionTurnProvenance.isSemanticUserTurn(projected)).toBe(false)
+      expect(SessionTurnProvenance.isGoalAuthorizationTurn(projected)).toBe(false)
+    }),
+  )
+
+  it.effect("rejects reusing an admitted id with a different authority origin", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const id = SessionMessage.ID.make("msg_origin_conflict")
+      const prompt = Prompt.make({ text: "Same bytes, different authority" })
+
+      yield* session.hostPrompt({ id, sessionID, prompt, resume: false })
+      const failure = yield* session.prompt({ id, sessionID, prompt, resume: false }).pipe(Effect.flip)
+
+      expect(failure._tag).toBe("Session.PromptConflictError")
+      expect((yield* admitted(id))?.provenance).toEqual({ owner: "host", source: "host.prompt" })
     }),
   )
 

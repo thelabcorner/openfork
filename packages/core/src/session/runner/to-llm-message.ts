@@ -8,6 +8,7 @@ import {
   type ProviderMetadata,
 } from "@opencode-ai/llm"
 import { SessionMessage } from "../message"
+import { SessionTurnProvenance } from "../turn-provenance"
 import type { FileAttachment } from "../prompt"
 
 const media = (file: FileAttachment): ContentPart => ({
@@ -130,7 +131,19 @@ function toLLMMessage(message: SessionMessage.Message, model: Model): Message[] 
         }),
       ]
     case "synthetic":
-      return [Message.make({ id: message.id, role: "user", content: message.text, metadata: message.metadata })]
+      // Imported historical STATE preserves transcript/replay identity but is
+      // structurally transparent to the live provider context. Current STATE is
+      // reprojected from its authoritative Goal owner and remains included.
+      if (SessionTurnProvenance.hasStateSemantics(message) && !SessionTurnProvenance.isStateProjection(message))
+        return []
+      return [
+        Message.make({
+          id: message.id,
+          role: "user",
+          content: [{ type: "text", text: message.text }, ...(message.files ?? []).map(media)],
+          metadata: message.metadata,
+        }),
+      ]
     case "system":
       return [Message.system(message.text)]
     case "shell":

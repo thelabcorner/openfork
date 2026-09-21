@@ -28,6 +28,7 @@ const snapshotLayer = Layer.succeed(
     checkout: () => Effect.void,
     retain: () => Effect.void as any,
     release: () => Effect.void as any,
+    retained: () => Effect.succeed({ keys: [] }) as any,
     epoch: () => Effect.succeed("snapshot-overlap-test") as any,
     excludedFiles: () => Effect.succeed([]) as any,
   }),

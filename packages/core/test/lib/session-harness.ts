@@ -91,7 +91,7 @@ export const catalogModel = (providerID: string, id: string): ModelV2.Info =>
   })
 
 export type Harness = {
-  readonly it: ReturnType<typeof testEffect>
+  readonly it: any
   /** Runner provider-turn requests, in order. */
   readonly requests: LLMRequest[]
   /** SessionTitle LLM requests, in order. */
@@ -143,6 +143,7 @@ export const makeHarness = (options: { readonly snapshotLayer?: Layer.Layer<Snap
     LLMClient.Service,
     LLMClient.Service.of({
       prepare: () => Effect.die("unused"),
+      compile: () => Effect.die("unused"),
       stream: (request: LLMRequest) => {
         if (request.tools.some((item) => item.name === SessionTitle.GENERATED_TITLE_TOOL)) {
           titleRequests.push(request)
@@ -360,8 +361,9 @@ export const makeHarness = (options: { readonly snapshotLayer?: Layer.Layer<Snap
       catalogSmall.clear()
       for (const entry of configEntries) {
         if (entry.type !== "document") continue
-        delete entry.info.small_model
-        delete entry.info.title_prompt
+        const info = entry.info as { small_model?: string; title_prompt?: string }
+        delete info.small_model
+        delete info.title_prompt
       }
     },
   }

@@ -13,6 +13,8 @@ import { Location } from "./location"
 import { ProjectID } from "./project-id"
 import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
+import { SessionInput } from "./session-input"
+import { Permission } from "./permission"
 
 export { FileAttachment }
 
@@ -34,6 +36,7 @@ const PromptFields = {
   messageID: SessionMessage.ID,
   prompt: Prompt,
   delivery: Delivery,
+  provenance: SessionMessage.Provenance.pipe(optional),
 }
 
 const options = {
@@ -58,6 +61,7 @@ export const AgentSwitched = Event.define({
   schema: {
     ...Base,
     messageID: SessionMessage.ID,
+    provenance: SessionMessage.Provenance.pipe(optional),
     agent: Schema.String,
   },
 })
@@ -69,6 +73,7 @@ export const ModelSwitched = Event.define({
   schema: {
     ...Base,
     messageID: SessionMessage.ID,
+    provenance: SessionMessage.Provenance.pipe(optional),
     model: Model.Ref,
   },
 })
@@ -102,6 +107,47 @@ export const PromptAdmitted = Event.define({
 })
 export type PromptAdmitted = typeof PromptAdmitted.Type
 
+const SyntheticInputFields = {
+  ...Base,
+  messageID: SessionMessage.ID,
+  content: SessionInput.SyntheticContent,
+  origin: SessionInput.SyntheticOrigin,
+  delegated: SessionInput.DelegatedTurnAuthority.pipe(optional),
+  execution: SessionInput.SyntheticExecution.pipe(optional),
+  delivery: Delivery,
+  admissionClass: SessionInput.SyntheticAdmissionClass,
+  userPreemptible: Schema.Boolean,
+}
+
+export const SyntheticAdmitted = Event.define({
+  type: "session.next.synthetic.admitted",
+  ...options,
+  schema: SyntheticInputFields,
+})
+export type SyntheticAdmitted = typeof SyntheticAdmitted.Type
+
+export const SyntheticPromoted = Event.define({
+  type: "session.next.synthetic.promoted",
+  ...options,
+  schema: {
+    ...SyntheticInputFields,
+    /** Actual promotion instant. Optional for historical v1 events. */
+    promotedAt: DateTimeUtcFromMillis.pipe(optional),
+  },
+})
+export type SyntheticPromoted = typeof SyntheticPromoted.Type
+
+export const SyntheticRevoked = Event.define({
+  type: "session.next.synthetic.revoked",
+  ...options,
+  schema: {
+    ...Base,
+    messageID: SessionMessage.ID,
+    reason: SessionInput.RevocationReason,
+  },
+})
+export type SyntheticRevoked = typeof SyntheticRevoked.Type
+
 export const ContextUpdated = Event.define({
   type: "session.next.context.updated",
   ...options,
@@ -120,6 +166,7 @@ export const Synthetic = Event.define({
     ...Base,
     messageID: SessionMessage.ID,
     text: Schema.String,
+    provenance: SessionMessage.Provenance.pipe(optional),
   },
 })
 export type Synthetic = typeof Synthetic.Type
@@ -434,6 +481,7 @@ export namespace Compaction {
       ...Base,
       messageID: SessionMessage.ID,
       reason: Schema.Union([Schema.Literal("auto"), Schema.Literal("manual")]),
+      provenance: SessionMessage.Provenance.pipe(optional),
     },
   })
   export type Started = typeof Started.Type
@@ -458,6 +506,7 @@ export namespace Compaction {
       reason: Started.data.fields.reason,
       text: Schema.String,
       recent: Schema.String,
+      provenance: SessionMessage.Provenance.pipe(optional),
     },
   })
   export type Ended = typeof Ended.Type
@@ -501,12 +550,29 @@ export const Renamed = Event.define({
 })
 export type Renamed = typeof Renamed.Type
 
+/**
+ * Session-owned hard execution ceiling. Kept out of dense Session.Info while
+ * remaining replayable as part of the Session aggregate.
+ */
+export const ExecutionBoundaryUpdated = Event.define({
+  type: "session.next.execution-boundary.updated",
+  ...options,
+  schema: {
+    ...Base,
+    boundary: Permission.Boundary,
+  },
+})
+export type ExecutionBoundaryUpdated = typeof ExecutionBoundaryUpdated.Type
+
 export const DurableDefinitions = Event.inventory(
   AgentSwitched,
   ModelSwitched,
   Moved,
   Prompted,
   PromptAdmitted,
+  SyntheticAdmitted,
+  SyntheticPromoted,
+  SyntheticRevoked,
   ContextUpdated,
   Synthetic,
   Shell.Started,
@@ -534,6 +600,7 @@ export const DurableDefinitions = Event.inventory(
   Paused,
   Resumed,
   Renamed,
+  ExecutionBoundaryUpdated,
 )
 
 export const Definitions = Event.inventory(
@@ -542,6 +609,9 @@ export const Definitions = Event.inventory(
   Moved,
   Prompted,
   PromptAdmitted,
+  SyntheticAdmitted,
+  SyntheticPromoted,
+  SyntheticRevoked,
   ContextUpdated,
   Synthetic,
   Shell.Started,
@@ -573,6 +643,7 @@ export const Definitions = Event.inventory(
   Paused,
   Resumed,
   Renamed,
+  ExecutionBoundaryUpdated,
 )
 
 export const Durable = Schema.Union(DurableDefinitions, { mode: "oneOf" })

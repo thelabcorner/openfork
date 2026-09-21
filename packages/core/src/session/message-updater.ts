@@ -1,6 +1,7 @@
 import { castDraft, produce, type WritableDraft } from "immer"
 import { Effect } from "effect"
 import { SessionEvent } from "./event"
+import { SessionInput } from "./input"
 import { SessionMessage } from "./message"
 
 export type MemoryState = {
@@ -106,6 +107,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             id: event.data.messageID,
             type: "agent-switched",
             metadata: event.metadata,
+            provenance: event.data.provenance,
             agent: event.data.agent,
             time: { created: event.data.timestamp },
           }),
@@ -117,18 +119,22 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             id: event.data.messageID,
             type: "model-switched",
             metadata: event.metadata,
+            provenance: event.data.provenance,
             model: event.data.model,
             time: { created: event.data.timestamp },
           }),
         )
       },
       "session.next.moved": () => Effect.void,
+      // Execution policy is Session state, not conversational history.
+      "session.next.execution-boundary.updated": () => Effect.void,
       "session.next.prompted": (event) => {
         return adapter.appendMessage(
           SessionMessage.User.make({
             id: event.data.messageID,
             type: "user",
             metadata: event.metadata,
+            provenance: event.data.provenance,
             text: event.data.prompt.text,
             files: event.data.prompt.files,
             agents: event.data.prompt.agents,
@@ -137,6 +143,27 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
         )
       },
       "session.next.prompt.admitted": () => Effect.void,
+      "session.next.synthetic.admitted": () => Effect.void,
+      "session.next.synthetic.promoted": (event) => {
+        const item = SessionInput.SyntheticItem.make({
+          type: "synthetic",
+          content: event.data.content,
+          origin: event.data.origin,
+          ...(event.data.delegated === undefined ? {} : { delegated: event.data.delegated }),
+        })
+        return adapter.appendMessage(
+          SessionMessage.Synthetic.make({
+            sessionID: event.data.sessionID,
+            text: event.data.content.text,
+            files: event.data.content.files,
+            id: event.data.messageID,
+            type: "synthetic",
+            provenance: SessionInput.provenanceForSynthetic(event.data.sessionID, item),
+            time: { created: event.data.timestamp },
+          }),
+        )
+      },
+      "session.next.synthetic.revoked": () => Effect.void,
       "session.next.context.updated": (event) =>
         adapter.appendMessage(
           SessionMessage.System.make({
@@ -153,6 +180,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             text: event.data.text,
             id: event.data.messageID,
             type: "synthetic",
+            provenance: event.data.provenance,
             time: { created: event.data.timestamp },
           }),
         )
@@ -390,6 +418,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
             id: event.data.messageID,
             type: "compaction",
             metadata: event.metadata,
+            provenance: event.data.provenance,
             reason: event.data.reason,
             summary: event.data.text,
             recent: event.data.recent,

@@ -330,7 +330,9 @@ const decodeTitleRow = (row: typeof SessionTable.$inferSelect) => {
   }
   return fromRow({
     ...row,
-    model: parseJson<{ id: string; providerID: string; variant?: string }>(row.model as string | null),
+        model: parseJson<{ id: string; providerID: string; accountID?: string; variant?: string }>(
+          row.model as string | null,
+        ),
     revert: parseJson(row.revert as string | null),
   })
 }

@@ -42,6 +42,7 @@ export {
   ToolStatePending,
   ToolStateRunning,
   User,
+  UserTurnProvenance,
   WithParts,
 } from "@opencode-ai/schema/session-v1"
 

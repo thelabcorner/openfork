@@ -22,6 +22,7 @@ export function fromRow(row: typeof SessionTable.$inferSelect): SessionSchema.In
       ? {
           id: ModelV2.ID.make(row.model.id),
           providerID: ProviderV2.ID.make(row.model.providerID),
+          ...(row.model.accountID ? { accountID: row.model.accountID } : {}),
           variant: ModelV2.VariantID.make(row.model.variant ?? "default"),
         }
       : undefined,

@@ -30,6 +30,7 @@ import {
   SessionTable,
 } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { testEffect } from "./lib/effect"
 
@@ -105,6 +106,20 @@ describe("SessionSearch extraction", () => {
       expect(searchText(user)).toBe("hello search world")
       expect(searchText(system)).toBe("system boot message")
       expect(searchText(synthetic)).toBe("synthetic summary")
+    }),
+  )
+
+  it.effect("does not index replaceable Goal STATE publications as historical conversation", () =>
+    Effect.gen(function* () {
+      const state = SessionMessage.Synthetic.make({
+        id: SessionMessage.ID.create(),
+        type: "synthetic",
+        sessionID: SessionV2.ID.make("ses_goal_state_search"),
+        text: '<goal_progress state="current">stale searchable objective</goal_progress>',
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, { ref: "goal-state:test" }),
+        time,
+      })
+      expect(searchText(state)).toBe("")
     }),
   )
 
@@ -619,6 +634,27 @@ describe("SessionSearch V1 part extraction", () => {
       })
       expect(partSearchText(text)).toContain("frobnicate")
       expect(partSearchText(reasoning)).toContain("tradeoffs")
+    }),
+  )
+
+  it.effect("does not index hidden synthetic or ignored V1 text plumbing", () =>
+    Effect.gen(function* () {
+      const synthetic = SessionV1.TextPart.make({
+        ...base,
+        type: "text",
+        text: "hidden Goal projection",
+        synthetic: true,
+        time: { start: 0 },
+      })
+      const ignored = SessionV1.TextPart.make({
+        ...base,
+        type: "text",
+        text: "ignored provider context",
+        ignored: true,
+        time: { start: 0 },
+      })
+      expect(partSearchText(synthetic)).toBe("")
+      expect(partSearchText(ignored)).toBe("")
     }),
   )
 

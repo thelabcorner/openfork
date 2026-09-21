@@ -6,6 +6,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { AgentAttachment, FileAttachment } from "@opencode-ai/core/session/prompt"
 import { toLLMMessages } from "@opencode-ai/core/session/runner/to-llm-message"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { DateTime } from "effect"
 
@@ -14,6 +15,36 @@ const id = (value: string) => SessionMessage.ID.make(`msg_${value}`)
 const model = Model.make({ id: "model", provider: "provider", route: OpenAIChat.route })
 
 describe("toLLMMessages", () => {
+  test("keeps historical STATE structurally transparent while including live STATE", () => {
+    const live = SessionMessage.Synthetic.make({
+      id: id("goal-state-live"),
+      type: "synthetic",
+      sessionID: SessionV2.ID.make("ses_state_context"),
+      text: "current progress",
+      provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+        ref: "goal.progress:live",
+      }),
+      time: { created },
+    })
+    const historical = SessionMessage.Synthetic.make({
+      id: id("goal-state-historical"),
+      type: "synthetic",
+      sessionID: SessionV2.ID.make("ses_state_context"),
+      text: "stale imported progress",
+      provenance: {
+        ...SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+          ref: "goal.progress:historical",
+        }),
+        lifetime: "historical",
+      },
+      time: { created },
+    })
+
+    const messages = toLLMMessages([historical, live], model)
+    expect(messages).toHaveLength(1)
+    expect(messages[0]?.id).toBe(live.id)
+  })
+
   test("omits empty assistant turns", () => {
     const assistant = (value: string, content: SessionMessage.Assistant["content"]) =>
       SessionMessage.Assistant.make({

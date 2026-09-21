@@ -16,6 +16,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
@@ -178,6 +179,42 @@ describe("active runner history projection", () => {
         SessionMessage.ID.make("msg_a"),
         SessionMessage.ID.make("msg_b"),
       ])
+
+      yield* history.close
+    }),
+  )
+
+  it.effect("serves live Goal state projection indexes from memory after the initial history snapshot", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionV2.ID.make("ses_runner_history_goal_state")
+      const { readDb, events } = yield* setup(sessionID)
+      let denyReads = false
+      const guardedReadDb = new Proxy(readDb as object, {
+        get(target, property, receiver) {
+          if (denyReads && property === "select") throw new Error("unexpected history database read")
+          const value = Reflect.get(target, property, receiver)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      }) as typeof readDb
+      const history = yield* makeRunnerHistoryProjection({ events, readDb: guardedReadDb, sessionID })
+
+      // One authoritative snapshot is allowed to initialize the projection.
+      expect(yield* history.stateProjections(-1)).toMatchObject({ messages: expect.any(Map) })
+      denyReads = true
+
+      yield* events.publish(SessionEvent.Synthetic, {
+        sessionID,
+        messageID: SessionMessage.ID.make("msg_goal_state_live"),
+        timestamp: DateTime.makeUnsafe(10),
+        text: "live Goal progress",
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+          ref: "goal-state:v1:progress:gol_test:" + "a".repeat(64),
+        }),
+      })
+      const first = yield* history.stateProjections(-1)
+      const second = yield* history.stateProjections(-1)
+      expect(first.messages.get(SessionTurnProvenance.Source.GoalProgress)?.text).toBe("live Goal progress")
+      expect(String(second.messages.get(SessionTurnProvenance.Source.GoalProgress)?.id)).toBe("msg_goal_state_live")
 
       yield* history.close
     }),

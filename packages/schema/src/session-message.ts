@@ -7,6 +7,7 @@ import { Model } from "./model"
 import { FileAttachment, Prompt } from "./prompt"
 import { DateTimeUtcFromMillis, RelativePath, statics } from "./schema"
 import { SessionID } from "./session-id"
+import { SessionTurnProvenance } from "./session-turn-provenance"
 import { ascending } from "./identifier"
 
 export const ID = Schema.String.check(Schema.isStartsWith("msg_")).pipe(
@@ -14,6 +15,31 @@ export const ID = Schema.String.check(Schema.isStartsWith("msg_")).pipe(
   statics((schema) => ({ create: () => schema.make("msg_" + ascending()) })),
 )
 export type ID = typeof ID.Type
+
+/**
+ * Durable conversational provenance for current/V2 messages.
+ *
+ * Optional on message schemas for rows/events created before provenance existed.
+ * Trusted first-party producers must stamp it at admission/publication.
+ */
+export const Provenance = Schema.Union([
+  Schema.Struct({
+    owner: Schema.Literal("user"),
+    source: Schema.String,
+    lifetime: Schema.Literal("historical").pipe(optional),
+  }),
+  Schema.Struct({
+    owner: Schema.Literal("host"),
+    source: Schema.String,
+    sourceMessageID: ID.pipe(optional),
+    ref: Schema.String.pipe(optional),
+    lifetime: Schema.Literal("historical").pipe(optional),
+  }),
+]).annotate({ discriminator: "owner", identifier: "Session.Message.Provenance" })
+export type Provenance = Schema.Schema.Type<typeof Provenance>
+
+export const ProvenanceSource = SessionTurnProvenance.Source
+export type ProvenanceSource = SessionTurnProvenance.Source
 
 export interface UnknownError extends Schema.Schema.Type<typeof UnknownError> {}
 export const UnknownError = Schema.Struct({
@@ -31,6 +57,7 @@ export interface AgentSwitched extends Schema.Schema.Type<typeof AgentSwitched> 
 export const AgentSwitched = Schema.Struct({
   ...Base,
   type: Schema.Literal("agent-switched"),
+  provenance: Provenance.pipe(optional),
   agent: Schema.String,
 }).annotate({ identifier: "Session.Message.AgentSwitched" })
 
@@ -38,12 +65,14 @@ export interface ModelSwitched extends Schema.Schema.Type<typeof ModelSwitched> 
 export const ModelSwitched = Schema.Struct({
   ...Base,
   type: Schema.Literal("model-switched"),
+  provenance: Provenance.pipe(optional),
   model: Model.Ref,
 }).annotate({ identifier: "Session.Message.ModelSwitched" })
 
 export interface User extends Schema.Schema.Type<typeof User> {}
 export const User = Schema.Struct({
   ...Base,
+  provenance: Provenance.pipe(optional),
   text: Prompt.fields.text,
   files: Prompt.fields.files,
   agents: Prompt.fields.agents,
@@ -53,8 +82,10 @@ export const User = Schema.Struct({
 export interface Synthetic extends Schema.Schema.Type<typeof Synthetic> {}
 export const Synthetic = Schema.Struct({
   ...Base,
+  provenance: Provenance.pipe(optional),
   sessionID: SessionID,
   text: Schema.String,
+  files: Schema.Array(FileAttachment).pipe(optional),
   type: Schema.Literal("synthetic"),
 }).annotate({ identifier: "Session.Message.Synthetic" })
 
@@ -197,6 +228,7 @@ export const Assistant = Schema.Struct({
 export interface Compaction extends Schema.Schema.Type<typeof Compaction> {}
 export const Compaction = Schema.Struct({
   type: Schema.Literal("compaction"),
+  provenance: Provenance.pipe(optional),
   reason: Schema.Literals(["auto", "manual"]),
   summary: Schema.String,
   recent: Schema.String,

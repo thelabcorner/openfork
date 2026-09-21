@@ -5,8 +5,12 @@ import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2, resolveProjectionRef } from "../event"
 import { makeGlobalNode } from "../effect/app-node"
+import { ModelV2 } from "../model"
+import { ProviderV2 } from "../provider"
 import { SessionEvent } from "./event"
+import { SessionSchema } from "./schema"
 import { SessionV1 } from "../v1/session"
+import { SessionTurnProvenance as SharedTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { SessionMessage } from "./message"
 import { SessionMessageProjection } from "./message-projection"
@@ -24,6 +28,7 @@ import {
   type SessionMessageSettlement,
 } from "./sql"
 import { SessionSearch } from "./search"
+import { SessionExecutionBoundaryTable } from "./execution-boundary.sql"
 import { searchText, partSearchText } from "./search-text"
 import type { DeepMutable } from "../schema"
 import { EventValueTable } from "../event/sql"
@@ -123,6 +128,241 @@ function applyUsage(
     .pipe(Effect.orDie)
 }
 
+const legacyProvenance = (provenance: SessionMessage.Provenance): SessionV1.UserTurnProvenance =>
+  provenance.owner === "user"
+    ? { owner: "user", source: provenance.source }
+    : {
+        owner: "host",
+        source: provenance.source,
+        ...(provenance.sourceMessageID
+          ? { sourceMessageID: SessionV1.MessageID.ascending(provenance.sourceMessageID) }
+          : {}),
+        ...(provenance.ref ? { ref: provenance.ref } : {}),
+      }
+
+const writeLegacyUserProjection = Effect.fnUntraced(function* (
+  db: DatabaseService,
+  input: {
+    readonly info: SessionV1.User
+    readonly parts: readonly SessionV1.Part[]
+    readonly label: string
+  },
+) {
+  const data = messageData(input.info)
+  const existingMessage = yield* db
+    .select()
+    .from(MessageTable)
+    .where(eq(MessageTable.id, input.info.id))
+    .get()
+    .pipe(Effect.orDie)
+  if (existingMessage) {
+    if (
+      existingMessage.session_id !== input.info.sessionID ||
+      JSON.stringify(existingMessage.data) !== JSON.stringify(data)
+    )
+      return yield* Effect.die(`${input.label} V1 projection collision for ${input.info.id}`)
+  } else {
+    yield* db
+      .insert(MessageTable)
+      .values({
+        id: input.info.id,
+        session_id: input.info.sessionID,
+        time_created: input.info.time.created,
+        data,
+      })
+      .run()
+      .pipe(Effect.orDie)
+  }
+
+  for (const part of input.parts) {
+    const data = partData(part)
+    const search = partSearchText(part)
+    const existing = yield* db.select().from(PartTable).where(eq(PartTable.id, part.id)).get().pipe(Effect.orDie)
+    if (existing) {
+      if (
+        existing.message_id !== part.messageID ||
+        existing.session_id !== part.sessionID ||
+        JSON.stringify(existing.data) !== JSON.stringify(data)
+      )
+        return yield* Effect.die(`${input.label} V1 part projection collision for ${part.id}`)
+      continue
+    }
+    yield* db
+      .insert(PartTable)
+      .values({
+        id: part.id,
+        message_id: part.messageID,
+        session_id: part.sessionID,
+        time_created: input.info.time.created,
+        data,
+        search_text: search,
+      })
+      .run()
+      .pipe(Effect.orDie)
+  }
+})
+
+const projectLegacyPrompted = Effect.fnUntraced(function* (
+  db: DatabaseService,
+  event: typeof SessionEvent.Prompted.Type,
+) {
+  const session = yield* db
+    .select({ agent: SessionTable.agent, model: SessionTable.model })
+    .from(SessionTable)
+    .where(eq(SessionTable.id, event.data.sessionID))
+    .get()
+    .pipe(Effect.orDie)
+  if (!session?.agent || !session.model) return
+  // Historical current events can predate mandatory provenance. The V1
+  // execution adapter must not invent user/host authority for them from shape.
+  // New SessionInput admissions always stamp provenance before promotion.
+  if (!event.data.provenance) return
+
+  const id = SessionV1.MessageID.ascending(event.data.messageID)
+  const info: SessionV1.User = {
+    id,
+    sessionID: event.data.sessionID,
+    role: "user",
+    provenance: legacyProvenance(event.data.provenance),
+    time: { created: DateTime.toEpochMillis(event.data.timestamp) },
+    agent: session.agent,
+    model: {
+      providerID: ProviderV2.ID.make(session.model.providerID),
+      modelID: ModelV2.ID.make(session.model.id),
+      ...(session.model.variant ? { variant: session.model.variant } : {}),
+    },
+  }
+  const parts: SessionV1.Part[] = [
+    ...(event.data.prompt.text.length > 0
+      ? ([
+          {
+            id: SessionV1.PartID.ascending(`prt_prompt_${String(id).slice(4)}_text`),
+            messageID: id,
+            sessionID: event.data.sessionID,
+            type: "text",
+            text: event.data.prompt.text,
+          } satisfies SessionV1.TextPart,
+        ] as const)
+      : []),
+    ...(event.data.prompt.files ?? []).map(
+      (file, index): SessionV1.FilePart => ({
+        id: SessionV1.PartID.ascending(`prt_prompt_${String(id).slice(4)}_file_${index}`),
+        messageID: id,
+        sessionID: event.data.sessionID,
+        type: "file",
+        mime: file.mime,
+        ...(file.name ? { filename: file.name } : {}),
+        url: file.uri,
+      }),
+    ),
+    ...(event.data.prompt.agents ?? []).map(
+      (agent, index): SessionV1.AgentPart => ({
+        id: SessionV1.PartID.ascending(`prt_prompt_${String(id).slice(4)}_agent_${index}`),
+        messageID: id,
+        sessionID: event.data.sessionID,
+        type: "agent",
+        name: agent.name,
+        ...(agent.source
+          ? { source: { value: agent.source.text, start: agent.source.start, end: agent.source.end } }
+          : {}),
+      }),
+    ),
+  ]
+  yield* writeLegacyUserProjection(db, { info, parts, label: "Prompted" })
+})
+
+/**
+ * Compatibility lowering for the mature V1 execution runtime.
+ *
+ * The durable fact remains one current `SyntheticPromoted` event and one
+ * current semantic `SessionMessage.Synthetic`. V1 still consumes its legacy
+ * message/part projection, so SessionProjector lowers the same event into a
+ * provider-user-shaped V1 turn here. Swarm and other producers never dual-write
+ * transcript history themselves.
+ */
+const projectLegacySynthetic = Effect.fnUntraced(function* (
+  db: DatabaseService,
+  event: typeof SessionEvent.SyntheticPromoted.Type,
+) {
+  const session = yield* db
+    .select({ agent: SessionTable.agent, model: SessionTable.model })
+    .from(SessionTable)
+    .where(eq(SessionTable.id, event.data.sessionID))
+    .get()
+    .pipe(Effect.orDie)
+
+  // SyntheticExecution is the turn-owned execution identity for trusted
+  // producers. Older producers predate that field and continue to inherit the
+  // Session's current agent/model as a compatibility fallback.
+  const execution =
+    event.data.execution ??
+    (session?.agent && session.model
+      ? {
+          agent: session.agent,
+          model: {
+            id: ModelV2.ID.make(session.model.id),
+            providerID: ProviderV2.ID.make(session.model.providerID),
+            ...(session.model.accountID ? { accountID: session.model.accountID } : {}),
+            ...(session.model.variant && session.model.variant !== "default"
+              ? { variant: session.model.variant as never }
+              : {}),
+          },
+        }
+      : undefined)
+  // Current-only Sessions with neither explicit Synthetic execution identity
+  // nor a V1-compatible Session selection need no legacy projection.
+  if (!execution) return
+
+  const item = SessionInput.SyntheticItem.make({
+    type: "synthetic",
+    content: event.data.content,
+    origin: event.data.origin,
+    ...(event.data.delegated === undefined ? {} : { delegated: event.data.delegated }),
+    ...(event.data.execution === undefined ? {} : { execution: event.data.execution }),
+  })
+  const currentProvenance = SessionInput.provenanceForSynthetic(event.data.sessionID, item)
+  if (currentProvenance.owner !== "host")
+    return yield* Effect.die(`Synthetic projection unexpectedly resolved non-host provenance for ${event.data.messageID}`)
+  const provenance = legacyProvenance(currentProvenance)
+  const legacyMessageID = SessionV1.MessageID.ascending(event.data.messageID)
+  const info: SessionV1.User = {
+    id: legacyMessageID,
+    sessionID: event.data.sessionID,
+    role: "user",
+    provenance,
+    time: { created: DateTime.toEpochMillis(event.data.timestamp) },
+    agent: execution.agent,
+    model: {
+      providerID: execution.model.providerID,
+      modelID: execution.model.id,
+      ...(execution.model.accountID ? { accountID: execution.model.accountID } : {}),
+      ...(execution.model.variant ? { variant: execution.model.variant } : {}),
+    },
+  }
+  const parts: SessionV1.Part[] = [
+    {
+      id: SessionV1.PartID.ascending(`prt_synthetic_${String(info.id).slice(4)}_text`),
+      messageID: info.id,
+      sessionID: info.sessionID,
+      type: "text",
+      text: event.data.content.text,
+      synthetic: true,
+    },
+    ...(event.data.content.files ?? []).map(
+      (file, index): SessionV1.FilePart => ({
+        id: SessionV1.PartID.ascending(`prt_synthetic_${String(info.id).slice(4)}_file_${index}`),
+        messageID: info.id,
+        sessionID: info.sessionID,
+        type: "file",
+        mime: file.mime,
+        ...(file.name ? { filename: file.name } : {}),
+        url: file.uri,
+      }),
+    ),
+  ]
+  yield* writeLegacyUserProjection(db, { info, parts, label: "Synthetic" })
+})
+
 function run(db: DatabaseService, event: SessionEvent.Event) {
   return Effect.gen(function* () {
     // `search_text` is backed by an external-content FTS5 table. Most assistant
@@ -204,7 +444,7 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
 
       const messageID = event.data.assistantMessageID
       const target = yield* db
-        .select({ id: SessionMessageTable.id })
+        .select({ id: SessionMessageTable.id, data: SessionMessageTable.data })
         .from(SessionMessageTable)
         .where(
           and(
@@ -216,6 +456,14 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
         .get()
         .pipe(Effect.orDie)
       if (!target) return true
+
+      // A prior OPCL rebuild may have collapsed the canonical assistant JSON to
+      // an event_value reference. Lifecycle-only mutations must remain entirely
+      // in the sidecar and therefore must not materialize/release that root.
+      // Remember it here so the cold-reader overlay can decode the referenced
+      // canonical payload without routing through updateMessage().
+      const targetRef = projectionRefID(target.data)
+      if (targetRef) projectionRefs.set(SessionMessage.ID.make(target.id), targetRef)
 
       if (event.type === SessionEvent.Step.Streamed.type) {
         const streamedAt = DateTime.toEpochMillis(event.data.timestamp)
@@ -264,7 +512,7 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
 
     if (yield* patchAssistantLifecycle()) return
 
-    // Progress and settlement events already own the canonical tool payload in
+    // Tool call existence plus progress/settlement events already own the canonical tool payload in
     // the durable event log. Rewriting that same payload into the assistant row
     // duplicates large media while SQLite's one writer is held, and later tool
     // mutations repeatedly copy every earlier result in the assistant. Keep a
@@ -274,6 +522,7 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
     const patchToolOverlay = Effect.fnUntraced(function* () {
       if (event.durable === undefined) return false
       if (
+        event.type !== SessionEvent.Tool.Called.type &&
         event.type !== SessionEvent.Tool.Progress.type &&
         event.type !== SessionEvent.Tool.Success.type &&
         event.type !== SessionEvent.Tool.Failed.type
@@ -294,6 +543,21 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
         .get()
         .pipe(Effect.orDie)
       if (!target) return true
+
+      if (event.type === SessionEvent.Tool.Called.type) {
+        // Persist the unresolved call key immediately. A hard crash can happen
+        // before the first progress event, and recovery must still discover that
+        // outcome-uncertain call without scanning/decoding Session history.
+        yield* db
+          .insert(SessionMessageToolOverlayTable)
+          .values({ message_id: messageID, call_id: event.data.callID })
+          .onConflictDoNothing({
+            target: [SessionMessageToolOverlayTable.message_id, SessionMessageToolOverlayTable.call_id],
+          })
+          .run()
+          .pipe(Effect.orDie)
+        return false
+      }
 
       if (event.type === SessionEvent.Tool.Progress.type) {
         yield* db
@@ -446,6 +710,24 @@ const layer = Layer.effectDiscard(
         }
       }),
     )
+    yield* events.project(SessionEvent.ExecutionBoundaryUpdated, (event) =>
+      db
+        .insert(SessionExecutionBoundaryTable)
+        .values({
+          session_id: event.data.sessionID,
+          boundary: event.data.boundary,
+          time_updated: DateTime.toEpochMillis(event.data.timestamp),
+        })
+        .onConflictDoUpdate({
+          target: SessionExecutionBoundaryTable.session_id,
+          set: {
+            boundary: event.data.boundary,
+            time_updated: DateTime.toEpochMillis(event.data.timestamp),
+          },
+        })
+        .run()
+        .pipe(Effect.orDie),
+    )
     yield* events.project(SessionV1.Event.Updated, (event) =>
       db
         .update(SessionTable)
@@ -487,6 +769,23 @@ const layer = Layer.effectDiscard(
           .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
           .run()
           .pipe(Effect.orDie)
+        if (
+          event.durable !== undefined &&
+          event.data.info.role === "user" &&
+          event.data.info.provenance?.owner === "user" &&
+          SharedTurnProvenance.policy(event.data.info.provenance.source)?.kind === "user"
+        ) {
+          yield* SessionInput.projectLegacyPromotedUser(db, {
+            seq: event.durable.seq,
+            id: SessionMessage.ID.make(event.data.info.id),
+            sessionID: SessionSchema.ID.make(sessionID),
+            provenance: {
+              owner: "user",
+              source: event.data.info.provenance.source,
+            },
+            timeCreated: time_created,
+          })
+        }
       }),
     )
     yield* events.project(SessionV1.Event.MessageRemoved, (event) =>
@@ -588,10 +887,12 @@ const layer = Layer.effectDiscard(
           sessionID: event.data.sessionID,
           prompt: event.data.prompt,
           delivery: event.data.delivery,
+          provenance: event.data.provenance,
           timeCreated: event.data.timestamp,
           promotedSeq: event.durable.seq,
         })
         yield* run(db, event)
+        yield* projectLegacyPrompted(db, event)
       }),
     )
     yield* events.project(SessionEvent.PromptAdmitted, (event) =>
@@ -603,7 +904,57 @@ const layer = Layer.effectDiscard(
           sessionID: event.data.sessionID,
           prompt: event.data.prompt,
           delivery: event.data.delivery,
+          provenance: event.data.provenance,
           timeCreated: event.data.timestamp,
+        })
+      }),
+    )
+    yield* events.project(SessionEvent.SyntheticAdmitted, (event) =>
+      Effect.gen(function* () {
+        if (event.durable === undefined) return yield* Effect.die("Durable Session event is missing aggregate sequence")
+        yield* SessionInput.projectSyntheticAdmitted(db, {
+          admittedSeq: event.durable.seq,
+          id: event.data.messageID,
+          sessionID: event.data.sessionID,
+          content: event.data.content,
+          origin: event.data.origin,
+          delegated: event.data.delegated,
+          execution: event.data.execution,
+          delivery: event.data.delivery,
+          admissionClass: event.data.admissionClass,
+          userPreemptible: event.data.userPreemptible,
+          timeCreated: event.data.timestamp,
+        })
+      }),
+    )
+    yield* events.project(SessionEvent.SyntheticPromoted, (event) =>
+      Effect.gen(function* () {
+        if (event.durable === undefined) return yield* Effect.die("Durable Session event is missing aggregate sequence")
+        yield* SessionInput.projectSyntheticPromoted(db, {
+          promotedSeq: event.durable.seq,
+          id: event.data.messageID,
+          sessionID: event.data.sessionID,
+          content: event.data.content,
+          origin: event.data.origin,
+          delegated: event.data.delegated,
+          execution: event.data.execution,
+          delivery: event.data.delivery,
+          admissionClass: event.data.admissionClass,
+          userPreemptible: event.data.userPreemptible,
+          timeCreated: event.data.timestamp,
+        })
+        yield* run(db, event)
+        yield* projectLegacySynthetic(db, event)
+      }),
+    )
+    yield* events.project(SessionEvent.SyntheticRevoked, (event) =>
+      Effect.gen(function* () {
+        if (event.durable === undefined) return yield* Effect.die("Durable Session event is missing aggregate sequence")
+        yield* SessionInput.projectSyntheticRevoked(db, {
+          revokedSeq: event.durable.seq,
+          id: event.data.messageID,
+          sessionID: event.data.sessionID,
+          reason: event.data.reason,
         })
       }),
     )

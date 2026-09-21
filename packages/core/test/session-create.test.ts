@@ -369,6 +369,62 @@ describe("SessionV2.create", () => {
     }),
   )
 
+  it.effect("persists account-aware OXP model selection provenance through the durable Session owner", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionV2.Service
+      const created = yield* session.create({ location })
+      const model = ModelV2.Ref.make({
+        id: ModelV2.ID.make("deepseek-v4.1-flash"),
+        providerID: ProviderV2.ID.make("workbuddy"),
+        accountID: "wb-test-account",
+        variant: ModelV2.VariantID.make("max"),
+      })
+      const provenance = {
+        owner: "host" as const,
+        source: "oxp.supervisor",
+        ref: "oxp:test-connector",
+      }
+
+      yield* session.switchModel({
+        sessionID: created.id,
+        model,
+        provenance,
+      })
+
+      expect(yield* session.get(created.id)).toMatchObject({ model })
+      expect(
+        Array.from(
+          yield* session.events({ sessionID: created.id }).pipe(
+            Stream.take(1),
+            Stream.runCollect,
+          ),
+        ),
+      ).toMatchObject([
+        {
+          type: "session.next.model.switched",
+          data: { model, provenance },
+        },
+      ])
+    }),
+  )
+
+  it.effect("preserves an explicit provider account when the Session is created with a model", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionV2.Service
+      const model = ModelV2.Ref.make({
+        id: ModelV2.ID.make("deepseek-v4.1-flash"),
+        providerID: ProviderV2.ID.make("workbuddy"),
+        accountID: "wb-create-account",
+        variant: ModelV2.VariantID.make("max"),
+      })
+
+      const created = yield* session.create({ location, model })
+
+      expect(created.model).toEqual(model)
+      expect((yield* session.get(created.id)).model).toEqual(model)
+    }),
+  )
+
   it.effect("ignores a model switch when the selected model is unchanged", () =>
     Effect.gen(function* () {
       const session = yield* SessionV2.Service

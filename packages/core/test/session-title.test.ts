@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { DateTime, Effect, Fiber } from "effect"
+import { LLMEvent, ModelID } from "@opencode-ai/llm"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -7,6 +8,9 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionHistory } from "@opencode-ai/core/session/history"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
+import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -194,6 +198,78 @@ describe("SessionTitle.regenerate", () => {
         ),
       ).toBe(true)
       expect(h.titleRequests.length).toBe(1)
+      const { readDb } = yield* Database.Service
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "session_title",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const prompts = history.filter(
+        (message) =>
+          message.type === "synthetic" &&
+          message.provenance?.owner === "host" &&
+          message.provenance.source === SessionTurnProvenance.Source.SessionTitle,
+      )
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]?.type === "synthetic" ? prompts[0].text : "").toContain("first message")
+      expect(
+        prompts[0]?.type === "synthetic" && prompts[0].provenance?.owner === "host"
+          ? prompts[0].provenance.ref
+          : undefined,
+      ).toBeTruthy()
+      expect(prompts[0] && SessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+      const toolStates = history.flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.filter((part) => part.type === "tool").map((part) => ({ name: part.name, status: part.state.status }))
+          : [],
+      )
+      expect(toolStates).toContainEqual({ name: SessionTitle.GENERATED_TITLE_TOOL, status: "completed" })
+      expect(toolStates.some((tool) => tool.status === "pending" || tool.status === "running")).toBe(false)
+    }),
+  )
+
+  fx.live("shared settlement fail-safe errors a forgotten provider tool before ending the assistant step", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitle([
+        LLMEvent.toolCall({
+          id: "provider-hosted-tool",
+          name: "provider_lookup",
+          input: { query: "context" },
+          providerExecuted: true,
+        }),
+        LLMEvent.toolCall({
+          id: "generated-title",
+          name: SessionTitle.GENERATED_TITLE_TOOL,
+          input: { title: "Fail-safe title" },
+        }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ])
+      yield* regenerate()
+      expect(yield* waitForTitle("Fail-safe title")).toBe(true)
+
+      const { readDb } = yield* Database.Service
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "session_title",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const tools = history.flatMap((message) =>
+        message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+      )
+      expect(tools.map((tool) => ({ name: tool.name, status: tool.state.status }))).toContainEqual({
+        name: SessionTitle.GENERATED_TITLE_TOOL,
+        status: "completed",
+      })
+      expect(tools.map((tool) => ({ name: tool.name, status: tool.state.status }))).toContainEqual({
+        name: "provider_lookup",
+        status: "error",
+      })
+      expect(tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")).toBe(false)
     }),
   )
 
@@ -319,7 +395,7 @@ describe("SessionTitle model cascade", () => {
       h.enqueueTitle(generatedTitleCompletion("Title"))
       yield* regenerate()
       expect(yield* waitForTitle("Title")).toBe(true)
-      expect(h.titleRequests.at(-1)?.model.id).toBe("fake-model")
+      expect(h.titleRequests.at(-1)?.model.id).toBe(ModelID.make("fake-model"))
     }),
   )
 
@@ -334,7 +410,7 @@ describe("SessionTitle model cascade", () => {
       h.enqueueTitle(generatedTitleCompletion("Title"))
       yield* regenerate()
       expect(yield* waitForTitle("Title")).toBe(true)
-      expect(h.titleRequests.at(-1)?.model.id).toBe("small-v1")
+      expect(h.titleRequests.at(-1)?.model.id).toBe(ModelID.make("small-v1"))
     }),
   )
 
@@ -352,7 +428,7 @@ describe("SessionTitle model cascade", () => {
         }),
       })
       expect(yield* waitForTitle("Title")).toBe(true)
-      expect(h.titleRequests.at(-1)?.model.id).toBe("picker-v1")
+      expect(h.titleRequests.at(-1)?.model.id).toBe(ModelID.make("picker-v1"))
     }),
   )
 
@@ -367,7 +443,7 @@ describe("SessionTitle model cascade", () => {
       h.enqueueTitle(generatedTitleCompletion("Title"))
       yield* regenerate()
       expect(yield* waitForTitle("Title")).toBe(true)
-      expect(h.titleRequests.at(-1)?.model.id).toBe("catalog-small")
+      expect(h.titleRequests.at(-1)?.model.id).toBe(ModelID.make("catalog-small"))
     }),
   )
 

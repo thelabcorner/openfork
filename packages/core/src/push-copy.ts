@@ -17,6 +17,17 @@ export type PushSessionCopy = {
   projectLabel?: string
 }
 
+export type PushScheduledRunContext = {
+  name: string
+  targetDirectory?: string | null
+}
+
+export type PushScheduledRunOutcome = {
+  status: "succeeded" | "failed" | "skipped" | "abandoned"
+  errorMessage?: string | null
+  skipReason?: string | null
+}
+
 const FALLBACK_TITLE = "Untitled chat"
 
 export function sessionTitle(context: PushSessionContext | undefined, sessionID: string) {
@@ -91,6 +102,36 @@ export function questionCopy(
     title: truncate(`Question · ${title}`, 120),
     body: truncate(project ? `${project} · ${questionText}` : questionText, 240),
     sessionTitle: title,
+    ...(project ? { projectLabel: project } : {}),
+  }
+}
+
+export function scheduledRunCopy(
+  context: PushScheduledRunContext,
+  outcome: PushScheduledRunOutcome,
+): PushSessionCopy {
+  const name = clean(context.name, 96) || "Scheduled task"
+  const project = projectLabel({ directory: context.targetDirectory })
+  const label =
+    outcome.status === "succeeded"
+      ? "Completed"
+      : outcome.status === "failed"
+        ? "Failed"
+        : outcome.status === "skipped"
+          ? "Skipped"
+          : "Interrupted"
+  const detail =
+    outcome.status === "failed"
+      ? errorText(outcome.errorMessage) || "The scheduled run failed."
+      : outcome.status === "skipped"
+        ? clean(outcome.skipReason?.replaceAll("_", " "), 180) || "The scheduled run was skipped."
+        : outcome.status === "abandoned"
+          ? "The scheduled run stopped before completion."
+          : "The scheduled run completed successfully."
+  return {
+    title: truncate(`${label} · ${name}`, 120),
+    body: truncate(project ? `${project} · ${detail}` : detail, 240),
+    sessionTitle: name,
     ...(project ? { projectLabel: project } : {}),
   }
 }

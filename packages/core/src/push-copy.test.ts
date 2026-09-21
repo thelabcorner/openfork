@@ -6,6 +6,7 @@ import {
   permissionCopy,
   projectLabel,
   questionCopy,
+  scheduledRunCopy,
   sessionTitle,
 } from "./push-copy"
 
@@ -36,5 +37,26 @@ describe("push notification copy", () => {
   test("falls back to a safe directory label and session id", () => {
     expect(projectLabel({ directory: "C:\\work\\mobile" })).toBe("mobile")
     expect(sessionTitle({}, "ses_abcdef123")).toBe("Untitled chat · bcdef123")
+  })
+
+  test("formats scheduled run outcomes without depending on session history", () => {
+    expect(
+      scheduledRunCopy(
+        { name: "Nightly dependency audit", targetDirectory: "C:\\work\\opencode" },
+        { status: "failed", errorMessage: "Provider timed out" },
+      ),
+    ).toMatchObject({
+      title: "Failed · Nightly dependency audit",
+      body: "opencode · Provider timed out",
+    })
+    expect(
+      scheduledRunCopy(
+        { name: "Nightly dependency audit", targetDirectory: "/work/opencode" },
+        { status: "skipped", skipReason: "target_missing" },
+      ),
+    ).toMatchObject({
+      title: "Skipped · Nightly dependency audit",
+      body: "opencode · target missing",
+    })
   })
 })

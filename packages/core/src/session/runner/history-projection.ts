@@ -6,12 +6,17 @@ import { SessionHistory } from "../history"
 import { SessionMessage } from "../message"
 import { SessionMessageUpdater } from "../message-updater"
 import { SessionSchema } from "../schema"
+import { SessionTurnProvenance } from "../turn-provenance"
 
 type DatabaseService = Database.Interface["db"]
 type Entry = SessionHistory.RunnerEntry
 
 export interface RunnerHistoryProjection {
   readonly entries: (baselineSeq: number) => Effect.Effect<readonly Entry[]>
+  readonly stateProjections: (baselineSeq: number) => Effect.Effect<{
+    readonly resetBoundary?: SessionMessage.ID
+    readonly messages: ReadonlyMap<string, SessionMessage.Synthetic>
+  }>
   readonly close: Effect.Effect<void>
 }
 
@@ -21,7 +26,10 @@ function makeProjection(initial: readonly Entry[]) {
   const entries: Entry[] = initial.map((entry) => ({ seq: entry.seq, message: entry.message }))
   const byID = new Map<SessionMessage.ID, number>()
   const shellByCallID = new Map<string, number>()
+  const stateBySource = new Map<string, SessionMessage.Synthetic>()
   let latestAssistant = -1
+  let latestCompactionSeq: number | undefined
+  let latestCompactionID: SessionMessage.ID | undefined
   let appendSeq = -1
   let version = 0
   let cachedView:
@@ -31,12 +39,23 @@ function makeProjection(initial: readonly Entry[]) {
   const rebuildIndexes = () => {
     byID.clear()
     shellByCallID.clear()
+    stateBySource.clear()
     latestAssistant = -1
+    latestCompactionSeq = undefined
+    latestCompactionID = undefined
     for (let index = 0; index < entries.length; index++) {
-      const message = entries[index]!.message
+      const entry = entries[index]!
+      const message = entry.message
       byID.set(message.id, index)
       if (message.type === "assistant") latestAssistant = index
       if (message.type === "shell") shellByCallID.set(message.callID, index)
+      if (message.type === "compaction") {
+        latestCompactionSeq = entry.seq
+        latestCompactionID = message.id
+        stateBySource.clear()
+      } else if (message.type === "synthetic" && SessionTurnProvenance.isStateProjection(message)) {
+        stateBySource.set(message.provenance!.source, message)
+      }
     }
   }
   rebuildIndexes()
@@ -93,6 +112,13 @@ function makeProjection(initial: readonly Entry[]) {
         byID.set(message.id, index)
         if (message.type === "assistant") latestAssistant = index
         if (message.type === "shell") shellByCallID.set(message.callID, index)
+        if (message.type === "compaction") {
+          latestCompactionSeq = appendSeq
+          latestCompactionID = message.id
+          stateBySource.clear()
+        } else if (message.type === "synthetic" && SessionTurnProvenance.isStateProjection(message)) {
+          stateBySource.set(message.provenance!.source, message)
+        }
         version++
         cachedView = undefined
       }),
@@ -121,23 +147,21 @@ function makeProjection(initial: readonly Entry[]) {
 
   const view = (baselineSeq: number): readonly Entry[] => {
     if (cachedView?.version === version && cachedView.baselineSeq === baselineSeq) return cachedView.entries
-    let compactionSeq: number | undefined
-    for (let index = entries.length - 1; index >= 0; index--) {
-      const entry = entries[index]!
-      if (entry.message.type !== "compaction") continue
-      compactionSeq = entry.seq
-      break
-    }
     const visible = entries.filter((entry) => {
       if (entry.message.type === "system" && entry.seq <= baselineSeq) return false
-      if (compactionSeq === undefined) return true
-      return entry.seq >= compactionSeq || (entry.message.type === "system" && entry.seq > baselineSeq)
+      if (latestCompactionSeq === undefined) return true
+      return entry.seq >= latestCompactionSeq || (entry.message.type === "system" && entry.seq > baselineSeq)
     })
     cachedView = { version, baselineSeq, entries: visible }
     return visible
   }
 
-  return { apply, view }
+  const stateProjections = () => ({
+    ...(latestCompactionID ? { resetBoundary: latestCompactionID } : {}),
+    messages: new Map(stateBySource) as ReadonlyMap<string, SessionMessage.Synthetic>,
+  })
+
+  return { apply, view, stateProjections }
 }
 
 /**
@@ -225,5 +249,10 @@ export const makeRunnerHistoryProjection = Effect.fn("SessionRunnerHistory.make"
     return projection!.view(baselineSeq)
   })
 
-  return { entries, close } satisfies RunnerHistoryProjection
+  const stateProjections = Effect.fn("SessionRunnerHistory.stateProjections")(function* (baselineSeq: number) {
+    yield* entries(baselineSeq)
+    return projection!.stateProjections()
+  })
+
+  return { entries, stateProjections, close } satisfies RunnerHistoryProjection
 })

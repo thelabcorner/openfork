@@ -109,7 +109,15 @@ export type ForkOrigin = typeof ForkOrigin.Type
 
 // ── Ledger ────────────────────────────────────────────────────────
 
-export const LedgerEntryType = Schema.Literals(["system", "user", "assistant", "tool", "compaction"])
+export const LedgerEntryType = Schema.Literals([
+  "system",
+  "user",
+  "synthetic",
+  "shell",
+  "assistant",
+  "tool",
+  "compaction",
+])
 export type LedgerEntryType = typeof LedgerEntryType.Type
 
 export const LedgerEntry = Schema.Struct({

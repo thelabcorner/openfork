@@ -1,16 +1,109 @@
 export * as SessionRecovery from "./recovery"
 
-import { and, eq, inArray, isNull } from "drizzle-orm"
+import { and, eq, inArray, isNull, sql } from "drizzle-orm"
 import { DateTime, Effect } from "effect"
 import type { Database } from "../database/database"
 import { EventV2 } from "../event"
+import type { RuntimeOwner } from "../runtime-owner"
 import { SessionEvent } from "./event"
+import { SessionExecutionOwner } from "./execution-owner"
 import { SessionMessage } from "./message"
 import { SessionMessageProjection } from "./message-projection"
 import { SessionSchema } from "./schema"
-import { SessionMessageTable, SessionMessageToolOverlayTable } from "./sql"
+import { PartTable, SessionMessageTable, SessionMessageToolOverlayTable } from "./sql"
 
 type DatabaseReader = Pick<Database.Interface["db"], "select">
+
+export interface ExecutionHazards {
+  readonly currentTool: boolean
+  readonly legacyTool: boolean
+}
+
+export type DeadOwnerRecoveryResult =
+  | { readonly state: "idle"; readonly snapshot: SessionExecutionOwner.Snapshot }
+  | { readonly state: "recovered"; readonly token: SessionExecutionOwner.RecoveryToken }
+  | {
+      readonly state: "effect-unknown"
+      readonly token: SessionExecutionOwner.RecoveryToken
+      readonly hazards: ExecutionHazards
+    }
+  | {
+      readonly state: "blocked"
+      readonly snapshot: SessionExecutionOwner.Snapshot
+      readonly proof?: Exclude<RuntimeOwner.LocalDeathProof, "dead">
+    }
+  | { readonly state: "raced"; readonly snapshot: SessionExecutionOwner.Snapshot }
+
+/**
+ * Negative containment proof for automatic dead-owner recovery.
+ *
+ * A hard-dead runtime may have left an OS child alive. OpenFork therefore only
+ * auto-completes recovery when there is no durable in-flight tool boundary in
+ * either the current or V1 projection. Any pending/running tool is preserved as
+ * effect-unknown evidence and keeps the generation fenced; do not "repair" it
+ * away before containment or explicit operator acknowledgement exists.
+ */
+export const executionHazards = Effect.fn("SessionRecovery.executionHazards")(function* (
+  db: DatabaseReader,
+  sessionID: SessionSchema.ID,
+) {
+  const currentTool =
+    (yield* db
+      .select({ callID: SessionMessageToolOverlayTable.call_id })
+      .from(SessionMessageTable)
+      .innerJoin(
+        SessionMessageToolOverlayTable,
+        eq(SessionMessageToolOverlayTable.message_id, SessionMessageTable.id),
+      )
+      .where(
+        and(
+          eq(SessionMessageTable.session_id, sessionID),
+          eq(SessionMessageTable.type, "assistant"),
+          isNull(SessionMessageToolOverlayTable.settlement_event_id),
+        ),
+      )
+      .limit(1)
+      .get()
+      .pipe(Effect.orDie)) !== undefined
+
+  const legacyTool =
+    (yield* db
+      .select({ id: PartTable.id })
+      .from(PartTable)
+      .where(
+        and(
+          eq(PartTable.session_id, sessionID),
+          sql`json_extract(${PartTable.data}, '$.type') = 'tool'`,
+          sql`json_extract(${PartTable.data}, '$.state.status') IN ('pending', 'running')`,
+        ),
+      )
+      .limit(1)
+      .get()
+      .pipe(Effect.orDie)) !== undefined
+
+  return { currentTool, legacyTool } satisfies ExecutionHazards
+})
+
+export const recoverDeadOwnerIfQuiescent = Effect.fn("SessionRecovery.recoverDeadOwnerIfQuiescent")(function* (
+  db: DatabaseReader,
+  ownership: SessionExecutionOwner.Interface,
+  sessionID: SessionSchema.ID,
+) {
+  const claim = yield* ownership.tryClaimRecovery(sessionID)
+  if (claim.state === "idle") return { state: "idle" as const, snapshot: claim.snapshot }
+  if (claim.state === "blocked")
+    return { state: "blocked" as const, snapshot: claim.snapshot, proof: claim.proof }
+  if (claim.state === "busy") return { state: "blocked" as const, snapshot: claim.snapshot }
+
+  const hazards = yield* executionHazards(db, sessionID)
+  if (hazards.currentTool || hazards.legacyTool) {
+    return { state: "effect-unknown" as const, token: claim.token, hazards }
+  }
+
+  const completed = yield* ownership.completeRecovery(claim.token)
+  if (completed === "released") return { state: "recovered" as const, token: claim.token }
+  return { state: "raced" as const, snapshot: yield* ownership.snapshot(sessionID) }
+})
 
 export interface InterruptedToolRepairResult {
   readonly candidates: number

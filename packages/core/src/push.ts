@@ -1,10 +1,11 @@
 export * as PushV2 from "./push"
 
 import { createHash } from "node:crypto"
-import { eq } from "drizzle-orm"
+import { and, desc, eq, isNotNull } from "drizzle-orm"
 import { Context, Effect, Layer, Schema, Stream } from "effect"
 import webpush from "web-push"
 import { PushSubscription } from "@opencode-ai/schema/push-subscription"
+import { ScheduledTask } from "@opencode-ai/schema/scheduled-task"
 import { PermissionV2 } from "./permission"
 import { QuestionV2 } from "./question"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
@@ -14,9 +15,19 @@ import { EventV2 } from "./event"
 import { makeGlobalNode } from "./effect/app-node"
 import { PushSubscriptionTable, PushVapidKeyTable } from "./push/sql"
 import { ProjectTable } from "./project/sql"
-import { SessionTable } from "./session/sql"
+import { SessionInputTable, SessionTable } from "./session/sql"
 import { SessionSchema } from "./session/schema"
-import { completedCopy, failedCopy, permissionCopy, questionCopy, type PushSessionContext } from "./push-copy"
+import { SessionTurnProvenance } from "./session/turn-provenance"
+import {
+  completedCopy,
+  failedCopy,
+  permissionCopy,
+  questionCopy,
+  scheduledRunCopy,
+  type PushSessionContext,
+} from "./push-copy"
+import { ScheduledTaskPolicy } from "./scheduled-task/policy"
+import { ScheduledTaskLeaseTable, ScheduledTaskRunTable, ScheduledTaskTable } from "./scheduled-task/sql"
 
 export const ID = PushSubscription.ID
 export type ID = typeof ID.Type
@@ -95,7 +106,7 @@ function hashEndpoint(endpoint: string) {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
 
     const vapidRow = yield* db
       .select()
@@ -133,7 +144,7 @@ const layer = Layer.effect(
     // This lookup is best-effort: a deleted/raced session must not prevent a
     // useful fallback notification from being delivered.
     const sessionContext = Effect.fn("PushV2.sessionContext")(function* (sessionID: string) {
-      const row = yield* db
+      const row = yield* readDb
         .select({
           title: SessionTable.title,
           directory: SessionTable.directory,
@@ -155,6 +166,103 @@ const layer = Layer.effect(
         projectName: row.projectName,
         parentID: row.parentID,
       }
+    })
+
+    /**
+     * Generic Session outcome ownership is turn-scoped, not aggregate-scoped.
+     *
+     * A reusable or pinned Session can contain a Scheduled root followed by a
+     * human root while the same logical run is still alive. The latest promoted
+     * SessionInput is the durable worker-root frontier, so it tells us which
+     * producer owns the provider cycle without scanning transcript history.
+     */
+    const scheduledOwnsCurrentTurn = Effect.fn("PushV2.scheduledOwnsCurrentTurn")(function* (sessionID: string) {
+      const latest = yield* readDb
+        .select({
+          id: SessionInputTable.id,
+          kind: SessionInputTable.kind,
+          admissionClass: SessionInputTable.admission_class,
+          input: SessionInputTable.input,
+        })
+        .from(SessionInputTable)
+        .where(
+          and(
+            eq(SessionInputTable.session_id, sessionID as SessionSchema.ID),
+            isNotNull(SessionInputTable.promoted_seq),
+          ),
+        )
+        .orderBy(desc(SessionInputTable.promoted_seq))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      if (!latest) return false
+
+      // Derived Synthetic turns (Goal continuation, compaction/recovery, etc.)
+      // carry a flattened causal worker root. Resolve that root with one
+      // primary-key lookup instead of scanning transcript history. A genuine
+      // User root has no Synthetic cause and remains an immediate ownership
+      // boundary.
+      let root = latest
+      if (
+        latest.input?.type === "synthetic" &&
+        latest.input.origin.producer !== SessionTurnProvenance.Source.ScheduledTaskRun &&
+        latest.input.origin.cause?.sessionID === sessionID
+      ) {
+        const cause = latest.input.origin.cause
+        const causal = yield* readDb
+          .select({
+            id: SessionInputTable.id,
+            kind: SessionInputTable.kind,
+            admissionClass: SessionInputTable.admission_class,
+            input: SessionInputTable.input,
+          })
+          .from(SessionInputTable)
+          .where(
+            and(
+              eq(SessionInputTable.id, cause.messageID),
+              eq(SessionInputTable.session_id, sessionID as SessionSchema.ID),
+              isNotNull(SessionInputTable.promoted_seq),
+            ),
+          )
+          .get()
+          .pipe(Effect.orDie)
+        if (!causal) return false
+        root = causal
+      }
+
+      if (
+        root.kind !== "synthetic" ||
+        root.admissionClass !== "host" ||
+        root.input?.type !== "synthetic"
+      ) {
+        return false
+      }
+      const origin = root.input.origin
+      if (
+        origin.producer !== SessionTurnProvenance.Source.ScheduledTaskRun ||
+        origin.actor.type !== "host" ||
+        !origin.ref?.startsWith("str_")
+      ) {
+        return false
+      }
+
+      // Correlation explains causality; the run row proves that this exact
+      // Scheduled root was authorized for this exact Session. Do not require
+      // the run to still be active: a delayed idle/failure event for the same
+      // root must not manufacture a duplicate generic notification after the
+      // durable run has already settled.
+      const run = yield* readDb
+        .select({ id: ScheduledTaskRunTable.id })
+        .from(ScheduledTaskRunTable)
+        .where(
+          and(
+            eq(ScheduledTaskRunTable.id, ScheduledTask.RunID.make(origin.ref)),
+            eq(ScheduledTaskRunTable.session_id, sessionID as SessionSchema.ID),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      return run !== undefined
     })
 
     const contextualNotification = (
@@ -383,11 +491,130 @@ const layer = Layer.effect(
       Effect.forkScoped({ startImmediately: true }),
     )
 
+    // Scheduled Sessions have their own durable run outcome and notification
+    // policy. Generic Session success/failure pushes are suppressed below and
+    // this settlement projection becomes the sole outcome notification path.
+    yield* events.subscribe(ScheduledTask.Event.RunSettled).pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          const projected = event.data.run
+          const current = yield* readDb
+            .select({
+              runID: ScheduledTaskRunTable.id,
+              taskID: ScheduledTaskRunTable.task_id,
+              fireFor: ScheduledTaskRunTable.fire_for,
+              status: ScheduledTaskRunTable.status,
+              attempt: ScheduledTaskRunTable.attempt,
+              finishedAt: ScheduledTaskRunTable.finished_at,
+              sessionID: ScheduledTaskRunTable.session_id,
+              errorMessage: ScheduledTaskRunTable.error_message,
+              skipReason: ScheduledTaskRunTable.skip_reason,
+              taskName: ScheduledTaskTable.name,
+              targetDirectory: ScheduledTaskTable.target_directory,
+              policy: ScheduledTaskTable.policy,
+            })
+            .from(ScheduledTaskRunTable)
+            .innerJoin(ScheduledTaskTable, eq(ScheduledTaskTable.id, ScheduledTaskRunTable.task_id))
+            .where(eq(ScheduledTaskRunTable.id, projected.id))
+            .get()
+            .pipe(Effect.orDie)
+          if (!current) return
+
+          // EventV2 is an accelerator, not authority. A delayed retry-attempt
+          // settlement must not notify after a newer attempt has taken over.
+          if (
+            !ScheduledTaskPolicy.isCurrentSettlement({
+              current: {
+                status: current.status,
+                attempt: current.attempt,
+                finishedAt: current.finishedAt,
+              },
+              projected,
+            })
+          ) {
+            return
+          }
+
+          const retry =
+            current.status === "failed"
+              ? yield* readDb
+                  .select({ attempt: ScheduledTaskLeaseTable.attempt })
+                  .from(ScheduledTaskLeaseTable)
+                  .where(
+                    and(
+                      eq(ScheduledTaskLeaseTable.task_id, current.taskID),
+                      eq(ScheduledTaskLeaseTable.fire_for, current.fireFor),
+                    ),
+                  )
+                  .get()
+                  .pipe(Effect.orDie)
+              : undefined
+          const retryPending = retry !== undefined && retry.attempt > current.attempt
+          if (
+            !ScheduledTaskPolicy.shouldNotifyRun({
+              notify: current.policy.notify,
+              status: current.status,
+              retryPending,
+            })
+          ) {
+            return
+          }
+          if (
+            current.status !== "succeeded" &&
+            current.status !== "failed" &&
+            current.status !== "skipped" &&
+            current.status !== "abandoned"
+          ) {
+            return
+          }
+
+          const copy = scheduledRunCopy(
+            { name: current.taskName, targetDirectory: current.targetDirectory },
+            {
+              status: current.status,
+              errorMessage: current.errorMessage,
+              skipReason: current.skipReason,
+            },
+          )
+          const attention = current.status === "failed" || current.status === "abandoned"
+          const navigate = current.sessionID ? `/session/${encodeURIComponent(current.sessionID)}` : "/"
+          yield* push.notifyAll(
+            {
+              title: copy.title,
+              body: copy.body,
+              // Mobile is the only current PushV2 subscriber. Its service
+              // worker canonicalizes /session/:id onto /?session=... for warm
+              // and cold navigation. Runs that never reached Session creation
+              // fall back to the universally valid mobile root; the semantic
+              // scheduled-run identity remains in data for richer future
+              // clients.
+              navigate,
+              tag: `scheduled-task-${current.taskID}`,
+              data: {
+                kind: "scheduled-task-run",
+                taskID: current.taskID,
+                runID: current.runID,
+                sessionID: current.sessionID ?? undefined,
+                status: current.status,
+                taskName: current.taskName,
+              },
+            },
+            {
+              ttl: 3600,
+              urgency: attention ? "high" : "normal",
+              topic: topicFor("scheduled-task", current.taskID),
+            },
+          )
+        }),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    )
+
     yield* events.subscribe(SessionEvent.Step.Failed).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           const context = yield* sessionContext(event.data.sessionID)
-          if (context?.parentID) return
+          if (context?.parentID || (yield* scheduledOwnsCurrentTurn(event.data.sessionID))) return
           const copy = failedCopy(context, event.data.sessionID, event.data.error)
           yield* push.notifyAll(
             {
@@ -420,7 +647,7 @@ const layer = Layer.effect(
           if (!busySessions.delete(sessionID)) return Effect.void
           return Effect.gen(function* () {
             const context = yield* sessionContext(sessionID)
-            if (context?.parentID) return
+            if (context?.parentID || (yield* scheduledOwnsCurrentTurn(sessionID))) return
             const copy = completedCopy(context, sessionID)
             yield* push.notifyAll(
               {

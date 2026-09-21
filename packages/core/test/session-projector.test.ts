@@ -21,8 +21,10 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import {
   SessionInputTable,
+  MessageTable,
   SessionMessageLifecycleTable,
   SessionMessageTable,
   SessionMessageToolOverlayTable,
@@ -53,6 +55,74 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.effect("uses turn-owned Synthetic execution identity for the V1 compatibility projection", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "synthetic-execution",
+          directory: "/project",
+          title: "synthetic execution",
+          version: "test",
+          agent: "session-agent",
+          model: {
+            id: ModelV2.ID.make("session-model"),
+            providerID: ProviderV2.ID.make("session-provider"),
+            variant: "default",
+          },
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      const id = SessionMessage.ID.make("msg_synthetic_execution")
+      yield* SessionInput.admitSynthetic(db, events, {
+        id,
+        sessionID,
+        content: { text: "scheduled work" },
+        origin: { producer: "host.prompt", actor: { type: "host" } },
+        execution: {
+          agent: "turn-agent",
+          model: {
+            id: ModelV2.ID.make("turn-model"),
+            providerID: ProviderV2.ID.make("turn-provider"),
+            accountID: "account-a",
+            variant: "high" as never,
+          },
+        },
+        admissionClass: "host",
+        delivery: "queue",
+      })
+      const cutoff = yield* EventV2.latestSequence(db, sessionID)
+      yield* SessionInput.promoteLane(db, events, sessionID, { admissionClass: "host", delivery: "queue" }, cutoff)
+
+      const legacy = yield* db
+        .select({ data: MessageTable.data })
+        .from(MessageTable)
+        .where(eq(MessageTable.id, SessionV1.MessageID.ascending(id)))
+        .get()
+        .pipe(Effect.orDie)
+      expect(legacy?.data).toMatchObject({
+        role: "user",
+        agent: "turn-agent",
+        model: {
+          providerID: "turn-provider",
+          modelID: "turn-model",
+          accountID: "account-a",
+          variant: "high",
+        },
+      })
+    }),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service
@@ -234,6 +304,7 @@ describe("SessionProjector", () => {
         sessionID,
         prompt: Prompt.make({ text: "promote me" }),
         delivery: "steer",
+        provenance: SessionMessage.Provenance.make({ owner: "user", source: "prompt" }),
       })
       if (!admitted) return yield* Effect.die("Prompt admission failed")
 
@@ -373,6 +444,76 @@ describe("SessionProjector", () => {
         model,
         time_updated: DateTime.toEpochMillis(created),
       })
+    }),
+  )
+
+  it.effect("persists account-aware model switches with external supervisor provenance", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "selection-provenance",
+          directory: "/project",
+          title: "selection provenance",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      const events = yield* EventV2.Service
+      const messageID = SessionMessage.ID.make("msg_oxp_model_switch")
+      const selected = ModelV2.Ref.make({
+        providerID: ProviderV2.ID.make("workbuddy"),
+        id: ModelV2.ID.make("deepseek-v4.1-flash"),
+        accountID: "wb-explicit",
+        variant: ModelV2.VariantID.make("max"),
+      })
+      const provenance = {
+        owner: "host" as const,
+        source: "oxp.supervisor",
+        ref: "oxp:test-connector",
+      }
+
+      yield* events.publish(SessionEvent.ModelSwitched, {
+        sessionID,
+        messageID,
+        timestamp: created,
+        model: selected,
+        provenance,
+      })
+
+      expect(
+        yield* db
+          .select({ model: SessionTable.model })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ model: selected })
+
+      const rows = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.session_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      const messages = yield* SessionMessageProjection.decodeRows(db, rows).pipe(Effect.orDie)
+      expect(messages).toEqual([
+        expect.objectContaining({
+          id: messageID,
+          type: "model-switched",
+          model: selected,
+          provenance,
+        }),
+      ])
     }),
   )
 

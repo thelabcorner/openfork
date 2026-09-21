@@ -11,6 +11,7 @@ import {
   type LLMRequest,
 } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
+import * as AnthropicMessages from "@opencode-ai/llm/protocols/anthropic-messages"
 import { Database } from "@opencode-ai/core/database/database"
 import { makeLocationNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -64,10 +65,10 @@ import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
 const requests: LLMRequest[] = []
-const generateRequests: LLMRequest[] = []
+const auditRequests: LLMRequest[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
-let generateResponses: LLMResponse[] = []
+let auditResponses: LLMEvent[][] = []
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
@@ -81,7 +82,12 @@ const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
+    compile: () => Effect.die("unused"),
     stream: ((request: LLMRequest) => {
+      if (request.tools.some((tool) => tool.name === "audit_verdict")) {
+        auditRequests.push(request)
+        return Stream.fromIterable(auditResponses.shift() ?? [])
+      }
       requests.push(request)
       if (responseStream) {
         const stream = responseStream
@@ -99,15 +105,13 @@ const client = Layer.succeed(
         ),
       )
     }) as unknown as LLMClientShape["stream"],
-    generate: (request: LLMRequest) => {
-      generateRequests.push(request)
-      const next = generateResponses.shift()
-      return next ? Effect.succeed(next) : Effect.die("unexpected generate() call in session-runner test")
-    },
+    generate: () => Effect.die("unexpected generate() call in session-runner test"),
   }),
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
 const replacementModel = Model.make({ id: "replacement", provider: "fake", route: OpenAIChat.route })
+const cumulativeModel = Model.make({ id: "claude-opus-4-8", provider: "anthropic", route: AnthropicMessages.route })
+const cumulativeReplacementModel = Model.make({ id: "claude-opus-5", provider: "anthropic", route: AnthropicMessages.route })
 const compactModel = Model.make({
   id: "compact",
   provider: "fake",
@@ -186,15 +190,12 @@ const systemContext = Layer.effectDiscard(
               : [
                   SystemContext.make({
                     key: systemContextKey,
-                    codec: Schema.toCodecJson(Schema.String),
                     load: systemLoadHook.pipe(
                       Effect.andThen(
                         Effect.sync(() => (systemUnavailable ? SystemContext.unavailable : systemBaseline)),
                       ),
                     ),
-                    baseline: String,
-                    update: (_previous, current) => current,
-                    removed: () => "System context source removed: test/context",
+                    render: String,
                   }),
                 ],
           ),
@@ -209,11 +210,8 @@ const skillGuidance = Layer.mock(SkillGuidance.Service, {
       skillBaselines.has(agent.id)
         ? SystemContext.make({
             key: SystemContext.Key.make("test/skill-guidance"),
-            codec: Schema.toCodecJson(Schema.String),
             load: Effect.succeed(skillBaselines.get(agent.id)!),
-            baseline: String,
-            update: (_previous, current) => current,
-            removed: () => "Skill guidance removed",
+            render: String,
           })
         : SystemContext.empty,
     ),
@@ -343,8 +341,8 @@ const setup = Effect.gen(function* () {
   currentModel = model
   skillBaselines.clear()
   responses = undefined
-  generateResponses = []
-  generateRequests.length = 0
+  auditResponses = []
+  auditRequests.length = 0
   streamFailure = undefined
   responseStream = undefined
   streamGate = undefined
@@ -494,11 +492,10 @@ const fragmentFixture = (kind: FragmentKind, id: string, chunks: readonly string
   }
 }
 
-const auditResponse = (id: string, verdict: Goal.AuditorVerdict) =>
-  LLMResponse.fromEvents([
+const auditResponse = (id: string, verdict: Goal.AuditorVerdict) => [
     LLMEvent.toolCall({ id, name: "audit_verdict", input: verdict }),
     LLMEvent.finish({ reason: "tool-calls" }),
-  ])!
+] satisfies LLMEvent[]
 
 const verifyEphemeralDeltas = (kind: FragmentKind) =>
   Effect.gen(function* () {
@@ -609,7 +606,7 @@ describe("SessionRunnerLLM", () => {
         .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
         .pipe(Effect.orDie)
       yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
-      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Begin the Goal" }), resume: false })
+      const goalRoot = yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Begin the Goal" }), resume: false })
 
       requests.length = 0
       responses = [
@@ -617,7 +614,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "goal-auto-cycle-1", ["Continuing autonomously once."]).completeEvents,
         fragmentFixture("text", "goal-auto-cycle-2", ["Continuing autonomously twice."]).completeEvents,
       ]
-      generateResponses = [
+      auditResponses = [
         auditResponse("audit-goal-1", {
           decision: "continue",
           rationale: "The objective is not yet complete; continue implementation.",
@@ -656,18 +653,36 @@ describe("SessionRunnerLLM", () => {
       yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(3)
-      expect(userTexts(requests[0]!)).toEqual(["Begin the Goal"])
-      expect(userTexts(requests[1]!)).toEqual(["Begin the Goal"])
-      expect(userTexts(requests[2]!)).toEqual(["Begin the Goal"])
-      expect(requestSystemTexts(requests[0]!)).not.toContain("[GOAL CONTINUATION — system, not the user]")
-      expect(requestSystemTexts(requests[1]!).join("\n")).toContain(
-        "Implement the first remaining autonomous Goal task, then verify the affected behavior.",
-      )
-      expect(requestSystemTexts(requests[2]!).join("\n")).toContain(
-        "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
-      )
-      expect(generateRequests).toHaveLength(3)
-      for (const request of generateRequests) {
+      const spec = expect.stringContaining('<goal_spec state="current"')
+      const progress = expect.stringContaining('<goal_progress state="current"')
+      expect(userTexts(requests[0]!)).toEqual([spec, progress, "Begin the Goal"])
+      expect(userTexts(requests[1]!)).toEqual([
+        spec,
+        progress,
+        "Begin the Goal",
+        expect.stringContaining("Implement the first remaining autonomous Goal task, then verify the affected behavior."),
+      ])
+      expect(userTexts(requests[2]!)).toEqual([
+        spec,
+        progress,
+        "Begin the Goal",
+        expect.stringContaining("Implement the first remaining autonomous Goal task, then verify the affected behavior."),
+        expect.stringContaining(
+          "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
+        ),
+      ])
+      for (const request of requests) {
+        expect(requestSystemTexts(request).join("\n")).toContain("<goal_mechanism>")
+        expect(requestSystemTexts(request).join("\n")).not.toContain("Autonomous runner integration")
+        expect(requestSystemTexts(request).join("\n")).not.toContain("Keep working without another user prompt")
+        expect(requestSystemTexts(request).join("\n")).not.toContain('<goal_spec state="current"')
+        expect(requestSystemTexts(request).join("\n")).not.toContain('<goal_progress state="current"')
+        expect(requestSystemTexts(request).join("\n")).not.toContain("[GOAL CONTINUATION — host-authored, not a new human request]")
+        expect(requestSystemTexts(request).join("\n")).not.toContain("Implement the first remaining autonomous Goal task")
+        expect(requestSystemTexts(request).join("\n")).not.toContain("Finish the second remaining Goal task")
+      }
+      expect(auditRequests).toHaveLength(3)
+      for (const request of auditRequests) {
         expect(request.tools.map((tool) => tool.name).sort()).toEqual(["audit_verdict", "glob", "grep", "read"])
         expect(request.toolChoice).toMatchObject({ type: "required" })
       }
@@ -678,11 +693,142 @@ describe("SessionRunnerLLM", () => {
         blocker: "Automation guardrail: no Goal-state progress for 2 automatic turns",
       })
       expect(yield* session.context(sessionID)).toMatchObject([
+        {
+          type: "synthetic",
+          text: expect.stringContaining('<goal_spec state="current"'),
+          provenance: { owner: "host", source: "goal.spec", ref: expect.any(String) },
+        },
+        {
+          type: "synthetic",
+          text: expect.stringContaining('<goal_progress state="current"'),
+          provenance: { owner: "host", source: "goal.progress", ref: expect.any(String) },
+        },
         { type: "user", text: "Begin the Goal" },
         { type: "assistant" },
+        {
+          type: "synthetic",
+          text: expect.stringContaining("Implement the first remaining autonomous Goal task, then verify the affected behavior."),
+          provenance: {
+            owner: "host",
+            source: "goal.continuation",
+            sourceMessageID: goalRoot.id,
+            ref: expect.any(String),
+          },
+        },
         { type: "assistant" },
+        {
+          type: "synthetic",
+          text: expect.stringContaining("Finish the second remaining Goal task without repeating the previous cycle"),
+          provenance: {
+            owner: "host",
+            source: "goal.continuation",
+            sourceMessageID: goalRoot.id,
+            ref: expect.any(String),
+          },
+        },
         { type: "assistant" },
+        {
+          type: "synthetic",
+          text: expect.stringContaining("Automation guardrail: no Goal-state progress for 2 automatic turns"),
+          provenance: { owner: "host", source: "goal.progress", ref: expect.any(String) },
+        },
       ])
+    }),
+  )
+
+  it.effect("yields an already-promoted automatic continuation to a newer User before provider spend", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const goals = yield* GoalV2.Service
+      const session = yield* SessionV2.Service
+      const created = yield* goals
+        .create({
+          projectID: Project.ID.global,
+          title: "Automatic pre-spend revalidation",
+          objective: "Prove a newer User owns the provider boundary",
+          criteria: ["Do not spend stale automatic work"],
+          continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 8 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Start automatic work" }), resume: false })
+
+      requests.length = 0
+      auditRequests.length = 0
+      let injected = false
+      modelResolveHook = Effect.gen(function* () {
+        // The auditor also resolves a model. Wait until its first request has
+        // actually been issued; the next worker resolution is the already
+        // promoted automatic continuation immediately before provider spend.
+        if (injected || requests.length !== 1 || auditRequests.length !== 1) return
+        injected = true
+        yield* session.prompt({
+          sessionID,
+          prompt: Prompt.make({ text: "Human takes over after automatic promotion" }),
+          resume: false,
+        })
+      }).pipe(Effect.orDie)
+      responses = [
+        fragmentFixture("text", "auto-revalidate-user-1", ["Initial work complete."]).completeEvents,
+        fragmentFixture("text", "auto-revalidate-user-2", ["Handled the human takeover."]).completeEvents,
+      ]
+      auditResponses = [
+        auditResponse("audit-auto-revalidate-1", {
+          decision: "continue",
+          rationale: "One autonomous follow-up would normally run.",
+          progressMade: true,
+          criteria: active.criteria.map((criterion) => ({
+            criterionID: criterion.id,
+            status: "pending",
+            evidence: "More work remains.",
+          })),
+          continuationPrompt: "Perform the stale automatic follow-up that should yield if a human arrives.",
+        }),
+        auditResponse("audit-auto-revalidate-2", {
+          decision: "complete",
+          rationale: "The human-owned cycle completed the intended verification.",
+          progressMade: true,
+          criteria: active.criteria.map((criterion) => ({
+            criterionID: criterion.id,
+            status: "passed",
+            evidence: "The newer User owned the provider boundary.",
+          })),
+        }),
+      ]
+
+      yield* drainSession(sessionID)
+
+      expect(injected).toBe(true)
+      expect(requests).toHaveLength(2)
+      expect(userTexts(requests[0]!)).toContain("Start automatic work")
+      const secondUserTexts = userTexts(requests[1]!)
+      expect(secondUserTexts).toContainEqual(
+        expect.stringContaining("Perform the stale automatic follow-up that should yield if a human arrives."),
+      )
+      expect(secondUserTexts.at(-1)).toBe("Human takes over after automatic promotion")
+
+      const automaticRows = (yield* db.select().from(SessionInputTable).all().pipe(Effect.orDie)).filter(
+        (row) => row.admission_class === "automatic",
+      )
+      expect(automaticRows).toHaveLength(1)
+      expect(automaticRows[0]?.promoted_seq).not.toBeNull()
+      expect(automaticRows[0]?.revoked_seq).toBeNull()
+      const context = yield* session.context(sessionID)
+      const continuationIndex = context.findIndex(
+        (message) =>
+          message.type === "synthetic" &&
+          message.provenance?.source === "goal.continuation" &&
+          message.text.includes("stale automatic follow-up"),
+      )
+      const takeoverIndex = context.findIndex(
+        (message) => message.type === "user" && message.text === "Human takes over after automatic promotion",
+      )
+      expect(continuationIndex).toBeGreaterThanOrEqual(0)
+      expect(takeoverIndex).toBeGreaterThan(continuationIndex)
     }),
   )
 
@@ -869,7 +1015,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("reuses one durable baseline after the context producer changes", () =>
+  it.effect("rebaselines the complete current System head when a head-only route context changes", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -884,11 +1030,10 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
-        ["Initial context"],
+        ["Changed context"],
       ])
-      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
-      expect(requests[1]?.messages.at(-1)?.content).toEqual([{ type: "text", text: "Changed context" }])
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user"])
+      expect(yield* session.messages({ sessionID })).toHaveLength(2)
       const { db } = yield* Database.Service
       expect(
         yield* db
@@ -897,9 +1042,101 @@ describe("SessionRunnerLLM", () => {
           .where(eq(EventTable.type, "session.next.context.updated.1"))
           .all()
           .pipe(Effect.orDie),
-      ).toHaveLength(1)
+      ).toHaveLength(0)
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(yield* session.messages({ sessionID })).toHaveLength(2)
+    }),
+  )
+
+  it.effect("appends a true suffix addition under cumulative privileged semantics", () =>
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = cumulativeModel
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+
+      requests.length = 0
+      response = []
+      yield* drainSession(sessionID)
+      skillBaselines.set(AgentV2.ID.make("build"), "Build skills")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      yield* drainSession(sessionID)
+
+      expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
+        ["Initial context"],
+        ["Initial context"],
+      ])
+      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
+      expect(requests[1]?.messages.at(-1)?.content).toEqual([{ type: "text", text: "Build skills" }])
+    }),
+  )
+
+  it.effect("rebaselines a cumulative route when an admitted section is replaced", () =>
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = cumulativeModel
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+
+      requests.length = 0
+      response = []
+      yield* drainSession(sessionID)
+      systemBaseline = "Changed context"
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      yield* drainSession(sessionID)
+
+      expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
+        ["Initial context"],
+        ["Changed context"],
+      ])
+      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user"])
+    }),
+  )
+
+  it.effect("keeps active cumulative System history across a model switch with identical semantics", () =>
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = cumulativeModel
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+
+      requests.length = 0
+      response = []
+      yield* drainSession(sessionID)
+      skillBaselines.set(AgentV2.ID.make("build"), "Build skills")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      yield* drainSession(sessionID)
+      currentModel = cumulativeReplacementModel
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
+      yield* drainSession(sessionID)
+
+      expect(requests[2]?.model).toBe(cumulativeReplacementModel)
+      expect(requests[2]?.system.map((part) => part.text)).toEqual(["Initial context"])
+      expect(requests[2]?.messages.map((message) => message.role)).toEqual(["user", "user", "system", "user"])
+      expect(systemTexts(requests[2]!)).toContain("Build skills")
+    }),
+  )
+
+  it.effect("rebaselines once when active cumulative System history moves to head-only semantics", () =>
+    Effect.gen(function* () {
+      yield* setup
+      currentModel = cumulativeModel
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
+
+      requests.length = 0
+      response = []
+      yield* drainSession(sessionID)
+      skillBaselines.set(AgentV2.ID.make("build"), "Build skills")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
+      yield* drainSession(sessionID)
+      currentModel = model
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
+      yield* drainSession(sessionID)
+
+      expect(requests[2]?.system.map((part) => part.text)).toEqual(["Initial context\n\nBuild skills"])
+      expect(requests[2]?.messages.map((message) => message.role)).toEqual(["user", "user", "user"])
+      expect(requests[2]?.messages.some((message) => message.role === "system")).toBe(false)
     }),
   )
 
@@ -980,7 +1217,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("updates selected-agent skill guidance after an agent switch", () =>
+  it.effect("rebaselines head-only skill guidance after an agent switch", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -1003,9 +1240,9 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context\n\nBuild skills"],
-        ["Initial context\n\nBuild skills"],
+        ["Initial context\n\nReviewer skills"],
       ])
-      expect(systemTexts(requests[1]!)).toContainEqual(expect.stringContaining("Reviewer skills"))
+      expect(requests[1]?.messages.some((message) => message.role === "system")).toBe(false)
     }),
   )
 
@@ -1069,7 +1306,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("admits removed context as a chronological System message", () =>
+  it.effect("removes head-only context by projecting the complete current privileged head", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -1082,15 +1319,13 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
       yield* drainSession(sessionID)
 
-      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
-      expect(requests[1]?.messages.at(-1)?.content).toEqual([
-        { type: "text", text: "System context source removed: test/context" },
-      ])
-      expect(yield* session.messages({ sessionID })).toHaveLength(3)
+      expect(requests[1]?.system).toEqual([])
+      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user"])
+      expect(yield* session.messages({ sessionID })).toHaveLength(2)
     }),
   )
 
-  it.effect("keeps the baseline and chronological System updates after a model switch", () =>
+  it.effect("keeps ordinary history while head-only System state changes across a model switch", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -1115,21 +1350,19 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
-        ["Initial context"],
-        ["Initial context"],
+        ["Changed context"],
+        ["Replacement context"],
       ])
-      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
-      expect(requests[2]?.messages.filter((message) => message.role === "system")).toHaveLength(2)
+      expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user"])
+      expect(requests[2]?.messages.filter((message) => message.role === "system")).toHaveLength(0)
       expect((yield* session.context(sessionID)).map((message) => message.type)).toEqual([
         "user",
         "user",
-        "system",
         "model-switched",
         "user",
-        "system",
       ])
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.messages({ sessionID })).toHaveLength(6)
+      expect(yield* session.messages({ sessionID })).toHaveLength(4)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fourth" }), resume: false })
       yield* drainSession(sessionID)
     }),
@@ -1162,7 +1395,7 @@ describe("SessionRunnerLLM", () => {
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
         ["Initial context"],
-        ["Initial context"],
+        ["Replacement context"],
       ])
     }),
   )
@@ -1224,7 +1457,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-summary", ["## Objective\n- Preserve the task"]).completeEvents,
         fragmentFixture("text", "text-final", ["Continued"]).completeEvents,
       ]
-      yield* session.prompt({
+      const recentRoot = yield* session.prompt({
         sessionID,
         prompt: Prompt.make({ text: "Recent exact request ".repeat(180) }),
         resume: false,
@@ -1252,6 +1485,7 @@ describe("SessionRunnerLLM", () => {
       expect(context[0]).toMatchObject({
         type: "compaction",
         summary: "## Objective\n- Preserve the task",
+        provenance: { owner: "host", source: "compaction", sourceMessageID: recentRoot.id },
       })
 
       requests.length = 0
@@ -1260,7 +1494,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-summary-2", ["## Objective\n- Preserve the updated task"]).completeEvents,
         fragmentFixture("text", "text-final-2", ["Continued again"]).completeEvents,
       ]
-      yield* session.prompt({
+      const newestRoot = yield* session.prompt({
         sessionID,
         prompt: Prompt.make({ text: "Newest exact request ".repeat(180) }),
         resume: false,
@@ -1275,6 +1509,7 @@ describe("SessionRunnerLLM", () => {
       expect((yield* (yield* SessionStore.Service).context(sessionID))[0]).toMatchObject({
         type: "compaction",
         summary: "## Objective\n- Preserve the updated task",
+        provenance: { owner: "host", source: "compaction", sourceMessageID: newestRoot.id },
       })
     }),
   )
@@ -1465,7 +1700,7 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
-  it.effect("preserves effective System updates while compaction rebaseline is blocked", () =>
+  it.effect("reuses admitted exact System bytes when compaction rebaseline observes temporary unavailability", () =>
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
@@ -1497,8 +1732,8 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
       yield* drainSession(sessionID)
 
-      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Initial context"])
-      expect(systemTexts(requests.at(-1)!)).toContain("Changed context")
+      expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Changed context"])
+      expect(requests.at(-1)?.messages.some((message) => message.role === "system")).toBe(false)
     }),
   )
 
@@ -1665,6 +1900,170 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
+  it.effect("does not grant human userTurn authority to a trusted host prompt", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const root = yield* session.hostPrompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Run scheduled worker automation" }),
+        resume: false,
+      })
+
+      requests.length = 0
+      authorizations.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-host-echo", name: "echo", input: { text: "host" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "text-host-final" }),
+          LLMEvent.textDelta({ id: "text-host-final", text: "Done" }),
+          LLMEvent.textEnd({ id: "text-host-final" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ],
+      ]
+
+      yield* drainSession(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(authorizations).toHaveLength(1)
+      expect(authorizations[0]).toMatchObject({
+        sessionID,
+        toolCallID: "call-host-echo",
+      })
+      expect(authorizations[0]?.userTurn).toBeUndefined()
+      expect(executions).toEqual(["host"])
+      expect(yield* session.context(sessionID)).toMatchObject([
+        {
+          id: root.id,
+          type: "user",
+          provenance: { owner: "host", source: "host.prompt" },
+          text: "Run scheduled worker automation",
+        },
+        { type: "assistant" },
+        { type: "assistant" },
+      ])
+    }),
+  )
+
+  it.effect("runs a native host Synthetic worker root without granting human userTurn authority", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const session = yield* SessionV2.Service
+      const rootID = SessionMessage.ID.make("msg_native_scheduled_root")
+      yield* SessionInput.admitSynthetic(db, events, {
+        id: rootID,
+        sessionID,
+        content: SessionInput.SyntheticContent.make({ text: "Run native scheduled worker automation" }),
+        origin: SessionInput.SyntheticOrigin.make({
+          producer: "scheduled-task.run",
+          actor: { type: "host" },
+          ref: "scheduled-run:test-native-root",
+        }),
+        admissionClass: "host",
+        delivery: "queue",
+        userPreemptible: true,
+      })
+
+      requests.length = 0
+      authorizations.length = 0
+      executions.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-native-host-echo", name: "echo", input: { text: "native-host" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        fragmentFixture("text", "text-native-host-final", ["Done"]).completeEvents,
+      ]
+
+      yield* drainSession(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(authorizations).toHaveLength(1)
+      expect(authorizations[0]).toMatchObject({
+        sessionID,
+        toolCallID: "call-native-host-echo",
+      })
+      expect(authorizations[0]?.userTurn).toBeUndefined()
+      expect(executions).toEqual(["native-host"])
+      expect(yield* session.context(sessionID)).toMatchObject([
+        {
+          id: rootID,
+          type: "synthetic",
+          text: "Run native scheduled worker automation",
+          provenance: {
+            owner: "host",
+            source: "scheduled-task.run",
+            ref: "scheduled-run:test-native-root",
+          },
+        },
+        { type: "assistant" },
+        { type: "assistant" },
+      ])
+    }),
+  )
+
+  it.effect("revalidates a selected host cycle and lets a newly admitted User take the provider boundary", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const session = yield* SessionV2.Service
+      const hostID = SessionMessage.ID.make("msg_host_revalidation_root")
+      yield* SessionInput.admitSynthetic(db, events, {
+        id: hostID,
+        sessionID,
+        content: SessionInput.SyntheticContent.make({ text: "Host work selected first" }),
+        origin: SessionInput.SyntheticOrigin.make({
+          producer: "scheduled-task.run",
+          actor: { type: "host" },
+          ref: "scheduled-run:revalidation",
+        }),
+        admissionClass: "host",
+        delivery: "queue",
+        userPreemptible: true,
+      })
+
+      let injected = false
+      modelResolveHook = Effect.gen(function* () {
+        if (injected) return
+        injected = true
+        yield* session.prompt({
+          sessionID,
+          prompt: Prompt.make({ text: "Human takes the next provider boundary" }),
+          resume: false,
+        })
+      }).pipe(Effect.orDie)
+      requests.length = 0
+      response = fragmentFixture("text", "text-human-boundary", ["Handled human input"]).completeEvents
+
+      yield* drainSession(sessionID)
+
+      expect(requests).toHaveLength(1)
+      expect(userTexts(requests[0]!)).toEqual([
+        "Host work selected first",
+        "Human takes the next provider boundary",
+      ])
+      expect((yield* SessionInput.findEntry(db, hostID))?.promotedSeq).toBeDefined()
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { id: hostID, type: "synthetic", text: "Host work selected first" },
+        { type: "user", text: "Human takes the next provider boundary" },
+        { type: "assistant", finish: "stop" },
+      ])
+    }),
+  )
+
   it.effect("reloads a model switch before a tool-driven continuation turn", () =>
     Effect.gen(function* () {
       yield* setup
@@ -1704,9 +2103,9 @@ describe("SessionRunnerLLM", () => {
       expect(requests.map((request) => request.model)).toEqual([model, replacementModel])
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
-        ["Initial context"],
+        ["Replacement context"],
       ])
-      expect(systemTexts(requests[1]!)).toContain("Replacement context")
+      expect(requests[1]?.messages.some((message) => message.role === "system")).toBe(false)
     }),
   )
 

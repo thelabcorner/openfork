@@ -1,6 +1,7 @@
 export * as SessionSearch from "./search-text"
 
 import type { SessionMessage } from "./message"
+import { SessionTurnProvenance } from "./turn-provenance"
 
 // Tool call inputs and shell output are indexed as bounded summaries so the
 // index stays small on large databases: the request/intent is searchable and
@@ -12,6 +13,10 @@ const SnippetWindow = 120
 const truncate = (input: string, max: number) => (input.length > max ? input.slice(0, max) : input)
 
 export function searchText(message: SessionMessage.Message): string {
+  // Replaceable domain STATE is durable so replay/idempotence can reconstruct
+  // it, but it is not historical conversation. Indexing every publication
+  // would make superseded Goal specs/progress permanently discoverable.
+  if (SessionTurnProvenance.isStateProjection(message)) return ""
   switch (message.type) {
     case "user":
     case "synthetic":
@@ -56,6 +61,8 @@ export function snippet(text: string, terms: readonly string[]): string {
 export type V1PartSearchable = {
   readonly type: string
   readonly text?: string
+  readonly synthetic?: boolean
+  readonly ignored?: boolean
   readonly tool?: string
   readonly state?: { readonly input?: unknown }
 }
@@ -63,6 +70,8 @@ export type V1PartSearchable = {
 export function partSearchText(part: V1PartSearchable): string {
   switch (part.type) {
     case "text":
+      if (part.synthetic === true || part.ignored === true) return ""
+      return part.text ?? ""
     case "reasoning":
       return part.text ?? ""
     case "tool":

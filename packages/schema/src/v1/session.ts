@@ -10,6 +10,7 @@ import { NonNegativeInt, optional, statics } from "../schema"
 import { ascending } from "../identifier"
 import { SessionID } from "../session-id"
 import { WorkspaceID } from "../workspace-id"
+import { SessionTurnProvenance as SharedTurnProvenance } from "../session-turn-provenance"
 import { PermissionV1 } from "./permission"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
@@ -330,9 +331,41 @@ const messageBase = {
   sessionID: partBase.sessionID,
 }
 
+/**
+ * Durable ownership of a V1 user-role turn.
+ *
+ * `role: "user"` is a provider-facing conversation role and does not prove a
+ * human/user-owned turn: Goal continuations, compaction followups, scheduled
+ * work and other host orchestration also intentionally lower as user-role
+ * messages. New producers stamp this field at admission so semantic consumers
+ * never need to reconstruct ownership from text/part shape.
+ *
+ * Optional only for persisted V1 compatibility. New durable user-role turns
+ * should always carry explicit provenance.
+ */
+export const UserTurnSource = SharedTurnProvenance.Source
+export type UserTurnSource = SharedTurnProvenance.Source
+
+export const UserTurnProvenance = Schema.Union([
+  Schema.Struct({
+    owner: Schema.Literal("user"),
+    source: Schema.String,
+    lifetime: optional(Schema.Literal("historical")),
+  }),
+  Schema.Struct({
+    owner: Schema.Literal("host"),
+    source: Schema.String,
+    sourceMessageID: optional(MessageID),
+    ref: optional(Schema.String),
+    lifetime: optional(Schema.Literal("historical")),
+  }),
+]).annotate({ discriminator: "owner", identifier: "UserTurnProvenance" })
+export type UserTurnProvenance = Types.DeepMutable<Schema.Schema.Type<typeof UserTurnProvenance>>
+
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
+  provenance: optional(UserTurnProvenance),
   time: Schema.Struct({
     created: Timestamp,
   }),
@@ -348,6 +381,7 @@ export const User = Schema.Struct({
   model: Schema.Struct({
     providerID: Provider.ID,
     modelID: Model.ID,
+    accountID: Schema.optional(Schema.String),
     variant: Schema.optional(Schema.String),
     subProvider: Schema.optional(Schema.String),
   }),
@@ -558,6 +592,8 @@ const SessionRevert = Schema.Struct({
 const SessionModel = Schema.Struct({
   id: Model.ID,
   providerID: Provider.ID,
+  /** Stable provider-account selection retained across current/V1 Session projection. */
+  accountID: optional(Schema.String),
   variant: optional(Schema.String),
 })
 
