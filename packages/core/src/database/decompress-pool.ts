@@ -21,7 +21,7 @@
  */
 import { Worker } from "node:worker_threads"
 import os from "node:os"
-import { decodeValueBytesRaw } from "./json-codec"
+import { decodeValueBytesRaw, decodedValueByteLength } from "./json-codec"
 
 declare const OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH: string | undefined
 const workerUrl = new URL(
@@ -31,6 +31,11 @@ const workerUrl = new URL(
   import.meta.url,
 )
 const decoder = new TextDecoder()
+export const DECOMPRESS_POOL_MIN_BYTES = 64 * 1024
+
+export function shouldUseDecompressPool(storedBytes: number): boolean {
+  return storedBytes >= DECOMPRESS_POOL_MIN_BYTES
+}
 
 type Request = { id: number; bytes: Uint8Array }
 type Response = { id: number; raw: Uint8Array }
@@ -49,6 +54,13 @@ interface ParseJob {
 }
 
 const DEFAULT_MAX_RETAINED_BYTES = 64 * 1024 * 1024
+
+export class DecompressPoolCapacityError extends Error {
+  constructor() {
+    super("Decompression pool byte budget is full")
+    this.name = "DecompressPoolCapacityError"
+  }
+}
 
 export class DecompressPool {
   private readonly size: number
@@ -109,11 +121,10 @@ export class DecompressPool {
       return
     }
     this.busy.delete(worker)
-    // Keep the raw completion byte-accounted until parse settlement. Several
-    // workers can finish near-simultaneously, so counting only compressed input
-    // would let queued 16-32 MiB completions hide behind a tiny retained budget.
-    job.retainedBytes += res.raw.byteLength
-    this.retainedBytes += res.raw.byteLength
+    // Output bytes were reserved at admission from the frame's authoritative
+    // raw-length header. Do not discover/account them only after several workers
+    // have already completed: that would allow the nominal budget to overshoot
+    // by N concurrent jumbo results.
     this.parseQueue.push({ job, raw: res.raw })
     this.scheduleNextParse()
     this.idle.push(worker)
@@ -179,9 +190,13 @@ export class DecompressPool {
 
   submit(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
     if (this.closed) return Promise.reject(new Error("Decompression pool is closed"))
-    const retainedBytes = bytes.byteLength
+    // postMessage clones the stored input into a worker and the worker transfers
+    // one raw output back. Reserve both before dispatch. The caller's original
+    // SQLite buffer exists regardless of worker use; this budget tracks the
+    // incremental worker/parse retention.
+    const retainedBytes = bytes.byteLength + decodedValueByteLength(bytes)
     if (retainedBytes > this.maxRetainedBytes || this.retainedBytes + retainedBytes > this.maxRetainedBytes) {
-      return Promise.reject(new Error("Decompression pool byte budget is full"))
+      return Promise.reject(new DecompressPoolCapacityError())
     }
     this.start()
     return new Promise<{ value: unknown; raw: Uint8Array }>((resolve, reject) => {
@@ -241,10 +256,19 @@ function disablePool() {
  * worker round-trip beats a main-thread decompress.
  */
 export async function decompressValueAsync(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
+  // Centralize the worker admission policy here. Callers such as semantic
+  // backfill used to send every tiny frame through a worker while the event read
+  // path independently kept a 64 KiB threshold. One owner prevents those paths
+  // from drifting and makes small-frame decode a sync fast path.
+  if (!shouldUseDecompressPool(bytes.byteLength)) return decodeSynchronously(bytes)
   if (poolDisabled) return decodeSynchronously(bytes)
   try {
     return await getPool().submit(bytes)
-  } catch {
+  } catch (error) {
+    // Capacity is ordinary backpressure, not evidence that worker packaging or
+    // execution is broken. Decode this one value synchronously and keep the pool
+    // available for later jumbo values.
+    if (error instanceof DecompressPoolCapacityError) return decodeSynchronously(bytes)
     // Retrieval correctness cannot depend on worker packaging. If a production
     // worker fails, permanently retire the pool for this process and decode on
     // the caller rather than surfacing a false data-corruption error.

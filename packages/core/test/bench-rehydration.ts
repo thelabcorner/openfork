@@ -20,7 +20,7 @@ import { Effect, Schema } from "effect"
 import { EventV2, rehydrateCacheStats, resetRehydrateCacheStats, REHYDRATE_CACHE_CAP_ENTRIES } from "../src/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Database as CoreDatabase } from "../src/database/database"
-import { EventSequenceTable, EventTable } from "../src/event/sql"
+import { EventSequenceTable, EventTable, EventValueTable } from "../src/event/sql"
 import { compressText, decodeValueBytes, decodeValueBytesObject } from "../src/database/json-codec"
 
 process.env.OPENCODE_SEAL_DEDUP = "1"
@@ -91,6 +91,7 @@ function fusedDecodeMicroBench(bytes: Uint8Array): { fusedNs: number; nonFusedNs
   let nTime = 0n
   while (nTime < 200_000_000n) {
     const text = decodeValueBytes(bytes)
+    JSON.parse(text)
     createHash("sha256").update(encoder.encode(text)).digest("hex")
     nIters++
     nTime = process.hrtime.bigint() - nStart
@@ -208,6 +209,30 @@ function bench() {
     const warmEventsPerSec = N_EVENTS / (meanNs / 1e9)
     const warmHitRate = warmStats.hits / (warmStats.hits + warmStats.misses || 1)
 
+    // Counterfactual for the pre-audit ordering: the old read path fetched every
+    // referenced event_value BLOB before consulting the decoded-object cache.
+    // The cache is already warm here, so this isolates exactly that redundant
+    // SQLite/BLOB materialization overhead without re-running decode work.
+    const legacyWarmTimes: number[] = []
+    for (let i = 0; i < ITERS; i++) {
+      const start = process.hrtime.bigint()
+      yield* db
+        .select({
+          valueID: EventValueTable.value_id,
+          bytes: EventValueTable.bytes,
+          sha256: EventValueTable.sha256,
+          rawLen: EventValueTable.raw_len,
+          refs: EventValueTable.refs,
+        })
+        .from(EventValueTable)
+        .where(sql`${EventValueTable.aggregate_id} = ${aggID}`)
+        .all()
+        .pipe(Effect.orDie)
+      yield* readAll()
+      legacyWarmTimes.push(Number(process.hrtime.bigint() - start))
+    }
+    const legacyWarmMeanNs = legacyWarmTimes.reduce((a, b) => a + b, 0) / legacyWarmTimes.length
+
     // Fused-decode micro-bench on a representative frame.
     const sampleFrame = compressText(JSON.stringify(makePayload(7)))
     const sampleBytes = typeof sampleFrame === "string" ? encoder.encode(sampleFrame) : sampleFrame
@@ -223,6 +248,8 @@ function bench() {
     console.log(`cache hit rate         | ${(coldStats.hits / (coldStats.hits + coldStats.misses || 1) * 100).toFixed(1)}%`.padEnd(23) + `| ${(warmHitRate * 100).toFixed(1)}%`)
     console.log(`cache hits/misses      | ${coldStats.hits}/${coldStats.misses}`.padEnd(23) + `| ${warmStats.hits}/${warmStats.misses}`)
     console.log(`cache entries (cap ${REHYDRATE_CACHE_CAP_ENTRIES})`.padEnd(23) + `| ${coldStats.entries}`.padEnd(14) + `| ${warmStats.entries}`)
+    console.log(`cache charged raw MiB  | ${(coldStats.chargedBytes / 1024 / 1024).toFixed(2).padStart(12)} | ${(warmStats.chargedBytes / 1024 / 1024).toFixed(2).padStart(12)}`)
+    console.log(`warm + redundant BLOB fetch: ${(legacyWarmMeanNs / 1e6).toFixed(2)} ms (${(legacyWarmMeanNs / meanNs).toFixed(2)}x current warm)`)
     console.log(`\n=== Fused single-pass decode (ANVIL M) micro-bench ===`)
     console.log(`fused   : ${micro.fusedNs.toFixed(1)} ns/op (decode+parse+sha256 over raw bytes)`)
     console.log(`non-fused: ${micro.nonFusedNs.toFixed(1)} ns/op (decode+parse+sha256 over re-encoded string)`)

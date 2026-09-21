@@ -38,9 +38,10 @@ export const Flag = {
   get OPENCODE_SEAL_ENABLED() {
     return truthy("OPENCODE_SEAL_ENABLED")
   },
-  // Epoch-2 ChunkDB reference/dedup table. Implies epoch-1 (OPENCODE_SEAL_ENABLED);
-  // an epoch-1-only binary must refuse a DB opened under this flag (see chunkdb.ts
-  // epoch gate, user_version=2 fail-closed). Getter so the read path can be
+  // ChunkDB reference/dedup table. Implies framing (OPENCODE_SEAL_ENABLED).
+  // Reference-capable databases are fenced at storage user_version=5 so a
+  // pre-v5 reference reader cannot accept a DB that may contain delta_ref values.
+  // Getter so the read path can be
   // exercised under test without a process restart.
   get OPENCODE_SEAL_DEDUP() {
     return truthy("OPENCODE_SEAL_DEDUP")
@@ -110,15 +111,12 @@ export const Flag = {
   get OPENCODE_OPCL() {
     return truthy("OPENCODE_OPCL")
   },
-  // Epoch-4 (#10): opt-in, flag-gated (default OFF) delta_ref framing on the
-  // sealer write path. When ON, the sealer stores record-structured values
-  // (e.g. info.summary.diffs across turns) as a sparse correction against a
-  // previously-promoted base value in event_value instead of a full frame, when
-  // the correction is materially smaller. The read path (resolveCdbRef) decodes
-  // v5 delta_ref frames fail-closed (missing base -> quarantine). Default OFF —
-  // the v5 frame format is backward-compatible (old binaries fail-closed on
-  // version 5) but the write path stays opt-in until the ANVIL Exp E target is
-  // confirmed in production-shaped benches.
+  // Legacy compatibility knob for the retired v5 delta_ref writer. Whole-corpus
+  // measurement on the production-shaped main DB showed live delta children plus
+  // the otherwise-dead bases they retain occupy MORE bytes than independent
+  // frames, in addition to speculative encode CPU and read/GC amplification.
+  // The reader/integrity/GC paths remain mandatory for historical v5 databases;
+  // the sealer intentionally ignores this flag and logs when it is requested.
   get OPENCODE_SEAL_DELTA() {
     return truthy("OPENCODE_SEAL_DELTA")
   },

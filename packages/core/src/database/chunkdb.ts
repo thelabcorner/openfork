@@ -1,6 +1,7 @@
 import { Effect } from "effect"
 import { Flag } from "../flag/flag"
 import type { DatabaseShape } from "./database"
+import { SMALL_TEXT_THRESHOLD } from "./json-codec"
 
 /**
  * Epoch-3 storage-tuning constants (storage-frontier-v3). All are FLAG-GATED
@@ -53,7 +54,7 @@ export const CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS = 30
  * and production build/install capability probes. A binary must prove it can
  * open a database stamped at this epoch before it is considered deployable.
  */
-export const CHUNKDB_MAX_USER_VERSION = 4
+export const CHUNKDB_MAX_USER_VERSION = 5
 
 /**
  * Epoch-1/2 ChunkDB schema wiring + epoch gate + DB-open integration.
@@ -75,8 +76,10 @@ export const CHUNKDB_MAX_USER_VERSION = 4
  *   responsibility of the read path (readpath-v2): it reads `event_value.bytes`
  *   for `(aggregate_id, value_id)` and decodes it (see `decodeValueBytes` in
  *   json-codec.ts). `event_value.bytes` holds either a raw JSON UTF-8 BLOB
- *   (when compression gained nothing at seal time) or an OCDB v2 frame; the
- *   decoder detects the magic and decompresses or decodes accordingly. Because
+ *   (when compression gained nothing at seal time) or an OCDB frame. v5
+ *   delta-ref frames additionally depend on another `event_value` row via the
+ *   explicit dependency graph. The decoder detects the representation and
+ *   reconstructs it accordingly. Because
  *   the original object is `JSON.parse(decode(bytes))` and `decode` is
  *   lossless (CRC-verified frame or verbatim UTF-8), rehydration is byte-exact
  *   via `node:assert`'s `isDeepStrictEqual`.
@@ -132,11 +135,20 @@ export function ensureChunkDB(db: DatabaseShape): Effect.Effect<void> {
       PRIMARY KEY (table_name, row_id, column_name)
     )`).pipe(Effect.orDie)
 
-    // Partial expression index over the sealer's candidate filter so eligibility
-    // SELECTs seek directly to text rows >=4KiB instead of scanning all event rows.
-    yield* db.run(`CREATE INDEX IF NOT EXISTS idx_event_seal_candidates
+    // v2 candidate index includes the measured independent-small-frame frontier.
+    // A new name makes the predicate migration one-shot: CREATE is a no-op on
+    // subsequent opens, then the obsolete >=4KiB index can be dropped without
+    // rebuilding the new index every startup.
+    yield* db.run(`CREATE INDEX IF NOT EXISTS idx_event_seal_candidates_v2
       ON event (aggregate_id, seq)
-      WHERE typeof(data) = 'text' AND length(data) >= 4096`).pipe(Effect.orDie)
+      WHERE typeof(data) = 'text' AND length(data) >= ${SMALL_TEXT_THRESHOLD}`).pipe(Effect.orDie)
+    yield* db.run(`DROP INDEX IF EXISTS idx_event_seal_candidates`).pipe(Effect.orDie)
+
+    // The v2 >=512 candidate index is shared by both the measured small inline
+    // lane and the >=4KiB externalization lane. A short-lived audit prototype
+    // created a second 512..4095 partial index; production never needs it, so
+    // remove it on open rather than paying duplicate index write amplification.
+    yield* db.run(`DROP INDEX IF EXISTS idx_event_small_seal_candidates`).pipe(Effect.orDie)
 
     yield* db.run(`CREATE TABLE IF NOT EXISTS ocdb_meta (
       key TEXT PRIMARY KEY,
@@ -376,21 +388,32 @@ export function ensureChunkDB(db: DatabaseShape): Effect.Effect<void> {
     const rows = yield* db.all<{ user_version: number }>(`PRAGMA user_version`).pipe(Effect.orDie)
     const version = rows[0]?.user_version ?? 0
     // v3 understands physical event.compacted.1 markers. v4 additionally
-    // understands sparse sequence holes certified by event_compaction. Sparse
-    // reads are compiled in unconditionally, so a v4 DB remains readable if the
-    // pruning writer is later disabled. Older binaries fail closed on user_version.
-    const target = semantic ? 4 : framingEpoch >= 2 ? 2 : 1
+    // understands sparse sequence holes certified by event_compaction.
+    //
+    // v5 is the reference-capability fence. delta_ref frames were originally
+    // introduced while reference-capable databases were still stamped as
+    // user_version=2, which let an older epoch-2 binary accept a database and
+    // fail only when it eventually encountered a v5 event_value. Fence every
+    // dedup/reference-capable database at v5, even when the delta writer is
+    // currently disabled. This is deliberately conservative: the delta flag is
+    // runtime-readable and historical databases may already contain an
+    // unmarked v5 value. The monotonic user_version then prevents a downgrade
+    // from re-opening that database with a pre-v5 reference reader.
+    //
+    // Sparse reads and v5 reads are compiled in unconditionally, so disabling a
+    // writer later never lowers the durable capability fence.
+    const target = framingEpoch >= 2 ? 5 : semantic ? 4 : 1
     const maxAllowed = CHUNKDB_MAX_USER_VERSION
     if (framingEpoch >= 2 && !dedup) {
       throw new Error(
-        "OpenCode ChunkDB: this database contains epoch-2 reference framing, but OPENCODE_SEAL_DEDUP is disabled. Refusing to open.",
+        "OpenFork ChunkDB: this database contains epoch-2 reference framing, but OPENCODE_SEAL_DEDUP is disabled. Refusing to open.",
       )
     }
     if (version === 0 || version < target) {
       yield* db.run(`PRAGMA user_version = ${target}`).pipe(Effect.orDie)
     } else if (version > maxAllowed) {
       throw new Error(
-        `OpenCode ChunkDB: database user_version ${version} is newer than this binary supports (max ${maxAllowed}). Refusing to open.`,
+        `OpenFork ChunkDB: database user_version ${version} is newer than this binary supports (max ${maxAllowed}). Refusing to open.`,
       )
     }
   })

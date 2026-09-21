@@ -245,11 +245,12 @@ const layer = Layer.effect(
 
       // Supersession + insert is one transaction: a keyed fact must never be
       // left half-written (INV-8).
-      const superseded = yield* db.transaction((tx) =>
-        Effect.gen(function* () {
-          let previous: Row | undefined
-          if (input.supersedeKey) {
-            previous = yield* tx
+      const superseded = yield* db.transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            let previous: Row | undefined
+            if (input.supersedeKey) {
+              previous = yield* tx
               .select()
               .from(MemoryEntryTable)
               .where(
@@ -335,8 +336,9 @@ const layer = Layer.effect(
             )
           }
 
-          return previous
-        }),
+            return previous
+          }),
+        { behavior: "immediate" },
       )
 
       const row = yield* db.select().from(MemoryEntryTable).where(eq(MemoryEntryTable.id, id)).get().pipe(Effect.orDie)
