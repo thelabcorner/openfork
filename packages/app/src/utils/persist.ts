@@ -13,6 +13,7 @@ type PersistedWithReady<T> = [
   SetStoreFunction<T>,
   InitType,
   Accessor<boolean> & { promise: undefined | Promise<any> },
+  () => Promise<void>,
 ]
 
 type PersistTarget = {
@@ -82,18 +83,21 @@ const DRAFT_DEBOUNCE_MS = 500
 const pendingDraftWrites = new Map<string, { timer: ReturnType<typeof setTimeout>; value: string }>()
 let draftFlushListenersInstalled = false
 
-function flushPendingDraftWrites(draft: AsyncStorage) {
+async function flushPendingDraftWrites(draft: NonNullable<Platform["draftStore"]>) {
+  const writes: Promise<unknown>[] = []
   for (const [key, pending] of pendingDraftWrites) {
     clearTimeout(pending.timer)
     pendingDraftWrites.delete(key)
-    void draft.setItem(key, pending.value)
+    writes.push(Promise.resolve(draft.setItem(key, pending.value)))
   }
+  await Promise.all(writes)
+  await draft.flush()
 }
 
-function ensureDraftFlushListeners(draft: AsyncStorage) {
+function ensureDraftFlushListeners(draft: NonNullable<Platform["draftStore"]>) {
   if (draftFlushListenersInstalled) return
   draftFlushListenersInstalled = true
-  const flush = () => flushPendingDraftWrites(draft)
+  const flush = () => void flushPendingDraftWrites(draft).catch(() => undefined)
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flush()
   })
@@ -101,7 +105,12 @@ function ensureDraftFlushListeners(draft: AsyncStorage) {
   window.addEventListener("beforeunload", flush)
 }
 
-function createDebouncedDraftStorage(draft: AsyncStorage, prefix: string): AsyncStorage {
+type DebouncedDraftStorage = AsyncStorage & { flush: () => Promise<void> }
+
+function createDebouncedDraftStorage(
+  draft: NonNullable<Platform["draftStore"]>,
+  prefix: string,
+): DebouncedDraftStorage {
   ensureDraftFlushListeners(draft)
   return {
     getItem: (key) => draft.getItem(prefix + key),
@@ -125,6 +134,7 @@ function createDebouncedDraftStorage(draft: AsyncStorage, prefix: string): Async
       }
       return draft.removeItem(fullKey)
     },
+    flush: () => flushPendingDraftWrites(draft),
   }
 }
 
@@ -884,6 +894,29 @@ export function persisted<T>(
     } catch {}
   }
 
+  const flushDurable = async () => {
+    if (isAsync && !hydrated) {
+      await Promise.resolve(init).catch(() => undefined)
+      hydrated = true
+    }
+
+    if (dirty) {
+      dirty = false
+      cancelWrite()
+      const json = persistJson(unwrap(state as unknown as Store<unknown>))
+      if (json !== lastJson) {
+        lastJson = json
+        await Promise.resolve(
+          (storage as unknown as { setItem: (k: string, v: string) => unknown }).setItem(config.key, json),
+        )
+      }
+    } else {
+      cancelWrite()
+    }
+
+    if (draft) await (currentStorage as DebouncedDraftStorage).flush()
+  }
+
   const scheduleWrite = () => {
     dirty = true
     if (writeTimer !== undefined) clearTimeout(writeTimer)
@@ -929,6 +962,7 @@ export function persisted<T>(
     Object.assign(() => ready(), {
       promise: init instanceof Promise ? init : undefined,
     }),
+    flushDurable,
   ]
 }
 

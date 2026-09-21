@@ -1,6 +1,6 @@
 import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { OpenCodeEvent, SessionApi } from "@opencode-ai/client/promise"
 import type * as SessionEvent from "@opencode-ai/schema/session-event"
 import type {
   Message,
@@ -13,6 +13,8 @@ import type {
   Todo,
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
+import { hasSessionMessageStateSemantics } from "@/utils/session-message-info"
 import { batch } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { message as cleanMessage } from "@/utils/diffs"
@@ -26,6 +28,8 @@ import {
 } from "@/utils/server-request-scheduler"
 import {
   compareMessages,
+  isConversationParentMessage,
+  userTurnPresentation,
   messageKey,
   normalizeSessionAssistantContentPart,
   normalizeSessionMessages,
@@ -73,12 +77,20 @@ async function mapAsyncLimited<A, B>(
 function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
   const boundary = source.find(
     (message) =>
-      message.type === "user" ||
+      !hasSessionMessageStateSemantics(message) &&
+      (message.type === "user" ||
       message.type === "shell" ||
       message.type === "assistant" ||
-      (message.type === "synthetic" && message.description?.trim()),
+      (message.type === "synthetic" && message.text.trim())),
   )
-  return boundary?.type === "assistant"
+  if (boundary?.type === "assistant") return true
+  if (boundary?.type !== "synthetic") return false
+  const provenance = boundary.provenance
+  if (provenance?.owner !== "host" || !provenance.sourceMessageID) return false
+  // Modern continuation lineage is explicit. If the canonical worker root is
+  // older than the loaded window, keep paging until it is available instead of
+  // accepting the continuation itself as an adjacency-derived root.
+  return !source.some((message) => message.id === provenance.sourceMessageID)
 }
 
 type OptimisticItem = {
@@ -104,10 +116,21 @@ function legacyMessageSource(items: { info: Message; parts: Part[] }[]): Session
     .sort((a, b) => compareMessages(a.info, b.info))
     .map((item) => {
       if (item.info.role === "user") {
+        const text = item.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+        if (userTurnPresentation(item.info) !== "user") {
+          return {
+            id: item.info.id,
+            type: "synthetic" as const,
+            text,
+            provenance: item.info.provenance,
+            time: item.info.time,
+          }
+        }
         return {
           id: item.info.id,
           type: "user" as const,
-          text: item.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"),
+          text,
+          provenance: item.info.provenance,
           time: item.info.time,
         }
       }
@@ -908,10 +931,10 @@ export function createServerSession(
       const parents = [] as Awaited<ReturnType<typeof fetchMessage>>[]
       if (mode !== "prepend") {
         const users = new Set([
-          ...page.session.filter((message) => message.role === "user").map((message) => message.id),
+          ...page.session.filter(isConversationParentMessage).map((message) => message.id),
           ...(data.message[sessionID] ?? [])
             .filter((message) => {
-              if (message.role !== "user") return false
+              if (!isConversationParentMessage(message)) return false
               const item = optimistic.get(sessionID)?.get(message.id)
               return load.touchedMessages.has(message.id) && (!item || item.confirmedMessage === true)
             })
@@ -941,7 +964,9 @@ export function createServerSession(
         )
         for (const parent of fetchedParents) {
           if (!parent) continue
-          if (parent.message.role !== "user") throw new Error(`Assistant parent is not a user message: ${parent.message.id}`)
+          if (!isConversationParentMessage(parent.message)) {
+            throw new Error(`Assistant parent is not a conversational user-role boundary: ${parent.message.id}`)
+          }
           parents.push(parent)
         }
       }
@@ -1253,7 +1278,10 @@ export function createServerSession(
     const touched = new Set(reduction.touched)
     let parentID: string | undefined
     for (const message of messages) {
-      if (message.type === "user" || (message.type === "synthetic" && message.description?.trim()))
+      if (
+        !hasSessionMessageStateSemantics(message) &&
+        (message.type === "user" || (message.type === "synthetic" && message.text.trim()))
+      )
         parentID = message.id
       if (message.type === "shell") {
         if (touched.has(message.id)) touched.add(`${message.id}:assistant`)

@@ -72,6 +72,12 @@ type CompatibleFindApi = {
 }
 type CompatiblePromptRevisorInput = {
   prompt: string
+  purpose?: "prompt" | "goal" | "scheduled_task"
+  target?: {
+    kind: "prompt" | "goal" | "scheduled_task"
+    key: string
+    sourceFingerprint: string
+  }
   draft?: {
     mentions: (
       | {
@@ -88,12 +94,13 @@ type CompatiblePromptRevisorInput = {
     attachments: { id: string; type: "image"; filename: string; mime: string }[]
   }
   sessionID?: string
+  includeSessionContext?: boolean
   guidance?: string
-  model?: { providerID: string; id: string; variant?: string }
-  fallbackModel?: { providerID: string; id: string; variant?: string }
-  clarifications?: { question: string; answers: string[]; detail?: string }[]
-  clarificationRound?: number
+  model?: { providerID: string; id: string; accountID?: string; variant?: string }
+  fallbackModel?: { providerID: string; id: string; accountID?: string; variant?: string }
   location?: { directory?: string }
+  /** Client-owned lifetime for the long-running revision request. Never serialized. */
+  signal?: AbortSignal
 }
 type CompatiblePromptRevisorApi = {
   revise: (input: CompatiblePromptRevisorInput) => Promise<
@@ -124,29 +131,58 @@ type CompatiblePromptRevisorApi = {
         )[]
         tools: string[]
         rounds: number
+        artifactID?: string
       }
     | {
-        type: "question"
-        questions: {
-          question: string
-          header: string
-          options: { label: string; description: string }[]
-          multiple?: boolean
-          custom?: boolean
-        }[]
-        clarificationRound: number
+        type: "cancelled"
         tools: string[]
         rounds: number
       }
   >
 }
-type PromptRevisorWireBody = NonNullable<PromptReviseData["body"]>
+type PromptRevisorWireBody = NonNullable<PromptReviseData["body"]> & {
+  target?: CompatiblePromptRevisorInput["target"]
+}
+type CompatiblePromptRevisorResult = Awaited<ReturnType<CompatiblePromptRevisorApi["revise"]>>
+export type CompatibleRevisionDraftArtifact = {
+  id: string
+  directory: string
+  kind: "prompt" | "goal" | "scheduled_task"
+  key: string
+  purpose: "prompt" | "goal" | "scheduled_task"
+  sourceFingerprint: string
+  prompt: string
+  references: Extract<CompatiblePromptRevisorResult, { type: "revision" }>["references"]
+  timeCreated: number
+}
+type CompatibleRevisionDraftApi = {
+  recover: (input: {
+    kind: CompatibleRevisionDraftArtifact["kind"]
+    key: string
+  }) => Promise<CompatibleRevisionDraftArtifact | null>
+  consume: (input: { id: string }) => Promise<void>
+}
+
+export class LegacyPromptRevisorProtocolError extends Error {
+  override readonly name = "LegacyPromptRevisorProtocolError"
+  constructor() {
+    super("This server uses the retired Prompt Revisor clarification protocol and cannot complete this revision.")
+  }
+}
+
+function promptRevisorResult(value: unknown): CompatiblePromptRevisorResult {
+  if (value && typeof value === "object" && (value as { type?: unknown }).type === "question") {
+    throw new LegacyPromptRevisorProtocolError()
+  }
+  return value as CompatiblePromptRevisorResult
+}
 export type CompatibleApi = Omit<ServerApi, "session" | "permission" | "question"> & {
   readonly session: CompatibleSessionApi
   readonly permission: CompatiblePermissionApi
   readonly question: CompatibleQuestionApi
   readonly find: CompatibleFindApi
   readonly promptRevisor: CompatiblePromptRevisorApi
+  readonly revisionDraft: CompatibleRevisionDraftApi
 }
 type LegacyPrompt = {
   agent?: string
@@ -171,7 +207,7 @@ function mime(uri: string) {
 }
 
 function promptRevisorBody(value: CompatiblePromptRevisorInput): PromptRevisorWireBody {
-  const { location: _location, ...body } = value
+  const { location: _location, signal: _signal, ...body } = value
   return body satisfies PromptRevisorWireBody
 }
 
@@ -273,10 +309,18 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
       },
     },
     promptRevisor: {
-      revise(value) {
+      async revise(value) {
         const directory = value.location?.directory ?? input.directory
         const path = `/prompt/revise${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`
-        return postJSON(input, path, promptRevisorBody(value))
+        return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
+      },
+    },
+    revisionDraft: {
+      recover(value) {
+        return postJSON<CompatibleRevisionDraftArtifact | null>(input, "/revision-draft/recover", value)
+      },
+      async consume(value) {
+        await post(input, "/revision-draft/consume", value)
       },
     },
   }
@@ -305,7 +349,7 @@ async function post(input: CompatibleInput, path: string, body?: unknown) {
   } catch {}
 }
 
-async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown): Promise<T> {
+async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const headers = new Headers()
   if (body !== undefined) headers.set("content-type", "application/json")
   if (input.server.password) {
@@ -318,6 +362,7 @@ async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown)
     method: "POST",
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   })
   if (!response.ok) {
     const body = await response.text().catch(() => "")
@@ -546,10 +591,18 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
       },
     },
     promptRevisor: {
-      revise(value) {
+      async revise(value) {
         const target = directory(value.location)
         const path = `/prompt/revise${target ? `?directory=${encodeURIComponent(target)}` : ""}`
-        return postJSON(input, path, promptRevisorBody(value))
+        return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
+      },
+    },
+    revisionDraft: {
+      recover(value) {
+        return postJSON<CompatibleRevisionDraftArtifact | null>(input, "/revision-draft/recover", value)
+      },
+      async consume(value) {
+        await post(input, "/revision-draft/consume", value)
       },
     },
     project: {

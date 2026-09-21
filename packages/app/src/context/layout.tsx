@@ -27,6 +27,8 @@ import { planStartupSessionHydration } from "./startup-session-hydration"
 import { startupMark, startupSpan } from "@/utils/startup-perf"
 import { loadChatSidebarPane } from "@/pages/session/v2/chat-sidebar-preload"
 import { findChatProject } from "@/utils/chat-project"
+import { isAppTabPage, type AppTabPage } from "./app-tabs"
+import { isOxpPlatform } from "@/oxp/platform"
 
 export { createSessionKeyReader, ensureSessionKey, pruneSessionKeys }
 
@@ -115,7 +117,7 @@ export type HomeProjectSelection = { server: ServerConnection.Key; directory?: s
 
 export type LayoutRoute =
   | { type: "home" }
-  | { type: "settings" }
+  | { type: AppTabPage }
   | { type: "draft"; draftID: string; server?: ServerConnection.Key }
   | { type: "dir-new-sesssion"; dir: string; dirBase64: string; server?: ServerConnection.Key }
   | { type: "session"; sessionId: string; server?: ServerConnection.Key }
@@ -156,7 +158,7 @@ const normalizeStoredSessionTabs = (key: string, tabs: SessionTabs) => {
 export const currentRoute = (pathname: string, search: string): LayoutRoute => {
   const parts = pathname.split("/").filter(Boolean)
   if (parts.length === 0) return { type: "home" }
-  if (parts.length === 1 && parts[0] === "settings") return { type: "settings" }
+  if (parts.length === 1 && parts[0] && isAppTabPage(parts[0])) return { type: parts[0] }
 
   if (parts[0] === "new-session") {
     const draftID = new URLSearchParams(search).get("draftId")
@@ -203,8 +205,8 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
     const location = useLocation()
     const route = createMemo(() => {
       const value = currentRoute(location.pathname, location.search)
-      if (value.type === "home" || value.type === "settings") return value
-      if (value.server) return value
+      if (value.type === "home" || isAppTabPage(value.type)) return value
+      if ("server" in value && value.server) return value
       if (value.type === "draft") {
         const draft = tabs.store.find((tab): tab is DraftTab => tab.type === "draft" && tab.draftID === value.draftID)
         if (draft) return { ...value, server: draft.server }
@@ -607,6 +609,39 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       })
     })
 
+    // A project already added to OpenFork is already an explicit local-folder
+    // choice by the user. Keep OXP's project-managed roots converged with the
+    // same persisted catalog instead of asking for a second approval in
+    // Settings. Only local server projects are meaningful to this desktop's
+    // filesystem; remote/WSL/SSH projects remain owned by their remote runtime.
+    let oxpProjectRootSignature: string | undefined
+    createEffect(() => {
+      const oxp = platform.oxp
+      if (!isOxpPlatform(oxp) || !server.ready()) return
+
+      const byPath = new Map<string, string>()
+      for (const connection of server.list) {
+        // OXP executes in the desktop sidecar's filesystem namespace. A generic
+        // localhost/WSL/SSH/remote server is not proof that its path spelling is
+        // meaningful to that host. Only the canonical local scope may grant
+        // project-derived OXP authority.
+        if (server.scope(ServerConnection.key(connection)) !== ServerScope.local) continue
+        const projects = server.projects.forServer(ServerConnection.key(connection)).list()
+        for (const project of projects) byPath.set(pathKey(project.worktree), project.worktree)
+      }
+      const roots = [...byPath.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([, worktree]) => worktree)
+      const signature = roots.map(pathKey).join("\u0000")
+      if (signature === oxpProjectRootSignature) return
+      oxpProjectRootSignature = signature
+      void oxp.syncProjectRoots(roots).catch(() => {
+        // Retry on the next catalog/runtime transition. The desktop controller
+        // also retains the latest desired set across sidecar replacement.
+        if (oxpProjectRootSignature === signature) oxpProjectRootSignature = undefined
+      })
+    })
+
     createEffect(() => {
       const projects = enriched()
       if (projects.length === 0) return
@@ -680,7 +715,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
     let startupChatLoadedWorktree: string | undefined
     let startupChatLoadingWorktree: string | undefined
 
-    const loadStartupChat = (worktree: string, attempt = 0) => {
+    const loadStartupChat = (worktree: string, projectID?: string, attempt = 0) => {
       const key = pathKey(worktree)
       if (sessionHydrationCancelled) return
       if (startupChatLoadedWorktree === key || startupChatLoadingWorktree === key) return
@@ -688,7 +723,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       const startedAt = performance.now()
       startupMark("sidebar.chat-foreground-load-start", { worktree })
       void serverSync()
-        .project.loadSessions(worktree, { priority: "critical" })
+        .project.loadSessions(worktree, { priority: "critical", projectID })
         .then(() => {
           if (startupChatLoadingWorktree === key) startupChatLoadingWorktree = undefined
           startupChatLoadedWorktree = key
@@ -700,7 +735,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           if (startupChatRetryTimer !== undefined) window.clearTimeout(startupChatRetryTimer)
           startupChatRetryTimer = window.setTimeout(() => {
             startupChatRetryTimer = undefined
-            loadStartupChat(worktree, attempt + 1)
+            loadStartupChat(worktree, projectID, attempt + 1)
           }, 250 * (attempt + 1))
         })
     }
@@ -709,7 +744,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       if (!ready() || !store.chats.panelOpened) return
       const canonical = findChatProject(serverSync().data.project)
       if (!canonical?.worktree) return
-      loadStartupChat(canonical.worktree)
+      loadStartupChat(canonical.worktree, canonical.id)
     })
 
     onMount(() => {
@@ -736,7 +771,9 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         const foregroundStartedAt = performance.now()
         if (foreground) startupMark("sidebar.foreground-load-start")
         const foregroundLoad = foreground
-          ? serverSync().project.loadSessions(foreground.worktree, { priority: "critical" })
+          ? serverSync().project.loadSessions(foreground.worktree, {
+              priority: "critical",
+            })
           : Promise.resolve()
         if (foreground) {
           void foregroundLoad.then(() =>
@@ -772,7 +809,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           const plan = planStartupSessionHydration(server.projects.list(), foreground?.worktree)
           void forEachLimited(
             plan.background,
-            (project) => serverSync().project.loadSessions(project.worktree, { priority: "background" }),
+            (project) =>
+              serverSync().project.loadSessions(project.worktree, {
+                priority: "background",
+              }),
             PROJECT_SESSION_LOAD_CONCURRENCY,
           )
         }

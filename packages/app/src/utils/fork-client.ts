@@ -60,6 +60,10 @@ export type ForkUsageResult = {
   // vault has no row for). Absent when the pool is empty or on old servers.
   defaultAccountID?: string
   defaultAccountLabel?: string
+  // Actual bare opencode-go route after provider-auth > pool precedence.
+  routedAccountID?: string
+  routedAccountLabel?: string
+  routedAccountSource?: "provider" | "pool"
 }
 
 function authHeader(server: ForkServer): Record<string, string> {

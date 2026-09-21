@@ -107,7 +107,7 @@ function annotateAsyncIterable<T>(result: AsyncIterable<T>, method: string): Asy
 
 function annotateClientError(cause: unknown, method: string) {
   if (!isMissingDescriptorError(cause)) return cause
-  return new Error(`OpenCode client request descriptor missing while calling ${method}`, { cause })
+  return new Error(`OpenFork client request descriptor missing while calling ${method}`, { cause })
 }
 
 function isMissingDescriptorError(cause: unknown) {

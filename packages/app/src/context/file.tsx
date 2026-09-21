@@ -25,7 +25,7 @@ import {
 } from "./file/content-cache"
 import { createFileViewCache } from "./file/view-cache"
 import { useServerSDK } from "./server-sdk"
-import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
+import { ScopedKey, SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 import { createFileTreeStore, type TreeSnapshot } from "./file/tree-store"
 import { invalidateFromWatcher } from "./file/watcher"
 import { createStaleDrain, WATCHER_DIR_QUEUE_MAX } from "./file/stale-drain"
@@ -147,6 +147,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     const platform = usePlatform()
 
     const scope = createMemo(() => sdk().directory)
+    const cacheScope = createMemo(() => ScopedKey.from(serverSDK().scope, scope()))
     const path = createPathHelpers(scope)
     const tabs = layout.tabs(() =>
       SessionStateKey.from(serverSDK().scope, SessionRouteKey.fromRoute(base64Encode(sdk().directory), params.id)),
@@ -155,7 +156,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const inflight = new Map<string, Promise<void>>()
     let providerDisposed = false
-    let currentContentScope = scope()
+    let currentContentScope = cacheScope()
     const initialContentSnapshot = contentScopeCache.get(currentContentScope)
     const [store, setStore] = createStore<{
       file: Record<string, FileState>
@@ -195,6 +196,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     // the old recovery self-sustaining.
     const tree = createFileTreeStore({
       scope,
+      cacheScope,
       normalizeDir: path.normalizeDir,
       list: (dir, priority) => {
         const directory = scope()
@@ -329,7 +331,8 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     createEffect(() => {
-      const next = scope()
+      scope()
+      const next = cacheScope()
       tree.switchScope()
       if (next === currentContentScope) return
 

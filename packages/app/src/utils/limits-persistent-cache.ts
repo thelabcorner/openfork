@@ -1,4 +1,5 @@
 import type { ProviderResult } from "@/utils/limits-format"
+import { ScopedKey, ServerScope, type ServerScope as ServerScopeValue } from "@/utils/server-scope"
 
 const CACHE_KEY = "opencode.limits.cache.v2"
 const CACHE_TTL_MS = 5 * 60 * 1000 // 5 min - matches backend TTL
@@ -12,18 +13,23 @@ type CacheEntry = {
   results: ProviderResult[]
 }
 
-function readCache(): CacheEntry | undefined {
+function cacheKey(scope: ServerScopeValue) {
+  return scope === ServerScope.local ? CACHE_KEY : ScopedKey.from(scope, CACHE_KEY)
+}
+
+function readCache(scope: ServerScopeValue): CacheEntry | undefined {
   if (typeof localStorage === "undefined") return undefined
+  const key = cacheKey(scope)
   try {
-    const raw = localStorage.getItem(CACHE_KEY)
+    const raw = localStorage.getItem(key)
     if (!raw) return undefined
     const entry = JSON.parse(raw) as CacheEntry
     if (entry.version !== VERSION) {
-      localStorage.removeItem(CACHE_KEY)
+      localStorage.removeItem(key)
       return undefined
     }
     if (Date.now() - entry.timestamp > STALE_TTL_MS) {
-      localStorage.removeItem(CACHE_KEY)
+      localStorage.removeItem(key)
       return undefined
     }
     return entry
@@ -32,26 +38,27 @@ function readCache(): CacheEntry | undefined {
   }
 }
 
-let pendingWrite: CacheEntry | undefined
+const pendingWrites = new Map<string, CacheEntry>()
 let writeTimer: ReturnType<typeof setTimeout> | undefined
 
-function scheduleWrite(entry: CacheEntry) {
-  pendingWrite = entry
+function scheduleWrite(key: string, entry: CacheEntry) {
+  pendingWrites.set(key, entry)
   if (writeTimer !== undefined) return
   writeTimer = setTimeout(() => {
     writeTimer = undefined
-    if (!pendingWrite) return
-    const toWrite = pendingWrite
-    pendingWrite = undefined
-    try {
-      localStorage.setItem(CACHE_KEY, JSON.stringify(toWrite))
-    } catch {}
+    const writes = [...pendingWrites]
+    pendingWrites.clear()
+    for (const [target, toWrite] of writes) {
+      try {
+        localStorage.setItem(target, JSON.stringify(toWrite))
+      } catch {}
+    }
   }, 500)
   if (typeof (writeTimer as any).unref === "function") (writeTimer as any).unref()
 }
 
-export function loadLimitsCache(): CacheEntry | undefined {
-  const entry = readCache()
+export function loadLimitsCache(scope: ServerScopeValue): CacheEntry | undefined {
+  const entry = readCache(scope)
   if (!entry) return undefined
   return entry
 }
@@ -65,26 +72,27 @@ export function isCacheStale(entry: CacheEntry): boolean {
   return age >= CACHE_TTL_MS && age < STALE_TTL_MS
 }
 
-export function saveLimitsCache(providers: CacheEntry["providers"], results: ProviderResult[]) {
+export function saveLimitsCache(scope: ServerScopeValue, providers: CacheEntry["providers"], results: ProviderResult[]) {
   const entry: CacheEntry = {
     version: VERSION,
     timestamp: Date.now(),
     providers,
     results,
   }
-  scheduleWrite(entry)
+  scheduleWrite(cacheKey(scope), entry)
 }
 
-export function clearLimitsCache() {
+export function clearLimitsCache(scope: ServerScopeValue) {
   if (typeof localStorage === "undefined") return
+  const key = cacheKey(scope)
   try {
-    localStorage.removeItem(CACHE_KEY)
+    localStorage.removeItem(key)
   } catch {}
-  if (writeTimer !== undefined) {
+  pendingWrites.delete(key)
+  if (writeTimer !== undefined && pendingWrites.size === 0) {
     clearTimeout(writeTimer)
     writeTimer = undefined
   }
-  pendingWrite = undefined
 }
 
 export type { CacheEntry }

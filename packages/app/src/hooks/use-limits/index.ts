@@ -184,7 +184,7 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
   }
 
   // --- Persistent cache hydration ---
-  const initialCache = typeof window !== "undefined" ? loadLimitsCache() : undefined
+  const initialCache = typeof window !== "undefined" ? loadLimitsCache(sdk().scope) : undefined
   const initialMap = new Map<string, ProviderResult>()
   if (initialCache) {
     for (const r of initialCache.results) {
@@ -282,7 +282,7 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
         const allResults = Array.from(resultsThisGen.values())
         if (allResults.length > 0) {
           try {
-            saveLimitsCache(data.providers, allResults)
+            saveLimitsCache(sdk().scope, data.providers, allResults)
           } catch {}
         }
       }

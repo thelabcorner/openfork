@@ -13,6 +13,7 @@ const persist: typeof import("@/utils/persist").persisted = (_target, store) => 
   store[1],
   null,
   Object.assign(() => true, { promise: undefined }),
+  async () => undefined,
 ]
 
 const child = () => createStore({} as State)

@@ -33,6 +33,8 @@ export type TreeSnapshot = {
 
 type TreeStoreOptions = {
   scope: () => string
+  /** Cache identity may be wider than the filesystem directory (for example server + directory). */
+  cacheScope?: () => string
   normalizeDir: (input: string) => string
   list: (input: string, priority: "interactive" | "background") => Promise<FileNode[]>
   onError: (message: string) => void
@@ -103,7 +105,8 @@ async function mapLimited<A, B>(
 const scopeCache = new Map<string, TreeSnapshot>()
 
 export function createFileTreeStore(options: TreeStoreOptions) {
-  let currentScope = options.scope()
+  const cacheScope = () => options.cacheScope?.() ?? options.scope()
+  let currentScope = cacheScope()
 
   // Per-project LRU cache of tree snapshots, keyed by project scope. On a
   // scope switch we save the outgoing project's state here and restore the
@@ -916,7 +919,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   // state (or starts fresh + prewarms), and evicts cold entries.
   const switchScope = () => {
     if (disposed) return
-    const next = options.scope()
+    const next = cacheScope()
     if (next === currentScope) return
     cache.set(currentScope, snapshot())
     generation += 1

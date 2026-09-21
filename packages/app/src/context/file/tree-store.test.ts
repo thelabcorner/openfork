@@ -63,6 +63,33 @@ function makeStore(opts?: { cache?: { maxScopes?: number; maxNodes?: number; max
 }
 
 describe("file tree store search + expand/collapse helpers", () => {
+  test("module snapshots never cross cache owners that share the same directory", async () => {
+    const cache = new Map<string, TreeSnapshot>()
+    const makeOwned = (owner: string) =>
+      createRoot(() =>
+        createFileTreeStore({
+          scope: () => "/same/repo",
+          cacheScope: () => `${owner}\u0000/same/repo`,
+          normalizeDir: (input) => input,
+          list: async () => [
+            { path: "owner.txt", name: "owner.txt", absolute: "/same/repo/owner.txt", type: "file", ignored: false },
+          ],
+          onError: () => {},
+          cache: { store: cache },
+        }),
+      )
+
+    const serverA = makeOwned("server-a")
+    await serverA.listDir("")
+    serverA.persist()
+
+    const serverB = makeOwned("server-b")
+    expect(serverB.children("")).toEqual([])
+
+    const serverAAgain = makeOwned("server-a")
+    expect(serverAAgain.children("").map((node) => node.path)).toEqual(["owner.txt"])
+  })
+
   test("warm snapshot is bounded, visible immediately, and never considered authoritative", async () => {
     const { store } = makeStore()
     await store.listDir("")

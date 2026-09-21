@@ -9,6 +9,8 @@ import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
 import { getUsageTables } from "@/utils/model-usage-profile"
 import { isRecentModelRelease, withinRecentWindow } from "@/utils/model-recency"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
+import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 
 export type ModelKey = { providerID: string; modelID: string }
 
@@ -46,14 +48,24 @@ const sectionKeyFor = (section: string) =>
 export const { use: useModels, provider: ModelsProvider } = createSimpleContext({
   name: "Models",
   gate: false,
-  init: (props: { directory?: Accessor<string | undefined> } = {}) => {
-    const providers = useProviders(() => props.directory?.())
+  init: (
+    props: {
+      directory?: Accessor<string | undefined>
+      catalog?: Accessor<NormalizedProviderListResponse | undefined>
+      warmUsage?: boolean
+    } = {},
+  ) => {
+    // Global/server-owned surfaces may supply an explicitly fetched Tier-2
+    // catalog instead of manufacturing a directory-scoped Local/Sync tree.
+    const providers = props.catalog ? undefined : useProviders(() => props.directory?.())
 
     const warmUsage = () => {
       void getUsageTables()
     }
-    if (typeof requestIdleCallback === "function") requestIdleCallback(warmUsage, { timeout: 400 })
-    else requestAnimationFrame(warmUsage)
+    if (props.warmUsage !== false) {
+      if (typeof requestIdleCallback === "function") requestIdleCallback(warmUsage, { timeout: 400 })
+      else requestAnimationFrame(warmUsage)
+    }
 
     const [store, setStore, _, ready] = persisted(
       Persist.global("model", ["model.v1"]),
@@ -90,12 +102,23 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       }
     })
 
+    const connectedProviders = () => {
+      const catalog = props.catalog?.()
+      if (catalog) {
+        const connected = new Set(catalog.connected)
+        return [...catalog.all.values()].filter((provider) => connected.has(provider.id))
+      }
+      return providers?.connected() ?? []
+    }
+
     const available = createMemo(() =>
-      providers.connected().flatMap((p) =>
-        Object.values(p.models).map((m) => ({
-          ...m,
-          provider: p,
-        })),
+      connectedProviders().flatMap((p) =>
+        Object.values(p.models)
+          .filter((m) => ModelContract.isLanguageModel(p.id, m))
+          .map((m) => ({
+            ...m,
+            provider: p,
+          })),
       ),
     )
 

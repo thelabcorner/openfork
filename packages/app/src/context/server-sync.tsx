@@ -45,6 +45,11 @@ import type { SolidQueryOptions } from "@tanstack/solid-query"
 import { createRefreshQueue } from "./global-sync/queue"
 import { directoryKey } from "./global-sync/utils"
 import { pathKey, PathKey } from "@/utils/path-key"
+import {
+  rootSessionProjectID,
+  sessionEventIndexDirectories,
+  sessionIndexDirectory,
+} from "./global-sync/session-project-index"
 import { createDirSyncContext } from "./directory-sync"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -85,29 +90,7 @@ type GlobalStore = {
   reload: undefined | "pending" | "complete"
 }
 
-type SessionProjectIndex = Pick<Project, "id" | "worktree" | "sandboxes">
-
-/**
- * Resolve the loaded directory store that should own a session row.
- *
- * Most sessions live exactly at a project root or sandbox. Chat is the notable
- * exception: its project root is a catalog/routing identity while each session
- * can live in a generated scratch directory. In that case projectID is the
- * authoritative association and the canonical project root owns the sidebar
- * row. Unknown projects conservatively stay keyed by their actual directory.
- */
-export function sessionIndexDirectory(
-  info: Pick<Session, "directory" | "projectID">,
-  projects: readonly SessionProjectIndex[],
-) {
-  const project = info.projectID ? projects.find((item) => item.id === info.projectID) : undefined
-  if (!project) return info.directory
-
-  const directory = pathKey(info.directory)
-  if (pathKey(project.worktree) === directory) return project.worktree
-  const sandbox = project.sandboxes?.find((item) => pathKey(item) === directory)
-  return sandbox ?? project.worktree
-}
+export { rootSessionProjectID, sessionEventIndexDirectories, sessionIndexDirectory } from "./global-sync/session-project-index"
 
 type McpListApi = {
   readonly list: (input?: McpListInput) => Promise<McpListOutput>
@@ -408,7 +391,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const sdkCache = new Map<string, OpencodeClient>()
   const booting = new Map<string, Promise<void>>()
   const sessionLoads = new Map<string, Promise<void>>()
-  const sessionMeta = new Map<string, { limit: number }>()
+  const sessionMeta = new Map<string, { limit: number; projectID?: string }>()
+  const sessionProjectScope = new Map<string, string>()
   const directoryBootstrapGate = createDirectoryBootstrapGate()
 
   const sdkFor = (directory: string) => {
@@ -616,6 +600,32 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const setProjects = (next: Project[] | ((draft: Project[]) => Project[])) => {
     setGlobalStore("project", next)
+    const liveRoots = new Set<string>()
+    for (const project of globalStore.project) {
+      const key = directoryKey(project.worktree)
+      liveRoots.add(key)
+      sessionProjectScope.set(key, project.id)
+    }
+    for (const key of sessionProjectScope.keys()) {
+      if (!liveRoots.has(key)) sessionProjectScope.delete(key)
+    }
+    // Persisted startup projects may be directory-only. Once the authoritative
+    // project catalog arrives, upgrade any already-started/already-loaded root
+    // Session census to project scope. This belongs here, at cache ownership:
+    // consumers should not need to notice that project identity arrived after
+    // their initial directory load.
+    queueMicrotask(() => {
+      for (const project of globalStore.project) {
+        const key = directoryKey(project.worktree)
+        const meta = sessionMeta.get(key)
+        // Only upgrade roots that already participated in Session loading.
+        // setProjects can run before the child-store manager is initialized, so
+        // this owner-level metadata is intentionally the dependency-free fence.
+        if (!sessionLoads.has(key) && !meta) continue
+        if (meta?.projectID === project.id) continue
+        void loadSessions(project.worktree, { projectID: project.id, priority: "background" }).catch(() => {})
+      }
+    })
   }
 
   const setBootStore = ((...input: unknown[]) => {
@@ -707,10 +717,20 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   async function loadSessions(
     directory: string,
-    options?: { limit?: number; shrinkTo?: number; priority?: ServerRequestPriority },
+    options?: { limit?: number; shrinkTo?: number; priority?: ServerRequestPriority; projectID?: string },
   ) {
     const key = directoryKey(directory)
     const priority = options?.priority ?? "interactive"
+    // Scope is part of the cache contract. A directory-only root snapshot and
+    // a project-wide root snapshot may share the same canonical child store,
+    // but the former must never satisfy the latter merely because its row limit
+    // is already warm. Prefer an explicit caller-owned project identity; late
+    // callers may also resolve it from the durable project catalog.
+    const projectID =
+      options?.projectID ??
+      sessionProjectScope.get(key) ??
+      rootSessionProjectID(directory, globalStore.project) ??
+      sessionMeta.get(key)?.projectID
     const requestKey = `session-list:${key}`
     const pending = sessionLoads.get(key)
     if (pending) {
@@ -720,7 +740,17 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       // background ordering.
       serverSDK.requests.promote(requestKey, priority)
       await pending
-      return loadSessions(directory, options)
+      // Re-resolve scope after the in-flight request. The authoritative project
+      // catalog can land while a speculative directory-only request is pending.
+      // Replaying the stale caller options would otherwise suppress the required
+      // directory -> project census upgrade.
+      return loadSessions(directory, {
+        ...options,
+        projectID:
+          options?.projectID ??
+          sessionProjectScope.get(key) ??
+          rootSessionProjectID(directory, globalStore.project),
+      })
     }
 
     children.pin(key)
@@ -740,13 +770,13 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         setStore("limit", target)
         setStore("session", reconcile(next, { key: "id" }))
       })
-      sessionMeta.set(key, { limit: target })
+      sessionMeta.set(key, { limit: target, projectID })
       children.unpin(key)
       return
     }
     const meta = sessionMeta.get(key)
     const retainedLimit = Math.max(store.limit, options?.limit ?? 0, meta?.limit ?? 0)
-    if (meta && meta.limit >= retainedLimit) {
+    if (meta && meta.projectID === projectID && meta.limit >= retainedLimit) {
       const next = trimSessions(store.session, {
         limit: retainedLimit,
         permission: session.data.permission,
@@ -762,12 +792,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const promise = queryClient
       .fetchQuery({
         ...queryOptionsApi.sessions(key),
+        // Keep TanStack's freshness cache scope-aware as well. The base prefix
+        // remains unchanged, so existing useIsFetching/invalidation consumers
+        // still observe both directory and project variants.
+        queryKey: [...queryOptionsApi.sessions(key).queryKey, projectID ? `project:${projectID}` : "directory"] as const,
         queryFn: () =>
           serverSDK.requests
             .schedule(
               priority,
               () =>
-                loadRootSessionsFast({ client: serverSDK.client, directory, limit }).catch((error) => {
+                loadRootSessionsFast({
+                  client: serverSDK.client,
+                  directory,
+                  projectID,
+                  limit,
+                }).catch((error) => {
                   if (!rootSessionFastPathUnavailable(error)) throw error
                   return serverSDK.protocol.then((protocol) =>
                     protocol === "v1"
@@ -799,7 +838,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
                 )
                 setStore("session", reconcile(next, { key: "id" }))
               })
-              sessionMeta.set(key, { limit })
+              sessionMeta.set(key, { limit, projectID })
             })
             .catch((err) => {
               if (isCancelledRequestError(err)) return
@@ -850,7 +889,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         store: child[0],
         setStore: child[1],
         vcsCache: cache,
-        loadSessions,
+        loadSessions: (target) =>
+          loadSessions(target, {
+            projectID: rootSessionProjectID(target, globalStore.project),
+          }),
         translate: language.t,
         queryClient,
         session,
@@ -871,20 +913,22 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   }
 
   const indexSession = (info: Parameters<typeof session.remember>[0]) => {
-    const key = directoryKey(info.directory)
-    const existing = children.children[key]
-    if (!existing) return
-    applyDirectoryEvent({
-      event: { type: "session.created", properties: { info } },
-      directory: key,
-      store: existing[0],
-      setStore: existing[1],
-      push: queue.push,
-      retainedLimit: sessionMeta.get(key)?.limit,
-      sessionContent: false,
-      permission: session.data.permission,
-      loadLsp() {},
-    })
+    for (const indexedDirectory of sessionEventIndexDirectories(info, info.directory, globalStore.project)) {
+      const key = directoryKey(indexedDirectory)
+      const existing = children.children[key]
+      if (!existing) continue
+      applyDirectoryEvent({
+        event: { type: "session.created", properties: { info } },
+        directory: indexedDirectory,
+        store: existing[0],
+        setStore: existing[1],
+        push: queue.push,
+        retainedLimit: sessionMeta.get(key)?.limit,
+        sessionContent: false,
+        permission: session.data.permission,
+        loadLsp() {},
+      })
+    }
   }
 
   const findLoadedSession = (sessionID: string) => {
@@ -949,7 +993,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const unsub = serverSDK.event.listen((e) => {
     const directory = e.name
-    const key = directoryKey(directory)
     const event = e.details
     const eventType: string = event.type
     const connectedRepair =
@@ -1063,48 +1106,63 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         .then(indexSession)
         .catch(() => {})
 
-    const existing = children.children[key]
-    if (!existing) return
-    children.mark(key)
-    if (
-      event.current?.type === "session.moved" ||
-      // event.current?.type === "session.archived" ||
-      event.current?.type === "session.forked" ||
-      eventType === "command.updated" ||
-      eventType === "config.updated" ||
-      eventType === "agent.updated"
-    )
-      queue.push(key)
-    if (eventType === "mcp.status.changed")
-      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcp(key)))
-    if (eventType === "mcp.resources.changed")
-      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key)))
-    if (eventType === "tool.reloaded")
-      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.tools(key)))
-    const [store, setStore] = existing
-    time("dir", () =>
-      applyDirectoryEvent({
-        event,
-        directory,
-        store,
-        setStore,
-        push: (directory) => {
-          if (children.active(directory)) queue.push(directory)
-        },
-        retainedLimit: sessionMeta.get(key)?.limit,
-        sessionContent: false,
-        permission: session.data.permission,
-        vcsCache: children.vcsCache.get(key),
-        loadLsp: () => {
-          if (!children.active(key)) return
-          void queryClient.fetchQuery(queryOptionsApi.lsp(key))
-        },
-        loadReferences: () => {
-          if (!children.active(key)) return
-          void queryClient.fetchQuery(queryOptionsApi.references(key))
-        },
-      }),
-    )
+    const rootInfo =
+      eventType === "session.created" || eventType === "session.updated" || eventType === "session.deleted"
+        ? (event.properties as { info?: Session } | undefined)?.info
+        : undefined
+    const eventDirectories = rootInfo
+      ? sessionEventIndexDirectories(rootInfo, directory, globalStore.project)
+      : [directory]
+
+    // Root metadata can have two already-materialized consumers: the canonical
+    // project-wide root index and its physical directory detail store. Mirror
+    // the same ordinary Session event into both; this is bounded (<= 2), issues
+    // no requests, and keeps producer-specific state out of the sidebar.
+    for (const eventDirectory of eventDirectories) {
+      const eventKey = directoryKey(eventDirectory)
+      const existing = children.children[eventKey]
+      if (!existing) continue
+      children.mark(eventKey)
+      if (
+        event.current?.type === "session.moved" ||
+        // event.current?.type === "session.archived" ||
+        event.current?.type === "session.forked" ||
+        eventType === "command.updated" ||
+        eventType === "config.updated" ||
+        eventType === "agent.updated"
+      )
+        queue.push(eventKey)
+      if (eventType === "mcp.status.changed")
+        time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcp(eventKey)))
+      if (eventType === "mcp.resources.changed")
+        time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcpResources(eventKey)))
+      if (eventType === "tool.reloaded")
+        time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.tools(eventKey)))
+      const [store, setStore] = existing
+      time("dir", () =>
+        applyDirectoryEvent({
+          event,
+          directory: eventDirectory,
+          store,
+          setStore,
+          push: (nextDirectory) => {
+            if (children.active(nextDirectory)) queue.push(nextDirectory)
+          },
+          retainedLimit: sessionMeta.get(eventKey)?.limit,
+          sessionContent: false,
+          permission: session.data.permission,
+          vcsCache: children.vcsCache.get(eventKey),
+          loadLsp: () => {
+            if (!children.active(eventKey)) return
+            void queryClient.fetchQuery(queryOptionsApi.lsp(eventKey))
+          },
+          loadReferences: () => {
+            if (!children.active(eventKey)) return
+            void queryClient.fetchQuery(queryOptionsApi.references(eventKey))
+          },
+        }),
+      )
+    }
   })
 
   onCleanup(unsub)

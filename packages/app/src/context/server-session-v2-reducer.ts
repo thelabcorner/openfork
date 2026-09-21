@@ -1,5 +1,6 @@
-import type { OpenCodeEvent, SessionMessageInfo, SessionPendingMessage } from "@opencode-ai/client/promise"
+import type { OpenCodeEvent, SessionPendingMessage } from "@opencode-ai/client/promise"
 import type * as SessionEvent from "@opencode-ai/schema/session-event"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 
 type Assistant = Extract<SessionMessageInfo, { type: "assistant" }>
 type Compaction = Extract<SessionMessageInfo, { type: "compaction" }>
@@ -274,6 +275,7 @@ export function createV2SessionReducer() {
           id: event.data.messageID,
           type: "user",
           metadata: event.metadata as SessionMessageInfo["metadata"],
+          provenance: event.data.provenance,
           text: event.data.prompt.text,
           files: event.data.prompt.files as Extract<SessionMessageInfo, { type: "user" }>["files"],
           agents: event.data.prompt.agents as Extract<SessionMessageInfo, { type: "user" }>["agents"],
@@ -314,6 +316,7 @@ export function createV2SessionReducer() {
           id: event.data.messageID,
           type: "synthetic",
           metadata: event.metadata as SessionMessageInfo["metadata"],
+          provenance: event.data.provenance,
           text: event.data.text,
           time: { created: event.data.timestamp },
         })
@@ -1002,6 +1005,7 @@ export function createV2SessionReducer() {
           type: "compaction",
           status: "running",
           metadata: event.metadata as SessionMessageInfo["metadata"],
+          provenance: event.data.provenance,
           reason: event.data.reason,
           summary: "",
           recent: "",
@@ -1027,6 +1031,7 @@ export function createV2SessionReducer() {
             type: "compaction",
             status: "completed",
             metadata: event.metadata as SessionMessageInfo["metadata"],
+            provenance: event.data.provenance,
             reason: event.data.reason,
             summary: event.data.text,
             recent: event.data.recent,
@@ -1036,6 +1041,7 @@ export function createV2SessionReducer() {
           update(source, current.id, () => ({
             ...current,
             status: "completed",
+            provenance: event.data.provenance ?? current.provenance,
             reason: event.data.reason,
             summary: event.data.text,
             recent: event.data.recent,

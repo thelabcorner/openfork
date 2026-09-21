@@ -5,8 +5,16 @@ import { forgetServerStreamLiveness, isServerStreamLive } from "./server-livenes
 import { ClientError, OpenCode } from "@opencode-ai/client"
 import { Accessor, createEffect, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
+import type { OfxpSettingsServerSeed } from "@opencode-ai/sdk/v2/client"
+import { probeConfiguredServerOfxp, type ConfiguredServerOfxpIdentity } from "./ofxp-server-seeds"
 
-export type ServerHealth = { healthy: boolean; version?: string }
+export type ServerHealth = {
+  healthy: boolean
+  version?: string
+  instanceID?: string
+  ofxp?: ConfiguredServerOfxpIdentity
+  ofxpSeed?: OfxpSettingsServerSeed
+}
 
 interface CheckServerHealthOptions {
   timeoutMs?: number
@@ -114,6 +122,7 @@ export async function checkServerHealth(
 }
 
 const pollMs = 10_000
+const OFXP_SEED_REFRESH_MS = 20_000
 // While a server's SSE stream is live, the health check only re-runs this often
 // (to keep the version badge fresh); the stream's own heartbeat is the liveness
 // signal in between. Version only changes on a server restart, so this staleness
@@ -122,6 +131,7 @@ const pollMs = 10_000
 // re-check. Kept short specifically for that self-healing property.
 const VERSION_REFRESH_MS = 20_000
 const lastVersionAt = new Map<string, number>()
+const lastOfxpSeedAt = new Map<string, number>()
 // The live polling loop fails fast and relies on the next 10s tick to retry,
 // rather than the exported default (used by one-off manual checks, e.g. "test
 // connection", where waiting longer for a slow network is worth it). Without
@@ -157,6 +167,8 @@ export function useCheckServerHealth() {
 }
 
 export const useServerHealth = (servers: Accessor<ServerConnection.Any[]>, enabled: Accessor<boolean>) => {
+  const platform = usePlatform()
+  const fetcher = platform.fetch ?? globalThis.fetch
   const checkServerHealth = useCheckServerHealth()
   const [status, setStatus] = createStore({} as Record<ServerConnection.Key, ServerHealth | undefined>)
 
@@ -173,6 +185,9 @@ export const useServerHealth = (servers: Accessor<ServerConnection.Any[]>, enabl
 
     for (const key of [...lastVersionAt.keys()]) {
       if (!list.some((conn) => ServerConnection.key(conn) === key)) lastVersionAt.delete(key)
+    }
+    for (const key of [...lastOfxpSeedAt.keys()]) {
+      if (!list.some((conn) => ServerConnection.key(conn) === key)) lastOfxpSeedAt.delete(key)
     }
 
     const refresh = async () => {
@@ -200,12 +215,38 @@ export const useServerHealth = (servers: Accessor<ServerConnection.Any[]>, enabl
               }
             }
             const result = await checkServerHealth(conn.http)
-            if (result.healthy) lastVersionAt.set(key, Date.now())
-            const failed = result.healthy === false
+            let enriched: ServerHealth = result
+            if (result.healthy) {
+              lastVersionAt.set(key, Date.now())
+              const previous = status[key]
+              const lastSeedAt = lastOfxpSeedAt.get(key) ?? 0
+              if (lastSeedAt > Date.now() - OFXP_SEED_REFRESH_MS) {
+                if (previous?.instanceID || previous?.ofxp || previous?.ofxpSeed) {
+                  enriched = {
+                    ...result,
+                    ...(previous.instanceID ? { instanceID: previous.instanceID } : {}),
+                    ...(previous.ofxp ? { ofxp: previous.ofxp } : {}),
+                    ...(previous.ofxpSeed ? { ofxpSeed: previous.ofxpSeed } : {}),
+                  }
+                }
+              } else {
+                const ofxp = await probeConfiguredServerOfxp(conn, fetcher)
+                lastOfxpSeedAt.set(key, Date.now())
+                if (ofxp) {
+                  enriched = {
+                    ...result,
+                    instanceID: ofxp.instanceID,
+                    ofxp: ofxp.ofxp,
+                    ...(ofxp.seed ? { ofxpSeed: ofxp.seed } : {}),
+                  }
+                }
+              }
+            }
+            const failed = enriched.healthy === false
             const failureCount = failed ? (failures.get(key) ?? 0) + 1 : 0
             if (failed) failures.set(key, failureCount)
             else failures.delete(key)
-            const visible = failed && status[key]?.healthy === true && failureCount < 2 ? status[key]! : result
+            const visible = failed && status[key]?.healthy === true && failureCount < 2 ? status[key]! : enriched
             results[key] = visible
             if (!dead) setStatus(key, visible)
           }),

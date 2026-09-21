@@ -5,7 +5,7 @@ describe("chat project identity", () => {
   const canonical = {
     id: "chats",
     name: "Chat",
-    worktree: "C:\\Users\\jackson\\.local\\share\\opencode\\chats",
+    worktree: "C:\\Users\\jackson\\.local\\share\\openfork\\chats",
   }
 
   test("finds the server-owned project by reserved id", () => {
@@ -16,6 +16,10 @@ describe("chat project identity", () => {
     const legacy = { worktree: "/.local/share/opencode/chats" }
     expect(isReservedChatProjectPath(legacy.worktree)).toBe(true)
     expect(isChatProjectAlias(legacy, canonical)).toBe(true)
+  })
+
+  test("recognizes the canonical OpenFork chat root", () => {
+    expect(isReservedChatProjectPath("/home/me/.local/share/openfork/chats")).toBe(true)
   })
 
   test("does not collapse ordinary projects into Chat", () => {

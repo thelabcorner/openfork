@@ -109,6 +109,7 @@ describe("normalizeProviderList", () => {
     expect(result.all.get("openai")?.models["gpt-5"]).toMatchObject({
       id: "gpt-5",
       providerID: "openai",
+      primitive: "language",
       capabilities: { toolcall: true, attachment: true },
       cost: { input: 1, output: 2 },
       variants: { high: {} },
@@ -117,6 +118,46 @@ describe("normalizeProviderList", () => {
 
   test("preserves an empty current default", () => {
     expect(normalizeProviderList([] as ProviderListOutput["data"], [], null).defaultModel).toBeNull()
+  })
+
+  test("classifies legacy OpenCode-hosted Jev catalog rows as System One for Zen and Go", () => {
+    const result = normalizeProviderList(
+      [
+        { id: "opencode", name: "OpenCode", package: "@ai-sdk/openai-compatible" },
+        { id: "opencode-go", name: "OpenCode Go", package: "@ai-sdk/openai-compatible" },
+      ] as ProviderListOutput["data"],
+      [
+        {
+          id: "jev-1.13-free",
+          modelID: "jev-1.13-free",
+          providerID: "opencode",
+          name: "Jev 1.13 Free",
+          capabilities: { tools: false, input: ["text"], output: ["text"] },
+          variants: [],
+          time: { released: 1 },
+          cost: [],
+          status: "active",
+          enabled: true,
+          limit: { context: 128_000, output: 8_192 },
+        },
+        {
+          id: "jev-1.13",
+          modelID: "jev-1.13",
+          providerID: "opencode-go",
+          name: "Jev 1.13",
+          capabilities: { tools: false, input: ["text"], output: ["text"] },
+          variants: [],
+          time: { released: 1 },
+          cost: [],
+          status: "active",
+          enabled: true,
+          limit: { context: 64_000, output: 0 },
+        },
+      ] as ModelListOutput["data"],
+    )
+
+    expect(result.all.get("opencode")?.models["jev-1.13-free"]?.primitive).toBe("system-one")
+    expect(result.all.get("opencode-go")?.models["jev-1.13"]?.primitive).toBe("system-one")
   })
 })
 

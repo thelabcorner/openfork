@@ -152,7 +152,7 @@ function createServerCtx(
   const projectsList = createMemo(() => projects.list().map(enrich))
 
   // One-time migration for the original browser-side Chat faux-project. Older
-  // builds persisted `/.local/share/opencode/chats` because the renderer tried
+  // builds persisted `/.local/share/opencode/chats` because the legacy renderer tried
   // to infer HOME itself. Once the server advertises its canonical Chat
   // project, replace only that reserved alias and preserve whether it was the
   // user's last/open project.

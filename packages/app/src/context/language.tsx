@@ -40,6 +40,7 @@ type PluralKey =
   | "chats.archived.count"
   | "projectExplorer.folder.count"
   | "settings.providers.accounts.count"
+  | "goal.auditor.runs"
 
 const pluralCountFormatters = new Map<string, Intl.NumberFormat>()
 /** Locale-grouped rendering of a plural string's `{{count}}` placeholder. */

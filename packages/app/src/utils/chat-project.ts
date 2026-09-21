@@ -13,14 +13,16 @@ export function findChatProject<T extends ChatProjectLike>(projects: readonly T[
 
 export function isReservedChatProjectPath(directory: string) {
   const normalized = directory.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase()
-  return normalized === "/.local/share/opencode/chats" || normalized.endsWith("/.local/share/opencode/chats")
+  return ["/.local/share/openfork/chats", "/.local/share/opencode/chats"].some(
+    (suffix) => normalized === suffix || normalized.endsWith(suffix),
+  )
 }
 
 /**
  * Matches both the canonical server-owned Chat project and the legacy browser
- * faux-project (`/.local/share/opencode/chats`) that was persisted when the
+ * faux-project (`/.local/share/opencode/chats`) that was persisted before the
  * renderer tried to derive HOME itself. This is intentionally narrow to the
- * OpenCode-owned chats directory.
+ * OpenFork chats directory plus that one legacy migration alias.
  */
 export function isChatProjectAlias(project: ChatProjectLike, canonical: ChatProjectLike): boolean {
   if (project.id === CHAT_PROJECT_ID) return true

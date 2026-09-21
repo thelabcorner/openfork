@@ -1,9 +1,13 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
+import { createRoot } from "solid-js"
+import { createStore } from "solid-js/store"
+import { createDraftStore } from "./draft-store"
 import { ServerScope } from "./server-scope"
 
 type PersistTestingType = typeof import("./persist").PersistTesting
 type PersistType = typeof import("./persist").Persist
 type RemovePersistedType = typeof import("./persist").removePersisted
+type PersistedType = typeof import("./persist").persisted
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>()
@@ -50,6 +54,7 @@ const storage = new MemoryStorage()
 let persistTesting: PersistTestingType
 let Persist: PersistType
 let removePersisted: RemovePersistedType
+let persisted: PersistedType
 
 beforeAll(async () => {
   mock.module("@/context/platform", () => ({
@@ -60,6 +65,7 @@ beforeAll(async () => {
   persistTesting = mod.PersistTesting
   Persist = mod.Persist
   removePersisted = mod.removePersisted
+  persisted = mod.persisted
 })
 
 beforeEach(() => {
@@ -207,5 +213,49 @@ describe("persist localStorage resilience", () => {
 
   test("server global target cannot collide when scope and key contain colons", () => {
     expect(Persist.serverGlobal("a:b" as ServerScope, "c")).not.toEqual(Persist.serverGlobal("a" as ServerScope, "b:c"))
+  })
+
+  test("explicit flush crosses both prompt persistence debounce layers", async () => {
+    const durable = new Map<string, string>()
+    let commits = 0
+    const draftStore = createDraftStore({
+      get: async (key) => durable.get(key) ?? null,
+      set: async (key, value) => {
+        commits += 1
+        durable.set(key, value)
+      },
+      remove: async (key) => {
+        durable.delete(key)
+      },
+      putBlob: async () => "blob",
+      getBlob: async () => null,
+    })
+    const platform = {
+      platform: "desktop",
+      draftStore,
+    } as unknown as NonNullable<Parameters<PersistedType>[2]>
+
+    await new Promise<void>((resolve, reject) => {
+      createRoot((dispose) => {
+        const [state, setState, _init, ready, flush] = persisted(
+          Persist.prompt(Persist.draft("revision-flush", "prompt")),
+          createStore({ value: "initial" }),
+          platform,
+        )
+        void (async () => {
+          if (ready.promise) await ready.promise
+          setState("value", "revised")
+          expect(state.value).toBe("revised")
+          expect(commits).toBe(0)
+
+          await flush()
+
+          expect(commits).toBe(1)
+          expect([...durable.values()].map((value) => JSON.parse(value))).toContainEqual({ value: "revised" })
+        })()
+          .then(resolve, reject)
+          .finally(dispose)
+      })
+    })
   })
 })

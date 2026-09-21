@@ -15,6 +15,7 @@ import { useSync } from "./sync"
 import { useServerSDK } from "./server-sdk"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
 
 export type ModelKey = { providerID: string; modelID: string; variant?: string }
 
@@ -102,14 +103,20 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const validModel = (model: ModelKey) => {
       const provider = providers.all().get(model.providerID)
       if (!provider || !connected().has(model.providerID)) return false
-      if (provider.models[model.modelID]) return true
+      const exact = provider.models[model.modelID]
+      if (exact) return ModelContract.isLanguageModel(provider.id, exact)
       // Account-qualified ids (`model@vd-…`, `model@zen-…`) are routing
       // metadata decoded server-side (verdent proxy, zen fetch wrapper);
       // validate the base model id so a pinned account isn't silently
       // snapped back to the previous model. Unknown providers return the id
       // unchanged, preserving the strict check for everyone else.
       const base = splitModelIDForProvider(model.modelID, model.providerID).baseModelID
-      return base !== model.modelID && !!provider.models[base]
+      const resolved = provider.models[base]
+      return (
+        base !== model.modelID &&
+        resolved !== undefined &&
+        ModelContract.isLanguageModel(provider.id, resolved)
+      )
     }
 
     const firstModel = (...items: Array<() => ModelKey | undefined>) => {
@@ -179,7 +186,9 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (validModel(model)) return model
         }
 
-        const first = Object.values(provider.models)[0]
+        const first = Object.values(provider.models).find(
+          (model) => ModelContract.isLanguageModel(provider.id, model),
+        )
         if (!first) continue
         const model = { providerID: provider.id, modelID: first.id }
         if (validModel(model)) return model

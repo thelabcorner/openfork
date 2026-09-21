@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import type { OpenCodeEvent, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { OpenCodeEvent } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 import { createV2SessionReducer } from "./server-session-v2-reducer"
 
 const event = (input: object) => input as OpenCodeEvent
@@ -289,6 +290,86 @@ describe("v2 session reducer", () => {
       time: { created: 10, requestSentAt: 9, firstTokenAt: 11 },
       content: [{ type: "text", text: "hello" }],
     })
+  })
+
+  test("preserves current prompt, synthetic, and compaction provenance during live replay", () => {
+    const reducer = createV2SessionReducer()
+    let messages: SessionMessageInfo[] = []
+    const apply = (input: object) => {
+      const reduced = reducer.reduce(messages, event(input))
+      if (reduced?.kind === "messages") messages = reduced.messages
+    }
+    const root = "msg_root"
+    const rootProvenance = { owner: "host" as const, source: "host.prompt" }
+    const continuationProvenance = {
+      owner: "host" as const,
+      source: "goal.continuation",
+      sourceMessageID: root,
+      ref: "reservation-1",
+    }
+    const compactionProvenance = {
+      owner: "host" as const,
+      source: "compaction",
+      sourceMessageID: root,
+    }
+
+    apply({
+      ...base,
+      id: "evt_prompted_provenance",
+      type: "session.next.prompted",
+      data: {
+        sessionID: "ses_1",
+        messageID: root,
+        timestamp: 1,
+        prompt: { text: "scheduled work" },
+        delivery: "steer",
+        provenance: rootProvenance,
+      },
+    })
+    apply({
+      ...base,
+      id: "evt_synthetic_provenance",
+      type: "session.next.synthetic",
+      data: {
+        sessionID: "ses_1",
+        messageID: "msg_goal",
+        timestamp: 2,
+        text: "continue",
+        provenance: continuationProvenance,
+      },
+    })
+    apply({
+      ...base,
+      id: "evt_compaction_started_provenance",
+      type: "session.next.compaction.started",
+      data: {
+        sessionID: "ses_1",
+        messageID: "msg_compaction",
+        timestamp: 3,
+        reason: "auto",
+        provenance: compactionProvenance,
+      },
+    })
+    apply({
+      ...base,
+      id: "evt_compaction_ended_provenance",
+      type: "session.next.compaction.ended",
+      data: {
+        sessionID: "ses_1",
+        messageID: "msg_compaction",
+        timestamp: 4,
+        reason: "auto",
+        text: "summary",
+        recent: "recent",
+        provenance: compactionProvenance,
+      },
+    })
+
+    expect(messages).toMatchObject([
+      { id: root, type: "user", provenance: rootProvenance },
+      { id: "msg_goal", type: "synthetic", provenance: continuationProvenance },
+      { id: "msg_compaction", type: "compaction", status: "completed", provenance: compactionProvenance },
+    ])
   })
 
   test("recovers an unmapped current stream id from the latest compatible history slot", () => {

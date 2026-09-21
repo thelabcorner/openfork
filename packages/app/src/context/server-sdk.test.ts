@@ -12,7 +12,7 @@ import {
   streamInterestUpdatePriority,
 } from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 import type { Event } from "@opencode-ai/sdk/v2/client"
 import { createV2SessionReducer } from "./server-session-v2-reducer"
 

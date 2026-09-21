@@ -83,6 +83,7 @@ export interface Settings {
     showStatus: boolean
     showTerminal: boolean
     showReasoningSummaries: boolean
+    showSystemInjections: boolean
     shellToolPartsExpanded: boolean
     editToolPartsExpanded: boolean
     autoAcceptPermissionsDefault: boolean
@@ -250,6 +251,7 @@ const defaultSettings: Settings = {
     showStatus: false,
     showTerminal: false,
     showReasoningSummaries: false,
+    showSystemInjections: false,
     shellToolPartsExpanded: false,
     editToolPartsExpanded: false,
     autoAcceptPermissionsDefault: true,
@@ -463,6 +465,13 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         ),
         setShowReasoningSummaries(value: boolean) {
           setStore("general", "showReasoningSummaries", value)
+        },
+        showSystemInjections: withFallback(
+          () => store.general?.showSystemInjections,
+          defaultSettings.general.showSystemInjections,
+        ),
+        setShowSystemInjections(value: boolean) {
+          setStore("general", "showSystemInjections", value)
         },
         shellToolPartsExpanded: withFallback(
           () => store.general?.shellToolPartsExpanded,

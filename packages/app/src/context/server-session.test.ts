@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { OpenCodeEvent, SessionApi } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@/utils/session-message-info"
 import type { Message, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2/client"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
@@ -258,9 +259,16 @@ describe("server session", () => {
 
   test("does not resolve passive metadata-only events for uncached sessions", async () => {
     const ctx = setup({ child: session("child") })
-    const todos = [{ id: "todo", title: "review", status: "pending" }]
-    const permission = { id: "perm", sessionID: "child", action: "read", resources: ["src/**"] }
-    const question = { id: "question", sessionID: "child", prompt: "Continue?" }
+    const todos = [{ content: "review", status: "pending", priority: "medium" }]
+    const permission = {
+      id: "perm",
+      sessionID: "child",
+      permission: "read",
+      patterns: ["src/**"],
+      metadata: {},
+      always: [],
+    }
+    const question = { id: "question", sessionID: "child", questions: [] }
 
     ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } })
     ctx.store.apply({ type: "todo.updated", properties: { sessionID: "child", todos } })
@@ -438,6 +446,66 @@ describe("server session", () => {
       },
     })
     expect(ctx.store.data.session_status.child).toEqual({ type: "retry", attempt: 1, message: "waiting", next: 99 })
+  })
+
+  test("projects a Goal Auditor synthetic root into a live current assistant turn", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_auditor_prompt",
+        type: "synthetic",
+        text: "audit the latest Goal worker cycle",
+        provenance: { owner: "host", source: "special-agent.goal-auditor" },
+        time: { created: 1 },
+      },
+    ])
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+
+    apply({
+      id: "evt_auditor_step",
+      type: "session.next.step.started",
+      data: {
+        sessionID: "child",
+        timestamp: 2,
+        assistantMessageID: "msg_auditor_assistant",
+        agent: "goal_auditor",
+        model: { id: "auditor-model", providerID: "opencode" },
+      },
+    })
+    apply({
+      id: "evt_auditor_text_start",
+      type: "session.next.text.started",
+      data: {
+        sessionID: "child",
+        timestamp: 3,
+        assistantMessageID: "msg_auditor_assistant",
+        textID: "txt_auditor",
+      },
+    })
+    apply({
+      id: "evt_auditor_text_delta",
+      type: "session.next.text.delta",
+      data: {
+        sessionID: "child",
+        timestamp: 4,
+        assistantMessageID: "msg_auditor_assistant",
+        textID: "txt_auditor",
+        delta: "Live auditor output",
+      },
+    })
+
+    expect(ctx.store.data.message.child?.find((message) => message.id === "msg_auditor_prompt")).toMatchObject({
+      role: "user",
+      provenance: { owner: "host", source: "special-agent.goal-auditor" },
+    })
+    expect(ctx.store.data.message.child?.find((message) => message.id === "msg_auditor_assistant")).toMatchObject({
+      role: "assistant",
+      parentID: "msg_auditor_prompt",
+    })
+    expect(ctx.store.data.part.msg_auditor_assistant).toMatchObject([
+      { type: "text", text: "Live auditor output" },
+    ])
   })
 
   test("V2 content deltas do not invalidate legacy message metadata", () => {
@@ -892,6 +960,117 @@ describe("server session", () => {
       ...assistants.map((item) => item.id),
     ])
     expect(assistants.map((item) => store.data.part[item.id]?.[0]?.type)).toEqual(["text", "text", "text"])
+  })
+
+  test("extends a current page to include an explicit synthetic causal root", async () => {
+    const user = {
+      id: "msg_root",
+      type: "user" as const,
+      text: "root request",
+      provenance: { owner: "user" as const, source: "prompt" },
+      time: { created: 1 },
+    }
+    const continuation = {
+      id: "msg_goal",
+      type: "synthetic" as const,
+      sessionID: "root",
+      text: "continue",
+      provenance: {
+        owner: "host" as const,
+        source: "goal.continuation",
+        sourceMessageID: user.id,
+        ref: "reservation-1",
+      },
+      time: { created: 2 },
+    }
+    const assistant = {
+      id: "msg_assistant",
+      type: "assistant" as const,
+      agent: "build",
+      model: { id: "model", providerID: "provider" },
+      content: [{ type: "text" as const, text: "continued" }],
+      time: { created: 3, completed: 4 },
+    }
+    const pages = [
+      { data: [assistant, continuation], cursor: { previous: null, next: "older" } },
+      { data: [user], cursor: { previous: null, next: null } },
+    ]
+    const requests: unknown[] = []
+    const messageApi = {
+      list: async (input: unknown) => {
+        requests.push(input)
+        return pages.shift()!
+      },
+    } as unknown as MessageApi
+    const store = createServerSession({} as OpencodeClient, {} as SessionApi, messageApi)
+    store.remember(session("root"))
+
+    await store.sync("root")
+
+    expect(requests).toEqual([
+      { sessionID: "root", limit: 20, order: "desc" },
+      { sessionID: "root", limit: 20, cursor: "older" },
+    ])
+    expect(store.data.session_message.root).toMatchObject([
+      { id: user.id, type: "user", provenance: user.provenance },
+      { id: continuation.id, type: "synthetic", provenance: continuation.provenance },
+      { id: assistant.id, type: "assistant" },
+    ])
+  })
+
+  test("does not let historical state-shaped rows suppress older worker-root hydration", async () => {
+    const user = {
+      id: "msg_state_root",
+      type: "user" as const,
+      text: "root request",
+      provenance: { owner: "user" as const, source: "prompt" },
+      time: { created: 1 },
+    }
+    const state = {
+      id: "msg_state_projection",
+      type: "synthetic" as const,
+      text: '<goal_progress state="current" />',
+      provenance: {
+        owner: "host" as const,
+        source: "goal.progress",
+        ref: "goal-state:pagination",
+        lifetime: "historical" as const,
+      },
+      time: { created: 2 },
+    }
+    const assistant = {
+      id: "msg_state_assistant",
+      type: "assistant" as const,
+      agent: "build",
+      model: { id: "model", providerID: "provider" },
+      content: [{ type: "text" as const, text: "response" }],
+      time: { created: 3, completed: 4 },
+    }
+    const pages = [
+      { data: [assistant, state], cursor: { previous: null, next: "older" } },
+      { data: [user], cursor: { previous: null, next: null } },
+    ]
+    const requests: unknown[] = []
+    const messageApi = {
+      list: async (input: unknown) => {
+        requests.push(input)
+        return pages.shift()!
+      },
+    } as unknown as MessageApi
+    const store = createServerSession({} as OpencodeClient, {} as SessionApi, messageApi)
+    store.remember(session("root"))
+
+    await store.sync("root")
+
+    expect(requests).toEqual([
+      { sessionID: "root", limit: 20, order: "desc" },
+      { sessionID: "root", limit: 20, cursor: "older" },
+    ])
+    expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, state.id, assistant.id])
+    expect(store.data.message.root.find((message) => message.id === assistant.id)).toMatchObject({
+      role: "assistant",
+      parentID: user.id,
+    })
   })
 
   test("indexes V1 messages for the current timeline projection", async () => {

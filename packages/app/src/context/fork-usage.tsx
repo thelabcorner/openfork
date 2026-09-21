@@ -108,15 +108,17 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
         void refetchCredentials()
         void refetchUsage()
       },
-      // The account a bare opencode-go request routes to: the pool default
-      // (env-first, else the vault-designated default). Falls back to the
-      // vault UUID flagged `active` for old servers that don't report the
-      // pool envelope. Id domain is `zen-<hash>`; match spend via
-      // `usageWindowsFor` (which checks both pool id and vault UUID).
+      // The actual account a bare opencode-go request routes to. New servers
+      // report direct-provider-auth > pool precedence explicitly; old servers
+      // fall back to the pool default and then the vault active flag.
       activeCredentialID: () =>
-        usage.latest?.defaultAccountID ?? credentials.latest?.find((credential) => credential.active)?.id,
+        usage.latest?.routedAccountID ??
+        usage.latest?.defaultAccountID ??
+        credentials.latest?.find((credential) => credential.active)?.id,
       activeCredentialLabel: () =>
-        usage.latest?.defaultAccountLabel ?? credentials.latest?.find((credential) => credential.active)?.label,
+        usage.latest?.routedAccountLabel ??
+        usage.latest?.defaultAccountLabel ??
+        credentials.latest?.find((credential) => credential.active)?.label,
       // Per-account Go spend windows matched by EITHER the pool account id or
       // the vault UUID (old servers, or a synthesized group built from vault
       // rows before the pool envelope arrived).

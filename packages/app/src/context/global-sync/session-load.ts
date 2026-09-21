@@ -41,10 +41,12 @@ export async function loadRootSessions(input: {
 export async function loadRootSessionsFast(input: {
   client: OpencodeClient
   directory: string
+  projectID?: string
   limit: number
 }): Promise<RootSessions> {
   const result = await input.client.global.sessionRoots({
     directory: input.directory,
+    ...(input.projectID ? { projectID: input.projectID } : {}),
     limit: String(input.limit),
   })
   return {

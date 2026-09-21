@@ -1,7 +1,7 @@
 import type { Session, SessionGroupDetail, SessionGroupInfo, SessionGroupMember } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
-import { createEffect, createMemo, createSignal } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useGlobal } from "./global"
 import { safeQueryData } from "@/utils/safe-query-data"
@@ -14,7 +14,7 @@ export type SessionGroupEntry = {
   name: string
   sessionIds: string[]
   position: number
-  kind: "user" | "subagent" | "plugin"
+  kind: SessionGroupInfo["kind"]
   ownerPlugin?: string
   ownerRef?: string
   anchorSessionID?: string
@@ -50,6 +50,10 @@ export function sessionGroupMemberSession(member: SessionGroupMember): Session |
 
 function groupListQueryKey(scope: string) {
   return [scope, "session-groups"] as const
+}
+
+export function eventInvalidatesSessionGroupNavigation(type: string) {
+  return type === "swarm.created" || type === "swarm.updated" || type === "swarm.member.updated"
 }
 
 export const { use: useSessionGroups, provider: SessionGroupsProvider } = createSimpleContext({
@@ -195,6 +199,27 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
       queryClient.invalidateQueries({ queryKey: groupListQueryKey(scope()) })
       refreshDetails(groupList().map((group) => group.id))
     }
+
+    // Virtual Swarm groups are projections over durable Swarm membership, so
+    // they do not emit SessionGroup mutation events of their own. Invalidate
+    // the generic navigation projection from the authoritative typed Swarm
+    // events instead of polling. Coalesce same-tick event bursts (delegate emits
+    // create/member/update events back-to-back) into one list/detail refresh.
+    createEffect(() => {
+      if (!active()) return
+      const current = serverSDK()
+      let queued = false
+      const unsubscribe = current.event.listen((envelope) => {
+        if (!eventInvalidatesSessionGroupNavigation(envelope.details.type)) return
+        if (queued) return
+        queued = true
+        queueMicrotask(() => {
+          queued = false
+          invalidate()
+        })
+      })
+      onCleanup(unsubscribe)
+    })
 
     const fetchDetail = (groupId: string) => {
       activate()

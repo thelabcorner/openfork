@@ -1,10 +1,19 @@
 import { describe, expect, test } from "bun:test"
 import { createApiForServer, createSdkForServer } from "./server"
-import { createCompatibleApi } from "./server-compat"
+import {
+  createCompatibleApi,
+  LegacyPromptRevisorProtocolError,
+  type CompatibleRevisionDraftArtifact,
+} from "./server-compat"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2">,
-  responses?: { vcs?: { branch: string; default_branch: string }; reviseError?: Response },
+  responses?: {
+    vcs?: { branch: string; default_branch: string }
+    reviseError?: Response
+    reviseResult?: unknown
+    revisionDraft?: unknown
+  },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -37,6 +46,7 @@ function setup(
       }
       if (request.method === "POST" && new URL(request.url).pathname === "/prompt/revise") {
         if (responses?.reviseError) return responses.reviseError
+        if (responses && "reviseResult" in responses) return Response.json(responses.reviseResult)
         return Response.json({
           type: "revision",
           prompt: "Revised prompt",
@@ -45,6 +55,10 @@ function setup(
           rounds: 1,
         })
       }
+      if (request.method === "POST" && new URL(request.url).pathname === "/revision-draft/recover")
+        return Response.json(responses?.revisionDraft ?? null)
+      if (request.method === "POST" && new URL(request.url).pathname === "/revision-draft/consume")
+        return new Response(undefined, { status: 204 })
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
       if (request.method === "GET") return Response.json([])
@@ -122,7 +136,7 @@ describe("createCompatibleApi", () => {
     expect((error as Error).message).toContain("/prompt/revise")
   })
 
-  test("routes Prompt Revisor to the selected workspace and preserves structured clarification details", async () => {
+  test("routes Prompt Revisor to the selected workspace without transporting clarification lifecycle state", async () => {
     const { api, requests } = setup("v2")
     const result = await api.promptRevisor.revise({
       prompt: "Improve this parser.",
@@ -130,14 +144,6 @@ describe("createCompatibleApi", () => {
         mentions: [{ id: "m1", type: "file", token: "@src/parser.ts", path: "src/parser.ts" }],
         attachments: [{ id: "img1", type: "image", filename: "bug.png", mime: "image/png" }],
       },
-      clarificationRound: 1,
-      clarifications: [
-        {
-          question: "Compatibility?",
-          answers: ["Preserve API"],
-          detail: "Keep deprecated aliases for one release",
-        },
-      ],
       location: { directory: "/other" },
     })
 
@@ -151,14 +157,6 @@ describe("createCompatibleApi", () => {
         mentions: [{ id: "m1", type: "file", token: "@src/parser.ts", path: "src/parser.ts" }],
         attachments: [{ id: "img1", type: "image", filename: "bug.png", mime: "image/png" }],
       },
-      clarificationRound: 1,
-      clarifications: [
-        {
-          question: "Compatibility?",
-          answers: ["Preserve API"],
-          detail: "Keep deprecated aliases for one release",
-        },
-      ],
     })
     expect(result).toEqual({
       type: "revision",
@@ -167,6 +165,89 @@ describe("createCompatibleApi", () => {
       tools: ["question", "revised_prompt"],
       rounds: 1,
     })
+  })
+
+  test("preserves the scheduled-task revision purpose and exact fallback model identity", async () => {
+    const { api, requests } = setup("v2")
+    await api.promptRevisor.revise({
+      prompt: "Audit dependencies every night.",
+      purpose: "scheduled_task",
+      target: {
+        kind: "scheduled_task",
+        key: "task:task_1",
+        sourceFingerprint: "sha256-source",
+      },
+      includeSessionContext: false,
+      fallbackModel: {
+        providerID: "provider",
+        id: "model",
+        accountID: "account-2",
+        variant: "high",
+      },
+      location: { directory: "/scheduled" },
+    })
+
+    const request = requests.at(-1)!
+    const url = new URL(request.url)
+    expect(url.pathname).toBe("/prompt/revise")
+    expect(url.searchParams.get("directory")).toBe("/scheduled")
+    expect(await request.json()).toMatchObject({
+      prompt: "Audit dependencies every night.",
+      purpose: "scheduled_task",
+      target: {
+        kind: "scheduled_task",
+        key: "task:task_1",
+        sourceFingerprint: "sha256-source",
+      },
+      includeSessionContext: false,
+      fallbackModel: {
+        providerID: "provider",
+        id: "model",
+        accountID: "account-2",
+        variant: "high",
+      },
+    })
+  })
+
+  test("round-trips durable revision mailbox recovery and immutable acknowledgement", async () => {
+    const artifact: CompatibleRevisionDraftArtifact = {
+      id: "revision-draft:artifact-1",
+      directory: "/scheduled-target",
+      kind: "scheduled_task",
+      key: "new:/repo",
+      purpose: "scheduled_task",
+      sourceFingerprint: "source-fingerprint",
+      prompt: "Recovered scheduled prompt",
+      references: [],
+      timeCreated: 42,
+    }
+    const { api, requests } = setup("v2", { revisionDraft: artifact })
+
+    expect(await api.revisionDraft.recover({ kind: "scheduled_task", key: "new:/repo" })).toEqual(artifact)
+    const recover = requests.at(-1)!
+    expect(new URL(recover.url).pathname).toBe("/revision-draft/recover")
+    expect(await recover.json()).toEqual({ kind: "scheduled_task", key: "new:/repo" })
+
+    await api.revisionDraft.consume({ id: artifact.id })
+    const consume = requests.at(-1)!
+    expect(new URL(consume.url).pathname).toBe("/revision-draft/consume")
+    expect(await consume.json()).toEqual({ id: artifact.id })
+  })
+
+  test("localizes the retired question-return protocol to an explicit compatibility error", async () => {
+    const { api } = setup("v2", {
+      reviseResult: {
+        type: "question",
+        questions: [],
+        clarificationRound: 1,
+        tools: ["question"],
+        rounds: 1,
+      },
+    })
+
+    const error = await api.promptRevisor.revise({ prompt: "Improve this." }).catch((value: unknown) => value)
+    expect(error).toBeInstanceOf(LegacyPromptRevisorProtocolError)
+    expect((error as Error).message).toContain("retired Prompt Revisor clarification protocol")
   })
 
   /*
