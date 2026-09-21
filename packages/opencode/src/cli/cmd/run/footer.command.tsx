@@ -3,6 +3,7 @@ import { TextAttributes, type InputRenderable, type KeyEvent } from "@opentui/co
 import { useKeyboard, type JSX } from "@opentui/solid"
 import fuzzysort from "fuzzysort"
 import { createEffect, createMemo, createSignal, type Accessor } from "solid-js"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
 import { RunFooterMenu, createFooterMenuState, type RunFooterMenuItem } from "./footer.menu"
 import type { RunFooterTheme } from "./theme"
 import type { FooterQueuedPrompt, FooterSubagentTab, RunCommand, RunInput, RunProvider } from "./types"
@@ -960,7 +961,11 @@ export function RunModelSelectBody(props: {
     (props.providers() ?? [])
       .flatMap((provider) =>
         Object.entries(provider.models)
-          .filter(([, model]) => model.status !== "deprecated")
+          .filter(
+            ([, model]) =>
+              model.status !== "deprecated" &&
+              ModelContract.isLanguageModel(provider.id, model),
+          )
           .map(([modelID, model]) => {
             const title = model.name ?? modelID
             const current = props.current()?.providerID === provider.id && props.current()?.modelID === modelID

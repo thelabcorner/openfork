@@ -16,6 +16,7 @@ import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
 import { InstanceRef } from "@/effect/instance-ref"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import path from "path"
+import { CONFIG_BASENAME, LEGACY_CONFIG_BASENAME, LEGACY_PROJECT_CONFIG_DIRNAME, PROJECT_CONFIG_DIRNAME } from "@opencode-ai/core/storage-identity"
 import { Global } from "@opencode-ai/core/global"
 import { modify, applyEdits } from "jsonc-parser"
 import { Filesystem } from "@/util/filesystem"
@@ -187,7 +188,7 @@ export const McpAuthCommand = effectCmd({
 
     if (servers.length === 0) {
       prompts.log.warn("No OAuth-capable MCP servers configured")
-      prompts.log.info("Remote MCP servers support OAuth by default. Add a remote server in opencode.json:")
+      prompts.log.info("Remote MCP servers support OAuth by default. Add a remote server in openfork.json:")
       prompts.log.info(`
   "mcp": {
     "my-server": {
@@ -392,11 +393,22 @@ export const McpLogoutCommand = effectCmd({
 })
 
 async function resolveConfigPath(baseDir: string, global = false) {
-  // Check for existing config files (prefer .jsonc over .json, check .opencode/ subdirectory too)
-  const candidates = [path.join(baseDir, "opencode.json"), path.join(baseDir, "opencode.jsonc")]
+  // Prefer canonical OpenFork config. Legacy OpenCode-named files are read/edit
+  // only when they already exist; a new file is always OpenFork-owned.
+  const candidates = [
+    path.join(baseDir, `${CONFIG_BASENAME}.jsonc`),
+    path.join(baseDir, `${CONFIG_BASENAME}.json`),
+    path.join(baseDir, `${LEGACY_CONFIG_BASENAME}.jsonc`),
+    path.join(baseDir, `${LEGACY_CONFIG_BASENAME}.json`),
+  ]
 
   if (!global) {
-    candidates.push(path.join(baseDir, ".opencode", "opencode.json"), path.join(baseDir, ".opencode", "opencode.jsonc"))
+    candidates.push(
+      path.join(baseDir, PROJECT_CONFIG_DIRNAME, `${CONFIG_BASENAME}.jsonc`),
+      path.join(baseDir, PROJECT_CONFIG_DIRNAME, `${CONFIG_BASENAME}.json`),
+      path.join(baseDir, LEGACY_PROJECT_CONFIG_DIRNAME, `${LEGACY_CONFIG_BASENAME}.jsonc`),
+      path.join(baseDir, LEGACY_PROJECT_CONFIG_DIRNAME, `${LEGACY_CONFIG_BASENAME}.json`),
+    )
   }
 
   for (const candidate of candidates) {
@@ -405,7 +417,7 @@ async function resolveConfigPath(baseDir: string, global = false) {
     }
   }
 
-  // Default to opencode.json if none exist
+  // Default to the canonical OpenFork config if none exist.
   return candidates[0]
 }
 

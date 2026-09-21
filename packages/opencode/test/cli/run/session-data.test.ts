@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test"
 import type { Event } from "@opencode-ai/sdk/v2"
 import { createSessionData, flushInterrupted, reduceSessionData } from "@/cli/cmd/run/session-data"
 import type { StreamCommit } from "@/cli/cmd/run/types"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionV1 } from "@opencode-ai/schema/session-v1"
 
 function reduce(data: ReturnType<typeof createSessionData>, event: unknown, thinking = true) {
   return reduceSessionData({
@@ -35,7 +37,7 @@ function assistant(id: string, extra: Record<string, unknown> = {}) {
   }
 }
 
-function user(id: string) {
+function user(id: string, provenance?: ReturnType<typeof SessionTurnProvenance.user> | ReturnType<typeof SessionTurnProvenance.host>) {
   return {
     type: "message.updated",
     properties: {
@@ -43,6 +45,7 @@ function user(id: string) {
       info: {
         id,
         role: "user",
+        ...(provenance ? { provenance } : {}),
       },
     },
   }
@@ -160,6 +163,41 @@ describe("run session data", () => {
 
     expect(out.commits).toEqual([])
     expect(out.data.ids.has("txt-user-1")).toBe(true)
+  })
+
+  test("includeUserText never renders host-owned synthetic turns as user text", () => {
+    let data = createSessionData({ includeUserText: true })
+    data = reduce(
+      data,
+      text({ id: "txt-host-1", messageID: "msg-host-1", text: "auditor continuation", time: { end: 1 } }),
+    ).data
+
+    const out = reduce(
+      data,
+      user(
+        "msg-host-1",
+        SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+          sourceMessageID: SessionV1.MessageID.make("msg-user-root"),
+        }),
+      ),
+    )
+
+    expect(out.commits).toEqual([])
+    expect(out.data.ids.has("txt-host-1")).toBe(true)
+  })
+
+  test("includeUserText still renders semantic user turns", () => {
+    let data = createSessionData({ includeUserText: true })
+    data = reduce(data, text({ id: "txt-user-1", messageID: "msg-user-1", text: "hello", time: { end: 1 } })).data
+
+    const out = reduce(
+      data,
+      user("msg-user-1", SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)),
+    )
+
+    expect(out.commits).toEqual([
+      expect.objectContaining({ kind: "user", text: "hello", messageID: "msg-user-1" }),
+    ])
   })
 
   test("suppresses reasoning commits when thinking is disabled", () => {

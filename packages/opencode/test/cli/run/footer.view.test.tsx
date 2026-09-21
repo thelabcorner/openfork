@@ -53,6 +53,7 @@ function model(input: {
   status?: "active" | "deprecated"
   cost?: number
   variants?: Record<string, Record<string, never>>
+  primitive?: "language" | "system-one"
 }) {
   return {
     id: input.id,
@@ -63,6 +64,7 @@ function model(input: {
       npm: "@ai-sdk/openai-compatible",
     },
     name: input.name,
+    primitive: input.primitive,
     capabilities: {
       temperature: true,
       reasoning: true,
@@ -1328,7 +1330,9 @@ test("direct permission rejection submits through keymap return binding", async 
 })
 
 test("direct model panel renders current model selector", async () => {
-  const [providers] = createSignal<RunProvider[] | undefined>([provider()])
+  const item: RunProvider = provider()
+  item.models["jev-1.13"] = model({ id: "jev-1.13", name: "Jev 1.13", primitive: "system-one" })
+  const [providers] = createSignal<RunProvider[] | undefined>([item])
   const [current] = createSignal<RunInput["model"]>({ providerID: "opencode", modelID: "gpt-5" })
 
   const app = await testRender(
@@ -1364,6 +1368,7 @@ test("direct model panel renders current model selector", async () => {
     expect(frame).not.toContain("┌")
     expect(frame).not.toContain("┃")
     expect(frame).not.toContain("Old Model")
+    expect(frame).not.toContain("Jev 1.13")
     expectPaletteList(list, 2)
   } finally {
     app.renderer.destroy()

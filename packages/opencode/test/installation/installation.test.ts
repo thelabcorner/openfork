@@ -1,11 +1,16 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Effect, Layer, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
-import { Installation } from "../../src/installation"
+import {
+  Installation,
+  isDirectInstallPath,
+  openForkDirectUpgradeScript,
+  releaseVersionForChannel,
+} from "../../src/installation"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
@@ -67,174 +72,122 @@ function testLayer(
 }
 
 describe("installation", () => {
-  describe("latest", () => {
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v1.2.3" }))).effect(
-      "reads release version from GitHub releases",
-      () =>
-        Effect.gen(function* () {
-          const result = yield* Installation.use.latest("unknown")
-          expect(result).toBe("1.2.3")
-        }),
-    )
-
-    testEffect(testLayer(() => jsonResponse({ tag_name: "v4.0.0-beta.1" }))).effect(
-      "strips v prefix from GitHub release tag",
-      () =>
-        Effect.gen(function* () {
-          const result = yield* Installation.use.latest("curl")
-          expect(result).toBe("4.0.0-beta.1")
-        }),
-    )
-
-    const npmCalls: string[] = []
-    testEffect(
-      testLayer((request) => {
-        npmCalls.push(request.url)
-        return jsonResponse({ version: "1.5.0" })
-      }),
-    ).effect("reads npm versions via registry", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("npm")
-        expect(result).toBe("1.5.0")
-        expect(npmCalls).toContain(`https://registry.npmjs.org/opencode-ai/${InstallationChannel}`)
-      }),
-    )
-
-    const bunCalls: string[] = []
-    testEffect(
-      testLayer((request) => {
-        bunCalls.push(request.url)
-        return jsonResponse({ version: "1.6.0" })
-      }),
-    ).effect("reads bun versions via registry", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("bun")
-        expect(result).toBe("1.6.0")
-        expect(bunCalls).toContain(`https://registry.npmjs.org/opencode-ai/${InstallationChannel}`)
-      }),
-    )
-
-    const pnpmCalls: string[] = []
-    testEffect(
-      testLayer((request) => {
-        pnpmCalls.push(request.url)
-        return jsonResponse({ version: "1.7.0" })
-      }),
-    ).effect("reads pnpm versions via registry", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("pnpm")
-        expect(result).toBe("1.7.0")
-        expect(pnpmCalls).toContain(`https://registry.npmjs.org/opencode-ai/${InstallationChannel}`)
-      }),
-    )
-
-    testEffect(testLayer(() => jsonResponse({ version: "2.3.4" }))).effect("reads scoop manifest versions", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("scoop")
-        expect(result).toBe("2.3.4")
-      }),
-    )
-
-    testEffect(testLayer(() => jsonResponse({ d: { results: [{ Version: "3.4.5" }] } }))).effect(
-      "reads chocolatey feed versions",
-      () =>
-        Effect.gen(function* () {
-          const result = yield* Installation.use.latest("choco")
-          expect(result).toBe("3.4.5")
-        }),
-    )
-
-    testEffect(
-      testLayer(
-        () => jsonResponse({ versions: { stable: "2.0.0" } }),
-        (cmd, args) => {
-          // getBrewFormula: return core formula (no tap)
-          if (cmd === "brew" && args.includes("--formula") && args.includes("anomalyco/tap/opencode")) return ""
-          if (cmd === "brew" && args.includes("--formula") && args.includes("opencode")) return "opencode"
-          return ""
-        },
-      ),
-    ).effect("reads brew formulae API versions", () =>
-      Effect.gen(function* () {
-        const result = yield* Installation.use.latest("brew")
-        expect(result).toBe("2.0.0")
-      }),
-    )
-
-    const brewInfoJson = JSON.stringify({
-      formulae: [{ versions: { stable: "2.1.0" } }],
+  describe("release selection", () => {
+    test("selects stable latest without crossing into prereleases", () => {
+      expect(
+        releaseVersionForChannel(
+          [
+            { tag_name: "v2.0.0-dev.4", draft: false, prerelease: true },
+            { tag_name: "v1.9.0", draft: false, prerelease: false },
+          ],
+          "latest",
+        ),
+      ).toBe("1.9.0")
     })
+
+    test("selects only the requested prerelease channel and ignores drafts", () => {
+      expect(
+        releaseVersionForChannel(
+          [
+            { tag_name: "v9.0.0-dev.999", draft: true, prerelease: true },
+            { tag_name: "v3.0.0-beta.2", draft: false, prerelease: true },
+            { tag_name: "v0.0.0-dev.42+abc1234", draft: false, prerelease: true },
+            { tag_name: "v2.9.0", draft: false, prerelease: false },
+          ],
+          "dev",
+        ),
+      ).toBe("0.0.0-dev.42+abc1234")
+    })
+
+    const requests: string[] = []
+    const currentChannelVersion =
+      InstallationChannel === "latest" ? "1.2.3" : `1.2.3-${InstallationChannel}.1`
     testEffect(
-      testLayer(
-        () => jsonResponse({}), // HTTP not used for tap formula
-        (cmd, args) => {
-          if (cmd === "brew" && args.includes("anomalyco/tap/opencode") && args.includes("--formula")) return "opencode"
-          if (cmd === "brew" && args.includes("--json=v2")) return brewInfoJson
-          return ""
-        },
-      ),
-    ).effect("reads brew tap info JSON via CLI", () =>
+      testLayer((request) => {
+        requests.push(request.url)
+        return jsonResponse([
+          {
+            tag_name: `v${currentChannelVersion}`,
+            draft: false,
+            prerelease: InstallationChannel !== "latest",
+          },
+        ])
+      }),
+    ).effect("reads versions only from OpenFork GitHub releases", () =>
       Effect.gen(function* () {
-        const result = yield* Installation.use.latest("brew")
-        expect(result).toBe("2.1.0")
+        const result = yield* Installation.use.latest("unknown")
+        expect(result).toBe(currentChannelVersion)
+        expect(requests).toEqual(["https://api.github.com/repos/thelabcorner/openfork/releases?per_page=50"])
+        expect(requests.some((url) => url.includes("anomalyco/opencode"))).toBe(false)
+        expect(requests.some((url) => url.includes("registry.npmjs.org/opencode-ai"))).toBe(false)
       }),
     )
   })
 
+  describe("direct installation ownership", () => {
+    test("recognizes the canonical OpenFork direct path and its legacy migration source", () => {
+      expect(isDirectInstallPath("/home/me/.openfork/bin/opencode", "linux")).toBe(true)
+      expect(isDirectInstallPath("/Users/me/.openfork/bin/opencode", "darwin")).toBe(true)
+      expect(isDirectInstallPath("/home/me/.opencode/bin/opencode", "linux")).toBe(true)
+      expect(isDirectInstallPath("/Users/me/.opencode/bin/opencode", "darwin")).toBe(true)
+      expect(isDirectInstallPath("/home/me/.opencode/bin/opencode-helper", "linux")).toBe(false)
+      expect(isDirectInstallPath("/home/me/.local/bin/opencode", "linux")).toBe(false)
+      expect(isDirectInstallPath("C:\\Users\\me\\.opencode\\bin\\opencode.exe", "win32")).toBe(false)
+    })
+
+    test("builds a self-contained OpenFork release installer without upstream distribution channels", () => {
+      const script = openForkDirectUpgradeScript({
+        version: "v1.18.30",
+        target: "/home/me/.openfork/bin/opencode",
+      })
+
+      expect(script).toContain("https://github.com/thelabcorner/openfork")
+      expect(script).toContain('asset="opencode-linux-x64${baseline}${libc}.tar.gz"')
+      expect(script).toContain('asset="opencode-linux-arm64${libc}.tar.gz"')
+      expect(script).toContain('asset="opencode-darwin-x64${baseline}.zip"')
+      expect(script).toContain('opencode-darwin-arm64.zip')
+      expect(script).toContain('baseline="-baseline"')
+      expect(script).toContain('libc="-musl"')
+      expect(script).toContain('install -m 0755 "$tmp/opencode" "$staged"')
+      expect(script).toContain('test "$staged_version" = "$version"')
+      expect(script).toContain('mv -f "$staged" "$target"')
+      expect(script).toContain('test "$actual" = "$version"')
+      expect(script).not.toContain("opencode.ai/install")
+      expect(script).not.toContain("anomalyco/opencode")
+      expect(script).not.toContain("npm install")
+      expect(script).not.toContain("brew upgrade")
+      expect(script).not.toContain("choco")
+      expect(script).not.toContain("scoop")
+    })
+  })
+
   describe("upgrade", () => {
-    testEffect(
-      testLayer(
-        () => jsonResponse({}),
-        (cmd) => {
-          if (cmd === "npm") return { code: 1, stderr: "token=secret command output" }
-          return ""
-        },
-      ),
-    ).effect("returns sanitized typed errors for failed package upgrades", () =>
+    testEffect(testLayer(() => jsonResponse([]))).effect("rejects externally managed installations without spawning", () =>
       Effect.gen(function* () {
-        const error = yield* Effect.flip(Installation.use.upgrade("npm", "9.9.9"))
+        const error = yield* Effect.flip(Installation.use.upgrade("unknown", "9.9.9"))
         expect(error).toBeInstanceOf(Installation.UpgradeFailedError)
-        expect(error.stderr).toBe("Upgrade failed for npm (exit code 1).")
-        expect(error.message).toBe(error.stderr)
-        expect(error.stderr).not.toContain("secret")
-        expect(error.stderr).not.toContain("command output")
+        expect(error.stderr).toContain("does not use upstream package-manager channels")
+        expect(error.stderr).toContain("github.com/thelabcorner/openfork/releases")
       }),
     )
 
-    testEffect(
-      testLayer(
-        () => new Response("install script with token=secret", { status: 200 }),
-        (cmd, args) => {
-          if (cmd === "bash" && args[0] === "--version") return "GNU bash"
-          if (cmd === "bash" || cmd === "sh") return { code: 1, stderr: "script output with token=secret" }
-          return ""
-        },
-      ),
-    ).effect("returns sanitized typed errors when the curl install script fails", () =>
+    testEffect(testLayer(() => jsonResponse([]))).effect("rejects invalid release versions before launching a shell", () =>
       Effect.gen(function* () {
-        const error = yield* Effect.flip(Installation.use.upgrade("curl", "9.9.9"))
+        const error = yield* Effect.flip(Installation.use.upgrade("curl", "not-a-release"))
         expect(error).toBeInstanceOf(Installation.UpgradeFailedError)
-        expect(error.stderr).toBe("Upgrade failed for curl (exit code 1).")
-        expect(error.message).toBe(error.stderr)
-        expect(error.stderr).not.toContain("secret")
-        expect(error.stderr).not.toContain("script output")
+        expect(error.stderr).toBe("Invalid OpenFork release version: not-a-release")
       }),
     )
 
-    testEffect(
-      testLayer(
-        () => new Response("install script", { status: 200 }),
-        (cmd, args) => {
-          if (cmd === "bash" && args[0] === "--version") return { code: 1, stderr: "missing" }
-          if (cmd === "bash") return { code: 1, stderr: "should not execute installer with bash" }
-          if (cmd === "sh") return "ok"
-          return ""
-        },
-      ),
-    ).effect("falls back to sh when bash is unavailable during curl upgrade", () =>
-      Effect.gen(function* () {
-        yield* Installation.use.upgrade("curl", "9.9.9")
-      }),
+    testEffect(testLayer(() => jsonResponse([]))).effect(
+      "fails closed when the running executable is not a fork-managed direct install",
+      () =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(Installation.use.upgrade("curl", "9.9.9"))
+          expect(error).toBeInstanceOf(Installation.UpgradeFailedError)
+          expect(error.stderr).toContain("cannot update this installation in place")
+          expect(error.stderr).toContain("github.com/thelabcorner/openfork/releases")
+        }),
     )
   })
 })

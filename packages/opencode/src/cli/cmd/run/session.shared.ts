@@ -5,6 +5,7 @@
 // the current model so the footer can pre-select it.
 import { promptCopy, promptSame } from "./prompt.shared"
 import type { RunInput, RunPrompt } from "./types"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 const LIMIT = 200
 
@@ -130,9 +131,10 @@ export function messagePrompt(msg: SessionMessages[number]): RunPrompt {
 }
 
 function turn(msg: SessionMessages[number]): Turn | undefined {
-  if (msg.info.role !== "user") {
+  if (!SessionTurnProvenance.isSemanticUserInfo(msg.info)) {
     return undefined
   }
+  if (msg.info.role !== "user") return undefined
 
   return {
     prompt: messagePrompt(msg),

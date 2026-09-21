@@ -2,6 +2,7 @@ import { cmd } from "./cmd"
 import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
 import { Global } from "@opencode-ai/core/global"
+import { PROJECT_CONFIG_DIRNAME } from "@opencode-ai/core/storage-identity"
 import path from "path"
 import fs from "fs/promises"
 import { Filesystem } from "@/util/filesystem"
@@ -109,7 +110,10 @@ const AgentCreateCommand = effectCmd({
           if (prompts.isCancel(scopeResult)) throw new UI.CancelledError()
           scope = scopeResult
         }
-        targetPath = path.join(scope === "global" ? Global.Path.config : path.join(ctx.worktree, ".opencode"), "agents")
+        targetPath = path.join(
+          scope === "global" ? Global.Path.config : path.join(ctx.worktree, PROJECT_CONFIG_DIRNAME),
+          "agents",
+        )
       }
 
       // Get description

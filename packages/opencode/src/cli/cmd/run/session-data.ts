@@ -25,6 +25,7 @@
 //   event arrives, the queue entry is removed and the footer falls back
 //   to the next pending request or to the prompt view.
 import type { Event, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import * as Locale from "@/util/locale"
 import { toolView } from "./tool"
 import type { FooterOutput, FooterPatch, FooterView, StreamCommit } from "./types"
@@ -56,6 +57,8 @@ type SessionCommit = StreamCommit
 // - tools:  tool parts we've emitted a "start" for but not yet completed
 // - call:   tool call inputs, keyed by msg:call, for enriching permission views
 // - role:   message ID → "assistant" | "user", learned from message.updated
+// - kind:   message ID → semantic V2-compatible turn kind; provider role alone
+//           does not prove a human/user-owned turn
 // - msg:    part ID → message ID
 // - part:   part ID → "assistant" | "reasoning" (text parts only)
 // - text:   part ID → full accumulated text so far
@@ -79,6 +82,7 @@ export type SessionData = {
   permissions: PermissionRequest[]
   questions: QuestionRequest[]
   role: Map<string, MessageRole>
+  kind: Map<string, SessionTurnProvenance.SemanticKind>
   msg: Map<string, string>
   part: Map<string, PartKind>
   text: Map<string, string>
@@ -117,6 +121,7 @@ export function createSessionData(
     permissions: [],
     questions: [],
     role: new Map(),
+    kind: new Map(),
     msg: new Map(),
     part: new Map(),
     text: new Map(),
@@ -439,7 +444,7 @@ function ready(data: SessionData, partID: string): boolean {
     return true
   }
 
-  return data.includeUserText && role === "user"
+  return data.includeUserText && role === "user" && data.kind.get(msg) === "user"
 }
 
 function syncText(data: SessionData, partID: string, next: string) {
@@ -579,13 +584,20 @@ function drop(data: SessionData, partID: string) {
 // Called when we learn a message's role (from message.updated). Flushes any
 // buffered text parts that were waiting on role confirmation. User-role
 // parts are silently dropped.
-function replay(data: SessionData, commits: SessionCommit[], messageID: string, role: MessageRole, thinking: boolean) {
+function replay(
+  data: SessionData,
+  commits: SessionCommit[],
+  messageID: string,
+  role: MessageRole,
+  semanticKind: SessionTurnProvenance.SemanticKind,
+  thinking: boolean,
+) {
   for (const [partID, msg] of data.msg.entries()) {
     if (msg !== messageID || data.ids.has(partID)) {
       continue
     }
 
-    if (role === "user" && !data.includeUserText) {
+    if (role === "user" && (!data.includeUserText || semanticKind !== "user")) {
       data.ids.add(partID)
       drop(data, partID)
       continue
@@ -596,7 +608,7 @@ function replay(data: SessionData, commits: SessionCommit[], messageID: string, 
       continue
     }
 
-    if (role === "user" && kind === "assistant") {
+    if (role === "user" && semanticKind === "user" && kind === "assistant") {
       data.part.set(partID, "user")
     }
 
@@ -830,7 +842,9 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
     const info = event.properties.info
     if (typeof info.id === "string") {
       data.role.set(info.id, info.role)
-      replay(data, commits, info.id, info.role, input.thinking)
+      const semanticKind = SessionTurnProvenance.semanticKindInfo(info)
+      data.kind.set(info.id, semanticKind)
+      replay(data, commits, info.id, info.role, semanticKind, input.thinking)
     }
 
     if (info.role !== "assistant") {
@@ -1013,7 +1027,8 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
 
     const msg = part.messageID
     const role = msg ? data.role.get(msg) : undefined
-    if (role === "user" && part.type === "text" && !data.includeUserText) {
+    const semanticKind = msg ? data.kind.get(msg) : undefined
+    if (role === "user" && part.type === "text" && (!data.includeUserText || semanticKind !== "user")) {
       data.ids.add(part.id)
       drop(data, part.id)
       return out(data, commits)
@@ -1027,7 +1042,7 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       return out(data, commits)
     }
 
-    data.part.set(part.id, role === "user" && kind === "assistant" ? "user" : kind)
+    data.part.set(part.id, role === "user" && semanticKind === "user" && kind === "assistant" ? "user" : kind)
     syncText(data, part.id, part.text)
 
     if (part.time?.end) {

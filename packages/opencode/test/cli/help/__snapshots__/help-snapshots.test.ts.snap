@@ -44,7 +44,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode attach --help 1`] = `
 "opencode attach <url>
 
-attach to a running opencode server
+attach to a running OpenFork server
 
 Positionals:
   url  http://localhost:4096                                                     [string] [required]
@@ -70,7 +70,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode run --help 1`] = `
 "opencode run [message..]
 
-run opencode with a message
+run OpenFork with a message
 
 Positionals:
   message  message to send                                                     [array] [default: []]
@@ -92,7 +92,7 @@ Options:
                                           [string] [choices: "default", "json"] [default: "default"]
   -f, --file         file(s) to attach to message                                            [array]
       --title        title for the session (uses truncated prompt if no value provided)     [string]
-      --attach       attach to a running opencode server (e.g., http://localhost:4096)      [string]
+      --attach       attach to a running OpenFork server (e.g., http://localhost:4096)      [string]
   -p, --password     basic auth password (defaults to OPENCODE_SERVER_PASSWORD)             [string]
   -u, --username     basic auth username (defaults to OPENCODE_SERVER_USERNAME or 'opencode')
                                                                                             [string]
@@ -173,25 +173,23 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode upgrade --help 1`] = `
 "opencode upgrade [target]
 
-upgrade opencode to the latest or a specific version
+upgrade OpenFork to the latest or a specific version
 
 Positionals:
-  target  version to upgrade to, for ex '0.1.48' or 'v0.1.48'                               [string]
+  target  OpenFork release version to install, for example '1.18.30' or 'v1.18.30'          [string]
 
 Options:
   -h, --help        show help                                                              [boolean]
   -v, --version     show version number                                                    [boolean]
       --print-logs  print logs to stderr                                                   [boolean]
       --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
-      --pure        run without external plugins                                           [boolean]
-  -m, --method      installation method to use
-                          [string] [choices: "curl", "npm", "pnpm", "bun", "brew", "choco", "scoop"]"
+      --pure        run without external plugins                                           [boolean]"
 `;
 
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode uninstall --help 1`] = `
 "opencode uninstall
 
-uninstall opencode and remove all related files
+uninstall OpenFork and remove all related files
 
 Options:
   -h, --help         show help                                                             [boolean]
@@ -208,7 +206,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode serve --help 1`] = `
 "opencode serve
 
-starts a headless opencode server
+starts a headless OpenFork server
 
 Options:
   -h, --help         show help                                                             [boolean]
@@ -228,7 +226,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode web --help 1`] = `
 "opencode web
 
-start opencode server and open web interface
+start OpenFork server and open web interface
 
 Options:
   -h, --help         show help                                                             [boolean]
@@ -320,7 +318,7 @@ exports[`opencode CLI help-text snapshots every documented command emits stable 
 manage GitHub agent
 
 Commands:
-  opencode github install  install the GitHub agent
+  opencode github install  install the GitHub agent (not yet available in OpenFork)
   opencode github run      run the GitHub agent
 
 Options:
@@ -334,7 +332,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode pr --help 1`] = `
 "opencode pr <number>
 
-fetch and checkout a GitHub PR branch, then run opencode
+fetch and checkout a GitHub PR branch, then run OpenFork
 
 Positionals:
   number  PR number to checkout                                                  [number] [required]
@@ -390,6 +388,8 @@ database tools
 Commands:
   opencode db [query]     open an interactive sqlite3 shell or run a query                 [default]
   opencode db path        print the database path
+  opencode db restore     verify and repair ChunkDB framed rows
+  opencode db check       audit ChunkDB framing coverage and integrity
 
 Positionals:
   query  SQL query to execute                                                               [string]
@@ -489,7 +489,7 @@ exports[`opencode CLI help-text snapshots every documented command emits stable 
 log in to a provider
 
 Positionals:
-  url  opencode auth provider                                                               [string]
+  url  OpenFork auth provider                                                               [string]
 
 Options:
   -h, --help        show help                                                              [boolean]
@@ -533,7 +533,7 @@ Options:
       --mode                  agent mode            [string] [choices: "all", "primary", "subagent"]
       --permissions, --tools  comma-separated list of permissions to allow (default: all).
                               Available: "bash, read, edit, glob, grep, webfetch, task, todowrite,
-                              websearch, lsp, skill"                                        [string]
+                              websearch, lsp, skill, checkpoint"                            [string]
   -m, --model                 model to use in the format of provider/model                  [string]"
 `;
 
@@ -584,7 +584,7 @@ Options:
 exports[`opencode CLI help-text snapshots every documented command emits stable help text: opencode github install --help 1`] = `
 "opencode github install
 
-install the GitHub agent
+install the GitHub agent (not yet available in OpenFork)
 
 Options:
   -h, --help        show help                                                              [boolean]

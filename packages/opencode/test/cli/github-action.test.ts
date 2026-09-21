@@ -1,8 +1,10 @@
 import { test, expect, describe } from "bun:test"
+import { Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { extractResponseText, formatPromptTooLargeError } from "../../src/cli/cmd/github"
 import type { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID, PartID } from "../../src/session/schema"
+import { cliIt } from "../lib/cli-process"
 
 // Helper to create minimal valid parts
 function createTextPart(text: string): SessionV1.Part {
@@ -196,4 +198,22 @@ describe("formatPromptTooLargeError", () => {
     expect(result).toInclude("img2.jpg (6 KB)")
     expect(result).toInclude("img3.gif (9 KB)")
   })
+})
+
+describe("GitHub installer distribution boundary", () => {
+  cliIt.live(
+    "fails closed instead of installing upstream OpenCode automation",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const result = yield* opencode.spawn(["github", "install"])
+        expect(result.exitCode).not.toBe(0)
+        expect(result.stderr).toContain(
+          "OpenFork does not currently publish a first-party GitHub Action/GitHub App installer.",
+        )
+        expect(result.stderr).toContain("https://github.com/thelabcorner/openfork/issues")
+        expect(result.stderr).not.toContain("github.com/apps/opencode-agent")
+        expect(result.stderr).not.toContain("anomalyco/opencode/github@")
+      }),
+    60_000,
+  )
 })

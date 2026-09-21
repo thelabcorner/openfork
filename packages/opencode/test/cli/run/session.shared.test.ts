@@ -6,6 +6,7 @@ import {
   type RunSession,
   type SessionMessages,
 } from "@/cli/cmd/run/session.shared"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 type Message = SessionMessages[number]
 type Part = Message["parts"][number]
@@ -18,12 +19,22 @@ const model = {
   modelID: "gpt-5",
 }
 
-function userMessage(id: string, parts: Message["parts"], variant = "high"): Message {
+function userMessage(
+  id: string,
+  parts: Message["parts"],
+  variant = "high",
+  provenance?: Message["info"] extends infer Info
+    ? Info extends { role: "user"; provenance?: infer Provenance }
+      ? Provenance
+      : never
+    : never,
+): Message {
   return {
     info: {
       id,
       sessionID: "session-1",
       role: "user",
+      ...(provenance ? { provenance } : {}),
       time: {
         created: 1,
       },
@@ -191,6 +202,28 @@ describe("run session shared", () => {
         },
       ],
     })
+  })
+
+  test("prompt history excludes host-owned provider-user turns", () => {
+    const human = userMessage(
+      "msg-user-1",
+      [textPart("txt-user-1", "msg-user-1", "do the work")],
+      "high",
+      SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+    )
+    const continuation = userMessage(
+      "msg-host-1",
+      [textPart("txt-host-1", "msg-host-1", "continue from the audit", { synthetic: true })],
+      "high",
+      SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+        ref: "reservation-1",
+      }),
+    )
+
+    const out = createSession([human, continuation])
+
+    expect(out.turns).toHaveLength(1)
+    expect(out.turns[0]?.prompt.text).toBe("do the work")
   })
 
   test("dedupes consecutive history entries, drops blanks, and copies prompt parts", () => {

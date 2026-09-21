@@ -2,13 +2,20 @@ import { describe, expect, test } from "bun:test"
 import { replayLocalRows, replaySession } from "@/cli/cmd/run/session-replay"
 import type { SessionMessages } from "@/cli/cmd/run/session.shared"
 import type { RunProvider } from "@/cli/cmd/run/types"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionV1 } from "@opencode-ai/schema/session-v1"
 
-function userMessage(id: string, text: string): SessionMessages[number] {
+function userMessage(
+  id: string,
+  text: string,
+  provenance?: ReturnType<typeof SessionTurnProvenance.user> | ReturnType<typeof SessionTurnProvenance.host>,
+): SessionMessages[number] {
   return {
     info: {
       id,
       sessionID: "session-1",
       role: "user",
+      ...(provenance ? { provenance } : {}),
       time: {
         created: 1,
       },
@@ -296,6 +303,27 @@ describe("run session replay", () => {
         status: "",
       }),
     )
+  })
+
+  test("does not replay host-owned provider-user turns as human user entries", () => {
+    const out = replaySession({
+      messages: [
+        userMessage(
+          "msg-host-1",
+          "continue the next worker cycle",
+        SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+          sourceMessageID: SessionV1.MessageID.make("msg-user-root"),
+        }),
+        ),
+      ],
+      permissions: [],
+      questions: [],
+      thinking: true,
+      limits: {},
+      providers: [],
+    })
+
+    expect(out.commits).toEqual([])
   })
 
   test("uses provider model names for replayed turn summaries when available", () => {

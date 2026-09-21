@@ -3,6 +3,7 @@ import { bootstrapSessionData, createSessionData, reduceSessionData, type Sessio
 import { messagePrompt, type SessionMessages } from "./session.shared"
 import { messageTurnSummaryCommit } from "./turn-summary"
 import type { FooterPatch, LocalReplayRow, RunProvider, StreamCommit } from "./types"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 type ReplayInput = {
   messages: SessionMessages
@@ -30,7 +31,6 @@ type ReplayMessage = {
   patch?: FooterPatch
 }
 
-const SHELL_SYNTHETIC_USER_TEXT = "The following tool was executed by the user"
 
 function apply(data: SessionData, event: Event, sessionID: string, thinking: boolean, limits: Record<string, number>) {
   return reduceSessionData({
@@ -100,15 +100,13 @@ function replayPatch(data: SessionData, patch: FooterPatch | undefined) {
 }
 
 function isShellSyntheticUser(message: SessionMessages[number]) {
-  if (message.info.role !== "user") {
-    return false
-  }
-
-  const prompt = messagePrompt(message)
+  // The generated SDK and Core V1 schemas describe the same persisted wire
+  // shape through distinct nominal TypeScript surfaces. Keep that type bridge
+  // localized at the replay adapter boundary rather than weakening either API.
   return (
-    !prompt.text.trim() &&
-    prompt.parts.length === 0 &&
-    message.parts.some((part) => part.type === "text" && part.synthetic && part.text === SHELL_SYNTHETIC_USER_TEXT)
+    SessionTurnProvenance.semanticKind(
+      message as Parameters<typeof SessionTurnProvenance.semanticKind>[0],
+    ) === "shell"
   )
 }
 
@@ -157,6 +155,7 @@ function replayMessage(
   config: ReplayConfig,
 ): ReplayMessage {
   if (message.info.role === "user") {
+    if (!SessionTurnProvenance.isSemanticUserInfo(message.info)) return { commits: [] }
     const prompt = messagePrompt(message)
     if (!prompt.text.trim()) {
       return {
