@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { FileSystem, Integration, Permission, Project, Reference, Session, SessionGroup, Workspace } from "../src"
+import {
+  FileSystem,
+  Integration,
+  OxpActivity,
+  Permission,
+  Project,
+  Reference,
+  Session,
+  SessionGroup,
+  Workspace,
+} from "../src"
 import { EventManifest } from "../src/event-manifest"
 import { IdeEvent } from "../src/ide-event"
 import { SessionEvent } from "../src/session-event"
@@ -9,8 +19,8 @@ import { WorkspaceEvent } from "../src/workspace-event"
 
 describe("public event manifest", () => {
   test("owns the complete public event surface", () => {
-    expect(EventManifest.ServerDefinitions.length).toBe(67)
-    expect(EventManifest.Definitions.length).toBe(98)
+    expect(EventManifest.ServerDefinitions.length).toBe(102)
+    expect(EventManifest.Definitions.length).toBe(134)
     expect(SessionV1.Event.Definitions).toEqual([
       SessionV1.Event.Created,
       SessionV1.Event.Updated,
@@ -23,8 +33,8 @@ describe("public event manifest", () => {
       SessionV1.Event.Diff,
       SessionV1.Event.Error,
     ])
-    expect(EventManifest.Latest.size).toBe(98)
-    expect(EventManifest.Durable.size).toBe(41)
+    expect(EventManifest.Latest.size).toBe(134)
+    expect(EventManifest.Durable.size).toBe(46)
   })
 
   test("uses canonical definitions for current public events", () => {
@@ -36,6 +46,12 @@ describe("public event manifest", () => {
     expect(EventManifest.Latest.get("todo.updated")).toBe(SessionTodo.Event.Updated)
     expect(EventManifest.Latest.get("session_group.session.added")).toBe(SessionGroup.Event.SessionAdded)
     expect(EventManifest.Latest.get("project.updated")).toBe(Project.Event.Updated)
+    expect(EventManifest.Latest.get("oxpActivity.created")).toBe(OxpActivity.Event.Created)
+    expect(EventManifest.Latest.get("oxpActivity.updated")).toBe(OxpActivity.Event.Updated)
+    expect(EventManifest.Latest.get("oxpActivity.removed")).toBe(OxpActivity.Event.Removed)
+    expect(EventManifest.Latest.get("oxpActivity.invocation.started")).toBe(OxpActivity.Event.InvocationStarted)
+    expect(EventManifest.Latest.get("oxpActivity.invocation.settled")).toBe(OxpActivity.Event.InvocationSettled)
+    expect(EventManifest.Latest.get("oxpActivity.link.added")).toBe(OxpActivity.Event.LinkAdded)
     expect(Project.Event.Definitions).toEqual([Project.Event.Updated])
     expect(FileSystem.Event.Definitions).toEqual([FileSystem.Event.Edited])
     expect(Integration.Event.Definitions).toEqual([Integration.Event.Updated, Integration.Event.ConnectionUpdated])

@@ -63,9 +63,9 @@ export const AutomationMode = Schema.Literals(["manual", "auto_continue", "unatt
 export type AutomationMode = typeof AutomationMode.Type
 
 /**
- * User-owned continuation policy. Limits intentionally live in JSON so the
- * guardrail surface can grow without a database migration for every knob.
- * Phase 1 only consumes `mode`; later runner integration may honor the bounds.
+ * User/producer-owned continuation policy. Optional bounds are opt-in: omitted
+ * values mean no host-invented turn, no-progress, duration, or token ceiling.
+ * The JSON shape keeps policy extensible without a database migration per knob.
  */
 export interface ContinuationPolicy extends Schema.Schema.Type<typeof ContinuationPolicy> {}
 export const ContinuationPolicy = Schema.Struct({
@@ -82,6 +82,12 @@ export const ContinuationPolicy = Schema.Struct({
  * `model` is intentionally optional: when omitted the runtime inherits the
  * worker Session model. Persisting the override on the Goal keeps auditor
  * choice stable across workers, app restarts, and delegated Sessions.
+ *
+ * `blockedThreshold` and `maxAttempts` are opt-in policy. Without a blocked
+ * threshold, an auditor `blocked` verdict stops autonomous re-entry but does
+ * not manufacture durable Goal `blocked` state. Without maxAttempts, one full
+ * audit runs; bounded in-conversation protocol repair remains an internal
+ * correctness mechanism rather than a second hidden audit attempt.
  */
 export interface AuditorPolicy extends Schema.Schema.Type<typeof AuditorPolicy> {}
 export const AuditorPolicy = Schema.Struct({

@@ -38,6 +38,35 @@ export function resolvePrimitive(
   return model.primitive ?? "language"
 }
 
+function hasEmbeddingIdentity(value: string | undefined) {
+  if (!value) return false
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .some((token) => token === "embed" || token === "embeddings" || token.startsWith("embedding"))
+}
+
+/**
+ * True only when a catalog row is eligible for conversational generation.
+ *
+ * Some third-party/local provider plugins expose embedding models through a
+ * language-model shaped catalog without primitive metadata. Treat obvious
+ * embedding identities as non-conversational even when the legacy primitive
+ * fallback is "language".
+ */
+export function isLanguageModel(
+  providerID: string,
+  model: {
+    readonly id: string
+    readonly primitive?: Primitive
+    readonly family?: string
+    readonly name?: string
+  },
+) {
+  if (resolvePrimitive(providerID, model) !== "language") return false
+  return ![model.id, model.family, model.name].some(hasEmbeddingIdentity)
+}
+
 export interface Capabilities extends Schema.Schema.Type<typeof Capabilities> {}
 export const Capabilities = Schema.Struct({
   tools: Schema.Boolean,

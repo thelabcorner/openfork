@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
+import { Model } from "../src/model"
 import { mergePreferences } from "../src/model-select/preferences"
 import {
   applyProviderRailOrder,
@@ -13,6 +14,24 @@ import {
  * provider rail. Both sides import them, and the server persists what they
  * produce, so a change in either one silently reorders a paired phone.
  */
+
+describe("model language eligibility", () => {
+  test("rejects embedding identities that arrive without primitive metadata", () => {
+    expect(
+      Model.isLanguageModel("lmstudio", {
+        id: "text-embedding-nomic-embed-text-v1.5",
+        name: "Nomic Embed Text v1.5",
+      }),
+    ).toBe(false)
+    expect(Model.isLanguageModel("openai", { id: "text-embedding-3-large" })).toBe(false)
+    expect(Model.isLanguageModel("google", { id: "embeddinggemma-300m" })).toBe(false)
+  })
+
+  test("keeps ordinary language models eligible", () => {
+    expect(Model.isLanguageModel("openai", { id: "gpt-5.6", name: "GPT-5.6" })).toBe(true)
+    expect(Model.isLanguageModel("anthropic", { id: "claude-sonnet-4", family: "claude-sonnet" })).toBe(true)
+  })
+})
 
 describe("rail order", () => {
   test("uses the section key the desktop model store already persists", () => {
