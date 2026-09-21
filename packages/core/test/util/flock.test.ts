@@ -359,6 +359,24 @@ describe("util.flock", () => {
     expect(await exists(lockDir)).toBe(false)
   })
 
+  test("tryAcquire fails immediately while owned and succeeds after release", async () => {
+    await using tmp = await tmpdir()
+    const dir = path.join(tmp.path, "locks")
+    const key = "flock:try-acquire"
+    const first = await Flock.tryAcquire(key, { dir, staleMs: 1_000 })
+    expect(first).toBeDefined()
+
+    const started = performance.now()
+    const blocked = await Flock.tryAcquire(key, { dir, staleMs: 1_000 })
+    expect(blocked).toBeUndefined()
+    expect(performance.now() - started).toBeLessThan(250)
+
+    await first!.release()
+    const next = await Flock.tryAcquire(key, { dir, staleMs: 1_000 })
+    expect(next).toBeDefined()
+    await next!.release()
+  })
+
   test("refuses token mismatch release and recovers from stale", async () => {
     await using tmp = await tmpdir()
     const dir = path.join(tmp.path, "locks")

@@ -359,6 +359,40 @@ describe("cross-spawn spawner", () => {
     )
 
     fx.effect(
+      "kills the owned descendant process tree",
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (item) => Effect.promise(() => item[Symbol.asyncDispose]()),
+        )
+        const pidFile = path.join(tmp.path, "child.pid")
+        const childCode = "setInterval(() => {}, 10_000)"
+        const parentCode = [
+          'const fs = require("node:fs")',
+          'const { spawn } = require("node:child_process")',
+          `const child = spawn(process.execPath, ["-e", ${JSON.stringify(childCode)}], { stdio: "ignore" })`,
+          `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const handle = yield* js(parentCode)
+        const childPid = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 5_000
+          while (Date.now() < deadline) {
+            const text = await fs.readFile(pidFile, "utf8").catch(() => "")
+            const pid = Number(text.trim())
+            if (Number.isInteger(pid) && pid > 0) return pid
+            await new Promise((resolve) => setTimeout(resolve, 25))
+          }
+          throw new Error("descendant pid was not published")
+        })
+        expect(alive(childPid)).toBe(true)
+
+        yield* handle.kill({ forceKillAfter: "3 seconds" })
+        expect(yield* Effect.promise(() => gone(childPid))).toBe(true)
+      }),
+    )
+
+    fx.effect(
       "kills a child when scope exits",
       Effect.gen(function* () {
         const pid = yield* Effect.scoped(

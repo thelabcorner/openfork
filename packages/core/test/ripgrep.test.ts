@@ -82,4 +82,27 @@ describe("Ripgrep", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
+
+  it.live("handles valid ripgrep JSON records larger than 64 KiB without failing the search", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            fs.writeFile(path.join(tmp.path, "minified.js"), `${"x".repeat(70_000)}NEEDLE${"y".repeat(2_000)}\n`),
+          )
+
+          const matches = yield* (yield* Ripgrep.Service).grep({
+            cwd: tmp.path,
+            pattern: "NEEDLE",
+            limit: 10,
+          })
+
+          expect(matches).toHaveLength(1)
+          expect(matches[0]?.entry.path).toBe(RelativePath.make("minified.js"))
+          expect(matches[0]?.text.length).toBeLessThanOrEqual(2_003)
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
 })

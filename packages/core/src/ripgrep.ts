@@ -16,7 +16,12 @@ import { RipgrepBinary } from "./ripgrep/binary"
  */
 
 const ERROR_BYTES = 8 * 1024
-const MAX_RECORD_BYTES = 64 * 1024
+// `rg --json` embeds the complete matched source line in a single record. Real
+// generated/minified files routinely exceed 64 KiB even though the public Match
+// preview is truncated to 2,000 characters below. Keep a bounded parsing ceiling
+// for pathological records without turning one large line into a fatal search
+// (and therefore fatal Goal Auditor) error.
+const MAX_RECORD_BYTES = 4 * 1024 * 1024
 const MAX_SUBMATCHES = 100
 
 const RawMatch = Schema.Struct({
@@ -231,7 +236,11 @@ const layer = Layer.effect(
           ],
           parse: (line) =>
             (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES
-              ? Effect.fail(failure(`Ripgrep JSON record exceeded ${MAX_RECORD_BYTES} bytes`))
+              ? Effect.logWarning("ripgrep JSON match record exceeded bounded parser limit; skipping match", {
+                  bytes: Buffer.byteLength(line, "utf8"),
+                  limit: MAX_RECORD_BYTES,
+                  pattern: input.pattern,
+                }).pipe(Effect.as(undefined))
               : Effect.try({
                   try: () => JSON.parse(line) as unknown,
                   catch: (cause) => failure("Invalid ripgrep JSON output", cause),

@@ -90,6 +90,11 @@ describe("Git worktrees", () => {
         (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
       )
       yield* Effect.promise(() => initRepo(root.path))
+      yield* Effect.promise(async () => {
+        await fs.writeFile(path.join(root.path, "eol.txt"), "alpha\nbeta\n", "utf8")
+        await $`git add eol.txt`.cwd(root.path).quiet()
+        await $`git commit -m eol`.cwd(root.path).quiet()
+      })
       const directory = AbsolutePath.make(yield* Effect.promise(() => fs.realpath(root.path)))
       const worktree = AbsolutePath.make(`${root.path}-git-worktree`)
       yield* Effect.addFinalizer(() =>
@@ -99,7 +104,21 @@ describe("Git worktrees", () => {
       const repo = yield* git.repo.discover(directory)
       if (!repo) throw new Error("Repository not found")
 
-      yield* git.worktree.create({ repository: repo, directory: worktree })
+      const names = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] as const
+      const prior = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+      process.env.GIT_CONFIG_COUNT = "1"
+      process.env.GIT_CONFIG_KEY_0 = "core.autocrlf"
+      process.env.GIT_CONFIG_VALUE_0 = "true"
+      try {
+        yield* git.worktree.create({ repository: repo, directory: worktree })
+        expect(yield* Effect.promise(() => fs.readFile(path.join(worktree, "eol.txt"), "utf8"))).toBe("alpha\nbeta\n")
+      } finally {
+        for (const name of names) {
+          const value = prior[name]
+          if (value === undefined) delete process.env[name]
+          else process.env[name] = value
+        }
+      }
 
       expect((yield* git.worktree.list(repo)).some((entry) => entry.directory.endsWith("-git-worktree"))).toBe(true)
       const linked = yield* git.repo.discover(worktree)

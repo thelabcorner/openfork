@@ -66,6 +66,16 @@ export namespace Flock {
     [Symbol.asyncDispose]: () => Promise<void>
   }
 
+  function leaseOf(lock: Owned): Lease {
+    const release = () => lock.release()
+    return {
+      release,
+      [Symbol.asyncDispose]() {
+        return release()
+      },
+    }
+  }
+
   function code(err: unknown) {
     if (typeof err !== "object" || err === null || !("code" in err)) return
     const value = err.code
@@ -329,14 +339,29 @@ export namespace Flock {
       cfg,
     )
     lock.startHeartbeat()
+    return leaseOf(lock)
+  }
 
-    const release = () => lock.release()
-    return {
-      release,
-      [Symbol.asyncDispose]() {
-        return release()
-      },
+  /**
+   * One-shot, non-blocking acquisition. This is the admission primitive for
+   * work that must fail closed when another process already owns the resource;
+   * unlike acquire(), it never queues behind the current owner.
+   */
+  export async function tryAcquire(key: string, input: Options = {}): Promise<Lease | undefined> {
+    input.signal?.throwIfAborted()
+    const cfg: Opts = {
+      staleMs: input.staleMs ?? defaultOpts.staleMs,
+      timeoutMs: input.timeoutMs ?? defaultOpts.timeoutMs,
+      baseDelayMs: input.baseDelayMs ?? defaultOpts.baseDelayMs,
+      maxDelayMs: input.maxDelayMs ?? defaultOpts.maxDelayMs,
     }
+    const dir = input.dir ?? root()
+    await mkdir(dir, { recursive: true })
+    const lockfile = path.join(dir, Hash.fast(key) + ".lock")
+    const lock = await tryAcquireLockDir(lockfile, cfg)
+    if (!lock.acquired) return
+    lock.startHeartbeat()
+    return leaseOf(lock)
   }
 
   export async function withLock<T>(key: string, fn: () => Promise<T>, input: Options = {}) {
