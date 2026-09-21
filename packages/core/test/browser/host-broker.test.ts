@@ -43,6 +43,9 @@ const tab = (overrides: Partial<TabRecord> & { tabId: string }): TabRecord => ({
 const agentTab = (tabId: string, sessionId: string, overrides: Partial<TabRecord> = {}): TabRecord =>
   tab({ tabId, owner: { kind: "agent", sessionId }, ...overrides })
 
+const externalTab = (tabId: string, principalId: string, overrides: Partial<TabRecord> = {}): TabRecord =>
+  tab({ tabId, owner: { kind: "external", principalId }, ...overrides })
+
 const request = (overrides: Partial<BrowserHostBroker.BrokerRequestInput> = {}): BrowserHostBroker.BrokerRequestInput => ({
   sessionId: "ses_1",
   messageId: "msg_1",
@@ -329,6 +332,47 @@ describe("canDispatch / canClaim / orphanOwnedTabs / sessionTabs", () => {
     expect(canClaim({ kind: "user" }, "ses_1")).toBe("ok")
     expect(canClaim({ kind: "agent", sessionId: "ses_1" }, "ses_1")).toBe("idempotent")
     expect(canClaim({ kind: "agent", sessionId: "ses_2" }, "ses_1")).toBe("denied")
+  })
+
+  test("external principals are isolated exactly like native Session agents", () => {
+    const one = { kind: "external" as const, principalId: "oxp-parent-one" }
+    const two = { kind: "external" as const, principalId: "oxp-parent-two" }
+    expect(canDispatch({ kind: "external", principalId: "oxp-parent-one" }, one)).toBe("ok")
+    expect(canDispatch({ kind: "external", principalId: "oxp-parent-two" }, one)).toBe("other-agent")
+    expect(canDispatch({ kind: "agent", sessionId: "ses_1" }, one)).toBe("other-agent")
+    expect(canClaim({ kind: "user" }, one)).toBe("ok")
+    expect(canClaim({ kind: "external", principalId: "oxp-parent-one" }, one)).toBe("idempotent")
+    expect(canClaim({ kind: "external", principalId: "oxp-parent-two" }, one)).toBe("denied")
+    expect(canClaim({ kind: "external", principalId: "oxp-parent-one" }, two)).toBe("denied")
+  })
+
+  test("resolveDispatch defaults only to tabs owned by the same external principal", () => {
+    const principal = { kind: "external" as const, principalId: "oxp-parent-one" }
+    const tabs = [
+      externalTab("mine-old", "oxp-parent-one", { lastActiveAt: 10 }),
+      externalTab("mine-new", "oxp-parent-one", { lastActiveAt: 20 }),
+      externalTab("theirs", "oxp-parent-two", { lastActiveAt: 100 }),
+      agentTab("native", "ses_1", { lastActiveAt: 200 }),
+    ]
+    const result = resolveDispatch({
+      request: request({ sessionId: undefined, principal, operation: { name: "snapshot", input: {} } }),
+      windowId: "win-1",
+      tabs,
+    })
+    expect(result).toEqual({ kind: "forward", windowId: "win-1", tabId: "mine-new" })
+  })
+
+  test("explicit cross-principal external tab access fails closed", () => {
+    const result = resolveDispatch({
+      request: request({
+        sessionId: undefined,
+        principal: { kind: "external", principalId: "oxp-parent-one" },
+        tabId: "theirs",
+      }),
+      windowId: "win-1",
+      tabs: [externalTab("theirs", "oxp-parent-two")],
+    })
+    expectError(result, "BrowserPermissionDenied")
   })
 
   test("orphanOwnedTabs releases only the given session's tabs (O10)", () => {

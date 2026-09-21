@@ -34,7 +34,7 @@ import { httpClient } from "../effect/app-node-platform"
 
 // --- wire mirror (protocol/src/groups/browser.ts) ---------------------------
 
-export const BROWSER_PROTOCOL_VERSION = 2
+export const BROWSER_PROTOCOL_VERSION = 3
 export const BROKER_REQUEST_PATH = "/v1/browser/request"
 export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
 
@@ -86,9 +86,42 @@ export interface HostGuestState {
   readonly url: string | null
 }
 
-/** A tab's owner — exactly one of `user` or `agent(<sessionId>)`. Two agents
- * never share a tab; the user may always reassign (see `assign`). */
-export type HostOwner = { readonly kind: "user" } | { readonly kind: "agent"; readonly sessionId: string }
+export type BrowserPrincipal =
+  | { readonly kind: "session"; readonly sessionId: string }
+  | { readonly kind: "external"; readonly principalId: string }
+
+/** A tab's owner — human, one native Session agent, or one opaque external
+ * controller. The user may always reassign through the user-authority path. */
+export type HostOwner =
+  | { readonly kind: "user" }
+  | { readonly kind: "agent"; readonly sessionId: string }
+  | { readonly kind: "external"; readonly principalId: string }
+
+export const principalFromRequest = (request: {
+  readonly sessionId?: string
+  readonly principal?: BrowserPrincipal
+}): BrowserPrincipal | undefined => {
+  if (request.principal) {
+    if (
+      request.sessionId !== undefined &&
+      (request.principal.kind !== "session" || request.principal.sessionId !== request.sessionId)
+    ) return undefined
+    return request.principal
+  }
+  return request.sessionId ? { kind: "session", sessionId: request.sessionId } : undefined
+}
+
+export const ownerForPrincipal = (principal: BrowserPrincipal): Exclude<HostOwner, { readonly kind: "user" }> =>
+  principal.kind === "session"
+    ? { kind: "agent", sessionId: principal.sessionId }
+    : { kind: "external", principalId: principal.principalId }
+
+const samePrincipal = (owner: HostOwner, principal: BrowserPrincipal) =>
+  (owner.kind === "agent" && principal.kind === "session" && owner.sessionId === principal.sessionId) ||
+  (owner.kind === "external" && principal.kind === "external" && owner.principalId === principal.principalId)
+
+const normalizePrincipal = (principal: BrowserPrincipal | string): BrowserPrincipal =>
+  typeof principal === "string" ? { kind: "session", sessionId: principal } : principal
 
 export interface HostHello {
   readonly protocolVersion: number
@@ -192,11 +225,12 @@ export type BrokerRequestInput = Omit<BrokerRequest, "requestId" | "windowId"> &
 
 export interface BrokerRequest {
   readonly requestId: string
-  readonly sessionId: string
+  readonly sessionId?: string
+  readonly principal?: BrowserPrincipal
   readonly windowId: string
   readonly workspaceId?: string
   readonly directory?: string
-  readonly messageId: string
+  readonly messageId?: string
   readonly toolCallId?: string
   readonly tabId?: string
   readonly operation: BrokerOperation
@@ -477,16 +511,16 @@ const tabKey = (windowId: string, tabId: string) => `${windowId}#${tabId}`
 
 // --- pure ownership helpers (unit-tested; shared with the desktop engine) -----
 
-/** Can this session dispatch to a tab with this owner? (O1/O2/O3) */
-export const canDispatch = (owner: HostOwner, sessionId: string): "ok" | "other-agent" | "user-owned" => {
+/** Can this controller dispatch to a tab with this owner? (O1/O2/O3) */
+export const canDispatch = (owner: HostOwner, input: BrowserPrincipal | string): "ok" | "other-agent" | "user-owned" => {
   if (owner.kind === "user") return "user-owned"
-  return owner.sessionId === sessionId ? "ok" : "other-agent"
+  return samePrincipal(owner, normalizePrincipal(input)) ? "ok" : "other-agent"
 }
 
-/** Can this session claim a tab with this owner? (O4/O5/O6) */
-export const canClaim = (owner: HostOwner, sessionId: string): "ok" | "idempotent" | "denied" => {
+/** Can this controller claim a tab with this owner? (O4/O5/O6) */
+export const canClaim = (owner: HostOwner, input: BrowserPrincipal | string): "ok" | "idempotent" | "denied" => {
   if (owner.kind === "user") return "ok"
-  return owner.sessionId === sessionId ? "idempotent" : "denied"
+  return samePrincipal(owner, normalizePrincipal(input)) ? "idempotent" : "denied"
 }
 
 /** Release every tab owned by `sessionId` to the user (session-delete orphan, O10). */
@@ -505,6 +539,16 @@ export const sessionTabs = (
 ): readonly TabRecord[] =>
   [...tabs]
     .filter((tab) => tab.windowId === windowId && tab.owner.kind === "agent" && tab.owner.sessionId === sessionId)
+    .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
+
+/** One controller principal's tabs in a window, most-recently-active first. */
+export const principalTabs = (
+  tabs: readonly TabRecord[],
+  windowId: string,
+  principal: BrowserPrincipal,
+): readonly TabRecord[] =>
+  [...tabs]
+    .filter((tab) => tab.windowId === windowId && samePrincipal(tab.owner, principal))
     .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
 
 export type VisualOperationCapability = "capture" | "diff" | "record"
@@ -557,6 +601,8 @@ const errorResult = (tag: BrowserErrorTag, message: string): ResolveDispatchResu
 export const resolveDispatch = (input: ResolveDispatchInput): ResolveDispatchResult => {
   const { request, windowId, tabs } = input
   if (windowId === undefined) return errorResult("BrowserHostUnavailable", HOST_UNAVAILABLE_MESSAGE)
+  const principal = principalFromRequest(request)
+  if (!principal) return errorResult("BrowserOperationFailed", "Browser request has no valid control principal")
   const windowTabs = tabs.filter((tab) => tab.windowId === windowId)
 
   // (1) open: claim-and-navigate, or reuse-or-create (D5/D6)
@@ -565,14 +611,14 @@ export const resolveDispatch = (input: ResolveDispatchInput): ResolveDispatchRes
     if (openInput.tabId !== undefined) {
       const tab = windowTabs.find((t) => t.tabId === openInput.tabId)
       if (!tab) return errorResult("BrowserTabNotFound", TAB_NOT_FOUND_MESSAGE)
-      const gate = canDispatch(tab.owner, request.sessionId)
+      const gate = canDispatch(tab.owner, principal)
       if (gate === "other-agent") return errorResult("BrowserPermissionDenied", PERMISSION_DENIED_OTHER_MESSAGE)
       if (gate === "user-owned" && openInput.claim !== true) return errorResult("BrowserPermissionDenied", PERMISSION_DENIED_USER_MESSAGE)
       // own agent tab, or user tab with claim → host flips owner (claim) then navigates
       return { kind: "forward", windowId, tabId: tab.tabId }
     }
     if (!openInput.newTab) {
-      const owned = sessionTabs(tabs, windowId, request.sessionId)
+      const owned = principalTabs(tabs, windowId, principal)
       if (owned.length > 0) {
         const target = owned[0]!
         const rewrite: BrokerOperation = {
@@ -591,7 +637,7 @@ export const resolveDispatch = (input: ResolveDispatchInput): ResolveDispatchRes
     const claimInput = request.operation.input as { tabId: string }
     const tab = windowTabs.find((t) => t.tabId === claimInput.tabId)
     if (!tab) return errorResult("BrowserTabNotFound", TAB_NOT_FOUND_MESSAGE)
-    const gate = canClaim(tab.owner, request.sessionId)
+    const gate = canClaim(tab.owner, principal)
     if (gate === "denied") return errorResult("BrowserPermissionDenied", PERMISSION_DENIED_OTHER_MESSAGE)
     // own agent tab → idempotent; user/unowned → host flips (first-come-wins)
     return { kind: "forward", windowId, tabId: tab.tabId }
@@ -613,15 +659,17 @@ export const resolveOwnedTab = (
   windowId: string,
   windowTabs: readonly TabRecord[],
 ): ResolveDispatchResult => {
+  const principal = principalFromRequest(request)
+  if (!principal) return errorResult("BrowserOperationFailed", "Browser request has no valid control principal")
   if (request.tabId !== undefined) {
     const tab = windowTabs.find((t) => t.tabId === request.tabId)
     if (!tab) return errorResult("BrowserTabNotFound", TAB_NOT_FOUND_MESSAGE)
-    const gate = canDispatch(tab.owner, request.sessionId)
+    const gate = canDispatch(tab.owner, principal)
     if (gate === "other-agent") return errorResult("BrowserPermissionDenied", PERMISSION_DENIED_OTHER_MESSAGE)
     if (gate === "user-owned") return errorResult("BrowserPermissionDenied", PERMISSION_DENIED_USER_MESSAGE)
     return { kind: "forward", windowId, tabId: tab.tabId }
   }
-  const owned = sessionTabs([...windowTabs], windowId, request.sessionId)
+  const owned = principalTabs([...windowTabs], windowId, principal)
   if (owned.length === 0) return errorResult("BrowserTabNotFound", TAB_NOT_FOUND_MESSAGE)
   return { kind: "forward", windowId, tabId: owned[0]!.tabId }
 }
@@ -747,7 +795,7 @@ const layer = Layer.effect(
     }
 
     /** Optimistic mirror of a freshly created tab (open response; events refine). */
-    const mirrorOpenTab = (opened: Record<string, unknown>, sessionId: string, windowId: string) => {
+    const mirrorOpenTab = (opened: Record<string, unknown>, principal: BrowserPrincipal, windowId: string) => {
       const tabId = typeof opened["tabId"] === "string" ? opened["tabId"] : ""
       if (!tabId) return
       upsertTab(
@@ -762,7 +810,7 @@ const layer = Layer.effect(
           attached: true,
           active: true,
           muted: false,
-          owner: { kind: "agent", sessionId },
+          owner: ownerForPrincipal(principal),
         },
         Date.now(),
       )
@@ -833,11 +881,12 @@ const layer = Layer.effect(
       if (typeof value !== "object" || value === null) return false
       const kind = (value as { kind?: unknown }).kind
       if (kind === "user") return true
-      return kind === "agent" && typeof (value as { sessionId?: unknown }).sessionId === "string"
+      if (kind === "agent") return typeof (value as { sessionId?: unknown }).sessionId === "string"
+      return kind === "external" && typeof (value as { principalId?: unknown }).principalId === "string"
     }
 
     /** The open-reuse rewrite: a navigate response normalized into OpenOutput shape. */
-    const normalizeOpenFromNavigate = (navResult: unknown, tabId: string, sessionId: string): unknown => {
+    const normalizeOpenFromNavigate = (navResult: unknown, tabId: string, principal: BrowserPrincipal): unknown => {
       const navigated = (((navResult ?? {}) as Record<string, unknown>)["navigated"] as Record<string, unknown> | undefined) ?? {}
       return {
         opened: {
@@ -846,7 +895,7 @@ const layer = Layer.effect(
           title: typeof navigated["title"] === "string" ? navigated["title"] : "",
           readyState: typeof navigated["readyState"] === "string" ? navigated["readyState"] : "Success",
           viewport: navigated["viewport"],
-          owner: { kind: "agent", sessionId },
+          owner: ownerForPrincipal(principal),
         },
       }
     }
@@ -905,16 +954,17 @@ const layer = Layer.effect(
       }
     })
 
-    /** v1: the single live window (prefer the window of the session's
+    /** v1: the single live window (prefer the window of the principal's
      * most-recently-active owned tab; else the most recent live registration). */
     const resolveWindow = (request: BrokerRequestInput): Connection | undefined => {
       const live = [...connections.values()].filter((connection) => connection.status === "live")
       if (live.length === 0) return undefined
-      const sessionOwned = [...tabs.values()]
-        .filter((record) => record.owner.kind === "agent" && record.owner.sessionId === request.sessionId)
-        .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
-      if (sessionOwned.length > 0) {
-        const connection = connections.get(sessionOwned[0]!.windowId)
+      const principal = principalFromRequest(request)
+      const principalOwned = principal
+        ? [...tabs.values()].filter((record) => samePrincipal(record.owner, principal)).sort((a, b) => b.lastActiveAt - a.lastActiveAt)
+        : []
+      if (principalOwned.length > 0) {
+        const connection = connections.get(principalOwned[0]!.windowId)
         if (connection && connection.status === "live") return connection
       }
       return live[live.length - 1]!
@@ -935,6 +985,14 @@ const layer = Layer.effect(
     ) {
       const startedAt = Date.now()
       const requestId = request.requestId ?? crypto.randomUUID()
+      const principal = principalFromRequest(request)
+      if (!principal) {
+        return errorResponse(
+          requestId,
+          { tag: "BrowserOperationFailed", message: "Browser request has no valid control principal", retryable: false },
+          startedAt,
+        )
+      }
       const connection = resolveWindow(request)
       if (!connection) return unavailable(requestId, startedAt)
 
@@ -1042,10 +1100,10 @@ const layer = Layer.effect(
         }
         if (request.operation.name === "open") {
           if (resolution.rewrite !== undefined && resolution.tabId !== undefined) {
-            return { ...response, result: normalizeOpenFromNavigate(response.result, resolution.tabId, request.sessionId) }
+            return { ...response, result: normalizeOpenFromNavigate(response.result, resolution.tabId, principal) }
           }
           const opened = result["opened"] as Record<string, unknown> | undefined
-          if (opened !== undefined) mirrorOpenTab(opened, request.sessionId, windowId)
+          if (opened !== undefined) mirrorOpenTab(opened, principal, windowId)
         }
         if (request.operation.name === "claim") {
           const claimed = result["claimed"] as { tabId?: unknown; owner?: unknown } | undefined
