@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Session } from "./session"
 import { SessionID, MessageID, PartID } from "./schema"
@@ -22,12 +23,13 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 
 export const Event = SessionCompactionEvent
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
+const TOOL_OUTPUT_MAX_BYTES = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
@@ -61,10 +63,20 @@ type CompletedCompaction = {
   summary: string | undefined
 }
 
-const truncate = (value: string) =>
-  value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
+export const compactToolOutput = (value: string) =>
+  ToolOutputProjection.project(value, {
+    maxLines: Number.MAX_SAFE_INTEGER,
+    maxBytes: TOOL_OUTPUT_MAX_BYTES,
+    marker: "[tool output truncated; showing beginning + end]",
+    strategy: "balanced",
+  }).content
 
 const serialize = (message: SessionV1.WithParts) => {
+  // Goal spec/progress are STATE-shaped projections, including imported
+  // historical snapshots. Historical lifetime revokes live authority but does
+  // not make stale domain STATE suitable for an immutable compaction summary.
+  // The runner republishes current authoritative state after compaction.
+  if (SessionTurnProvenance.hasStateSemanticsTurn(message)) return ""
   if (message.info.role === "user") {
     const text = message.parts
       .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
@@ -74,7 +86,16 @@ const serialize = (message: SessionV1.WithParts) => {
     const files = message.parts.flatMap((part) =>
       part.type === "file" ? [`[Attached ${part.mime}: ${part.filename ?? "file"}]`] : [],
     )
-    return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
+    const kind = SessionTurnProvenance.semanticKind(message)
+    const label =
+      kind === "user"
+        ? "User"
+        : kind === "shell"
+          ? "Shell context"
+          : kind === "compaction"
+            ? "Compaction context"
+            : "Synthetic context"
+    return [...(text ? [`[${label}]: ${text}`] : []), ...files].join("\n")
   }
   return message.parts
     .flatMap((part) => {
@@ -88,7 +109,7 @@ const serialize = (message: SessionV1.WithParts) => {
         )
         const output = part.state.time.compacted
           ? "[Old tool result content cleared]"
-          : truncate([part.state.output, ...attachments].join("\n"))
+          : compactToolOutput([part.state.output, ...attachments].join("\n"))
         return [call, `[Tool result]: ${output}`]
       }
       if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
@@ -136,8 +157,7 @@ function turns(messages: SessionV1.WithParts[]) {
   const result: Turn[] = []
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
-    if (msg.info.role !== "user") continue
-    if (msg.parts.some((part) => part.type === "compaction")) continue
+    if (!SessionTurnProvenance.isSemanticUserTurn(msg)) continue
     result.push({
       start: i,
       end: messages.length,
@@ -193,6 +213,8 @@ export interface Interface {
     sessionID: SessionID
     agent: string
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    /** Canonical worker-root turn; compaction is a derived host boundary, never a new authority root. */
+    sourceMessageID: MessageID
     auto: boolean
     continueAfter?: boolean
     overflow?: boolean
@@ -365,7 +387,7 @@ const layer = Layer.effect(
 
       loop: for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
         const msg = msgs[msgIndex]
-        if (msg.info.role === "user") turns++
+        if (SessionTurnProvenance.isSemanticUserTurn(msg)) turns++
         if (turns < 2) continue
         if (msg.info.role === "assistant" && msg.info.summary) break loop
         for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
@@ -420,14 +442,13 @@ const layer = Layer.effect(
         const idx = input.messages.findIndex((m) => m.info.id === input.parentID)
         for (let i = idx - 1; i >= 0; i--) {
           const msg = input.messages[i]
-          if (msg.info.role === "user" && !msg.parts.some((p) => p.type === "compaction")) {
+          if (SessionTurnProvenance.isSemanticUserTurn(msg) && msg.info.role === "user") {
             replay = { info: msg.info, parts: msg.parts }
             messages = input.messages.slice(0, i)
             break
           }
         }
-        const hasContent =
-          replay && messages.some((m) => m.info.role === "user" && !m.parts.some((p) => p.type === "compaction"))
+        const hasContent = replay && messages.some(SessionTurnProvenance.isSemanticUserTurn)
         if (!hasContent) {
           replay = undefined
           messages = input.messages
@@ -455,8 +476,10 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      // Provider-context transforms operate on an isolated copy only; compaction
+      // selection remains authoritative historical input and must not be mutated
+      // by plugin code.
+      const msgs = yield* plugin.transformChatMessages(selected.head)
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const customPrompt = cfg.compaction?.prompt?.trim() ? cfg.compaction.prompt.trim() : undefined
       const nextPrompt =
@@ -568,7 +591,7 @@ const layer = Layer.effect(
       const currentMessages = yield* session.messages({ sessionID: input.sessionID })
       const hasNewerUserMessage = currentMessages.some(
         (message) =>
-          message.info.role === "user" &&
+          SessionTurnProvenance.isSemanticUserTurn(message) &&
           message.info.id !== input.parentID &&
           (message.info.time.created > userMessage.time.created ||
             (message.info.time.created === userMessage.time.created && message.info.id > userMessage.id)),
@@ -580,6 +603,7 @@ const layer = Layer.effect(
           const replayMsg = yield* session.updateMessage({
             id: MessageID.ascending(),
             role: "user",
+            provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.CompactionReplay, replay.info),
             sessionID: input.sessionID,
             time: { created: Date.now() },
             agent: original.agent,
@@ -628,6 +652,7 @@ const layer = Layer.effect(
             const continueMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
               role: "user",
+              provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.CompactionContinue, parent.info),
               sessionID: input.sessionID,
               time: { created: Date.now() },
               agent: userMessage.agent,
@@ -674,6 +699,7 @@ const layer = Layer.effect(
       sessionID: SessionID
       agent: string
       model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      sourceMessageID: MessageID
       auto: boolean
       continueAfter?: boolean
       overflow?: boolean
@@ -681,6 +707,9 @@ const layer = Layer.effect(
       const msg = yield* session.updateMessage({
         id: MessageID.ascending(),
         role: "user",
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.Compaction, {
+          sourceMessageID: input.sourceMessageID,
+        }),
         model: input.model,
         sessionID: input.sessionID,
         agent: input.agent,

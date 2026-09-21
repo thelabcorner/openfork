@@ -39,6 +39,8 @@ export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
   readonly message: SessionV1.Assistant
+  /** True when this provider turn emitted at least one host-executed tool call. */
+  readonly hasNonProviderToolCalls: boolean
   readonly updateToolCall: (
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
@@ -100,6 +102,7 @@ interface PendingDelta {
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  nonProviderToolCallIDs: Set<string>
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -154,6 +157,7 @@ const layer = Layer.effect(
         model: input.model,
         spad: input.spad,
         toolcalls: {},
+        nonProviderToolCallIDs: new Set(),
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -336,11 +340,16 @@ const layer = Layer.effect(
       }) {
         const existing = yield* readToolCall(input.id)
         if (existing) {
-          if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
+          if (!input.providerExecuted || existing.part.metadata?.providerExecuted) {
+            if (existing.part.metadata?.providerExecuted) ctx.nonProviderToolCallIDs.delete(input.id)
+            else ctx.nonProviderToolCallIDs.add(input.id)
+            return existing
+          }
           const part = yield* session.updatePart({
             ...existing.part,
             metadata: { ...existing.part.metadata, providerExecuted: true },
           })
+          ctx.nonProviderToolCallIDs.delete(input.id)
           ctx.toolcalls[input.id] = {
             ...existing.call,
             partID: part.id,
@@ -359,6 +368,8 @@ const layer = Layer.effect(
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
         } satisfies SessionV1.ToolPart)
+        if (input.providerExecuted) ctx.nonProviderToolCallIDs.delete(input.id)
+        else ctx.nonProviderToolCallIDs.add(input.id)
         ctx.toolcalls[input.id] = {
           done: yield* Deferred.make<void>(),
           partID: part.id,
@@ -1067,6 +1078,9 @@ const layer = Layer.effect(
       return {
         get message() {
           return ctx.assistantMessage
+        },
+        get hasNonProviderToolCalls() {
+          return ctx.nonProviderToolCallIDs.size > 0
         },
         updateToolCall,
         completeToolCall,

@@ -120,6 +120,9 @@ const layer = Layer.effect(
         (m) => m.info.id === input.messageID || (m.info.role === "assistant" && m.info.parentID === input.messageID),
       )
       const target = messages.find((m) => m.info.id === input.messageID)
+      // Diff ownership follows the structural V1 turn parent, so a host-owned
+      // synthetic role=user continuation may legitimately own an assistant
+      // diff. This is not a human/user attribution check.
       if (!target || target.info.role !== "user") return
       const msgDiffs = yield* computeDiff({ messages })
       target.info.summary = { ...target.info.summary, diffs: msgDiffs }

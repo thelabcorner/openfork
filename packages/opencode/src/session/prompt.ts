@@ -1,9 +1,25 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
+import {
+  ModelRef,
+  PromptInput,
+  type HostPromptProvenance,
+  type SessionPromptOps,
+  type UserActionPromptProvenance,
+} from "./prompt-contract"
+export {
+  ModelRef,
+  PromptInput,
+  type HostPromptProvenance,
+  type SessionPromptOps,
+  type UserActionPromptProvenance,
+} from "./prompt-contract"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
 import { TurnCheckpoint } from "./checkpoint"
@@ -34,37 +50,45 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
+import { BackgroundJob } from "@/background/job"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
+import { ShellLaunch } from "@/tool/shell/launch"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
-import { SessionIngress, formatMonitorEvents } from "./ingress"
+import { SessionIngress, formatMonitorEvents, interactionGate } from "./ingress"
 import { Question } from "@/question"
 import { decodeDataUrl } from "@/util/data-url"
-import { Process } from "@/util/process"
 import { Cause, DateTime, Duration, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { TaskTool, type TaskPromptOps } from "@/tool/task"
+import * as SubagentDelegation from "./subagent-delegation"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { userChildEnvironment } from "@/util/javascript-runtime"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage as CurrentSessionMessage } from "@opencode-ai/core/session/message"
 import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
-import { LLMEvent, LLMResponse } from "@opencode-ai/llm"
+import { LLMEvent, LLMResponse, type ToolResultValue } from "@opencode-ai/llm"
 import { SpadSupervisor } from "./spad/supervisor"
 import { makeTurnPolicy } from "./spad/intent"
 import { GoalContext } from "@opencode-ai/core/goal/context"
+import { Goal } from "@opencode-ai/core/goal"
+import { GoalProjection } from "@opencode-ai/core/goal/projection"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { GoalAuditor } from "@opencode-ai/core/goal/auditor"
+import { makeRuntime as makeGoalAuditorRuntime } from "@/goal/auditor-runtime"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -72,6 +96,7 @@ import {
   collectUntilTerminalTool,
   generateAdaptive,
   runTerminalCompletionWithTranscript,
+  terminalCompletionAccepted,
   withSpecialAgentTimeout,
 } from "@opencode-ai/core/special-agent-completion"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
@@ -80,6 +105,9 @@ import { Usage as UsageAnalytics } from "@/usage/usage"
 import * as MaintenanceUsage from "@/usage/maintenance"
 import { SpadAuditor } from "@opencode-ai/core/spad-auditor"
 import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import { ScheduledTaskProvenance } from "@opencode-ai/core/scheduled-task/provenance"
+import { makeV1SpecialAgentAnchor } from "@/special-agent/v1-anchor"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -87,6 +115,7 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
+
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
   "image/gif",
@@ -105,22 +134,116 @@ IMPORTANT:
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
-// Injected (request-only) when a generation is an automatic continuation of
-// one that ended with finish "unknown" ΓÇö the provider stream dropped before a
-// stop reason. Without this the model is asked to produce another assistant
-// turn with no new input, which it experiences as a blank/phantom user message.
+// Persisted as a host-owned synthetic turn when a generation is an automatic
+// continuation of one that ended with finish "unknown" — the provider stream
+// dropped before a stop reason. Without this the model is asked to produce
+// another assistant turn with no new input, which it experiences as a
+// blank/phantom user message.
 const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION ΓÇö system, not the user] Your previous response was cut off mid-stream: the provider connection dropped before a completion signal arrived (finish reason "unknown"). Nothing new was asked and there is no new user request. Resume exactly where you stopped: continue the same task or sentence WITHOUT repeating output you already produced, without apologizing, and without asking the user anything. If you genuinely cannot continue, state in one short line what you were doing, then immediately proceed with the next concrete step.`
 
 function goalTokenCount(tokens: SessionV1.Assistant["tokens"]) {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
-function visibleUserText(message: SessionV1.WithParts | undefined) {
-  if (!message || message.info.role !== "user") return ""
+// Goal reservation ids are globally unique durable cursors. Deriving V1 ids
+// from that cursor gives continuation publication a stable identity across
+// process crashes without pushing V1-specific identifiers into GoalAutomation.
+function goalContinuationMessageID(reservationID: string) {
+  return MessageID.make(`msg_goal_continuation_${reservationID}`)
+}
+
+function goalContinuationPartID(reservationID: string) {
+  return PartID.make(`prt_goal_continuation_${reservationID}`)
+}
+
+function visibleWorkerPromptText(message: SessionV1.WithParts | undefined) {
+  if (!message || !SessionTurnProvenance.isWorkerPromptTurn(message)) return ""
+  return visiblePromptText(message)
+}
+
+function visiblePromptText(message: SessionV1.WithParts) {
   return message.parts
     .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic !== true)
     .map((part) => part.text)
     .join("\n")
+}
+
+function truncateTitleContext(value: string, maxChars: number) {
+  if (value.length <= maxChars) return value
+  if (maxChars <= 64) return value.slice(0, maxChars)
+  const marker = "\n...[truncated]...\n"
+  const remaining = Math.max(0, maxChars - marker.length)
+  const head = Math.ceil(remaining * 0.55)
+  return `${value.slice(0, head)}${marker}${value.slice(value.length - (remaining - head))}`
+}
+
+/**
+ * V1 adapter for the shared title-context semantics used by Core: compacted
+ * history wins over raw replay, only semantic conversational content is
+ * rendered, and the opening worker root is pinned only when no compaction
+ * summary supersedes it. The provider receives this bounded transcript as data,
+ * never the session's raw tool/protocol history.
+ */
+export function assembleV1TitleContext(messages: readonly SessionV1.WithParts[]) {
+  const maxChars = SessionTitle.MAX_TITLE_CONTEXT_CHARS
+  const maxBlockChars = maxChars
+  const latestCompaction = messages.findLastIndex((message) =>
+    message.parts.some((part) => part.type === "compaction"),
+  )
+  const floor = latestCompaction >= 0 ? latestCompaction : 0
+  const blocks: Array<{ index: number; text: string }> = []
+
+  for (let index = floor; index < messages.length; index++) {
+    const message = messages[index]!
+    let text = ""
+    if (message.info.role === "assistant") {
+      const body = message.parts
+        .filter((part): part is SessionV1.TextPart => part.type === "text" && part.text.trim().length > 0)
+        .map((part) => part.text)
+        .join("\n")
+      if (body) text = `<assistant>\n${body}\n</assistant>`
+    } else {
+      const kind = SessionTurnProvenance.semanticKind(message)
+      if (kind === "compaction") {
+        text = "<conversation-summary>\nPrevious conversation compacted; the following assistant summary is authoritative.\n</conversation-summary>"
+      } else if (kind === "user" || kind === "shell") {
+        const body = message.parts
+          .flatMap((part) => {
+            if (part.type === "text" && part.ignored !== true && (kind === "shell" || part.synthetic !== true)) return [part.text]
+            if (part.type === "subtask") return [part.prompt]
+            return []
+          })
+          .filter((part) => part.trim().length > 0)
+          .join("\n")
+        if (body) text = `<${kind}>\n${body}\n</${kind}>`
+      }
+    }
+    if (text) blocks.push({ index, text: truncateTitleContext(text, maxBlockChars) })
+  }
+
+  const selected = new Map<number, string>()
+  let chars = 0
+  const add = (block: { index: number; text: string } | undefined) => {
+    if (!block || selected.has(block.index)) return
+    const separator = selected.size > 0 ? 2 : 0
+    const remaining = maxChars - chars - separator
+    if (remaining <= 0) return
+    const text = truncateTitleContext(block.text, remaining)
+    if (!text) return
+    selected.set(block.index, text)
+    chars += text.length + separator
+  }
+
+  if (latestCompaction >= 0) add(blocks.find((block) => block.index === latestCompaction))
+  else {
+    const opening = messages.findIndex(SessionTurnProvenance.isWorkerPromptTurn)
+    add(blocks.find((block) => block.index === opening))
+  }
+  for (let index = blocks.length - 1; index >= 0; index--) add(blocks[index])
+  return [...selected.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, text]) => text)
+    .join("\n\n")
 }
 
 function goalAuditLatestWork(messages: readonly SessionV1.WithParts[]) {
@@ -159,7 +282,52 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Synchronous public-user admission preflight. HTTP async prompt routes use
+   * this before forking so producer-owned-but-user-drivable roots never return
+   * a false 204 while opaque worker/special-agent Sessions remain fenced.
+   */
+  readonly assertUserPromptable: (sessionID: SessionID) => Effect.Effect<Session.Info, HostOwnedSessionError>
+  /**
+   * Run the focused Goal's independent auditor immediately without fabricating
+   * another worker turn. Used by the user-facing "request verification" path
+   * and by recovery from an orphaned verification state.
+   */
+  readonly auditGoal: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * User-owned verification preemption. Durably records the audit request,
+   * interrupts active worker/tool execution to a finalized idle state, then
+   * launches the independent auditor immediately.
+   */
+  readonly requestGoalAudit: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
+  /**
+   * Trusted first-party user action. Public clients cannot choose provenance;
+   * domain handlers use this seam for durable user-owned actions whose semantic
+   * source is more precise than an ordinary typed prompt.
+   */
+  readonly userActionPrompt: (
+    input: PromptInput,
+    provenance: UserActionPromptProvenance,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
+  /**
+   * Host-origin prompt used by unattended runners (Goal continuation, scheduled
+   * tasks). It is not a synthetic user keystroke: it must not supersede
+   * autonomous reservations, and host-owned child Sessions are rejected.
+   */
+  readonly hostPrompt: (
+    input: PromptInput,
+    provenance?: HostPromptProvenance,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
+  /**
+   * Trusted current-model Synthetic ingress for first-party host producers.
+   * This is deliberately not exposed through the public prompt payload: typed
+   * origin/delegation remains host-owned and the durable SessionInput row is the
+   * sole wake source consumed by the mature V1 runtime adapter.
+   */
+  readonly admitSynthetic: (
+    input: SessionInput.SyntheticAdmission & { readonly resume?: boolean },
+  ) => Effect.Effect<SessionInput.Entry, HostOwnedSessionError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | HostOwnedSessionError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
@@ -177,7 +345,13 @@ export class HostOwnedSessionError extends Schema.TaggedErrorClass<HostOwnedSess
   {
     sessionID: SessionID,
     parentID: SessionID,
-    kind: Schema.Literals(["child", "goal_auditor"]),
+    kind: Schema.Union([
+      Schema.Literal("child"),
+      Schema.Literal("scheduled_task"),
+      Schema.Literal("delegated_worker"),
+      Schema.Literal("special_agent"),
+      SpecialAgentSession.Kind,
+    ]),
   },
 ) {}
 
@@ -217,11 +391,15 @@ const layer = Layer.effect(
     const ingress = yield* SessionIngress.Service
     const question = yield* Question.Service
     const goalContext = yield* GoalContext.Service
+    const goals = yield* Goal.Service
     const goalAutomation = yield* GoalAutomation.Service
     const locations = yield* LocationServiceMap.Service
     const database = yield* Database.Service
+    const subagentDelegation = yield* SubagentDelegation.make
     const specialAgents = yield* SpecialAgentSession.Service
+    const goalAuditorRuntime = makeGoalAuditorRuntime(provider, llm)
     const { db } = database
+    const titleLocks = KeyedMutex.makeUnsafe<SessionID>()
     // Throttle for the end-of-turn compaction.prune maintenance fork below.
     // prune re-scans the session's full message history on every turn; with
     // several concurrent sessions on long histories that is a repeated
@@ -242,7 +420,7 @@ const layer = Layer.effect(
       }
       return compaction.prune({ sessionID })
     }
-    let dispatchFn: TaskPromptOps["dispatch"] | undefined
+    let dispatchFn: SessionPromptOps["dispatch"] | undefined
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -250,13 +428,13 @@ const layer = Layer.effect(
         // Task/subagent dispatch is a trusted host capability. It may drive an
         // ordinary child Session, but the dedicated Goal Auditor runtime remains
         // the sole execution owner of goal_auditor children.
-        prompt: ((input: PromptInput) =>
-          hostPrompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
-        dispatch: ((input: PromptInput, options?: { wait?: boolean }) =>
+        prompt: ((input: PromptInput, provenance?: HostPromptProvenance) =>
+          hostPrompt(input, provenance).pipe(Effect.catch(Effect.die))) as unknown as SessionPromptOps["prompt"],
+        dispatch: ((input: PromptInput, options?: { wait?: boolean; provenance?: HostPromptProvenance }) =>
           dispatchFn
             ? dispatchFn(input, options)
-            : Effect.die(new Error("dispatch not initialized"))) as TaskPromptOps["dispatch"],
-      } satisfies TaskPromptOps
+            : Effect.die(new Error("dispatch not initialized"))) as SessionPromptOps["dispatch"],
+      } satisfies SessionPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
@@ -310,12 +488,13 @@ const layer = Layer.effect(
     // the host-owned protocol and generated_title tool remain authoritative.
     // Returns `undefined` when no valid structured artifact is committed, so the
     // caller keeps the existing title untouched.
-    const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (input: {
+    const generateTitleUnlocked = Effect.fn("SessionPrompt.generateTitleUnlocked")(function* (input: {
       sessionID: SessionID
       firstUser: SessionV1.WithParts
       context: SessionV1.WithParts[]
       providerID: ProviderV2.ID
       modelID: ModelV2.ID
+      accountID?: string
       model?: ModelV2.Ref
       previousTitle: string
       prompt?: string
@@ -323,9 +502,6 @@ const layer = Layer.effect(
     }) {
       const firstInfo = input.firstUser.info
       if (firstInfo.role !== "user") return
-      const subtasks = input.firstUser.parts.filter((p): p is SessionV1.SubtaskPart => p.type === "subtask")
-      const onlySubtasks = subtasks.length > 0 && input.firstUser.parts.every((p) => p.type === "subtask")
-
       const ag = yield* agents.get("title")
       if (!ag) return
       const cfg = yield* config.get()
@@ -342,13 +518,16 @@ const layer = Layer.effect(
       // config/plugin small model ΓåÆ session/default model. Runtime failures on
       // one candidate should not make manual retitle fail while another usable
       // model is available.
-      const resolve = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
-        provider.getModel(providerID, modelID).pipe(Effect.option, Effect.map(Option.getOrElse(() => undefined)))
+      const resolve = (providerID: ProviderV2.ID, modelID: ModelV2.ID, accountID?: string) =>
+        provider.getModel(providerID, modelID, accountID).pipe(
+          Effect.option,
+          Effect.map(Option.getOrElse(() => undefined)),
+        )
       const candidates = [
-        input.model ? yield* resolve(input.model.providerID, input.model.id) : undefined,
-        ag.model ? yield* resolve(ag.model.providerID, ag.model.modelID) : undefined,
+        input.model ? yield* resolve(input.model.providerID, input.model.id, input.model.accountID) : undefined,
+        ag.model ? yield* resolve(ag.model.providerID, ag.model.modelID, ag.model.accountID) : undefined,
         yield* provider.getSmallModel(input.providerID),
-        yield* resolve(input.providerID, input.modelID),
+        yield* resolve(input.providerID, input.modelID, input.accountID),
       ].filter((item): item is Provider.Model => item !== undefined)
       const seen = new Set<string>()
       const uniqueCandidates = candidates.filter((item) => {
@@ -365,6 +544,40 @@ const layer = Layer.effect(
           .filter((item) => !item.capabilities.toolcall)
           .map((item) => `${item.providerID}/${item.id}`),
       })
+      const titleTranscriptID =
+        toolCandidates.length === 0
+          ? undefined
+          : yield* specialAgents
+              .provision({
+                ownerKind: SpecialAgentSession.OWNER_SESSION,
+                ownerID: input.sessionID,
+                agent: "session_title",
+                parentSessionID: input.sessionID,
+                title: `Title · ${input.previousTitle}`,
+              })
+              .pipe(
+                Effect.tapError((error) =>
+                  Effect.logWarning("V1 title generation continuing without a durable transcript", {
+                    sessionID: input.sessionID,
+                    error: String(error),
+                  }),
+                ),
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
+      const conversation = assembleV1TitleContext(input.context)
+      const titleRequestText = `<title-generation-context>\n${JSON.stringify({
+        generationPurpose: input.purpose,
+        currentTitle: input.previousTitle,
+        sourceMessageID: firstInfo.id,
+        conversation,
+      })}\n</title-generation-context>`
+      if (titleTranscriptID) {
+        yield* specialAgents.publishPrompt({
+          sessionID: titleTranscriptID,
+          agent: "session_title",
+          text: titleRequestText,
+        })
+      }
       for (const mdl of toolCandidates) {
         const title = yield* Effect.gen(function* () {
           yield* Effect.logInfo("title model candidate starting", {
@@ -372,12 +585,9 @@ const layer = Layer.effect(
             providerID: mdl.providerID,
             modelID: mdl.id,
           })
-          const msgs = onlySubtasks
-            ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
-            : yield* MessageV2.toModelMessagesEffect(input.context, mdl)
           const policy = SessionTitle.renderLegacyPolicy(policySource, {
             previousTitle: input.previousTitle,
-            conversation: JSON.stringify(msgs),
+            conversation,
           })
           const titleAgent: Agent.Info = {
             ...ag,
@@ -397,28 +607,98 @@ const layer = Layer.effect(
               additionalProperties: false,
             }),
           })
-          const baseMessages: ModelMessage[] = [
-            {
-              role: "user" as const,
-              content: `<title-generation-context>\n${JSON.stringify({
-                generationPurpose: input.purpose,
-                currentTitle: input.previousTitle,
-              })}\n</title-generation-context>`,
-            },
-            ...msgs,
-          ]
-          const collect = (toolChoice: "required" | "auto", messages: ReadonlyArray<ModelMessage>) => {
-            const startedAt = Date.now()
-            const request = {
-              agentPrompt: titleAgent.prompt,
-              messages,
-              tool: SessionTitle.GENERATED_TITLE_TOOL,
-              toolChoice,
+          const baseMessages: ModelMessage[] = [{ role: "user" as const, content: titleRequestText }]
+          const titleUser = makeV1SpecialAgentAnchor({
+            sessionID: input.sessionID,
+            agent: "session_title",
+            model: { providerID: mdl.providerID, modelID: mdl.id },
+          })
+          type TranscriptTurn = {
+            readonly response: LLMResponse
+            readonly publisher: ReturnType<SpecialAgentSession.Interface["publisher"]>
+            readonly tokens: {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
             }
-            return collectUntilTerminalTool(
-              llm.stream({
+          }
+          const pendingTranscriptTurns = new Map<LLMResponse, TranscriptTurn>()
+          const settleTranscriptTurn = Effect.fn("SessionPrompt.settleV1TitleTranscriptTurn")(function* (
+            response: LLMResponse,
+            toolResults: ReadonlyArray<{
+              readonly id: string
+              readonly name: string
+              readonly result: ToolResultValue
+            }> = [],
+          ) {
+            if (!titleTranscriptID) return
+            const turn = pendingTranscriptTurns.get(response)
+            if (!turn) return
+            yield* specialAgents.settleTurn({
+              sessionID: titleTranscriptID,
+              publisher: turn.publisher,
+              response,
+              toolResults,
+              tokens: turn.tokens,
+            })
+            pendingTranscriptTurns.delete(response)
+          })
+          const rejectPendingTranscriptTurns = Effect.fn("SessionPrompt.rejectV1TitleTranscriptTurns")(function* (
+            reason: string,
+          ) {
+            for (const [response, turn] of pendingTranscriptTurns) {
+              yield* specialAgents.rejectTurn({
+                sessionID: titleTranscriptID!,
+                publisher: turn.publisher,
+                response,
+                tokens: turn.tokens,
+                reason,
+              })
+              pendingTranscriptTurns.delete(response)
+            }
+          })
+          const settleAcceptedTerminal = (response: LLMResponse, call: LLMResponse["toolCalls"][number]) =>
+            settleTranscriptTurn(
+              response,
+              response.toolCalls
+                .filter((item) => item.providerExecuted !== true)
+                .map((item) => ({
+                  id: item.id,
+                  name: item.name,
+                  result:
+                    item.id === call.id && item.name === call.name
+                      ? ({
+                          type: "text" as const,
+                          value: terminalCompletionAccepted(SessionTitle.GENERATED_TITLE_TOOL),
+                        } satisfies ToolResultValue)
+                      : ({
+                          type: "error" as const,
+                          value: "Session title protocol rejected this extra tool call.",
+                        } satisfies ToolResultValue),
+                })),
+            )
+          const collect = (toolChoice: "required" | "auto", messages: ReadonlyArray<ModelMessage>) =>
+            Effect.gen(function* () {
+              yield* rejectPendingTranscriptTurns("Session title protocol rejected this provider turn.")
+              const startedAt = Date.now()
+              const request = {
+                agentPrompt: titleAgent.prompt,
+                messages,
+                tool: SessionTitle.GENERATED_TITLE_TOOL,
+                toolChoice,
+              }
+              const publisher = titleTranscriptID
+                ? specialAgents.publisher({
+                    sessionID: titleTranscriptID,
+                    agent: "session_title",
+                    model: ModelV2.Ref.make({ providerID: mdl.providerID, id: mdl.id }),
+                  })
+                : undefined
+              if (publisher) publisher.setRequestSentAt(yield* DateTime.now)
+              const stream = llm.stream({
                 agent: titleAgent,
-                user: firstInfo,
+                user: titleUser,
                 system: [],
                 small: true,
                 tools: { [SessionTitle.GENERATED_TITLE_TOOL]: generatedTitleTool },
@@ -427,25 +707,47 @@ const layer = Layer.effect(
                 sessionID: input.sessionID,
                 retries: 2,
                 messages: [...messages],
-              }),
-              SessionTitle.GENERATED_TITLE_TOOL,
-            ).pipe(
-              Effect.tap((response) =>
-                response
-                  ? MaintenanceUsage.recordResponse({
-                      usage: usageAnalytics,
-                      agent: "title",
-                      model: mdl,
-                      response,
-                      request,
-                      sessionID: input.sessionID,
-                      variant: firstInfo.model.variant,
-                      startedAt,
-                    })
-                  : Effect.void,
-              ),
-            )
-          }
+              })
+              const collected = collectUntilTerminalTool(
+                publisher ? stream.pipe(Stream.tap((event) => publisher.publish(event))) : stream,
+                SessionTitle.GENERATED_TITLE_TOOL,
+              )
+              const response = yield* (publisher
+                ? specialAgents.guardProviderTurn({ publisher, label: "Session title", effect: collected })
+                : collected)
+              if (response) {
+                yield* MaintenanceUsage.recordResponse({
+                  usage: usageAnalytics,
+                  agent: "title",
+                  model: mdl,
+                  response,
+                  request,
+                  sessionID: input.sessionID,
+                  variant: firstInfo.model.variant,
+                  startedAt,
+                })
+              }
+              if (!publisher || !titleTranscriptID || !response) {
+                if (publisher && !response)
+                  yield* specialAgents.failTurn({
+                    publisher,
+                    message: "Title generation ended without a terminal response",
+                  })
+                return response
+              }
+              const reported = LLMResponse.usage(response)
+              const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
+              const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
+              const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
+              const tokens = {
+                input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
+                output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
+                reasoning,
+                cache: { read: cacheRead, write: cacheWrite },
+              }
+              pendingTranscriptTurns.set(response, { response, publisher, tokens })
+              return response
+            })
           const collectAdaptive = Effect.fn("SessionPrompt.collectTitle")(function* (
             messages: ReadonlyArray<ModelMessage>,
             preferred: "required" | "auto",
@@ -469,6 +771,7 @@ const layer = Layer.effect(
               return yield* Effect.fail(new Error("Title generation ended without a terminal response"))
             return { response: generated.response, toolChoice: generated.toolChoice } as const
           })
+          return yield* Effect.gen(function* () {
           let preferred: "required" | "auto" = "required"
           const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, string, unknown>({
             messages: baseMessages,
@@ -505,7 +808,10 @@ const layer = Layer.effect(
                     ? `Title generation hit the model output limit before it could call ${SessionTitle.GENERATED_TITLE_TOOL}`
                     : `Title generation protocol failure (${failure.reason}): expected exactly one ${SessionTitle.GENERATED_TITLE_TOOL} tool call`,
               ),
-          })
+          }).pipe(
+            Effect.tapError(() => rejectPendingTranscriptTurns("Session title generation failed protocol validation.")),
+          )
+          yield* settleAcceptedTerminal(terminal.response, terminal.call)
           const title = terminal.artifact
           yield* Effect.logInfo("title model candidate succeeded", {
             sessionID: input.sessionID,
@@ -514,6 +820,11 @@ const layer = Layer.effect(
             title,
           })
           return title
+          }).pipe(
+            Effect.ensuring(
+              rejectPendingTranscriptTurns("Session title operation ended before the provider turn was interpreted."),
+            ),
+          )
         }).pipe(
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
@@ -537,6 +848,21 @@ const layer = Layer.effect(
           .filter((item) => !item.capabilities.toolcall)
           .map((item) => `${item.providerID}/${item.id}`),
       })
+    })
+
+    const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (
+      input: Parameters<typeof generateTitleUnlocked>[0],
+    ) {
+      return yield* titleLocks.withLock(input.sessionID)(
+        Effect.gen(function* () {
+          // A queued retitle whose baseline changed while it waited is stale.
+          // Do not spend another provider request or append another operation to
+          // the shared deterministic title transcript.
+          const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+          if (current.title !== input.previousTitle) return undefined
+          return yield* generateTitleUnlocked(input)
+        }),
+      )
     })
 
     const auditSpadCases = Effect.fn("SessionPrompt.auditSpadCases")(function* (input: {
@@ -632,17 +958,99 @@ const layer = Layer.effect(
       // Keep the auditor economically bounded even if several heuristic lanes
       // observe the same generation. Remaining cases are still represented by
       // deterministic SPAD telemetry and can be sampled offline.
-      for (const candidate of input.cases.slice(0, 2)) {
+      for (const candidate of input.cases) {
         const rendered = SpadAuditor.renderCase({
           intentExcerpt: input.intentExcerpt,
           ...candidate.intentIndependent,
+        })
+        if (transcriptID) {
+          yield* specialAgents.publishPrompt({
+            sessionID: transcriptID,
+            agent: "spad_auditor",
+            text: rendered,
+          })
+        }
+        const auditUser = makeV1SpecialAgentAnchor({
+          sessionID: input.sessionID,
+          agent: "spad_auditor",
+          model: {
+            providerID: model.providerID,
+            modelID: model.id,
+            ...(input.variant ? { variant: input.variant } : {}),
+          },
         })
         const baseMessages: ModelMessage[] = [{ role: "user", content: rendered }]
         const startedAt = Date.now()
         const run = Effect.gen(function* () {
           let preferred: "required" | "auto" = "required"
+          type TranscriptTurn = {
+            readonly response: LLMResponse
+            readonly publisher: ReturnType<SpecialAgentSession.Interface["publisher"]>
+            readonly tokens: {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          }
+          const pendingTranscriptTurns = new Map<LLMResponse, TranscriptTurn>()
+          const settleTranscriptTurn = Effect.fn("SessionPrompt.settleSpadTranscriptTurn")(function* (
+            response: LLMResponse,
+            toolResults: ReadonlyArray<{
+              readonly id: string
+              readonly name: string
+              readonly result: ToolResultValue
+            }> = [],
+          ) {
+            if (!transcriptID) return
+            const turn = pendingTranscriptTurns.get(response)
+            if (!turn) return
+            yield* specialAgents.settleTurn({
+              sessionID: transcriptID,
+              publisher: turn.publisher,
+              response,
+              toolResults,
+              tokens: turn.tokens,
+            })
+            pendingTranscriptTurns.delete(response)
+          })
+          const rejectPendingTranscriptTurns = Effect.fn("SessionPrompt.rejectSpadTranscriptTurns")(function* (
+            reason: string,
+          ) {
+            for (const [response, turn] of pendingTranscriptTurns) {
+              yield* specialAgents.rejectTurn({
+                sessionID: transcriptID!,
+                publisher: turn.publisher,
+                response,
+                tokens: turn.tokens,
+                reason,
+              })
+              pendingTranscriptTurns.delete(response)
+            }
+          })
+          const settleAcceptedTerminal = (response: LLMResponse, call: LLMResponse["toolCalls"][number]) =>
+            settleTranscriptTurn(
+              response,
+              response.toolCalls
+                .filter((item) => item.providerExecuted !== true)
+                .map((item) => ({
+                  id: item.id,
+                  name: item.name,
+                  result:
+                    item.id === call.id && item.name === call.name
+                      ? ({
+                          type: "text" as const,
+                          value: terminalCompletionAccepted(SpadAuditor.VERDICT_TOOL),
+                        } satisfies ToolResultValue)
+                      : ({
+                          type: "error" as const,
+                          value: "SPAD auditor protocol rejected this extra tool call.",
+                        } satisfies ToolResultValue),
+                })),
+            )
           const collect = (messages: ReadonlyArray<ModelMessage>, toolChoice: "required" | "auto") =>
             Effect.gen(function* () {
+              yield* rejectPendingTranscriptTurns("SPAD auditor protocol rejected this provider turn.")
               // One publisher per physical provider request: terminal completion
               // can stop a stream early, and adaptive/repair retries are separate
               // turns that must each start and settle independently.
@@ -653,7 +1061,7 @@ const layer = Layer.effect(
               const attemptStartedAt = Date.now()
               const stream = llm.stream({
                 agent: auditAgent,
-                user: input.user,
+                user: auditUser,
                 system: [],
                 small: true,
                 tools: { [SpadAuditor.VERDICT_TOOL]: verdictTool },
@@ -664,19 +1072,16 @@ const layer = Layer.effect(
                 messages: [...messages],
                 maxOutputTokens: 256,
               })
-              const response = yield* collectUntilTerminalTool(
+              const collected = collectUntilTerminalTool(
                 publisher ? stream.pipe(Stream.tap((event) => publisher.publish(event))) : stream,
                 SpadAuditor.VERDICT_TOOL,
-              ).pipe(
-                // A failed provider turn never reaches settleTurn, so terminate
-                // the durable step here to avoid an unterminated stream.
-                Effect.tapError(() =>
-                  publisher ? publisher.failAssistant("SPAD auditor provider turn failed") : Effect.void,
-                ),
               )
+              const response = yield* (publisher
+                ? specialAgents.guardProviderTurn({ publisher, label: "SPAD auditor", effect: collected })
+                : collected)
               if (!publisher || !transcriptID) return response
               if (!response) {
-                yield* publisher.failAssistant("SPAD auditor ended without a terminal response")
+                yield* specialAgents.failTurn({ publisher, message: "SPAD auditor ended without a terminal response" })
                 return response
               }
               const reported = LLMResponse.usage(response)
@@ -689,7 +1094,7 @@ const layer = Layer.effect(
                 reasoning,
                 cache: { read: cacheRead, write: cacheWrite },
               }
-              yield* specialAgents.settleTurn({ sessionID: transcriptID, publisher, response, tokens })
+              pendingTranscriptTurns.set(response, { response, publisher, tokens })
               yield* specialAgents.recordMaintenance({
                 agent: "spad_auditor",
                 providerID: modelRef.providerID,
@@ -710,6 +1115,7 @@ const layer = Layer.effect(
               })
               return response
             })
+          return yield* Effect.gen(function* () {
           const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, SpadAuditor.Verdict, Error>({
             messages: baseMessages,
             toolName: SpadAuditor.VERDICT_TOOL,
@@ -744,7 +1150,10 @@ const layer = Layer.effect(
                   ? (failure.detail ?? `Invalid ${SpadAuditor.VERDICT_TOOL} payload`)
                   : `SPAD auditor protocol failure (${failure.reason})`,
               ),
-          })
+          }).pipe(
+            Effect.tapError(() => rejectPendingTranscriptTurns("SPAD auditor failed protocol validation.")),
+          )
+          yield* settleAcceptedTerminal(terminal.response, terminal.call)
           const disposition = SpadAuditor.disposition(terminal.artifact)
           yield* Effect.logInfo("spad.audit", {
             sessionID: input.sessionID,
@@ -759,6 +1168,11 @@ const layer = Layer.effect(
             disposition,
             latencyMs: Date.now() - startedAt,
           })
+          }).pipe(
+            Effect.ensuring(
+              rejectPendingTranscriptTurns("SPAD auditor operation ended before the provider turn was interpreted."),
+            ),
+          )
         })
         yield* withSpecialAgentTimeout(
           run,
@@ -798,12 +1212,12 @@ const layer = Layer.effect(
       history: SessionV1.WithParts[]
       providerID: ProviderV2.ID
       modelID: ModelV2.ID
+      accountID?: string
     }) {
       if (input.session.parentID) return
       if (!Session.isDefaultTitle(input.session.title)) return
 
-      const real = (m: SessionV1.WithParts) =>
-        m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
+      const real = SessionTurnProvenance.isWorkerPromptTurn
       const idx = input.history.findIndex(real)
       if (idx === -1) return
       if (input.history.filter(real).length !== 1) return
@@ -818,6 +1232,7 @@ const layer = Layer.effect(
         context,
         providerID: input.providerID,
         modelID: input.modelID,
+        accountID: input.accountID,
         previousTitle: input.session.title,
         purpose: "initial",
       })
@@ -843,9 +1258,10 @@ const layer = Layer.effect(
     }) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
 
-      const history = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-      const real = (m: SessionV1.WithParts) =>
-        m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
+      const history = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const real = SessionTurnProvenance.isWorkerPromptTurn
       const firstIdx = history.findIndex(real)
       if (firstIdx === -1) return
       const firstUser = history[firstIdx]
@@ -856,7 +1272,13 @@ const layer = Layer.effect(
       const fallbackModel = yield* provider.defaultModel().pipe(Effect.option)
       const baseModel =
         firstUser.info.model ??
-        (session.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined) ??
+        (session.model
+          ? {
+              providerID: session.model.providerID,
+              modelID: session.model.id,
+              ...(session.model.accountID ? { accountID: session.model.accountID } : {}),
+            }
+          : undefined) ??
         Option.getOrUndefined(fallbackModel)
       if (!baseModel) {
         yield* Effect.logWarning("regenerate title has no model fallback", {
@@ -887,6 +1309,7 @@ const layer = Layer.effect(
         context,
         providerID: baseModel.providerID,
         modelID: baseModel.modelID,
+        accountID: baseModel.accountID,
         model: input.model,
         previousTitle: session.title,
         prompt: input.prompt,
@@ -905,7 +1328,6 @@ const layer = Layer.effect(
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
-      const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
@@ -928,7 +1350,7 @@ const layer = Layer.effect(
         sessionID: assistantMessage.sessionID,
         type: "tool",
         callID: ulid(),
-        tool: TaskTool.id,
+        tool: SubagentDelegation.ID,
         state: {
           status: "running",
           input: {
@@ -948,7 +1370,7 @@ const layer = Layer.effect(
       }
       yield* plugin.trigger(
         "tool.execute.before",
-        { tool: TaskTool.id, sessionID, callID: part.id },
+        { tool: SubagentDelegation.ID, sessionID, callID: part.id },
         { args: taskArgs },
       )
 
@@ -963,42 +1385,41 @@ const layer = Layer.effect(
 
       let error: Error | undefined
       const taskAbort = new AbortController()
-      const result = yield* taskTool
-        .execute(taskArgs, {
-          agent: task.agent,
-          messageID: assistantMessage.id,
-          sessionID,
-          abort: taskAbort.signal,
-          callID: part.callID,
-          extra: { bypassAgentCheck: true, promptOps },
-          messages: msgs,
-          metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
-            Effect.gen(function* () {
-              part = yield* sessions.updatePart({
-                ...part,
-                type: "tool",
-                state: { ...part.state, ...val },
-              } satisfies SessionV1.ToolPart)
-            }),
-          ask: (req: any) =>
-            permission
-              .ask({
-                ...req,
-                sessionID,
-                ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
-              })
-              .pipe(Effect.orDie),
-        })
+      const result = yield* subagentDelegation
+        .execute(
+          {
+            prompt: task.prompt,
+            description: task.description,
+            subagentType: task.agent,
+            command: task.command,
+          },
+          {
+            parentAgent: task.agent,
+            assistantMessageID: assistantMessage.id,
+            parentSessionID: sessionID,
+            abort: taskAbort.signal,
+            authorizedAgentNames: new Set([task.agent]),
+            promptOps,
+            messages: msgs,
+            metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
+              Effect.gen(function* () {
+                part = yield* sessions.updatePart({
+                  ...part,
+                  type: "tool",
+                  state: { ...part.state, ...val },
+                } satisfies SessionV1.ToolPart)
+              }),
+            ask: (req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) =>
+              permission
+                .ask({
+                  ...req,
+                  sessionID,
+                  ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
+                })
+                .pipe(Effect.orDie),
+          },
+        )
         .pipe(
-          Effect.catchCause((cause) => {
-            const defect = Cause.squash(cause)
-            error = defect instanceof Error ? defect : new Error(String(defect))
-            return Effect.logError("subtask execution failed", {
-              error,
-              agent: task.agent,
-              description: task.description,
-            })
-          }),
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
               taskAbort.abort()
@@ -1019,6 +1440,15 @@ const layer = Layer.effect(
               }
             }),
           ),
+          Effect.catchCause((cause) => {
+            const defect = Cause.squash(cause)
+            error = defect instanceof Error ? defect : new Error(String(defect))
+            return Effect.logError("subtask execution failed", {
+              error,
+              agent: task.agent,
+              description: task.description,
+            })
+          }),
         )
 
       const attachments = result?.attachments?.map((attachment) => ({
@@ -1030,7 +1460,7 @@ const layer = Layer.effect(
 
       yield* plugin.trigger(
         "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+        { tool: SubagentDelegation.ID, sessionID, callID: part.id, args: taskArgs },
         result,
       )
 
@@ -1075,6 +1505,7 @@ const layer = Layer.effect(
         id: MessageID.ascending(),
         sessionID,
         role: "user",
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.TaskSummary, lastUser),
         time: { created: Date.now() },
         agent: lastUser.agent,
         model: lastUser.model,
@@ -1094,8 +1525,14 @@ const layer = Layer.effect(
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const markReady = ready ? ready.open.pipe(Effect.asVoid) : Effect.void
-          const { msg, part, cwd } = yield* Effect.gen(function* () {
+          const { msg, part, cwd, sh, invocation } = yield* Effect.gen(function* () {
             const ctx = yield* InstanceState.context
+            const cfg = yield* config.get()
+            const sh = Shell.preferred(cfg.shell)
+            // Validate/lower the transport before creating any durable shell
+            // turn. Unsupported Windows inline forms must fail without leaving
+            // a synthetic user message or a forever-"running" tool part.
+            const invocation = Shell.invocation(sh, input.command, ctx.directory)
             const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
             if (session.revert) {
               yield* revert.cleanup(session)
@@ -1114,6 +1551,7 @@ const layer = Layer.effect(
               sessionID: input.sessionID,
               time: { created: Date.now() },
               role: "user",
+              provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Shell),
               agent: input.agent,
               model: { providerID: model.providerID, modelID: model.modelID },
             }
@@ -1158,12 +1596,8 @@ const layer = Layer.effect(
               },
             }
             yield* sessions.updatePart(part)
-            return { msg, part, cwd: ctx.directory }
+            return { msg, part, cwd: ctx.directory, sh, invocation }
           }).pipe(Effect.ensuring(markReady))
-
-          const cfg = yield* config.get()
-          const sh = Shell.preferred(cfg.shell)
-          const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
 
@@ -1193,15 +1627,26 @@ const layer = Layer.effect(
 
           const exit = yield* restore(
             Effect.gen(function* () {
+              // Arbitrary shell.env plugin code runs only after the durable shell
+              // turn exists and the Runner readiness barrier has opened. That
+              // keeps cancellation from waiting behind a hung plugin. Compose,
+              // sanitize, and validate one exact environment snapshot, then spawn
+              // with extendEnv=false so the process cannot observe a later merge.
               const shellEnv = yield* plugin.trigger(
                 "shell.env",
                 { cwd, sessionID: input.sessionID, callID: part.callID },
                 { env: {} },
               )
-              const cmd = ChildProcess.make(sh, args, {
+              const childEnv = Shell.withSourceEnvironment(
+                userChildEnvironment(process.env, { ...shellEnv.env, TERM: "dumb" }),
+                invocation.sourceEnvironment,
+              )
+              Shell.validateInvocationEnvironment(sh, input.command, childEnv)
+              const cmd = ChildProcess.make(invocation.command ?? sh, invocation.args, {
                 cwd,
-                extendEnv: true,
-                env: { ...shellEnv.env, TERM: "dumb" },
+                shell: invocation.shell,
+                extendEnv: false,
+                env: childEnv,
                 stdin: "ignore",
                 forceKillAfter: "3 seconds",
               })
@@ -1237,8 +1682,9 @@ const layer = Layer.effect(
       providerID: ProviderV2.ID,
       modelID: ModelV2.ID,
       sessionID: SessionID,
+      accountID?: string,
     ) {
-      const exit = yield* provider.getModel(providerID, modelID).pipe(Effect.exit)
+      const exit = yield* provider.getModel(providerID, modelID, accountID).pipe(Effect.exit)
       if (Exit.isSuccess(exit)) return exit.value
       const err = Cause.squash(exit.cause)
       if (Provider.ModelNotFoundError.isInstance(err)) {
@@ -1264,17 +1710,24 @@ const layer = Layer.effect(
         return {
           providerID: ProviderV2.ID.make(current.model.providerID),
           modelID: ModelV2.ID.make(current.model.id),
+          ...(current.model.accountID ? { accountID: current.model.accountID } : {}),
           ...(current.model.variant && current.model.variant !== "default" ? { variant: current.model.variant } : {}),
         }
       }
       const match = yield* sessions
-        .findMessage(sessionID, (m) => m.info.role === "user" && !!m.info.model)
+        .findMessage(
+          sessionID,
+          (m) => SessionTurnProvenance.isWorkerPromptTurn(m) && m.info.role === "user" && !!m.info.model,
+        )
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      provenance: SessionV1.UserTurnProvenance,
+    ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -1286,11 +1739,15 @@ const layer = Layer.effect(
       }
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const accountID =
+        "accountID" in model && typeof model.accountID === "string"
+          ? model.accountID
+          : undefined
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
         !input.variant && ag.variant && same
           ? yield* provider
-              .getModel(model.providerID, model.modelID)
+              .getModel(model.providerID, model.modelID, accountID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
@@ -1298,6 +1755,7 @@ const layer = Layer.effect(
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
+        provenance,
         sessionID: input.sessionID,
         time: { created: Date.now() },
         tools: input.tools,
@@ -1305,6 +1763,7 @@ const layer = Layer.effect(
         model: {
           providerID: model.providerID,
           modelID: model.modelID,
+          ...(accountID ? { accountID } : {}),
           variant,
           ...(input.subProvider ? { subProvider: input.subProvider } : {}),
         },
@@ -1317,6 +1776,7 @@ const layer = Layer.effect(
         current.agent !== info.agent ||
         current.model?.providerID !== info.model.providerID ||
         current.model?.id !== info.model.modelID ||
+        current.model?.accountID !== info.model.accountID ||
         (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
       ) {
         yield* sessions.setAgentModel({
@@ -1325,6 +1785,7 @@ const layer = Layer.effect(
           model: {
             id: info.model.modelID,
             providerID: info.model.providerID,
+            ...(info.model.accountID ? { accountID: info.model.accountID } : {}),
             variant: info.model.variant ?? "default",
           },
           time: info.time.created,
@@ -1504,7 +1965,11 @@ const layer = Layer.effect(
                     text: `Called the Read tool with the following input: ${JSON.stringify(args)}`,
                   },
                 ]
-                const exit = yield* provider.getModel(info.model.providerID, info.model.modelID).pipe(
+                const exit = yield* provider.getModel(
+                  info.model.providerID,
+                  info.model.modelID,
+                  info.model.accountID,
+                ).pipe(
                   Effect.flatMap((mdl) => execRead(args, { model: mdl })),
                   Effect.exit,
                 )
@@ -1697,27 +2162,104 @@ const layer = Layer.effect(
       origin: "user" | "host",
     ) {
       const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      const rawSpecialAgent = SessionMetadataOwnership.specialAgentKind(session.metadata ?? undefined)
+      const specialAgent = rawSpecialAgent
+        ? (Option.getOrUndefined(Schema.decodeUnknownOption(SpecialAgentSession.Kind)(rawSpecialAgent)) ?? "special_agent")
+        : undefined
+      // Aggregate producer identity is an execution boundary, not turn
+      // authority. Any host-owned special-agent transcript is non-promptable by
+      // the normal worker loop regardless of whether the caller is user- or
+      // host-originated. Ordinary host-created child workers remain promptable.
+      if (specialAgent) {
+        return yield* new HostOwnedSessionError({
+          sessionID,
+          parentID: session.parentID ?? session.id,
+          kind: specialAgent,
+        })
+      }
+      // Presence of either Scheduled origin key is producer-owned fail-closed.
+      // A genuine Scheduled run root is user-drivable, but a partial/corrupt
+      // envelope must not silently downgrade into an ordinary public Session.
+      if (
+        SessionMetadataOwnership.hasScheduledTaskOrigin(session.metadata ?? undefined) &&
+        !ScheduledTaskProvenance.parseSessionMetadata(session.metadata)
+      ) {
+        return yield* new HostOwnedSessionError({
+          sessionID,
+          parentID: session.parentID ?? session.id,
+          kind: "scheduled_task",
+        })
+      }
+      // Scheduled-task run Sessions are root worker chats, not opaque child
+      // workers. Like Swarm member roots they remain directly user-drivable;
+      // producer-owned metadata constrains trusted scheduler admission below,
+      // not ordinary human interaction.
+      // OXP-delegated workers are producer-owned root Sessions. Their durable
+      // model/account/nested-delegation contract may only be driven through the
+      // trusted host delegation seam; a public user prompt must not silently
+      // convert the worker into an ordinary interactive Session.
+      if (SessionMetadataOwnership.hasWorkerDelegationOrigin(session.metadata ?? undefined) && origin === "user") {
+        return yield* new HostOwnedSessionError({
+          sessionID,
+          parentID: session.parentID ?? session.id,
+          kind: "delegated_worker",
+        })
+      }
       if (!session.parentID) return session
-      const goalAuditor = session.metadata?.specialAgent === "goal_auditor"
-      if (origin === "host" && !goalAuditor) return session
+      if (origin === "host") return session
       return yield* new HostOwnedSessionError({
         sessionID,
         parentID: session.parentID,
-        kind: goalAuditor ? "goal_auditor" : "child",
+        kind: "child",
       })
     })
+
+    const assertUserPromptable = Effect.fn("SessionPrompt.assertUserPromptable")((sessionID: SessionID) =>
+      requirePromptable(sessionID, "user"),
+    )
 
     const promptInternal = Effect.fn("SessionPrompt.promptInternal")(function* (
       input: PromptInput,
       origin: "user" | "host",
+      provenance: SessionV1.UserTurnProvenance,
     ) {
       const session = yield* requirePromptable(input.sessionID, origin)
+      if (origin === "host" && SessionMetadataOwnership.hasScheduledTaskOrigin(session.metadata ?? undefined)) {
+        const scheduled = ScheduledTaskProvenance.parseSessionMetadata(session.metadata)
+        if (
+          !scheduled ||
+          provenance.owner !== "host" ||
+          provenance.source !== SessionTurnProvenance.Source.ScheduledTaskRun ||
+          provenance.ref !== scheduled.scheduledTaskRunID
+        ) {
+          return yield* new HostOwnedSessionError({
+            sessionID: input.sessionID,
+            parentID: input.sessionID,
+            kind: "scheduled_task",
+          })
+        }
+      }
+      if (origin === "host" && SessionMetadataOwnership.hasWorkerDelegationOrigin(session.metadata ?? undefined)) {
+        const delegation = SessionMetadataOwnership.workerDelegation(session.metadata ?? undefined)
+        if (
+          !delegation ||
+          provenance.owner !== "host" ||
+          provenance.source !== SessionTurnProvenance.Source.OxpDelegation ||
+          provenance.ref !== delegation.principalRef
+        ) {
+          return yield* new HostOwnedSessionError({
+            sessionID: input.sessionID,
+            parentID: session.parentID ?? session.id,
+            kind: "delegated_worker",
+          })
+        }
+      }
       // A genuine user prompt always supersedes a reserved autonomous cycle.
       // If an automatic provider request is already in flight, its eventual
       // settlement observes the missing reservation and cannot resurrect it.
       if (origin === "user") yield* goalAutomation.cancel(input.sessionID)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      const message = yield* createUserMessage(input, provenance)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1736,8 +2278,84 @@ const layer = Layer.effect(
       return yield* loop({ sessionID: input.sessionID })
     })
 
-    const prompt = Effect.fn("SessionPrompt.prompt")((input: PromptInput) => promptInternal(input, "user"))
-    const hostPrompt = Effect.fn("SessionPrompt.hostPrompt")((input: PromptInput) => promptInternal(input, "host"))
+    const prompt = Effect.fn("SessionPrompt.prompt")((input: PromptInput) =>
+      promptInternal(input, "user", SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)),
+    )
+    const userActionPrompt = Effect.fn("SessionPrompt.userActionPrompt")(function* (
+      input: PromptInput,
+      provenance: UserActionPromptProvenance,
+    ) {
+      yield* requirePromptable(input.sessionID, "user")
+      if (input.messageID) {
+        const existing = yield* MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.option,
+        )
+        if (Option.isSome(existing)) {
+          const message = existing.value
+          if (
+            message.info.role !== "user" ||
+            message.info.provenance?.owner !== "user" ||
+            message.info.provenance.source !== provenance.source
+          ) {
+            return yield* Effect.die(
+              new Error(`Trusted user action id ${input.messageID} already exists with incompatible provenance`),
+            )
+          }
+          const requestedText =
+            input.parts.length === 1 && input.parts[0]?.type === "text" ? input.parts[0].text.trim() : undefined
+          if (requestedText !== undefined && visiblePromptText(message).trim() !== requestedText) {
+            return yield* Effect.die(
+              new Error(`Trusted user action id ${input.messageID} already exists with incompatible content`),
+            )
+          }
+          if (input.noReply === true) return message
+          const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+          if (session.pausedAt !== undefined) return message
+          // Do not cancel Goal automation again on an idempotent retry. The
+          // first durable admission already represented the user intervention;
+          // retry only repairs the execution wakeup if the process died after it.
+          return yield* loop({ sessionID: input.sessionID })
+        }
+      }
+      return yield* promptInternal(input, "user", SessionTurnProvenance.user(provenance.source))
+    })
+    const hostPrompt = Effect.fn("SessionPrompt.hostPrompt")(function* (
+      input: PromptInput,
+      provenance?: HostPromptProvenance,
+    ) {
+      const source = provenance?.source ?? SessionTurnProvenance.Source.HostPrompt
+      const derived = SessionTurnProvenance.requiresCausalRoot(source)
+      if (derived) {
+        const rootID = provenance?.sourceMessageID
+        if (!rootID) return yield* Effect.die(new Error(`Host source ${source} requires a causal worker root`))
+        const root = yield* MessageV2.get({ sessionID: input.sessionID, messageID: rootID }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        )
+        if (!root || !SessionTurnProvenance.isWorkerPromptTurn(root)) {
+          return yield* Effect.die(
+            new Error(`Host source ${source} references an unavailable or invalid worker root ${rootID}`),
+          )
+        }
+        const current = yield* sessions
+          .findMessage(input.sessionID, SessionTurnProvenance.isWorkerPromptTurn)
+          .pipe(Effect.orDie)
+        if (Option.isNone(current) || current.value.info.id !== rootID) {
+          return yield* Effect.die(new Error(`Host source ${source} references stale worker root ${rootID}`))
+        }
+      } else if (provenance?.sourceMessageID) {
+        return yield* Effect.die(new Error(`Root host source ${source} cannot carry sourceMessageID`))
+      }
+      return yield* promptInternal(
+        input,
+        "host",
+        SessionTurnProvenance.host(source, {
+          ...(provenance?.sourceMessageID ? { sourceMessageID: provenance.sourceMessageID } : {}),
+          ...(provenance?.ref ? { ref: provenance.ref } : {}),
+        }),
+      )
+    })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1745,6 +2363,280 @@ const layer = Layer.effect(
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
       throw new Error("Impossible")
+    })
+
+    const executeGoalAudit = Effect.fn("SessionPrompt.executeGoalAudit")(function* (input: {
+      sessionID: SessionID
+      origin: "user" | "automatic"
+      reservationID?: string
+      sourceMessageID: MessageID
+      tokens?: number
+      workerModel: ModelV2.Ref
+      latestWork: string
+    }) {
+      const ctx = yield* InstanceState.context
+      const audit = yield* Effect.gen(function* () {
+        const goalAuditor = yield* GoalAuditor.Service
+        return yield* goalAuditor.evaluateWithRuntime(
+          {
+            sessionID: input.sessionID,
+            workerModel: input.workerModel,
+            latestWork: input.latestWork,
+            ...(input.reservationID ? { reservationID: input.reservationID } : {}),
+          },
+          goalAuditorRuntime,
+        )
+      }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+
+      return yield* goalAutomation.afterTurn({
+        sessionID: input.sessionID,
+        origin: input.origin,
+        ...(input.reservationID ? { reservationID: input.reservationID } : {}),
+        sourceMessageID: input.sourceMessageID,
+        tokens: input.tokens,
+        audit,
+      })
+    })
+
+    const isAfterV1 = (left: SessionV1.Info, right: SessionV1.Info) =>
+      left.time.created !== right.time.created ? left.time.created > right.time.created : left.id > right.id
+
+    const reconcileGoalState = Effect.fn("SessionPrompt.reconcileGoalState")(function* (
+      sessionID: SessionID,
+      messages: SessionV1.WithParts[],
+    ) {
+      // V1 already hydrates the effective transcript once per runner iteration.
+      // Derive projection/reset state from those loaded rows; do not add another
+      // history query or a projection ownership table merely for Goal state.
+      const compaction = MessageV2.latestCompletedCompaction(messages)
+      const current = new Map<string, SessionV1.WithParts>()
+      for (const message of messages) {
+        if (!SessionTurnProvenance.isStateProjectionTurn(message)) continue
+        if (compaction && !isAfterV1(message.info, compaction.info)) continue
+        if (message.info.role !== "user" || message.info.provenance?.owner !== "host") continue
+        const source = message.info.provenance.source
+        const previous = current.get(source)
+        if (!previous || isAfterV1(message.info, previous.info)) current.set(source, message)
+      }
+
+      const focused = yield* goals.focused(sessionID)
+      const desired = focused
+        ? GoalProjection.sections(focused.detail)
+        : (["spec", "progress"] as const).flatMap((kind) => {
+            const source =
+              kind === "spec"
+                ? SessionTurnProvenance.Source.GoalSpecification
+                : SessionTurnProvenance.Source.GoalProgress
+            const existing = current.get(source)
+            if (!existing || existing.info.role !== "user" || existing.info.provenance?.owner !== "host") return []
+            const parsed = GoalProjection.parseRef(source, existing.info.provenance.ref)
+            if (!parsed) throw new Error(`Malformed ${source} projection provenance: ${existing.info.id}`)
+            return [GoalProjection.section(kind, parsed.goalID, GoalProjection.renderAbsent(kind, parsed.goalID))]
+          })
+      if (desired.length === 0) return 0
+
+      // STATE is provider-user context but not a turn boundary. MessageV2.latest
+      // deliberately skips state projections, so this anchor remains the actual
+      // human/host/continuation/compaction turn whose model/agent contract V1
+      // needs for provider lowering.
+      const anchor = MessageV2.latest(messages).user
+      if (!anchor) return yield* Effect.die("Goal state projection requires an active V1 user-role turn")
+
+      let published = 0
+      for (const value of desired) {
+        const previous = current.get(value.source)
+        const previousProvenance =
+          previous?.info.role === "user" && previous.info.provenance?.owner === "host"
+            ? previous.info.provenance
+            : undefined
+        if (previous) {
+          if (!previousProvenance) return yield* Effect.die(`Malformed ${value.source} projection: ${previous.info.id}`)
+          if (previousProvenance.ref === value.ref) {
+            const exact =
+              previous.parts.length === 1 &&
+              previous.parts[0]?.type === "text" &&
+              previous.parts[0].synthetic === true &&
+              previous.parts[0].text === value.text
+            if (exact) continue
+            if (previous.parts.length === 0) {
+              // V1 publication is a two-event commit. A host-owned same-digest
+              // message with no parts is the precise crash boundary after
+              // MessageUpdated and before PartUpdated; repair that row in place
+              // rather than creating a successor state transition.
+              yield* sessions.updatePart({
+                id: PartID.make(`prt_goal_projection_${previous.info.id.slice("msg_goal_projection_".length)}`),
+                messageID: previous.info.id,
+                sessionID,
+                type: "text",
+                text: value.text,
+                synthetic: true,
+              } satisfies SessionV1.TextPart)
+              published++
+              continue
+            }
+            if (!exact)
+              return yield* Effect.die(
+                `Goal projection ${previous.info.id} claims the current semantic digest with different bytes`,
+              )
+          }
+        }
+
+        const messageID = MessageID.make(
+          GoalProjection.publicationMessageID({
+            sessionID: sessionID as never,
+            section: value,
+            ...(compaction ? { resetBoundary: compaction.info.id as never } : {}),
+            ...(previous ? { predecessor: previous.info.id as never } : {}),
+          }),
+        )
+        const partID = PartID.make(`prt_goal_projection_${messageID.slice("msg_goal_projection_".length)}`)
+        const provenance = SessionTurnProvenance.host(value.source, { ref: value.ref })
+        const existing = yield* MessageV2.get({ sessionID, messageID }).pipe(Effect.option)
+        if (Option.isSome(existing)) {
+          const stored = existing.value
+          if (
+            stored.info.role !== "user" ||
+            !SessionTurnProvenance.hasHostCorrelation(stored, value.source, value.ref)
+          )
+            return yield* Effect.die(`Goal projection message ${messageID} conflicts with its deterministic identity`)
+          const exact =
+            stored.parts.length === 1 &&
+            stored.parts[0]?.type === "text" &&
+            stored.parts[0].synthetic === true &&
+            stored.parts[0].text === value.text
+          if (exact) continue
+          if (stored.parts.length > 0)
+            return yield* Effect.die(`Goal projection message ${messageID} has conflicting durable parts`)
+          // Crash repair: message publication committed but its sole text part
+          // did not. Stable message/part ids make the second half idempotent.
+          yield* sessions.updatePart({
+            id: partID,
+            messageID,
+            sessionID,
+            type: "text",
+            text: value.text,
+            synthetic: true,
+          } satisfies SessionV1.TextPart)
+          published++
+          continue
+        }
+
+        yield* sessions.updateMessage({
+          id: messageID,
+          role: "user",
+          provenance,
+          sessionID,
+          time: { created: Date.now() },
+          agent: anchor.agent,
+          model: anchor.model,
+        } satisfies SessionV1.User)
+        yield* sessions.updatePart({
+          id: partID,
+          messageID,
+          sessionID,
+          type: "text",
+          text: value.text,
+          synthetic: true,
+        } satisfies SessionV1.TextPart)
+        published++
+      }
+      return published
+    })
+
+    const materializeGoalContinuation = Effect.fn("SessionPrompt.materializeGoalContinuation")(function* (
+      reservation: GoalAutomation.Reservation,
+    ) {
+      const sessionID = SessionID.make(reservation.sessionID)
+      const stableMessageID = goalContinuationMessageID(reservation.id)
+      const stablePartID = goalContinuationPartID(reservation.id)
+      let sourceMessageID = reservation.sourceMessageID ? MessageID.make(reservation.sourceMessageID) : undefined
+
+      // Modern reservations always have a causal source and therefore take only
+      // direct indexed lookups. The transcript scan below is deliberately
+      // quarantined to pre-migration reservations that could not persist it.
+      let existing = yield* MessageV2.get({ sessionID, messageID: stableMessageID }).pipe(Effect.option)
+      if (Option.isNone(existing) && !sourceMessageID) {
+        existing = yield* sessions
+          .findMessage(sessionID, (message) =>
+            SessionTurnProvenance.hasGoalContinuationReservation(message, reservation.id),
+          )
+          .pipe(Effect.orDie)
+      }
+
+      if (Option.isSome(existing)) {
+        const turn = existing.value
+        if (
+          turn.info.role !== "user" ||
+          !SessionTurnProvenance.hasGoalContinuationReservation(turn, reservation.id)
+        ) {
+          throw new Error(`Goal continuation identity collision for reservation ${reservation.id}`)
+        }
+        const persistedSource = SessionTurnProvenance.goalContinuationSourceMessageID(turn)
+        if (sourceMessageID && persistedSource !== sourceMessageID) {
+          throw new Error(`Goal continuation causal source mismatch for reservation ${reservation.id}`)
+        }
+        sourceMessageID ??= persistedSource
+        const complete = turn.parts.some(
+          (part) => part.type === "text" && part.synthetic === true && part.text === reservation.prompt,
+        )
+        if (complete) return false
+        if (turn.parts.length > 0) {
+          throw new Error(`Goal continuation content conflict for reservation ${reservation.id}`)
+        }
+        yield* sessions.updatePart({
+          id: stablePartID,
+          messageID: turn.info.id,
+          sessionID,
+          type: "text",
+          text: reservation.prompt,
+          synthetic: true,
+        } satisfies SessionV1.TextPart)
+        return true
+      }
+
+      let source: SessionV1.WithParts | undefined
+      if (sourceMessageID) {
+        source = Option.getOrUndefined(
+          yield* MessageV2.get({ sessionID, messageID: sourceMessageID }).pipe(Effect.option),
+        )
+        if (!source) {
+          throw new Error(
+            `Goal continuation cannot start because causal worker turn ${sourceMessageID} is missing`,
+          )
+        }
+      } else {
+        // Compatibility only: old reservation rows predate durable causal
+        // lineage. New reservations never reach this history-hydrating path.
+        source = Option.getOrUndefined(
+          yield* sessions.findMessage(sessionID, SessionTurnProvenance.isWorkerPromptTurn).pipe(Effect.orDie),
+        )
+        sourceMessageID = source?.info.id
+      }
+      if (!source || source.info.role !== "user" || !SessionTurnProvenance.isWorkerPromptTurn(source)) {
+        throw new Error("Goal continuation cannot start because the Session has no worker prompt")
+      }
+
+      const continuationUser: SessionV1.User = {
+        ...source.info,
+        id: stableMessageID,
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.GoalContinuation, source.info, {
+          ref: reservation.id,
+        }),
+        time: { created: reservation.createdAt },
+      }
+      // These are intentionally two durable events. Stable ids make the pair
+      // convergent: if the process dies after MessageUpdated, restart observes
+      // that exact row and publishes only the missing PartUpdated.
+      yield* sessions.updateMessage(continuationUser)
+      yield* sessions.updatePart({
+        id: stablePartID,
+        messageID: continuationUser.id,
+        sessionID,
+        type: "text",
+        text: reservation.prompt,
+        synthetic: true,
+      } satisfies SessionV1.TextPart)
+      return true
     })
 
     const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
@@ -1756,21 +2648,80 @@ const layer = Layer.effect(
       let spadAuditRemaining = 4
       let turn: TurnCheckpoint.Turn | undefined
       let titleStarted = false
-      let goalReservation = yield* goalAutomation.claim(sessionID)
+      let goalReservation: GoalAutomation.Reservation | undefined
+      let materializedGoalReservationID: string | undefined
       let goalCycleTokens = 0
       const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
       // Hard pause gate (V1): a paused session must not start any provider
       // work. Prompt admission already gates, but direct loop callers (resume,
       // summarize, command) and in-flight wake races need the same check.
-      if (session.pausedAt !== undefined) return yield* lastAssistant(sessionID)
+      if (session.pausedAt !== undefined) {
+        yield* state.deferPending(sessionID)
+        return yield* lastAssistant(sessionID)
+      }
 
       while (true) {
         yield* status.set(sessionID, { type: "busy" })
         yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
+        // Admission and execution are separate decisions. At each provider-cycle
+        // boundary choose exactly one canonical SessionInput lane and snapshot
+        // the aggregate sequence before promotion. The lane is homogeneous by
+        // admission class; arrivals after the cutoff belong to the next cycle.
+        //
+        // Do this BEFORE Goal reservation claiming or history loading so a
+        // genuine User/host arrival cannot be overtaken by autonomous work.
+        let promotedClass: SessionInput.AdmissionClass | undefined
+        while (true) {
+          const lane = yield* SessionInput.nextPendingLane(db, sessionID)
+          if (!lane) break
+          const cutoff = yield* EventV2.latestSequence(db, sessionID)
+          const result = yield* SessionInput.promoteLane(db, events, sessionID, lane, cutoff)
+          if (result.promoted > 0) {
+            promotedClass = lane.admissionClass
+            break
+          }
+          // A selected row may lose the promote-vs-revoke CAS. Re-evaluate the
+          // fixed priority lanes rather than manufacturing an empty provider
+          // cycle or falling through to autonomous Goal work.
+        }
+
+        if (promotedClass === "user") {
+          // Human input supersedes autonomous Goal continuation authority.
+          yield* goalAutomation.cancel(sessionID)
+          goalReservation = undefined
+          materializedGoalReservationID = undefined
+        } else if (promotedClass !== undefined && goalReservation) {
+          // Host/automatic inbox work wins this cycle, but unlike genuine User
+          // input it does not cancel the Goal. Release the claimed reservation so
+          // it can be reclaimed after the higher-priority cycle settles.
+          yield* goalAutomation.release({ sessionID, reservationID: goalReservation.id })
+          goalReservation = undefined
+          materializedGoalReservationID = undefined
+        }
+        if (promotedClass === undefined && !goalReservation) {
+          goalReservation = yield* goalAutomation.claim(sessionID)
+        }
+
         let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
           Effect.provideService(Database.Service, database),
         )
+        if ((yield* reconcileGoalState(sessionID, msgs)) > 0) {
+          msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+        }
+        if (goalReservation && materializedGoalReservationID !== goalReservation.id) {
+          const changed = yield* materializeGoalContinuation(goalReservation).pipe(
+            Effect.onError(() => goalAutomation.release({ sessionID, reservationID: goalReservation!.id })),
+          )
+          if (changed) {
+            msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+          }
+          materializedGoalReservationID = goalReservation.id
+        }
         // ── Conversation Control: Effective Context Compiler ─────
         // Fork-owned seam (see FORK.md). Filters excluded/pinned/edits before
         // provider lowering. Best-effort — falls back to canonical on error.
@@ -1817,21 +2768,50 @@ const layer = Layer.effect(
 
         if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
-        // Per-turn checkpoint: capture a pre-turn tree and insert a `capturing`
-        // row on the first step of this runLoop invocation (one logical turn).
-        // On resume of an interrupted turn, begin() reconciles the existing row.
-        if (step === 0 && turn === undefined) {
-          turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: lastUser.id }).pipe(
-            Effect.catch((err) =>
-              Effect.logWarning("turn checkpoint begin failed", {
-                "session.id": sessionID,
-                error: String(err),
-              }).pipe(Effect.as(undefined)),
-            ),
+        const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
+        const causalRootID = SessionTurnProvenance.causalRootMessageID(lastUserMsg)
+        let causalRootMsg =
+          causalRootID === undefined ? undefined : msgs.findLast((message) => message.info.id === causalRootID)
+        if (!causalRootMsg && causalRootID) {
+          // Compaction may legitimately remove the original worker turn from the
+          // provider history. Provenance still names it exactly, so recover that
+          // one row by primary key instead of scanning/hydrating transcript pages.
+          causalRootMsg = Option.getOrUndefined(
+            yield* MessageV2.get({ sessionID, messageID: causalRootID }).pipe(Effect.option),
           )
         }
+        const workerRootMsg =
+          causalRootMsg && SessionTurnProvenance.isWorkerPromptTurn(causalRootMsg) ? causalRootMsg : undefined
 
-        const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
+        // A provider stream that ended without a terminal finish reason needs a
+        // real host-owned turn boundary before another assistant generation.
+        // Persist this as a V1 compatibility Synthetic turn instead of adding a
+        // request-only provider message. The next loop iteration will parent the
+        // assistant to this turn while inherited worker capabilities come from
+        // the explicit causal root above.
+        if (lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id) {
+          const continuation: SessionV1.User = {
+            ...lastUser,
+            id: MessageID.ascending(),
+            provenance: SessionTurnProvenance.hostDerived(
+              SessionTurnProvenance.Source.UnknownFinishContinuation,
+              lastUser,
+              { ref: lastAssistant.id },
+            ),
+            time: { created: Date.now() },
+          }
+          yield* sessions.updateMessage(continuation)
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: continuation.id,
+            sessionID,
+            type: "text",
+            text: UNKNOWN_FINISH_CONTINUATION_PROMPT,
+            synthetic: true,
+          } satisfies SessionV1.TextPart)
+          continue
+        }
+
         // Destructive SPAD-R recovery remains explicitly opt-in. The bounded
         // veto-only auditor is enabled by default, so an ordinary turn still
         // runs SPAD in observe-only mode to collect ambiguous evidence without
@@ -1841,7 +2821,7 @@ const layer = Layer.effect(
           const recoveryEnabled = experimental?.spad_recovery === true
           const auditorEnabled = SpadAuditor.enabled(experimental?.spad_auditor)
           if (recoveryEnabled || auditorEnabled) {
-            const userText = visibleUserText(lastUserMsg)
+            const userText = visibleWorkerPromptText(workerRootMsg)
             spad = new SpadSupervisor()
             const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
             spad.beginTurn(
@@ -1872,12 +2852,13 @@ const layer = Layer.effect(
           const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
           let gated = false
           if (hasPendingIngress) {
-            const pendingQs2 = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-            gated =
-              pendingQs2.some((q: any) => q.sessionID === sessionID) ||
-              (yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))).some(
-                (p: any) => p.sessionID === sessionID,
-              )
+            gated = (
+              yield* interactionGate({
+                sessionID,
+                questions: () => question.list(),
+                permissions: () => permission.list(),
+              })
+            ).blocked
             if (!gated) {
               yield* Effect.logInfo("loop continuing for pending monitor ingress", { sessionID })
               // don't break — next iteration will drain ingress as system context
@@ -1903,6 +2884,23 @@ const layer = Layer.effect(
           // else: pending ingress present, not gated → continue loop to process event
         }
 
+        // Allocate a checkpoint only after proving this iteration will actually
+        // execute work. A quiescent wake may exist solely to reconcile durable
+        // state (for example after compaction or a terminal manual Goal audit);
+        // allocating before the terminal-assistant gate creates a duplicate
+        // checkpoint for the same canonical worker root.
+        if (step === 0 && turn === undefined) {
+          const checkpointUserMessageID = SessionTurnProvenance.checkpointRootMessageID(lastUserMsg) ?? lastUser.id
+          turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: checkpointUserMessageID }).pipe(
+            Effect.catch((err) =>
+              Effect.logWarning("turn checkpoint begin failed", {
+                "session.id": sessionID,
+                error: String(err),
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+        }
+
         step++
         if (step === 1 && !titleStarted) {
           titleStarted = true
@@ -1910,11 +2908,17 @@ const layer = Layer.effect(
             session,
             modelID: lastUser.model.modelID,
             providerID: lastUser.model.providerID,
+            accountID: lastUser.model.accountID,
             history: msgs,
           }).pipe(Effect.ignore, Effect.forkIn(scope))
         }
 
-        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+        const model = yield* getModel(
+          lastUser.model.providerID,
+          lastUser.model.modelID,
+          sessionID,
+          lastUser.model.accountID,
+        )
         const task = tasks.pop()
 
         if (task?.type === "subtask") {
@@ -1938,6 +2942,11 @@ const layer = Layer.effect(
           const afterCompaction = yield* MessageV2.stream(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          // Compaction is the state reset boundary. Reconcile from the history
+          // this branch already re-read for concurrent-user detection, avoiding
+          // another full transcript query while ensuring current Goal state is
+          // durable even when compaction stops rather than auto-continues.
+          yield* reconcileGoalState(sessionID, MessageV2.filterCompacted(afterCompaction))
           const newestUser = MessageV2.latest(afterCompaction).user
           const hasConcurrentUser =
             newestUser !== undefined &&
@@ -1954,7 +2963,14 @@ const layer = Layer.effect(
           lastFinished.summary !== true &&
           (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
         ) {
-          yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+          if (!workerRootMsg) throw new Error("Compaction cannot preserve causal provenance without a worker prompt root")
+          yield* compaction.create({
+            sessionID,
+            agent: lastUser.agent,
+            model: lastUser.model,
+            sourceMessageID: workerRootMsg.info.id,
+            auto: true,
+          })
           continue
         }
 
@@ -2018,13 +3034,13 @@ const layer = Layer.effect(
           })
           .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
-        // True when THIS generation is an automatic continuation of a
-        // previous one that ended with finish "unknown" ΓÇö the #43892 case.
-        const continuingAfterUnknown = lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
-
-        const outcome: "break" | "continue" | "goal-stop" = yield* Effect.gen(function* () {
-          const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-          const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+        const outcome: "break" | "continue" | "goal-audit" = yield* Effect.gen(function* () {
+          const canonicalWorkerInput = workerRootMsg
+            ? yield* SessionInput.findEntry(db, CurrentSessionMessage.ID.make(workerRootMsg.info.id))
+            : undefined
+          const authorizedAgentNames = canonicalWorkerInput
+            ? SessionInput.authorizedAgentNames(canonicalWorkerInput.item)
+            : new Set((workerRootMsg?.parts ?? []).flatMap((part) => (part.type === "agent" ? [part.name] : [])))
           const promptOps = yield* ops()
 
           const tools = yield* SessionTools.resolve({
@@ -2032,7 +3048,8 @@ const layer = Layer.effect(
             session,
             model,
             processor: handle,
-            bypassAgentCheck,
+            authorizedAgentNames,
+            workerRootMessageID: workerRootMsg?.info.id,
             messages: msgs,
             promptOps,
           }).pipe(
@@ -2056,24 +3073,29 @@ const layer = Layer.effect(
           if (step === 1)
             yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+          // Plugin message transforms are provider-context extensions only.
+          // Isolate them from authoritative history because later logic in this
+          // same turn still consumes `msgs` for Goal reconciliation and
+          // provenance-sensitive continuation decisions.
+          const providerHistory = yield* plugin.transformChatMessages(msgs)
 
           // Drain monitor ingress at safe boundary — respecting Question/Permission gates (§48-49)
           let monitorContext: string | undefined
           {
-            const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-            const hasQuestion = pendingQs.some((q: any) => q.sessionID === sessionID)
-            const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-            const hasPermission = pendingPs.some((p: any) => p.sessionID === sessionID)
-            if (!hasQuestion && !hasPermission) {
+            const gate = yield* interactionGate({
+              sessionID,
+              questions: () => question.list(),
+              permissions: () => permission.list(),
+            })
+            if (!gate.blocked) {
               const evs = yield* ingress.drain(sessionID).pipe(Effect.catch(() => Effect.succeed([] as any[])))
               if (evs.length > 0) monitorContext = formatMonitorEvents(evs as any)
-            } else if (hasQuestion || hasPermission) {
+            } else {
               // keep queued — do not drain when gate active
               yield* Effect.logInfo("monitor ingress gated — retaining events", {
                 sessionID,
-                hasQuestion,
-                hasPermission,
+                hasQuestion: gate.hasQuestion,
+                hasPermission: gate.hasPermission,
               })
             }
           }
@@ -2084,11 +3106,11 @@ const layer = Layer.effect(
             instruction.system().pipe(Effect.orDie),
             sys.mcp(agent, session.permission),
             goalContext.render(sessionID),
-            MessageV2.toModelMessagesEffect(msgs, model),
+            MessageV2.toModelMessagesEffect(providerHistory, model),
           ])
           const explicitToolContext = yield* SessionTools.explicitLazyToolContext({
             agent,
-            text: visibleUserText(lastUserMsg),
+            text: visibleWorkerPromptText(workerRootMsg),
             permission: session.permission,
           }).pipe(
             Effect.provideService(ToolRegistry.Service, registry),
@@ -2105,7 +3127,6 @@ const layer = Layer.effect(
             ...(mcpInstructions ? [mcpInstructions] : []),
             ...(skills ? [skills] : []),
             ...(goalSystem ? [goalSystem] : []),
-            ...(goalReservation ? [goalReservation.prompt] : []),
             ...(monitorContext ? [monitorContext] : []),
           ]
           const format = lastUser.format ?? { type: "text" as const }
@@ -2121,16 +3142,6 @@ const layer = Layer.effect(
               messages: [
                 ...modelMsgs,
                 ...(explicitToolContext ? [{ role: "user" as const, content: explicitToolContext }] : []),
-                // #43892 continuation context: when the previous generation
-                // ended with finish "unknown" (provider stream dropped before
-                // a stop reason), the loop starts ANOTHER generation with no
-                // new user input. Left unexplained, models experience this as
-                // a blank prompt / phantom user turn and may restart, ask the
-                // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
-                // never persisted into the session.
-                ...(continuingAfterUnknown
-                  ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
-                  : []),
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
               tools,
@@ -2147,14 +3158,13 @@ const layer = Layer.effect(
           goalCycleTokens += goalTokenCount(handle.message.tokens)
 
           if (spad) {
-            const auditCases = spad.takeAuditCases()
-            const selected = auditCases.slice(0, Math.max(0, spadAuditRemaining))
+            const selected = spad.takeAuditCases(Math.max(0, spadAuditRemaining))
             spadAuditRemaining -= selected.length
             if (selected.length > 0) {
               yield* auditSpadCases({
                 sessionID,
                 user: lastUser,
-                intentExcerpt: visibleUserText(lastUserMsg),
+                intentExcerpt: visibleWorkerPromptText(workerRootMsg),
                 activeModel: model,
                 variant: lastUser.model.variant,
                 cases: selected,
@@ -2173,6 +3183,10 @@ const layer = Layer.effect(
             const recoveryUser: SessionV1.User = {
               ...lastUser,
               id: MessageID.ascending(),
+              provenance: SessionTurnProvenance.hostDerived(
+                SessionTurnProvenance.Source.RecoveryContinuation,
+                lastUser,
+              ),
               time: { created: Date.now() },
             }
             yield* sessions.updateMessage(recoveryUser)
@@ -2211,49 +3225,75 @@ const layer = Layer.effect(
             }
           }
 
-          if (result === "stop") return "goal-stop" as const
           if (result === "compact") {
+            if (!workerRootMsg) throw new Error("Compaction cannot preserve causal provenance without a worker prompt root")
             yield* compaction.create({
               sessionID,
               agent: lastUser.agent,
               model: lastUser.model,
+              sourceMessageID: workerRootMsg.info.id,
               auto: true,
               overflow: !handle.message.finish,
             })
           }
+          if (result === "stop") return "break" as const
+          // SessionProcessor returns "continue" after an ordinary successful
+          // model completion; "stop" is reserved for blocked/error/SPAD-abort
+          // paths. Goal verification must therefore key off the authoritative
+          // assistant terminal state, not the processor control-flow result.
+          // Some providers also report `stop` while emitting host-executed tool
+          // calls, so defer verification until those results have gone back
+          // through the worker loop.
+          if (
+            result === "continue" &&
+            goalSystem &&
+            finished &&
+            !handle.message.error &&
+            !handle.hasNonProviderToolCalls &&
+            (yield* goalAutomation.shouldAudit(sessionID))
+          )
+            return "goal-audit" as const
           return "continue" as const
         }).pipe(
           Effect.ensuring(instruction.clear(handle.message.id)),
           Effect.onInterrupt(() => finalizeInterruptedAssistant),
         )
-        if (outcome === "goal-stop") {
+        if (outcome === "goal-audit") {
           const completedReservation = goalReservation
-          const auditHistory = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
-          const audit = yield* Effect.gen(function* () {
-            const goalAuditor = yield* GoalAuditor.Service
-            return yield* goalAuditor.evaluate({
+          if (!workerRootMsg || workerRootMsg.info.role !== "user") {
+            yield* goalAutomation.failAudit({
               sessionID,
-              workerModel: {
-                providerID: ProviderV2.ID.make(model.providerID),
-                id: ModelV2.ID.make(model.id),
-              },
-              latestWork: goalAuditLatestWork(auditHistory),
+              error: "Goal auditor cannot reserve a continuation because the causal worker prompt is unavailable.",
             })
-          }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
-          const decision = yield* goalAutomation.afterTurn({
+            break
+          }
+          const auditHistory = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
+          const decision = yield* executeGoalAudit({
             sessionID,
             origin: completedReservation ? "automatic" : "user",
             ...(completedReservation ? { reservationID: completedReservation.id } : {}),
+            sourceMessageID: workerRootMsg.info.id,
             tokens: goalCycleTokens,
-            audit,
+            workerModel: {
+              providerID: ProviderV2.ID.make(model.providerID),
+              id: ModelV2.ID.make(model.id),
+              ...(lastUser.model.variant ? { variant: ModelV2.VariantID.make(lastUser.model.variant) } : {}),
+            },
+            latestWork: goalAuditLatestWork(auditHistory),
           })
+          // Auditor reconciliation mutates authoritative lifecycle/progress
+          // state. Publish that complete state only after the worker/auditor
+          // cycle has settled and before any new automatic continuation.
+          yield* reconcileGoalState(sessionID, msgs)
           goalReservation = undefined
           if (decision.reservation) {
             goalReservation = yield* goalAutomation.claim(sessionID)
             if (goalReservation) {
-              // A Goal continuation is a fresh bounded logical cycle. Reset
-              // the agent step budget, but retain the same user-turn
-              // checkpoint and transcript because no fake user message exists.
+              // A Goal continuation is a fresh bounded logical cycle. The
+              // claimed reservation is materialized as a durable synthetic user
+              // turn at the top of the next iteration; it never enters the
+              // worker's system channel. Keep the existing TurnCheckpoint open
+              // so one user-owned Goal run remains one rollback boundary.
               step = 0
               goalCycleTokens = 0
               continue
@@ -2281,8 +3321,25 @@ const layer = Layer.effect(
       return yield* lastAssistant(sessionID)
     })
 
+    // SessionRunState owns process-local activation; SessionInput owns durable
+    // work. Register the raw drain (not `loop`, which would reacquire ownership)
+    // so releaseIfDrained can continue newly committed work under the SAME
+    // generation and close the cross-process admission-vs-release race.
+    yield* state.registerDrain(
+      (sessionID) =>
+        requirePromptable(sessionID, "host").pipe(
+          Effect.catch(Effect.die),
+          Effect.andThen(runLoop(sessionID)),
+        ) as unknown as Effect.Effect<SessionV1.WithParts>,
+    )
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.loop")(
       function* (input: LoopInput) {
+        // Defense in depth: host-owned Goal Auditor children are never worker
+        // Sessions. Public prompt entry points already reject them, but direct
+        // internal loop callers must not be able to bypass that ownership
+        // boundary and accidentally run coding/tool orchestration as the auditor.
+        yield* requirePromptable(input.sessionID, "host").pipe(Effect.catch(Effect.die))
         return yield* (
           state.ensureRunning as unknown as (
             a: SessionID,
@@ -2299,23 +3356,126 @@ const layer = Layer.effect(
       },
     )
 
+    const admitSynthetic = Effect.fn("SessionPrompt.admitSynthetic")(function* (
+      input: SessionInput.SyntheticAdmission & { readonly resume?: boolean },
+    ) {
+      const session = yield* requirePromptable(input.sessionID, "host")
+      const admitted = yield* SessionInput.admitSynthetic(db, events, input)
+      if (input.resume === false || session.pausedAt !== undefined) return admitted
+
+      // Admission is durable before activation. A different process may already
+      // own execution; in that case its releaseIfDrained transaction observes
+      // this row and continues. Local activation failures are logged but cannot
+      // roll back or duplicate the admitted intent.
+      yield* loop({ sessionID: input.sessionID }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("trusted Synthetic wake did not acquire/run locally", {
+            sessionID: input.sessionID,
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts)),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+        Effect.asVoid,
+      )
+      return admitted
+    })
+
+    const auditGoal = Effect.fn("SessionPrompt.auditGoal")(function* (sessionID: SessionID) {
+      const sessionStatus = yield* status.get(sessionID)
+      // If the worker is still producing a turn, that turn owns the transcript
+      // and will run the ordinary end-of-turn audit itself. Never audit a
+      // half-finished worker cycle or create a parallel provider request.
+      if (sessionStatus.type !== "idle") return
+      const runtime = yield* goalAutomation.runtime(sessionID)
+      // A running auditor or an already-authorized continuation owns the Goal.
+      // Never create a second independent auditor alongside it.
+      if (runtime?.phase === "auditing" || runtime?.phase === "working" || runtime?.phase === "continuation_pending") return
+      if (!(yield* goalAutomation.shouldAudit(sessionID))) return
+
+      const lastUserMatch = yield* sessions
+        .findMessage(sessionID, SessionTurnProvenance.isWorkerPromptTurn)
+        .pipe(Effect.orDie)
+      if (Option.isNone(lastUserMatch)) {
+        yield* goalAutomation.failAudit({ sessionID, error: "Goal auditor cannot start because the Session has no worker prompt." })
+        return
+      }
+      const lastUser = lastUserMatch.value
+      if (lastUser.info.role !== "user") {
+        yield* goalAutomation.failAudit({ sessionID, error: "Goal auditor cannot start because the Session has no worker prompt." })
+        return
+      }
+      // Recent work context stays intentionally bounded; model provenance does
+      // not. Long-running Goal sessions can contain many assistant/tool messages
+      // since their last user-authored turn, so a bounded page must never be
+      // used to decide whether a worker prompt exists.
+      const history = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
+
+      const workerModel: ModelV2.Ref = {
+        providerID: ProviderV2.ID.make(lastUser.info.model.providerID),
+        id: ModelV2.ID.make(lastUser.info.model.modelID),
+        ...(lastUser.info.model.variant ? { variant: ModelV2.VariantID.make(lastUser.info.model.variant) } : {}),
+      }
+
+      const decision = yield* executeGoalAudit({
+        sessionID,
+        origin: "user",
+        sourceMessageID: lastUser.info.id,
+        workerModel,
+        latestWork: goalAuditLatestWork(history),
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            const error = Cause.squash(cause)
+            const message = error instanceof Error ? error.message : String(error)
+            yield* goalAutomation.failAudit({ sessionID, error: message })
+            yield* Effect.logError("manual Goal audit failed", { sessionID, cause: Cause.pretty(cause) })
+            return undefined
+          }),
+        ),
+      )
+      if (!decision) return
+
+      // Auditor reconciliation changes authoritative Goal state independently
+      // of the worker transcript. Publish the resulting STATE directly here;
+      // a terminal audit must not re-enter the worker loop merely to project it.
+      const effective = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      yield* reconcileGoalState(sessionID, effective)
+
+      // Only an actual continuation reservation authorizes another worker cycle.
+      // The loop claims/materializes that reservation at its own admission seam.
+      if (decision.reservation) yield* loop({ sessionID }).pipe(Effect.asVoid)
+    })
+
+    const requestGoalAudit = Effect.fn("SessionPrompt.requestGoalAudit")(function* (sessionID: SessionID) {
+      const requested = yield* goalAutomation.requestAudit(sessionID)
+      if (!requested) return
+      if (requested.phase === "auditing") return
+
+      // A user verification request is explicit preemption. SessionRunState owns
+      // the worker/tool fiber and its interrupt cleanup finalizes partial text,
+      // reasoning, and tool parts before publishing the parent Session idle.
+      // Only after that teardown completes may the independent auditor inspect
+      // the durable transcript/workspace.
+      yield* state.cancel(sessionID)
+      yield* auditGoal(sessionID)
+    })
+
     // Register monitor ingress wake handler — enqueue first, wake second, coalesce if busy, gate on Question/Permission (§42-49)
     yield* ingress.registerWakeHandler(
       (sessionID: SessionID) =>
         Effect.gen(function* () {
-          const pendingQs = yield* question.list().pipe(
-            Effect.catch(() => Effect.succeed([] as any[])),
-            Effect.as([]),
-          )
-          if (pendingQs.some((q: any) => q.sessionID === sessionID)) {
+          const gate = yield* interactionGate({
+            sessionID,
+            questions: () => question.list(),
+            permissions: () => permission.list(),
+          })
+          if (gate.hasQuestion) {
             yield* Effect.logInfo("monitor wake gated by question", { sessionID })
             return
           }
-          const pendingPs = yield* permission.list().pipe(
-            Effect.catch(() => Effect.succeed([] as any[])),
-            Effect.as([]),
-          )
-          if (pendingPs.some((p: any) => p.sessionID === sessionID)) {
+          if (gate.hasPermission) {
             yield* Effect.logInfo("monitor wake gated by permission", { sessionID })
             return
           }
@@ -2335,8 +3495,11 @@ const layer = Layer.effect(
         }) as Effect.Effect<void>,
     )
 
-    dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (input: PromptInput, options?: { wait?: boolean }) {
-      const admitted = yield* hostPrompt({ ...input, noReply: true })
+    dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (
+      input: PromptInput,
+      options?: { wait?: boolean; provenance?: HostPromptProvenance },
+    ) {
+      const admitted = yield* hostPrompt({ ...input, noReply: true }, options?.provenance)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (session.pausedAt !== undefined) {
         return { admitted, paused: true }
@@ -2369,7 +3532,7 @@ const layer = Layer.effect(
         return { admitted, paused: false, result: exit.value }
       }
       return { admitted, paused: false }
-    }) as unknown as TaskPromptOps["dispatch"]
+    }) as unknown as SessionPromptOps["dispatch"]
 
     const shell: (
       input: ShellInput,
@@ -2429,10 +3592,20 @@ const layer = Layer.effect(
       if (shellMatches.length > 0) {
         const cfg = yield* config.get()
         const sh = Shell.preferred(cfg.shell)
+        const instance = yield* InstanceState.context
         const results = yield* Effect.forEach(
           shellMatches,
-          ([, cmd]) =>
-            Effect.promise(() => Process.text([cmd], { shell: sh, nothrow: true }).then((result) => result.text)),
+          ([, command]) =>
+            Effect.try({
+              try: () => ShellLaunch.command(sh, command, instance.directory, process.env),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(
+              // Preserve the historical custom-command behavior for process
+              // launch/read failures and non-zero shell exits: substitution
+              // contributes whatever stdout was produced (often empty). Host
+              // transport validation above is deliberately NOT swallowed.
+              Effect.flatMap((child) => spawner.string(child).pipe(Effect.catch(() => Effect.succeed("")))),
+            ),
           { concurrency: 4 },
         )
         let index = 0
@@ -2495,14 +3668,18 @@ const layer = Layer.effect(
         { parts },
       )
 
-      const result = yield* prompt({
-        sessionID: input.sessionID,
-        messageID: input.messageID,
-        model: userModel,
-        agent: userAgent,
-        parts,
-        variant: input.variant,
-      })
+      const result = yield* promptInternal(
+        {
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          model: userModel,
+          agent: userAgent,
+          parts,
+          variant: input.variant,
+        },
+        "user",
+        SessionTurnProvenance.user(SessionTurnProvenance.Source.Command),
+      )
       yield* events.publish(Command.Event.Executed, {
         name: input.command,
         sessionID: input.sessionID,
@@ -2514,7 +3691,13 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel: cancel as unknown as Interface["cancel"],
+      assertUserPromptable: assertUserPromptable as unknown as Interface["assertUserPromptable"],
+      auditGoal: auditGoal as unknown as Interface["auditGoal"],
+      requestGoalAudit: requestGoalAudit as unknown as Interface["requestGoalAudit"],
       prompt: prompt as unknown as Interface["prompt"],
+      userActionPrompt: userActionPrompt as unknown as Interface["userActionPrompt"],
+      hostPrompt: hostPrompt as unknown as Interface["hostPrompt"],
+      admitSynthetic: admitSynthetic as unknown as Interface["admitSynthetic"],
       loop: loop as unknown as Interface["loop"],
       shell: shell as unknown as Interface["shell"],
       command: command as unknown as Interface["command"],
@@ -2523,36 +3706,6 @@ const layer = Layer.effect(
     } as unknown as Interface)
   }),
 )
-
-const ModelRef = Schema.Struct({
-  providerID: ProviderV2.ID,
-  modelID: ModelV2.ID,
-})
-
-export const PromptInput = Schema.Struct({
-  sessionID: SessionID,
-  messageID: Schema.optional(MessageID),
-  model: Schema.optional(ModelRef),
-  agent: Schema.optional(Schema.String),
-  noReply: Schema.optional(Schema.Boolean),
-  tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
-    description:
-      "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",
-  }),
-  format: Schema.optional(SessionV1.Format),
-  system: Schema.optional(Schema.String),
-  variant: Schema.optional(Schema.String),
-  subProvider: Schema.optional(Schema.String),
-  parts: Schema.Array(
-    Schema.Union([
-      SessionV1.TextPartInput,
-      SessionV1.FilePartInput,
-      SessionV1.AgentPartInput,
-      SessionV1.SubtaskPartInput,
-    ]).annotate({ discriminator: "type" }),
-  ),
-})
-export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 export class LoopInput extends Schema.Class<LoopInput>("SessionPrompt.LoopInput")({
   sessionID: SessionID,
@@ -2641,6 +3794,7 @@ export const node = LayerNode.make({
   deps: [
     SessionStatus.node,
     Session.node,
+    BackgroundJob.node,
     Agent.node,
     Provider.node,
     SessionProcessor.node,
@@ -2670,6 +3824,7 @@ export const node = LayerNode.make({
     SessionIngress.node,
     Question.node,
     GoalContext.node,
+    Goal.node,
     GoalAutomation.node,
     SpecialAgentSession.node,
     locationServiceMapNode,

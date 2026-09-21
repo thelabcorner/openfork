@@ -2,6 +2,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
 import { BackgroundJob } from "@/background/job"
@@ -11,6 +13,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
 
@@ -38,6 +41,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
+import { PROJECT_CONFIG_DIRNAME } from "@opencode-ai/core/storage-identity"
 import { Effect, Layer, Option, Context, Schema, Types, Scope } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -101,6 +105,7 @@ export function fromRow(row: SessionRow): Info {
       ? {
           id: ModelV2.ID.make(row.model.id),
           providerID: ProviderV2.ID.make(row.model.providerID),
+          ...(row.model.accountID ? { accountID: row.model.accountID } : {}),
           variant: row.model.variant,
         }
       : undefined,
@@ -230,6 +235,7 @@ const Revert = Schema.Struct({
 const Model = Schema.Struct({
   id: ModelV2.ID,
   providerID: ProviderV2.ID,
+  accountID: optional(Schema.String),
   variant: optional(Schema.String),
 })
 
@@ -331,6 +337,7 @@ export type ListInput = {
 
 export type GlobalListInput = {
   directory?: string
+  projectID?: ProjectV2.ID
   parentID?: SessionID
   roots?: boolean
   start?: number
@@ -350,7 +357,7 @@ export const Event = {
 
 export function plan(input: { slug: string; time: { created: number } }, instance: InstanceContext) {
   const base = instance.project.vcs
-    ? path.join(instance.worktree, ".opencode", "plans")
+    ? path.join(instance.worktree, PROJECT_CONFIG_DIRNAME, "plans")
     : path.join(Global.Path.data, "plans")
   return path.join(base, [input.time.created, input.slug].join("-") + ".md")
 }
@@ -428,6 +435,14 @@ export class BusyError extends Schema.TaggedErrorClass<BusyError>()("SessionBusy
   sessionID: SessionID,
 }) {}
 
+export class ManagedRootConflictError extends Schema.TaggedErrorClass<ManagedRootConflictError>()(
+  "Session.ManagedRootConflictError",
+  {
+    sessionID: SessionID,
+    reason: Schema.String,
+  },
+) {}
+
 export type NotFound = NotFoundError
 
 export interface Interface {
@@ -442,6 +457,14 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
   }) => Effect.Effect<Info>
+  /** Trusted host-only stable root creation for crash/retry-safe runtime principals. */
+  readonly createManagedRoot: (input: {
+    id: SessionID
+    title: string
+    agent: string
+    model: Schema.Schema.Type<typeof Model>
+    workspaceID?: WorkspaceV2.ID
+  }) => Effect.Effect<Info, ManagedRootConflictError>
   readonly fork: (input: {
     sessionID: SessionID
     messageID?: MessageID
@@ -542,7 +565,7 @@ const layer: Layer.Layer<
         // Revisor, Session Title) have their own durable, locked grouping path.
         // Do not let the generic descendant grouper create a transient
         // auto_subagent identity for any of them.
-        if (session.metadata?.specialAgent) return
+        if (SessionMetadataOwnership.isSpecialAgent(session.metadata)) return
         const plugin = Option.getOrUndefined(yield* Effect.serviceOption(Plugin.Service))
         const assigned = {} as { groupID?: string; locked?: boolean; origin?: "user" | "auto_subagent" | "plugin" }
         if (plugin) {
@@ -726,6 +749,7 @@ const layer: Layer.Layer<
     const listGlobal = Effect.fn("Session.listGlobal")(function* (input?: GlobalListInput) {
       const conditions: SQL[] = []
       if (input?.directory) conditions.push(eq(SessionTable.directory, input.directory))
+      if (input?.projectID) conditions.push(eq(SessionTable.project_id, input.projectID))
       if (input?.parentID) conditions.push(eq(SessionTable.parent_id, input.parentID))
       if (input?.roots) conditions.push(isNull(SessionTable.parent_id))
       if (input?.start) conditions.push(gte(SessionTable.time_updated, input.start))
@@ -913,6 +937,61 @@ const layer: Layer.Layer<
       )
     })
 
+    const createManagedRoot: Interface["createManagedRoot"] = Effect.fn("Session.createManagedRoot")(function* (input) {
+      const ctx = yield* InstanceState.context
+      const workspace = yield* InstanceState.workspaceID
+      const desiredWorkspace = input.workspaceID ?? workspace
+
+      const compatible = (session: Info) => {
+        if (session.parentID !== undefined) return "existing Session is not a root"
+        if (session.projectID !== ctx.project.id) return `project mismatch (${session.projectID} != ${ctx.project.id})`
+        if (session.directory !== ctx.directory) return `directory mismatch (${session.directory} != ${ctx.directory})`
+        if (session.agent !== input.agent) return `agent mismatch (${session.agent ?? "<none>"} != ${input.agent})`
+        if (session.workspaceID !== desiredWorkspace) {
+          return `workspace mismatch (${session.workspaceID ?? "<none>"} != ${desiredWorkspace ?? "<none>"})`
+        }
+        const model = session.model
+        if (!model) return "existing Session has no model"
+        if (model.providerID !== input.model.providerID || model.id !== input.model.id) {
+          return `model mismatch (${model.providerID}/${model.id} != ${input.model.providerID}/${input.model.id})`
+        }
+        if (model.accountID !== input.model.accountID) {
+          return `provider account mismatch (${model.accountID ?? "<none>"} != ${input.model.accountID ?? "<none>"})`
+        }
+        if (model.variant !== input.model.variant) {
+          return `model variant mismatch (${model.variant ?? "<default>"} != ${input.model.variant ?? "<default>"})`
+        }
+        return undefined
+      }
+
+      const accept = (session: Info) => {
+        const reason = compatible(session)
+        return reason
+          ? Effect.fail(new ManagedRootConflictError({ sessionID: input.id, reason }))
+          : Effect.succeed(session)
+      }
+
+      const existing = yield* getFrom(readDb, input.id)
+      if (existing) return yield* accept(fromRow(existing))
+
+      return yield* createNext({
+        id: input.id,
+        directory: ctx.directory,
+        path: sessionPath(ctx.worktree, ctx.directory),
+        title: input.title,
+        agent: input.agent,
+        model: input.model,
+        workspaceID: desiredWorkspace,
+      }).pipe(
+        Effect.catchDefect((defect) => {
+          if (!(defect instanceof SessionProjector.SessionAlreadyProjected)) return Effect.die(defect)
+          return getFrom(db, input.id).pipe(
+            Effect.flatMap((row) => (row ? accept(fromRow(row)) : Effect.die(defect))),
+          )
+        }),
+      )
+    })
+
     const fork = Effect.fn("Session.fork")(function* (input: {
       sessionID: SessionID
       messageID?: MessageID
@@ -933,7 +1012,7 @@ const layer: Layer.Layer<
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
         title,
-        metadata: structuredClone(original.metadata),
+        metadata: SessionMetadataOwnership.forDerivedSession(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
 
@@ -945,7 +1024,7 @@ const layer: Layer.Layer<
         for (let i = msgs.length - 1; i >= 0; i--) {
           const m = msgs[i]
           if (!m) continue
-          if (m.info.role === "user") {
+          if (m.info.role === "user" && !SessionTurnProvenance.hasStateSemanticsInfo(m.info)) {
             lastCompleted = i + 1
             break
           }
@@ -970,7 +1049,7 @@ const layer: Layer.Layer<
               let lastCompleted = 0
               for (let i = idx - 1; i >= 0; i--) {
                 const mm = msgs[i]!
-                if (mm.info.role === "user") {
+                if (mm.info.role === "user" && !SessionTurnProvenance.hasStateSemanticsInfo(mm.info)) {
                   lastCompleted = i + 1
                   break
                 }
@@ -996,6 +1075,7 @@ const layer: Layer.Layer<
       // Respect exclusions/edits: fork inherits effective context, not raw canonical.
       // We still need to fetch state for the source session and filter at materialization.
       let effectiveIDs: Set<string> | undefined
+      let contextState = new Map<string, any>()
       try {
         const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
         const state = yield* (SessionContextState.getState as any)(input.sessionID).pipe(
@@ -1006,58 +1086,91 @@ const layer: Layer.Layer<
           // than allowing a fork to fail for an optional lookup.
           Effect.catchCause(() => Effect.succeed(new Map())),
         )
-        const stateMap = state as Map<string, any>
-        if (stateMap.size > 0) {
+        contextState = state as Map<string, any>
+        if (contextState.size > 0) {
           effectiveIDs = new Set()
           for (const msg of msgs.slice(0, target)) {
-            const s = stateMap.get(msg.info.id)
+            const s = contextState.get(msg.info.id)
             if (!s?.excluded || s?.pinned) effectiveIDs.add(msg.info.id)
           }
         }
       } catch {}
-      const idMap = new Map<string, MessageID>()
-      const includedCount = effectiveIDs ? effectiveIDs.size : target
-
-      for (const msg of msgs.slice(0, target)) {
-        // Skip excluded messages (unless pinned) — fork inherits effective context
+      const prefix = msgs.slice(0, target)
+      const includedIDs = new Set<string>()
+      for (const msg of prefix) {
+        // STATE is aggregate-local current meaning, not historical lineage.
+        // Copying it would preserve a source-session publication identity and
+        // let stale Goal state survive independently of authoritative focus.
+        if (SessionTurnProvenance.isStateProjectionTurn(msg)) continue
         if (effectiveIDs && !effectiveIDs.has(msg.info.id)) continue
+        if (msg.info.role === "assistant") {
+          // A fork is a new aggregate. Never preserve a source-session parent
+          // pointer when effective-context filtering removed the owning turn.
+          if (!includedIDs.has(msg.info.parentID)) continue
+        } else if (msg.info.role === "user") {
+          const provenance = SessionTurnProvenance.resolve(msg)
+          const causalRoot =
+            provenance?.owner === "host" ? SessionTurnProvenance.causalRootMessageID(msg) : undefined
+          // Host continuations carry capabilities/checkpoint identity from their
+          // causal root. If that root is not in the fork, the continuation and
+          // its descendants must not survive as a dangling synthetic turn.
+          // Independent host worker roots (host.prompt) resolve to themselves.
+          if (causalRoot && causalRoot !== msg.info.id && !includedIDs.has(causalRoot)) continue
+        }
+        includedIDs.add(msg.info.id)
+      }
+
+      const idMap = new Map<string, MessageID>()
+
+      for (const msg of prefix) {
+        // Forks materialize a causally closed effective history, not isolated
+        // rows whose parent/provenance pointers still target the source session.
+        if (!includedIDs.has(msg.info.id)) continue
 
         const newID = MessageID.ascending()
         idMap.set(msg.info.id, newID)
 
         const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
+        const provenance =
+          msg.info.role === "user" &&
+          msg.info.provenance?.owner === "host" &&
+          msg.info.provenance.sourceMessageID
+            ? {
+                ...msg.info.provenance,
+                sourceMessageID: idMap.get(msg.info.provenance.sourceMessageID)!,
+              }
+            : msg.info.role === "user"
+              ? msg.info.provenance
+              : undefined
         const cloned = yield* updateMessage({
           ...msg.info,
           sessionID: session.id,
           id: newID,
-          ...(parentID && { parentID }),
+          ...(msg.info.role === "assistant" ? { parentID: parentID! } : {}),
+          ...(msg.info.role === "user" && provenance ? { provenance } : {}),
         })
 
+        const messageState = contextState.get(msg.info.id)
         for (const part of msg.parts) {
-          // Apply overlay overrides if any — text.replace at fork time
+          // Apply overlay overrides from the state map already loaded above.
+          // Do not re-query context state per part: fork materialization is a
+          // linear clone over an already-resolved effective prefix.
           let partToWrite: SessionV1.Part = {
             ...part,
             id: PartID.ascending(),
             messageID: cloned.id,
             sessionID: session.id,
           }
-          try {
-            const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
-            const ms = yield* (SessionContextState.getMessageState as any)(input.sessionID, msg.info.id).pipe(
-              Effect.provideService(Database.Service, database),
-              Effect.catchCause(() => Effect.succeed(undefined)),
-            )
-            if (ms?.overrideData && !ms.excluded) {
-              const od = ms.overrideData as any
-              if (od.text != null && partToWrite.type === "text") {
-                if (!od.partID || od.partID === part.id) {
-                  ;(partToWrite as any).text = od.text
-                }
+          if (messageState?.overrideData && !messageState.excluded) {
+            const od = messageState.overrideData as any
+            if (od.text != null && partToWrite.type === "text") {
+              if (!od.partID || od.partID === part.id) {
+                ;(partToWrite as any).text = od.text
               }
-              // Collapsed tool output is already handled via compacted flag at compile time,
-              // but also materialize as truncated here for fork hygiene.
             }
-          } catch {}
+            // Collapsed tool output is already handled via compacted flag at compile time,
+            // but also materialize as truncated here for fork hygiene.
+          }
           if (partToWrite.type === "compaction" && (partToWrite as any).tail_start_id) {
             ;(partToWrite as any).tail_start_id = idMap.get((partToWrite as any).tail_start_id)
           }
@@ -1106,9 +1219,14 @@ const layer: Layer.Layer<
     const patch = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
         const current = yield* getForMutation(sessionID)
+        const metadata =
+          info.metadata === undefined
+            ? current.metadata
+            : SessionMetadataOwnership.replaceCallerOwned(current.metadata, info.metadata)
         const next = {
           ...current,
           ...info,
+          metadata,
           time: info.time ? { ...current.time, ...info.time } : current.time,
           share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
           summary: info.summary === null ? undefined : (info.summary ?? current.summary),
@@ -1292,6 +1410,7 @@ const layer: Layer.Layer<
       list,
       listGlobal,
       create,
+      createManagedRoot,
       fork: fork as Interface["fork"],
       touch,
       get,

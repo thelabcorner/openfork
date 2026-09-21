@@ -2,6 +2,7 @@ export * as SessionLedger from "./ledger"
 
 import { Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import type { WithParts } from "@opencode-ai/schema/session-v1"
 import { SessionContext } from "@opencode-ai/schema/session-context"
 import { Database } from "@opencode-ai/core/database/database"
@@ -22,7 +23,13 @@ function previewForMessage(msg: WithParts): string {
 function typeForMessage(msg: WithParts): SessionContext.LedgerEntryType {
   if (msg.parts.some((p) => p.type === "compaction")) return "compaction"
   if (msg.parts.some((p) => p.type === "tool")) return "tool"
-  if (msg.info.role === "user") return "user"
+  if (msg.info.role === "user") {
+    const kind = SessionTurnProvenance.semanticKind(msg)
+    if (kind === "shell") return "shell"
+    if (kind === "synthetic") return "synthetic"
+    if (kind === "compaction") return "compaction"
+    return "user"
+  }
   if (msg.info.role === "assistant") return "assistant"
   return "system"
 }
@@ -58,7 +65,10 @@ export const build = Effect.fn("SessionLedger.build")(function* (input: {
   const stateMap = new Map(stateRows.map((r) => [r.message_id, r]))
 
   const entries: SessionContext.LedgerEntry[] = input.messages.map((msg) => {
-    const s = stateMap.get(msg.info.id)
+    // Historical invalid overlays may still exist in old databases. STATE is
+    // authoritative domain projection, so those rows must not affect the
+    // effective ledger or any totals derived from it.
+    const s = SessionTurnProvenance.hasStateSemanticsTurn(msg) ? undefined : stateMap.get(msg.info.id)
     const hasSignedReasoning = msg.parts.some(
       (p) => p.type === "reasoning" && (p as any).metadata?.anthropic?.signature != null,
     )

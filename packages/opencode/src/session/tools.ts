@@ -10,16 +10,17 @@ import { ToolInterrupt } from "@/tool/interrupt"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
 import { isLazyTool, TOOL_ACCESS_ID } from "@/tool/access"
+import { BrokerContract } from "@/tool/broker-contract"
 import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
-import type { TaskPromptOps } from "@/tool/task"
+import type { SessionPromptOps } from "./prompt-contract"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { Effect } from "effect"
 import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
-import { PartID } from "./schema"
+import { type MessageID, PartID } from "./schema"
 import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -122,7 +123,7 @@ export const explicitLazyToolContext = Effect.fn("SessionTools.explicitLazyToolC
     const target = lazy.get(id)
     if (!target || disabled.has(id)) continue
 
-    let parameters: unknown
+    let parameters: ReturnType<typeof ToolJsonSchema.fromTool>
     try {
       parameters = ToolJsonSchema.fromTool(target)
     } catch (error) {
@@ -132,12 +133,21 @@ export const explicitLazyToolContext = Effect.fn("SessionTools.explicitLazyToolC
       })
       continue
     }
+    const descriptor = BrokerContract.describe({
+      broker: TOOL_ACCESS_ID,
+      target: target.id,
+      targetField: "tool",
+      description: target.description,
+      schema: parameters,
+    })
 
     const block = [
       `Tool: @${target.id}`,
       `Description: ${target.description}`,
       `Parameters: ${JSON.stringify(parameters)}`,
-      `Invocation: call the provider-visible \`${TOOL_ACCESS_ID}\` tool with {"action":"call","tool":"${target.id}","args":<object matching Parameters>}.`,
+      `Descriptor protocol: ${descriptor.protocol}`,
+      `Contract: ${descriptor.contract}`,
+      `Invocation: call the provider-visible \`${TOOL_ACCESS_ID}\` tool with {"action":"call","tool":"${target.id}","contract":"${descriptor.contract}","args":<object matching Parameters>}.`,
     ].join("\n")
     if (size + block.length > MAX_EXPLICIT_LAZY_TOOL_CONTEXT_CHARS) continue
     blocks.push(block)
@@ -147,7 +157,7 @@ export const explicitLazyToolContext = Effect.fn("SessionTools.explicitLazyToolC
   if (blocks.length === 0) return undefined
   return [
     "<explicit-tool-mention-context>",
-    "The immediately preceding user request explicitly referenced the lazy tool(s) below. This is harness-generated capability metadata, not an additional user task. The schemas are already supplied here, so do not spend a tool call listing or describing these capabilities before use. Invoke the stable `tool` broker directly when the request calls for them.",
+    "The immediately preceding user request explicitly referenced the lazy tool(s) below. This is harness-generated capability metadata, not an additional user task. The exact schemas and descriptor contracts are already supplied here, so the broker's discovery requirement is satisfied for these capabilities only; do not spend a redundant list/describe call. Invoke the stable `tool` broker directly with the supplied contract when the request calls for them.",
     blocks.join("\n\n"),
     "</explicit-tool-mention-context>",
   ].join("\n")
@@ -239,9 +249,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   model: Provider.Model
   session: Session.Info
   processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
-  bypassAgentCheck: boolean
+  authorizedAgentNames: ReadonlySet<string>
+  workerRootMessageID?: MessageID
   messages: SessionV1.WithParts[]
-  promptOps: TaskPromptOps
+  promptOps: SessionPromptOps
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -273,7 +284,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: killable ?? options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
+    extra: {
+      model: input.model,
+      authorizedAgentNames: input.authorizedAgentNames,
+      promptOps: input.promptOps,
+      workerRootMessageID: input.workerRootMessageID,
+    },
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) => {
@@ -442,8 +458,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 count: filtered.length,
                 servers: resourceServers,
                 ...(parsed.server ? { server: parsed.server } : {}),
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                ...Truncate.mergeMetadata({}, truncated),
               },
               output: truncated.content,
             }
@@ -524,8 +539,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 count: filtered.length,
                 servers: resourceServers,
                 ...(parsed.server ? { server: parsed.server } : {}),
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                ...Truncate.mergeMetadata({}, truncated),
               },
               output: truncated.content,
             }
@@ -599,8 +613,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 uri: parsed.uri,
                 contents: formatted.contents,
                 attachments: formatted.attachments.length,
-                truncated: truncated.truncated,
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                ...Truncate.mergeMetadata({}, truncated),
               },
               output: truncated.content,
               attachments: formatted.attachments.map((attachment) => ({
@@ -714,11 +727,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
 
           const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
-          const metadata = {
-            ...result.metadata,
-            truncated: truncated.truncated,
-            ...(truncated.truncated && { outputPath: truncated.outputPath }),
-          }
+          const metadata = Truncate.mergeMetadata(result.metadata ?? {}, truncated)
 
           const output = {
             title: "",

@@ -35,6 +35,7 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -128,6 +129,74 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 
+export function latestCompletedCompaction(msgs: readonly WithParts[]) {
+  const completed = new Set<string>()
+  for (const msg of msgs) {
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error) completed.add(msg.info.parentID)
+  }
+  let result: WithParts | undefined
+  for (const msg of msgs) {
+    if (msg.info.role !== "user" || !completed.has(msg.info.id)) continue
+    if (SessionTurnProvenance.isHistoricalInfo(msg.info)) continue
+    if (!msg.parts.some((part) => part.type === "compaction")) continue
+    if (!result || isAfter(msg.info, result.info)) result = msg
+  }
+  return result
+}
+
+/**
+ * STATE projections are durable append-only records, but model consumption is
+ * a materialized view rather than raw event chronology. Collapse each state
+ * source to its latest effective snapshot and place those snapshots immediately
+ * before the active non-state user-role turn. This preserves user/host turn
+ * precedence in V1 even though legacy prompt admission persists a real human
+ * steer before the runner reaches its next safe reconciliation boundary.
+ */
+export function projectStateForModel(input: WithParts[]) {
+  const reset = latestCompletedCompaction(input)
+  const states = new Map<string, WithParts>()
+  const ordinary: WithParts[] = []
+  let activeUser: User | undefined
+  for (const msg of input) {
+    if (SessionTurnProvenance.hasStateSemanticsTurn(msg)) {
+      // Historical/imported STATE keeps its semantic identity for replay but
+      // must stay transparent to the live provider projection. Only current
+      // STATE participates in the replaceable source-index below.
+      if (!SessionTurnProvenance.isStateProjectionTurn(msg)) continue
+      if (reset && !isAfter(msg.info, reset.info)) continue
+      const provenance = msg.info.role === "user" ? msg.info.provenance : undefined
+      if (provenance?.owner !== "host") continue
+      const previous = states.get(provenance.source)
+      if (!previous || isAfter(msg.info, previous.info)) states.set(provenance.source, msg)
+      continue
+    }
+    ordinary.push(msg)
+    if (
+      msg.info.role === "user" &&
+      !SessionTurnProvenance.isHistoricalInfo(msg.info) &&
+      !SessionTurnProvenance.hasStateSemanticsInfo(msg.info) &&
+      isAfter(msg.info, activeUser)
+    )
+      activeUser = msg.info
+  }
+  if (states.size === 0) return ordinary
+  const projected = [...states.values()].sort((a, b) => {
+    const pa = a.info.role === "user" && a.info.provenance?.owner === "host" ? a.info.provenance.source : ""
+    const pb = b.info.role === "user" && b.info.provenance?.owner === "host" ? b.info.provenance.source : ""
+    const rank = (source: string) =>
+      source === SessionTurnProvenance.Source.GoalSpecification
+        ? 0
+        : source === SessionTurnProvenance.Source.GoalProgress
+          ? 1
+          : 2
+    return rank(pa) - rank(pb) || pa.localeCompare(pb)
+  })
+  if (!activeUser) return [...projected, ...ordinary]
+  const index = ordinary.findIndex((message) => message.info.id === activeUser!.id)
+  if (index < 0) return [...projected, ...ordinary]
+  return [...ordinary.slice(0, index), ...projected, ...ordinary.slice(index)]
+}
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
@@ -192,7 +261,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     return { type: "json", value: output as never }
   }
 
-  for (const msg of input) {
+  for (const msg of projectStateForModel(input)) {
     if (msg.parts.length === 0) continue
 
     if (msg.info.role === "user") {
@@ -580,12 +649,22 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
 // position is not chronological. IDs are only a deterministic tie-breaker
 // because imported messages do not necessarily have monotonic IDs.
 export function latest(msgs: WithParts[]) {
+  // Structural/provider turn selection: host-owned continuations/compaction are
+  // still real V1 provider-user turn boundaries. Replaceable STATE projections
+  // are not: they are transparent context and must never steal assistant
+  // parenting, checkpoint roots, or active-turn selection.
   let user: User | undefined
   let assistant: Assistant | undefined
   let finished: Assistant | undefined
   for (const msg of msgs) {
     const info = msg.info
-    if (info.role === "user" && isAfter(info, user)) user = info
+    if (
+      info.role === "user" &&
+      !SessionTurnProvenance.isHistoricalInfo(info) &&
+      !SessionTurnProvenance.hasStateSemanticsInfo(info) &&
+      isAfter(info, user)
+    )
+      user = info
     if (info.role === "assistant" && isAfter(info, assistant)) assistant = info
     if (info.role === "assistant" && info.finish && isAfter(info, finished)) finished = info
   }

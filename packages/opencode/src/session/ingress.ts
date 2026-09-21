@@ -23,6 +23,33 @@ export type SessionIngressEvent = MonitorIngressEvent
 
 const MAX_PENDING_BATCHES = 64
 
+type SessionScopedRequest = { readonly sessionID: string }
+
+/**
+ * Resolve the human-interaction fence for monitor ingress.
+ *
+ * Question/permission state is authoritative for whether asynchronous monitor
+ * observations may wake or advance the worker. Successful list results must be
+ * preserved; lookup failure degrades conservatively to "no observed gate" so
+ * the caller's existing error-containment policy remains unchanged.
+ */
+export const interactionGate = Effect.fnUntraced(function* (input: {
+  readonly sessionID: SessionID
+  readonly questions: () => Effect.Effect<ReadonlyArray<SessionScopedRequest>>
+  readonly permissions: () => Effect.Effect<ReadonlyArray<SessionScopedRequest>>
+}) {
+  const [questions, permissions] = yield* Effect.all(
+    [
+      input.questions().pipe(Effect.catchCause(() => Effect.succeed([] as ReadonlyArray<SessionScopedRequest>))),
+      input.permissions().pipe(Effect.catchCause(() => Effect.succeed([] as ReadonlyArray<SessionScopedRequest>))),
+    ],
+    { concurrency: 2 },
+  )
+  const hasQuestion = questions.some((item) => item.sessionID === input.sessionID)
+  const hasPermission = permissions.some((item) => item.sessionID === input.sessionID)
+  return { hasQuestion, hasPermission, blocked: hasQuestion || hasPermission }
+})
+
 interface State {
   queues: Map<SessionID, SessionIngressEvent[]>
   overflow: Map<SessionID, number>

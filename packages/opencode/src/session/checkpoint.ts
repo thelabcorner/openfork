@@ -2,8 +2,8 @@ export * as TurnCheckpoint from "./checkpoint"
 
 import fs from "node:fs/promises"
 import path from "path"
-import { Effect, Fiber, Layer, Context, Clock, Scope, Schema, Semaphore } from "effect"
-import { and, eq, lt, desc } from "drizzle-orm"
+import { Effect, Fiber, Layer, Context, Clock, Scope, Schema, Semaphore, Schedule, Duration } from "effect"
+import { and, eq, lt, desc, inArray } from "drizzle-orm"
 import { randomUUID } from "crypto"
 import { Database } from "@opencode-ai/core/database/database"
 import { Global } from "@opencode-ai/core/global"
@@ -19,7 +19,9 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
+import type { InstanceContext } from "@/project/instance-context"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Git } from "@/git"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type { SessionID } from "./schema"
 
@@ -76,6 +78,14 @@ export interface Turn {
   readonly sessionID: SessionID
   readonly ordinal: number
   readonly beforeFiber: Fiber.Fiber<string | undefined>
+  /** Last committed post-state retained while this logical row is reopened. */
+  readonly previousAfterSnapshot?: string
+  /**
+   * True when a crashed/error checkpoint had no durable original baseline and
+   * this resume had to capture the best-available current tree instead. The
+   * resulting checkpoint is useful but cannot claim complete attribution.
+   */
+  readonly baselineRecovered?: boolean
 }
 
 export interface Interface {
@@ -100,19 +110,25 @@ export interface Interface {
    * index transitions.
    */
   readonly quiesce: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Reconcile physical checkpoint retention refs against durable checkpoint
+   * ownership. Production runs this as bounded background maintenance; exposed
+   * here as an internal proof/test seam.
+   */
+  readonly reconcileRetention: () => Effect.Effect<{ readonly scanned: number; readonly released: number }>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TurnCheckpoint") {}
 
 const STALE_MS = 60 * 60 * 1000
-// Keep durable metadata bounded. Full patches are regenerated from the two
-// content-addressed trees by the diff endpoint when needed.
-const MAX_CACHED_PATCH_BYTES = 256 * 1024
 // Mirrors the V1 snapshot large-file rule (packages/opencode/src/snapshot: 2 MiB).
 const SNAPSHOT_SIZE_LIMIT = 2 * 1024 * 1024
 // Bounds the untracked-file scan for exclusion detection (background fiber only).
 const MAX_EXCLUDED_REPORTED = 50
 const MAX_EXCLUDED_SCANNED = 500
+const RETENTION_ROOT = "refs/opencode/retained/"
+const RETENTION_REF_PREFIX = `${RETENTION_ROOT}${Checkpoint.SNAPSHOT_RETENTION_PREFIX}`
+const RETENTION_PAGE_SIZE = 128
 
 // Per-process bookkeeping (cheap, bounded by open sessions):
 // - healed: sessions whose stale-row sweep already ran this process
@@ -142,6 +158,7 @@ const layer = Layer.effect(
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
     const locations = yield* LocationServiceMap.Service
+    const git = yield* Git.Service
     const scope = yield* Scope.Scope
     const { db } = database
 
@@ -160,6 +177,149 @@ const layer = Layer.effect(
       return path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
     })
 
+    const retainTree = Effect.fn("TurnCheckpoint.retainTree")(function* (
+      tree: string | undefined,
+      checkpointID: Checkpoint.ID,
+      slot: Checkpoint.SnapshotSlot,
+    ) {
+      if (!tree) return
+      const ctx = yield* InstanceState.context
+      const dir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      const ref = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(checkpointID, slot, tree)}`
+      // Use the shared Git service even for the shadow repository. This keeps
+      // checkpoint retention under the same deterministic EOL/process policy
+      // as worktree Git and avoids direct Bun.$ calls inheriting host config.
+      const commit = yield* git.run(
+        [
+          "-c",
+          "user.name=opencode",
+          "-c",
+          "user.email=opencode@localhost",
+          "--git-dir",
+          dir,
+          "commit-tree",
+          tree,
+          "-m",
+          "checkpoint-retain",
+        ],
+        { cwd: ctx.worktree },
+      )
+      const hash = commit.exitCode === 0 ? commit.text().trim() : ""
+      if (!hash) return
+      yield* git.run(["--git-dir", dir, "update-ref", ref, hash], { cwd: ctx.worktree }).pipe(Effect.ignore)
+    })
+
+    const releaseTree = Effect.fn("TurnCheckpoint.releaseTree")(function* (
+      tree: string | undefined,
+      checkpointID: Checkpoint.ID,
+      slot: Checkpoint.SnapshotSlot,
+    ) {
+      if (!tree) return
+      const ctx = yield* InstanceState.context
+      const dir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      const ref = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(checkpointID, slot, tree)}`
+      yield* git.run(["--git-dir", dir, "update-ref", "-d", ref], { cwd: ctx.worktree }).pipe(Effect.ignore)
+    })
+
+    const reconcileRetentionFor = Effect.fn("TurnCheckpoint.reconcileRetentionFor")(function* (
+      ctx: InstanceContext,
+    ) {
+      if ((yield* config.get()).snapshot === false) return { scanned: 0, released: 0 }
+      const dir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      // The maintenance fiber owns this captured instance context. Derive the
+      // epoch from that durable owner rather than consulting ambient InstanceRef
+      // again on an hourly wakeup.
+      const currentEpoch = Hash.fast(`${ctx.project.id}:${ctx.worktree}`)
+      const exists = yield* Effect.tryPromise(() => fs.stat(path.join(dir, "HEAD"))).pipe(
+        Effect.as(true),
+        Effect.catch(() => Effect.succeed(false)),
+      )
+      if (!exists) return { scanned: 0, released: 0 }
+
+      let scanned = 0
+      let released = 0
+      let cursor: string | undefined
+      while (true) {
+        const args = [
+          "--git-dir",
+          dir,
+          "for-each-ref",
+          `--count=${RETENTION_PAGE_SIZE}`,
+          "--format=%(refname)",
+          ...(cursor ? [`--start-after=${cursor}`] : []),
+          RETENTION_REF_PREFIX,
+        ]
+        const page = yield* git.run(args, { cwd: ctx.worktree })
+        if (page.exitCode !== 0) break
+        const refs = page
+          .text()
+          .split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+        if (refs.length === 0) break
+        scanned += refs.length
+        cursor = refs[refs.length - 1]
+
+        const parsed = refs.map((ref) => {
+          const key = ref.startsWith(RETENTION_ROOT) ? ref.slice(RETENTION_ROOT.length) : ref
+          return { ref, key, parsed: Checkpoint.parseSnapshotRetentionKey(key) }
+        })
+        const ids = Array.from(
+          new Set(parsed.flatMap((item) => (item.parsed ? [item.parsed.checkpointID] : []))),
+        )
+        const rows =
+          ids.length === 0
+            ? []
+            : yield* db
+                .select({
+                  id: SessionCheckpointTable.id,
+                  status: SessionCheckpointTable.status,
+                  beforeSnapshot: SessionCheckpointTable.before_snapshot,
+                  afterSnapshot: SessionCheckpointTable.after_snapshot,
+                  epoch: SessionCheckpointTable.epoch,
+                })
+                .from(SessionCheckpointTable)
+                .where(inArray(SessionCheckpointTable.id, ids))
+                .all()
+                .pipe(Effect.orDie)
+        const byID = new Map(rows.map((row) => [row.id, row]))
+        const stale = parsed.flatMap(({ ref, key, parsed }) => {
+          if (!parsed) return [ref]
+          return Checkpoint.ownsSnapshotRetention(byID.get(parsed.checkpointID), key, currentEpoch) ? [] : [ref]
+        })
+        yield* Effect.forEach(
+          stale,
+          (ref) =>
+            git
+              .run(["--git-dir", dir, "update-ref", "-d", ref], { cwd: ctx.worktree })
+              .pipe(Effect.tap((result) => Effect.sync(() => {
+                if (result.exitCode === 0) released++
+              })), Effect.ignore),
+          { concurrency: 4, discard: true },
+        )
+        if (refs.length < RETENTION_PAGE_SIZE) break
+      }
+      return { scanned, released }
+    })
+
+    const reconcileRetention = Effect.fn("TurnCheckpoint.reconcileRetention")(function* () {
+      return yield* reconcileRetentionFor(yield* InstanceState.context)
+    })
+
+    const retentionMaintenance = yield* InstanceState.make((ctx) =>
+      Effect.gen(function* () {
+        // Instance-owned maintenance: starts lazily on first checkpoint use and
+        // is canceled when that project instance is disposed. Never retain an
+        // InstanceRef in a global timer.
+        yield* reconcileRetentionFor(ctx).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("checkpoint retention reconciliation failed", { cause })),
+          Effect.repeat(Schedule.spaced(Duration.hours(1))),
+          Effect.forkScoped,
+        )
+        return true
+      }),
+    )
+
     const publish = (event: (typeof Event)[keyof typeof Event], summary: {
       sessionID: string
       checkpointID: string
@@ -174,12 +334,17 @@ const layer = Layer.effect(
         Effect.catch((err) => Effect.logWarning("checkpoint event publish failed", { error: String(err) })),
       )
 
-    // Serialized per session: ordinal read + insert must be atomic against a
-    // concurrent begin for a queued follow-up turn.
+    const waitForFinalize = Effect.fn("TurnCheckpoint.waitForFinalize")(function* (sessionID: SessionID) {
+      for (let i = 0; i < 1500 && finalizing.has(sessionID); i++) {
+        yield* Effect.sleep("20 millis")
+      }
+    })
+
+    // Serialized per session: reconciliation + ordinal allocation + insert must
+    // be atomic against a concurrent begin for a queued follow-up turn.
     const allocate = Effect.fn("TurnCheckpoint.allocate")(function* (input: {
       sessionID: SessionID
       userMessageID: string
-      beforeFiber: Fiber.Fiber<string | undefined>
     }) {
       const existing = yield* db
         .select()
@@ -188,23 +353,68 @@ const layer = Layer.effect(
           and(
             eq(SessionCheckpointTable.session_id, input.sessionID),
             eq(SessionCheckpointTable.user_message_id, input.userMessageID),
-            eq(SessionCheckpointTable.status, "capturing"),
           ),
         )
         .get()
         .pipe(Effect.orDie)
 
-      // Resume of an interrupted turn: reuse the original row. Its pre-turn
-      // tree may be unrecoverable; the fresh capture is the best-available
-      // baseline and is written at finalize.
       if (existing) {
+        const current = active.get(input.sessionID)
+        if (existing.status === "capturing" && current?.checkpointID === existing.id) return current
+
+        // A canonical worker root may legitimately re-enter after a user
+        // verification/preemption cycle. The unique (session, user_message)
+        // row is the logical rollback boundary, so reopen it instead of trying
+        // to mint a duplicate checkpoint. Preserve the original baseline when
+        // it exists; only terminal projections are reset for the new work.
+        if (existing.status !== "capturing") {
+          const reopened = yield* db
+            .update(SessionCheckpointTable)
+            .set({
+              status: "capturing",
+              // Keep the last successfully finalized post-state as a durable
+              // recovery anchor until the replacement finalize commits. The
+              // capturing status prevents callers from restoring it as current.
+              assistant_message_id: null,
+              diff: null,
+              additions: 0,
+              deletions: 0,
+              files: 0,
+              excluded: null,
+              error: null,
+              epoch_mismatch: 0,
+              finalized_at: null,
+            })
+            .where(
+              and(
+                eq(SessionCheckpointTable.id, existing.id),
+                eq(SessionCheckpointTable.status, existing.status),
+              ),
+            )
+            .returning({ id: SessionCheckpointTable.id })
+            .get()
+            .pipe(Effect.orDie)
+          if (!reopened) return yield* Effect.die(`Checkpoint ${existing.id} changed while reopening`)
+        }
+
+        const baselineRecovered = !existing.before_snapshot
+        const beforeFiber = yield* (existing.before_snapshot
+          ? Effect.succeed(existing.before_snapshot)
+          : snapshot.track()
+        ).pipe(Effect.forkIn(scope))
         return {
           checkpointID: Checkpoint.ID.make(existing.id),
           sessionID: input.sessionID,
           ordinal: existing.ordinal,
-          beforeFiber: input.beforeFiber,
+          beforeFiber,
+          ...(existing.after_snapshot ? { previousAfterSnapshot: existing.after_snapshot } : {}),
+          ...(baselineRecovered ? { baselineRecovered: true } : {}),
         } as Turn
       }
+
+      // Start the pre-turn capture before any tool can execute, but do not wait
+      // for Git. The fork overlaps provider/tool work exactly as before.
+      const beforeFiber = yield* snapshot.track().pipe(Effect.forkIn(scope))
 
       const last = yield* db
         .select({ ordinal: SessionCheckpointTable.ordinal })
@@ -259,7 +469,7 @@ const layer = Layer.effect(
         deletions: 0,
       }).pipe(Effect.forkIn(scope))
 
-      return { checkpointID: id, sessionID: input.sessionID, ordinal, beforeFiber: input.beforeFiber } as Turn
+      return { checkpointID: id, sessionID: input.sessionID, ordinal, beforeFiber } as Turn
     })
 
     const begin = Effect.fn("TurnCheckpoint.begin")(function* (input: {
@@ -267,6 +477,9 @@ const layer = Layer.effect(
       userMessageID: string
     }) {
       if ((yield* config.get()).snapshot === false) return undefined
+      // Lazy O(1) cache lookup after the first call; initialization only forks
+      // bounded maintenance and never puts Git reconciliation on prompt latency.
+      yield* InstanceState.get(retentionMaintenance)
 
       // Contention detection (t3 §46.3): v1 policy is detect-and-warn —
       // checkpoint accuracy is guaranteed only with one active mutating run
@@ -303,15 +516,23 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
       }
 
-      // Fork the pre-turn capture NOW — before any tool executes — but do not
-      // wait for it. The write-tree overlaps LLM streaming; finalize joins it.
-      const beforeFiber = yield* snapshot.track().pipe(Effect.forkIn(scope))
-
       // Serialize ordinal allocation + insert per session (in-memory mutex;
       // uncontended fast path is a Map lookup).
-      const turn = yield* lock(input.sessionID).withPermits(1)(allocate({ ...input, beforeFiber }))
-      active.set(input.sessionID, turn)
-      return turn
+      // A previous logical-cycle finalize mutates the same shadow repository.
+      // Wait only on that rare re-entry path; ordinary turn start remains a
+      // SQLite + fork fast path and never blocks on Git.
+      return yield* lock(input.sessionID).withPermits(1)(
+        Effect.gen(function* () {
+          // Finalization wait, row allocation/reopen, and process-local handle
+          // registration are one ownership transition. Keeping active.set()
+          // inside this critical section prevents a second begin from observing
+          // the same capturing row before its authoritative handle is visible.
+          yield* waitForFinalize(input.sessionID)
+          const turn = yield* allocate(input)
+          active.set(input.sessionID, turn)
+          return turn
+        }),
+      )
     })
 
     /**
@@ -339,14 +560,15 @@ const layer = Layer.effect(
           : undefined
       const others =
         inventory?.join("\0") ??
-        (yield* Effect.tryPromise(() => Bun.$`git ls-files --others --exclude-standard -z`.cwd(ctx.worktree).text()).pipe(
-          Effect.catch(() => Effect.succeed("")),
-        ))
+        (yield* git
+          .run(["ls-files", "--others", "--exclude-standard", "-z"], { cwd: ctx.worktree })
+          .pipe(Effect.map((result) => (result.exitCode === 0 ? result.text() : ""))))
       const candidates = others.split("\0").filter(Boolean)
       if (candidates.length === 0) return [] as Checkpoint.Excluded[]
-      const listed = yield* Effect.tryPromise(() =>
-        Bun.$`git --git-dir ${dir} ls-tree -r --name-only -z ${after}`.text(),
-      ).pipe(Effect.catch(() => Effect.succeed("")))
+      const listedResult = yield* git.run(["--git-dir", dir, "ls-tree", "-r", "--name-only", "-z", after], {
+        cwd: ctx.worktree,
+      })
+      const listed = listedResult.exitCode === 0 ? listedResult.text() : ""
       const inTree = new Set(listed.split("\0").filter(Boolean))
       const result: Checkpoint.Excluded[] = []
       const scanned = Math.min(candidates.length, MAX_EXCLUDED_SCANNED)
@@ -363,20 +585,7 @@ const layer = Layer.effect(
       return result
     })
 
-    // Guarded wrapper: marks the session as mutating the shadow repo so
-    // external consumers (tool restore) can quiesce before their own git ops.
-    const finalize = Effect.fn("TurnCheckpoint.finalize")(function* (turn: Turn, forced?: Checkpoint.Status) {
-      finalizing.add(turn.sessionID)
-      yield* finalizeInner(turn, forced).pipe(
-        Effect.ensuring(Effect.sync(() => finalizing.delete(turn.sessionID))),
-      )
-    })
-
-    const quiesce = Effect.fn("TurnCheckpoint.quiesce")(function* (sessionID: SessionID) {
-      for (let i = 0; i < 1500 && finalizing.has(sessionID); i++) {
-        yield* Effect.sleep("20 millis")
-      }
-    })
+    const quiesce = waitForFinalize
 
     const finalizeInner = Effect.fn("TurnCheckpoint.finalizeInner")(function* (turn: Turn, forced?: Checkpoint.Status) {
       // Join the pre-turn capture forked at begin. By quiescence it has long
@@ -409,8 +618,14 @@ const layer = Layer.effect(
         return
       }
 
+      // Checkpoint finalization owns compact durable metadata, not presentation
+      // patches. Full patches are deterministically regenerable from the retained
+      // immutable trees and are produced only when a caller explicitly requests
+      // mode:"diff". Avoid blob reads + unified-patch synthesis on every turn.
       const diff = before
-        ? yield* snapshot.diffFull(before, after).pipe(Effect.catch(() => Effect.succeed([] as Snapshot.FileDiff[])))
+        ? yield* snapshot
+            .diffSummary(before, after)
+            .pipe(Effect.catch(() => Effect.succeed([] as Snapshot.FileDiff[])))
         : []
 
       const additions = diff.reduce((sum, f) => sum + (f.additions ?? 0), 0)
@@ -420,24 +635,30 @@ const layer = Layer.effect(
         status: f.status ?? "modified",
         additions: f.additions ?? 0,
         deletions: f.deletions ?? 0,
-        patch:
-          (f.patch ?? "").length > MAX_CACHED_PATCH_BYTES
-            ? `${(f.patch ?? "").slice(0, MAX_CACHED_PATCH_BYTES)}\n[patch truncated; fetch checkpoint diff for full content]`
-            : f.patch ?? "",
+        // Keep the persisted Revert.FileDiff shape compatible while making the
+        // row a compact metadata projection. Patch bodies belong to on-demand
+        // snapshot diff, not the durable checkpoint index.
+        patch: "",
       }))
 
       const excluded = yield* detectExcluded(after).pipe(Effect.catch(() => Effect.succeed([] as Checkpoint.Excluded[])))
       // Forced status (aborted) wins; otherwise exclusions degrade to partial.
-      const status = forced ?? (excluded.length > 0 ? "partial" : "ready")
+      const status = forced ?? (turn.baselineRecovered || excluded.length > 0 ? "partial" : "ready")
 
       // Pin both trees against GC pruning (git gc --prune=7.days). Concurrent,
       // best-effort: a failed pin only shortens how long this checkpoint stays
       // restorable, it never breaks the row.
-      yield* Effect.all([retainTree(before), retainTree(after)], { concurrency: 2 }).pipe(Effect.ignore)
+      yield* Effect.all(
+        [
+          retainTree(before, turn.checkpointID, "before"),
+          retainTree(after, turn.checkpointID, "after"),
+        ],
+        { concurrency: 2 },
+      ).pipe(Effect.ignore)
 
       const finalizedAt = yield* Clock.currentTimeMillis
       // CAS: only the capturing owner finalizes; a fail()/reconcile race loses.
-      yield* db
+      const updated = yield* db
         .update(SessionCheckpointTable)
         .set({
           before_snapshot: before ?? null,
@@ -451,8 +672,26 @@ const layer = Layer.effect(
           finalized_at: finalizedAt,
         })
         .where(and(eq(SessionCheckpointTable.id, turn.checkpointID), eq(SessionCheckpointTable.status, "capturing")))
-        .run()
+        .returning({ id: SessionCheckpointTable.id })
+        .get()
         .pipe(Effect.orDie)
+      if (!updated) {
+        // This finalize lost ownership. Do not retire a previously committed
+        // owner ref; only discard the speculative new post-state when it cannot
+        // be the durable row's current value.
+        if (turn.previousAfterSnapshot !== after) {
+          yield* releaseTree(after, turn.checkpointID, "after").pipe(Effect.ignore)
+        }
+        return
+      }
+
+      // Replacement is now durable. Only after the row commits may the prior
+      // after-state owner ref be retired. Crash before here preserves both refs;
+      // crash after the row commit but before cleanup is safe and only leaks the
+      // stale owner ref until a later reconciliation.
+      if (turn.previousAfterSnapshot && turn.previousAfterSnapshot !== after) {
+        yield* releaseTree(turn.previousAfterSnapshot, turn.checkpointID, "after").pipe(Effect.ignore)
+      }
 
       yield* publish(Event.Finalized, {
         sessionID: turn.sessionID,
@@ -476,7 +715,11 @@ const layer = Layer.effect(
       releaseWorktree(turn.sessionID, yield* worktreeKey())
       // Performance contract: heavy work runs in a background fiber. The turn
       // result returns to the user immediately.
-      yield* finalize(turn).pipe(
+      // Mark finalization ownership before forking so a same-root re-entry cannot
+      // slip between scheduling the finalizer and its first instruction.
+      finalizing.add(turn.sessionID)
+      yield* finalizeInner(turn).pipe(
+        Effect.ensuring(Effect.sync(() => finalizing.delete(turn.sessionID))),
         Effect.catch((err) =>
           Effect.logWarning("turn checkpoint finalize failed", {
             "session.id": turn.sessionID,
@@ -496,7 +739,9 @@ const layer = Layer.effect(
       // t3 §47: aborted turn + filesystem changed ⇒ capture after state,
       // status=aborted, diff remains reviewable/revertible. Forked so interrupt
       // teardown is never blocked.
-      yield* finalize(turn, "aborted").pipe(
+      finalizing.add(sessionID)
+      yield* finalizeInner(turn, "aborted").pipe(
+        Effect.ensuring(Effect.sync(() => finalizing.delete(sessionID))),
         Effect.catch((err) =>
           Effect.logWarning("turn checkpoint aborted-finalize failed", {
             "session.id": sessionID,
@@ -572,7 +817,7 @@ const layer = Layer.effect(
         })
         .run()
         .pipe(Effect.orDie)
-      yield* retainTree(tree).pipe(Effect.ignore)
+      yield* retainTree(tree, id, "after").pipe(Effect.ignore)
       worktreeOwners.set(key, sessionID)
       yield* publish(Event.Finalized, {
         sessionID,
@@ -587,29 +832,9 @@ const layer = Layer.effect(
       return { checkpointID: id, ordinal, tree }
     })
 
-    return Service.of({ begin, finish, finishAborted, fail, safetyPoint, quiesce })
+    return Service.of({ begin, finish, finishAborted, fail, safetyPoint, quiesce, reconcileRetention })
   }),
 )
-
-/**
- * Pin a tree object in the shared shadow repo under refs/opencode/retained/<hash>.
- * Mirrors core Snapshot.retain using the V1 shadow-repo layout. Runs only on the
- * background finalize fiber.
- */
-const retainTree = Effect.fn("TurnCheckpoint.retainTree")(function* (tree: string | undefined) {
-  if (!tree) return
-  const ctx = yield* InstanceState.context
-  const dir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
-  const ref = `refs/opencode/retained/${tree}`
-  // commit-tree needs an identity; set inline to avoid relying on repo config.
-  const commit = yield* Effect.tryPromise(() =>
-    Bun.$`git -c user.name=opencode -c user.email=opencode@localhost --git-dir ${dir} commit-tree ${tree} -m checkpoint-retain`.text(),
-  ).pipe(Effect.catch(() => Effect.succeed("")))
-  if (!commit.trim()) return
-  yield* Effect.tryPromise(() => Bun.$`git --git-dir ${dir} update-ref ${ref} ${commit.trim()}`.quiet()).pipe(
-    Effect.ignore,
-  )
-})
 
 // Concrete fallback node for the canonical location map. Node identity is the
 // service key, so the server's canonical map replaces this by name at the app
@@ -624,5 +849,5 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Snapshot.node, Config.node, Database.node, EventV2Bridge.node, locationServiceMapNode],
+  deps: [Snapshot.node, Config.node, Database.node, EventV2Bridge.node, Git.node, locationServiceMapNode],
 })

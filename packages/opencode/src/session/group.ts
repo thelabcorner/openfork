@@ -3,7 +3,10 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionGroupMemberTable, SessionGroupTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SessionGroup } from "@opencode-ai/schema/session-group"
+import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { DateTime } from "effect"
 import { and, asc, eq, isNull, ne, sql } from "drizzle-orm"
 import { Effect, Layer, Context, Schema, Types } from "effect"
@@ -46,10 +49,21 @@ export class HasLockedMembersError extends Schema.TaggedErrorClass<HasLockedMemb
   },
 ) {}
 
+export class ManagedProjectionError extends Schema.TaggedErrorClass<ManagedProjectionError>()(
+  "SessionGroupManagedProjectionError",
+  {
+    code: Schema.Literal("session_group.managed_projection"),
+    message: Schema.String,
+    groupID: SessionGroup.ID,
+  },
+) {}
+
 export const Event = SessionGroup.Event
 
 type MembershipError = NotFoundError | MemberLockedError | OwnerMismatchError
-type RemoveError = NotFoundError | HasLockedMembersError | OwnerMismatchError
+type ManagedMutationError = NotFoundError | ManagedProjectionError
+type MembershipErrorWithManaged = MembershipError | ManagedProjectionError
+type RemoveError = NotFoundError | HasLockedMembersError | OwnerMismatchError | ManagedProjectionError
 type GroupPolicy = Schema.Schema.Type<typeof SessionGroup.Policy>
 
 export interface Interface {
@@ -57,7 +71,7 @@ export interface Interface {
   readonly listWithSessions: () => Effect.Effect<Detail[]>
   readonly create: (input: CreateInput) => Effect.Effect<Info>
   readonly resolveOrCreate: (input: ResolveInput) => Effect.Effect<Info>
-  readonly rename: (input: { id: ID; name: string }) => Effect.Effect<void, NotFoundError>
+  readonly rename: (input: { id: ID; name: string }) => Effect.Effect<void, ManagedMutationError>
   readonly remove: (
     id: ID,
     options?: {
@@ -66,21 +80,21 @@ export interface Interface {
       anchorSessionDeleted?: boolean
     },
   ) => Effect.Effect<void, RemoveError>
-  readonly reorder: (input: { id: ID; position: number }) => Effect.Effect<void, NotFoundError>
-  readonly addSession: (input: AddSessionInput) => Effect.Effect<void, NotFoundError>
-  readonly removeSession: (input: RemoveSessionInput) => Effect.Effect<void, MembershipError>
+  readonly reorder: (input: { id: ID; position: number }) => Effect.Effect<void, ManagedMutationError>
+  readonly addSession: (input: AddSessionInput) => Effect.Effect<void, ManagedMutationError>
+  readonly removeSession: (input: RemoveSessionInput) => Effect.Effect<void, MembershipErrorWithManaged>
   /** Internal lifecycle hook: detach a session that is being permanently deleted. */
   readonly detachDeletedSession: (sessionId: string) => Effect.Effect<void>
   readonly membershipsFor: (sessionId: string) => Effect.Effect<Detail[]>
   readonly getWithSessions: (id: ID) => Effect.Effect<Detail, NotFoundError>
-  readonly setPolicy: (input: { id: ID; policy: GroupPolicy }) => Effect.Effect<void, NotFoundError>
-  readonly reorderMembers: (input: { id: ID; sessionIds: string[] }) => Effect.Effect<void, NotFoundError>
+  readonly setPolicy: (input: { id: ID; policy: GroupPolicy }) => Effect.Effect<void, ManagedMutationError>
+  readonly reorderMembers: (input: { id: ID; sessionIds: string[] }) => Effect.Effect<void, ManagedMutationError>
   readonly capabilities: () => Effect.Effect<{ version: number; features: string[] }>
 }
 
 interface CreateInput {
   name: string
-  kind?: SessionGroup.Kind
+  kind?: SessionGroup.MutableKind
   anchorSessionId?: string
   ownerPlugin?: string
   ownerRef?: string
@@ -88,14 +102,14 @@ interface CreateInput {
 }
 
 interface ResolveInput extends CreateInput {
-  kind: SessionGroup.Kind
+  kind: SessionGroup.MutableKind
 }
 
 interface AddSessionInput {
   groupId: ID
   sessionId: string
   locked?: boolean
-  origin?: SessionGroup.MemberOrigin
+  origin?: SessionGroup.MutableMemberOrigin
   originPlugin?: string
   originRef?: string
   position?: number
@@ -109,24 +123,31 @@ interface RemoveSessionInput {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionGroup") {}
 
-const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Service> = Layer.effect(
+const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Service | SwarmV2.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
+    const swarms = yield* SwarmV2.Service
     const filename = database.filename
     let listCache: { at: number; value: Info[] } | null = null
     let detailCache: { at: number; value: Detail[] } | null = null
-    const membershipsCache = new Map<string, { at: number; value: Detail[] }>()
     const LIST_TTL = 5_000
-    const invalidate = (sessionId?: string) => {
+    const invalidate = (_sessionId?: string) => {
       listCache = null
       detailCache = null
-      if (sessionId) membershipsCache.delete(sessionId)
-      if (!sessionId) membershipsCache.clear()
     }
 
-    const list = Effect.fn("SessionGroup.list")(function* () {
+    const rejectManagedProjection = Effect.fn("SessionGroup.rejectManagedProjection")(function* (groupID: ID) {
+      if (!SessionGroup.isSwarmGroupID(groupID)) return
+      return yield* new ManagedProjectionError({
+        code: "session_group.managed_projection",
+        message: "Swarm session groups are read-only projections. Mutate membership through the Swarm domain.",
+        groupID,
+      })
+    })
+
+    const persistedList = Effect.fn("SessionGroup.persistedList")(function* () {
       const now = Date.now()
       if (listCache && now - listCache.at < LIST_TTL) return listCache.value
       const read = (backfill: Database.DatabaseShape) =>
@@ -149,7 +170,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       return value
     })
 
-    const listWithSessions = Effect.fn("SessionGroup.listWithSessions")(function* () {
+    const persistedListWithSessions = Effect.fn("SessionGroup.persistedListWithSessions")(function* () {
       const now = Date.now()
       if (detailCache && now - detailCache.at < LIST_TTL) return detailCache.value
       const read = (backfill: Database.DatabaseShape) =>
@@ -201,6 +222,22 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       detailCache = { at: now, value }
       listCache = { at: now, value: value.map((detail) => detail.group) }
       return value
+    })
+
+    // Swarm groups are a live virtual projection owned by Core Swarm. Keep them
+    // outside the persisted SessionGroup cache: SessionGroup invalidation does
+    // not own Swarm events, and caching the composed result would make rebinds,
+    // membership changes, and coordinator changes stale for up to LIST_TTL.
+    const list = Effect.fn("SessionGroup.list")(function* () {
+      const persisted = yield* persistedList()
+      const virtual = (yield* swarms.navigation()).map((item) => fromSwarmNavigation(item).group)
+      return sortGroupInfos([...persisted, ...virtual])
+    })
+
+    const listWithSessions = Effect.fn("SessionGroup.listWithSessions")(function* () {
+      const persisted = yield* persistedListWithSessions()
+      const virtual = (yield* swarms.navigation()).map(fromSwarmNavigation)
+      return sortDetails([...persisted, ...virtual])
     })
 
     const create = Effect.fn("SessionGroup.create")(function* (input: CreateInput) {
@@ -360,6 +397,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const rename = Effect.fn("SessionGroup.rename")(function* (input: { id: ID; name: string }) {
+      yield* rejectManagedProjection(input.id)
       const row = yield* requireGroup(database.db, input.id)
       const now = Date.now()
       yield* database.db
@@ -381,6 +419,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         anchorSessionDeleted?: boolean
       },
     ) {
+      yield* rejectManagedProjection(id)
       const group = yield* requireGroup(database.db, id)
       const locked = yield* database.db
         .select({ session_id: SessionGroupMemberTable.session_id })
@@ -434,6 +473,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const reorder = Effect.fn("SessionGroup.reorder")(function* (input: { id: ID; position: number }) {
+      yield* rejectManagedProjection(input.id)
       const row = yield* requireGroup(database.db, input.id)
       const now = Date.now()
       yield* database.db
@@ -448,6 +488,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const addSession = Effect.fn("SessionGroup.addSession")(function* (input: AddSessionInput) {
+      yield* rejectManagedProjection(input.groupId)
       yield* requireGroup(database.db, input.groupId)
       const sessionID = SessionID.make(input.sessionId)
       const session = yield* database.db
@@ -486,6 +527,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const removeSession = Effect.fn("SessionGroup.removeSession")(function* (input: RemoveSessionInput) {
+      yield* rejectManagedProjection(input.groupId)
       yield* requireGroup(database.db, input.groupId)
       const sessionID = SessionID.make(input.sessionId)
       const member = yield* database.db
@@ -616,23 +658,21 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const membershipsFor = Effect.fn("SessionGroup.membershipsFor")(function* (sessionId: string) {
-      const now = Date.now()
-      const cached = membershipsCache.get(sessionId)
-      if (cached && now - cached.at < LIST_TTL) return cached.value
-      const value = (yield* listWithSessions()).filter((detail) =>
+      return (yield* listWithSessions()).filter((detail) =>
         detail.sessions.some((member) => member.id === sessionId),
       )
-      membershipsCache.set(sessionId, { at: now, value })
-      return value
     })
 
     const getWithSessions = Effect.fn("SessionGroup.getWithSessions")(function* (id: ID) {
-      const detail = (yield* listWithSessions()).find((item) => item.group.id === id)
+      const detail = SessionGroup.isSwarmGroupID(id)
+        ? (yield* swarms.navigation()).map(fromSwarmNavigation).find((item) => item.group.id === id)
+        : (yield* persistedListWithSessions()).find((item) => item.group.id === id)
       if (!detail) return yield* new NotFoundError({ message: `Session group not found: ${id}` })
       return detail
     })
 
     const setPolicy = Effect.fn("SessionGroup.setPolicy")(function* (input: { id: ID; policy: GroupPolicy }) {
+      yield* rejectManagedProjection(input.id)
       const row = yield* requireGroup(database.db, input.id)
       const now = Date.now()
       yield* database.db
@@ -650,6 +690,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       id: ID
       sessionIds: string[]
     }) {
+      yield* rejectManagedProjection(input.id)
       yield* requireGroup(database.db, input.id)
       yield* Effect.forEach(
         input.sessionIds,
@@ -725,8 +766,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         const goalID = typeof input.metadata?.goalID === "string" ? input.metadata.goalID : undefined
         return goalID ? `goal:${goalID}` : undefined
       }
-      const ownerID =
-        typeof input.metadata?.specialAgentOwnerID === "string" ? input.metadata.specialAgentOwnerID : input.sessionID
+      const ownerID = SessionMetadataOwnership.specialAgentOwnerID(input.metadata ?? undefined) ?? input.sessionID
       return `${input.agent}:${ownerID}`
     }
 
@@ -734,7 +774,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       info: SessionV1.SessionInfo,
     ) {
       if (!info.parentID) return
-      const agent = typeof info.metadata?.specialAgent === "string" ? info.metadata.specialAgent : undefined
+      const agent = SessionMetadataOwnership.specialAgentKind(info.metadata ?? undefined)
       if (!agent) return
       const originRef = specialAgentOriginRef({ sessionID: info.id, metadata: info.metadata, agent })
       if (!originRef) return
@@ -827,7 +867,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .pipe(Effect.orDie)
       for (const candidate of candidates) {
         if (!candidate.parentID) continue
-        const agent = typeof candidate.metadata?.specialAgent === "string" ? candidate.metadata.specialAgent : undefined
+        const agent = SessionMetadataOwnership.specialAgentKind(candidate.metadata ?? undefined)
         if (!agent) continue
         const originRef = specialAgentOriginRef({ sessionID: candidate.id, metadata: candidate.metadata, agent })
         if (!originRef) continue
@@ -933,6 +973,43 @@ function fromMemberRow(row: {
   }
 }
 
+function fromSwarmNavigation(input: SwarmModel.NavigationGroup): Detail {
+  return {
+    group: {
+      id: SessionGroup.groupIDForSwarm(input.swarm.id),
+      name: input.swarm.name,
+      position: DateTime.toEpochMillis(input.swarm.time.created),
+      kind: "swarm",
+      ownerRef: input.swarm.id,
+      anchorSessionID: input.coordinatorSessionID,
+      time: input.swarm.time,
+    },
+    sessions: input.members.map((member) => ({
+      id: member.sessionID,
+      slug: member.slug,
+      projectID: member.projectID,
+      directory: member.directory,
+      parentID: member.parentID,
+      title: member.title,
+      version: member.version,
+      time: member.time,
+      locked: true,
+      origin: "swarm",
+      originRef: member.memberID,
+      position: member.position,
+      timeAdded: member.timeAdded,
+    })),
+  }
+}
+
+function sortGroupInfos(groups: Info[]) {
+  return groups.sort((left, right) => left.position - right.position)
+}
+
+function sortDetails(details: Detail[]) {
+  return details.sort((left, right) => left.group.position - right.group.position)
+}
+
 function requireGroup(database: Database.DatabaseShape, id: ID) {
   return database
     .select()
@@ -947,6 +1024,6 @@ function requireGroup(database: Database.DatabaseShape, id: ID) {
     )
 }
 
-export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer, deps: [Database.node, EventV2Bridge.node, SwarmV2.node] })
 
 export * as SessionGroup from "./group"

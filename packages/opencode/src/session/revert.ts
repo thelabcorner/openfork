@@ -1,6 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect, Layer, Context, Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Snapshot } from "../snapshot"
 import { Storage } from "@/storage/storage"
@@ -44,7 +45,15 @@ const layer = Layer.effect(
       let rev: Session.Info["revert"]
       const patches: Snapshot.Patch[] = []
       for (const msg of all) {
-        if (msg.info.role === "user") lastUser = msg.info
+        // Revert snapping is a live rollback boundary, not merely a
+        // presentation-user lookup. Historical imported user rows remain
+        // visible but cannot become the current rollback owner.
+        if (
+          SessionTurnProvenance.isSemanticUserTurn(msg) &&
+          SessionTurnProvenance.isWorkerPromptTurn(msg) &&
+          msg.info.role === "user"
+        )
+          lastUser = msg.info
         const remaining = []
         for (const part of msg.parts) {
           if (rev) {

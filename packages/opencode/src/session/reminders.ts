@@ -1,5 +1,6 @@
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Effect } from "effect"
 import { Agent } from "@/agent/agent"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -12,6 +13,15 @@ import PROMPT_PLAN from "./prompt/plan.txt"
 import BUILD_SWITCH from "./prompt/build-switch.txt"
 import PLAN_MODE from "./prompt/plan-mode.txt"
 
+/**
+ * Reminder directives decorate the active execution objective, not the latest
+ * row that merely presents as a user message. Historical/imported semantic
+ * users retain transcript authorship but cannot regain live worker authority.
+ */
+export function targetWorkerTurn(messages: readonly SessionV1.WithParts[]) {
+  return messages.findLast(SessionTurnProvenance.isWorkerPromptTurn)
+}
+
 export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   messages: SessionV1.WithParts[]
   agent: Agent.Info
@@ -20,7 +30,10 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   const flags = yield* RuntimeFlags.Service
   const fsys = yield* FSUtil.Service
   const sessions = yield* Session.Service
-  const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
+  // Reminder bytes decorate the active execution turn. Target the canonical
+  // live worker root rather than the latest presentation-user row: imported
+  // historical users remain visible but must never receive new live guidance.
+  const userMessage = targetWorkerTurn(input.messages)
   if (!userMessage) return input.messages
 
   if (!flags.experimentalPlanMode) {

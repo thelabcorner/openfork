@@ -1,6 +1,7 @@
 export * as EffectiveContextCompiler from "./compiler"
 
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import type { WithParts } from "@opencode-ai/schema/session-v1"
 import { SessionContextStateTable } from "@opencode-ai/core/session/sql"
 import { Database } from "@opencode-ai/core/database/database"
@@ -20,6 +21,9 @@ function hasSignedReasoningInMessage(msg: WithParts): boolean {
 }
 
 export function canEditMessage(msg: WithParts): { allowed: boolean; reason?: string } {
+  if (SessionTurnProvenance.hasStateSemanticsTurn(msg)) {
+    return { allowed: false, reason: "Replaceable host state is owned by its authoritative domain and cannot be edited" }
+  }
   if (hasSignedReasoningInMessage(msg)) {
     return { allowed: false, reason: "Message contains signed reasoning — editing would invalidate provider signature" }
   }
@@ -27,9 +31,32 @@ export function canEditMessage(msg: WithParts): { allowed: boolean; reason?: str
 }
 
 export function canExcludeMessage(msg: WithParts): { allowed: boolean; reason?: string } {
+  if (SessionTurnProvenance.hasStateSemanticsTurn(msg)) {
+    return { allowed: false, reason: "Replaceable host state is owned by its authoritative domain and cannot be excluded" }
+  }
   if (hasSignedReasoningInMessage(msg)) {
     return { allowed: false, reason: "Message contains signed reasoning — excluding would shift signature positions" }
   }
+  return { allowed: true }
+}
+
+export function canApplyContextOperation(
+  msg: WithParts,
+  type: string,
+): { allowed: boolean; reason?: string } {
+  // Restorative operations remain allowed so old/bad overlay rows can be
+  // cleared. New mutations against authoritative STATE are never admissible.
+  if (
+    SessionTurnProvenance.hasStateSemanticsTurn(msg) &&
+    (type === "message.exclude" || type === "message.pin" || type === "text.replace" || type === "tool.collapse")
+  ) {
+    return {
+      allowed: false,
+      reason: "Replaceable host state is owned by its authoritative domain and cannot be mutated by context overlays",
+    }
+  }
+  if (type === "message.exclude") return canExcludeMessage(msg)
+  if (type === "text.replace") return canEditMessage(msg)
   return { allowed: true }
 }
 
@@ -59,6 +86,19 @@ export function compile(input: { messages: WithParts[]; state: StateMap }): {
 
   for (const msg of input.messages) {
     const s = input.state.get(msg.info.id)
+
+    // Domain-owned STATE is a materialized projection of current authoritative
+    // meaning, not user-editable transcript history. Applying a historical
+    // exclude/edit/pin overlay to the newest snapshot could expose an older
+    // snapshot and silently resurrect stale state. Ignore overlays completely;
+    // the Goal/domain reconciler is the only writer of these bytes.
+    if (SessionTurnProvenance.hasStateSemanticsTurn(msg)) {
+      if (s?.excluded || s?.pinned || s?.overrideData) {
+        warnings.push(`Ignored context overlay for authoritative state projection ${msg.info.id}`)
+      }
+      effective.push(msg)
+      continue
+    }
 
     // Pinned messages are never excluded, even if marked excluded
     if (s?.pinned) pinned.push(msg.info.id)
@@ -202,7 +242,10 @@ export function groupTurns(messages: WithParts[]): TurnAtom[] {
   const users: WithParts[] = []
 
   for (const msg of messages) {
-    if (msg.info.role === "user") {
+    // Structural conversation atom: assistants parent to V1 role=user ids,
+    // including host-owned synthetic turns. Do not replace this with semantic
+    // user ownership; provenance is used by human-attribution consumers.
+    if (msg.info.role === "user" && !SessionTurnProvenance.hasStateSemanticsInfo(msg.info)) {
       users.push(msg)
     } else if (msg.info.role === "assistant") {
       const parentID = (msg.info as SessionV1.Assistant).parentID
