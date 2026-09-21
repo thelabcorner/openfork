@@ -158,7 +158,12 @@ export type AgentsListOutput = {
   }
   readonly data: ReadonlyArray<{
     readonly id: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
     readonly request: {
       readonly headers: { readonly [x: string]: string }
       readonly body: { readonly [x: string]: JsonValue }
@@ -285,7 +290,12 @@ export type SessionsListOutput = {
     readonly parentID?: string
     readonly projectID: string
     readonly agent?: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -360,7 +370,12 @@ export type SessionsSearchOutput = {
       readonly parentID?: string
       readonly projectID: string
       readonly agent?: string
-      readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+      readonly model?: {
+        readonly id: string
+        readonly providerID: string
+        readonly accountID?: string
+        readonly variant?: string
+      }
       readonly cost: number
       readonly tokens: {
         readonly input: number
@@ -413,25 +428,45 @@ export type SessionsCreateInput = {
   readonly id?: {
     readonly id?: string | null
     readonly agent?: string | null
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["id"]
   readonly agent?: {
     readonly id?: string | null
     readonly agent?: string | null
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["agent"]
   readonly model?: {
     readonly id?: string | null
     readonly agent?: string | null
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["model"]
   readonly location?: {
     readonly id?: string | null
     readonly agent?: string | null
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["location"]
 }
@@ -442,7 +477,12 @@ export type SessionsCreateOutput = {
     readonly parentID?: string
     readonly projectID: string
     readonly agent?: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -475,6 +515,71 @@ export type SessionsActiveOutput = {
   readonly data: { readonly [x: string]: { readonly type: "running" | "paused" } }
 }["data"]
 
+export type SessionsTelemetryInput = {
+  readonly sessionIDs: { readonly sessionIDs: ReadonlyArray<string> }["sessionIDs"]
+}
+
+export type SessionsTelemetryOutput = {
+  readonly data: {
+    readonly [x: string]: {
+      readonly sessionID: string
+      readonly phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      readonly phaseStartedAt?: number | undefined
+      readonly updatedAt: number
+      readonly model?:
+        | {
+            readonly providerID: string
+            readonly modelID: string
+            readonly name?: string | undefined
+            readonly variant?: string | undefined
+            readonly contextLimit?: number | undefined
+          }
+        | undefined
+      readonly context?:
+        | {
+            readonly model: {
+              readonly providerID: string
+              readonly modelID: string
+              readonly name?: string | undefined
+              readonly variant?: string | undefined
+              readonly contextLimit?: number | undefined
+            }
+            readonly tokens: {
+              readonly input: number
+              readonly output: number
+              readonly reasoning: number
+              readonly cache: { readonly read: number; readonly write: number }
+            }
+          }
+        | undefined
+      readonly step?:
+        | {
+            readonly assistantMessageID?: string | undefined
+            readonly requestSentAt?: number | undefined
+            readonly firstTokenAt?: number | undefined
+            readonly streamedAt?: number | undefined
+            readonly completedAt?: number | undefined
+            readonly visibleChars: number
+            readonly reasoningChars: number
+            readonly generatedMs: number
+            readonly toolMs: number
+            readonly cost?: number | undefined
+            readonly tokens?:
+              | {
+                  readonly input: number
+                  readonly output: number
+                  readonly reasoning: number
+                  readonly cache: { readonly read: number; readonly write: number }
+                }
+              | undefined
+          }
+        | undefined
+      readonly generatedMs: number
+      readonly toolMs: number
+    }
+  }
+}["data"]
+
 export type SessionsGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionsGetOutput = {
@@ -483,7 +588,12 @@ export type SessionsGetOutput = {
     readonly parentID?: string
     readonly projectID: string
     readonly agent?: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
     readonly cost: number
     readonly tokens: {
       readonly input: number
@@ -522,7 +632,12 @@ export type SessionsSwitchAgentOutput = void
 export type SessionsSwitchModelInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
   readonly model: {
-    readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
   }["model"]
 }
 
@@ -624,6 +739,15 @@ export type SessionsPromptOutput = {
       }>
     }
     readonly delivery: "steer" | "queue"
+    readonly provenance?:
+      | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+      | {
+          readonly owner: "host"
+          readonly source: string
+          readonly sourceMessageID?: string
+          readonly ref?: string
+          readonly lifetime?: "historical"
+        }
     readonly timeCreated: number
     readonly promotedSeq?: number
   }
@@ -676,6 +800,15 @@ export type SessionsContextOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "agent-switched"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly agent: string
       }
     | {
@@ -683,12 +816,35 @@ export type SessionsContextOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "model-switched"
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
       }
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -707,8 +863,24 @@ export type SessionsContextOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly sessionID: string
         readonly text: string
+        readonly files?: ReadonlyArray<{
+          readonly uri: string
+          readonly mime: string
+          readonly name?: string
+          readonly description?: string
+          readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+        }>
         readonly type: "synthetic"
       }
     | {
@@ -739,7 +911,12 @@ export type SessionsContextOutput = {
         }
         readonly type: "assistant"
         readonly agent: string
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
           | {
@@ -819,6 +996,15 @@ export type SessionsContextOutput = {
       }
     | {
         readonly type: "compaction"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly reason: "auto" | "manual"
         readonly summary: string
         readonly recent: string
@@ -847,6 +1033,15 @@ export type SessionsHistoryOutput = {
           readonly timestamp: number
           readonly sessionID: string
           readonly messageID: string
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
           readonly agent: string
         }
       }
@@ -860,7 +1055,21 @@ export type SessionsHistoryOutput = {
           readonly timestamp: number
           readonly sessionID: string
           readonly messageID: string
-          readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
+          readonly model: {
+            readonly id: string
+            readonly providerID: string
+            readonly accountID?: string
+            readonly variant?: string
+          }
         }
       }
     | {
@@ -902,6 +1111,15 @@ export type SessionsHistoryOutput = {
             }>
           }
           readonly delivery: "steer" | "queue"
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
         }
       }
     | {
@@ -929,6 +1147,115 @@ export type SessionsHistoryOutput = {
             }>
           }
           readonly delivery: "steer" | "queue"
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.synthetic.admitted"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly messageID: string
+          readonly content: {
+            readonly text: string
+            readonly files?: ReadonlyArray<{
+              readonly uri: string
+              readonly mime: string
+              readonly name?: string
+              readonly description?: string
+              readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+            }>
+          }
+          readonly origin: {
+            readonly producer: string
+            readonly actor:
+              | { readonly type: "host" }
+              | { readonly type: "session"; readonly sessionID: string; readonly messageID?: string }
+            readonly ref?: string
+            readonly cause?: { readonly sessionID: string; readonly messageID: string }
+          }
+          readonly delegated?: { readonly authorizedAgentNames?: ReadonlyArray<string> }
+          readonly execution?: {
+            readonly agent: string
+            readonly model: {
+              readonly id: string
+              readonly providerID: string
+              readonly accountID?: string
+              readonly variant?: string
+            }
+          }
+          readonly delivery: "steer" | "queue"
+          readonly admissionClass: "host" | "automatic"
+          readonly userPreemptible: boolean
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.synthetic.promoted"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly messageID: string
+          readonly content: {
+            readonly text: string
+            readonly files?: ReadonlyArray<{
+              readonly uri: string
+              readonly mime: string
+              readonly name?: string
+              readonly description?: string
+              readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+            }>
+          }
+          readonly origin: {
+            readonly producer: string
+            readonly actor:
+              | { readonly type: "host" }
+              | { readonly type: "session"; readonly sessionID: string; readonly messageID?: string }
+            readonly ref?: string
+            readonly cause?: { readonly sessionID: string; readonly messageID: string }
+          }
+          readonly delegated?: { readonly authorizedAgentNames?: ReadonlyArray<string> }
+          readonly execution?: {
+            readonly agent: string
+            readonly model: {
+              readonly id: string
+              readonly providerID: string
+              readonly accountID?: string
+              readonly variant?: string
+            }
+          }
+          readonly delivery: "steer" | "queue"
+          readonly admissionClass: "host" | "automatic"
+          readonly userPreemptible: boolean
+          readonly promotedAt?: number
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.synthetic.revoked"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly messageID: string
+          readonly reason: "cancelled" | "superseded" | "user_superseded" | "expired" | "policy"
         }
       }
     | {
@@ -955,6 +1282,15 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly messageID: string
           readonly text: string
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
         }
       }
     | {
@@ -995,7 +1331,12 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly assistantMessageID: string
           readonly agent: string
-          readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+          readonly model: {
+            readonly id: string
+            readonly providerID: string
+            readonly accountID?: string
+            readonly variant?: string
+          }
           readonly snapshot?: string
           readonly requestSentAt?: number
         }
@@ -1238,6 +1579,15 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly messageID: string
           readonly reason: "auto" | "manual"
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
         }
       }
     | {
@@ -1253,6 +1603,15 @@ export type SessionsHistoryOutput = {
           readonly reason: "auto" | "manual"
           readonly text: string
           readonly recent: string
+          readonly provenance?:
+            | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+            | {
+                readonly owner: "host"
+                readonly source: string
+                readonly sourceMessageID?: string
+                readonly ref?: string
+                readonly lifetime?: "historical"
+              }
         }
       }
     | {
@@ -1319,6 +1678,22 @@ export type SessionsHistoryOutput = {
         readonly location?: { readonly directory: string; readonly workspaceID?: string }
         readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
       }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.execution-boundary.updated"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly boundary: ReadonlyArray<{
+            readonly action: string
+            readonly resource: string
+            readonly effect: "allow" | "deny" | "ask"
+          }>
+        }
+      }
   >
   readonly hasMore: boolean
 }
@@ -1339,6 +1714,15 @@ export type SessionsEventsOutput =
         readonly timestamp: number
         readonly sessionID: string
         readonly messageID: string
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly agent: string
       }
     }
@@ -1352,7 +1736,21 @@ export type SessionsEventsOutput =
         readonly timestamp: number
         readonly sessionID: string
         readonly messageID: string
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
       }
     }
   | {
@@ -1394,6 +1792,15 @@ export type SessionsEventsOutput =
           }>
         }
         readonly delivery: "steer" | "queue"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
       }
     }
   | {
@@ -1421,6 +1828,115 @@ export type SessionsEventsOutput =
           }>
         }
         readonly delivery: "steer" | "queue"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.synthetic.admitted"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly messageID: string
+        readonly content: {
+          readonly text: string
+          readonly files?: ReadonlyArray<{
+            readonly uri: string
+            readonly mime: string
+            readonly name?: string
+            readonly description?: string
+            readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+          }>
+        }
+        readonly origin: {
+          readonly producer: string
+          readonly actor:
+            | { readonly type: "host" }
+            | { readonly type: "session"; readonly sessionID: string; readonly messageID?: string }
+          readonly ref?: string
+          readonly cause?: { readonly sessionID: string; readonly messageID: string }
+        }
+        readonly delegated?: { readonly authorizedAgentNames?: ReadonlyArray<string> }
+        readonly execution?: {
+          readonly agent: string
+          readonly model: {
+            readonly id: string
+            readonly providerID: string
+            readonly accountID?: string
+            readonly variant?: string
+          }
+        }
+        readonly delivery: "steer" | "queue"
+        readonly admissionClass: "host" | "automatic"
+        readonly userPreemptible: boolean
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.synthetic.promoted"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly messageID: string
+        readonly content: {
+          readonly text: string
+          readonly files?: ReadonlyArray<{
+            readonly uri: string
+            readonly mime: string
+            readonly name?: string
+            readonly description?: string
+            readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+          }>
+        }
+        readonly origin: {
+          readonly producer: string
+          readonly actor:
+            | { readonly type: "host" }
+            | { readonly type: "session"; readonly sessionID: string; readonly messageID?: string }
+          readonly ref?: string
+          readonly cause?: { readonly sessionID: string; readonly messageID: string }
+        }
+        readonly delegated?: { readonly authorizedAgentNames?: ReadonlyArray<string> }
+        readonly execution?: {
+          readonly agent: string
+          readonly model: {
+            readonly id: string
+            readonly providerID: string
+            readonly accountID?: string
+            readonly variant?: string
+          }
+        }
+        readonly delivery: "steer" | "queue"
+        readonly admissionClass: "host" | "automatic"
+        readonly userPreemptible: boolean
+        readonly promotedAt?: number
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.synthetic.revoked"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly messageID: string
+        readonly reason: "cancelled" | "superseded" | "user_superseded" | "expired" | "policy"
       }
     }
   | {
@@ -1447,6 +1963,15 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly messageID: string
         readonly text: string
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
       }
     }
   | {
@@ -1487,7 +2012,12 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly assistantMessageID: string
         readonly agent: string
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
         readonly snapshot?: string
         readonly requestSentAt?: number
       }
@@ -1730,6 +2260,15 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly messageID: string
         readonly reason: "auto" | "manual"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
       }
     }
   | {
@@ -1745,6 +2284,15 @@ export type SessionsEventsOutput =
         readonly reason: "auto" | "manual"
         readonly text: string
         readonly recent: string
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
       }
     }
   | {
@@ -1811,6 +2359,22 @@ export type SessionsEventsOutput =
       readonly location?: { readonly directory: string; readonly workspaceID?: string }
       readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
     }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.execution-boundary.updated"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly boundary: ReadonlyArray<{
+          readonly action: string
+          readonly resource: string
+          readonly effect: "allow" | "deny" | "ask"
+        }>
+      }
+    }
 
 export type SessionsInterruptInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
@@ -1827,11 +2391,21 @@ export type SessionsResumeOutput = void
 export type SessionsRegenerateTitleInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
   readonly model?: {
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly prompt?: string | null
   }["model"]
   readonly prompt?: {
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    } | null
     readonly prompt?: string | null
   }["prompt"]
 }
@@ -1850,6 +2424,15 @@ export type SessionsMessageOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "agent-switched"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly agent: string
       }
     | {
@@ -1857,12 +2440,35 @@ export type SessionsMessageOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "model-switched"
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
       }
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -1881,8 +2487,24 @@ export type SessionsMessageOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly sessionID: string
         readonly text: string
+        readonly files?: ReadonlyArray<{
+          readonly uri: string
+          readonly mime: string
+          readonly name?: string
+          readonly description?: string
+          readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+        }>
         readonly type: "synthetic"
       }
     | {
@@ -1913,7 +2535,12 @@ export type SessionsMessageOutput = {
         }
         readonly type: "assistant"
         readonly agent: string
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
           | {
@@ -1993,6 +2620,15 @@ export type SessionsMessageOutput = {
       }
     | {
         readonly type: "compaction"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly reason: "auto" | "manual"
         readonly summary: string
         readonly recent: string
@@ -2173,6 +2809,15 @@ export type MessagesListOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "agent-switched"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly agent: string
       }
     | {
@@ -2180,12 +2825,35 @@ export type MessagesListOutput = {
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
         readonly type: "model-switched"
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
       }
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly text: string
         readonly files?: ReadonlyArray<{
           readonly uri: string
@@ -2204,8 +2872,24 @@ export type MessagesListOutput = {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
         readonly time: { readonly created: number }
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly sessionID: string
         readonly text: string
+        readonly files?: ReadonlyArray<{
+          readonly uri: string
+          readonly mime: string
+          readonly name?: string
+          readonly description?: string
+          readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+        }>
         readonly type: "synthetic"
       }
     | {
@@ -2236,7 +2920,12 @@ export type MessagesListOutput = {
         }
         readonly type: "assistant"
         readonly agent: string
-        readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly model: {
+          readonly id: string
+          readonly providerID: string
+          readonly accountID?: string
+          readonly variant?: string
+        }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
           | {
@@ -2316,6 +3005,15 @@ export type MessagesListOutput = {
       }
     | {
         readonly type: "compaction"
+        readonly provenance?:
+          | { readonly owner: "user"; readonly source: string; readonly lifetime?: "historical" }
+          | {
+              readonly owner: "host"
+              readonly source: string
+              readonly sourceMessageID?: string
+              readonly ref?: string
+              readonly lifetime?: "historical"
+            }
         readonly reason: "auto" | "manual"
         readonly summary: string
         readonly recent: string
@@ -2344,6 +3042,7 @@ export type ModelsListOutput = {
     readonly providerID: string
     readonly family?: string
     readonly name: string
+    readonly primitive?: "language" | "system-one"
     readonly api:
       | {
           readonly id: string
@@ -3003,7 +3702,12 @@ export type CommandsListOutput = {
     readonly template: string
     readonly description?: string
     readonly agent?: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
     readonly subtask?: boolean
   }>
 }

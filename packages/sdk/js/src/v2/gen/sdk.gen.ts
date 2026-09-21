@@ -121,6 +121,19 @@ import type {
   GlobalEventResponses,
   GlobalHealthErrors,
   GlobalHealthResponses,
+  GlobalOxpActivitiesErrors,
+  GlobalOxpActivitiesResponses,
+  GlobalOxpActivityDeleteErrors,
+  GlobalOxpActivityDeleteResponses,
+  GlobalOxpActivityGetErrors,
+  GlobalOxpActivityGetResponses,
+  GlobalOxpActivityPatch,
+  GlobalOxpActivityUpdateErrors,
+  GlobalOxpActivityUpdateResponses,
+  GlobalOxpInvocationsErrors,
+  GlobalOxpInvocationsResponses,
+  GlobalOxpResourceErrors,
+  GlobalOxpResourceResponses,
   GlobalPreferencesGetErrors,
   GlobalPreferencesGetResponses,
   GlobalPreferencesUpdateErrors,
@@ -129,6 +142,8 @@ import type {
   GlobalProjectsResponses,
   GlobalResetLocalDataErrors,
   GlobalResetLocalDataResponses,
+  GlobalSessionGetErrors,
+  GlobalSessionGetResponses,
   GlobalSessionRootsErrors,
   GlobalSessionRootsResponses,
   GlobalSessionTelemetryErrors,
@@ -147,6 +162,8 @@ import type {
   GoalCriterionErrors,
   GoalCriterionResponses,
   GoalCriterionStatus,
+  GoalDispatchErrors,
+  GoalDispatchResponses,
   GoalEvidenceErrors,
   GoalEvidenceResponses,
   GoalFocusedErrors,
@@ -197,7 +214,38 @@ import type {
   ModelPreferencesPatch,
   ModelRef,
   MoveSessionDestination,
+  OfxpDiscoveryServerSeedsErrors,
+  OfxpDiscoveryServerSeedsResponses,
+  OfxpFinalizeIdentityRotationErrors,
+  OfxpFinalizeIdentityRotationResponses,
+  OfxpPairErrors,
+  OfxpPairingCancelErrors,
+  OfxpPairingCancelResponses,
+  OfxpPairingConfirmErrors,
+  OfxpPairingConfirmResponses,
+  OfxpPairResponses,
+  OfxpPeerGrantErrors,
+  OfxpPeerGrantResponses,
+  OfxpPeerRevokeErrors,
+  OfxpPeerRevokeResponses,
+  OfxpPeerRootAddErrors,
+  OfxpPeerRootAddResponses,
+  OfxpPeerRootRemoveErrors,
+  OfxpPeerRootRemoveResponses,
+  OfxpRotateIdentityErrors,
+  OfxpRotateIdentityResponses,
+  OfxpRuntimeErrors,
+  OfxpRuntimeResponses,
+  OfxpSettingsGrantPayload,
+  OfxpSettingsIdentityMutationPayload,
+  OfxpSettingsRevokePayload,
+  OfxpSettingsRootPayload,
+  OfxpSettingsRuntimePayload,
+  OfxpSettingsServerSeedsPayload,
+  OfxpStateErrors,
+  OfxpStateResponses,
   OutputFormat,
+  OxpActivityLinkKind,
   PairBeginResponses,
   PairClaimErrors,
   PairClaimResponses,
@@ -281,6 +329,51 @@ import type {
   QuotaGetResponses,
   QuotaProvidersErrors,
   QuotaProvidersResponses,
+  RevisionDraftConsumeErrors,
+  RevisionDraftConsumeResponses,
+  RevisionDraftRecoverErrors,
+  RevisionDraftRecoverResponses,
+  ScheduledTaskAcknowledgeErrors,
+  ScheduledTaskAcknowledgeResponses,
+  ScheduledTaskAction,
+  ScheduledTaskAgendaErrors,
+  ScheduledTaskAgendaResponses,
+  ScheduledTaskClearBindingErrors,
+  ScheduledTaskClearBindingResponses,
+  ScheduledTaskCreateErrors,
+  ScheduledTaskCreateResponses,
+  ScheduledTaskEnabledErrors,
+  ScheduledTaskEnabledResponses,
+  ScheduledTaskGetBindingErrors,
+  ScheduledTaskGetBindingResponses,
+  ScheduledTaskGetControlErrors,
+  ScheduledTaskGetControlResponses,
+  ScheduledTaskGetErrors,
+  ScheduledTaskGetResponses,
+  ScheduledTaskInboxErrors,
+  ScheduledTaskInboxResponses,
+  ScheduledTaskListErrors,
+  ScheduledTaskListResponses,
+  ScheduledTaskPolicy,
+  ScheduledTaskPreviewErrors,
+  ScheduledTaskPreviewResponses,
+  ScheduledTaskRemoveErrors,
+  ScheduledTaskRemoveResponses,
+  ScheduledTaskRunNowErrors,
+  ScheduledTaskRunNowResponses,
+  ScheduledTaskRunsErrors,
+  ScheduledTaskRunsResponses,
+  ScheduledTaskScheduleInput,
+  ScheduledTaskSessionCandidatesErrors,
+  ScheduledTaskSessionCandidatesResponses,
+  ScheduledTaskSessionPolicy,
+  ScheduledTaskSetControlErrors,
+  ScheduledTaskSetControlResponses,
+  ScheduledTaskTarget,
+  ScheduledTaskUnreadCountErrors,
+  ScheduledTaskUnreadCountResponses,
+  ScheduledTaskUpdateErrors,
+  ScheduledTaskUpdateResponses,
   SessionAbortErrors,
   SessionAbortResponses,
   SessionChildrenErrors,
@@ -324,6 +417,8 @@ import type {
   SessionGroupListDetailsResponses,
   SessionGroupListErrors,
   SessionGroupListResponses,
+  SessionGroupMutableKind,
+  SessionGroupMutableMemberOrigin,
   SessionGroupPolicy,
   SessionGroupRemoveErrors,
   SessionGroupRemoveResponses,
@@ -377,6 +472,45 @@ import type {
   SessionUpdateErrors,
   SessionUpdateResponses,
   SubtaskPartInput,
+  SwarmBlackboardErrors,
+  SwarmBlackboardResponses,
+  SwarmClaimsErrors,
+  SwarmClaimsResponses,
+  SwarmDelegateErrors,
+  SwarmDelegateResponses,
+  SwarmDeliverablesErrors,
+  SwarmDeliverablesResponses,
+  SwarmDependencyRequirement,
+  SwarmDetailErrors,
+  SwarmDetailResponses,
+  SwarmListErrors,
+  SwarmListResponses,
+  SwarmMemberAddErrors,
+  SwarmMemberAddResponses,
+  SwarmMemberCapabilities,
+  SwarmMemberConfigureErrors,
+  SwarmMemberConfigureResponses,
+  SwarmMemberExecutionProfile,
+  SwarmMemberLifecycleErrors,
+  SwarmMemberLifecycleResponses,
+  SwarmMessagesErrors,
+  SwarmMessagesResponses,
+  SwarmPolicy,
+  SwarmRecoverErrors,
+  SwarmRecoverResponses,
+  SwarmRunsErrors,
+  SwarmRunsResponses,
+  SwarmStatus,
+  SwarmSummaryErrors,
+  SwarmSummaryResponses,
+  SwarmTaskAcceptance,
+  SwarmTaskCreateErrors,
+  SwarmTaskCreateResponses,
+  SwarmTaskDependenciesErrors,
+  SwarmTaskDependenciesResponses,
+  SwarmUpdateErrors,
+  SwarmUpdateResponses,
+  SwarmWorkspacePolicy,
   SyncCapabilitiesErrors,
   SyncCapabilitiesResponses,
   SyncHistoryListErrors,
@@ -387,6 +521,9 @@ import type {
   SyncStartResponses,
   SyncStealErrors,
   SyncStealResponses,
+  SystemOneInferErrors,
+  SystemOneInferInput,
+  SystemOneInferResponses,
   TextPartInput,
   ToolCatalogErrors,
   ToolCatalogResponses,
@@ -772,7 +909,7 @@ export class App extends HeyApiClient {
   /**
    * List agents
    *
-   * Get a list of all available AI agents in the OpenCode system.
+   * Get a list of all available AI agents in the OpenFork system.
    */
   public agents<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -802,7 +939,7 @@ export class App extends HeyApiClient {
   /**
    * List skills
    *
-   * Get a list of all available skills in the OpenCode system.
+   * Get a list of all available skills in the OpenFork system.
    */
   public skills<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -877,7 +1014,7 @@ export class Capabilities extends HeyApiClient {
   /**
    * Get experimental capabilities
    *
-   * Get experimental features enabled on the OpenCode server.
+   * Get experimental features enabled on the OpenFork server.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -981,7 +1118,7 @@ export class Console extends HeyApiClient {
   /**
    * Switch active Console org
    *
-   * Persist a new active Console account/org selection for the current local OpenCode state.
+   * Persist a new active Console account/org selection for the current local OpenFork state.
    */
   public switchOrg<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -1022,7 +1159,7 @@ export class Session extends HeyApiClient {
   /**
    * List sessions
    *
-   * Get a list of all OpenCode sessions across projects, sorted by most recently updated. Archived sessions are excluded by default.
+   * Get a list of all OpenFork sessions across projects, sorted by most recently updated. Archived sessions are excluded by default.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -1628,7 +1765,7 @@ export class Experimental extends HeyApiClient {
 
 export class Credential extends HeyApiClient {
   /**
-   * List OpenCode credentials
+   * List OpenCode Zen credentials
    */
   public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<ForkCredentialListResponses, ForkCredentialListErrors, ThrowOnError>({
@@ -1638,7 +1775,7 @@ export class Credential extends HeyApiClient {
   }
 
   /**
-   * Add an OpenCode key
+   * Add an OpenCode Zen key
    */
   public add<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -1802,7 +1939,7 @@ export class Config extends HeyApiClient {
   /**
    * Get global configuration
    *
-   * Retrieve the current global OpenCode configuration settings and preferences.
+   * Retrieve the current global OpenFork configuration settings and preferences.
    */
   public get<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<GlobalConfigGetResponses, GlobalConfigGetErrors, ThrowOnError>({
@@ -1814,7 +1951,7 @@ export class Config extends HeyApiClient {
   /**
    * Update global configuration
    *
-   * Update global OpenCode configuration settings and preferences.
+   * Update global OpenFork configuration settings and preferences.
    */
   public update<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -1883,7 +2020,7 @@ export class Global extends HeyApiClient {
   /**
    * Get health
    *
-   * Get health information about the OpenCode server.
+   * Get health information about the OpenFork server.
    */
   public health<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<GlobalHealthResponses, GlobalHealthErrors, ThrowOnError>({
@@ -1895,7 +2032,7 @@ export class Global extends HeyApiClient {
   /**
    * Get global events
    *
-   * Subscribe to global events from the OpenCode system using server-sent events.
+   * Subscribe to global events from the OpenFork system using server-sent events.
    */
   public event<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).sse.get<GlobalEventResponses, GlobalEventErrors, ThrowOnError>({
@@ -1933,11 +2070,12 @@ export class Global extends HeyApiClient {
   /**
    * List recent root sessions without instance bootstrap
    *
-   * List recent non-archived root sessions for one directory directly from durable session storage. This read-only startup surface intentionally does not materialize directory config, plugins, providers, or tools.
+   * List recent non-archived root sessions directly from durable session storage. When projectID is supplied it is authoritative and the directory is retained only as the caller's canonical cache location; otherwise the read is directory-scoped. This startup surface never materializes directory config, plugins, providers, or tools.
    */
   public sessionRoots<ThrowOnError extends boolean = false>(
     parameters: {
       directory: string
+      projectID?: string
       limit?: string
     },
     options?: Options<never, ThrowOnError>,
@@ -1948,6 +2086,7 @@ export class Global extends HeyApiClient {
         {
           args: [
             { in: "query", key: "directory" },
+            { in: "query", key: "projectID" },
             { in: "query", key: "limit" },
           ],
         },
@@ -1955,6 +2094,25 @@ export class Global extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<GlobalSessionRootsResponses, GlobalSessionRootsErrors, ThrowOnError>({
       url: "/global/session/roots",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Locate a session without instance bootstrap
+   *
+   * Read one durable session record directly from global storage. Returns null when absent and never materializes directory config, plugins, providers, tools, or a workspace runtime.
+   */
+  public sessionGet<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<GlobalSessionGetResponses, GlobalSessionGetErrors, ThrowOnError>({
+      url: "/global/session/{sessionID}",
       ...options,
       ...params,
     })
@@ -1989,6 +2147,195 @@ export class Global extends HeyApiClient {
   }
 
   /**
+   * List OXP parent activities without workspace bootstrap
+   *
+   * List compact durable ChatGPT/OXP parent-activity summaries. The response contains no upstream correlation identifiers and never materializes a workspace runtime.
+   */
+  public oxpActivities<ThrowOnError extends boolean = false>(
+    parameters?: {
+      limit?: string
+      includeArchived?: "true" | "false"
+      beforeLastSeenAt?: string
+      beforeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "limit" },
+            { in: "query", key: "includeArchived" },
+            { in: "query", key: "beforeLastSeenAt" },
+            { in: "query", key: "beforeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<GlobalOxpActivitiesResponses, GlobalOxpActivitiesErrors, ThrowOnError>({
+      url: "/global/oxp/activity",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Delete OXP activity history
+   *
+   * Delete only OXP activity-history rows. Native Sessions, workers, tasks, files, commits, and other linked resources are never cascaded by this operation.
+   */
+  public oxpActivityDelete<ThrowOnError extends boolean = false>(
+    parameters: {
+      activityID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "activityID" }] }])
+    return (options?.client ?? this.client).delete<
+      GlobalOxpActivityDeleteResponses,
+      GlobalOxpActivityDeleteErrors,
+      ThrowOnError
+    >({
+      url: "/global/oxp/activity/{activityID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get one OXP parent activity
+   *
+   * Read one durable OXP parent-activity summary directly from global storage without workspace bootstrap.
+   */
+  public oxpActivityGet<ThrowOnError extends boolean = false>(
+    parameters: {
+      activityID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "activityID" }] }])
+    return (options?.client ?? this.client).get<
+      GlobalOxpActivityGetResponses,
+      GlobalOxpActivityGetErrors,
+      ThrowOnError
+    >({
+      url: "/global/oxp/activity/{activityID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Rename or archive OXP activity history
+   *
+   * Update local presentation/history state only. This never mutates resources referenced by the activity.
+   */
+  public oxpActivityUpdate<ThrowOnError extends boolean = false>(
+    parameters: {
+      activityID: string
+      globalOxpActivityPatch?: GlobalOxpActivityPatch
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "activityID" },
+            { key: "globalOxpActivityPatch", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      GlobalOxpActivityUpdateResponses,
+      GlobalOxpActivityUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/global/oxp/activity/{activityID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Read OXP invocation history
+   *
+   * Read one parent activity's bounded invocation spans and causal links without hydrating Sessions, messages, providers, plugins, or workspace runtime state.
+   */
+  public oxpInvocations<ThrowOnError extends boolean = false>(
+    parameters: {
+      activityID: string
+      limit?: string
+      beforeStartedAt?: string
+      beforeID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "activityID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "beforeStartedAt" },
+            { in: "query", key: "beforeID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      GlobalOxpInvocationsResponses,
+      GlobalOxpInvocationsErrors,
+      ThrowOnError
+    >({
+      url: "/global/oxp/activity/{activityID}/invocations",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Find OXP provenance for a native resource
+   *
+   * Reverse lookup over durable OXP causal links. This is observability-only history and never grants authority over the referenced resource.
+   */
+  public oxpResource<ThrowOnError extends boolean = false>(
+    parameters: {
+      kind: OxpActivityLinkKind
+      ref: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "kind" },
+            { in: "query", key: "ref" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<GlobalOxpResourceResponses, GlobalOxpResourceErrors, ThrowOnError>({
+      url: "/global/oxp/resource",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * List projects without instance bootstrap
    *
    * List durable project metadata without materializing directory config, plugins, providers, or tools. Intended for startup navigation/catalog hydration.
@@ -2003,7 +2350,7 @@ export class Global extends HeyApiClient {
   /**
    * Dispose instance
    *
-   * Clean up and dispose all OpenCode instances, releasing all resources.
+   * Clean up and dispose all OpenFork instances, releasing all resources.
    */
   public dispose<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).post<GlobalDisposeResponses, GlobalDisposeErrors, ThrowOnError>({
@@ -2013,7 +2360,7 @@ export class Global extends HeyApiClient {
   }
 
   /**
-   * Reset local OpenCode history
+   * Reset local OpenFork history
    *
    * Delete sessions, goals, memory, usage history, and derived database indexes while preserving provider authentication, credentials, accounts, paired devices, application settings, project/workspace configuration, saved project permissions, and database migration state.
    */
@@ -2290,6 +2637,1552 @@ export class Usage2 extends HeyApiClient {
   }
 }
 
+export class Discovery extends HeyApiClient {
+  /**
+   * Replace configured-server OFXP discovery hints
+   *
+   * Replace the bounded secret-free discovery hints projected from the caller's already configured OpenFork ServerConnections. These hints are untrusted routing metadata only and never grant peer trust or capability authority.
+   */
+  public serverSeeds<ThrowOnError extends boolean = false>(
+    parameters?: {
+      ofxpSettingsServerSeedsPayload?: OfxpSettingsServerSeedsPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "ofxpSettingsServerSeedsPayload", map: "body" }] }])
+    return (options?.client ?? this.client).put<
+      OfxpDiscoveryServerSeedsResponses,
+      OfxpDiscoveryServerSeedsErrors,
+      ThrowOnError
+    >({
+      url: "/ofxp/discovery/server-seeds",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Pairing extends HeyApiClient {
+  /**
+   * Confirm an OFXP pairing ceremony
+   *
+   * Confirm a pending pairing only after the operator has compared the displayed short authentication string on both peers. The newly trusted peer remains deny-by-default.
+   */
+  public confirm<ThrowOnError extends boolean = false>(
+    parameters: {
+      pairingID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "pairingID" }] }])
+    return (options?.client ?? this.client).post<OfxpPairingConfirmResponses, OfxpPairingConfirmErrors, ThrowOnError>({
+      url: "/ofxp/pairing/{pairingID}/confirm",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cancel an OFXP pairing ceremony
+   */
+  public cancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      pairingID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "pairingID" }] }])
+    return (options?.client ?? this.client).delete<OfxpPairingCancelResponses, OfxpPairingCancelErrors, ThrowOnError>({
+      url: "/ofxp/pairing/{pairingID}",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Root extends HeyApiClient {
+  /**
+   * Approve a local root for a trusted peer
+   *
+   * Approve one explicit local directory for a trusted peer. The canonical host path is validated locally and is never returned in the public root projection.
+   */
+  public add<ThrowOnError extends boolean = false>(
+    parameters: {
+      peerID: string
+      ofxpSettingsRootPayload?: OfxpSettingsRootPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "peerID" },
+            { key: "ofxpSettingsRootPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<OfxpPeerRootAddResponses, OfxpPeerRootAddErrors, ThrowOnError>({
+      url: "/ofxp/peer/{peerID}/root",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Remove an approved peer root
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      peerID: string
+      rootID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "peerID" },
+            { in: "path", key: "rootID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<OfxpPeerRootRemoveResponses, OfxpPeerRootRemoveErrors, ThrowOnError>(
+      {
+        url: "/ofxp/peer/{peerID}/root/{rootID}",
+        ...options,
+        ...params,
+      },
+    )
+  }
+}
+
+export class Peer extends HeyApiClient {
+  /**
+   * Update a trusted peer grant
+   *
+   * Replace one trusted peer's directional inbound grant using optimistic revision fencing. This operator surface changes authority; model-facing OFXP tools cannot call it.
+   */
+  public grant<ThrowOnError extends boolean = false>(
+    parameters: {
+      peerID: string
+      ofxpSettingsGrantPayload?: OfxpSettingsGrantPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "peerID" },
+            { key: "ofxpSettingsGrantPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<OfxpPeerGrantResponses, OfxpPeerGrantErrors, ThrowOnError>({
+      url: "/ofxp/peer/{peerID}/grant",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Revoke a trusted OpenFork peer
+   *
+   * Revoke peer trust immediately. Re-pairing later does not resurrect the peer's previous grants or roots.
+   */
+  public revoke<ThrowOnError extends boolean = false>(
+    parameters: {
+      peerID: string
+      ofxpSettingsRevokePayload?: OfxpSettingsRevokePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "peerID" },
+            { key: "ofxpSettingsRevokePayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<OfxpPeerRevokeResponses, OfxpPeerRevokeErrors, ThrowOnError>({
+      url: "/ofxp/peer/{peerID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  private _root?: Root
+  get root(): Root {
+    return (this._root ??= new Root({ client: this.client }))
+  }
+}
+
+export class Ofxp extends HeyApiClient {
+  /**
+   * Get OpenFork peer network state
+   *
+   * Read the compact Tier-0/Tier-1 OFXP settings projection: local runtime state, nearby untrusted candidates, pending pairing ceremonies, trusted peers, grants, and approved root aliases. This endpoint never materializes a workspace runtime or remote capability catalog.
+   */
+  public state<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<OfxpStateResponses, OfxpStateErrors, ThrowOnError>({
+      url: "/ofxp/state",
+      ...options,
+    })
+  }
+
+  /**
+   * Enable or disable OpenFork peer networking
+   *
+   * Start or stop the narrow OFXP listener and discovery owner for this OpenFork process. Disabling OFXP stops its listener and mDNS work without affecting the ordinary OpenFork server API.
+   */
+  public runtime<ThrowOnError extends boolean = false>(
+    parameters?: {
+      ofxpSettingsRuntimePayload?: OfxpSettingsRuntimePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "ofxpSettingsRuntimePayload", map: "body" }] }])
+    return (options?.client ?? this.client).patch<OfxpRuntimeResponses, OfxpRuntimeErrors, ThrowOnError>({
+      url: "/ofxp/runtime",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Rotate the local OFXP identity
+   *
+   * Atomically replace the local OFXP key, restart the narrow listener, and retain a short-lived old-key continuity proof for fresh SAS re-verification. Existing remote grants are never copied to the replacement identity.
+   */
+  public rotateIdentity<ThrowOnError extends boolean = false>(
+    parameters?: {
+      ofxpSettingsIdentityMutationPayload?: OfxpSettingsIdentityMutationPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [{ args: [{ key: "ofxpSettingsIdentityMutationPayload", map: "body" }] }],
+    )
+    return (options?.client ?? this.client).post<OfxpRotateIdentityResponses, OfxpRotateIdentityErrors, ThrowOnError>({
+      url: "/ofxp/runtime/rotate-identity",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Finalize the current OFXP identity rotation
+   *
+   * Explicitly discard the persisted old-key continuity journal for the current replacement identity after re-verification is complete or intentionally abandoned. The replacement key is preserved; finalization transfers no authority and is required before another rotation.
+   */
+  public finalizeIdentityRotation<ThrowOnError extends boolean = false>(
+    parameters?: {
+      ofxpSettingsIdentityMutationPayload?: OfxpSettingsIdentityMutationPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [{ args: [{ key: "ofxpSettingsIdentityMutationPayload", map: "body" }] }],
+    )
+    return (options?.client ?? this.client).post<
+      OfxpFinalizeIdentityRotationResponses,
+      OfxpFinalizeIdentityRotationErrors,
+      ThrowOnError
+    >({
+      url: "/ofxp/runtime/rotation/finalize",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Begin pairing with a nearby OpenFork peer
+   *
+   * Begin an operator-controlled OFXP identity ceremony with a currently discovered candidate. Pairing establishes identity continuity only and grants no capability authority.
+   */
+  public pair<ThrowOnError extends boolean = false>(
+    parameters: {
+      peerID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "peerID" }] }])
+    return (options?.client ?? this.client).post<OfxpPairResponses, OfxpPairErrors, ThrowOnError>({
+      url: "/ofxp/peer/{peerID}/pair",
+      ...options,
+      ...params,
+    })
+  }
+
+  private _discovery?: Discovery
+  get discovery(): Discovery {
+    return (this._discovery ??= new Discovery({ client: this.client }))
+  }
+
+  private _pairing?: Pairing
+  get pairing(): Pairing {
+    return (this._pairing ??= new Pairing({ client: this.client }))
+  }
+
+  private _peer?: Peer
+  get peer(): Peer {
+    return (this._peer ??= new Peer({ client: this.client }))
+  }
+}
+
+export class RevisionDraft extends HeyApiClient {
+  /**
+   * Recover a pending editor revision
+   *
+   * Bootstrap-free durable lookup of the latest accepted revision for a globally stable editor target. Never materializes a workspace Instance.
+   */
+  public recover<ThrowOnError extends boolean = false>(
+    parameters?: {
+      kind?: "prompt" | "goal" | "scheduled_task"
+      key?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "kind" },
+            { in: "body", key: "key" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      RevisionDraftRecoverResponses,
+      RevisionDraftRecoverErrors,
+      ThrowOnError
+    >({
+      url: "/revision-draft/recover",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Acknowledge a recovered editor revision
+   *
+   * Delete exactly one pending revision by immutable artifact id. An acknowledgement for an older generation cannot delete a newer replacement.
+   */
+  public consume<ThrowOnError extends boolean = false>(
+    parameters?: {
+      id?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "id" }] }])
+    return (options?.client ?? this.client).post<
+      RevisionDraftConsumeResponses,
+      RevisionDraftConsumeErrors,
+      ThrowOnError
+    >({
+      url: "/revision-draft/consume",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class ScheduledTask extends HeyApiClient {
+  /**
+   * List scheduled tasks
+   *
+   * Durable Tier 0 read of scheduled task rows. This endpoint never materializes an Instance, including when projectID is omitted.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      projectID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "projectID" }] }])
+    return (options?.client ?? this.client).get<ScheduledTaskListResponses, ScheduledTaskListErrors, ThrowOnError>({
+      url: "/scheduled-task",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create a scheduled task
+   *
+   * targetDirectory is required and must be absolute; the due cursor is materialized in the same transaction.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters?: {
+      projectID?: string
+      targetDirectory?: string
+      target?: ScheduledTaskTarget
+      sessionPolicy?: ScheduledTaskSessionPolicy
+      name?: string
+      enabled?: boolean
+      schedule?: ScheduledTaskScheduleInput
+      timezone?: string
+      action?: ScheduledTaskAction
+      policy?: ScheduledTaskPolicy
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "projectID" },
+            { in: "body", key: "targetDirectory" },
+            { in: "body", key: "target" },
+            { in: "body", key: "sessionPolicy" },
+            { in: "body", key: "name" },
+            { in: "body", key: "enabled" },
+            { in: "body", key: "schedule" },
+            { in: "body", key: "timezone" },
+            { in: "body", key: "action" },
+            { in: "body", key: "policy" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ScheduledTaskCreateResponses, ScheduledTaskCreateErrors, ThrowOnError>(
+      {
+        url: "/scheduled-task",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Preview a schedule
+   *
+   * Pure recurrence evaluation. No database write and no Instance.
+   */
+  public preview<ThrowOnError extends boolean = false>(
+    parameters?: {
+      schedule?: ScheduledTaskScheduleInput
+      timezone?: string
+      count?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "schedule" },
+            { in: "body", key: "timezone" },
+            { in: "body", key: "count" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      ScheduledTaskPreviewResponses,
+      ScheduledTaskPreviewErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/preview",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Calendar occurrences for scheduled tasks
+   *
+   * Bounded Tier 0 recurrence projection for a requested window. Returns compact task/time rows only; never materializes an Instance.
+   */
+  public agenda<ThrowOnError extends boolean = false>(
+    parameters: {
+      from: string
+      to: string
+      limit?: string
+      projectID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "from" },
+            { in: "query", key: "to" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "projectID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ScheduledTaskAgendaResponses, ScheduledTaskAgendaErrors, ThrowOnError>({
+      url: "/scheduled-task/agenda",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List Session candidates for Existing mode
+   *
+   * Bounded Tier 0 root-Session projection filtered by canonical producer ownership. No history hydration and no Instance materialization.
+   */
+  public sessionCandidates<ThrowOnError extends boolean = false>(
+    parameters: {
+      targetDirectory: string
+      projectID?: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "targetDirectory" },
+            { in: "query", key: "projectID" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ScheduledTaskSessionCandidatesResponses,
+      ScheduledTaskSessionCandidatesErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/session-candidate",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Scheduled run inbox
+   *
+   * Newest runs across all tasks, optionally unread only.
+   */
+  public inbox<ThrowOnError extends boolean = false>(
+    parameters?: {
+      limit?: string
+      unread?: "true"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "limit" },
+            { in: "query", key: "unread" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ScheduledTaskInboxResponses, ScheduledTaskInboxErrors, ThrowOnError>({
+      url: "/scheduled-task/run",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Unread inbox count
+   */
+  public unreadCount<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      ScheduledTaskUnreadCountResponses,
+      ScheduledTaskUnreadCountErrors,
+      ThrowOnError
+    >({ url: "/scheduled-task/inbox/count", ...options })
+  }
+
+  /**
+   * Get the global kill switch
+   */
+  public getControl<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      ScheduledTaskGetControlResponses,
+      ScheduledTaskGetControlErrors,
+      ThrowOnError
+    >({ url: "/scheduled-task/control", ...options })
+  }
+
+  /**
+   * Pause or resume all schedules
+   *
+   * Pausing disarms the process-global timer; in-flight runs complete normally.
+   */
+  public setControl<ThrowOnError extends boolean = false>(
+    parameters?: {
+      paused?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "paused" }] }])
+    return (options?.client ?? this.client).post<
+      ScheduledTaskSetControlResponses,
+      ScheduledTaskSetControlErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/control",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Acknowledge a run
+   *
+   * Clears the unread inbox bit server-side so it converges across clients.
+   */
+  public acknowledge<ThrowOnError extends boolean = false>(
+    parameters: {
+      runID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "runID" }] }])
+    return (options?.client ?? this.client).post<
+      ScheduledTaskAcknowledgeResponses,
+      ScheduledTaskAcknowledgeErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/run/{runID}/ack",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Delete a scheduled task
+   *
+   * Deletes the task and its run history; Sessions created by runs are never deleted.
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "taskID" }] }])
+    return (options?.client ?? this.client).delete<
+      ScheduledTaskRemoveResponses,
+      ScheduledTaskRemoveErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/{taskID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get a scheduled task
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "taskID" }] }])
+    return (options?.client ?? this.client).get<ScheduledTaskGetResponses, ScheduledTaskGetErrors, ThrowOnError>({
+      url: "/scheduled-task/{taskID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update a scheduled task
+   *
+   * Optimistic concurrency via expectedRevision; the due cursor is recomputed in-transaction.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      name?: string
+      targetDirectory?: string
+      target?: ScheduledTaskTarget
+      sessionPolicy?: ScheduledTaskSessionPolicy
+      schedule?: ScheduledTaskScheduleInput
+      timezone?: string
+      action?: ScheduledTaskAction
+      policy?: ScheduledTaskPolicy
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "taskID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "name" },
+            { in: "body", key: "targetDirectory" },
+            { in: "body", key: "target" },
+            { in: "body", key: "sessionPolicy" },
+            { in: "body", key: "schedule" },
+            { in: "body", key: "timezone" },
+            { in: "body", key: "action" },
+            { in: "body", key: "policy" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      ScheduledTaskUpdateResponses,
+      ScheduledTaskUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/{taskID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Start fresh on the next reusable run
+   *
+   * Clears only runner-owned binding state. The Session itself survives.
+   */
+  public clearBinding<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "taskID" }] }])
+    return (options?.client ?? this.client).delete<
+      ScheduledTaskClearBindingResponses,
+      ScheduledTaskClearBindingErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/{taskID}/session-binding",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get current Session anchor
+   *
+   * Tier 0 compact projection; does not hydrate Session history or materialize an Instance.
+   */
+  public getBinding<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "taskID" }] }])
+    return (options?.client ?? this.client).get<
+      ScheduledTaskGetBindingResponses,
+      ScheduledTaskGetBindingErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/{taskID}/session-binding",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Enable or disable a scheduled task
+   *
+   * Cheap toggle separate from update; enables compute the cursor from now.
+   */
+  public enabled<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+      enabled?: boolean
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "taskID" },
+            { in: "body", key: "enabled" },
+            { in: "body", key: "expectedRevision" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      ScheduledTaskEnabledResponses,
+      ScheduledTaskEnabledErrors,
+      ThrowOnError
+    >({
+      url: "/scheduled-task/{taskID}/enabled",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Run history for one task
+   *
+   * Paged newest-first. Fetched only when a run history surface is explicitly opened.
+   */
+  public runs<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+      limit?: string
+      before?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "taskID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "before" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ScheduledTaskRunsResponses, ScheduledTaskRunsErrors, ThrowOnError>({
+      url: "/scheduled-task/{taskID}/run",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Run a scheduled task immediately
+   *
+   * Tier 0 durable enqueue: writes a queued run and returns before the process-global runner crosses the Tier 3 execution boundary.
+   */
+  public runNow<ThrowOnError extends boolean = false>(
+    parameters: {
+      taskID: string
+      now?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "taskID" },
+            { in: "body", key: "now" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ScheduledTaskRunNowResponses, ScheduledTaskRunNowErrors, ThrowOnError>(
+      {
+        url: "/scheduled-task/{taskID}/run-now",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+}
+
+export class Swarm extends HeyApiClient {
+  /**
+   * List Swarms
+   *
+   * Bounded Tier 0 summary catalog. Counts are aggregated in bulk and the endpoint never materializes an Instance or hydrates Session history.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters?: {
+      projectID?: string
+      workspaceID?: string
+      status?: SwarmStatus
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "projectID" },
+            { in: "query", key: "workspaceID" },
+            { in: "query", key: "status" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmListResponses, SwarmListErrors, ThrowOnError>({
+      url: "/swarm",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm detail
+   *
+   * Durable roster/task projection plus the whole DAG edge set. Live Session status remains owned by Session telemetry.
+   */
+  public detail<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "swarmID" }] }])
+    return (options?.client ?? this.client).get<SwarmDetailResponses, SwarmDetailErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update Swarm state
+   *
+   * Exact-revision operator mutation for pause/resume/completion/archive and metadata.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      expectedRevision?: number
+      name?: string
+      status?: "active" | "paused" | "completed" | "failed" | "archived"
+      policy?: SwarmPolicy
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "name" },
+            { in: "body", key: "status" },
+            { in: "body", key: "policy" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<SwarmUpdateResponses, SwarmUpdateErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get Swarm summary
+   *
+   * Cheap durable aggregate status without Instance or transcript materialization.
+   */
+  public summary<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "swarmID" }] }])
+    return (options?.client ?? this.client).get<SwarmSummaryResponses, SwarmSummaryErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/summary",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm message history
+   *
+   * Newest-first bounded history. Delivery receipts are fetched in one batch for the page; cursor is opaque.
+   */
+  public messages<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      limit?: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmMessagesResponses, SwarmMessagesErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/message",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm task-run history
+   *
+   * Newest-first bounded run history, optionally scoped to one exact task id.
+   */
+  public runs<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      limit?: string
+      cursor?: string
+      taskID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+            { in: "query", key: "taskID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmRunsResponses, SwarmRunsErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/run",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm blackboard
+   *
+   * Bounded key-ordered shared-state projection.
+   */
+  public blackboard<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      limit?: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmBlackboardResponses, SwarmBlackboardErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/blackboard",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm claims
+   *
+   * Bounded deterministic claim projection; no worker runtime is consulted.
+   */
+  public claims<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      limit?: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmClaimsResponses, SwarmClaimsErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/claim",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get Swarm deliverables
+   *
+   * Newest-first bounded deliverable ledger, optionally scoped to one exact member id.
+   */
+  public deliverables<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      limit?: string
+      cursor?: string
+      memberID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+            { in: "query", key: "memberID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SwarmDeliverablesResponses, SwarmDeliverablesErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/deliverable",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create a native Swarm
+   *
+   * Authenticated operator workflow. All cross references are validated before activation; the supplied coordinator Session is operator intent, not inferred model authority.
+   */
+  public delegate<ThrowOnError extends boolean = false>(
+    parameters?: {
+      projectID?: string
+      workspaceID?: string
+      directory?: string
+      coordinatorSessionID?: string
+      name?: string
+      coordinatorName?: string
+      coordinatorRole?: string
+      members?: Array<{
+        name: string
+        role: string
+        desiredProfile: SwarmMemberExecutionProfile
+        workspacePolicy: SwarmWorkspacePolicy
+        capabilities?: SwarmMemberCapabilities
+      }>
+      tasks?: Array<{
+        key: string
+        title: string
+        description?: string
+        priority?: number
+        reservedMemberName?: string
+        acceptance?: SwarmTaskAcceptance
+        metadata?: {
+          [key: string]: unknown
+        }
+        dependsOn?: Array<{
+          key: string
+          requirement?: SwarmDependencyRequirement
+        }>
+      }>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "projectID" },
+            { in: "body", key: "workspaceID" },
+            { in: "body", key: "directory" },
+            { in: "body", key: "coordinatorSessionID" },
+            { in: "body", key: "name" },
+            { in: "body", key: "coordinatorName" },
+            { in: "body", key: "coordinatorRole" },
+            { in: "body", key: "members" },
+            { in: "body", key: "tasks" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SwarmDelegateResponses, SwarmDelegateErrors, ThrowOnError>({
+      url: "/swarm/delegate",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Add managed member
+   *
+   * Adds durable managed-worker intent; the process-global member Session owner performs materialization.
+   */
+  public memberAdd<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      name?: string
+      role?: string
+      desiredProfile?: SwarmMemberExecutionProfile
+      workspacePolicy?: SwarmWorkspacePolicy
+      capabilities?: SwarmMemberCapabilities
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "body", key: "name" },
+            { in: "body", key: "role" },
+            { in: "body", key: "desiredProfile" },
+            { in: "body", key: "workspacePolicy" },
+            { in: "body", key: "capabilities" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SwarmMemberAddResponses, SwarmMemberAddErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/member",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Stop or resume managed member
+   *
+   * Exact lifecycle mutation. Stop invalidates the Session binding fence; runtime retirement/reconciliation remains owned by canonical process-global services.
+   */
+  public memberLifecycle<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      memberID: string
+      expectedLifecycle?: "active" | "stopped"
+      lifecycle?: "active" | "stopped"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "path", key: "memberID" },
+            { in: "body", key: "expectedLifecycle" },
+            { in: "body", key: "lifecycle" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SwarmMemberLifecycleResponses,
+      SwarmMemberLifecycleErrors,
+      ThrowOnError
+    >({
+      url: "/swarm/{swarmID}/member/{memberID}/lifecycle",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Configure member execution profile
+   *
+   * Requires the managed member to be stopped and unbound at the exact binding generation; resume creates a fresh Session from the new intent.
+   */
+  public memberConfigure<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      memberID: string
+      expectedBindingGeneration?: number
+      desiredProfile?: SwarmMemberExecutionProfile
+      workspacePolicy?: SwarmWorkspacePolicy
+      capabilities?: SwarmMemberCapabilities
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "path", key: "memberID" },
+            { in: "body", key: "expectedBindingGeneration" },
+            { in: "body", key: "desiredProfile" },
+            { in: "body", key: "workspacePolicy" },
+            { in: "body", key: "capabilities" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SwarmMemberConfigureResponses,
+      SwarmMemberConfigureErrors,
+      ThrowOnError
+    >({
+      url: "/swarm/{swarmID}/member/{memberID}/configure",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Create Swarm task
+   *
+   * Operator-authored task intent. No member identity is accepted or synthesized; optional reservation uses an exact member id.
+   */
+  public taskCreate<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      title?: string
+      description?: string
+      priority?: number
+      reservedMemberID?: string
+      acceptance?: SwarmTaskAcceptance
+      metadata?: {
+        [key: string]: unknown
+      }
+      dependencies?: Array<{
+        taskID: string
+        requirement?: SwarmDependencyRequirement
+      }>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "body", key: "title" },
+            { in: "body", key: "description" },
+            { in: "body", key: "priority" },
+            { in: "body", key: "reservedMemberID" },
+            { in: "body", key: "acceptance" },
+            { in: "body", key: "metadata" },
+            { in: "body", key: "dependencies" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SwarmTaskCreateResponses, SwarmTaskCreateErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/task",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Replace task dependencies
+   *
+   * Validated whole-edge replacement with native DAG cycle checks.
+   */
+  public taskDependencies<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+      taskID: string
+      dependencies?: Array<{
+        taskID: string
+        requirement?: SwarmDependencyRequirement
+      }>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "swarmID" },
+            { in: "path", key: "taskID" },
+            { in: "body", key: "dependencies" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<
+      SwarmTaskDependenciesResponses,
+      SwarmTaskDependenciesErrors,
+      ThrowOnError
+    >({
+      url: "/swarm/{swarmID}/task/{taskID}/dependencies",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Request member recovery
+   *
+   * Requests the existing disposable reconciliation wake only. Durable state and the process-global member Session owner retain correctness and execution ownership.
+   */
+  public recover<ThrowOnError extends boolean = false>(
+    parameters: {
+      swarmID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "swarmID" }] }])
+    return (options?.client ?? this.client).post<SwarmRecoverResponses, SwarmRecoverErrors, ThrowOnError>({
+      url: "/swarm/{swarmID}/recover",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Event extends HeyApiClient {
   /**
    * Subscribe to events
@@ -2408,7 +4301,7 @@ export class Config2 extends HeyApiClient {
   /**
    * Get configuration
    *
-   * Retrieve the current OpenCode configuration settings and preferences.
+   * Retrieve the current OpenFork configuration settings and preferences.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -2438,7 +4331,7 @@ export class Config2 extends HeyApiClient {
   /**
    * Update configuration
    *
-   * Update OpenCode configuration settings and preferences.
+   * Update OpenFork configuration settings and preferences.
    */
   public update<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -3270,7 +5163,7 @@ export class Instance extends HeyApiClient {
   /**
    * Dispose instance
    *
-   * Clean up and dispose the current OpenCode instance, releasing all resources.
+   * Clean up and dispose the current OpenFork instance, releasing all resources.
    */
   public dispose<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -3302,7 +5195,7 @@ export class Path extends HeyApiClient {
   /**
    * Get paths
    *
-   * Retrieve the current working directory and related path information for the OpenCode instance.
+   * Retrieve the current working directory and related path information for the OpenFork instance.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -3504,7 +5397,7 @@ export class Command extends HeyApiClient {
   /**
    * List commands
    *
-   * Get a list of all available commands in the OpenCode system.
+   * Get a list of all available commands in the OpenFork system.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -3875,7 +5768,7 @@ export class Project extends HeyApiClient {
   /**
    * List all projects
    *
-   * Get a list of projects that have been opened with OpenCode.
+   * Get a list of projects that have been opened with OpenFork.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -3905,7 +5798,7 @@ export class Project extends HeyApiClient {
   /**
    * Get current project
    *
-   * Retrieve the currently active project that OpenCode is working with.
+   * Retrieve the currently active project that OpenFork is working with.
    */
   public current<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -4072,7 +5965,7 @@ export class Pty extends HeyApiClient {
   /**
    * List PTY sessions
    *
-   * Get a list of all active pseudo-terminal (PTY) sessions managed by OpenCode.
+   * Get a list of all active pseudo-terminal (PTY) sessions managed by OpenFork.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -4742,7 +6635,7 @@ export class Session2 extends HeyApiClient {
   /**
    * List sessions
    *
-   * Get a list of all OpenCode sessions, sorted by most recently updated.
+   * Get a list of all OpenFork sessions, sorted by most recently updated.
    */
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -4784,7 +6677,7 @@ export class Session2 extends HeyApiClient {
   /**
    * Create session
    *
-   * Create a new OpenCode session for interacting with AI assistants and managing conversations.
+   * Create a new OpenFork session for interacting with AI assistants and managing conversations.
    */
   public create<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -4796,6 +6689,7 @@ export class Session2 extends HeyApiClient {
       model?: {
         id: string
         providerID: string
+        accountID?: string
         variant?: string
       }
       metadata?: {
@@ -4901,7 +6795,7 @@ export class Session2 extends HeyApiClient {
   /**
    * Get session
    *
-   * Retrieve detailed information about a specific OpenCode session.
+   * Retrieve detailed information about a specific OpenFork session.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters: {
@@ -5135,6 +7029,7 @@ export class Session2 extends HeyApiClient {
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
       }
       agent?: string
       noReply?: boolean
@@ -5605,6 +7500,7 @@ export class Session2 extends HeyApiClient {
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
       }
       agent?: string
       noReply?: boolean
@@ -5726,6 +7622,7 @@ export class Session2 extends HeyApiClient {
       model?: {
         providerID: string
         modelID: string
+        accountID?: string
       }
       command?: string
     },
@@ -6120,7 +8017,7 @@ export class SessionGroup extends HeyApiClient {
   public create<ThrowOnError extends boolean = false>(
     parameters?: {
       name?: string
-      kind?: "user" | "subagent" | "plugin"
+      kind?: SessionGroupMutableKind
       anchorSessionID?: string
       ownerPlugin?: string
       ownerRef?: string
@@ -6303,7 +8200,7 @@ export class SessionGroup extends HeyApiClient {
       groupID: string
       sessionId?: string
       locked?: boolean
-      origin?: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
+      origin?: SessionGroupMutableMemberOrigin
       originPlugin?: string
       originRef?: string
     },
@@ -6420,7 +8317,7 @@ export class SessionGroup extends HeyApiClient {
   public resolve<ThrowOnError extends boolean = false>(
     parameters?: {
       name?: string
-      kind?: "user" | "subagent" | "plugin"
+      kind?: SessionGroupMutableKind
       anchorSessionID?: string
       ownerPlugin?: string
       ownerRef?: string
@@ -6689,6 +8586,7 @@ export class Goal extends HeyApiClient {
     parameters: {
       goalID: string
       expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      sessionID?: string
       action?:
         | "start"
         | "pause"
@@ -6710,6 +8608,7 @@ export class Goal extends HeyApiClient {
           args: [
             { in: "path", key: "goalID" },
             { in: "body", key: "expectedRevision" },
+            { in: "body", key: "sessionID" },
             { in: "body", key: "action" },
             { in: "body", key: "blocker" },
           ],
@@ -7017,6 +8916,82 @@ export class Goal extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<GoalPrepareResponses, GoalPrepareErrors, ThrowOnError>({
       url: "/session/{sessionID}/goal/prepare",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Dispatch a user-authorized focused Goal action to the worker
+   */
+  public dispatch<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      goalID?: string
+      revision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      action?: "start" | "update"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "goalID" },
+            { in: "body", key: "revision" },
+            { in: "body", key: "action" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<GoalDispatchResponses, GoalDispatchErrors, ThrowOnError>({
+      url: "/session/{sessionID}/goal/dispatch",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class SystemOne extends HeyApiClient {
+  /**
+   * Run typed System One semantic inference
+   *
+   * Runs a non-generative semantic model over shared structured state and typed Noul, Choice, or Score questions. Raw probabilities and scores are preserved in the response.
+   */
+  public infer<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      systemOneInferInput?: SystemOneInferInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "systemOneInferInput", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SystemOneInferResponses, SystemOneInferErrors, ThrowOnError>({
+      url: "/system-one/infer",
       ...options,
       ...params,
       headers: {
@@ -7679,13 +9654,19 @@ export class Prompt extends HeyApiClient {
   /**
    * Revise a draft prompt
    *
-   * Rewrite a draft prompt with an optional dedicated model, bounded read-only workspace reconnaissance, and stateless clarification interrupts.
+   * Rewrite a draft prompt with an optional dedicated model, bounded read-only workspace reconnaissance, and session-owned clarification through the canonical question lifecycle.
    */
   public revise<ThrowOnError extends boolean = false>(
     parameters?: {
       directory?: string
       workspace?: string
       prompt?: string
+      purpose?: "prompt" | "goal" | "scheduled_task"
+      target?: {
+        kind: "prompt" | "goal" | "scheduled_task"
+        key: string
+        sourceFingerprint: string
+      }
       draft?: {
         mentions: Array<
           | {
@@ -7736,15 +9717,10 @@ export class Prompt extends HeyApiClient {
         }>
       }
       sessionID?: string
+      includeSessionContext?: boolean
       guidance?: string
       model?: ModelRef
       fallbackModel?: ModelRef
-      clarifications?: Array<{
-        question: string
-        answers: Array<string>
-        detail?: string
-      }>
-      clarificationRound?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -7756,13 +9732,14 @@ export class Prompt extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "prompt" },
+            { in: "body", key: "purpose" },
+            { in: "body", key: "target" },
             { in: "body", key: "draft" },
             { in: "body", key: "sessionID" },
+            { in: "body", key: "includeSessionContext" },
             { in: "body", key: "guidance" },
             { in: "body", key: "model" },
             { in: "body", key: "fallbackModel" },
-            { in: "body", key: "clarifications" },
-            { in: "body", key: "clarificationRound" },
           ],
         },
       ],
@@ -8533,7 +10510,7 @@ export class Session3 extends HeyApiClient {
   /**
    * List active sessions
    *
-   * Retrieve active sessions: foreground drains currently owned by this OpenCode process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.
+   * Retrieve active sessions: foreground drains currently owned by this OpenFork process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.
    */
   public active<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<V2SessionActiveResponses, V2SessionActiveErrors, ThrowOnError>({
@@ -8826,7 +10803,7 @@ export class Session3 extends HeyApiClient {
   /**
    * Interrupt session execution
    *
-   * Interrupt active execution owned by this OpenCode process. Idle interruption is a no-op.
+   * Interrupt active execution owned by this OpenFork process. Idle interruption is a no-op.
    */
   public interrupt<ThrowOnError extends boolean = false>(
     parameters: {
@@ -10400,6 +12377,10 @@ export class Browser extends HeyApiClient {
                     kind: "agent"
                     sessionId: string
                   }
+                | {
+                    kind: "external"
+                    principalId: string
+                  }
               active: boolean
               muted: boolean
             }
@@ -10462,6 +12443,10 @@ export class Browser extends HeyApiClient {
         | {
             kind: "agent"
             sessionId: string
+          }
+        | {
+            kind: "external"
+            principalId: string
           }
     },
     options?: Options<never, ThrowOnError>,
@@ -10719,6 +12704,26 @@ export class OpencodeClient extends HeyApiClient {
     return (this._usage ??= new Usage2({ client: this.client }))
   }
 
+  private _ofxp?: Ofxp
+  get ofxp(): Ofxp {
+    return (this._ofxp ??= new Ofxp({ client: this.client }))
+  }
+
+  private _revisionDraft?: RevisionDraft
+  get revisionDraft(): RevisionDraft {
+    return (this._revisionDraft ??= new RevisionDraft({ client: this.client }))
+  }
+
+  private _scheduledTask?: ScheduledTask
+  get scheduledTask(): ScheduledTask {
+    return (this._scheduledTask ??= new ScheduledTask({ client: this.client }))
+  }
+
+  private _swarm?: Swarm
+  get swarm(): Swarm {
+    return (this._swarm ??= new Swarm({ client: this.client }))
+  }
+
   private _event?: Event
   get event(): Event {
     return (this._event ??= new Event({ client: this.client }))
@@ -10852,6 +12857,11 @@ export class OpencodeClient extends HeyApiClient {
   private _goal?: Goal
   get goal(): Goal {
     return (this._goal ??= new Goal({ client: this.client }))
+  }
+
+  private _systemOne?: SystemOne
+  get systemOne(): SystemOne {
+    return (this._systemOne ??= new SystemOne({ client: this.client }))
   }
 
   private _sync?: Sync

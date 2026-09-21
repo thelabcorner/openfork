@@ -21,6 +21,9 @@ export type Event =
   | EventSessionNextMoved
   | EventSessionNextPrompted
   | EventSessionNextPromptAdmitted
+  | EventSessionNextSyntheticAdmitted
+  | EventSessionNextSyntheticPromoted
+  | EventSessionNextSyntheticRevoked
   | EventSessionNextContextUpdated
   | EventSessionNextSynthetic
   | EventSessionNextShellStarted
@@ -52,6 +55,7 @@ export type Event =
   | EventSessionNextPaused
   | EventSessionNextResumed
   | EventSessionNextRenamed
+  | EventSessionNextExecutionBoundaryUpdated
   | EventMessagePartDelta
   | EventSessionDiff
   | EventSessionError
@@ -62,6 +66,33 @@ export type Event =
   | EventGoalUpdated
   | EventGoalFocused
   | EventGoalUnfocused
+  | EventGoalAutomationUpdated
+  | EventOxpActivityCreated
+  | EventOxpActivityUpdated
+  | EventOxpActivityRemoved
+  | EventOxpActivityInvocationStarted
+  | EventOxpActivityInvocationSettled
+  | EventOxpActivityLinkAdded
+  | EventScheduledTaskCreated
+  | EventScheduledTaskUpdated
+  | EventScheduledTaskRemoved
+  | EventScheduledTaskRunStarted
+  | EventScheduledTaskRunSettled
+  | EventScheduledTaskRunUpdated
+  | EventScheduledTaskControlChanged
+  | EventScheduledTaskSessionBindingChanged
+  | EventSwarmCreated
+  | EventSwarmUpdated
+  | EventSwarmMemberUpdated
+  | EventSwarmTaskUpdated
+  | EventSwarmTaskDependenciesUpdated
+  | EventSwarmTaskLeaseUpdated
+  | EventSwarmTaskRunUpdated
+  | EventSwarmMessageCreated
+  | EventSwarmDeliveryUpdated
+  | EventSwarmBlackboardUpdated
+  | EventSwarmClaimUpdated
+  | EventSwarmDeliverableUpdated
   | EventReferenceUpdated
   | EventPermissionV2Asked
   | EventPermissionV2Replied
@@ -215,6 +246,7 @@ export type Session = {
   model?: {
     id: string
     providerID: string
+    accountID?: string
     variant?: string
   }
   version: string
@@ -237,6 +269,20 @@ export type Session = {
   }
 }
 
+export type UserTurnProvenance =
+  | {
+      owner: "user"
+      source: string
+      lifetime?: "historical"
+    }
+  | {
+      owner: "host"
+      source: string
+      sourceMessageID?: string
+      ref?: string
+      lifetime?: "historical"
+    }
+
 export type OutputFormatText = {
   type: "text"
 }
@@ -257,6 +303,7 @@ export type UserMessage = {
   id: string
   sessionID: string
   role: "user"
+  provenance?: UserTurnProvenance
   time: {
     created: number
   }
@@ -270,6 +317,7 @@ export type UserMessage = {
   model: {
     providerID: string
     modelID: string
+    accountID?: string
     variant?: string
     subProvider?: string
   }
@@ -851,6 +899,7 @@ export type GlobalEvent = {
           timestamp: number
           sessionID: string
           messageID: string
+          provenance?: SessionMessageProvenance
           agent: string
         }
       }
@@ -861,6 +910,7 @@ export type GlobalEvent = {
           timestamp: number
           sessionID: string
           messageID: string
+          provenance?: SessionMessageProvenance
           model: ModelRef
         }
       }
@@ -884,6 +934,7 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           delivery: "steer" | "queue"
+          provenance?: SessionMessageProvenance
         }
       }
     | {
@@ -895,6 +946,50 @@ export type GlobalEvent = {
           messageID: string
           prompt: Prompt
           delivery: "steer" | "queue"
+          provenance?: SessionMessageProvenance
+        }
+      }
+    | {
+        id: string
+        type: "session.next.synthetic.admitted"
+        properties: {
+          timestamp: number
+          sessionID: string
+          messageID: string
+          content: SessionSyntheticContent
+          origin: SessionSyntheticOrigin
+          delegated?: SessionSyntheticDelegatedTurnAuthority
+          execution?: SessionInputSyntheticExecution
+          delivery: "steer" | "queue"
+          admissionClass: SessionInputSyntheticAdmissionClass
+          userPreemptible: boolean
+        }
+      }
+    | {
+        id: string
+        type: "session.next.synthetic.promoted"
+        properties: {
+          timestamp: number
+          sessionID: string
+          messageID: string
+          content: SessionSyntheticContent
+          origin: SessionSyntheticOrigin
+          delegated?: SessionSyntheticDelegatedTurnAuthority
+          execution?: SessionInputSyntheticExecution
+          delivery: "steer" | "queue"
+          admissionClass: SessionInputSyntheticAdmissionClass
+          userPreemptible: boolean
+          promotedAt?: number
+        }
+      }
+    | {
+        id: string
+        type: "session.next.synthetic.revoked"
+        properties: {
+          timestamp: number
+          sessionID: string
+          messageID: string
+          reason: SessionInputRevocationReason
         }
       }
     | {
@@ -915,6 +1010,7 @@ export type GlobalEvent = {
           sessionID: string
           messageID: string
           text: string
+          provenance?: SessionMessageProvenance
         }
       }
     | {
@@ -1177,6 +1273,7 @@ export type GlobalEvent = {
           sessionID: string
           messageID: string
           reason: "auto" | "manual"
+          provenance?: SessionMessageProvenance
         }
       }
     | {
@@ -1199,6 +1296,7 @@ export type GlobalEvent = {
           reason: "auto" | "manual"
           text: string
           recent: string
+          provenance?: SessionMessageProvenance
         }
       }
     | {
@@ -1250,6 +1348,15 @@ export type GlobalEvent = {
           timestamp: number
           sessionID: string
           title: string
+        }
+      }
+    | {
+        id: string
+        type: "session.next.execution-boundary.updated"
+        properties: {
+          timestamp: number
+          sessionID: string
+          boundary: PermissionV2Boundary
         }
       }
     | {
@@ -1339,6 +1446,223 @@ export type GlobalEvent = {
         properties: {
           goalID: string
           sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "goal.automation.updated"
+        properties: {
+          goalID: string
+          sessionID: string
+          automation?: GoalAutomationRuntime
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.created"
+        properties: {
+          activityID: string
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.updated"
+        properties: {
+          activityID: string
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.removed"
+        properties: {
+          activityID: string
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.invocation.started"
+        properties: {
+          activityID: string
+          invocationID: string
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.invocation.settled"
+        properties: {
+          activityID: string
+          invocationID: string
+        }
+      }
+    | {
+        id: string
+        type: "oxpActivity.link.added"
+        properties: {
+          activityID: string
+          invocationID: string
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.created"
+        properties: {
+          taskID: string
+          info: ScheduledTaskInfo
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.updated"
+        properties: {
+          taskID: string
+          info: ScheduledTaskInfo
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.removed"
+        properties: {
+          taskID: string
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.runStarted"
+        properties: {
+          taskID: string
+          run: ScheduledTaskRun
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.runSettled"
+        properties: {
+          taskID: string
+          run: ScheduledTaskRun
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.runUpdated"
+        properties: {
+          taskID: string
+          run: ScheduledTaskRun
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.controlChanged"
+        properties: {
+          control: ScheduledTaskControl
+        }
+      }
+    | {
+        id: string
+        type: "scheduledTask.sessionBindingChanged"
+        properties: {
+          taskID: string
+          binding: ScheduledTaskSessionBindingProjection
+        }
+      }
+    | {
+        id: string
+        type: "swarm.created"
+        properties: {
+          swarmID: string
+          info: SwarmInfo
+        }
+      }
+    | {
+        id: string
+        type: "swarm.updated"
+        properties: {
+          swarmID: string
+          info: SwarmInfo
+        }
+      }
+    | {
+        id: string
+        type: "swarm.member.updated"
+        properties: {
+          swarmID: string
+          member: SwarmMember
+        }
+      }
+    | {
+        id: string
+        type: "swarm.task.updated"
+        properties: {
+          swarmID: string
+          task: SwarmTask
+        }
+      }
+    | {
+        id: string
+        type: "swarm.task.dependencies.updated"
+        properties: {
+          swarmID: string
+          task: SwarmTask
+          dependencies: Array<SwarmTaskDependency>
+        }
+      }
+    | {
+        id: string
+        type: "swarm.task.lease.updated"
+        properties: {
+          swarmID: string
+          task: SwarmTask
+          lease?: SwarmTaskLease
+        }
+      }
+    | {
+        id: string
+        type: "swarm.task.run.updated"
+        properties: {
+          swarmID: string
+          task: SwarmTask
+          run: SwarmTaskRun
+          lease?: SwarmTaskLease
+        }
+      }
+    | {
+        id: string
+        type: "swarm.message.created"
+        properties: {
+          swarmID: string
+          message: SwarmMessage
+          deliveries: Array<SwarmDelivery>
+        }
+      }
+    | {
+        id: string
+        type: "swarm.delivery.updated"
+        properties: {
+          swarmID: string
+          delivery: SwarmDelivery
+        }
+      }
+    | {
+        id: string
+        type: "swarm.blackboard.updated"
+        properties: {
+          swarmID: string
+          entry: SwarmBlackboardEntry
+        }
+      }
+    | {
+        id: string
+        type: "swarm.claim.updated"
+        properties: {
+          swarmID: string
+          claim: SwarmClaim
+        }
+      }
+    | {
+        id: string
+        type: "swarm.deliverable.updated"
+        properties: {
+          swarmID: string
+          deliverable: SwarmDeliverable
         }
       }
     | {
@@ -1850,6 +2174,9 @@ export type GlobalEvent = {
     | SyncEventSessionNextMoved
     | SyncEventSessionNextPrompted
     | SyncEventSessionNextPromptAdmitted
+    | SyncEventSessionNextSyntheticAdmitted
+    | SyncEventSessionNextSyntheticPromoted
+    | SyncEventSessionNextSyntheticRevoked
     | SyncEventSessionNextContextUpdated
     | SyncEventSessionNextSynthetic
     | SyncEventSessionNextShellStarted
@@ -1877,6 +2204,19 @@ export type GlobalEvent = {
     | SyncEventSessionNextPaused
     | SyncEventSessionNextResumed
     | SyncEventSessionNextRenamed
+    | SyncEventSessionNextExecutionBoundaryUpdated
+    | SyncEventSwarmCreated
+    | SyncEventSwarmUpdated
+    | SyncEventSwarmMemberUpdated
+    | SyncEventSwarmTaskUpdated
+    | SyncEventSwarmTaskDependenciesUpdated
+    | SyncEventSwarmTaskLeaseUpdated
+    | SyncEventSwarmTaskRunUpdated
+    | SyncEventSwarmMessageCreated
+    | SyncEventSwarmDeliveryUpdated
+    | SyncEventSwarmBlackboardUpdated
+    | SyncEventSwarmClaimUpdated
+    | SyncEventSwarmDeliverableUpdated
 }
 
 export type GlobalEventInterestInput = {
@@ -1949,6 +2289,80 @@ export type GlobalSessionTelemetryResult = {
   }
 }
 
+export type OxpParentActivitySummary = {
+  id: string
+  title?: string
+  firstSeenAt: number
+  lastSeenAt: number
+  callCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  failureCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  augmentationCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  supervisionCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  delegationCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  observedEpochCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lastTool?: string
+  lastRootAlias?: string
+  archivedAt?: number
+}
+
+export type OxpInvocationLinkInfo = {
+  kind: OxpActivityLinkKind
+  ref: string
+  relation: string
+  label?: string
+}
+
+export type OxpInvocationInfo = {
+  id: string
+  activityID: string
+  hostRunID: string
+  observedEpoch?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  plane: OxpActivityPlane
+  tool: string
+  action?: string
+  rootID?: string
+  rootAlias?: string
+  status: OxpActivityStatus
+  continuityMarker?: OxpActivityContinuityMarker
+  errorCode?: string
+  mutationAttempted: boolean
+  mutationCommitted: boolean
+  startedAt: number
+  completedAt?: number
+  links: Array<OxpInvocationLinkInfo>
+}
+
+export type OxpInvocationPage = {
+  items: Array<OxpInvocationInfo>
+  more: boolean
+  before?: {
+    startedAt: number
+    id: string
+  }
+}
+
+export type OxpResourceProvenanceInfo = {
+  activityID: string
+  invocationID: string
+  kind: OxpActivityLinkKind
+  ref: string
+  relation: string
+  label?: string
+  tool: string
+  action?: string
+  startedAt: number
+}
+
+export type GlobalOxpActivityPatch = {
+  title?: string
+  clearTitle?: boolean
+  archived?: boolean
+}
+
+export type GlobalOxpActivityDeleteResult = {
+  deleted: boolean
+}
+
 export type Project = {
   id: string
   worktree: string
@@ -1974,6 +2388,10 @@ export type ServerConfig = {
   mdns?: boolean
   mdnsDomain?: string
   cors?: Array<string>
+}
+
+export type OfxpConfig = {
+  enabled?: boolean
 }
 
 export type PermissionActionConfig = "ask" | "allow" | "deny"
@@ -2087,6 +2505,7 @@ export type ProviderConfig = {
       id?: string
       name?: string
       family?: string
+      primitive?: ModelPrimitive
       release_date?: string
       attachment?: boolean
       reasoning?: boolean
@@ -2213,6 +2632,7 @@ export type Config = {
   shell?: string
   logLevel?: LogLevel
   server?: ServerConfig
+  ofxp?: OfxpConfig
   command?: {
     [key: string]: {
       template: string
@@ -2249,7 +2669,7 @@ export type Config = {
   share?: "manual" | "auto" | "disabled"
   autoshare?: boolean
   /**
-   * Automatically update to the latest version. Set to true to auto-update, false to disable, or 'notify' to show update notifications
+   * Check OpenFork releases for updates. true installs patch updates only for fork-managed direct installs and otherwise notifies; false disables checks; 'notify' never installs automatically
    */
   autoupdate?: boolean | "notify"
   disabled_providers?: Array<string>
@@ -2411,6 +2831,31 @@ export type ModelPreferencesPatch = {
   remove?: ModelPreferencesRemoval
 }
 
+export type NotFoundError = {
+  name: "NotFoundError"
+  data: {
+    message: string
+  }
+}
+
+export type ConflictError = {
+  _tag: "ConflictError"
+  message: string
+  resource?: string
+  code?: string
+}
+
+export type ServiceUnavailableError = {
+  _tag: "ServiceUnavailableError"
+  message: string
+  service?: string
+}
+
+export type InvalidCursorError = {
+  _tag: "InvalidCursorError"
+  message: string
+}
+
 export type PairBeginResult = {
   code: string
   url: string
@@ -2455,6 +2900,7 @@ export type Model = {
   }
   name: string
   family?: string
+  primitive?: ModelPrimitive
   capabilities: {
     temperature: boolean
     reasoning: boolean
@@ -2649,6 +3095,7 @@ export type GlobalSession = {
   model?: {
     id: string
     providerID: string
+    accountID?: string
     variant?: string
   }
   version: string
@@ -2976,6 +3423,7 @@ export type Agent = {
   model?: {
     modelID: string
     providerID: string
+    accountID?: string
   }
   variant?: string
   prompt?: string
@@ -3145,25 +3593,12 @@ export type ProviderAuthError1 = {
   }
 }
 
-export type NotFoundError = {
-  name: "NotFoundError"
-  data: {
-    message: string
-  }
-}
-
 export type SessionNullableArchivedTimestamp = number
 
 export type SessionNotFoundError = {
   _tag: "SessionNotFoundError"
   sessionID: string
   message: string
-}
-
-export type ServiceUnavailableError = {
-  _tag: "ServiceUnavailableError"
-  message: string
-  service?: string
 }
 
 export type TextPartInput = {
@@ -3261,7 +3696,7 @@ export type SessionContextOperation =
 
 export type SessionContextLedgerEntry = {
   messageID: string
-  type: "system" | "user" | "assistant" | "tool" | "compaction"
+  type: "system" | "user" | "synthetic" | "shell" | "assistant" | "tool" | "compaction"
   role: string
   preview: string
   tokenEstimate: number
@@ -3286,11 +3721,48 @@ export type SessionContextLedger = {
   }
 }
 
-export type ConflictError = {
-  _tag: "ConflictError"
+export type ModelNotFoundError = {
+  _tag: "ModelNotFoundError"
+  providerID: string
+  modelID: string
+  suggestions: Array<string>
   message: string
-  resource?: string
-  code?: string
+}
+
+export type UnauthorizedError = {
+  _tag: "UnauthorizedError"
+  message: string
+}
+
+export type ForbiddenError = {
+  _tag: "ForbiddenError"
+  message: string
+}
+
+export type RateLimitError = {
+  _tag: "RateLimitError"
+  message: string
+  service?: string
+  retryAfterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type QuotaExceededError = {
+  _tag: "QuotaExceededError"
+  message: string
+  service?: string
+}
+
+export type UpstreamError = {
+  _tag: "UpstreamError"
+  message: string
+  service?: string
+  status?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type TimeoutError = {
+  _tag: "TimeoutError"
+  message: string
+  operation?: string
 }
 
 export type ToolReloadResponse =
@@ -3407,22 +3879,12 @@ export type WorkspaceWarpError = {
   }
 }
 
-export type UnauthorizedError = {
-  _tag: "UnauthorizedError"
-  message: string
-}
-
 export type SessionsResponse = {
   data: Array<SessionV2Info>
   cursor: {
     previous?: string
     next?: string
   }
-}
-
-export type InvalidCursorError = {
-  _tag: "InvalidCursorError"
-  message: string
 }
 
 export type SessionSearchMessageMatch = {
@@ -3479,6 +3941,9 @@ export type SessionDurableEvent =
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
+  | SessionNextSyntheticAdmitted
+  | SessionNextSyntheticPromoted
+  | SessionNextSyntheticRevoked
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -3506,6 +3971,7 @@ export type SessionDurableEvent =
   | SessionNextPaused
   | SessionNextResumed
   | SessionNextRenamed
+  | SessionNextExecutionBoundaryUpdated
 
 export type SessionHistory = {
   data: Array<SessionDurableEvent>
@@ -3672,6 +4138,9 @@ export type V2Event =
   | SessionNextMoved
   | SessionNextPrompted
   | SessionNextPromptAdmitted
+  | SessionNextSyntheticAdmitted
+  | SessionNextSyntheticPromoted
+  | SessionNextSyntheticRevoked
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -3703,6 +4172,7 @@ export type V2Event =
   | SessionNextPaused
   | SessionNextResumed
   | SessionNextRenamed
+  | SessionNextExecutionBoundaryUpdated
   | MessagePartDelta
   | SessionDiff
   | SessionError
@@ -3713,6 +4183,33 @@ export type V2Event =
   | GoalUpdated
   | GoalFocused
   | GoalUnfocused
+  | GoalAutomationUpdated
+  | OxpActivityCreated
+  | OxpActivityUpdated
+  | OxpActivityRemoved
+  | OxpActivityInvocationStarted
+  | OxpActivityInvocationSettled
+  | OxpActivityLinkAdded
+  | ScheduledTaskCreated
+  | ScheduledTaskUpdated
+  | ScheduledTaskRemoved
+  | ScheduledTaskRunStarted
+  | ScheduledTaskRunSettled
+  | ScheduledTaskRunUpdated
+  | ScheduledTaskControlChanged
+  | ScheduledTaskSessionBindingChanged
+  | SwarmCreated
+  | SwarmUpdated
+  | SwarmMemberUpdated
+  | SwarmTaskUpdated
+  | SwarmTaskDependenciesUpdated
+  | SwarmTaskLeaseUpdated
+  | SwarmTaskRunUpdated
+  | SwarmMessageCreated
+  | SwarmDeliveryUpdated
+  | SwarmBlackboardUpdated
+  | SwarmClaimUpdated
+  | SwarmDeliverableUpdated
   | ReferenceUpdated
   | PermissionV2Asked
   | PermissionV2Replied
@@ -3765,11 +4262,6 @@ export type V2Event =
   | V2EventServerStreamProgress
 
 export type V2EventStream = string
-
-export type ForbiddenError = {
-  _tag: "ForbiddenError"
-  message: string
-}
 
 export type ProjectCopyError = {
   name: "ProjectCopyError"
@@ -3857,9 +4349,24 @@ export type MoveSessionDestination = {
   directory: string
 }
 
+export type SessionMessageProvenance =
+  | {
+      owner: "user"
+      source: string
+      lifetime?: "historical"
+    }
+  | {
+      owner: "host"
+      source: string
+      sourceMessageID?: string
+      ref?: string
+      lifetime?: "historical"
+    }
+
 export type ModelRef = {
   id: string
   providerID: string
+  accountID?: string
   variant?: string
 }
 
@@ -3886,6 +4393,46 @@ export type PromptAgentAttachment = {
   name: string
   source?: PromptSource
 }
+
+export type SessionSyntheticContent = {
+  text: string
+  files?: Array<PromptFileAttachment>
+}
+
+export type SessionSyntheticActor =
+  | {
+      type: "host"
+    }
+  | {
+      type: "session"
+      sessionID: string
+      messageID?: string
+    }
+
+export type SessionSyntheticTurnRef = {
+  sessionID: string
+  messageID: string
+}
+
+export type SessionSyntheticOrigin = {
+  producer: string
+  actor: SessionSyntheticActor
+  ref?: string
+  cause?: SessionSyntheticTurnRef
+}
+
+export type SessionSyntheticDelegatedTurnAuthority = {
+  authorizedAgentNames?: Array<string>
+}
+
+export type SessionInputSyntheticExecution = {
+  agent: string
+  model: ModelRef
+}
+
+export type SessionInputSyntheticAdmissionClass = "host" | "automatic"
+
+export type SessionInputRevocationReason = "cancelled" | "superseded" | "user_superseded" | "expired" | "policy"
 
 export type SessionErrorUnknown = {
   type: "unknown"
@@ -3941,6 +4488,16 @@ export type RevertState = {
   files?: Array<FileDiff>
 }
 
+export type PermissionV2Effect = "allow" | "deny" | "ask"
+
+export type PermissionV2Rule = {
+  action: string
+  resource: string
+  effect: PermissionV2Effect
+}
+
+export type PermissionV2Boundary = Array<PermissionV2Rule>
+
 export type GoalStatus = "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
 
 export type GoalAutomationMode = "manual" | "auto_continue" | "unattended"
@@ -3968,6 +4525,7 @@ export type GoalInfo = {
   constraints: Array<string>
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  auditorRuns: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   continuationPolicy: GoalContinuationPolicy
   auditorPolicy: GoalAuditorPolicy
   blocker?: string
@@ -3979,6 +4537,462 @@ export type GoalInfo = {
 }
 
 export type GoalFocusRole = "owner" | "worker" | "verifier"
+
+export type GoalAutomationRuntime =
+  | {
+      phase: "working"
+      since: number
+    }
+  | {
+      phase: "audit_requested"
+      since: number
+    }
+  | {
+      phase: "continuation_pending"
+      since: number
+    }
+  | {
+      phase: "auditing"
+      since: number
+      auditorSessionID: string
+    }
+  | {
+      phase: "audit_error"
+      since: number
+      error: string
+    }
+
+export type ScheduledTaskTarget =
+  | {
+      kind: "directory"
+    }
+  | {
+      kind: "worktree"
+      baseRef?: string
+      reuse: boolean
+    }
+
+export type ScheduledTaskSessionPolicy =
+  | {
+      kind: "new"
+    }
+  | {
+      kind: "reuse"
+    }
+  | {
+      kind: "auto"
+    }
+  | {
+      kind: "existing"
+      sessionID: string
+    }
+
+export type ScheduledTaskTimeOfDay = {
+  hour: number
+  minute: number
+}
+
+export type ScheduledTaskWeekday = number
+
+export type ScheduledTaskSchedule =
+  | {
+      kind: "once"
+      at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+  | {
+      kind: "daily"
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "weekly"
+      weekdays: Array<ScheduledTaskWeekday>
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "cron"
+      expression: string
+    }
+
+export type ScheduledTaskGoalAction = {
+  title: string
+  objective: string
+  criteria?: Array<string>
+  continuationPolicy?: GoalContinuationPolicy
+}
+
+export type ScheduledTaskAction = {
+  prompt: string
+  agent?: string
+  model?: ModelRef
+  goal?: ScheduledTaskGoalAction
+}
+
+export type ScheduledTaskCatchUpPolicy = "skip" | "run_once" | "run_all"
+
+export type ScheduledTaskOverrunPolicy = "skip" | "queue" | "cancel_prior"
+
+export type ScheduledTaskPermissionMode = "deny" | "pause" | "inherit"
+
+export type ScheduledTaskNotifyMode = "failure" | "always" | "never"
+
+export type ScheduledTaskResolvedPolicy = {
+  catchUp: ScheduledTaskCatchUpPolicy
+  catchUpMaxAgeMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  overrun: ScheduledTaskOverrunPolicy
+  jitterMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxAttempts: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxDurationMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  retentionRuns: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  permission: ScheduledTaskPermissionMode
+  notify: ScheduledTaskNotifyMode
+}
+
+export type ScheduledTaskRunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed" | "skipped" | "abandoned"
+
+export type ScheduledTaskSource = "api" | "agent" | "oxp" | "loop_file"
+
+export type ScheduledTaskInfo = {
+  id: string
+  projectID?: string
+  targetDirectory: string
+  target: ScheduledTaskTarget
+  sessionPolicy: ScheduledTaskSessionPolicy
+  name: string
+  enabled: boolean
+  revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  schedule: ScheduledTaskSchedule
+  timezone?: string
+  action: ScheduledTaskAction
+  policy: ScheduledTaskResolvedPolicy
+  nextRunAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lastRunAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lastRunStatus?: ScheduledTaskRunStatus
+  lastRunID?: string
+  consecutiveFailures: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  source: ScheduledTaskSource
+  sourcePath?: string
+  sourceMessageID?: string
+  sourceRef?: string
+  sourcePrincipal?: string
+  time: {
+    created: number
+    updated: number
+  }
+}
+
+export type ScheduledTaskTrigger = "schedule" | "manual" | "catchup" | "retry"
+
+export type ScheduledTaskSkipReason =
+  | "target_missing"
+  | "stale"
+  | "overrun"
+  | "disabled"
+  | "invalid_schedule"
+  | "paused"
+  | "already_settled"
+  | "deleted"
+  | "max_attempts"
+
+export type ScheduledTaskErrorKind =
+  | "config"
+  | "auth"
+  | "quota"
+  | "provider"
+  | "timeout"
+  | "aborted"
+  | "internal"
+  | "target_missing"
+
+export type ScheduledTaskRun = {
+  id: string
+  taskID: string
+  fireFor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  trigger: ScheduledTaskTrigger
+  status: ScheduledTaskRunStatus
+  sessionID?: string
+  goalID?: string
+  workspaceID?: string
+  directory?: string
+  skipReason?: ScheduledTaskSkipReason
+  errorKind?: ScheduledTaskErrorKind
+  errorMessage?: string
+  acknowledgedAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  attempt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  finishedAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type ScheduledTaskControl = {
+  paused: boolean
+  timeUpdated: number
+}
+
+export type ScheduledTaskSessionBindingProjection = {
+  taskID: string
+  sessionID: string
+  generation: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  timeUpdated: number
+}
+
+export type SwarmStatus = "creating" | "active" | "paused" | "stopping" | "completed" | "failed" | "archived"
+
+export type SwarmPolicy = {
+  [key: string]: unknown
+}
+
+export type SwarmInfo = {
+  id: string
+  projectID: string
+  directory: string
+  workspaceID?: string
+  name: string
+  status: SwarmStatus
+  coordinatorMemberID?: string
+  policy: SwarmPolicy
+  revision: number
+  time: {
+    created: number
+    updated: number
+    completed?: number
+    archived?: number
+  }
+}
+
+export type SwarmMemberKind = "coordinator" | "managed_worker" | "external" | "guest"
+
+export type SwarmMemberLifecycle = "active" | "held" | "stopping" | "stopped"
+
+export type SwarmMemberExecutionProfile = {
+  agent: string
+  model: ModelRef
+  permissionBoundary: PermissionV2Boundary
+  requestedCapabilities?: Array<string>
+}
+
+export type SwarmWorkspacePolicy =
+  | {
+      mode: "shared-read"
+    }
+  | {
+      mode: "shared-write"
+    }
+  | {
+      mode: "worktree"
+      baseRef?: string
+    }
+
+export type SwarmMemberCapabilities = {
+  tags: Array<string>
+}
+
+export type SwarmMember = {
+  id: string
+  swarmID: string
+  name: string
+  kind: SwarmMemberKind
+  role: string
+  lifecycle: SwarmMemberLifecycle
+  sessionID?: string
+  bindingGeneration: number
+  desiredProfile?: SwarmMemberExecutionProfile
+  workspacePolicy: SwarmWorkspacePolicy
+  capabilities?: SwarmMemberCapabilities
+  time: {
+    created: number
+    updated: number
+    stopped?: number
+  }
+}
+
+export type SwarmTaskStatus =
+  | "pending"
+  | "blocked"
+  | "ready"
+  | "working"
+  | "review_pending"
+  | "changes_requested"
+  | "completed"
+  | "failed"
+  | "cancelled"
+
+export type SwarmTaskAcceptance = {
+  criteria: Array<string>
+}
+
+export type SwarmTask = {
+  id: string
+  swarmID: string
+  title: string
+  description?: string
+  status: SwarmTaskStatus
+  priority: number
+  createdByMemberID?: string
+  reservedMemberID?: string
+  reservedUntil?: number
+  reservationRevision: number
+  leaseGeneration: number
+  semanticRetryCount: number
+  acceptance: SwarmTaskAcceptance
+  metadata: {
+    [key: string]: unknown
+  }
+  readyAt?: number
+  time: {
+    created: number
+    updated: number
+    completed?: number
+  }
+}
+
+export type SwarmDependencyRequirement = "require_success" | "require_terminal"
+
+export type SwarmTaskDependency = {
+  taskID: string
+  dependsOnTaskID: string
+  requirement: SwarmDependencyRequirement
+}
+
+export type SwarmLeaseState = "active" | "human_hold" | "retiring"
+
+export type SwarmTaskLease = {
+  taskID: string
+  generation: number
+  ownerMemberID: string
+  ownerSessionID: string
+  ownerBindingGeneration: number
+  leaseOwnerProcess: string
+  state: SwarmLeaseState
+  holdUserSeq?: number
+  holdStartedAt?: number
+  holdDeadline?: number
+  retireReason?: string
+  retireRequestedAt?: number
+  acquiredAt: number
+  expiresAt: number
+  renewedAt?: number
+}
+
+export type SwarmTaskRunStatus = "admitted" | "running" | "completed" | "failed" | "cancelled" | "superseded"
+
+export type SwarmTaskFailureKind =
+  | "semantic"
+  | "provider"
+  | "tool"
+  | "permission"
+  | "timeout"
+  | "session_aborted"
+  | "stale_binding"
+  | "stale_lease"
+  | "internal"
+
+export type SwarmTaskRun = {
+  id: string
+  taskID: string
+  memberID: string
+  sessionID: string
+  bindingGeneration: number
+  leaseGeneration: number
+  sessionInputID: string
+  status: SwarmTaskRunStatus
+  failureKind?: SwarmTaskFailureKind
+  failureDetail?: string
+  admittedAt?: number
+  startedAt?: number
+  endedAt?: number
+  createdAt: number
+}
+
+export type SwarmMessageKind =
+  | "message"
+  | "request"
+  | "response"
+  | "finding"
+  | "handoff"
+  | "blocker"
+  | "decision"
+  | "review"
+  | "control"
+
+export type SwarmMessagePriority = "low" | "normal" | "high" | "urgent"
+
+export type SwarmMessage = {
+  id: string
+  swarmID: string
+  senderMemberID: string
+  senderSessionID: string
+  senderBindingGeneration: number
+  kind: SwarmMessageKind
+  body: string
+  taskID?: string
+  correlationID?: string
+  responseTo?: string
+  priority: SwarmMessagePriority
+  replyExpected: boolean
+  createdAt: number
+  expiresAt?: number
+}
+
+export type SwarmDeliveryState = "pending" | "claimed" | "admitted" | "expired" | "failed"
+
+export type SwarmDelivery = {
+  id: string
+  messageID: string
+  recipientMemberID: string
+  state: SwarmDeliveryState
+  sessionInputID: string
+  claimGeneration: number
+  claimOwner?: string
+  claimExpiresAt?: number
+  nextAttemptAt?: number
+  attemptCount: number
+  admittedSessionID?: string
+  admittedSeq?: number
+  admittedAt?: number
+  error?: string
+}
+
+export type SwarmBlackboardEntry = {
+  swarmID: string
+  key: string
+  value: unknown
+  contentType: string
+  version: number
+  authorMemberID: string
+  taskID?: string
+  time: {
+    created: number
+    updated: number
+  }
+}
+
+export type SwarmClaim = {
+  swarmID: string
+  memberID: string
+  scope: string
+  generation: number
+  expiresAt?: number
+  releasedAt?: number
+  time: {
+    created: number
+    updated: number
+  }
+}
+
+export type SwarmDeliverableVerdict = "accepted" | "rejected"
+
+export type SwarmDeliverable = {
+  id: string
+  swarmID: string
+  memberID: string
+  taskRunID?: string
+  summary: string
+  refs: Array<string>
+  files: Array<string>
+  verdict?: SwarmDeliverableVerdict
+  verdictByMemberID?: string
+  createdAt: number
+  verdictAt?: number
+}
 
 export type PermissionV2Source = {
   type: "tool"
@@ -4023,6 +5037,8 @@ export type QuestionV2Tool = {
 
 export type QuestionV2Answer = Array<string>
 
+export type SessionGroupKind = "user" | "subagent" | "plugin" | "delegation" | "swarm"
+
 export type SessionGroupPolicy = {
   autoAddDescendants: boolean
   lockAdded: boolean
@@ -4033,7 +5049,7 @@ export type SessionGroupInfo = {
   id: string
   name: string
   position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  kind: "user" | "subagent" | "plugin"
+  kind: SessionGroupKind
   ownerPlugin?: string
   ownerRef?: string
   anchorSessionID?: string
@@ -4193,6 +5209,7 @@ export type SyncEventSessionNextAgentSwitched = {
       timestamp: number
       sessionID: string
       messageID: string
+      provenance?: SessionMessageProvenance
       agent: string
     }
   }
@@ -4210,6 +5227,7 @@ export type SyncEventSessionNextModelSwitched = {
       timestamp: number
       sessionID: string
       messageID: string
+      provenance?: SessionMessageProvenance
       model: ModelRef
     }
   }
@@ -4247,6 +5265,7 @@ export type SyncEventSessionNextPrompted = {
       messageID: string
       prompt: Prompt
       delivery: "steer" | "queue"
+      provenance?: SessionMessageProvenance
     }
   }
 }
@@ -4265,6 +5284,71 @@ export type SyncEventSessionNextPromptAdmitted = {
       messageID: string
       prompt: Prompt
       delivery: "steer" | "queue"
+      provenance?: SessionMessageProvenance
+    }
+  }
+}
+
+export type SyncEventSessionNextSyntheticAdmitted = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.synthetic.admitted.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      messageID: string
+      content: SessionSyntheticContent
+      origin: SessionSyntheticOrigin
+      delegated?: SessionSyntheticDelegatedTurnAuthority
+      execution?: SessionInputSyntheticExecution
+      delivery: "steer" | "queue"
+      admissionClass: SessionInputSyntheticAdmissionClass
+      userPreemptible: boolean
+    }
+  }
+}
+
+export type SyncEventSessionNextSyntheticPromoted = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.synthetic.promoted.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      messageID: string
+      content: SessionSyntheticContent
+      origin: SessionSyntheticOrigin
+      delegated?: SessionSyntheticDelegatedTurnAuthority
+      execution?: SessionInputSyntheticExecution
+      delivery: "steer" | "queue"
+      admissionClass: SessionInputSyntheticAdmissionClass
+      userPreemptible: boolean
+      promotedAt?: number
+    }
+  }
+}
+
+export type SyncEventSessionNextSyntheticRevoked = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.synthetic.revoked.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      messageID: string
+      reason: SessionInputRevocationReason
     }
   }
 }
@@ -4299,6 +5383,7 @@ export type SyncEventSessionNextSynthetic = {
       sessionID: string
       messageID: string
       text: string
+      provenance?: SessionMessageProvenance
     }
   }
 }
@@ -4654,6 +5739,7 @@ export type SyncEventSessionNextCompactionStarted = {
       sessionID: string
       messageID: string
       reason: "auto" | "manual"
+      provenance?: SessionMessageProvenance
     }
   }
 }
@@ -4673,6 +5759,7 @@ export type SyncEventSessionNextCompactionEnded = {
       reason: "auto" | "manual"
       text: string
       recent: string
+      provenance?: SessionMessageProvenance
     }
   }
 }
@@ -4770,6 +5857,233 @@ export type SyncEventSessionNextRenamed = {
   }
 }
 
+export type SyncEventSessionNextExecutionBoundaryUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.execution-boundary.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      boundary: PermissionV2Boundary
+    }
+  }
+}
+
+export type SyncEventSwarmCreated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.created.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      info: SwarmInfo
+    }
+  }
+}
+
+export type SyncEventSwarmUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      info: SwarmInfo
+    }
+  }
+}
+
+export type SyncEventSwarmMemberUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.member.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      member: SwarmMember
+    }
+  }
+}
+
+export type SyncEventSwarmTaskUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.task.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      task: SwarmTask
+    }
+  }
+}
+
+export type SyncEventSwarmTaskDependenciesUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.task.dependencies.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      task: SwarmTask
+      dependencies: Array<SwarmTaskDependency>
+    }
+  }
+}
+
+export type SyncEventSwarmTaskLeaseUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.task.lease.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      task: SwarmTask
+      lease?: SwarmTaskLease
+    }
+  }
+}
+
+export type SyncEventSwarmTaskRunUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.task.run.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      task: SwarmTask
+      run: SwarmTaskRun
+      lease?: SwarmTaskLease
+    }
+  }
+}
+
+export type SyncEventSwarmMessageCreated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.message.created.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      message: SwarmMessage
+      deliveries: Array<SwarmDelivery>
+    }
+  }
+}
+
+export type SyncEventSwarmDeliveryUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.delivery.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      delivery: SwarmDelivery
+    }
+  }
+}
+
+export type SyncEventSwarmBlackboardUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.blackboard.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      entry: SwarmBlackboardEntry
+    }
+  }
+}
+
+export type SyncEventSwarmClaimUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.claim.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      claim: SwarmClaim
+    }
+  }
+}
+
+export type SyncEventSwarmDeliverableUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "swarm.deliverable.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      swarmID: string
+      deliverable: SwarmDeliverable
+    }
+  }
+}
+
+export type OxpActivityPlane = "augmentation" | "supervision" | "delegation"
+
+export type OxpActivityStatus =
+  | "running"
+  | "success"
+  | "committed"
+  | "cancelled_before_commit"
+  | "cancelled_after_commit"
+  | "denied"
+  | "conflict"
+  | "failed"
+  | "ambiguous_external_result"
+  | "interrupted"
+
+export type OxpActivityContinuityMarker = "handoff_advisory"
+
+export type OxpActivityLinkKind =
+  | "session"
+  | "worker_session"
+  | "worker_group"
+  | "scheduled_task"
+  | "process"
+  | "root"
+  | "external_mcp"
+  | "file_transfer"
+
 export type ConfigV2ReferenceGit = {
   repository: string
   branch?: string
@@ -4782,6 +6096,8 @@ export type ConfigV2ReferenceLocal = {
   description?: string
   hidden?: boolean
 }
+
+export type ModelPrimitive = "language" | "system-one"
 
 export type PolicyEffect = "allow" | "deny"
 
@@ -4804,6 +6120,324 @@ export type ConnectionEnvInfo = {
 }
 
 export type ConnectionInfo = ConnectionCredentialInfo | ConnectionEnvInfo
+
+export type OfxpSettingsRuntimeStatus = {
+  active: boolean
+  peerID?: string
+  label?: string
+  port?: number
+  discovery: "disabled" | "active" | "degraded"
+  discoveryError?: string
+  identityRotationSupported?: boolean
+  rotation?: {
+    previousPeerID: string
+    expiresAt: number
+    expired: boolean
+  }
+}
+
+export type OfxpSettingsCandidate = {
+  peerID: string
+  realmID: string
+  openforkVersion: string
+  protocolVersion: number
+  pairing: boolean
+  endpointCount: number
+  lastSeenAt: number
+}
+
+export type OfxpSettingsPairingPeer = {
+  id: string
+  realmID: string
+  label: string
+  fingerprint: string
+}
+
+export type OfxpSettingsPairingPreview = {
+  pairingID: string
+  peer: OfxpSettingsPairingPeer
+  sas: string
+  expiresAt: number
+  continuityClaim?: {
+    previousPeerID: string
+    expiresAt: number
+  }
+}
+
+export type OfxpRekeyState = "stable" | "required"
+
+export type OfxpPeerInfo = {
+  id: string
+  realmID: string
+  label: string
+  fingerprint: string
+  rekeyState: OfxpRekeyState
+  pairedAt: number
+  lastSeenAt?: number
+  revokedAt?: number
+  grantRevision: number
+  grantExpiresAt?: number
+}
+
+export type OfxpSessionSupervision = "none" | "approved-roots"
+
+export type OfxpDelegation = "disabled" | "spawn"
+
+export type OfxpGrant = {
+  read: boolean
+  write: boolean
+  git: boolean
+  process: boolean
+  integrations: boolean
+  browser: boolean
+  filesReceive: boolean
+  filesSend: boolean
+  automation: boolean
+  messaging: boolean
+  sessionSupervision: OfxpSessionSupervision
+  requestSupervision: boolean
+  delegation: OfxpDelegation
+  nestedDelegation: boolean
+}
+
+export type OfxpSettingsApprovedRoot = {
+  id: string
+  alias: string
+  source: "manual" | "project"
+  approvedAt: number
+}
+
+export type OfxpSettingsAuthenticatedEndpoint = {
+  host: string
+  port: number
+  pendingRequests: number
+}
+
+export type OfxpSettingsPeerOverview = {
+  info: OfxpPeerInfo
+  grant: OfxpGrant
+  roots: Array<OfxpSettingsApprovedRoot>
+  online: boolean
+  openforkVersion?: string
+  protocolVersion?: number
+  authenticatedEndpoint?: OfxpSettingsAuthenticatedEndpoint
+}
+
+export type OfxpCommitClass = "safe_read" | "idempotent_mutation" | "non_idempotent_mutation" | "durable_start"
+
+export type OfxpReceiptState = "admitted" | "started" | "committed" | "failed" | "cancelled"
+
+export type OfxpSettingsRecentActivity = {
+  sourcePeerID: string
+  operation: string
+  commitClass: OfxpCommitClass
+  state: OfxpReceiptState
+  createdAt: number
+  settledAt?: number
+}
+
+export type OfxpSettingsState = {
+  status: OfxpSettingsRuntimeStatus
+  candidates: Array<OfxpSettingsCandidate>
+  pairings: Array<OfxpSettingsPairingPreview>
+  peers: Array<OfxpSettingsPeerOverview>
+  activity: Array<OfxpSettingsRecentActivity>
+}
+
+export type OfxpSettingsRuntimePayload = {
+  enabled: boolean
+}
+
+export type OfxpSettingsServerSeed = {
+  id: string
+  peerID: string
+  realmID: string
+  openforkVersion: string
+  protocolVersion: number
+  pairing: boolean
+  endpoint: {
+    host: string
+    port: number
+    addresses?: Array<string>
+  }
+}
+
+export type OfxpSettingsServerSeedsPayload = {
+  seeds: Array<OfxpSettingsServerSeed>
+}
+
+export type OfxpSettingsServerSeedsResult = {
+  accepted: number
+}
+
+export type OfxpSettingsIdentityMutationPayload = {
+  expectedPeerID: string
+}
+
+export type OfxpSettingsGrantPayload = {
+  expectedRevision: number
+  grant: OfxpGrant
+}
+
+export type OfxpSettingsRevokePayload = {
+  expectedRevision: number
+}
+
+export type OfxpSettingsRootPayload = {
+  expectedRevision: number
+  alias: string
+  canonicalPath: string
+  source?: "manual" | "project"
+}
+
+export type ScheduledTaskRecurringSchedule =
+  | {
+      kind: "daily"
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "weekly"
+      weekdays: Array<ScheduledTaskWeekday>
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "cron"
+      expression: string
+    }
+
+export type ScheduledTaskScheduleInput =
+  | {
+      kind: "once"
+      at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+  | {
+      kind: "daily"
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "weekly"
+      weekdays: Array<ScheduledTaskWeekday>
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "cron"
+      expression: string
+    }
+  | {
+      kind: "relative"
+      delayMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+  | {
+      kind: "timestamp"
+      at: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+  | {
+      kind: "recurring"
+      schedule: ScheduledTaskRecurringSchedule
+    }
+
+export type ScheduledTaskPolicy = {
+  catchUp?: ScheduledTaskCatchUpPolicy
+  catchUpMaxAgeMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  overrun?: ScheduledTaskOverrunPolicy
+  jitterMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxAttempts?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  retentionRuns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  permission?: ScheduledTaskPermissionMode
+  notify?: ScheduledTaskNotifyMode
+}
+
+export type ScheduledTaskPreview = {
+  next: Array<number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN">
+  warnings: Array<string>
+  summary: string
+}
+
+export type ScheduledTaskAgendaOccurrence = {
+  taskID: string
+  scheduledAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  effectiveAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type ScheduledTaskSessionCandidate = {
+  id: string
+  projectID: string
+  directory: string
+  title: string
+  timeUpdated: number
+}
+
+export type ScheduledTaskInboxCount = {
+  unread: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type SwarmSummary = {
+  swarm: SwarmInfo
+  memberCount: number
+  boundMemberCount: number
+  readyTaskCount: number
+  workingTaskCount: number
+  pendingDeliveryCount: number
+}
+
+export type SwarmHttpApiDetail = {
+  swarm: SwarmInfo
+  members: Array<SwarmMember>
+  tasks: Array<SwarmTask>
+  dependencies: Array<SwarmTaskDependency>
+}
+
+export type SwarmHttpApiMessageHistoryEntry = {
+  message: SwarmMessage
+  deliveries: Array<SwarmDelivery>
+}
+
+export type SwarmHttpApiMessageHistoryPage = {
+  items: Array<SwarmHttpApiMessageHistoryEntry>
+  more: boolean
+  nextCursor?: string
+}
+
+export type SwarmHttpApiTaskRunHistoryPage = {
+  items: Array<SwarmTaskRun>
+  more: boolean
+  nextCursor?: string
+}
+
+export type SwarmHttpApiBlackboardPage = {
+  items: Array<SwarmBlackboardEntry>
+  more: boolean
+  nextCursor?: string
+}
+
+export type SwarmHttpApiClaimPage = {
+  items: Array<SwarmClaim>
+  more: boolean
+  nextCursor?: string
+}
+
+export type SwarmHttpApiDeliverablePage = {
+  items: Array<SwarmDeliverable>
+  more: boolean
+  nextCursor?: string
+}
+
+export type SwarmHttpApiDelegateResponse = {
+  swarm: SwarmInfo
+  coordinator: SwarmMember
+  members: Array<SwarmMember>
+  tasks: Array<SwarmTask>
+}
+
+export type SwarmHttpApiRecoveryResponse = {
+  requested: boolean
+  unresolved: Array<{
+    memberID: string
+    name: string
+    bindingGeneration: number
+  }>
+}
 
 export type DeviceInfo = {
   id: string
@@ -4835,6 +6469,17 @@ export type PtyTicketConnectToken = {
   expires_in: number
 }
 
+export type SessionGroupMutableKind = "user" | "subagent" | "plugin" | "delegation"
+
+export type SessionGroupMemberOrigin =
+  | "user"
+  | "auto_subagent"
+  | "goal_auditor"
+  | "special_agent"
+  | "plugin"
+  | "delegation"
+  | "swarm"
+
 export type SessionGroupMember = {
   id: string
   title: string
@@ -4849,7 +6494,7 @@ export type SessionGroupMember = {
     archived?: number
   }
   locked: boolean
-  origin: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
+  origin: SessionGroupMemberOrigin
   originPlugin?: string
   originRef?: string
   position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -4860,6 +6505,14 @@ export type SessionGroupDetail = {
   group: SessionGroupInfo
   sessions: Array<SessionGroupMember>
 }
+
+export type SessionGroupMutableMemberOrigin =
+  | "user"
+  | "auto_subagent"
+  | "goal_auditor"
+  | "special_agent"
+  | "plugin"
+  | "delegation"
 
 export type GoalCriterionStatus = "pending" | "passed" | "failed"
 
@@ -4941,26 +6594,115 @@ export type GoalFocus = {
   focusedAt: number
 }
 
+export type GoalFocusedGoal = {
+  focus: GoalFocus
+  detail: GoalDetail
+  auditorSessionID?: string
+  automation?: GoalAutomationRuntime
+}
+
+export type SystemOneContent =
+  | string
+  | {
+      [key: string]: unknown
+    }
+  | Array<unknown>
+
+export type SystemOneCriterion = SystemOneContent
+
+export type SystemOneNoulCriteria = {
+  true?: SystemOneContent
+  false?: SystemOneContent
+}
+
+export type SystemOneNoulQuestion = {
+  type: "noul"
+  instructions: SystemOneContent
+  criteria?: SystemOneNoulCriteria
+}
+
+export type SystemOneChoiceQuestion = {
+  type: "choice"
+  instructions: SystemOneContent
+  criteria: {
+    [key: string]: SystemOneContent
+  }
+}
+
+export type SystemOneScoreQuestion = {
+  type: "score"
+  instructions: SystemOneContent
+  criteria: Array<SystemOneContent>
+}
+
+export type SystemOneQuestion = SystemOneNoulQuestion | SystemOneChoiceQuestion | SystemOneScoreQuestion
+
+export type SystemOneQuestions = {
+  [key: string]: SystemOneQuestion
+}
+
+export type SystemOneInferInput = {
+  providerID: string
+  modelID: string
+  accountID?: string
+  affinityID?: string
+  state: SystemOneContent
+  questions: SystemOneQuestions
+  timeoutMs?: number
+}
+
+export type SystemOneNoulAnswer = {
+  type: "noul"
+  noul: number
+}
+
+export type SystemOneChoiceAnswer = {
+  type: "choice"
+  choice: string
+  confidence: number
+  probabilities: {
+    [key: string]: number
+  }
+}
+
+export type SystemOneScoreAnswer = {
+  type: "score"
+  score: number
+  confidence: number
+  legend: {
+    [key: string]: SystemOneContent
+  }
+  probabilities: {
+    [key: string]: number
+  }
+}
+
+export type SystemOneAnswer = SystemOneNoulAnswer | SystemOneChoiceAnswer | SystemOneScoreAnswer
+
+export type SystemOneUsage = {
+  input_tokens: number
+  output_tokens: number
+}
+
+export type SystemOneCost = {
+  input: number
+  output: number
+  total: number
+}
+
+export type SystemOneInferResult = {
+  model: string
+  answers: {
+    [key: string]: SystemOneAnswer
+  }
+  usage: SystemOneUsage
+  cost: SystemOneCost
+  raw: unknown
+}
+
 export type WorkspaceEventConnectionStatus = {
   workspaceID: string
   status: "connected" | "connecting" | "disconnected" | "error"
-}
-
-export type QuestionV2Prompt = {
-  /**
-   * Complete question
-   */
-  question: string
-  /**
-   * Very short label (max 30 chars)
-   */
-  header: string
-  /**
-   * Available choices
-   */
-  options: Array<QuestionV2Option>
-  multiple?: boolean
-  custom?: boolean
 }
 
 export type LocationInfo = {
@@ -4982,14 +6724,6 @@ export type ProviderRequest = {
 }
 
 export type AgentColor = string | "primary" | "secondary" | "accent" | "success" | "warning" | "error" | "info"
-
-export type PermissionV2Effect = "allow" | "deny" | "ask"
-
-export type PermissionV2Rule = {
-  action: string
-  resource: string
-  effect: PermissionV2Effect
-}
 
 export type PermissionV2Ruleset = Array<PermissionV2Rule>
 
@@ -5047,6 +6781,7 @@ export type SessionInputAdmitted = {
   sessionID: string
   prompt: Prompt
   delivery: "steer" | "queue"
+  provenance?: SessionMessageProvenance
   timeCreated: number
   promotedSeq?: number
 }
@@ -5060,6 +6795,7 @@ export type SessionMessageAgentSwitched = {
     created: number
   }
   type: "agent-switched"
+  provenance?: SessionMessageProvenance
   agent: string
 }
 
@@ -5072,6 +6808,7 @@ export type SessionMessageModelSwitched = {
     created: number
   }
   type: "model-switched"
+  provenance?: SessionMessageProvenance
   model: ModelRef
 }
 
@@ -5083,6 +6820,7 @@ export type SessionMessageUser = {
   time: {
     created: number
   }
+  provenance?: SessionMessageProvenance
   text: string
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
@@ -5097,8 +6835,10 @@ export type SessionMessageSynthetic = {
   time: {
     created: number
   }
+  provenance?: SessionMessageProvenance
   sessionID: string
   text: string
+  files?: Array<PromptFileAttachment>
   type: "synthetic"
 }
 
@@ -5248,6 +6988,7 @@ export type SessionMessageAssistant = {
 
 export type SessionMessageCompaction = {
   type: "compaction"
+  provenance?: SessionMessageProvenance
   reason: "auto" | "manual"
   summary: string
   recent: string
@@ -5286,6 +7027,7 @@ export type SessionNextAgentSwitched = {
     timestamp: number
     sessionID: string
     messageID: string
+    provenance?: SessionMessageProvenance
     agent: string
   }
 }
@@ -5306,6 +7048,7 @@ export type SessionNextModelSwitched = {
     timestamp: number
     sessionID: string
     messageID: string
+    provenance?: SessionMessageProvenance
     model: ModelRef
   }
 }
@@ -5349,6 +7092,7 @@ export type SessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -5370,6 +7114,80 @@ export type SessionNextPromptAdmitted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    provenance?: SessionMessageProvenance
+  }
+}
+
+export type SessionNextSyntheticAdmitted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.synthetic.admitted"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    content: SessionSyntheticContent
+    origin: SessionSyntheticOrigin
+    delegated?: SessionSyntheticDelegatedTurnAuthority
+    execution?: SessionInputSyntheticExecution
+    delivery: "steer" | "queue"
+    admissionClass: SessionInputSyntheticAdmissionClass
+    userPreemptible: boolean
+  }
+}
+
+export type SessionNextSyntheticPromoted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.synthetic.promoted"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    content: SessionSyntheticContent
+    origin: SessionSyntheticOrigin
+    delegated?: SessionSyntheticDelegatedTurnAuthority
+    execution?: SessionInputSyntheticExecution
+    delivery: "steer" | "queue"
+    admissionClass: SessionInputSyntheticAdmissionClass
+    userPreemptible: boolean
+    promotedAt?: number
+  }
+}
+
+export type SessionNextSyntheticRevoked = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.synthetic.revoked"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    reason: SessionInputRevocationReason
   }
 }
 
@@ -5410,6 +7228,7 @@ export type SessionNextSynthetic = {
     sessionID: string
     messageID: string
     text: string
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -5819,6 +7638,7 @@ export type SessionNextCompactionStarted = {
     sessionID: string
     messageID: string
     reason: "auto" | "manual"
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -5841,6 +7661,7 @@ export type SessionNextCompactionEnded = {
     reason: "auto" | "manual"
     text: string
     recent: string
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -5955,6 +7776,25 @@ export type SessionNextRenamed = {
   }
 }
 
+export type SessionNextExecutionBoundaryUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.execution-boundary.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    boundary: PermissionV2Boundary
+  }
+}
+
 export type ModelApi =
   | {
       id: string
@@ -5998,6 +7838,7 @@ export type ModelV2Info = {
   providerID: string
   family?: string
   name: string
+  primitive?: ModelPrimitive
   api: ModelApi
   capabilities: ModelCapabilities
   request: {
@@ -6598,7 +8439,7 @@ export type FileEdited = {
   }
 }
 
-export type GoalContinuationPolicy4 = {
+export type GoalContinuationPolicy5 = {
   mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
@@ -6621,7 +8462,8 @@ export type GoalInfo1 = {
   constraints: Array<string>
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy4
+  auditorRuns: number | "NaN" | "Infinity" | "-Infinity"
+  continuationPolicy: GoalContinuationPolicy5
   auditorPolicy: GoalAuditorPolicy4
   blocker?: string
   time: {
@@ -6701,6 +8543,587 @@ export type GoalUnfocused = {
   data: {
     goalID: string
     sessionID: string
+  }
+}
+
+export type GoalAutomationUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.automation.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    goalID: string
+    sessionID: string
+    automation?: GoalAutomationRuntime
+  }
+}
+
+export type OxpActivityCreated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.created"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+  }
+}
+
+export type OxpActivityUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+  }
+}
+
+export type OxpActivityRemoved = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.removed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+  }
+}
+
+export type OxpActivityInvocationStarted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.invocation.started"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type OxpActivityInvocationSettled = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.invocation.settled"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type OxpActivityLinkAdded = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "oxpActivity.link.added"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type ScheduledTaskSchedule1 =
+  | {
+      kind: "once"
+      at: number | "NaN" | "Infinity" | "-Infinity"
+    }
+  | {
+      kind: "daily"
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "weekly"
+      weekdays: Array<ScheduledTaskWeekday>
+      times: Array<ScheduledTaskTimeOfDay>
+    }
+  | {
+      kind: "cron"
+      expression: string
+    }
+
+export type GoalContinuationPolicy6 = {
+  mode: GoalAutomationMode
+  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
+  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type ScheduledTaskResolvedPolicy1 = {
+  catchUp: ScheduledTaskCatchUpPolicy
+  catchUpMaxAgeMs: number | "NaN" | "Infinity" | "-Infinity"
+  overrun: ScheduledTaskOverrunPolicy
+  jitterMs: number | "NaN" | "Infinity" | "-Infinity"
+  maxAttempts: number | "NaN" | "Infinity" | "-Infinity"
+  maxDurationMs: number | "NaN" | "Infinity" | "-Infinity"
+  retentionRuns: number | "NaN" | "Infinity" | "-Infinity"
+  permission: ScheduledTaskPermissionMode
+  notify: ScheduledTaskNotifyMode
+}
+
+export type ScheduledTaskInfo5 = {
+  id: string
+  projectID?: string
+  targetDirectory: string
+  target: ScheduledTaskTarget
+  sessionPolicy: ScheduledTaskSessionPolicy
+  name: string
+  enabled: boolean
+  revision: number | "NaN" | "Infinity" | "-Infinity"
+  schedule: ScheduledTaskSchedule1
+  timezone?: string
+  action: ScheduledTaskAction
+  policy: ScheduledTaskResolvedPolicy1
+  nextRunAt?: number | "NaN" | "Infinity" | "-Infinity"
+  lastRunAt?: number | "NaN" | "Infinity" | "-Infinity"
+  lastRunStatus?: ScheduledTaskRunStatus
+  lastRunID?: string
+  consecutiveFailures: number | "NaN" | "Infinity" | "-Infinity"
+  source: ScheduledTaskSource
+  sourcePath?: string
+  sourceMessageID?: string
+  sourceRef?: string
+  sourcePrincipal?: string
+  time: {
+    created: number
+    updated: number
+  }
+}
+
+export type ScheduledTaskCreated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.created"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    info: ScheduledTaskInfo5
+  }
+}
+
+export type ScheduledTaskUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    info: ScheduledTaskInfo5
+  }
+}
+
+export type ScheduledTaskRemoved = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.removed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+  }
+}
+
+export type ScheduledTaskRun2 = {
+  id: string
+  taskID: string
+  fireFor: number | "NaN" | "Infinity" | "-Infinity"
+  trigger: ScheduledTaskTrigger
+  status: ScheduledTaskRunStatus
+  sessionID?: string
+  goalID?: string
+  workspaceID?: string
+  directory?: string
+  skipReason?: ScheduledTaskSkipReason
+  errorKind?: ScheduledTaskErrorKind
+  errorMessage?: string
+  acknowledgedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  attempt?: number | "NaN" | "Infinity" | "-Infinity"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  finishedAt?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type ScheduledTaskRunStarted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.runStarted"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    run: ScheduledTaskRun2
+  }
+}
+
+export type ScheduledTaskRunSettled = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.runSettled"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    run: ScheduledTaskRun2
+  }
+}
+
+export type ScheduledTaskRunUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.runUpdated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    run: ScheduledTaskRun2
+  }
+}
+
+export type ScheduledTaskControlChanged = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.controlChanged"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    control: ScheduledTaskControl
+  }
+}
+
+export type ScheduledTaskSessionBindingProjection1 = {
+  taskID: string
+  sessionID: string
+  generation: number | "NaN" | "Infinity" | "-Infinity"
+  timeUpdated: number
+}
+
+export type ScheduledTaskSessionBindingChanged = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "scheduledTask.sessionBindingChanged"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    taskID: string
+    binding: ScheduledTaskSessionBindingProjection1
+  }
+}
+
+export type SwarmCreated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.created"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    info: SwarmInfo
+  }
+}
+
+export type SwarmUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    info: SwarmInfo
+  }
+}
+
+export type SwarmMemberUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.member.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    member: SwarmMember
+  }
+}
+
+export type SwarmTaskUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.task.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    task: SwarmTask
+  }
+}
+
+export type SwarmTaskDependenciesUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.task.dependencies.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    task: SwarmTask
+    dependencies: Array<SwarmTaskDependency>
+  }
+}
+
+export type SwarmTaskLeaseUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.task.lease.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    task: SwarmTask
+    lease?: SwarmTaskLease
+  }
+}
+
+export type SwarmTaskRunUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.task.run.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    task: SwarmTask
+    run: SwarmTaskRun
+    lease?: SwarmTaskLease
+  }
+}
+
+export type SwarmMessageCreated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.message.created"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    message: SwarmMessage
+    deliveries: Array<SwarmDelivery>
+  }
+}
+
+export type SwarmDeliveryUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.delivery.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    delivery: SwarmDelivery
+  }
+}
+
+export type SwarmBlackboardUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.blackboard.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    entry: SwarmBlackboardEntry
+  }
+}
+
+export type SwarmClaimUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.claim.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    claim: SwarmClaim
+  }
+}
+
+export type SwarmDeliverableUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "swarm.deliverable.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    swarmID: string
+    deliverable: SwarmDeliverable
   }
 }
 
@@ -6969,7 +9392,7 @@ export type SessionGroupInfo3 = {
   id: string
   name: string
   position: number | "NaN" | "Infinity" | "-Infinity"
-  kind: "user" | "subagent" | "plugin"
+  kind: SessionGroupKind
   ownerPlugin?: string
   ownerRef?: string
   anchorSessionID?: string
@@ -7830,6 +10253,7 @@ export type EventSessionNextAgentSwitched = {
     timestamp: number
     sessionID: string
     messageID: string
+    provenance?: SessionMessageProvenance
     agent: string
   }
 }
@@ -7841,6 +10265,7 @@ export type EventSessionNextModelSwitched = {
     timestamp: number
     sessionID: string
     messageID: string
+    provenance?: SessionMessageProvenance
     model: ModelRef
   }
 }
@@ -7866,6 +10291,7 @@ export type EventSessionNextPrompted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -7878,6 +10304,53 @@ export type EventSessionNextPromptAdmitted = {
     messageID: string
     prompt: Prompt
     delivery: "steer" | "queue"
+    provenance?: SessionMessageProvenance
+  }
+}
+
+export type EventSessionNextSyntheticAdmitted = {
+  id: string
+  type: "session.next.synthetic.admitted"
+  properties: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    content: SessionSyntheticContent
+    origin: SessionSyntheticOrigin
+    delegated?: SessionSyntheticDelegatedTurnAuthority
+    execution?: SessionInputSyntheticExecution
+    delivery: "steer" | "queue"
+    admissionClass: SessionInputSyntheticAdmissionClass
+    userPreemptible: boolean
+  }
+}
+
+export type EventSessionNextSyntheticPromoted = {
+  id: string
+  type: "session.next.synthetic.promoted"
+  properties: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    content: SessionSyntheticContent
+    origin: SessionSyntheticOrigin
+    delegated?: SessionSyntheticDelegatedTurnAuthority
+    execution?: SessionInputSyntheticExecution
+    delivery: "steer" | "queue"
+    admissionClass: SessionInputSyntheticAdmissionClass
+    userPreemptible: boolean
+    promotedAt?: number
+  }
+}
+
+export type EventSessionNextSyntheticRevoked = {
+  id: string
+  type: "session.next.synthetic.revoked"
+  properties: {
+    timestamp: number
+    sessionID: string
+    messageID: string
+    reason: SessionInputRevocationReason
   }
 }
 
@@ -7900,6 +10373,7 @@ export type EventSessionNextSynthetic = {
     sessionID: string
     messageID: string
     text: string
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -8183,6 +10657,7 @@ export type EventSessionNextCompactionStarted = {
     sessionID: string
     messageID: string
     reason: "auto" | "manual"
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -8207,6 +10682,7 @@ export type EventSessionNextCompactionEnded = {
     reason: "auto" | "manual"
     text: string
     recent: string
+    provenance?: SessionMessageProvenance
   }
 }
 
@@ -8264,6 +10740,16 @@ export type EventSessionNextRenamed = {
     timestamp: number
     sessionID: string
     title: string
+  }
+}
+
+export type EventSessionNextExecutionBoundaryUpdated = {
+  id: string
+  type: "session.next.execution-boundary.updated"
+  properties: {
+    timestamp: number
+    sessionID: string
+    boundary: PermissionV2Boundary
   }
 }
 
@@ -8329,7 +10815,7 @@ export type EventFileEdited = {
   }
 }
 
-export type GoalContinuationPolicy5 = {
+export type GoalContinuationPolicy7 = {
   mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
@@ -8352,7 +10838,8 @@ export type GoalInfo2 = {
   constraints: Array<string>
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy5
+  auditorRuns: number | "NaN" | "Infinity" | "-Infinity"
+  continuationPolicy: GoalContinuationPolicy7
   auditorPolicy: GoalAuditorPolicy5
   blocker?: string
   time: {
@@ -8396,6 +10883,313 @@ export type EventGoalUnfocused = {
   properties: {
     goalID: string
     sessionID: string
+  }
+}
+
+export type EventGoalAutomationUpdated = {
+  id: string
+  type: "goal.automation.updated"
+  properties: {
+    goalID: string
+    sessionID: string
+    automation?: GoalAutomationRuntime
+  }
+}
+
+export type EventOxpActivityCreated = {
+  id: string
+  type: "oxpActivity.created"
+  properties: {
+    activityID: string
+  }
+}
+
+export type EventOxpActivityUpdated = {
+  id: string
+  type: "oxpActivity.updated"
+  properties: {
+    activityID: string
+  }
+}
+
+export type EventOxpActivityRemoved = {
+  id: string
+  type: "oxpActivity.removed"
+  properties: {
+    activityID: string
+  }
+}
+
+export type EventOxpActivityInvocationStarted = {
+  id: string
+  type: "oxpActivity.invocation.started"
+  properties: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type EventOxpActivityInvocationSettled = {
+  id: string
+  type: "oxpActivity.invocation.settled"
+  properties: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type EventOxpActivityLinkAdded = {
+  id: string
+  type: "oxpActivity.link.added"
+  properties: {
+    activityID: string
+    invocationID: string
+  }
+}
+
+export type GoalContinuationPolicy8 = {
+  mode: GoalAutomationMode
+  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
+  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type ScheduledTaskInfo6 = {
+  id: string
+  projectID?: string
+  targetDirectory: string
+  target: ScheduledTaskTarget
+  sessionPolicy: ScheduledTaskSessionPolicy
+  name: string
+  enabled: boolean
+  revision: number | "NaN" | "Infinity" | "-Infinity"
+  schedule: ScheduledTaskSchedule1
+  timezone?: string
+  action: ScheduledTaskAction
+  policy: ScheduledTaskResolvedPolicy1
+  nextRunAt?: number | "NaN" | "Infinity" | "-Infinity"
+  lastRunAt?: number | "NaN" | "Infinity" | "-Infinity"
+  lastRunStatus?: ScheduledTaskRunStatus
+  lastRunID?: string
+  consecutiveFailures: number | "NaN" | "Infinity" | "-Infinity"
+  source: ScheduledTaskSource
+  sourcePath?: string
+  sourceMessageID?: string
+  sourceRef?: string
+  sourcePrincipal?: string
+  time: {
+    created: number
+    updated: number
+  }
+}
+
+export type EventScheduledTaskCreated = {
+  id: string
+  type: "scheduledTask.created"
+  properties: {
+    taskID: string
+    info: ScheduledTaskInfo6
+  }
+}
+
+export type EventScheduledTaskUpdated = {
+  id: string
+  type: "scheduledTask.updated"
+  properties: {
+    taskID: string
+    info: ScheduledTaskInfo6
+  }
+}
+
+export type EventScheduledTaskRemoved = {
+  id: string
+  type: "scheduledTask.removed"
+  properties: {
+    taskID: string
+  }
+}
+
+export type ScheduledTaskRun3 = {
+  id: string
+  taskID: string
+  fireFor: number | "NaN" | "Infinity" | "-Infinity"
+  trigger: ScheduledTaskTrigger
+  status: ScheduledTaskRunStatus
+  sessionID?: string
+  goalID?: string
+  workspaceID?: string
+  directory?: string
+  skipReason?: ScheduledTaskSkipReason
+  errorKind?: ScheduledTaskErrorKind
+  errorMessage?: string
+  acknowledgedAt?: number | "NaN" | "Infinity" | "-Infinity"
+  attempt?: number | "NaN" | "Infinity" | "-Infinity"
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  finishedAt?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type EventScheduledTaskRunStarted = {
+  id: string
+  type: "scheduledTask.runStarted"
+  properties: {
+    taskID: string
+    run: ScheduledTaskRun3
+  }
+}
+
+export type EventScheduledTaskRunSettled = {
+  id: string
+  type: "scheduledTask.runSettled"
+  properties: {
+    taskID: string
+    run: ScheduledTaskRun3
+  }
+}
+
+export type EventScheduledTaskRunUpdated = {
+  id: string
+  type: "scheduledTask.runUpdated"
+  properties: {
+    taskID: string
+    run: ScheduledTaskRun3
+  }
+}
+
+export type EventScheduledTaskControlChanged = {
+  id: string
+  type: "scheduledTask.controlChanged"
+  properties: {
+    control: ScheduledTaskControl
+  }
+}
+
+export type ScheduledTaskSessionBindingProjection2 = {
+  taskID: string
+  sessionID: string
+  generation: number | "NaN" | "Infinity" | "-Infinity"
+  timeUpdated: number
+}
+
+export type EventScheduledTaskSessionBindingChanged = {
+  id: string
+  type: "scheduledTask.sessionBindingChanged"
+  properties: {
+    taskID: string
+    binding: ScheduledTaskSessionBindingProjection2
+  }
+}
+
+export type EventSwarmCreated = {
+  id: string
+  type: "swarm.created"
+  properties: {
+    swarmID: string
+    info: SwarmInfo
+  }
+}
+
+export type EventSwarmUpdated = {
+  id: string
+  type: "swarm.updated"
+  properties: {
+    swarmID: string
+    info: SwarmInfo
+  }
+}
+
+export type EventSwarmMemberUpdated = {
+  id: string
+  type: "swarm.member.updated"
+  properties: {
+    swarmID: string
+    member: SwarmMember
+  }
+}
+
+export type EventSwarmTaskUpdated = {
+  id: string
+  type: "swarm.task.updated"
+  properties: {
+    swarmID: string
+    task: SwarmTask
+  }
+}
+
+export type EventSwarmTaskDependenciesUpdated = {
+  id: string
+  type: "swarm.task.dependencies.updated"
+  properties: {
+    swarmID: string
+    task: SwarmTask
+    dependencies: Array<SwarmTaskDependency>
+  }
+}
+
+export type EventSwarmTaskLeaseUpdated = {
+  id: string
+  type: "swarm.task.lease.updated"
+  properties: {
+    swarmID: string
+    task: SwarmTask
+    lease?: SwarmTaskLease
+  }
+}
+
+export type EventSwarmTaskRunUpdated = {
+  id: string
+  type: "swarm.task.run.updated"
+  properties: {
+    swarmID: string
+    task: SwarmTask
+    run: SwarmTaskRun
+    lease?: SwarmTaskLease
+  }
+}
+
+export type EventSwarmMessageCreated = {
+  id: string
+  type: "swarm.message.created"
+  properties: {
+    swarmID: string
+    message: SwarmMessage
+    deliveries: Array<SwarmDelivery>
+  }
+}
+
+export type EventSwarmDeliveryUpdated = {
+  id: string
+  type: "swarm.delivery.updated"
+  properties: {
+    swarmID: string
+    delivery: SwarmDelivery
+  }
+}
+
+export type EventSwarmBlackboardUpdated = {
+  id: string
+  type: "swarm.blackboard.updated"
+  properties: {
+    swarmID: string
+    entry: SwarmBlackboardEntry
+  }
+}
+
+export type EventSwarmClaimUpdated = {
+  id: string
+  type: "swarm.claim.updated"
+  properties: {
+    swarmID: string
+    claim: SwarmClaim
+  }
+}
+
+export type EventSwarmDeliverableUpdated = {
+  id: string
+  type: "swarm.deliverable.updated"
+  properties: {
+    swarmID: string
+    deliverable: SwarmDeliverable
   }
 }
 
@@ -8538,7 +11332,7 @@ export type SessionGroupInfo4 = {
   id: string
   name: string
   position: number | "NaN" | "Infinity" | "-Infinity"
-  kind: "user" | "subagent" | "plugin"
+  kind: SessionGroupKind
   ownerPlugin?: string
   ownerRef?: string
   anchorSessionID?: string
@@ -9061,7 +11855,7 @@ export type ForkCredentialListError = ForkCredentialListErrors[keyof ForkCredent
 
 export type ForkCredentialListResponses = {
   /**
-   * Stored OpenCode credentials
+   * Stored OpenCode Zen credentials
    */
   200: Array<{
     id: string
@@ -9252,6 +12046,9 @@ export type ForkUsageGetResponses = {
     }>
     defaultAccountID?: string
     defaultAccountLabel?: string
+    routedAccountID?: string
+    routedAccountLabel?: string
+    routedAccountSource?: "provider" | "pool"
   }
 }
 
@@ -9347,6 +12144,7 @@ export type GlobalSessionRootsData = {
   path?: never
   query: {
     directory: string
+    projectID?: string
     limit?: string
   }
   url: "/global/session/roots"
@@ -9369,6 +12167,33 @@ export type GlobalSessionRootsResponses = {
 }
 
 export type GlobalSessionRootsResponse = GlobalSessionRootsResponses[keyof GlobalSessionRootsResponses]
+
+export type GlobalSessionGetData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/global/session/{sessionID}"
+}
+
+export type GlobalSessionGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalSessionGetError = GlobalSessionGetErrors[keyof GlobalSessionGetErrors]
+
+export type GlobalSessionGetResponses = {
+  /**
+   * Durable session metadata
+   */
+  200: Session
+}
+
+export type GlobalSessionGetResponse = GlobalSessionGetResponses[keyof GlobalSessionGetResponses]
 
 export type GlobalSessionTelemetryData = {
   body?: GlobalSessionTelemetryInput
@@ -9394,6 +12219,177 @@ export type GlobalSessionTelemetryResponses = {
 }
 
 export type GlobalSessionTelemetryResponse = GlobalSessionTelemetryResponses[keyof GlobalSessionTelemetryResponses]
+
+export type GlobalOxpActivitiesData = {
+  body?: never
+  path?: never
+  query?: {
+    limit?: string
+    includeArchived?: "true" | "false"
+    beforeLastSeenAt?: string
+    beforeID?: string
+  }
+  url: "/global/oxp/activity"
+}
+
+export type GlobalOxpActivitiesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpActivitiesError = GlobalOxpActivitiesErrors[keyof GlobalOxpActivitiesErrors]
+
+export type GlobalOxpActivitiesResponses = {
+  /**
+   * OXP parent activity summaries
+   */
+  200: Array<OxpParentActivitySummary>
+}
+
+export type GlobalOxpActivitiesResponse = GlobalOxpActivitiesResponses[keyof GlobalOxpActivitiesResponses]
+
+export type GlobalOxpActivityDeleteData = {
+  body?: never
+  path: {
+    activityID: string
+  }
+  query?: never
+  url: "/global/oxp/activity/{activityID}"
+}
+
+export type GlobalOxpActivityDeleteErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpActivityDeleteError = GlobalOxpActivityDeleteErrors[keyof GlobalOxpActivityDeleteErrors]
+
+export type GlobalOxpActivityDeleteResponses = {
+  /**
+   * OXP activity deletion result
+   */
+  200: GlobalOxpActivityDeleteResult
+}
+
+export type GlobalOxpActivityDeleteResponse = GlobalOxpActivityDeleteResponses[keyof GlobalOxpActivityDeleteResponses]
+
+export type GlobalOxpActivityGetData = {
+  body?: never
+  path: {
+    activityID: string
+  }
+  query?: never
+  url: "/global/oxp/activity/{activityID}"
+}
+
+export type GlobalOxpActivityGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpActivityGetError = GlobalOxpActivityGetErrors[keyof GlobalOxpActivityGetErrors]
+
+export type GlobalOxpActivityGetResponses = {
+  /**
+   * OXP parent activity summary
+   */
+  200: OxpParentActivitySummary
+}
+
+export type GlobalOxpActivityGetResponse = GlobalOxpActivityGetResponses[keyof GlobalOxpActivityGetResponses]
+
+export type GlobalOxpActivityUpdateData = {
+  body?: GlobalOxpActivityPatch
+  path: {
+    activityID: string
+  }
+  query?: never
+  url: "/global/oxp/activity/{activityID}"
+}
+
+export type GlobalOxpActivityUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpActivityUpdateError = GlobalOxpActivityUpdateErrors[keyof GlobalOxpActivityUpdateErrors]
+
+export type GlobalOxpActivityUpdateResponses = {
+  /**
+   * OXP activity updated
+   */
+  200: boolean
+}
+
+export type GlobalOxpActivityUpdateResponse = GlobalOxpActivityUpdateResponses[keyof GlobalOxpActivityUpdateResponses]
+
+export type GlobalOxpInvocationsData = {
+  body?: never
+  path: {
+    activityID: string
+  }
+  query?: {
+    limit?: string
+    beforeStartedAt?: string
+    beforeID?: string
+  }
+  url: "/global/oxp/activity/{activityID}/invocations"
+}
+
+export type GlobalOxpInvocationsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpInvocationsError = GlobalOxpInvocationsErrors[keyof GlobalOxpInvocationsErrors]
+
+export type GlobalOxpInvocationsResponses = {
+  /**
+   * Paginated OXP invocation history
+   */
+  200: OxpInvocationPage
+}
+
+export type GlobalOxpInvocationsResponse = GlobalOxpInvocationsResponses[keyof GlobalOxpInvocationsResponses]
+
+export type GlobalOxpResourceData = {
+  body?: never
+  path?: never
+  query: {
+    kind: OxpActivityLinkKind
+    ref: string
+    limit?: string
+  }
+  url: "/global/oxp/resource"
+}
+
+export type GlobalOxpResourceErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpResourceError = GlobalOxpResourceErrors[keyof GlobalOxpResourceErrors]
+
+export type GlobalOxpResourceResponses = {
+  /**
+   * Reverse OXP provenance for one durable resource handle
+   */
+  200: Array<OxpResourceProvenanceInfo>
+}
+
+export type GlobalOxpResourceResponse = GlobalOxpResourceResponses[keyof GlobalOxpResourceResponses]
 
 export type GlobalProjectsData = {
   body?: never
@@ -10253,6 +13249,1833 @@ export type UsagePricingCatalogResponses = {
 }
 
 export type UsagePricingCatalogResponse = UsagePricingCatalogResponses[keyof UsagePricingCatalogResponses]
+
+export type OfxpStateData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/ofxp/state"
+}
+
+export type OfxpStateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type OfxpStateError = OfxpStateErrors[keyof OfxpStateErrors]
+
+export type OfxpStateResponses = {
+  /**
+   * Compact OpenFork peer-network settings state
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpStateResponse = OfxpStateResponses[keyof OfxpStateResponses]
+
+export type OfxpRuntimeData = {
+  body?: OfxpSettingsRuntimePayload
+  path?: never
+  query?: never
+  url: "/ofxp/runtime"
+}
+
+export type OfxpRuntimeErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpRuntimeError = OfxpRuntimeErrors[keyof OfxpRuntimeErrors]
+
+export type OfxpRuntimeResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpRuntimeResponse = OfxpRuntimeResponses[keyof OfxpRuntimeResponses]
+
+export type OfxpDiscoveryServerSeedsData = {
+  body?: OfxpSettingsServerSeedsPayload
+  path?: never
+  query?: never
+  url: "/ofxp/discovery/server-seeds"
+}
+
+export type OfxpDiscoveryServerSeedsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpDiscoveryServerSeedsError = OfxpDiscoveryServerSeedsErrors[keyof OfxpDiscoveryServerSeedsErrors]
+
+export type OfxpDiscoveryServerSeedsResponses = {
+  /**
+   * OfxpSettings.ServerSeedsResult
+   */
+  200: OfxpSettingsServerSeedsResult
+}
+
+export type OfxpDiscoveryServerSeedsResponse =
+  OfxpDiscoveryServerSeedsResponses[keyof OfxpDiscoveryServerSeedsResponses]
+
+export type OfxpRotateIdentityData = {
+  body?: OfxpSettingsIdentityMutationPayload
+  path?: never
+  query?: never
+  url: "/ofxp/runtime/rotate-identity"
+}
+
+export type OfxpRotateIdentityErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpRotateIdentityError = OfxpRotateIdentityErrors[keyof OfxpRotateIdentityErrors]
+
+export type OfxpRotateIdentityResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpRotateIdentityResponse = OfxpRotateIdentityResponses[keyof OfxpRotateIdentityResponses]
+
+export type OfxpFinalizeIdentityRotationData = {
+  body?: OfxpSettingsIdentityMutationPayload
+  path?: never
+  query?: never
+  url: "/ofxp/runtime/rotation/finalize"
+}
+
+export type OfxpFinalizeIdentityRotationErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpFinalizeIdentityRotationError =
+  OfxpFinalizeIdentityRotationErrors[keyof OfxpFinalizeIdentityRotationErrors]
+
+export type OfxpFinalizeIdentityRotationResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpFinalizeIdentityRotationResponse =
+  OfxpFinalizeIdentityRotationResponses[keyof OfxpFinalizeIdentityRotationResponses]
+
+export type OfxpPairData = {
+  body?: never
+  path: {
+    peerID: string
+  }
+  query?: never
+  url: "/ofxp/peer/{peerID}/pair"
+}
+
+export type OfxpPairErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPairError = OfxpPairErrors[keyof OfxpPairErrors]
+
+export type OfxpPairResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPairResponse = OfxpPairResponses[keyof OfxpPairResponses]
+
+export type OfxpPairingConfirmData = {
+  body?: never
+  path: {
+    pairingID: string
+  }
+  query?: never
+  url: "/ofxp/pairing/{pairingID}/confirm"
+}
+
+export type OfxpPairingConfirmErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPairingConfirmError = OfxpPairingConfirmErrors[keyof OfxpPairingConfirmErrors]
+
+export type OfxpPairingConfirmResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPairingConfirmResponse = OfxpPairingConfirmResponses[keyof OfxpPairingConfirmResponses]
+
+export type OfxpPairingCancelData = {
+  body?: never
+  path: {
+    pairingID: string
+  }
+  query?: never
+  url: "/ofxp/pairing/{pairingID}"
+}
+
+export type OfxpPairingCancelErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPairingCancelError = OfxpPairingCancelErrors[keyof OfxpPairingCancelErrors]
+
+export type OfxpPairingCancelResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPairingCancelResponse = OfxpPairingCancelResponses[keyof OfxpPairingCancelResponses]
+
+export type OfxpPeerGrantData = {
+  body?: OfxpSettingsGrantPayload
+  path: {
+    peerID: string
+  }
+  query?: never
+  url: "/ofxp/peer/{peerID}/grant"
+}
+
+export type OfxpPeerGrantErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPeerGrantError = OfxpPeerGrantErrors[keyof OfxpPeerGrantErrors]
+
+export type OfxpPeerGrantResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPeerGrantResponse = OfxpPeerGrantResponses[keyof OfxpPeerGrantResponses]
+
+export type OfxpPeerRevokeData = {
+  body?: OfxpSettingsRevokePayload
+  path: {
+    peerID: string
+  }
+  query?: never
+  url: "/ofxp/peer/{peerID}"
+}
+
+export type OfxpPeerRevokeErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPeerRevokeError = OfxpPeerRevokeErrors[keyof OfxpPeerRevokeErrors]
+
+export type OfxpPeerRevokeResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPeerRevokeResponse = OfxpPeerRevokeResponses[keyof OfxpPeerRevokeResponses]
+
+export type OfxpPeerRootAddData = {
+  body?: OfxpSettingsRootPayload
+  path: {
+    peerID: string
+  }
+  query?: never
+  url: "/ofxp/peer/{peerID}/root"
+}
+
+export type OfxpPeerRootAddErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPeerRootAddError = OfxpPeerRootAddErrors[keyof OfxpPeerRootAddErrors]
+
+export type OfxpPeerRootAddResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPeerRootAddResponse = OfxpPeerRootAddResponses[keyof OfxpPeerRootAddResponses]
+
+export type OfxpPeerRootRemoveData = {
+  body?: never
+  path: {
+    peerID: string
+    rootID: string
+  }
+  query?: never
+  url: "/ofxp/peer/{peerID}/root/{rootID}"
+}
+
+export type OfxpPeerRootRemoveErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type OfxpPeerRootRemoveError = OfxpPeerRootRemoveErrors[keyof OfxpPeerRootRemoveErrors]
+
+export type OfxpPeerRootRemoveResponses = {
+  /**
+   * OfxpSettings.State
+   */
+  200: OfxpSettingsState
+}
+
+export type OfxpPeerRootRemoveResponse = OfxpPeerRootRemoveResponses[keyof OfxpPeerRootRemoveResponses]
+
+export type RevisionDraftRecoverData = {
+  body?: {
+    kind: "prompt" | "goal" | "scheduled_task"
+    key: string
+  }
+  path?: never
+  query?: never
+  url: "/revision-draft/recover"
+}
+
+export type RevisionDraftRecoverErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type RevisionDraftRecoverError = RevisionDraftRecoverErrors[keyof RevisionDraftRecoverErrors]
+
+export type RevisionDraftRecoverResponses = {
+  /**
+   * Pending revision artifact
+   */
+  200: {
+    id: string
+    directory: string
+    kind: "prompt" | "goal" | "scheduled_task"
+    key: string
+    purpose: "prompt" | "goal" | "scheduled_task"
+    sourceFingerprint: string
+    prompt: string
+    references: Array<unknown>
+    timeCreated: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type RevisionDraftRecoverResponse = RevisionDraftRecoverResponses[keyof RevisionDraftRecoverResponses]
+
+export type RevisionDraftConsumeData = {
+  body?: {
+    id: string
+  }
+  path?: never
+  query?: never
+  url: "/revision-draft/consume"
+}
+
+export type RevisionDraftConsumeErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type RevisionDraftConsumeError = RevisionDraftConsumeErrors[keyof RevisionDraftConsumeErrors]
+
+export type RevisionDraftConsumeResponses = {
+  /**
+   * <No Content>
+   */
+  200: unknown
+}
+
+export type ScheduledTaskListData = {
+  body?: never
+  path?: never
+  query?: {
+    projectID?: string
+  }
+  url: "/scheduled-task"
+}
+
+export type ScheduledTaskListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskListError = ScheduledTaskListErrors[keyof ScheduledTaskListErrors]
+
+export type ScheduledTaskListResponses = {
+  /**
+   * Scheduled tasks
+   */
+  200: Array<ScheduledTaskInfo>
+}
+
+export type ScheduledTaskListResponse = ScheduledTaskListResponses[keyof ScheduledTaskListResponses]
+
+export type ScheduledTaskCreateData = {
+  body?: {
+    projectID?: string
+    targetDirectory: string
+    target?: ScheduledTaskTarget
+    sessionPolicy?: ScheduledTaskSessionPolicy
+    name: string
+    enabled?: boolean
+    schedule: ScheduledTaskScheduleInput
+    timezone?: string
+    action: ScheduledTaskAction
+    policy?: ScheduledTaskPolicy
+  }
+  path?: never
+  query?: never
+  url: "/scheduled-task"
+}
+
+export type ScheduledTaskCreateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskCreateError = ScheduledTaskCreateErrors[keyof ScheduledTaskCreateErrors]
+
+export type ScheduledTaskCreateResponses = {
+  /**
+   * Created scheduled task
+   */
+  200: ScheduledTaskInfo
+}
+
+export type ScheduledTaskCreateResponse = ScheduledTaskCreateResponses[keyof ScheduledTaskCreateResponses]
+
+export type ScheduledTaskPreviewData = {
+  body?: {
+    schedule: ScheduledTaskScheduleInput
+    timezone?: string
+    count?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  path?: never
+  query?: never
+  url: "/scheduled-task/preview"
+}
+
+export type ScheduledTaskPreviewErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskPreviewError = ScheduledTaskPreviewErrors[keyof ScheduledTaskPreviewErrors]
+
+export type ScheduledTaskPreviewResponses = {
+  /**
+   * Computed next occurrences and DST warnings
+   */
+  200: ScheduledTaskPreview
+}
+
+export type ScheduledTaskPreviewResponse = ScheduledTaskPreviewResponses[keyof ScheduledTaskPreviewResponses]
+
+export type ScheduledTaskAgendaData = {
+  body?: never
+  path?: never
+  query: {
+    from: string
+    to: string
+    limit?: string
+    projectID?: string
+  }
+  url: "/scheduled-task/agenda"
+}
+
+export type ScheduledTaskAgendaErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskAgendaError = ScheduledTaskAgendaErrors[keyof ScheduledTaskAgendaErrors]
+
+export type ScheduledTaskAgendaResponses = {
+  /**
+   * Scheduled task calendar occurrences
+   */
+  200: Array<ScheduledTaskAgendaOccurrence>
+}
+
+export type ScheduledTaskAgendaResponse = ScheduledTaskAgendaResponses[keyof ScheduledTaskAgendaResponses]
+
+export type ScheduledTaskSessionCandidatesData = {
+  body?: never
+  path?: never
+  query: {
+    targetDirectory: string
+    projectID?: string
+    limit?: string
+  }
+  url: "/scheduled-task/session-candidate"
+}
+
+export type ScheduledTaskSessionCandidatesErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskSessionCandidatesError =
+  ScheduledTaskSessionCandidatesErrors[keyof ScheduledTaskSessionCandidatesErrors]
+
+export type ScheduledTaskSessionCandidatesResponses = {
+  /**
+   * User-drivable root Session candidates
+   */
+  200: Array<ScheduledTaskSessionCandidate>
+}
+
+export type ScheduledTaskSessionCandidatesResponse =
+  ScheduledTaskSessionCandidatesResponses[keyof ScheduledTaskSessionCandidatesResponses]
+
+export type ScheduledTaskInboxData = {
+  body?: never
+  path?: never
+  query?: {
+    limit?: string
+    unread?: "true"
+  }
+  url: "/scheduled-task/run"
+}
+
+export type ScheduledTaskInboxErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskInboxError = ScheduledTaskInboxErrors[keyof ScheduledTaskInboxErrors]
+
+export type ScheduledTaskInboxResponses = {
+  /**
+   * Scheduled task runs across all tasks
+   */
+  200: Array<ScheduledTaskRun>
+}
+
+export type ScheduledTaskInboxResponse = ScheduledTaskInboxResponses[keyof ScheduledTaskInboxResponses]
+
+export type ScheduledTaskUnreadCountData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/scheduled-task/inbox/count"
+}
+
+export type ScheduledTaskUnreadCountErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskUnreadCountError = ScheduledTaskUnreadCountErrors[keyof ScheduledTaskUnreadCountErrors]
+
+export type ScheduledTaskUnreadCountResponses = {
+  /**
+   * Unread run count
+   */
+  200: ScheduledTaskInboxCount
+}
+
+export type ScheduledTaskUnreadCountResponse =
+  ScheduledTaskUnreadCountResponses[keyof ScheduledTaskUnreadCountResponses]
+
+export type ScheduledTaskGetControlData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/scheduled-task/control"
+}
+
+export type ScheduledTaskGetControlErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskGetControlError = ScheduledTaskGetControlErrors[keyof ScheduledTaskGetControlErrors]
+
+export type ScheduledTaskGetControlResponses = {
+  /**
+   * Global scheduling control
+   */
+  200: ScheduledTaskControl
+}
+
+export type ScheduledTaskGetControlResponse = ScheduledTaskGetControlResponses[keyof ScheduledTaskGetControlResponses]
+
+export type ScheduledTaskSetControlData = {
+  body?: {
+    paused: boolean
+  }
+  path?: never
+  query?: never
+  url: "/scheduled-task/control"
+}
+
+export type ScheduledTaskSetControlErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskSetControlError = ScheduledTaskSetControlErrors[keyof ScheduledTaskSetControlErrors]
+
+export type ScheduledTaskSetControlResponses = {
+  /**
+   * Updated global scheduling control
+   */
+  200: ScheduledTaskControl
+}
+
+export type ScheduledTaskSetControlResponse = ScheduledTaskSetControlResponses[keyof ScheduledTaskSetControlResponses]
+
+export type ScheduledTaskAcknowledgeData = {
+  body?: never
+  path: {
+    runID: string
+  }
+  query?: never
+  url: "/scheduled-task/run/{runID}/ack"
+}
+
+export type ScheduledTaskAcknowledgeErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskAcknowledgeError = ScheduledTaskAcknowledgeErrors[keyof ScheduledTaskAcknowledgeErrors]
+
+export type ScheduledTaskAcknowledgeResponses = {
+  /**
+   * Acknowledged run
+   */
+  204: void
+}
+
+export type ScheduledTaskAcknowledgeResponse =
+  ScheduledTaskAcknowledgeResponses[keyof ScheduledTaskAcknowledgeResponses]
+
+export type ScheduledTaskRemoveData = {
+  body?: never
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}"
+}
+
+export type ScheduledTaskRemoveErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskRemoveError = ScheduledTaskRemoveErrors[keyof ScheduledTaskRemoveErrors]
+
+export type ScheduledTaskRemoveResponses = {
+  /**
+   * Removed scheduled task
+   */
+  204: void
+}
+
+export type ScheduledTaskRemoveResponse = ScheduledTaskRemoveResponses[keyof ScheduledTaskRemoveResponses]
+
+export type ScheduledTaskGetData = {
+  body?: never
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}"
+}
+
+export type ScheduledTaskGetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskGetError = ScheduledTaskGetErrors[keyof ScheduledTaskGetErrors]
+
+export type ScheduledTaskGetResponses = {
+  /**
+   * Scheduled task
+   */
+  200: ScheduledTaskInfo
+}
+
+export type ScheduledTaskGetResponse = ScheduledTaskGetResponses[keyof ScheduledTaskGetResponses]
+
+export type ScheduledTaskUpdateData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    name?: string
+    targetDirectory?: string
+    target?: ScheduledTaskTarget
+    sessionPolicy?: ScheduledTaskSessionPolicy
+    schedule?: ScheduledTaskScheduleInput
+    timezone?: string
+    action?: ScheduledTaskAction
+    policy?: ScheduledTaskPolicy
+  }
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}"
+}
+
+export type ScheduledTaskUpdateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskUpdateError = ScheduledTaskUpdateErrors[keyof ScheduledTaskUpdateErrors]
+
+export type ScheduledTaskUpdateResponses = {
+  /**
+   * Updated scheduled task
+   */
+  200: ScheduledTaskInfo
+}
+
+export type ScheduledTaskUpdateResponse = ScheduledTaskUpdateResponses[keyof ScheduledTaskUpdateResponses]
+
+export type ScheduledTaskClearBindingData = {
+  body?: never
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}/session-binding"
+}
+
+export type ScheduledTaskClearBindingErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskClearBindingError = ScheduledTaskClearBindingErrors[keyof ScheduledTaskClearBindingErrors]
+
+export type ScheduledTaskClearBindingResponses = {
+  /**
+   * Cleared current Session anchor
+   */
+  204: void
+}
+
+export type ScheduledTaskClearBindingResponse =
+  ScheduledTaskClearBindingResponses[keyof ScheduledTaskClearBindingResponses]
+
+export type ScheduledTaskGetBindingData = {
+  body?: never
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}/session-binding"
+}
+
+export type ScheduledTaskGetBindingErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskGetBindingError = ScheduledTaskGetBindingErrors[keyof ScheduledTaskGetBindingErrors]
+
+export type ScheduledTaskGetBindingResponses = {
+  /**
+   * Current Scheduled Task Session anchor
+   */
+  200: ScheduledTaskSessionBindingProjection
+}
+
+export type ScheduledTaskGetBindingResponse = ScheduledTaskGetBindingResponses[keyof ScheduledTaskGetBindingResponses]
+
+export type ScheduledTaskEnabledData = {
+  body?: {
+    enabled: boolean
+    expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}/enabled"
+}
+
+export type ScheduledTaskEnabledErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskEnabledError = ScheduledTaskEnabledErrors[keyof ScheduledTaskEnabledErrors]
+
+export type ScheduledTaskEnabledResponses = {
+  /**
+   * Updated scheduled task
+   */
+  200: ScheduledTaskInfo
+}
+
+export type ScheduledTaskEnabledResponse = ScheduledTaskEnabledResponses[keyof ScheduledTaskEnabledResponses]
+
+export type ScheduledTaskRunsData = {
+  body?: never
+  path: {
+    taskID: string
+  }
+  query?: {
+    limit?: string
+    before?: string
+  }
+  url: "/scheduled-task/{taskID}/run"
+}
+
+export type ScheduledTaskRunsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskRunsError = ScheduledTaskRunsErrors[keyof ScheduledTaskRunsErrors]
+
+export type ScheduledTaskRunsResponses = {
+  /**
+   * Run history
+   */
+  200: Array<ScheduledTaskRun>
+}
+
+export type ScheduledTaskRunsResponse = ScheduledTaskRunsResponses[keyof ScheduledTaskRunsResponses]
+
+export type ScheduledTaskRunNowData = {
+  body?: {
+    now?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  path: {
+    taskID: string
+  }
+  query?: never
+  url: "/scheduled-task/{taskID}/run-now"
+}
+
+export type ScheduledTaskRunNowErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type ScheduledTaskRunNowError = ScheduledTaskRunNowErrors[keyof ScheduledTaskRunNowErrors]
+
+export type ScheduledTaskRunNowResponses = {
+  /**
+   * Queued manual run
+   */
+  200: ScheduledTaskRun
+}
+
+export type ScheduledTaskRunNowResponse = ScheduledTaskRunNowResponses[keyof ScheduledTaskRunNowResponses]
+
+export type SwarmListData = {
+  body?: never
+  path?: never
+  query?: {
+    projectID?: string
+    workspaceID?: string
+    status?: SwarmStatus
+    limit?: string
+  }
+  url: "/swarm"
+}
+
+export type SwarmListErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmListError = SwarmListErrors[keyof SwarmListErrors]
+
+export type SwarmListResponses = {
+  /**
+   * Compact Swarm summaries
+   */
+  200: Array<SwarmSummary>
+}
+
+export type SwarmListResponse = SwarmListResponses[keyof SwarmListResponses]
+
+export type SwarmDetailData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}"
+}
+
+export type SwarmDetailErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmDetailError = SwarmDetailErrors[keyof SwarmDetailErrors]
+
+export type SwarmDetailResponses = {
+  /**
+   * Swarm roster, tasks, and dependency graph
+   */
+  200: SwarmHttpApiDetail
+}
+
+export type SwarmDetailResponse = SwarmDetailResponses[keyof SwarmDetailResponses]
+
+export type SwarmUpdateData = {
+  body?: {
+    expectedRevision: number
+    name?: string
+    status?: "active" | "paused" | "completed" | "failed" | "archived"
+    policy?: SwarmPolicy
+  }
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}"
+}
+
+export type SwarmUpdateErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmUpdateError = SwarmUpdateErrors[keyof SwarmUpdateErrors]
+
+export type SwarmUpdateResponses = {
+  /**
+   * Updated Swarm
+   */
+  200: SwarmInfo
+}
+
+export type SwarmUpdateResponse = SwarmUpdateResponses[keyof SwarmUpdateResponses]
+
+export type SwarmSummaryData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/summary"
+}
+
+export type SwarmSummaryErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmSummaryError = SwarmSummaryErrors[keyof SwarmSummaryErrors]
+
+export type SwarmSummaryResponses = {
+  /**
+   * Compact Swarm summary
+   */
+  200: SwarmSummary
+}
+
+export type SwarmSummaryResponse = SwarmSummaryResponses[keyof SwarmSummaryResponses]
+
+export type SwarmMessagesData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: {
+    limit?: string
+    cursor?: string
+  }
+  url: "/swarm/{swarmID}/message"
+}
+
+export type SwarmMessagesErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmMessagesError = SwarmMessagesErrors[keyof SwarmMessagesErrors]
+
+export type SwarmMessagesResponses = {
+  /**
+   * Paged Swarm message and delivery history
+   */
+  200: SwarmHttpApiMessageHistoryPage
+}
+
+export type SwarmMessagesResponse = SwarmMessagesResponses[keyof SwarmMessagesResponses]
+
+export type SwarmRunsData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: {
+    limit?: string
+    cursor?: string
+    taskID?: string
+  }
+  url: "/swarm/{swarmID}/run"
+}
+
+export type SwarmRunsErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmRunsError = SwarmRunsErrors[keyof SwarmRunsErrors]
+
+export type SwarmRunsResponses = {
+  /**
+   * Paged Swarm task-run history
+   */
+  200: SwarmHttpApiTaskRunHistoryPage
+}
+
+export type SwarmRunsResponse = SwarmRunsResponses[keyof SwarmRunsResponses]
+
+export type SwarmBlackboardData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: {
+    limit?: string
+    cursor?: string
+  }
+  url: "/swarm/{swarmID}/blackboard"
+}
+
+export type SwarmBlackboardErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmBlackboardError = SwarmBlackboardErrors[keyof SwarmBlackboardErrors]
+
+export type SwarmBlackboardResponses = {
+  /**
+   * Paged Swarm blackboard
+   */
+  200: SwarmHttpApiBlackboardPage
+}
+
+export type SwarmBlackboardResponse = SwarmBlackboardResponses[keyof SwarmBlackboardResponses]
+
+export type SwarmClaimsData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: {
+    limit?: string
+    cursor?: string
+  }
+  url: "/swarm/{swarmID}/claim"
+}
+
+export type SwarmClaimsErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmClaimsError = SwarmClaimsErrors[keyof SwarmClaimsErrors]
+
+export type SwarmClaimsResponses = {
+  /**
+   * Paged Swarm claims
+   */
+  200: SwarmHttpApiClaimPage
+}
+
+export type SwarmClaimsResponse = SwarmClaimsResponses[keyof SwarmClaimsResponses]
+
+export type SwarmDeliverablesData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: {
+    limit?: string
+    cursor?: string
+    memberID?: string
+  }
+  url: "/swarm/{swarmID}/deliverable"
+}
+
+export type SwarmDeliverablesErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmDeliverablesError = SwarmDeliverablesErrors[keyof SwarmDeliverablesErrors]
+
+export type SwarmDeliverablesResponses = {
+  /**
+   * Paged Swarm deliverables
+   */
+  200: SwarmHttpApiDeliverablePage
+}
+
+export type SwarmDeliverablesResponse = SwarmDeliverablesResponses[keyof SwarmDeliverablesResponses]
+
+export type SwarmDelegateData = {
+  body?: {
+    projectID: string
+    workspaceID?: string
+    directory: string
+    coordinatorSessionID: string
+    name: string
+    coordinatorName?: string
+    coordinatorRole?: string
+    members?: Array<{
+      name: string
+      role: string
+      desiredProfile: SwarmMemberExecutionProfile
+      workspacePolicy: SwarmWorkspacePolicy
+      capabilities?: SwarmMemberCapabilities
+    }>
+    tasks?: Array<{
+      key: string
+      title: string
+      description?: string
+      priority?: number
+      reservedMemberName?: string
+      acceptance?: SwarmTaskAcceptance
+      metadata?: {
+        [key: string]: unknown
+      }
+      dependsOn?: Array<{
+        key: string
+        requirement?: SwarmDependencyRequirement
+      }>
+    }>
+  }
+  path?: never
+  query?: never
+  url: "/swarm/delegate"
+}
+
+export type SwarmDelegateErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmDelegateError = SwarmDelegateErrors[keyof SwarmDelegateErrors]
+
+export type SwarmDelegateResponses = {
+  /**
+   * Created native Swarm
+   */
+  200: SwarmHttpApiDelegateResponse
+}
+
+export type SwarmDelegateResponse = SwarmDelegateResponses[keyof SwarmDelegateResponses]
+
+export type SwarmMemberAddData = {
+  body?: {
+    name: string
+    role: string
+    desiredProfile: SwarmMemberExecutionProfile
+    workspacePolicy: SwarmWorkspacePolicy
+    capabilities?: SwarmMemberCapabilities
+  }
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/member"
+}
+
+export type SwarmMemberAddErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmMemberAddError = SwarmMemberAddErrors[keyof SwarmMemberAddErrors]
+
+export type SwarmMemberAddResponses = {
+  /**
+   * Added managed Swarm member
+   */
+  200: SwarmMember
+}
+
+export type SwarmMemberAddResponse = SwarmMemberAddResponses[keyof SwarmMemberAddResponses]
+
+export type SwarmMemberLifecycleData = {
+  body?: {
+    expectedLifecycle: "active" | "stopped"
+    lifecycle: "active" | "stopped"
+  }
+  path: {
+    swarmID: string
+    memberID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/member/{memberID}/lifecycle"
+}
+
+export type SwarmMemberLifecycleErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmMemberLifecycleError = SwarmMemberLifecycleErrors[keyof SwarmMemberLifecycleErrors]
+
+export type SwarmMemberLifecycleResponses = {
+  /**
+   * Updated member lifecycle
+   */
+  200: SwarmMember
+}
+
+export type SwarmMemberLifecycleResponse = SwarmMemberLifecycleResponses[keyof SwarmMemberLifecycleResponses]
+
+export type SwarmMemberConfigureData = {
+  body?: {
+    expectedBindingGeneration: number
+    desiredProfile: SwarmMemberExecutionProfile
+    workspacePolicy: SwarmWorkspacePolicy
+    capabilities?: SwarmMemberCapabilities
+  }
+  path: {
+    swarmID: string
+    memberID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/member/{memberID}/configure"
+}
+
+export type SwarmMemberConfigureErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmMemberConfigureError = SwarmMemberConfigureErrors[keyof SwarmMemberConfigureErrors]
+
+export type SwarmMemberConfigureResponses = {
+  /**
+   * Configured managed member
+   */
+  200: SwarmMember
+}
+
+export type SwarmMemberConfigureResponse = SwarmMemberConfigureResponses[keyof SwarmMemberConfigureResponses]
+
+export type SwarmTaskCreateData = {
+  body?: {
+    title: string
+    description?: string
+    priority?: number
+    reservedMemberID?: string
+    acceptance?: SwarmTaskAcceptance
+    metadata?: {
+      [key: string]: unknown
+    }
+    dependencies?: Array<{
+      taskID: string
+      requirement?: SwarmDependencyRequirement
+    }>
+  }
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/task"
+}
+
+export type SwarmTaskCreateErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmTaskCreateError = SwarmTaskCreateErrors[keyof SwarmTaskCreateErrors]
+
+export type SwarmTaskCreateResponses = {
+  /**
+   * Created Swarm task
+   */
+  200: SwarmTask
+}
+
+export type SwarmTaskCreateResponse = SwarmTaskCreateResponses[keyof SwarmTaskCreateResponses]
+
+export type SwarmTaskDependenciesData = {
+  body?: {
+    dependencies: Array<{
+      taskID: string
+      requirement?: SwarmDependencyRequirement
+    }>
+  }
+  path: {
+    swarmID: string
+    taskID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/task/{taskID}/dependencies"
+}
+
+export type SwarmTaskDependenciesErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmTaskDependenciesError = SwarmTaskDependenciesErrors[keyof SwarmTaskDependenciesErrors]
+
+export type SwarmTaskDependenciesResponses = {
+  /**
+   * Updated task dependencies
+   */
+  200: SwarmTask
+}
+
+export type SwarmTaskDependenciesResponse = SwarmTaskDependenciesResponses[keyof SwarmTaskDependenciesResponses]
+
+export type SwarmRecoverData = {
+  body?: never
+  path: {
+    swarmID: string
+  }
+  query?: never
+  url: "/swarm/{swarmID}/recover"
+}
+
+export type SwarmRecoverErrors = {
+  /**
+   * InvalidRequestError | InvalidCursorError
+   */
+  400: InvalidRequestError | InvalidCursorError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type SwarmRecoverError = SwarmRecoverErrors[keyof SwarmRecoverErrors]
+
+export type SwarmRecoverResponses = {
+  /**
+   * Requested member reconciliation
+   */
+  200: SwarmHttpApiRecoveryResponse
+}
+
+export type SwarmRecoverResponse = SwarmRecoverResponses[keyof SwarmRecoverResponses]
 
 export type EventSubscribeData = {
   body?: never
@@ -12969,6 +17792,7 @@ export type SessionCreateData = {
     model?: {
       id: string
       providerID: string
+      accountID?: string
       variant?: string
     }
     metadata?: {
@@ -13294,6 +18118,7 @@ export type SessionPromptData = {
     model?: {
       providerID: string
       modelID: string
+      accountID?: string
     }
     agent?: string
     noReply?: boolean
@@ -13648,9 +18473,9 @@ export type SessionUnshareData = {
 
 export type SessionUnshareErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -13686,9 +18511,9 @@ export type SessionShareData = {
 
 export type SessionShareErrors = {
   /**
-   * Bad request
+   * BadRequest | InvalidRequestError
    */
-  400: BadRequestError
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
    * NotFoundError
    */
@@ -13754,6 +18579,7 @@ export type SessionPromptAsyncData = {
     model?: {
       providerID: string
       modelID: string
+      accountID?: string
     }
     agent?: string
     noReply?: boolean
@@ -13857,6 +18683,7 @@ export type SessionShellData = {
     model?: {
       providerID: string
       modelID: string
+      accountID?: string
     }
     command: string
   }
@@ -14038,6 +18865,10 @@ export type PartDeleteErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * SessionBusyError
+   */
+  409: SessionBusyError
 }
 
 export type PartDeleteError = PartDeleteErrors[keyof PartDeleteErrors]
@@ -14074,6 +18905,10 @@ export type PartUpdateErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * SessionBusyError
+   */
+  409: SessionBusyError
 }
 
 export type PartUpdateError = PartUpdateErrors[keyof PartUpdateErrors]
@@ -14312,7 +19147,7 @@ export type SessionGroupListResponse = SessionGroupListResponses[keyof SessionGr
 export type SessionGroupCreateData = {
   body?: {
     name: string
-    kind?: "user" | "subagent" | "plugin"
+    kind?: SessionGroupMutableKind
     anchorSessionID?: string
     ownerPlugin?: string
     ownerRef?: string
@@ -14397,6 +19232,10 @@ export type SessionGroupGetErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupGetError = SessionGroupGetErrors[keyof SessionGroupGetErrors]
@@ -14430,6 +19269,10 @@ export type SessionGroupRenameErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupRenameError = SessionGroupRenameErrors[keyof SessionGroupRenameErrors]
@@ -14488,6 +19331,10 @@ export type SessionGroupReorderErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupReorderError = SessionGroupReorderErrors[keyof SessionGroupReorderErrors]
@@ -14505,7 +19352,7 @@ export type SessionGroupAddSessionData = {
   body?: {
     sessionId: string
     locked?: boolean
-    origin?: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
+    origin?: SessionGroupMutableMemberOrigin
     originPlugin?: string
     originRef?: string
   }
@@ -14525,6 +19372,10 @@ export type SessionGroupAddSessionErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupAddSessionError = SessionGroupAddSessionErrors[keyof SessionGroupAddSessionErrors]
@@ -14636,7 +19487,7 @@ export type SessionGroupForSessionResponse = SessionGroupForSessionResponses[key
 export type SessionGroupResolveData = {
   body?: {
     name: string
-    kind: "user" | "subagent" | "plugin"
+    kind: SessionGroupMutableKind
     anchorSessionID?: string
     ownerPlugin?: string
     ownerRef?: string
@@ -14685,6 +19536,10 @@ export type SessionGroupReorderMembersErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupReorderMembersError = SessionGroupReorderMembersErrors[keyof SessionGroupReorderMembersErrors]
@@ -14717,6 +19572,10 @@ export type SessionGroupSetPolicyErrors = {
    * NotFoundError
    */
   404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
 }
 
 export type SessionGroupSetPolicyError = SessionGroupSetPolicyErrors[keyof SessionGroupSetPolicyErrors]
@@ -14897,6 +19756,7 @@ export type GoalUpdateResponse = GoalUpdateResponses[keyof GoalUpdateResponses]
 export type GoalTransitionData = {
   body?: {
     expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    sessionID?: string
     action:
       | "start"
       | "pause"
@@ -15238,10 +20098,7 @@ export type GoalFocusedResponses = {
   /**
    * Focused Goal
    */
-  200: {
-    focus: GoalFocus
-    detail: GoalDetail
-  }
+  200: GoalFocusedGoal
 }
 
 export type GoalFocusedResponse = GoalFocusedResponses[keyof GoalFocusedResponses]
@@ -15326,13 +20183,97 @@ export type GoalPrepareResponses = {
   /**
    * Prepared focused Goal
    */
-  200: {
-    focus: GoalFocus
-    detail: GoalDetail
-  }
+  200: GoalFocusedGoal
 }
 
 export type GoalPrepareResponse = GoalPrepareResponses[keyof GoalPrepareResponses]
+
+export type GoalDispatchData = {
+  body?: {
+    goalID: string
+    revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    action: "start" | "update"
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/goal/dispatch"
+}
+
+export type GoalDispatchErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalDispatchError = GoalDispatchErrors[keyof GoalDispatchErrors]
+
+export type GoalDispatchResponses = {
+  /**
+   * Dispatched focused Goal action
+   */
+  204: void
+}
+
+export type GoalDispatchResponse = GoalDispatchResponses[keyof GoalDispatchResponses]
+
+export type SystemOneInferData = {
+  body?: SystemOneInferInput
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/system-one/infer"
+}
+
+export type SystemOneInferErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ForbiddenError
+   */
+  403: ForbiddenError
+  /**
+   * ModelNotFoundError
+   */
+  404: ModelNotFoundError
+  /**
+   * RateLimitError | QuotaExceededError
+   */
+  429: RateLimitError | QuotaExceededError
+  /**
+   * UpstreamError
+   */
+  502: UpstreamError
+  /**
+   * TimeoutError
+   */
+  504: TimeoutError
+}
+
+export type SystemOneInferError = SystemOneInferErrors[keyof SystemOneInferErrors]
+
+export type SystemOneInferResponses = {
+  /**
+   * Typed System One semantic inference result
+   */
+  200: SystemOneInferResult
+}
+
+export type SystemOneInferResponse = SystemOneInferResponses[keyof SystemOneInferResponses]
 
 export type SyncCapabilitiesData = {
   body?: never
@@ -16175,6 +21116,12 @@ export type ExperimentalWorkspaceWarpResponse =
 export type PromptReviseData = {
   body?: {
     prompt: string
+    purpose?: "prompt" | "goal" | "scheduled_task"
+    target?: {
+      kind: "prompt" | "goal" | "scheduled_task"
+      key: string
+      sourceFingerprint: string
+    }
     draft?: {
       mentions: Array<
         | {
@@ -16225,15 +21172,10 @@ export type PromptReviseData = {
       }>
     }
     sessionID?: string
+    includeSessionContext?: boolean
     guidance?: string
     model?: ModelRef
     fallbackModel?: ModelRef
-    clarifications?: Array<{
-      question: string
-      answers: Array<string>
-      detail?: string
-    }>
-    clarificationRound?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
   path?: never
   query?: {
@@ -16313,11 +21255,10 @@ export type PromptReviseResponses = {
         >
         tools: Array<string>
         rounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        artifactID?: string
       }
     | {
-        type: "question"
-        questions: Array<QuestionV2Prompt>
-        clarificationRound: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        type: "cancelled"
         tools: Array<string>
         rounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
       }
@@ -19509,6 +24450,10 @@ export type V2BrowserEventData = {
                 kind: "agent"
                 sessionId: string
               }
+            | {
+                kind: "external"
+                principalId: string
+              }
           active: boolean
           muted: boolean
         }
@@ -19628,6 +24573,10 @@ export type V2BrowserAssignData = {
           kind: "agent"
           sessionId: string
         }
+      | {
+          kind: "external"
+          principalId: string
+        }
   }
   path?: never
   query?: never
@@ -19661,6 +24610,10 @@ export type V2BrowserAssignResponses = {
         | {
             kind: "agent"
             sessionId: string
+          }
+        | {
+            kind: "external"
+            principalId: string
           }
     }
   }

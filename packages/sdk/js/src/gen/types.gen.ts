@@ -1214,7 +1214,7 @@ export type Config = {
     diff_style?: "auto" | "stacked"
   }
   /**
-   * Command configuration, see https://opencode.ai/docs/commands
+   * Command configuration. See OpenFork documentation at https://github.com/thelabcorner/openfork/tree/main/docs
    */
   command?: {
     [key: string]: {
@@ -1239,7 +1239,7 @@ export type Config = {
    */
   autoshare?: boolean
   /**
-   * Automatically update to the latest version. Set to true to auto-update, false to disable, or 'notify' to show update notifications
+   * Check OpenFork releases for updates. true installs patch updates only for fork-managed direct installs and otherwise notifies; false disables checks; 'notify' never installs automatically
    */
   autoupdate?: boolean | "notify"
   /**
@@ -1271,7 +1271,7 @@ export type Config = {
     [key: string]: AgentConfig | undefined
   }
   /**
-   * Agent configuration, see https://opencode.ai/docs/agent
+   * Agent configuration. See OpenFork documentation at https://github.com/thelabcorner/openfork/tree/main/docs
    */
   agent?: {
     plan?: AgentConfig
