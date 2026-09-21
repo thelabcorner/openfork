@@ -53,7 +53,7 @@ export async function createOpencodeServer(options?: ServerOptions) {
       output += chunk.toString()
       const lines = output.split("\n")
       for (const line of lines) {
-        if (line.startsWith("opencode server listening")) {
+        if (line.startsWith("OpenFork server listening") || line.startsWith("opencode server listening")) {
           const match = line.match(/on\s+(https?:\/\/[^\s]+)/)
           if (!match) {
             clear()

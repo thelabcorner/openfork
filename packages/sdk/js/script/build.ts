@@ -8,16 +8,52 @@ import { $ } from "bun"
 import path from "path"
 
 import { createClient } from "@hey-api/openapi-ts"
+import { PRODUCT_DOCS_URL } from "../../../core/src/brand"
 
 const opencode = path.resolve(dir, "../../opencode")
 
-await $`bun dev generate > ${dir}/openapi.json`.cwd(opencode)
+// Do not rely on shell redirection here. Bun's shell redirection semantics are
+// not portable across every supported host (notably Windows), which can leave
+// the generator command successful but no openapi.json on disk. Capture the
+// canonical producer's stdout and materialize the file ourselves.
+const openapi = await $`bun dev generate`.cwd(opencode).text()
+await Bun.write(path.join(dir, "openapi.json"), openapi)
 
 const document = (await Bun.file("./openapi.json").json()) as {
   components?: { schemas?: Record<string, unknown> }
   [key: string]: unknown
 }
 const schemas = document.components?.schemas
+
+function configPropertyDescription(property: string) {
+  const config = schemas?.Config
+  if (!config || typeof config !== "object") throw new Error("OpenAPI Config schema is missing")
+  const properties = (config as { properties?: Record<string, unknown> }).properties
+  const candidate = properties?.[property]
+  if (!candidate || typeof candidate !== "object") {
+    throw new Error(`OpenAPI Config.${property} schema is missing`)
+  }
+  const description = (candidate as { description?: unknown }).description
+  if (typeof description !== "string" || !description.trim()) {
+    throw new Error(`OpenAPI Config.${property} description is missing`)
+  }
+  return description.trim()
+}
+
+async function syncFrozenLegacyDescription(property: string, marker: string, description: string) {
+  const path = "./src/gen/types.gen.ts"
+  let source = await Bun.file(path).text()
+  const markerIndex = source.indexOf(marker)
+  if (markerIndex === -1) throw new Error(`Legacy SDK marker changed for ${property}: ${marker}`)
+  const commentStart = source.lastIndexOf("  /**", markerIndex)
+  const commentEnd = source.indexOf("  */", commentStart)
+  if (commentStart === -1 || commentEnd === -1 || commentEnd > markerIndex) {
+    throw new Error(`Legacy SDK description block changed for ${property}`)
+  }
+  const replacement = ["  /**", `   * ${description}`, "   */"].join("\n")
+  source = source.slice(0, commentStart) + replacement + source.slice(commentEnd + "  */".length)
+  await Bun.write(path, source)
+}
 if (schemas) {
   const reachable = new Set<string>()
   const visit = (value: unknown) => {
@@ -70,6 +106,26 @@ await createClient({
     },
   ],
 })
+
+// src/gen is the intentionally frozen V1 SDK surface. Regenerating it from the
+// unified OpenAPI document would silently migrate that public API toward current/V2.
+// Keep its documentation synchronized from the canonical schema without changing
+// the frozen method/type surface.
+await syncFrozenLegacyDescription(
+  "command",
+  "  command?: {",
+  `Command configuration. See OpenFork documentation at ${PRODUCT_DOCS_URL}`,
+)
+await syncFrozenLegacyDescription(
+  "autoupdate",
+  '  autoupdate?: boolean | "notify"',
+  configPropertyDescription("autoupdate"),
+)
+await syncFrozenLegacyDescription(
+  "agent",
+  "  agent?: {",
+  `Agent configuration. See OpenFork documentation at ${PRODUCT_DOCS_URL}`,
+)
 
 const generatedTypes = await Bun.file("./src/v2/gen/types.gen.ts").text()
 if (/export type SessionNext\w+1 =/.test(generatedTypes)) {

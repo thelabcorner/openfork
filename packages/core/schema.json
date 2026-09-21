@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "8199226b-e14d-4129-ba35-1efe268bb287",
+  "id": "b4dfe541-9426-4723-acb0-5543bfb18f0a",
   "prevIds": [
-    "e2b5c266-737e-475e-b26d-43615e46e15c"
+    "8bde4d59-96ca-42d1-818e-880ca0642d33"
   ],
   "ddl": [
     {
@@ -128,6 +128,22 @@
     },
     {
       "name": "memory_topic",
+      "entityType": "tables"
+    },
+    {
+      "name": "ofxp_invocation_receipt",
+      "entityType": "tables"
+    },
+    {
+      "name": "ofxp_peer_grant",
+      "entityType": "tables"
+    },
+    {
+      "name": "ofxp_peer_root",
+      "entityType": "tables"
+    },
+    {
+      "name": "ofxp_peer",
       "entityType": "tables"
     },
     {
@@ -2790,6 +2806,356 @@
     },
     {
       "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "invocation_id",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_peer_id",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "commit_class",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_digest",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_ref",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "result_digest",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "settled_at",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "peer_id",
+      "entityType": "columns",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "grant",
+      "entityType": "columns",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "peer_id",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_id",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "alias",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "canonical_path",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "identity_fingerprint",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'manual'",
+      "generated": null,
+      "name": "source",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "approved_at",
+      "entityType": "columns",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "realm_id",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "label",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "public_key_spki",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "public_key_fingerprint",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'stable'",
+      "generated": null,
+      "name": "rekey_state",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "paired_at",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_seen_at",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revoked_at",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "authority_epoch",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "ofxp_peer"
+    },
+    {
+      "type": "text",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -4290,7 +4656,7 @@
     },
     {
       "type": "text",
-      "notNull": false,
+      "notNull": true,
       "autoincrement": false,
       "default": null,
       "generated": null,
@@ -4540,7 +4906,7 @@
     },
     {
       "type": "text",
-      "notNull": false,
+      "notNull": true,
       "autoincrement": false,
       "default": null,
       "generated": null,
@@ -4670,7 +5036,7 @@
     },
     {
       "type": "text",
-      "notNull": false,
+      "notNull": true,
       "autoincrement": false,
       "default": null,
       "generated": null,
@@ -7930,6 +8296,51 @@
     },
     {
       "columns": [
+        "source_peer_id"
+      ],
+      "tableTo": "ofxp_peer",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_ofxp_invocation_receipt_source_peer_id_ofxp_peer_id_fk",
+      "entityType": "fks",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "columns": [
+        "peer_id"
+      ],
+      "tableTo": "ofxp_peer",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_ofxp_peer_grant_peer_id_ofxp_peer_id_fk",
+      "entityType": "fks",
+      "table": "ofxp_peer_grant"
+    },
+    {
+      "columns": [
+        "peer_id"
+      ],
+      "tableTo": "ofxp_peer",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_ofxp_peer_root_peer_id_ofxp_peer_id_fk",
+      "entityType": "fks",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "columns": [
         "activity_id"
       ],
       "tableTo": "oxp_parent_activity",
@@ -8715,6 +9126,16 @@
     },
     {
       "columns": [
+        "peer_id",
+        "root_id"
+      ],
+      "nameExplicit": false,
+      "name": "ofxp_peer_root_pk",
+      "entityType": "pks",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "columns": [
         "scheme",
         "digest"
       ],
@@ -8747,6 +9168,24 @@
     },
     {
       "columns": [
+        "checkpoint_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_checkpoint_search_pk",
+      "entityType": "pks",
+      "table": "session_checkpoint_search"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "session_context_ops_pk",
+      "entityType": "pks",
+      "table": "session_context_ops"
+    },
+    {
+      "columns": [
         "session_id",
         "message_id"
       ],
@@ -8754,6 +9193,15 @@
       "name": "session_context_state_pk",
       "entityType": "pks",
       "table": "session_context_state"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_fork_origin_pk",
+      "entityType": "pks",
+      "table": "session_fork_origin"
     },
     {
       "columns": [
@@ -9052,6 +9500,33 @@
     },
     {
       "columns": [
+        "invocation_id"
+      ],
+      "nameExplicit": false,
+      "name": "ofxp_invocation_receipt_pk",
+      "table": "ofxp_invocation_receipt",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "peer_id"
+      ],
+      "nameExplicit": false,
+      "name": "ofxp_peer_grant_pk",
+      "table": "ofxp_peer_grant",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "ofxp_peer_pk",
+      "table": "ofxp_peer",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -9187,15 +9662,6 @@
     },
     {
       "columns": [
-        "checkpoint_id"
-      ],
-      "nameExplicit": false,
-      "name": "session_checkpoint_search_pk",
-      "table": "session_checkpoint_search",
-      "entityType": "pks"
-    },
-    {
-      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -9210,24 +9676,6 @@
       "nameExplicit": false,
       "name": "session_context_epoch_pk",
       "table": "session_context_epoch",
-      "entityType": "pks"
-    },
-    {
-      "columns": [
-        "id"
-      ],
-      "nameExplicit": false,
-      "name": "session_context_ops_pk",
-      "table": "session_context_ops",
-      "entityType": "pks"
-    },
-    {
-      "columns": [
-        "session_id"
-      ],
-      "nameExplicit": false,
-      "name": "session_fork_origin_pk",
-      "table": "session_fork_origin",
       "entityType": "pks"
     },
     {
@@ -10082,6 +10530,114 @@
       "name": "memory_topic_workspace_idx",
       "entityType": "indexes",
       "table": "memory_topic"
+    },
+    {
+      "columns": [
+        {
+          "value": "source_peer_id",
+          "isExpression": false
+        },
+        {
+          "value": "created_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_invocation_peer_created_idx",
+      "entityType": "indexes",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "columns": [
+        {
+          "value": "state",
+          "isExpression": false
+        },
+        {
+          "value": "created_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_invocation_state_created_idx",
+      "entityType": "indexes",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "columns": [
+        {
+          "value": "peer_id",
+          "isExpression": false
+        },
+        {
+          "value": "alias",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_peer_root_alias_idx",
+      "entityType": "indexes",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "columns": [
+        {
+          "value": "peer_id",
+          "isExpression": false
+        },
+        {
+          "value": "canonical_path",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_peer_root_path_idx",
+      "entityType": "indexes",
+      "table": "ofxp_peer_root"
+    },
+    {
+      "columns": [
+        {
+          "value": "public_key_fingerprint",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_peer_fingerprint_idx",
+      "entityType": "indexes",
+      "table": "ofxp_peer"
+    },
+    {
+      "columns": [
+        {
+          "value": "revoked_at",
+          "isExpression": false
+        },
+        {
+          "value": "last_seen_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "ofxp_peer_active_seen_idx",
+      "entityType": "indexes",
+      "table": "ofxp_peer"
     },
     {
       "columns": [
@@ -11870,6 +12426,18 @@
       "name": "push_subscription_endpoint_unique",
       "entityType": "uniques",
       "table": "push_subscription"
+    },
+    {
+      "value": "length(\"operation\") BETWEEN 1 AND 128",
+      "name": "ofxp_invocation_operation_len",
+      "entityType": "checks",
+      "table": "ofxp_invocation_receipt"
+    },
+    {
+      "value": "\"revision\" >= 1",
+      "name": "ofxp_peer_grant_revision_positive",
+      "entityType": "checks",
+      "table": "ofxp_peer_grant"
     },
     {
       "value": "\"task_id\" != \"depends_on_task_id\"",

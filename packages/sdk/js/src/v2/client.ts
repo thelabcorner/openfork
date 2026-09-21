@@ -76,7 +76,7 @@ export function createOpencodeClient(config?: Config & { directory?: string; exp
 
   const client = createClient(config)
   client.interceptors.request.use((request) => {
-    if (!request) throw new Error("OpenCode SDK request interceptor received no Request")
+    if (!request) throw new Error("OpenFork SDK request interceptor received no Request")
     return rewrite(request, {
       directory: config?.directory,
       workspace: config?.experimental_workspaceID,
@@ -85,7 +85,7 @@ export function createOpencodeClient(config?: Config & { directory?: string; exp
   client.interceptors.response.use((response) => {
     const contentType = response.headers.get("content-type")
     if (contentType === "text/html")
-      throw new Error("Request is not supported by this version of OpenCode Server (Server responded with text/html)")
+      throw new Error("Request is not supported by this version of OpenFork Server (Server responded with text/html)")
 
     return response
   })

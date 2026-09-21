@@ -52,7 +52,7 @@ export function createOpencodeClient(config?: Config & { directory?: string }) {
 
   const client = createClient(config)
   client.interceptors.request.use((request) => {
-    if (!request) throw new Error("OpenCode SDK request interceptor received no Request")
+    if (!request) throw new Error("OpenFork SDK request interceptor received no Request")
     return rewrite(request, config?.directory)
   })
   client.interceptors.error.use(wrapClientError)
