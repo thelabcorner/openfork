@@ -188,6 +188,7 @@ const OxpInvocationInfo = Schema.Struct({
   rootAlias: Schema.optional(Schema.String),
   status: OxpActivitySchema.Status,
   continuityMarker: Schema.optional(OxpActivitySchema.ContinuityMarker),
+  safeSummary: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   errorCode: Schema.optional(Schema.String),
   mutationAttempted: Schema.Boolean,
   mutationCommitted: Schema.Boolean,

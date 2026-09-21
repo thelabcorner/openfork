@@ -104,6 +104,7 @@ function projectOxpInvocation(
     ...(row.safe_summary?.continuityMarker === "handoff_advisory"
       ? { continuityMarker: "handoff_advisory" as const }
       : {}),
+    ...(row.safe_summary ? { safeSummary: row.safe_summary } : {}),
     ...(row.error_code ? { errorCode: row.error_code } : {}),
     mutationAttempted: row.mutation_attempted,
     mutationCommitted: row.mutation_committed,

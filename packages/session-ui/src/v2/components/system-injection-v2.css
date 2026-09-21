@@ -1,0 +1,242 @@
+/*
+ * System-injection card: reads as a sibling of the user prompt bubble (same
+ * column, same radius, same max width) but is unmistakably not the user's text
+ * -- hairline dashed edge, no filled bubble, muted type, and a leading badge.
+ */
+[data-component="system-injection"] {
+  --sysinj-edge: var(--v2-border-border-base, var(--border-weak-base));
+  --sysinj-accent: var(--v2-text-text-muted, var(--text-weak));
+
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  width: fit-content;
+  max-width: min(82%, 64ch);
+  margin-inline-start: auto;
+  border: 1px dashed color-mix(in srgb, var(--sysinj-edge) 80%, transparent);
+  border-radius: 10px;
+  background: transparent;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+
+  &:hover,
+  &:focus-within {
+    border-color: var(--v2-border-border-strong, var(--border-weak-base));
+    background: color-mix(in srgb, var(--v2-background-bg-layer-01, var(--surface-raised-base)) 45%, transparent);
+  }
+
+  [data-slot="system-injection-trigger"] {
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    min-height: 24px;
+    padding: 3px 7px;
+    margin: 0;
+    border: none;
+    background: transparent;
+    text-align: start;
+    color: inherit;
+    cursor: pointer;
+    outline: none;
+    border-radius: 10px;
+  }
+
+  [data-slot="system-injection-trigger"]:focus-visible {
+    outline: 2px solid var(--v2-border-border-focus, var(--border-focus));
+    outline-offset: -1px;
+  }
+
+  [data-slot="system-injection-badge"] {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 4px;
+    height: 18px;
+    padding: 0 5px 0 4px;
+    border-radius: var(--radius-xs, 4px);
+    border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 90%, transparent);
+    background: var(--v2-background-bg-layer-02, var(--surface-raised-stronger));
+    color: var(--sysinj-accent);
+    font-family: var(--font-family-sans);
+    font-size: 11px;
+    font-weight: 560;
+    line-height: 18px;
+    letter-spacing: 0.02em;
+    user-select: none;
+    white-space: nowrap;
+  }
+
+  [data-slot="system-injection-glyph"] {
+    display: block;
+    flex-shrink: 0;
+    opacity: 0.85;
+  }
+
+  [data-slot="system-injection-count"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--sysinj-accent) 16%, transparent);
+    color: var(--sysinj-accent);
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 560;
+    line-height: 16px;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-preview"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--sysinj-accent);
+    font-family: var(--font-family-sans);
+    font-size: 12px;
+    font-weight: 440;
+    line-height: 18px;
+    letter-spacing: -0.04px;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-chevron-wrap"] {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 14px;
+    height: 18px;
+    color: var(--v2-text-text-faint, var(--text-weaker));
+  }
+
+  [data-slot="system-injection-chevron"] {
+    display: block;
+    flex-shrink: 0;
+    transition: transform 0.15s ease-out;
+  }
+
+  &[data-expanded] [data-slot="system-injection-chevron"] {
+    transform: rotate(90deg);
+  }
+
+  [data-slot="system-injection-content"] {
+    box-sizing: border-box;
+    min-width: 0;
+    border-top: 1px dashed color-mix(in srgb, var(--sysinj-edge) 65%, transparent);
+  }
+
+  /* Bounded growth: one reminder can be tens of kilobytes, and an unbounded
+     row would dominate the virtualizer's measured height for the whole turn. */
+  [data-slot="system-injection-body"] {
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 420px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 7px 8px;
+  }
+
+  [data-slot="system-injection-segment"] {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  [data-slot="system-injection-segment"] + [data-slot="system-injection-segment"] {
+    border-top: 0.5px dashed color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
+    padding-top: 8px;
+  }
+
+  [data-slot="system-injection-segment-index"] {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    margin-top: 2px;
+    border-radius: 3px;
+    border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 75%, transparent);
+    color: var(--v2-text-text-faint, var(--text-weaker));
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 560;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-text"] {
+    min-width: 0;
+    flex: 1 1 auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    unicode-bidi: plaintext;
+    color: var(--v2-text-text-muted, var(--text-weak));
+    font-family: var(--font-family-sans);
+    font-size: 12px;
+    font-weight: 440;
+    line-height: var(--line-height-large, 1.5);
+    letter-spacing: -0.04px;
+  }
+
+  [data-slot="system-injection-actions"] {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 8px 7px;
+  }
+
+  [data-slot="system-injection-copy"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 20px;
+    padding: 0 6px;
+    border: 0.5px solid transparent;
+    border-radius: var(--radius-xs, 4px);
+    background: transparent;
+    color: var(--v2-text-text-faint, var(--text-weaker));
+    font-family: var(--font-family-sans);
+    font-size: 11px;
+    font-weight: 530;
+    line-height: 20px;
+    cursor: pointer;
+    transition:
+      color 0.15s ease,
+      border-color 0.15s ease,
+      background-color 0.15s ease;
+  }
+
+  [data-slot="system-injection-copy"]:hover {
+    color: var(--v2-text-text-base, var(--text-base));
+    border-color: color-mix(in srgb, var(--sysinj-edge) 85%, transparent);
+    background: var(--v2-background-bg-layer-02, var(--surface-raised-stronger));
+  }
+
+  [data-slot="system-injection-copy"][data-copied] {
+    color: var(--v2-state-fg-success, var(--text-base));
+  }
+
+  [data-slot="system-injection-copy"]:focus-visible {
+    outline: 2px solid var(--v2-border-border-focus, var(--border-focus));
+    outline-offset: 1px;
+  }
+}

@@ -59,6 +59,257 @@ function text(
     : undefined
 }
 
+function finite(
+  source: Record<string, unknown> | undefined,
+  key: string,
+) {
+  const value = source?.[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function flag(
+  source: Record<string, unknown> | undefined,
+  key: string,
+) {
+  const value = source?.[key]
+  return typeof value === "boolean" ? value : undefined
+}
+
+function diffCounts(value: unknown) {
+  if (typeof value !== "string" || !value) return {}
+  let additions = 0
+  let deletions = 0
+  for (const line of value.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue
+    if (line.startsWith("+")) additions += 1
+    else if (line.startsWith("-")) deletions += 1
+  }
+  return { additions, deletions }
+}
+
+function safePatchFiles(value: unknown) {
+  if (!Array.isArray(value)) return undefined
+  const files = value.slice(0, 32).flatMap((entry) => {
+    const row = record(entry)
+    const path = text(row, "path", 4096)
+    if (!path) return []
+    const type = text(row, "type", 32)
+    const movePath = text(row, "movePath", 4096)
+    return [{
+      path,
+      ...(type ? { type } : {}),
+      ...(movePath ? { movePath } : {}),
+      ...(finite(row, "additions") === undefined ? {} : { additions: finite(row, "additions") }),
+      ...(finite(row, "deletions") === undefined ? {} : { deletions: finite(row, "deletions") }),
+    }]
+  })
+  return files.length ? files : undefined
+}
+
+const SAFE_SUMMARY_TARGET_BYTES = 7 * 1024
+
+function finishSummary(
+  value: Record<string, unknown>,
+): OxpActivitySchema.SafeSummary | undefined {
+  if (Object.keys(value).length === 0) return undefined
+  const bytes = (candidate: Record<string, unknown>) =>
+    Buffer.byteLength(JSON.stringify(candidate), "utf8")
+  if (bytes(value) <= SAFE_SUMMARY_TARGET_BYTES) return value
+
+  // Large multi-file operations can naturally exceed the durable 8 KiB
+  // ceiling. Degrade presentation detail deterministically rather than
+  // allowing observability to make the real operation look failed.
+  const compact = { ...value }
+  if (Array.isArray(compact.files)) {
+    const files = [...compact.files]
+    while (files.length > 1) {
+      files.pop()
+      compact.files = files
+      compact.filesTruncated = true
+      if (bytes(compact) <= SAFE_SUMMARY_TARGET_BYTES) return compact
+    }
+  }
+
+  for (const key of ["path", "pattern", "include", "workdir", "root", "ref"] as const) {
+    if (!(key in compact)) continue
+    delete compact[key]
+    compact.summaryTruncated = true
+    if (bytes(compact) <= SAFE_SUMMARY_TARGET_BYTES) return compact
+  }
+
+  const minimal: Record<string, unknown> = { summaryTruncated: true }
+  for (const key of [
+    "continuityMarker",
+    "action",
+    "kind",
+    "format",
+    "fileCount",
+    "count",
+    "workerCount",
+    "applied",
+    "changed",
+    "running",
+    "exitCode",
+    "outputBytes",
+  ] as const) {
+    if (value[key] !== undefined) minimal[key] = value[key]
+  }
+  return minimal
+}
+
+/**
+ * Persist only the operation-specific, bounded projection the durable activity
+ * UI is allowed to render. Raw args/results, prompts, file contents, patch
+ * bodies, process output and credentials never cross this boundary.
+ */
+function safeSummary(
+  input: BeginInput,
+  result?: OxpResult.CapabilityResult,
+): OxpActivitySchema.SafeSummary | undefined {
+  const args = record(input.args)
+  const metadata = record(result?.metadata)
+  const structured = record(result?.structured)
+  const base: Record<string, unknown> = input.continuityMarker
+    ? { continuityMarker: input.continuityMarker }
+    : {}
+  const action = text(args, "action", 256)
+  if (action) base.action = action
+
+  if (input.tool === "read") {
+    const path = text(metadata, "path", 4096)
+    if (path) base.path = path
+    for (const key of ["lines", "offset", "entries", "targets"] as const) {
+      const value = finite(metadata, key)
+      if (value !== undefined) base[key] = value
+    }
+    for (const key of ["directory", "attachment", "truncated"] as const) {
+      const value = flag(metadata, key)
+      if (value !== undefined) base[key] = value
+    }
+  } else if (input.tool === "find") {
+    const kind = text(metadata, "action", 32)
+    const pattern = kind === "glob" ? text(args, "glob", 2048) : text(args, "grep", 2048)
+    const include = text(args, "include", 2048)
+    const root = text(metadata, "root", 128)
+    if (kind) base.kind = kind
+    if (pattern) base.pattern = pattern
+    if (include) base.include = include
+    if (root) base.root = root
+    const count = finite(metadata, "count")
+    if (count !== undefined) base.count = count
+    const truncated = flag(metadata, "truncated")
+    if (truncated !== undefined) base.truncated = truncated
+  } else if (input.tool === "edit" || input.tool === "write") {
+    const path = text(metadata, "path", 4096)
+    if (path) {
+      const counts = diffCounts(metadata?.diff)
+      base.files = [{
+        path,
+        type: input.tool === "write" && flag(metadata, "exists") === false ? "add" : "update",
+        ...counts,
+      }]
+    }
+    const strategy = text(metadata, "strategy", 64)
+    if (strategy) base.strategy = strategy
+    const applied = finite(metadata, "applied")
+    if (applied !== undefined) base.applied = applied
+    const changed = flag(metadata, "changed")
+    if (changed !== undefined) base.changed = changed
+  } else if (input.tool === "patch") {
+    const files = safePatchFiles(metadata?.files)
+    if (files) base.files = files
+    const format = text(metadata, "format", 32)
+    if (format) base.format = format
+    const fileCount = finite(metadata, "fileCount")
+    if (fileCount !== undefined) base.fileCount = fileCount
+    const applied = flag(metadata, "applied")
+    if (applied !== undefined) base.applied = applied
+  } else if (input.tool === "process") {
+    for (const key of ["handle", "workdir", "mode"] as const) {
+      const value = text(metadata ?? structured, key, key === "workdir" ? 4096 : 128)
+      if (value) base[key] = value
+    }
+    for (const key of ["exitCode", "outputBytes", "retainedBytes"] as const) {
+      const value = finite(metadata ?? structured, key)
+      if (value !== undefined) base[key] = value
+    }
+    for (const key of ["running", "truncated", "pageTruncated"] as const) {
+      const value = flag(metadata ?? structured, key)
+      if (value !== undefined) base[key] = value
+    }
+  } else if (input.tool === "git") {
+    for (const key of ["root", "workdir", "mode", "branch", "ref"] as const) {
+      const value = text(metadata, key, 4096)
+      if (value) base[key] = value
+    }
+    for (const key of ["files", "additions", "deletions"] as const) {
+      const value = finite(metadata, key)
+      if (value !== undefined) base[key] = value
+    }
+  } else if (input.tool === "openfork_worker") {
+    for (const key of ["workerID", "batchID", "agent"] as const) {
+      const value = text(args, key, 512) ?? text(structured, key, 512)
+      if (value) base[key] = value
+    }
+    const model = record(args?.model) ?? record(structured?.model)
+    if (model) {
+      const providerID = text(model, "providerID", 256)
+      const modelID = text(model, "modelID", 256)
+      const variant = text(model, "variant", 256)
+      if (providerID && modelID) base.model = { providerID, modelID, ...(variant ? { variant } : {}) }
+    }
+    if (Array.isArray(args?.workers)) base.workerCount = Math.min(args.workers.length, 16)
+    if (Array.isArray(structured?.workerIDs)) base.workerCount = Math.min(structured.workerIDs.length, 100)
+  } else if (input.tool === "openfork_session" || input.tool === "openfork_request") {
+    for (const key of ["sessionID", "requestID"] as const) {
+      const value = text(args, key, 512) ?? text(structured, key, 512)
+      if (value) base[key] = value
+    }
+    const agent = text(args, "agent", 256) ?? text(structured, "agent", 256)
+    if (agent) base.agent = agent
+    const model = record(args?.model) ?? record(structured?.model)
+    if (model) {
+      const providerID = text(model, "providerID", 256)
+      const modelID = text(model, "modelID", 256)
+      const variant = text(model, "variant", 256)
+      if (providerID && modelID) base.model = { providerID, modelID, ...(variant ? { variant } : {}) }
+    }
+  } else if (input.tool === "capability") {
+    const namespace = text(args, "namespace", 64)
+    const capability = text(args, "capability", 512)
+    const canonicalNamespace = text(metadata, "namespace", 64)
+    const canonicalCapability = text(metadata, "capability", 512)
+    if (
+      canonicalNamespace === "mcp" &&
+      canonicalCapability &&
+      /^[^/\s]{1,255}\/[^/\s]{1,255}$/.test(canonicalCapability)
+    ) {
+      // External MCP selectors are caller-controlled. Persist only the
+      // capability broker's canonical server/tool identity after execution.
+      base.namespace = canonicalNamespace
+      base.capability = canonicalCapability
+    } else if (
+      namespace === "openfork" &&
+      capability &&
+      /^[A-Za-z0-9_.-]{1,128}$/.test(capability)
+    ) {
+      // OpenFork capability identifiers are a closed structural namespace;
+      // arguments/results remain excluded from the durable activity record.
+      base.namespace = namespace
+      base.capability = capability
+    }
+  } else if (input.tool === "openfork_info") {
+    // action is already included in base
+  } else if (input.tool === "openai_files") {
+    const resultAction = text(structured, "action", 64) ?? text(metadata, "action", 64)
+    if (resultAction) base.action = resultAction
+    const bytes = finite(structured, "bytes") ?? finite(metadata, "bytes")
+    if (bytes !== undefined) base.bytes = bytes
+  }
+
+  return finishSummary(base)
+}
+
 export function plane(tool: string): OxpActivitySchema.Plane {
   if (tool === "openfork_session" || tool === "openfork_request")
     return "supervision"
@@ -351,8 +602,9 @@ const layer = Layer.effect(
     const linkAll = (
       invocationID: OxpActivitySchema.InvocationID,
       links: readonly Link[],
-    ) =>
-      Effect.forEach(
+    ) => {
+      if (links.length === 0) return Effect.void
+      return Effect.forEach(
         links,
         (link) =>
           activity
@@ -360,6 +612,7 @@ const layer = Layer.effect(
             .pipe(Effect.catchCause(() => Effect.void)),
         { discard: true, concurrency: "unbounded" },
       )
+    }
 
     const beginRaw = Effect.fn("OxpActivityRecorder.beginRaw")(function* (
       input: BeginInput,
@@ -372,6 +625,7 @@ const layer = Layer.effect(
       const rootAlias = rootID
         ? (yield* config.get()).roots.find((root) => root.id === rootID)?.alias
         : undefined
+      const summary = safeSummary(input)
       const started = yield* activity.begin({
         correlation,
         hostRunID,
@@ -381,9 +635,7 @@ const layer = Layer.effect(
         action,
         rootID,
         rootAlias,
-        ...(input.continuityMarker
-          ? { summary: { continuityMarker: input.continuityMarker } }
-          : {}),
+        ...(summary ? { summary } : {}),
       })
       yield* linkAll(
         started.invocationID,
@@ -412,6 +664,7 @@ const layer = Layer.effect(
           status: result.mutation?.committed ? "committed" : "success",
           mutationAttempted: result.mutation?.attempted ?? false,
           mutationCommitted: result.mutation?.committed ?? false,
+          summary: safeSummary(input, result),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }
@@ -427,6 +680,7 @@ const layer = Layer.effect(
           errorCode: error._tag,
           mutationAttempted: committed,
           mutationCommitted: committed,
+          summary: safeSummary(input),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }
