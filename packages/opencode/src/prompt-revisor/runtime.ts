@@ -5,13 +5,17 @@ import { MessageID, SessionID } from "@/session/schema"
 import { MCP } from "@/mcp"
 import { PromptRevisor } from "@opencode-ai/core/prompt-revisor"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
-import { collectUntilTerminalTool, generateAdaptive } from "@opencode-ai/core/special-agent-completion"
+import { collectUntilTerminalTool } from "@opencode-ai/core/special-agent-completion"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { type ToolDefinition as CanonicalToolDefinition } from "@opencode-ai/llm"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { jsonSchema, tool, type Tool } from "ai"
+import type { JSONSchema7 } from "@ai-sdk/provider"
+import { ToolJsonSchema } from "@/tool/json-schema"
 import { canonicalMessagesToModelMessages } from "@/special-agent/model-message-bridge"
+import { makeV1SpecialAgentAnchor } from "@/special-agent/v1-anchor"
 
 const toTools = (definitions: readonly CanonicalToolDefinition[]): Record<string, Tool> =>
   Object.fromEntries(
@@ -19,7 +23,7 @@ const toTools = (definitions: readonly CanonicalToolDefinition[]): Record<string
       definition.name,
       tool({
         description: definition.description,
-        inputSchema: jsonSchema(definition.inputSchema),
+        inputSchema: jsonSchema(ToolJsonSchema.fromJsonSchema(definition.inputSchema as JSONSchema7)),
       }),
     ]),
   )
@@ -50,7 +54,7 @@ export const makeRuntime = (
       if (seen.has(key)) continue
       seen.add(key)
       const resolved = yield* provider.getModel(candidate.providerID, candidate.id).pipe(Effect.option)
-      if (resolved._tag === "Some") return { ref: candidate, value: resolved.value }
+      if (resolved._tag === "Some") return { ref: candidate, value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
     }
 
     const fallbackRef = yield* provider.defaultModel().pipe(
@@ -72,28 +76,28 @@ export const makeRuntime = (
     return {
       ref: { providerID: fallbackRef.providerID, id: fallbackRef.modelID },
       value: fallback,
+      capability: toolChoiceIdentity(fallback),
     }
   }),
 
   generate: Effect.fn("PromptRevisorRuntime.generate")(function* (request) {
     const model = request.model.value as Provider.Model
-    const capability = toolChoiceIdentity(model)
     const sessionID = request.sessionID ?? SessionID.create()
-    const user: SessionV1.User = {
-      id: MessageID.ascending(),
+    const user = makeV1SpecialAgentAnchor({
       sessionID,
-      role: "user",
-      time: { created: Date.now() },
-      agent: "prompt-revisor",
+      agent: request.specialAgent,
       model: {
         providerID: model.providerID,
         modelID: model.id,
         variant: request.model.ref.variant,
       },
-    }
+    })
     const agent: Agent.Info = {
-      name: "prompt-revisor",
-      description: "Read-only prompt revision runtime",
+      name: request.specialAgent === "goal_revisor" ? "goal-revisor" : "prompt-revisor",
+      description:
+        request.specialAgent === "goal_revisor"
+          ? "Read-only Goal revision runtime"
+          : "Read-only prompt revision runtime",
       mode: "primary",
       native: true,
       hidden: true,
@@ -127,28 +131,14 @@ export const makeRuntime = (
       )
     }
 
-    const response =
-      request.toolChoice === "none"
-        ? yield* collect("none").pipe(
-            Effect.mapError(
-              (error) =>
-                new PromptRevisor.UnavailableError({
-                  message: `Prompt revision failed: ${error instanceof Error ? error.message : String(error)}`,
-                }),
-            ),
-          )
-        : (yield* generateAdaptive({
-            identity: capability,
-            requested: request.toolChoice,
-            generate: (toolChoice) => collect(toolChoice),
-          }).pipe(
-            Effect.mapError(
-              (error) =>
-                new PromptRevisor.UnavailableError({
-                  message: `Prompt revision failed: ${error instanceof Error ? error.message : String(error)}`,
-                }),
-            ),
-          )).response
+    const response = yield* collect(request.toolChoice).pipe(
+      Effect.mapError(
+        (error) =>
+          new PromptRevisor.UnavailableError({
+            message: `Prompt revision failed: ${error instanceof Error ? error.message : String(error)}`,
+          }),
+      ),
+    )
     if (!response) {
       return yield* new PromptRevisor.UnavailableError({ message: "Prompt revision ended without a terminal response" })
     }

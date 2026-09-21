@@ -18,8 +18,8 @@ const it = testEffect(layer)
 
 describe("RevisionDraft", () => {
   test("survives a complete service/database restart on the same SQLite file", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-revision-draft-"))
-    const databasePath = join(directory, "opencode.db")
+    const directory = await mkdtemp(join(tmpdir(), "openfork-revision-draft-"))
+    const databasePath = join(directory, "openfork.db")
     const target = {
       kind: "prompt" as const,
       key: "session:restart-survival",

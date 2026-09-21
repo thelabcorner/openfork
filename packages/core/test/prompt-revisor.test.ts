@@ -10,31 +10,42 @@ import {
   type LLMRequest,
 } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
-import { AgentV2 } from "@opencode-ai/core/agent"
+import { and, eq } from "drizzle-orm"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { Config } from "@opencode-ai/core/config"
+import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FileSystem } from "@opencode-ai/core/filesystem"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { QuestionV2 } from "@opencode-ai/core/question"
 import { Reference } from "@opencode-ai/core/reference"
 import {
   PromptRevisor,
-  normalizeClarifications,
-  normalizeClarificationRound,
   sanitizeQuestion,
 } from "@opencode-ai/core/prompt-revisor"
+import { RevisionDraftTable } from "@opencode-ai/core/revision-draft.sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { MessageDecodeError } from "@opencode-ai/core/session/error"
+import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
 import { resetToolChoiceCapabilityMemory } from "@opencode-ai/core/tool-choice-compatibility"
-import { Cause, DateTime, Effect, Layer } from "effect"
+import { SPECIAL_AGENT_TIME_WINDOW_MS } from "@opencode-ai/core/special-agent-completion"
+import { Cause, DateTime, Deferred, Effect, Fiber, Layer } from "effect"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import { testEffect } from "./lib/effect"
 
 const modelRef: ModelV2.Ref = {
@@ -48,11 +59,13 @@ let configEntries: Config.Entry[] = []
 let referenceItems: Reference.Info[] = []
 let sessionInfo: SessionSchema.Info | undefined
 let sessionMessages: SessionMessage.Message[] = []
+let readClockAdvanceMs = 0
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
+    compile: (() => Effect.die("unused")) as LLMClientShape["compile"],
     stream: ((request: LLMRequest) => {
       generatedRequests.push(request)
       const next = generatedResponses.shift()
@@ -74,7 +87,11 @@ let fileRead: (path: string) => Effect.Effect<{ content: Uint8Array; mime: strin
 const filesystem = Layer.mock(FileSystem.Service, {
   // The real FileSystem service has a `never` error channel and reports missing
   // paths, directories, and location escapes as defects, so the mock does too.
-  read: (input: { path: string }) => fileRead(input.path),
+  read: (input: { path: string }) =>
+    Effect.gen(function* () {
+      if (readClockAdvanceMs > 0) yield* TestClock.adjust(readClockAdvanceMs)
+      return yield* fileRead(input.path)
+    }),
   grep: () => Effect.die("unexpected grep"),
   glob: () => Effect.die("unexpected glob"),
 })
@@ -122,16 +139,19 @@ const models = SessionRunnerModel.layerWith(
   () => Effect.succeed(model),
 )
 
-const integrationLayer = AppNodeBuilder.build(PromptRevisor.node, [
-  [LayerNodePlatform.llmClient, llmClient],
-  [FileSystem.node, filesystem],
-  [Catalog.node, catalog],
-  [Config.node, config],
-  [Reference.node, references],
-  [SessionRunnerModel.node, models],
-  [SessionStore.node, sessions],
-  [Location.node, Location.boundNode({ directory: AbsolutePath.make(process.cwd()) })],
-])
+const integrationLayer = AppNodeBuilder.build(
+  LayerNode.group([PromptRevisor.node, Database.node, EventV2.node, QuestionV2.node]),
+  [
+    [LayerNodePlatform.llmClient, llmClient],
+    [FileSystem.node, filesystem],
+    [Catalog.node, catalog],
+    [Config.node, config],
+    [Reference.node, references],
+    [SessionRunnerModel.node, models],
+    [SessionStore.node, sessions],
+    [Location.node, Location.boundNode({ directory: AbsolutePath.make(process.cwd()) })],
+  ],
+)
 const it = testEffect(integrationLayer)
 
 const callResponse = (name: string, input: unknown, id = `${name}-1`) =>
@@ -217,31 +237,7 @@ describe("PromptRevisor", () => {
     expect(question.custom).toBe(true)
   })
 
-  test("normalizes clarification round input", () => {
-    expect(normalizeClarificationRound(undefined)).toBe(0)
-    expect(normalizeClarificationRound(Number.NaN)).toBe(0)
-    expect(normalizeClarificationRound(-4)).toBe(0)
-    expect(normalizeClarificationRound(1.9)).toBe(1)
-  })
-
-  test("bounds and preserves selected labels separately from free-form clarification details", () => {
-    const detail = " d ".repeat(20_000)
-    const result = normalizeClarifications([
-      {
-        question: ` ${"q".repeat(600)} `,
-        answers: [" Preserve API ", "Preserve API", "", "x".repeat(900)],
-        detail,
-      },
-    ])
-    expect(result).toHaveLength(1)
-    expect(result[0]?.question).toHaveLength(500)
-    expect(result[0]?.answers[0]).toBe("Preserve API")
-    expect(result[0]?.answers).toHaveLength(2)
-    expect(result[0]?.answers[1]).toHaveLength(500)
-    expect(result[0]?.detail?.length).toBeLessThanOrEqual(16_384)
-  })
-
-  it.effect("interrupts for a question without a session, then resumes statelessly with the user's answer", () =>
+  it.effect("does not expose question without a durable Session owner", () =>
     Effect.gen(function* () {
       configEntries = []
       generatedRequests.length = 0
@@ -259,17 +255,178 @@ describe("PromptRevisor", () => {
             },
           ],
         }),
+        revisionResponse("Improve the parser from the evidence already available."),
       ]
 
       const revisor = yield* PromptRevisor.Service
-      const first = yield* revisor.revise({ prompt: "Improve the parser implementation.", model: modelRef })
-      expect(first.type).toBe("question")
-      if (first.type !== "question") return
-      expect(first.clarificationRound).toBe(1)
-      expect(first.questions[0]).toMatchObject({
-        header: "Compatibility",
-        custom: true,
+      const result = yield* revisor.revise({ prompt: "Improve the parser implementation.", model: modelRef })
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Improve the parser from the evidence already available.",
       })
+      expect(generatedRequests[0]?.tools.map((tool) => tool.name).sort()).toEqual([
+        "composer_context",
+        "glob",
+        "grep",
+        "read",
+        "revised_prompt",
+      ])
+      expect(generatedRequests).toHaveLength(2)
+      expect(generatedRequests[1]?.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+    }),
+  )
+
+  it.effect("commits a targeted revision to the durable mailbox before returning success", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [revisionResponse("Durably revised prompt.")]
+      sessionInfo = undefined
+      sessionMessages = []
+
+      const target = {
+        kind: "prompt" as const,
+        key: "session:prompt-revisor-durable-target",
+        sourceFingerprint: "source-fingerprint",
+      }
+      const revisor = yield* PromptRevisor.Service
+      const { readDb } = yield* Database.Service
+      const result = yield* revisor.revise({
+        prompt: "Improve this prompt.",
+        model: modelRef,
+        target,
+      })
+
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Durably revised prompt.",
+        artifactID: expect.stringContaining("revision-draft:"),
+      })
+      const recovered = yield* readDb
+        .select()
+        .from(RevisionDraftTable)
+        .where(
+          and(
+            eq(RevisionDraftTable.target_kind, target.kind),
+            eq(RevisionDraftTable.target_key, target.key),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      expect(recovered).toMatchObject({
+        id: result.type === "revision" ? result.artifactID : undefined,
+        prompt: "Durably revised prompt.",
+        source_fingerprint: target.sourceFingerprint,
+        directory: process.cwd(),
+      })
+    }),
+  )
+
+  it.effect("rejects mismatched target semantics before model work begins", () =>
+    Effect.gen(function* () {
+      generatedRequests.length = 0
+      generatedResponses = []
+
+      const exit = yield* (yield* PromptRevisor.Service)
+        .revise({
+          prompt: "Improve this prompt.",
+          purpose: "goal",
+          model: modelRef,
+          target: {
+            kind: "prompt",
+            key: "session:wrong-kind",
+            sourceFingerprint: "source",
+          },
+        })
+        .pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      const error = Cause.squash(exit.cause) as PromptRevisor.UnavailableError
+      expect(error._tag).toBe("PromptRevisor.UnavailableError")
+      expect(error.message).toContain("does not match revision purpose")
+      expect(generatedRequests).toHaveLength(0)
+    }),
+  )
+
+  it.effect("routes clarification through the canonical descendant question lifecycle and resumes the same revision", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        questionResponse({
+          questions: [
+            {
+              question: "Should the existing API remain backward compatible?",
+              header: "Compatibility",
+              options: [
+                { label: "Preserve API", description: "Keep existing callers working" },
+                { label: "Breaking change", description: "A migration is acceptable" },
+              ],
+              custom: true,
+            },
+          ],
+        }),
+        revisionResponse("Improve the parser while preserving the existing public API and add regression tests."),
+      ]
+
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_question")
+      sessionInfo = {
+        id: sessionID,
+        title: "Prompt owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("prompt-revisor-question-project")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const events = yield* EventV2.Service
+      const asked = yield* Deferred.make<QuestionV2.Request>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.Asked.type
+          ? Deferred.succeed(asked, event.data as QuestionV2.Request).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const revisor = yield* PromptRevisor.Service
+      const fiber = yield* revisor
+        .revise({ prompt: "Improve the parser implementation.", model: modelRef, sessionID })
+        .pipe(Effect.forkScoped)
+      const request = yield* Deferred.await(asked)
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+
+      expect(request.sessionID).toBe(transcriptID)
+      expect(request.questions[0]).toMatchObject({ header: "Compatibility", custom: true })
       expect(generatedRequests[0]?.tools.map((tool) => tool.name).sort()).toEqual([
         "composer_context",
         "glob",
@@ -279,28 +436,178 @@ describe("PromptRevisor", () => {
         "revised_prompt",
       ])
 
-      generatedResponses = [
-        revisionResponse("Improve the parser while preserving the existing public API and add regression tests."),
-      ]
-      const second = yield* revisor.revise({
-        prompt: "Improve the parser implementation.",
-        model: modelRef,
-        clarifications: [
-          {
-            question: first.questions[0]!.question,
-            answers: ["Preserve API"],
-            detail: "Keep deprecated aliases for one release",
-          },
-        ],
-        clarificationRound: first.clarificationRound,
+      yield* (yield* QuestionV2.Service).reply({
+        requestID: request.id,
+        answers: [["Preserve API"]],
+        details: ["Keep deprecated aliases for one release"],
       })
+      const result = yield* Fiber.join(fiber)
 
-      expect(second).toMatchObject({
+      expect(result).toMatchObject({
         type: "revision",
         prompt: "Improve the parser while preserving the existing public API and add regression tests.",
       })
+      expect(generatedRequests).toHaveLength(2)
       expect(JSON.stringify(generatedRequests[1]?.messages)).toContain("Preserve API")
       expect(JSON.stringify(generatedRequests[1]?.messages)).toContain("Keep deprecated aliases for one release")
+    }),
+  )
+
+  it.effect("treats canonical question dismissal as a clean Prompt Revisor cancellation", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        questionResponse({
+          questions: [
+            {
+              question: "Which compatibility policy should the revision use?",
+              header: "Compatibility",
+              options: [{ label: "Preserve API", description: "Keep existing callers working" }],
+            },
+          ],
+        }),
+      ]
+
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_question_dismiss")
+      sessionInfo = {
+        id: sessionID,
+        title: "Prompt owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("prompt-revisor-question-dismiss-project")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const events = yield* EventV2.Service
+      const asked = yield* Deferred.make<QuestionV2.Request>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.Asked.type
+          ? Deferred.succeed(asked, event.data as QuestionV2.Request).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const revisor = yield* PromptRevisor.Service
+      const fiber = yield* revisor
+        .revise({ prompt: "Improve the parser implementation.", model: modelRef, sessionID })
+        .pipe(Effect.forkScoped)
+      const request = yield* Deferred.await(asked)
+      const questions = yield* QuestionV2.Service
+
+      yield* questions.reject(request.id)
+      const result = yield* Fiber.join(fiber)
+
+      expect(result).toEqual({ type: "cancelled", tools: ["question"], rounds: 1 })
+      expect(yield* questions.list()).toEqual([])
+      expect(generatedRequests).toHaveLength(1)
+    }),
+  )
+
+  it.effect("closes the durable provider turn when the revision is interrupted while a QuestionV2 request is pending", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        questionResponse({
+          questions: [
+            {
+              question: "Which compatibility policy should the revision use?",
+              header: "Compatibility",
+              options: [{ label: "Preserve API", description: "Keep existing callers working" }],
+            },
+          ],
+        }),
+      ]
+
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_question_interrupt")
+      sessionInfo = {
+        id: sessionID,
+        title: "Prompt owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("prompt-revisor-question-interrupt-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const events = yield* EventV2.Service
+      const asked = yield* Deferred.make<QuestionV2.Request>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.Asked.type
+          ? Deferred.succeed(asked, event.data as QuestionV2.Request).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const fiber = yield* (yield* PromptRevisor.Service)
+        .revise({ prompt: "Improve the parser implementation.", model: modelRef, sessionID })
+        .pipe(Effect.forkScoped)
+      yield* Deferred.await(asked)
+      yield* Fiber.interrupt(fiber)
+
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const tools = history.flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.filter((part) => part.type === "tool").map((part) => ({ name: part.name, status: part.state.status }))
+          : [],
+      )
+      expect(tools).toContainEqual({ name: "question", status: "error" })
+      expect(tools.some((tool) => tool.status === "pending" || tool.status === "running")).toBe(false)
     }),
   )
 
@@ -554,7 +861,6 @@ describe("PromptRevisor", () => {
         "composer_context",
         "glob",
         "grep",
-        "question",
         "read",
         "revised_prompt",
       ])
@@ -880,29 +1186,53 @@ describe("PromptRevisor", () => {
   it.effect("falls back to a revision when the clarification interrupt itself is malformed", () =>
     Effect.gen(function* () {
       configEntries = []
-      const requests: PromptRevisor.RuntimeGenerateInput[] = []
-      const responses = [
+      generatedRequests.length = 0
+      generatedResponses = [
         questionResponse({ questions: [{ header: "Scope", options: [] }] }),
         revisionResponse("Revised without a usable question"),
       ]
-      const runtime: PromptRevisor.Runtime = {
-        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
-        generate: (request) => {
-          requests.push(request)
-          return Effect.succeed(responses.shift()!)
-        },
-      }
 
-      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
-        { prompt: "Improve this.", model: modelRef },
-        runtime,
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_malformed_question")
+      sessionInfo = {
+        id: sessionID,
+        title: "Malformed question owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
       )
+      const projectID = ProjectV2.ID.make("prompt-revisor-malformed-question-project")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Malformed question owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef, sessionID })
       expect(result.type).toBe("revision")
       if (result.type !== "revision") return
       expect(result.prompt).toBe("Revised without a usable question")
-      expect(requests).toHaveLength(2)
-      expect(requests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
-      expect(JSON.stringify(requests[1]!.messages)).toContain("question payload was invalid")
+      expect(generatedRequests).toHaveLength(2)
+      expect(generatedRequests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+      expect(JSON.stringify(generatedRequests[1]!.messages)).toContain("question payload was invalid")
     }),
   )
 
@@ -1184,26 +1514,321 @@ describe("PromptRevisor", () => {
     }),
   )
 
-  it.effect("removes the question tool after the clarification budget is exhausted", () =>
+  it.effect("durably closes a provider turn that defects before emitting its first event", () =>
     Effect.gen(function* () {
       configEntries = []
       generatedRequests.length = 0
-      generatedResponses = [revisionResponse("Use the supplied decisions and produce the final revised prompt.")]
-      const revisor = yield* PromptRevisor.Service
-      const result = yield* revisor.revise({
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_pre_event_defect")
+      sessionInfo = {
+        id: sessionID,
+        title: "Prompt owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("prompt-revisor-pre-event-defect-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: () => Effect.die(new Error("provider exploded before first event")),
+      }
+      const exit = yield* (yield* PromptRevisor.Service)
+        .reviseWithRuntime({ prompt: "Improve this.", model: modelRef, sessionID }, runtime)
+        .pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const assistants = history.filter((message) => message.type === "assistant")
+      expect(assistants).toHaveLength(1)
+      expect(assistants[0]).toMatchObject({
+        type: "assistant",
+        finish: "error",
+        error: { message: "Prompt Revisor provider turn failed" },
+      })
+      expect(assistants[0]?.type === "assistant" ? assistants[0].time.completed : undefined).toBeDefined()
+    }),
+  )
+
+  it.effect("injects the privileged non-coding-agent reminder after two minutes before the next reasoning round", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      readClockAdvanceMs = PromptRevisor.REVISOR_REMINDER_INTERVAL_MS + 1
+      fileRead = (path) =>
+        Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
+      generatedResponses = [
+        callResponse("read", { path: "src/feature.ts" }, "slow-read"),
+        revisionResponse("Reminded revision"),
+      ]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          readClockAdvanceMs = 0
+          fileRead = () => Effect.die("unexpected read")
+        }),
+      )
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Reminded revision" })
+      expect(generatedRequests).toHaveLength(2)
+      expect(JSON.stringify(generatedRequests[0]!.messages)).not.toContain("PROMPT REVISOR REMINDER")
+      const reminder = JSON.stringify(generatedRequests[1]!.messages)
+      expect(reminder).toContain("PROMPT REVISOR REMINDER")
+      expect(reminder).toContain("not the coding or implementation agent")
+      expect(reminder).toContain("read-only")
+      expect(reminder).toContain("revised_prompt")
+    }),
+  )
+
+  it.effect("records the privileged reminder in the durable revision transcript", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      readClockAdvanceMs = PromptRevisor.REVISOR_REMINDER_INTERVAL_MS + 1
+      fileRead = () =>
+        Effect.succeed({ content: new TextEncoder().encode("export const file = true"), mime: "text/plain" })
+      generatedResponses = [
+        callResponse("read", { path: "src/feature.ts" }, "slow-read"),
+        revisionResponse("Durable reminder revision"),
+      ]
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_reminder")
+      sessionInfo = {
+        id: sessionID,
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          readClockAdvanceMs = 0
+          fileRead = () => Effect.die("unexpected read")
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+      // Host-child provisioning only accepts a parent that exists durably.
+      const projectID = ProjectV2.ID.make("prompt-revisor-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt revisor",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* (yield* PromptRevisor.Service).revise({
         prompt: "Improve this.",
         model: modelRef,
-        clarificationRound: 2,
-        clarifications: [{ question: "Scope?", answers: ["UI only"] }],
+        sessionID,
       })
       expect(result.type).toBe("revision")
-      expect(generatedRequests[0]?.tools.map((tool) => tool.name).sort()).toEqual([
-        "composer_context",
-        "glob",
-        "grep",
-        "read",
-        "revised_prompt",
-      ])
+
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const prompts = history.filter(
+        (message) =>
+          message.type === "synthetic" &&
+          message.provenance?.owner === "host" &&
+          message.provenance.source === SessionTurnProvenance.Source.PromptRevisor,
+      )
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]?.type === "synthetic" ? prompts[0].text : "").toContain("<draft>\nImprove this.\n</draft>")
+      expect(prompts[0] && SessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+      const toolStates = history.flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.filter((part) => part.type === "tool").map((part) => ({ name: part.name, status: part.state.status }))
+          : [],
+      )
+      expect(toolStates).toContainEqual({ name: "revised_prompt", status: "completed" })
+      expect(toolStates.some((tool) => tool.status === "pending" || tool.status === "running")).toBe(false)
+      const reminders = history.filter(
+        (message) => message.type === "system" && message.text.includes("[PROMPT REVISOR REMINDER"),
+      )
+      expect(reminders).toHaveLength(1)
+    }),
+  )
+
+  it.effect("keeps Goal revision durable and separate without consuming Session conversation context", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [revisionResponse("# Goal\n\nShip the focused Goal robustly.")]
+      const sessionID = SessionSchema.ID.make("ses_goal_revisor_identity")
+      sessionInfo = {
+        id: sessionID,
+        title: "Goal owner",
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      sessionMessages = [sessionUser("PRIVATE CONVERSATION CONTEXT MUST NOT BE INJECTED")]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("goal-revisor-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Goal owner",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* (yield* PromptRevisor.Service).revise({
+        prompt: "Rewrite this Goal brief.",
+        purpose: "goal",
+        sessionID,
+        includeSessionContext: false,
+        model: modelRef,
+      })
+      expect(result).toMatchObject({ type: "revision", prompt: "# Goal\n\nShip the focused Goal robustly." })
+      expect(JSON.stringify(generatedRequests[0]?.messages)).not.toContain("PRIVATE CONVERSATION CONTEXT MUST NOT BE INJECTED")
+
+      const goalTranscriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "goal_revisor",
+      })
+      const promptTranscriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+      expect(goalTranscriptID).not.toBe(promptTranscriptID)
+      const history = yield* SessionHistory.load(readDb, goalTranscriptID)
+      const origin = history.find(
+        (message) =>
+          message.type === "synthetic" && message.provenance?.source === SessionTurnProvenance.Source.GoalRevisor,
+      )
+      expect(origin?.type).toBe("synthetic")
+      expect(origin && SessionTurnProvenance.isWorkerPromptTurn(origin)).toBe(false)
+      expect(origin && SessionTurnProvenance.isGoalAuthorizationTurn(origin)).toBe(false)
+      const goalTranscript = yield* readDb
+        .select({ metadata: SessionTable.metadata })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, goalTranscriptID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(goalTranscript?.metadata).toMatchObject({
+        specialAgent: "goal_revisor",
+        specialAgentOwnerKind: "session",
+        specialAgentOwnerID: sessionID,
+      })
+      const promptTranscript = yield* readDb
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, promptTranscriptID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(promptTranscript).toBeUndefined()
+    }),
+  )
+
+  it.effect("re-asserts the revisor identity on protocol-correction turns", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        textResponse("Here is a prose rewrite without the required tool call."),
+        revisionResponse("Corrected revision"),
+      ]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Corrected revision" })
+      expect(JSON.stringify(generatedRequests[0]!.messages)).not.toContain("PROMPT REVISOR REMINDER")
+      const correction = JSON.stringify(generatedRequests[1]!.messages)
+      expect(correction).toContain("PROMPT REVISOR REMINDER")
+      expect(correction).toContain("not the coding or implementation agent")
+      expect(correction).toContain("revised_prompt")
+    }),
+  )
+
+  it.effect("applies five-minute time pressure and completes instead of failing", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      readClockAdvanceMs = SPECIAL_AGENT_TIME_WINDOW_MS + 1
+      fileRead = (path) =>
+        Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
+      generatedResponses = [
+        callResponse("read", { path: "src/feature.ts" }, "slow-read"),
+        revisionResponse("Pressured revision"),
+      ]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          readClockAdvanceMs = 0
+          fileRead = () => Effect.die("unexpected read")
+        }),
+      )
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Pressured revision" })
+      const pressured = JSON.stringify(generatedRequests[1]!.messages)
+      expect(pressured).toContain("time limit reached")
+      expect(pressured).toContain("one final five-minute window")
+      expect(pressured).toContain("revised_prompt")
     }),
   )
 })

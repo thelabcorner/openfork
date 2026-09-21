@@ -95,6 +95,7 @@ describe("Prompt Revisor production runtime", () => {
     const response = await Effect.runPromise(
       runtime.generate({
         model,
+        specialAgent: "prompt_revisor",
         system: "PROMPT REVISOR SYSTEM",
         messages: [Message.user("Improve this")],
         tools: [],
@@ -110,6 +111,47 @@ describe("Prompt Revisor production runtime", () => {
     expect(request?.user.model.variant).toBe("high")
     expect(request?.maxOutputTokens).toBe(4096)
     expect(request?.sessionID.startsWith("ses")).toBe(true)
+  })
+
+  test("forwards mid-conversation system reminders into the production Session LLM transcript", async () => {
+    const selectedRef = ref("dedicated", "revisor", "high")
+    const selected = providerModel("dedicated", "revisor")
+    let request: SessionLLM.StreamInput | undefined
+    const provider = {
+      getModel: () => Effect.succeed(selected),
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const llm = {
+      stream(input: SessionLLM.StreamInput) {
+        request = input
+        return Stream.fromIterable([
+          LLMEvent.textStart({ id: "text-1" }),
+          LLMEvent.textDelta({ id: "text-1", text: "ok" }),
+          LLMEvent.textEnd({ id: "text-1" }),
+          LLMEvent.finish({ reason: "stop" }),
+        ])
+      },
+    } as SessionLLM.Interface
+    const runtime = makeRuntime(provider, llm)
+    const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
+
+    await Effect.runPromise(
+      runtime.generate({
+        model,
+        specialAgent: "prompt_revisor",
+        system: "PROMPT REVISOR SYSTEM",
+        messages: [Message.user("Improve this"), Message.system("[PROMPT REVISOR REMINDER] not a coding agent")],
+        tools: [],
+        toolChoice: "none",
+        generation: {},
+      }),
+    )
+
+    expect(request?.messages).toEqual([
+      { role: "user", content: "Improve this" },
+      { role: "system", content: "[PROMPT REVISOR REMINDER] not a coding agent" },
+    ])
+    expect(request?.agent.prompt).toBe("PROMPT REVISOR SYSTEM")
   })
 
   test("stops consuming and finalizes the production Session LLM stream at revised_prompt", async () => {
@@ -146,6 +188,7 @@ describe("Prompt Revisor production runtime", () => {
     const response = await Effect.runPromise(
       runtime.generate({
         model,
+        specialAgent: "prompt_revisor",
         system: "PROMPT REVISOR SYSTEM",
         messages: [Message.user("Improve this")],
         tools: [],
@@ -160,7 +203,7 @@ describe("Prompt Revisor production runtime", () => {
     expect(finalized).toBe(true)
   })
 
-  test("retries required tool choice as auto when the upstream only supports auto", async () => {
+  test("leaves required-to-auto negotiation to the owning Prompt Revisor operation", async () => {
     const selectedRef = ref("console-go", "revisor")
     const selected = providerModel("console-go", "revisor")
     const toolChoices: SessionLLM.StreamInput["toolChoice"][] = []
@@ -191,9 +234,10 @@ describe("Prompt Revisor production runtime", () => {
     const runtime = makeRuntime(provider, llm)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
-    const response = await Effect.runPromise(
+    const exit = await Effect.runPromiseExit(
       runtime.generate({
         model,
+        specialAgent: "prompt_revisor",
         system: "PROMPT REVISOR SYSTEM",
         messages: [Message.user("Improve this")],
         tools: [],
@@ -202,21 +246,8 @@ describe("Prompt Revisor production runtime", () => {
       }),
     )
 
-    expect(toolChoices).toEqual(["required", "auto"])
-    expect(response.toolCalls[0]?.name).toBe("revised_prompt")
-
-    await Effect.runPromise(
-      runtime.generate({
-        model,
-        system: "PROMPT REVISOR SYSTEM",
-        messages: [Message.user("Improve this again")],
-        tools: [],
-        toolChoice: "required",
-        generation: { maxTokens: 4096, temperature: 0.2 },
-      }),
-    )
-
-    expect(toolChoices).toEqual(["required", "auto", "auto"])
+    expect(toolChoices).toEqual(["required"])
+    expect(exit._tag).toBe("Failure")
   })
 
   test("does not downgrade unrelated required-tool failures", async () => {
@@ -239,6 +270,7 @@ describe("Prompt Revisor production runtime", () => {
     const exit = await Effect.runPromiseExit(
       runtime.generate({
         model,
+        specialAgent: "prompt_revisor",
         system: "PROMPT REVISOR SYSTEM",
         messages: [Message.user("Improve this")],
         tools: [],
@@ -271,6 +303,7 @@ describe("Prompt Revisor production runtime", () => {
     const exit = await Effect.runPromiseExit(
       runtime.generate({
         model,
+        specialAgent: "prompt_revisor",
         system: "PROMPT REVISOR SYSTEM",
         messages: [Message.user("Improve this")],
         tools: [],
