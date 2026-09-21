@@ -1,0 +1,368 @@
+/*
+ * Concept F — Turn Lane. DEV-ONLY styling.
+ *
+ * Kept in its own file because it is the hybrid, and it should be readable as a
+ * whole rather than as a diff against four other concepts. It depends on three
+ * keyframes declared in `lab.css` — `lab-orbit`, `lab-charge`, `lab-launch` —
+ * deliberately, because the baton's motion here IS Concept B's motion, not a
+ * re-creation of it. If those move, this moves with them.
+ *
+ * Shared tokens (--lab-swap, --lab-enter, --lab-ease-out, …) also come from
+ * `lab.css`, scoped to [data-lab="send-control"].
+ */
+
+/* ── lane ─────────────────────────────────────────────────────────────────── */
+
+[data-lab-concept="f"] [data-lab-f-lane] {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/*
+ * Turn group: clock + baton, growing leftward out of a right-anchored lane.
+ *
+ * It needs no reserved slot — unlike Concept A, which held an empty 28px gutter
+ * open forever. Right-anchoring already guarantees the send group's distance
+ * from the composer's trailing edge is constant, so an idle composer pays 52px
+ * instead of 84px and Send still never moves a pixel.
+ *
+ * Width is declared rather than measured because the clock is fixed-width
+ * tabular text; measuring it would make the group breathe once a second as the
+ * elapsed digits roll over.
+ */
+[data-lab-concept="f"] [data-lab-f-turn] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* border-box: the declared 86px is 48 clock + 4 gap + 28 baton + 6 trailing. */
+  padding-right: 6px;
+  overflow: hidden;
+  flex: none;
+  transition:
+    width var(--lab-enter) var(--lab-ease-out),
+    padding-right var(--lab-enter) var(--lab-ease-out),
+    opacity var(--lab-swap) ease;
+}
+
+/*
+ * The trailing gap has to collapse with the group. `box-sizing: border-box`
+ * floors a 0px width at the padding, so leaving it on would park a permanent
+ * 6px sliver against the composer's trailing edge.
+ */
+[data-lab-concept="f"] [data-lab-f-turn][data-lab-f-live="false"] {
+  opacity: 0;
+  padding-right: 0;
+  pointer-events: none;
+  transition-duration: var(--lab-exit);
+  transition-timing-function: var(--lab-ease-in);
+}
+
+[data-lab-concept="f"] [data-lab-f-clock] {
+  width: 48px;
+  flex: none;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-muted);
+  white-space: nowrap;
+  user-select: none;
+  transition: color var(--lab-swap) ease;
+}
+
+/* The final elapsed time is the last thing a turn says before it leaves. */
+[data-lab-concept="f"] [data-lab-f-clock][data-lab-f-settled="true"] {
+  color: var(--v2-text-text-faint);
+}
+
+/* ── the baton: Concept B's 28px choreography, unchanged ──────────────────── */
+
+[data-lab-concept="f"] [data-lab-f-baton] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background-color: var(--v2-background-bg-button-neutral);
+  color: var(--v2-state-fg-danger);
+  box-shadow: var(--v2-elevation-button-neutral);
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-concept="f"] [data-lab-f-baton]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+}
+
+[data-lab-concept="f"] [data-lab-f-baton]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+  box-shadow:
+    var(--v2-elevation-button-neutral),
+    inset 0 1px 2px 0 var(--v2-alpha-dark-8);
+}
+
+[data-lab-concept="f"] [data-lab-f-baton]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+/* Arming and stopping are not interruptible; the mark goes quiet. */
+[data-lab-concept="f"] [data-lab-f-baton][data-lab-f-quiet="true"] {
+  color: var(--v2-icon-icon-muted);
+}
+
+[data-lab-concept="f"] [data-lab-f-arc] {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+[data-lab-concept="f"] [data-lab-f-track] {
+  stroke: var(--v2-border-border-muted);
+}
+
+[data-lab-concept="f"] [data-lab-f-runner] {
+  stroke: var(--v2-border-border-strong);
+  /* rect carries pathLength="100"; dash units are percent of the perimeter. */
+  stroke-dasharray: 24 76;
+  animation: lab-orbit var(--lab-loop) linear infinite;
+}
+
+/* Interrupt acknowledged: the orbit collapses into a closed static ring. */
+[data-lab-concept="f"] [data-lab-f-arc][data-lab-f-frozen="true"] [data-lab-f-runner] {
+  animation: none;
+  stroke-dasharray: none;
+  stroke: var(--v2-border-border-base);
+}
+
+/* In flight, nothing streamed yet: a literal charging edge. */
+[data-lab-concept="f"] [data-lab-f-charge] {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 3px;
+  height: 1px;
+  border-radius: 1px;
+  background: var(--v2-icon-icon-accent);
+  transform-origin: left center;
+  animation: lab-charge 1400ms linear forwards;
+}
+
+[data-lab-concept="f"] [data-lab-f-launch="true"] {
+  animation: lab-launch 260ms var(--lab-ease-out);
+}
+
+/* ── send group: one silhouette, two halves ───────────────────────────────── */
+
+[data-lab-concept="f"] [data-lab-f-send-group] {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  flex: none;
+  border-radius: 8px;
+  overflow: clip;
+  box-shadow: var(--v2-elevation-button-contrast);
+  transition: opacity var(--lab-swap) ease;
+}
+
+[data-lab-concept="f"] [data-lab-f-send-group][data-lab-f-dim="true"] {
+  opacity: 0.4;
+}
+
+/*
+ * The two halves share one silhouette and one elevation because they are one
+ * control: "send" and "how to send". The cheek is the same contrast surface
+ * under a dark scrim, so it reads as recessed rather than as a separate button
+ * that happens to be adjacent — and on hover it brightens up to meet Send.
+ */
+[data-lab-concept="f"] [data-lab-f-cheek],
+[data-lab-concept="f"] [data-lab-f-send] {
+  position: relative;
+  display: grid;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  outline: none;
+  cursor: default;
+  flex: none;
+  user-select: none;
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  color: var(--v2-icon-icon-contrast);
+  transition:
+    background-image var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-concept="f"] [data-lab-f-send] {
+  width: 28px;
+}
+
+/*
+ * 24px wide. Today's disclosure is 11x11 and is carved *inside* the send
+ * button's own silhouette, so a mis-aim sends the prompt — the single worst
+ * failure this control can have. 24x28 clears WCAG 2.5.8's 24px minimum and can
+ * never be mistaken for the primary half.
+ */
+[data-lab-concept="f"] [data-lab-f-cheek] {
+  width: 24px;
+  /* 78%, not lower: on dark-theme bg-contrast this is the difference between
+     3.8:1 and 4.2:1 against the scrimmed cheek. Hover takes it to full. */
+  color: color-mix(in srgb, var(--v2-icon-icon-contrast) 78%, transparent);
+  background-image:
+    linear-gradient(90deg, var(--v2-alpha-dark-20) 0%, var(--v2-alpha-dark-20) 100%),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  box-shadow: inset -0.5px 0 0 0 var(--v2-alpha-light-14);
+}
+
+[data-lab-concept="f"]
+  [data-lab-f-cheek]:is(:hover, [data-expanded], [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  color: var(--v2-icon-icon-contrast);
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-concept="f"] [data-lab-f-cheek]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]),
+[data-lab-concept="f"] [data-lab-f-cheek][data-expanded] {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 0%,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-concept="f"] [data-lab-f-send]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-hover) 0%,
+      var(--v2-overlay-simple-overlay-contrast-hover) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-concept="f"] [data-lab-f-send]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 0%,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+/* Inset so the shared silhouette's `overflow: clip` cannot eat the ring. */
+[data-lab-concept="f"] [data-lab-f-cheek]:is(:focus-visible, [data-lab-force="focus"]),
+[data-lab-concept="f"] [data-lab-f-send]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+  z-index: 1;
+}
+
+[data-lab-concept="f"] [data-lab-f-chevron] {
+  transition: transform 160ms var(--lab-ease-out);
+}
+
+[data-lab-concept="f"] [data-lab-f-cheek][data-expanded] [data-lab-f-chevron] {
+  transform: rotate(180deg);
+}
+
+/*
+ * Armed indicator.
+ *
+ * Auto-revise changes what the primary half *does*, so the disclosure that owns
+ * that setting carries a persistent mark. It is deliberately not the same
+ * signal as the primary glyph: the dot says "the setting is on", the sparkle
+ * mark on Send says "this particular press will rewrite first". They disagree
+ * exactly when the draft is not revisable — a slash command — which is the case
+ * today's 11px tinted chevron cannot express at all.
+ */
+[data-lab-concept="f"] [data-lab-f-armed] {
+  position: absolute;
+  bottom: 3.5px;
+  left: 50%;
+  translate: -50% 0;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--v2-icon-icon-accent);
+  animation: lab-f-arm 180ms var(--lab-ease-out);
+}
+
+@keyframes lab-f-arm {
+  from {
+    opacity: 0;
+    scale: 0.4;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+
+/* Revising: the revisor mark breathes. It does not spin — nothing is looping. */
+[data-lab-concept="f"] [data-lab-f-revising] {
+  animation: lab-f-breathe 2200ms ease-in-out infinite;
+}
+
+@keyframes lab-f-breathe {
+  0%,
+  100% {
+    opacity: 0.58;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* Staged revision waiting to be sent. */
+[data-lab-concept="f"] [data-lab-f-staged] {
+  position: absolute;
+  top: 3.5px;
+  right: 3.5px;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--v2-icon-icon-accent);
+}
+
+/* ── reduced motion ───────────────────────────────────────────────────────── */
+
+/*
+ * `lab.css` already flattens every duration under the lab root. The orbit needs
+ * one extra rule: a 1ms animation would leave the 24/76 dash frozen as a stub
+ * somewhere on the perimeter. Close the ring instead, so "a turn is live" still
+ * reads without anything moving.
+ */
+@media (prefers-reduced-motion: reduce) {
+  [data-lab-concept="f"] [data-lab-f-runner] {
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+}
+
+[data-lab="send-control"][data-lab-motion="off"] [data-lab-f-runner] {
+  stroke-dasharray: none !important;
+  stroke-dashoffset: 0 !important;
+}

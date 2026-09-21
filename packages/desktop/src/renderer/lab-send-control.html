@@ -1,0 +1,33 @@
+<!doctype html>
+<!--
+  DEV-ONLY prototype surface for the Prompt Input V2 send/stop concept lab.
+
+  Deliberately NOT part of the renderer build input (electron.vite.config.ts pins
+  `renderer.build.rollupOptions.input` to `src/renderer/index.html`), so it exists
+  only while the dev server is running.
+
+  Open it at http://[::1]:5173/lab-send-control.html — the renderer dev server
+  binds IPv6 loopback, and `localhost` may resolve to a different Vite instance.
+-->
+<html lang="en" style="background-color: var(--v2-background-bg-deep, #fafafa)">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Send / Stop concept lab · OpenFork</title>
+    <script id="oc-theme-preload-script" src="./oc-theme-preload.js"></script>
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body class="antialiased overscroll-none overflow-hidden">
+    <noscript>You need to enable JavaScript to run this page.</noscript>
+    <div id="root"></div>
+    <script src="./lab-send-control.tsx" type="module"></script>
+  </body>
+</html>

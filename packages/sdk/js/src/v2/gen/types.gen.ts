@@ -2324,6 +2324,9 @@ export type OxpInvocationInfo = {
   rootAlias?: string
   status: OxpActivityStatus
   continuityMarker?: OxpActivityContinuityMarker
+  safeSummary?: {
+    [key: string]: unknown
+  }
   errorCode?: string
   mutationAttempted: boolean
   mutationCommitted: boolean

@@ -1,0 +1,332 @@
+/*
+ * The five disclosures (G–K). DEV-ONLY.
+ *
+ * Same lane, same baton, same clock, same primary — see `turn-lane.css`. The
+ * only thing that varies here is how you get to the Prompt Revisor send-policy
+ * menu, and what that costs the composer footer.
+ *
+ * Footprint at rest, for comparison:
+ *   today   30px   (11x11 chevron carved inside the send button)
+ *   G       38px   10px gutter inside one silhouette
+ *   H       28px   trigger relocated to the existing revisor control
+ *   I       28px   no trigger; right-click / long-press / Alt-click
+ *   J       28px   tab rises above the button on hover or focus
+ *   K       28px idle, 44px with a draft
+ */
+
+/* ══════════════════════ G — Seam Gutter ═══════════════════════════════════ */
+
+[data-lab-g-group] {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  flex: none;
+  border-radius: 8px;
+  overflow: clip;
+  box-shadow: var(--v2-elevation-button-contrast);
+  transition: opacity var(--lab-swap) ease;
+}
+
+[data-lab-g-group][data-lab-g-dim="true"] {
+  opacity: 0.4;
+}
+
+/* The halves share one silhouette and one elevation, so the group owns both. */
+[data-lab-g-group] [data-lab-tl-send] {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+[data-lab-g-group] [data-lab-tl-send]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline-offset: -2px;
+}
+
+/*
+ * 10px, full height. Today's trigger is an 11x11 chevron carved into the send
+ * button's *bottom-left corner* — a 121px² target with the primary action on
+ * three of its four sides. This is 280px², has the primary on exactly one side,
+ * and a visible hairline between them. The target is still small; that is the
+ * deliberate trade for keeping the whole control at 38px.
+ */
+[data-lab-g-gutter] {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 10px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  color: color-mix(in srgb, var(--v2-icon-icon-contrast) 66%, transparent);
+  background-image:
+    linear-gradient(90deg, var(--v2-alpha-dark-24) 0%, var(--v2-alpha-dark-24) 100%),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  box-shadow: inset -0.5px 0 0 0 var(--v2-alpha-light-14);
+  transition:
+    background-image var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-g-gutter]:is(:hover, [data-expanded], [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  color: var(--v2-icon-icon-contrast);
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-g-gutter]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+  z-index: 1;
+}
+
+/* Armed: the gutter fills with accent instead of wearing a dot it has no room for. */
+[data-lab-g-gutter][data-lab-g-armed="true"] {
+  color: var(--v2-text-text-contrast);
+  background-image: linear-gradient(90deg, var(--v2-background-bg-accent) 0%, var(--v2-background-bg-accent) 100%);
+}
+
+[data-lab-g-chevron] {
+  transition: transform 160ms var(--lab-ease-out);
+}
+
+[data-lab-g-gutter][data-expanded] [data-lab-g-chevron] {
+  transform: rotate(180deg);
+}
+
+/* ══════════════════════ H — Revisor Owns It ═══════════════════════════════ */
+
+/*
+ * No disclosure at the send end at all. The trigger moves onto the prompt
+ * revisor control that already sits in the footer's leading cluster, because
+ * that is what the menu is *about*. Send goes back to a clean 28px square —
+ * smaller than today.
+ */
+[data-lab-h-revisor] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background: transparent;
+  color: var(--v2-icon-icon-muted);
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-h-revisor]:is(:hover, [data-lab-force="hover"]):not([data-expanded]) {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+  color: var(--v2-icon-icon-base);
+}
+
+[data-lab-h-revisor]:is(:active, [data-lab-force="pressed"]),
+[data-lab-h-revisor][data-expanded] {
+  background-color: var(--v2-overlay-simple-overlay-pressed);
+  color: var(--v2-icon-icon-base);
+}
+
+[data-lab-h-revisor]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+/* Armed reads here, where there is room for it to read properly. */
+[data-lab-h-revisor][data-lab-h-armed="true"] {
+  color: var(--v2-icon-icon-accent);
+}
+
+/* The disclosure caret is part of the control, not a second button. */
+[data-lab-h-caret] {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  color: var(--v2-icon-icon-faint, var(--v2-icon-icon-muted));
+  opacity: 0.7;
+  transition:
+    transform 160ms var(--lab-ease-out),
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab-h-revisor]:is(:hover, [data-expanded]) [data-lab-h-caret] {
+  opacity: 1;
+}
+
+[data-lab-h-revisor][data-expanded] [data-lab-h-caret] {
+  transform: rotate(180deg);
+}
+
+/* ══════════════════════ I — Dog-ear ═══════════════════════════════════════ */
+
+/*
+ * No trigger at all. The menu is a gesture — right-click, long-press, or
+ * Alt-click on Send — and the only chrome is a 5px folded corner that is paint,
+ * not a target. Zero added width, zero new tab stops, zero mis-aim risk.
+ */
+[data-lab-i-fold] {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+  border-bottom-left-radius: 8px;
+  background: linear-gradient(45deg, var(--v2-alpha-light-24) 0%, var(--v2-alpha-light-24) 50%, transparent 50%);
+  opacity: 0.55;
+  transition: opacity var(--lab-swap) ease;
+}
+
+[data-lab-i-send-wrap]:hover [data-lab-i-fold],
+[data-lab-i-fold][data-lab-i-open="true"] {
+  opacity: 1;
+}
+
+/* Armed turns the fold accent — the one persistent signal this concept has. */
+[data-lab-i-fold][data-lab-i-armed="true"] {
+  background: linear-gradient(45deg, var(--v2-icon-icon-accent) 0%, var(--v2-icon-icon-accent) 50%, transparent 50%);
+  opacity: 1;
+}
+
+/* Anchor only. Never painted, never hit — Kobalte positions the menu off it. */
+[data-lab-i-anchor] {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+}
+
+/* ══════════════════════ J — Rising Tab ════════════════════════════════════ */
+
+[data-lab-j-wrap] {
+  position: relative;
+  display: flex;
+  flex: none;
+}
+
+/*
+ * The tab rises out of the button's top edge. It costs no layout width and it
+ * cannot be mis-hit into Send, because it is not beside Send — it is above it,
+ * and the 28px primary is still a clean square underneath.
+ */
+[data-lab-j-tab] {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% - 4px);
+  translate: -50% 0;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 13px;
+  padding: 0 0 3px;
+  border: 0;
+  border-radius: 5px 5px 0 0;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  color: var(--v2-icon-icon-contrast);
+  background-image: linear-gradient(180deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  box-shadow: 0 -1px 1.5px 0 var(--v2-alpha-dark-14);
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity var(--lab-swap) ease,
+    transform var(--lab-swap) var(--lab-ease-out);
+}
+
+[data-lab-j-wrap]:hover [data-lab-j-tab],
+[data-lab-j-wrap]:focus-within [data-lab-j-tab],
+[data-lab-j-tab][data-lab-j-pinned="true"] {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+[data-lab-j-tab]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 1px;
+}
+
+/* Pinned open while armed, so the setting is never hidden behind a hover. */
+[data-lab-j-tab][data-lab-j-armed="true"] {
+  background-image: linear-gradient(180deg, var(--v2-background-bg-accent) 0%, var(--v2-background-bg-accent) 100%);
+  color: var(--v2-text-text-contrast);
+}
+
+/* ══════════════════════ K — Contextual Chip ═══════════════════════════════ */
+
+/*
+ * The disclosure exists only when there is something to disclose. An empty
+ * composer has no send policy worth opening, so the footer shows a bare 28px
+ * square; the chip slides in the moment a draft exists or a turn starts.
+ */
+[data-lab-k-chip] {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 28px;
+  flex: none;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background: transparent;
+  color: var(--v2-icon-icon-muted);
+  transition:
+    width var(--lab-enter) var(--lab-ease-out),
+    margin-right var(--lab-enter) var(--lab-ease-out),
+    opacity var(--lab-swap) ease,
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+  margin-right: 2px;
+}
+
+[data-lab-k-chip][data-lab-k-present="false"] {
+  width: 0;
+  margin-right: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition-duration: var(--lab-exit);
+}
+
+[data-lab-k-chip]:is(:hover, [data-lab-force="hover"]):not([data-expanded]) {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+  color: var(--v2-icon-icon-base);
+}
+
+[data-lab-k-chip]:is(:active, [data-lab-force="pressed"]),
+[data-lab-k-chip][data-expanded] {
+  background-color: var(--v2-overlay-simple-overlay-pressed);
+  color: var(--v2-icon-icon-base);
+}
+
+[data-lab-k-chip]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -1px;
+}
+
+[data-lab-k-chip][data-lab-k-armed="true"] {
+  color: var(--v2-icon-icon-accent);
+}
+
+[data-lab-k-chevron] {
+  transition: transform 160ms var(--lab-ease-out);
+}
+
+[data-lab-k-chip][data-expanded] [data-lab-k-chevron] {
+  transform: rotate(180deg);
+}

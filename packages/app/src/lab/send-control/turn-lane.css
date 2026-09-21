@@ -1,0 +1,274 @@
+/*
+ * Shared skeleton for the Turn Lane hybrids (G–K). DEV-ONLY.
+ *
+ * Holds everything the five agree on: the lane, the turn group (clock + baton),
+ * Concept B's baton choreography, and the primary send surface. Each concept's
+ * own file adds only its disclosure.
+ *
+ * Depends on `lab.css` for the shared tokens and for the `lab-orbit`,
+ * `lab-charge` and `lab-launch` keyframes — deliberately, because the baton's
+ * motion here IS Concept B's motion rather than a re-creation of it.
+ */
+
+/* ── lane ─────────────────────────────────────────────────────────────────── */
+
+[data-lab-tl] {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+/*
+ * Turn group: clock + baton, growing leftward out of a right-anchored lane.
+ *
+ * No reserved gutter — unlike Concept A, which held an empty 28px slot open
+ * forever. Right-anchoring already guarantees the primary's distance from the
+ * composer's trailing edge is constant, so an idle composer pays nothing.
+ *
+ * The width is declared, not measured: the clock is fixed-width tabular text,
+ * and measuring it would make the group breathe once a second as digits roll.
+ */
+[data-lab-tl-turn] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  /* border-box: the declared 86px is 48 clock + 4 gap + 28 baton + 6 trailing. */
+  padding-right: 6px;
+  overflow: hidden;
+  flex: none;
+  transition:
+    width var(--lab-enter) var(--lab-ease-out),
+    padding-right var(--lab-enter) var(--lab-ease-out),
+    opacity var(--lab-swap) ease;
+}
+
+/*
+ * The trailing gap collapses with the group. `box-sizing: border-box` floors a
+ * 0px width at the padding, so leaving it on parks a permanent 6px sliver
+ * against the composer's trailing edge.
+ */
+[data-lab-tl-turn][data-lab-tl-live="false"] {
+  opacity: 0;
+  padding-right: 0;
+  pointer-events: none;
+  transition-duration: var(--lab-exit);
+  transition-timing-function: var(--lab-ease-in);
+}
+
+[data-lab-tl-clock] {
+  width: 48px;
+  flex: none;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-muted);
+  white-space: nowrap;
+  user-select: none;
+  transition: color var(--lab-swap) ease;
+}
+
+/* The final elapsed time is the last thing a turn says before it leaves. */
+[data-lab-tl-clock][data-lab-tl-settled="true"] {
+  color: var(--v2-text-text-faint);
+}
+
+/* ── baton: Concept B's 28px choreography ─────────────────────────────────── */
+
+[data-lab-tl-baton] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background-color: var(--v2-background-bg-button-neutral);
+  color: var(--v2-state-fg-danger);
+  box-shadow: var(--v2-elevation-button-neutral);
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-tl-baton]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+}
+
+[data-lab-tl-baton]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+  box-shadow:
+    var(--v2-elevation-button-neutral),
+    inset 0 1px 2px 0 var(--v2-alpha-dark-8);
+}
+
+[data-lab-tl-baton]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+/* Arming and stopping are not interruptible; the mark goes quiet. */
+[data-lab-tl-baton][data-lab-tl-quiet="true"] {
+  color: var(--v2-icon-icon-muted);
+}
+
+[data-lab-tl-arc] {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+[data-lab-tl-track] {
+  stroke: var(--v2-border-border-muted);
+}
+
+[data-lab-tl-runner] {
+  stroke: var(--v2-border-border-strong);
+  /* rect carries pathLength="100"; dash units are percent of the perimeter. */
+  stroke-dasharray: 24 76;
+  animation: lab-orbit var(--lab-loop) linear infinite;
+}
+
+/* Interrupt acknowledged: the orbit collapses into a closed static ring. */
+[data-lab-tl-arc][data-lab-tl-frozen="true"] [data-lab-tl-runner] {
+  animation: none;
+  stroke-dasharray: none;
+  stroke: var(--v2-border-border-base);
+}
+
+/* In flight, nothing streamed yet: a literal charging edge. */
+[data-lab-tl-charge] {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 3px;
+  height: 1px;
+  border-radius: 1px;
+  background: var(--v2-icon-icon-accent);
+  transform-origin: left center;
+  animation: lab-charge 1400ms linear forwards;
+}
+
+[data-lab-tl-launch="true"] {
+  animation: lab-launch 260ms var(--lab-ease-out);
+}
+
+/* ── primary send surface ─────────────────────────────────────────────────── */
+
+[data-lab-tl-send] {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  /* icon-contrast, not icon-muted: today's control puts a grey-600 mark on a
+     grey-700 surface in dark theme, which measures 1.6:1. */
+  color: var(--v2-icon-icon-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+  transition:
+    background-image var(--lab-swap) ease,
+    color var(--lab-swap) ease,
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab-tl-send]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-hover) 0%,
+      var(--v2-overlay-simple-overlay-contrast-hover) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-tl-send]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 0%,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-tl-send]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+  z-index: 1;
+}
+
+[data-lab-tl-send][aria-disabled="true"]:not([data-lab-busy="true"]) {
+  opacity: 0.4;
+}
+
+[data-lab-tl-send][data-lab-busy="true"] {
+  cursor: progress;
+}
+
+/* Revising: the revisor mark breathes. It does not spin — nothing is looping. */
+[data-lab-tl-revising] {
+  animation: lab-tl-breathe 2200ms ease-in-out infinite;
+}
+
+@keyframes lab-tl-breathe {
+  0%,
+  100% {
+    opacity: 0.58;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* A revision is staged and the next press will send it. */
+[data-lab-tl-staged] {
+  position: absolute;
+  top: 3.5px;
+  right: 3.5px;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--v2-icon-icon-accent);
+}
+
+/* ── reduced motion ───────────────────────────────────────────────────────── */
+
+/*
+ * `lab.css` flattens every duration under the lab root. The orbit needs one
+ * extra rule: a 1ms animation would freeze the 24/76 dash as a stub somewhere on
+ * the perimeter. Close the ring instead, so "a turn is live" still reads.
+ */
+@media (prefers-reduced-motion: reduce) {
+  [data-lab-tl-runner] {
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+}
+
+[data-lab="send-control"][data-lab-motion="off"] [data-lab-tl-runner] {
+  stroke-dasharray: none !important;
+  stroke-dashoffset: 0 !important;
+}

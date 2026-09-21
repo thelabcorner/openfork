@@ -1,0 +1,1039 @@
+/*
+ * Send / Stop concept lab. DEV-ONLY styling.
+ *
+ * Everything here is scoped under [data-lab="send-control"] so it cannot leak
+ * into app CSS, and every colour is an existing --v2-* token. The concepts are
+ * allowed their own geometry, but not their own colour system.
+ *
+ * Motion budget, shared by all five concepts so they stay comparable:
+ *   glyph swap / state colour .... 120ms
+ *   geometry (width, size) ....... 200ms
+ *   entrance / exit .............. 140ms / 110ms
+ *   ambient loop ................. 2200ms linear
+ *
+ * Reduced motion is honoured twice: the real media query, and the harness
+ * override (data-lab-motion="off") so the behaviour can be inspected on a
+ * machine that has no OS preference set.
+ */
+
+[data-lab="send-control"] {
+  --lab-ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --lab-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --lab-swap: 120ms;
+  --lab-geometry: 200ms;
+  --lab-enter: 140ms;
+  --lab-exit: 110ms;
+  --lab-loop: 2200ms;
+}
+
+/* ─────────────────────────── shared control surfaces ───────────────────────
+ * Mirrors packages/ui/src/v2/components/icon-button-v2.css so a concept with
+ * non-standard geometry still reads as the same family of button. Concept A
+ * uses the real IconButtonV2 instead, and is the reference for these values.
+ */
+
+[data-lab="send-control"] [data-lab-surface] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  outline: none;
+  user-select: none;
+  cursor: default;
+  flex-shrink: 0;
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease,
+    box-shadow var(--lab-swap) ease,
+    border-color var(--lab-swap) ease,
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab="send-control"] [data-lab-surface]:is(:focus-visible, [data-lab-force="focus"]):not(:disabled) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+[data-lab="send-control"] [data-lab-surface]:disabled,
+[data-lab="send-control"] [data-lab-surface][aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+/* contrast — the commit surface, used for Send */
+[data-lab="send-control"] [data-lab-surface="contrast"] {
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  /* Deliberately icon-contrast, not icon-muted. See README, "contrast note". */
+  color: var(--v2-icon-icon-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="contrast"]:is(:hover, [data-lab-force="hover"]):not(:disabled):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-hover) 0%,
+      var(--v2-overlay-simple-overlay-contrast-hover) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="contrast"]:is(:active, [data-lab-force="pressed"]):not(:disabled):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 0%,
+      var(--v2-overlay-simple-overlay-contrast-pressed) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab="send-control"] [data-lab-surface="contrast"]:disabled {
+  opacity: 0.4;
+}
+
+/* neutral — raised, quieter than contrast. Used for Stop at rest. */
+[data-lab="send-control"] [data-lab-surface="neutral"] {
+  background-color: var(--v2-background-bg-button-neutral);
+  color: var(--v2-icon-icon-base);
+  box-shadow: var(--v2-elevation-button-neutral);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="neutral"]:is(:hover, [data-lab-force="hover"]):not(:disabled):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-hover) 0%, var(--v2-overlay-simple-overlay-hover) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-button-neutral) 0%, var(--v2-background-bg-button-neutral) 100%);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="neutral"]:is(:active, [data-lab-force="pressed"]):not(:disabled):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-pressed) 0%, var(--v2-overlay-simple-overlay-pressed) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-button-neutral) 0%, var(--v2-background-bg-button-neutral) 100%);
+}
+
+[data-lab="send-control"] [data-lab-surface="neutral"]:disabled {
+  opacity: 0.5;
+}
+
+/* ghost — no surface until touched */
+[data-lab="send-control"] [data-lab-surface="ghost"] {
+  background-color: transparent;
+  color: var(--v2-icon-icon-base);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="ghost"]:is(:hover, [data-lab-force="hover"]):not(:disabled):not([aria-disabled="true"]) {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="ghost"]:is(:active, [data-lab-force="pressed"]):not(:disabled):not([aria-disabled="true"]) {
+  background-color: var(--v2-overlay-simple-overlay-pressed);
+}
+
+[data-lab="send-control"] [data-lab-surface="ghost"]:disabled {
+  opacity: 0.5;
+}
+
+/*
+ * danger — restrained at rest, committed on hover. No concept fills a control
+ * with red before the pointer is on it: an always-red composer reads as a
+ * broken session rather than an interruptible one.
+ */
+[data-lab="send-control"] [data-lab-surface="danger"] {
+  background-color: var(--v2-background-bg-layer-01);
+  color: var(--v2-state-fg-danger);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-base);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="danger"]:is(:hover, [data-lab-force="hover"]):not(:disabled):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+  box-shadow: 0 0 0 0.5px var(--v2-state-border-danger);
+}
+
+[data-lab="send-control"]
+  [data-lab-surface="danger"]:is(:active, [data-lab-force="pressed"]):not(:disabled):not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+  box-shadow:
+    0 0 0 0.5px var(--v2-state-border-danger),
+    inset 0 1px 2px 0 var(--v2-alpha-dark-8);
+}
+
+[data-lab="send-control"] [data-lab-surface="danger"][aria-disabled="true"] {
+  color: var(--v2-icon-icon-muted);
+  opacity: 0.7;
+}
+
+/*
+ * Disabled vs busy.
+ *
+ * "Nothing to send" and "cannot send" are inert and dim. A transient pre-send
+ * transform is *busy* — the control is unavailable for a moment because work is
+ * happening, not because the feature is off — so it keeps full strength and
+ * shows the accent mark instead of fading out.
+ */
+[data-lab="send-control"] [data-lab-surface="contrast"][aria-disabled="true"],
+[data-lab="send-control"] [data-lab-surface="neutral"][aria-disabled="true"] {
+  opacity: 0.4;
+}
+
+[data-lab="send-control"] [data-lab-busy="true"] {
+  opacity: 1 !important;
+  cursor: progress;
+}
+
+/* ───────────────────────────────── glyph crossfade ───────────────────────── */
+
+[data-lab="send-control"] [data-lab-glyph] {
+  display: grid;
+  place-items: center;
+  grid-template-areas: "glyph";
+}
+
+[data-lab="send-control"] [data-lab-glyph] > * {
+  grid-area: glyph;
+  transition:
+    opacity var(--lab-swap) ease,
+    transform var(--lab-swap) var(--lab-ease-out);
+}
+
+[data-lab="send-control"] [data-lab-glyph] > [data-lab-glyph-hidden="true"] {
+  opacity: 0;
+  transform: scale(0.72);
+  pointer-events: none;
+}
+
+/* ══════════════════════════ Concept A — Dual Lane ═════════════════════════ */
+
+[data-lab-concept="a"] [data-lab-a-lane] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/*
+ * The interrupt slot is always present and always 28px wide. Send therefore
+ * never moves, and the interrupt never materialises under a pointer that was
+ * already travelling toward Send.
+ */
+[data-lab-concept="a"] [data-lab-a-slot] {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  transition:
+    opacity var(--lab-enter) ease,
+    transform var(--lab-enter) var(--lab-ease-out);
+}
+
+[data-lab-concept="a"] [data-lab-a-slot][data-lab-a-present="false"] {
+  opacity: 0;
+  transform: translateX(6px) scale(0.86);
+  pointer-events: none;
+  transition-duration: var(--lab-exit);
+  transition-timing-function: var(--lab-ease-in);
+}
+
+[data-lab-concept="a"] [data-lab-a-queued] {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  font-size: 9px;
+  font-weight: 560;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-contrast);
+  background: var(--v2-background-bg-accent);
+  box-shadow: 0 0 0 1.5px var(--v2-background-bg-base);
+  animation: lab-a-queue-pop 180ms var(--lab-ease-out);
+}
+
+@keyframes lab-a-queue-pop {
+  from {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ═══════════════════════ Concept B — Turn Baton ═══════════════════════════ */
+
+[data-lab-concept="b"] [data-lab-b-core] {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+}
+
+[data-lab-concept="b"] [data-lab-b-arc] {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/*
+ * A single travelling dash on the perimeter. 1px, border-strong: it reads as a
+ * live edge rather than a spinner, and it cannot be mistaken for a progress
+ * measurement the runtime does not actually have.
+ */
+[data-lab-concept="b"] [data-lab-b-track] {
+  stroke: var(--v2-border-border-muted);
+}
+
+[data-lab-concept="b"] [data-lab-b-runner] {
+  stroke: var(--v2-border-border-strong);
+  /* rect has pathLength="100", so dash units are percent of the perimeter. */
+  stroke-dasharray: 24 76;
+  animation: lab-orbit var(--lab-loop) linear infinite;
+}
+
+@keyframes lab-orbit {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+[data-lab-concept="b"] [data-lab-b-arc][data-lab-b-settled="true"] [data-lab-b-runner] {
+  animation: none;
+  stroke-dasharray: none;
+  stroke: var(--v2-border-border-base);
+}
+
+/* The charging edge that fills while the request is in flight but unstreamed. */
+[data-lab-concept="b"] [data-lab-b-charge] {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 3px;
+  height: 1px;
+  border-radius: 1px;
+  background: var(--v2-icon-icon-accent);
+  transform-origin: left center;
+  animation: lab-charge 1400ms linear forwards;
+}
+
+@keyframes lab-charge {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+[data-lab-concept="b"] [data-lab-b-launch="true"] {
+  animation: lab-launch 260ms var(--lab-ease-out);
+}
+
+@keyframes lab-launch {
+  0% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  55% {
+    transform: translateY(-9px);
+    opacity: 0;
+  }
+  56% {
+    transform: translateY(5px);
+    opacity: 0;
+  }
+  100% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* The queue confirmation lives beside the control, never on it. */
+[data-lab-concept="b"] [data-lab-b-queue] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px 0 5px;
+  border-radius: 5px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-muted);
+  color: var(--v2-text-text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  animation: lab-b-queue-in var(--lab-enter) var(--lab-ease-out);
+}
+
+@keyframes lab-b-queue-in {
+  from {
+    opacity: 0;
+    transform: translateX(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* ════════════════════ Concept C — Turn Instrument ═════════════════════════ */
+
+/*
+ * The capsule grows leftward. justify-content: flex-end on the lane plus a
+ * right-pinned stop segment means the pixels under the pointer at the moment
+ * Send becomes Stop are the same pixels.
+ */
+[data-lab-concept="c"] [data-lab-c-capsule] {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  border-radius: 8px;
+  overflow: clip;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-base);
+  transition:
+    background-color var(--lab-swap) ease,
+    box-shadow var(--lab-swap) ease;
+}
+
+[data-lab-concept="c"] [data-lab-c-capsule][data-lab-c-bare="true"] {
+  background: transparent;
+  box-shadow: none;
+}
+
+/*
+ * Reveal animates between 0 and a *fixed* width, and the readout inside is
+ * fixed-width tabular text.
+ *
+ * Two earlier attempts are worth remembering. `grid-template-columns: 0fr ->
+ * 1fr` is tidier, but an `fr` track inside a content-sized flex item resolves to
+ * 0 in Chromium and silently collapses the readout. Measuring the content with a
+ * ResizeObserver works, but it is the wrong design: the elapsed readout changes
+ * width every time a digit rolls over ("9.9s" -> "10.0s" -> "1m 05s"), so the
+ * whole capsule breathes for the entire turn. A control that twitches once a
+ * second is worse than one that reserves eight characters.
+ */
+[data-lab-concept="c"] [data-lab-c-grow] {
+  flex: none;
+  overflow: hidden;
+  transition:
+    width var(--lab-geometry) var(--lab-ease-out),
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab-concept="c"] [data-lab-c-grow][data-lab-c-open="false"] {
+  opacity: 0;
+}
+
+[data-lab-concept="c"] [data-lab-c-measure] {
+  display: flex;
+  align-items: stretch;
+}
+
+[data-lab-concept="c"] [data-lab-c-readout] {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  /* Fixed: reserves the widest realistic readout so digits cannot resize it. */
+  width: 100px;
+  padding: 0 7px 0 9px;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-muted);
+}
+
+[data-lab-concept="c"] [data-lab-c-dim] {
+  color: var(--v2-text-text-faint);
+}
+
+[data-lab-concept="c"] [data-lab-c-divider] {
+  width: 0.5px;
+  align-self: stretch;
+  margin: 5px 0;
+  background: var(--v2-border-border-base);
+  flex: none;
+}
+
+[data-lab-concept="c"] [data-lab-c-seg] {
+  width: 28px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--v2-icon-icon-base);
+  border: 0;
+  padding: 0;
+  outline: none;
+  cursor: default;
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease;
+}
+
+[data-lab-concept="c"] [data-lab-c-seg]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]) {
+  background: var(--v2-overlay-simple-overlay-pressed);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-role="stop"] {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-role="stop"]:is(:hover, [data-lab-force="hover"]) {
+  background: var(--v2-state-bg-danger);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][aria-disabled="true"] {
+  color: var(--v2-icon-icon-muted);
+  opacity: 0.6;
+}
+
+/*
+ * Segment fills. C is deliberately the loudest Stop in the set: a pale
+ * state-bg-danger tint at rest, not just a red mark. That is the axis this
+ * concept is here to test — how much colour Stop is allowed to claim before the
+ * composer starts reading as broken.
+ */
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-fill="contrast"] {
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  color: var(--v2-icon-icon-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+}
+
+[data-lab-concept="c"]
+  [data-lab-c-seg][data-lab-c-fill="contrast"]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(
+      90deg,
+      var(--v2-overlay-simple-overlay-contrast-hover) 0%,
+      var(--v2-overlay-simple-overlay-contrast-hover) 100%
+    ),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-fill="contrast"][aria-disabled="true"] {
+  opacity: 0.4;
+  color: var(--v2-icon-icon-contrast);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-fill="danger"] {
+  background-color: var(--v2-state-bg-danger);
+  color: var(--v2-state-fg-danger);
+  box-shadow: inset 0.5px 0 0 0 var(--v2-state-border-danger);
+}
+
+[data-lab-concept="c"]
+  [data-lab-c-seg][data-lab-c-fill="danger"]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-color: color-mix(in srgb, var(--v2-state-bg-danger) 78%, var(--v2-state-fg-danger) 22%);
+}
+
+[data-lab-concept="c"] [data-lab-c-seg][data-lab-c-fill="danger"][aria-disabled="true"] {
+  background-color: var(--v2-background-bg-layer-02);
+  color: var(--v2-icon-icon-muted);
+  box-shadow: inset 0.5px 0 0 0 var(--v2-border-border-base);
+}
+
+[data-lab-concept="c"] [data-lab-c-capsule][data-lab-c-bare="true"] [data-lab-c-seg] {
+  border-radius: 8px;
+}
+
+/* The readout's own indeterminate hairline while nothing has streamed yet. */
+[data-lab-concept="c"] [data-lab-c-wait] {
+  position: relative;
+  width: 22px;
+  height: 1px;
+  border-radius: 1px;
+  overflow: clip;
+  background: var(--v2-border-border-base);
+  flex: none;
+}
+
+[data-lab-concept="c"] [data-lab-c-wait]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  border-radius: 1px;
+  background: var(--v2-icon-icon-accent);
+  animation: lab-c-wait 1100ms var(--lab-ease-out) infinite;
+}
+
+@keyframes lab-c-wait {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+/* ═════════════════════ Concept D — Keycap Parity ══════════════════════════ */
+
+[data-lab-concept="d"] [data-lab-d-cluster] {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+[data-lab-concept="d"] [data-lab-d-cap] {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  width: 30px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background-color: var(--v2-background-bg-layer-01);
+  background-image: linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 62%);
+  box-shadow: var(--v2-elevation-button-neutral);
+  color: var(--v2-icon-icon-base);
+  outline: none;
+  cursor: default;
+  transform: translateY(0);
+  transition:
+    transform 90ms var(--lab-ease-out),
+    box-shadow 90ms ease,
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease,
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab-concept="d"] [data-lab-d-cap]:is(:hover, [data-lab-force="hover"]):not([aria-disabled="true"]) {
+  background-color: var(--v2-background-bg-layer-02);
+  transform: translateY(-0.5px);
+}
+
+[data-lab-concept="d"] [data-lab-d-cap]:is(:active, [data-lab-force="pressed"]):not([aria-disabled="true"]),
+[data-lab-concept="d"] [data-lab-d-cap][data-lab-d-struck="true"] {
+  transform: translateY(1px);
+  box-shadow:
+    0 0 0 0.5px var(--v2-alpha-dark-14),
+    inset 0 1px 2px 0 var(--v2-alpha-dark-10);
+  background-image: none;
+  background-color: var(--v2-background-bg-layer-02);
+}
+
+[data-lab-concept="d"] [data-lab-d-cap]:is(:focus-visible, [data-lab-force="focus"]) {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2px;
+}
+
+[data-lab-concept="d"] [data-lab-d-cap][aria-disabled="true"] {
+  opacity: 0.45;
+}
+
+[data-lab-concept="d"] [data-lab-d-cap][data-lab-d-role="stop"] {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-lab-concept="d"] [data-lab-d-cap][data-lab-d-role="stop"]:is(:hover, [data-lab-force="hover"]) {
+  background-color: var(--v2-state-bg-danger);
+}
+
+[data-lab-concept="d"] [data-lab-d-legend] {
+  font-size: 8px;
+  font-weight: 560;
+  line-height: 1;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+[data-lab-concept="d"] [data-lab-d-cap][data-lab-d-role="stop"] [data-lab-d-legend] {
+  color: color-mix(in srgb, var(--v2-state-fg-danger) 72%, transparent);
+}
+
+/* A 1px life line along the cap base while a turn runs. */
+[data-lab-concept="d"] [data-lab-d-life] {
+  position: absolute;
+  left: 5px;
+  right: 5px;
+  bottom: 2.5px;
+  height: 1px;
+  border-radius: 1px;
+  overflow: clip;
+  background: color-mix(in srgb, var(--v2-state-fg-danger) 22%, transparent);
+}
+
+[data-lab-concept="d"] [data-lab-d-life]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 45%;
+  border-radius: 1px;
+  background: var(--v2-state-fg-danger);
+  animation: lab-d-life var(--lab-loop) var(--lab-ease-out) infinite;
+}
+
+@keyframes lab-d-life {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(222%);
+  }
+}
+
+/*
+ * The key strip. Always present, fixed width, so nothing in the footer ever
+ * reflows. Its job is to make the pointer control's meaning *predictable* —
+ * the armed key lights before the cap changes, rather than the cap silently
+ * swapping meaning underneath the pointer.
+ */
+[data-lab-concept="d"] [data-lab-d-strip] {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  width: 52px;
+  justify-content: flex-end;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-lab-concept="d"] [data-lab-d-key] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: var(--v2-background-bg-layer-02);
+  color: var(--v2-text-text-faint);
+  font-size: 9px;
+  font-weight: 530;
+  line-height: 1;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  user-select: none;
+  transition:
+    background-color var(--lab-swap) ease,
+    color var(--lab-swap) ease,
+    opacity var(--lab-swap) ease;
+}
+
+[data-lab-concept="d"] [data-lab-d-key][data-lab-d-armed="false"] {
+  opacity: 0.4;
+}
+
+[data-lab-concept="d"] [data-lab-d-key][data-lab-d-armed="true"] {
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-muted);
+}
+
+[data-lab-concept="d"] [data-lab-d-key][data-lab-d-armed="true"][data-lab-d-kind="stop"] {
+  background: var(--v2-state-bg-danger);
+  color: var(--v2-state-fg-danger);
+}
+
+[data-lab-concept="d"] [data-lab-d-key][data-lab-d-struck="true"] {
+  animation: lab-d-strike 220ms var(--lab-ease-out);
+}
+
+@keyframes lab-d-strike {
+  0% {
+    transform: translateY(0) scale(1);
+  }
+  30% {
+    transform: translateY(1.5px) scale(0.92);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ═══════════════════ Concept E — Ambient Composer Edge ════════════════════ */
+
+[data-lab-concept="e"] [data-lab-e-edge] {
+  --lab-e-stroke: var(--v2-border-border-strong);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity var(--lab-swap) ease;
+}
+
+[data-lab-concept="e"] [data-lab-e-edge][data-lab-e-quiet="true"] {
+  opacity: 0;
+}
+
+/*
+ * A 1px ring punched out of the composer's own 12px silhouette. Masking a
+ * rotating conic gradient (rather than stroking an SVG rect) is what keeps the
+ * corner radius correct at any composer width — a normalized viewBox would
+ * shear the corners on a wide composer.
+ */
+[data-lab-concept="e"] [data-lab-e-ring] {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  padding: 1px;
+  overflow: hidden;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+[data-lab-concept="e"] [data-lab-e-runner] {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 180%;
+  aspect-ratio: 1;
+  translate: -50% -50%;
+  background: conic-gradient(from 0deg, transparent 0deg 236deg, var(--lab-e-stroke) 302deg, transparent 334deg 360deg);
+  animation: lab-e-spin var(--lab-loop) linear infinite;
+}
+
+@keyframes lab-e-spin {
+  to {
+    rotate: 360deg;
+  }
+}
+
+/* Interrupted: the edge spins down and fades instead of simply disappearing. */
+[data-lab-concept="e"] [data-lab-e-edge][data-lab-e-mode="stopping"] {
+  --lab-e-stroke: var(--v2-state-border-danger);
+  animation: lab-e-spin-down 320ms var(--lab-ease-in) forwards;
+}
+
+[data-lab-concept="e"] [data-lab-e-edge][data-lab-e-mode="stopping"] [data-lab-e-runner] {
+  animation-duration: 620ms;
+}
+
+@keyframes lab-e-spin-down {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+[data-lab-concept="e"] [data-lab-e-button] {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+
+/*
+ * Send's prominence is a contrast ramp, not a filled CTA. Empty composer: a
+ * faint mark. Something to send: full-strength mark inside a hairline box. The
+ * composer's own state does the persuading.
+ */
+[data-lab-concept="e"] [data-lab-e-button][data-lab-e-ready="false"] {
+  color: var(--v2-icon-icon-muted);
+}
+
+[data-lab-concept="e"] [data-lab-e-button][data-lab-e-ready="true"] {
+  color: var(--v2-text-text-base);
+  background-color: var(--v2-background-bg-layer-01);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-base);
+}
+
+/*
+ * E says "nothing to send" with the colour ramp alone, so only genuine
+ * unavailability dims it — otherwise the two states would be indistinguishable
+ * at the bottom of the ramp.
+ */
+[data-lab-concept="e"] [data-lab-e-button][data-lab-e-halted="true"] {
+  opacity: 0.5;
+}
+
+[data-lab-concept="e"] [data-lab-e-button][data-lab-e-role="stop"] {
+  color: var(--v2-state-fg-danger);
+  background-color: transparent;
+  box-shadow: none;
+}
+
+/* The only boundary Stop gets: a crisp hairline box around the glyph. */
+[data-lab-concept="e"] [data-lab-e-frame] {
+  position: absolute;
+  inset: 5px;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--v2-state-fg-danger) 46%, transparent);
+  transition:
+    opacity var(--lab-swap) ease,
+    transform var(--lab-swap) var(--lab-ease-out);
+}
+
+[data-lab-concept="e"] [data-lab-e-frame][data-lab-e-hidden="true"] {
+  opacity: 0;
+  transform: scale(0.76);
+}
+
+/* ─────────────────────────── reduced motion ──────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  [data-lab="send-control"] *,
+  [data-lab="send-control"] *::after,
+  [data-lab="send-control"] *::before {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+
+  [data-lab="send-control"] [data-lab-b-runner] {
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+
+  /* No orbit at all: hold a static hairline so "a turn is live" survives. */
+  [data-lab="send-control"] [data-lab-e-runner] {
+    background: var(--lab-e-stroke) !important;
+    animation: none !important;
+  }
+}
+
+[data-lab="send-control"][data-lab-motion="off"] *,
+[data-lab="send-control"][data-lab-motion="off"] *::after,
+[data-lab="send-control"][data-lab-motion="off"] *::before {
+  animation-duration: 1ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 1ms !important;
+}
+
+[data-lab="send-control"][data-lab-motion="off"] [data-lab-b-runner] {
+  stroke-dasharray: none !important;
+  stroke-dashoffset: 0 !important;
+}
+
+[data-lab="send-control"][data-lab-motion="off"] [data-lab-e-runner] {
+  background: var(--lab-e-stroke) !important;
+  animation: none !important;
+}
+
+/* ───────────────────────────── harness chrome ────────────────────────────── */
+
+[data-lab="send-control"] [data-lab-chrome-button] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-base);
+  color: var(--v2-text-text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: default;
+  outline: none;
+  white-space: nowrap;
+  transition:
+    background-color 90ms ease,
+    color 90ms ease;
+}
+
+[data-lab="send-control"] [data-lab-chrome-button]:hover:not(:disabled) {
+  background: var(--v2-background-bg-layer-02);
+  color: var(--v2-text-text-base);
+}
+
+[data-lab="send-control"] [data-lab-chrome-button]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 1.5px;
+}
+
+[data-lab="send-control"] [data-lab-chrome-button][data-lab-active="true"] {
+  background: var(--v2-background-bg-contrast);
+  background-image: linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%);
+  color: var(--v2-text-text-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+}
+
+[data-lab="send-control"] [data-lab-chrome-button]:disabled {
+  opacity: 0.45;
+}
+
+[data-lab="send-control"] [data-lab-rail-item] {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: transparent;
+  color: var(--v2-text-text-muted);
+  cursor: default;
+  outline: none;
+  transition: background-color 90ms ease;
+}
+
+[data-lab="send-control"] [data-lab-rail-item]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-lab="send-control"] [data-lab-rail-item]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}
+
+[data-lab="send-control"] [data-lab-rail-item][data-lab-active="true"] {
+  background: var(--v2-background-bg-layer-02);
+  color: var(--v2-text-text-base);
+}
+
+[data-lab="send-control"] [data-lab-panel] {
+  border-radius: 10px;
+  background: var(--v2-background-bg-base);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-muted);
+}
+
+[data-lab="send-control"] [data-lab-eyebrow] {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--v2-text-text-faint);
+}
