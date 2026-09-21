@@ -219,6 +219,63 @@ describe("OFXP process-global runtime", () => {
     }),
   )
 
+  it.effect("retains sanitized ServerConnection seeds across disabled state and serves them without mDNS", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OfxpRuntime.Service
+      const remote = generated("Configured server seed", "realm:configured-server")
+      expect(yield* runtime.bootstrap()).toEqual({ enabled: false })
+
+      expect(
+        yield* runtime.replaceServerSeeds([
+          {
+            source: "known",
+            id: "configured:http://remote.example",
+            peerID: remote.key.peerID,
+            realmID: remote.identity.realmID,
+            openforkVersion: "9.9.9",
+            protocolVersion: 1,
+            pairing: true,
+            endpoint: { host: "remote.example", port: 9443, addresses: ["192.0.2.44", "not-an-ip"] },
+          },
+        ]),
+      ).toBe(1)
+      expect(yield* runtime.candidates()).toEqual([])
+
+      const started = yield* runtime.start({
+        host: "127.0.0.1",
+        discovery: false,
+        label: "Seed target",
+        identityStore: new MemoryStore(),
+      })
+      expect(started.discovery).toBe("disabled")
+      const bootstrap = yield* runtime.bootstrap()
+      expect(bootstrap.enabled).toBe(true)
+      if (!bootstrap.enabled) throw new Error("OFXP bootstrap unexpectedly disabled")
+      expect(bootstrap.peerID).toBe(started.peerID)
+      expect(bootstrap.fingerprint).toStartWith("sha256:")
+      expect(bootstrap.protocolMin).toBe(1)
+      expect(bootstrap.protocolMax).toBe(1)
+      expect(bootstrap.endpointHints).toEqual([{ port: started.port }])
+      expect(JSON.stringify(bootstrap)).not.toContain("privateKey")
+      expect(JSON.stringify(bootstrap)).not.toContain("password")
+
+      const [candidate] = yield* runtime.candidates()
+      expect(candidate?.peerID).toBe(remote.key.peerID)
+      expect(candidate?.realmID).toBe(remote.identity.realmID)
+      expect(candidate?.instances).toEqual([
+        {
+          source: "server",
+          id: "configured:http://remote.example",
+          endpoint: { host: "remote.example", port: 9443, addresses: ["192.0.2.44"] },
+        },
+      ])
+
+      expect(yield* runtime.replaceServerSeeds([])).toBe(0)
+      expect(yield* runtime.candidates()).toEqual([])
+      yield* runtime.stop()
+    }),
+  )
+
   it.effect("starts one listener, preserves identity across restart, and stops convergently", () =>
     Effect.gen(function* () {
       const runtime = yield* OfxpRuntime.Service

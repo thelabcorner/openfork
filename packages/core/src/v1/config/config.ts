@@ -16,6 +16,7 @@ import { ConfigPluginV1 } from "./plugin"
 import { ConfigProviderV1 } from "./provider"
 import { ConfigServerV1 } from "./server"
 import { ConfigSkillsV1 } from "./skills"
+import { PRODUCT_DOCS_URL } from "../../brand"
 
 export type Layout = ConfigLayoutV1.Layout
 
@@ -38,8 +39,18 @@ export const Info = Schema.Struct({
   server: Schema.optional(ConfigServerV1.Server).annotate({
     description: "Server configuration for opencode serve and web commands",
   }),
+  ofxp: Schema.optional(
+    Schema.Struct({
+      enabled: Schema.optional(Schema.Boolean).annotate({
+        description: "Enable the process-global OpenFork Exchange Protocol listener and peer discovery",
+      }),
+    }).annotate({ identifier: "OfxpConfig" }),
+  ).annotate({
+    description:
+      "Process-global OpenFork Network / OFXP runtime preferences. Workspace-scoped values are not used to grant peer authority.",
+  }),
   command: Schema.optional(Schema.Record(Schema.String, ConfigCommandV1.Info)).annotate({
-    description: "Command configuration, see https://opencode.ai/docs/commands",
+    description: `Command configuration. See OpenFork documentation at ${PRODUCT_DOCS_URL}`,
   }),
   skills: Schema.optional(ConfigSkillsV1.Info).annotate({ description: "Additional skill folder paths" }),
   references: Schema.optional(ConfigReference.Info).annotate({
@@ -63,7 +74,7 @@ export const Info = Schema.Struct({
   }),
   autoupdate: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("notify")])).annotate({
     description:
-      "Automatically update to the latest version. Set to true to auto-update, false to disable, or 'notify' to show update notifications",
+      "Check OpenFork releases for updates. true installs patch updates only for fork-managed direct installs and otherwise notifies; false disables checks; 'notify' never installs automatically",
   }),
   disabled_providers: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
     description: "Disable providers that are loaded automatically",
@@ -118,7 +129,7 @@ export const Info = Schema.Struct({
       }),
       [Schema.Record(Schema.String, ConfigAgentV1.Info)],
     ),
-  ).annotate({ description: "Agent configuration, see https://opencode.ai/docs/agents" }),
+  ).annotate({ description: `Agent configuration. See OpenFork documentation at ${PRODUCT_DOCS_URL}` }),
   provider: Schema.optional(Schema.Record(Schema.String, ConfigProviderV1.Info)).annotate({
     description: "Custom provider configurations and model overrides",
   }),

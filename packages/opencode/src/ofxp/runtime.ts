@@ -79,6 +79,18 @@ export interface Status {
   }
 }
 
+export type BootstrapProjection =
+  | { readonly enabled: false }
+  | {
+      readonly enabled: true
+      readonly peerID: Ofxp.PeerID
+      readonly fingerprint: Ofxp.PublicKeyFingerprint
+      readonly protocolMin: number
+      readonly protocolMax: number
+      readonly pairing: true
+      readonly endpointHints: readonly [{ readonly port: number }]
+    }
+
 export interface StartInput {
   readonly host?: string
   readonly port?: number
@@ -99,6 +111,7 @@ type Active = {
   readonly connections: OfxpConnectionManager.Manager
   readonly client: OfxpClient.Client
   readonly endpoint: OfxpTransport.Endpoint
+  readonly directory: OfxpDiscovery.Directory
   readonly mdns?: OfxpDiscovery.Mdns
   readonly discovery: DiscoveryState
   readonly discoveryError?: string
@@ -126,6 +139,10 @@ export interface Interface {
     expectedPeerID: Ofxp.PeerID,
   ) => Effect.Effect<Status, UnavailableError | ConflictError>
   readonly status: () => Effect.Effect<Status>
+  /** Secret-free Tier-0 projection suitable for an already-configured server to use as a discovery hint. */
+  readonly bootstrap: () => Effect.Effect<BootstrapProjection>
+  /** Replace renderer-provided ServerConnection hints. These are discovery-only and grant zero trust. */
+  readonly replaceServerSeeds: (seeds: readonly OfxpDiscovery.CandidateSeed[]) => Effect.Effect<number>
   readonly candidates: () => Effect.Effect<readonly OfxpDiscovery.Candidate[]>
   /**
    * Side-effect-free snapshot of already-authenticated outbound connections.
@@ -256,6 +273,29 @@ function targetHosts(candidate: OfxpDiscovery.Candidate) {
   return values
 }
 
+function sanitizeServerSeeds(seeds: readonly OfxpDiscovery.CandidateSeed[]) {
+  const values = new Map<string, OfxpDiscovery.CandidateSeed>()
+  for (const seed of seeds.slice(0, OfxpDiscovery.MAX_CANDIDATES)) {
+    const projection = OfxpDiscovery.projectSeed({ ...seed, source: "server" })
+    if (!projection) continue
+    values.set(projection.id, {
+      source: "server",
+      id: projection.id,
+      peerID: projection.peerID,
+      realmID: projection.realmID,
+      openforkVersion: projection.openforkVersion,
+      protocolVersion: projection.protocolVersion,
+      pairing: projection.pairing,
+      endpoint: {
+        host: projection.endpoint.host,
+        port: projection.endpoint.port,
+        addresses: projection.endpoint.addresses,
+      },
+    })
+  }
+  return [...values.values()]
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -265,6 +305,7 @@ const layer = Layer.effect(
     const capabilities = yield* OfxpCapability.Service
     const bridge = yield* EffectBridge.make()
     const state = yield* SynchronizedRef.make<State>({ _tag: "inactive" })
+    let serverSeeds: readonly OfxpDiscovery.CandidateSeed[] = []
     let onIdentityStoreChange: (() => void) | undefined
     let stopIdentityWatch: (() => void) | undefined
 
@@ -360,17 +401,22 @@ const layer = Layer.effect(
               bridge.promise(capabilities.dispatch(peer, method, body, signal)),
           })
 
+          const directory = new OfxpDiscovery.Directory(identity.id)
+          directory.replaceSeeds("server", serverSeeds)
           let mdns: OfxpDiscovery.Mdns | undefined
           let discovery: DiscoveryState = discoveryEnabled ? "active" : "disabled"
           let discoveryError: string | undefined
           if (discoveryEnabled) {
-            mdns = new OfxpDiscovery.Mdns({
-              peerID: identity.id,
-              realmID: identity.realmID,
-              openforkVersion: InstallationVersion,
-              port: endpoint.port,
-              pairing: true,
-            })
+            mdns = new OfxpDiscovery.Mdns(
+              {
+                peerID: identity.id,
+                realmID: identity.realmID,
+                openforkVersion: InstallationVersion,
+                port: endpoint.port,
+                pairing: true,
+              },
+              directory,
+            )
             try {
               mdns.start()
             } catch (error) {
@@ -380,7 +426,7 @@ const layer = Layer.effect(
           }
 
           const client = new OfxpClient.Client(identity, peers, connections, (peerID) => {
-            const candidate = mdns?.directory.list().find((item) => item.peerID === peerID)
+            const candidate = directory.list().find((item) => item.peerID === peerID)
             return candidate ? targetHosts(candidate) : []
           })
 
@@ -395,6 +441,7 @@ const layer = Layer.effect(
             connections,
             client,
             endpoint,
+            directory,
             mdns,
             discovery,
             ...(discoveryError ? { discoveryError } : {}),
@@ -807,9 +854,38 @@ const layer = Layer.effect(
       return statusOf(yield* SynchronizedRef.get(state))
     })
 
+    const bootstrap = Effect.fn("OfxpRuntime.bootstrap")(function* () {
+      const current = yield* SynchronizedRef.get(state)
+      if (current._tag !== "active") return { enabled: false } satisfies BootstrapProjection
+      return {
+        enabled: true,
+        peerID: current.identity.id,
+        fingerprint: current.identity.fingerprint,
+        protocolMin: OfxpDiscovery.PROTOCOL_VERSION,
+        protocolMax: OfxpDiscovery.PROTOCOL_VERSION,
+        pairing: true,
+        endpointHints: [{ port: current.endpoint.port }],
+      } satisfies BootstrapProjection
+    })
+
+    const replaceServerSeeds = Effect.fn("OfxpRuntime.replaceServerSeeds")(function* (
+      seeds: readonly OfxpDiscovery.CandidateSeed[],
+    ) {
+      const sanitized = sanitizeServerSeeds(seeds)
+      return yield* SynchronizedRef.modifyEffect(
+        state,
+        Effect.fnUntraced(function* (current) {
+          serverSeeds = sanitized
+          const accepted =
+            current._tag === "active" ? current.directory.replaceSeeds("server", sanitized) : sanitized.length
+          return [accepted, current] as const
+        }),
+      )
+    })
+
     const candidates = Effect.fn("OfxpRuntime.candidates")(function* () {
       const current = yield* SynchronizedRef.get(state)
-      return current._tag === "active" ? (current.mdns?.directory.list() ?? []) : []
+      return current._tag === "active" ? current.directory.list() : []
     })
 
     const connectionStatuses = Effect.fn("OfxpRuntime.connectionStatuses")(function* () {
@@ -827,7 +903,7 @@ const layer = Layer.effect(
       if (current._tag !== "active") {
         return yield* new UnavailableError({ detail: "OFXP is not running" })
       }
-      const candidate = current.mdns?.directory.list().find((item) => item.peerID === peerID)
+      const candidate = current.directory.list().find((item) => item.peerID === peerID)
       if (!candidate) {
         return yield* new OfxpClient.PeerUnavailableError({ peerID, detail: `OFXP peer is not currently discoverable: ${peerID}` })
       }
@@ -956,6 +1032,8 @@ const layer = Layer.effect(
       rotateIdentity,
       finalizeIdentityRotation,
       status,
+      bootstrap,
+      replaceServerSeeds,
       candidates,
       connectionStatuses,
       pairingPreviews,

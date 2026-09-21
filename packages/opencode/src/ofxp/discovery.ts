@@ -267,6 +267,49 @@ export class Directory {
     this.emit()
   }
 
+  clearSource(source: CandidateSource) {
+    let removed = 0
+    for (const [key, entry] of this.entries) {
+      if (entry.projection.source !== source) continue
+      this.entries.delete(key)
+      removed++
+    }
+    if (removed > 0) this.emit()
+    return removed
+  }
+
+  /**
+   * Reconcile one passive discovery provider as a bounded snapshot.
+   *
+   * ServerConnection/Known-peer providers own their own rows only; replacing
+   * one provider can never erase mDNS observations or another provider's hints.
+   * Seeds remain untrusted routing metadata and are self-filtered before publish.
+   */
+  replaceSeeds(source: Exclude<CandidateSource, "mdns">, seeds: readonly CandidateSeed[], now = Date.now()) {
+    const next = new Map<string, Entry>()
+    for (const seed of seeds.slice(0, this.maxCandidates)) {
+      if (seed.source !== source) continue
+      const projection = projectSeed(seed)
+      if (!projection || projection.peerID === this.localPeerID) continue
+      next.set(projectionKey(projection), { projection, seenAt: now })
+    }
+
+    let changed = false
+    for (const [key, entry] of this.entries) {
+      if (entry.projection.source !== source || next.has(key)) continue
+      this.entries.delete(key)
+      changed = true
+    }
+    for (const [key, entry] of next) {
+      this.entries.set(key, entry)
+      changed = true
+    }
+    for (const entry of next.values()) this.trimInstances(entry.projection.peerID)
+    this.trim()
+    if (changed) this.emit()
+    return next.size
+  }
+
   list(): readonly Candidate[] {
     const peers = new Map<Ofxp.PeerID, Entry[]>()
     for (const entry of this.entries.values()) {
@@ -341,8 +384,11 @@ export class Mdns {
   private browser?: Browser
   private published?: Service
 
-  constructor(private readonly options: MdnsOptions) {
-    this.directory = new Directory(options.peerID)
+  constructor(
+    private readonly options: MdnsOptions,
+    directory?: Directory,
+  ) {
+    this.directory = directory ?? new Directory(options.peerID)
   }
 
   start() {
@@ -404,7 +450,7 @@ export class Mdns {
       bonjour.unpublishAll()
       bonjour.destroy()
     } finally {
-      this.directory.clear()
+      this.directory.clearSource("mdns")
     }
   }
 }

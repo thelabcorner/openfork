@@ -145,6 +145,36 @@ describe("OFXP discovery candidate projection", () => {
     expect(directory.list()[0]?.instances.map((entry) => entry.source).sort()).toEqual(["known", "mdns"])
   })
 
+  test("reconciles one passive provider without erasing other discovery providers", () => {
+    const local = peerID(50)
+    const mdnsPeer = peerID(51)
+    const serverPeer = peerID(52)
+    const replacementPeer = peerID(53)
+    const directory = new OfxpDiscovery.Directory(local as never)
+    directory.up(service({ peerID: mdnsPeer, fqdn: "mdns._ofxp._tcp.local" }), 10)
+
+    expect(
+      directory.replaceSeeds(
+        "server",
+        [seed({ peerID: serverPeer, source: "server", id: "configured-a", port: 4401 })],
+        20,
+      ),
+    ).toBe(1)
+    expect(directory.list().map((item) => item.peerID).sort()).toEqual([mdnsPeer, serverPeer].sort())
+
+    expect(
+      directory.replaceSeeds(
+        "server",
+        [seed({ peerID: replacementPeer, source: "server", id: "configured-b", port: 4402 })],
+        30,
+      ),
+    ).toBe(1)
+    expect(directory.list().map((item) => item.peerID).sort()).toEqual([mdnsPeer, replacementPeer].sort())
+
+    expect(directory.clearSource("server")).toBe(1)
+    expect(directory.list().map((item) => item.peerID)).toEqual([mdnsPeer])
+  })
+
   test("self-filters passive seeds through the same directory boundary", () => {
     const local = peerID(9)
     const directory = new OfxpDiscovery.Directory(local as never)
