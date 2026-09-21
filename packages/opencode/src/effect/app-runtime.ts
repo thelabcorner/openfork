@@ -4,6 +4,7 @@ import * as Observability from "@opencode-ai/core/observability"
 
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Database } from "@opencode-ai/core/database/database"
+import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
 import { Account } from "@/account/account"
@@ -23,6 +24,7 @@ import { Question } from "@/question"
 import { Permission } from "@/permission"
 import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
+import { SessionGroup } from "@/session/group"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
 import { SessionProcessor } from "@/session/processor"
@@ -57,25 +59,71 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
+import { filesystem, requestExecutor } from "@opencode-ai/core/effect/app-node-platform"
 import { Goal } from "@opencode-ai/core/goal"
+import { Memory } from "@opencode-ai/core/memory"
 import { GoalContext } from "@opencode-ai/core/goal/context"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
+import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
+import { ScheduledTaskAgent } from "@opencode-ai/core/scheduled-task/agent"
+import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
+import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
+import { ScheduledTaskExecutor } from "@/scheduled-task/executor"
+import { ScheduledTaskRunner } from "@/scheduled-task/runner"
+import { SwarmMemberSession } from "@/swarm/member-session"
+import { SwarmMemberSessionRunner } from "@/swarm/member-session-runner"
+import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { SwarmSessionAdmission } from "@/swarm/session-admission"
+import { SwarmRuntimeRetention } from "@/swarm/runtime-retention"
+import { SwarmTaskExecutor } from "@/swarm/task-executor"
+import { SwarmMailExecutor } from "@/swarm/mail-executor"
+import { SwarmDispatcher } from "@/swarm/dispatcher"
+import { SwarmTaskRetirement } from "@/swarm/task-retirement"
+import { SwarmRecovery } from "@/swarm/recovery"
+import { SwarmDeadlineOwner } from "@/swarm/deadline-owner"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SystemOne } from "@/system-one/system-one"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
     filesystem,
+    requestExecutor,
     CrossSpawnSpawner.node,
     Npm.node,
     FSUtil.node,
     Database.node,
+    // OFXP trust is a global runtime dependency, not merely a transitive tool
+    // implementation detail. Keep it explicit at the AppRuntime boundary so
+    // SessionPrompt/ToolRegistry initialization can never observe a partially
+    // composed graph and fail with "Service not found: @opencode/core/OfxpPeer".
+    OfxpPeer.node,
+    Memory.node,
     Goal.node,
     GoalContext.node,
     GoalAutomation.node,
     GoalAgent.node,
+    ScheduledTask.node,
+    ScheduledTaskSessionBinding.node,
+    ScheduledTaskAgent.node,
+    ScheduledTaskLease.node,
+    ScheduledTaskExecutor.node,
+    ScheduledTaskRunner.node,
+    SwarmV2.node,
+    SwarmMemberSessionWake.node,
+    SwarmMemberSession.node,
+    SwarmMemberSessionRunner.node,
+    SwarmSessionAdmission.node,
+    SwarmRuntimeRetention.node,
+    SwarmTaskExecutor.node,
+    SwarmMailExecutor.node,
+    SwarmDispatcher.node,
+    SwarmTaskRetirement.node,
+    SwarmRecovery.node,
+    SwarmDeadlineOwner.node,
     Auth.node,
     ForkCredentials.node,
     Account.node,
@@ -86,6 +134,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     Plugin.node,
     ModelsDev.node,
     Provider.node,
+    SystemOne.node,
     ProviderAuth.node,
     Agent.node,
     Skill.node,
@@ -94,7 +143,16 @@ export const AppLayer = AppNodeBuilderV1.build(
     Permission.node,
     Todo.node,
     Session.node,
+    // OXP delegated batches consume SessionGroup directly. A LayerNode dependency
+    // of Session.node is provisioned transitively but is not exported from the
+    // compiled AppRuntime, so keep SessionGroup explicit at this boundary.
+    SessionGroup.node,
     SessionProjector.node,
+    // Session execution ownership is consumed by the V1 prompt/delegation
+    // runtime through Effect services rather than a standalone app node.
+    // Keep it explicit at the AppRuntime boundary so lazy OXP worker/session
+    // entry can never observe a partially composed instance graph.
+    SessionExecutionOwner.node,
     SessionStatus.node,
     BackgroundJob.node,
     RuntimeFlags.node,
