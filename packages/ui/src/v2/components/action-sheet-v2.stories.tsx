@@ -47,7 +47,7 @@ export const Basic = {
           Open action sheet
         </ButtonV2>
         <span style={{ "margin-left": "12px" }}>{picked()}</span>
-        <ActionSheet open={open()} onOpenChange={setOpen} title="Session" description="github.com/anomalyco/opencode">
+        <ActionSheet open={open()} onOpenChange={setOpen} title="Session" description="github.com/thelabcorner/openfork">
           <ActionSheetItem onSelect={() => setPicked("Renamed")}>Rename</ActionSheetItem>
           <ActionSheetItem onSelect={() => setPicked("Duplicated")}>Duplicate</ActionSheetItem>
           <ActionSheetItem onSelect={() => setPicked("Archived")}>Archive</ActionSheetItem>

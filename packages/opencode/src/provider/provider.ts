@@ -2555,7 +2555,7 @@ const layer = Layer.effect(
           s.providers[configured.providerID]?.models[configured.modelID]
         // Preserve explicit configuration when the current provider snapshot
         // cannot resolve it yet. Only self-heal away from a configured model
-        // when we can positively prove it is a non-language primitive.
+        // when we can positively prove it is not conversationally eligible.
         if (!model || isLanguageModel(model)) {
           return configured
         }
