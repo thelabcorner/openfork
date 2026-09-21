@@ -42,9 +42,11 @@ API, plugin, extension, CLI, config, or behavioral compatibility.
 - Preserve **OpenCode Zen**, **OpenCode Go**, and **OpenCode Console** when those
   names identify upstream-operated services that OpenFork consumes.
 - Preserve compatibility identifiers such as the `opencode` executable,
-  `opencode.json`, `.opencode/`, `OPENCODE_*`, `@opencode-ai/*`, provider
-  IDs, database/protocol keys, and `opencode://` unless an explicit migration
-  changes that contract. A compatibility identifier is not product branding.
+  `OPENCODE_*`, `@opencode-ai/*`, provider IDs, protocol keys, and `opencode://`
+  unless an explicit migration changes that contract. A compatibility identifier
+  is not product branding. Fork-owned persistence/configuration has been explicitly
+  migrated: new roots/files use `openfork` / `.openfork` / `openfork.json(c)`;
+  `opencode`-named storage/config paths are migration inputs only.
 - Upstream-sync work must not reintroduce generic OpenCode product branding onto
   OpenFork-owned surfaces.
 - **Distribution is fork-owned.** OpenFork update/install/release code must never
@@ -55,8 +57,10 @@ API, plugin, extension, CLI, config, or behavioral compatibility.
   **externally managed**: they may receive update-available notifications, but
   OpenFork must not invoke an upstream package manager to replace itself.
 - The CLI may self-replace only when ownership and replacement semantics are
-  explicit. Today that is the POSIX `~/.opencode/bin/opencode` direct-install
-  path; Windows and other installations fail closed to the OpenFork releases page.
+  explicit. Today the canonical POSIX path is `~/.openfork/bin/opencode`; the
+  legacy `~/.opencode/bin/opencode` path remains recognized only so existing
+  direct installs can transition safely. Windows and other installations fail
+  closed to the OpenFork releases page.
 - Retaining `@opencode-ai/*`, `opencode-ai`, or `opencode` as compatibility
   names does **not** grant OpenFork ownership of the corresponding public package
   namespace or distribution feed. Publishing there requires a separate explicit

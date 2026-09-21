@@ -50,9 +50,11 @@ package/repository metadata, and third-party attribution headers. Product links
 belong under `https://github.com/thelabcorner/openfork`.
 
 Names that are contracts rather than presentation remain unchanged until a deliberate
-migration exists: the `opencode` executable, `opencode.json`, `.opencode/`,
-`OPENCODE_*`, `@opencode-ai/*`, provider IDs, persisted/protocol identifiers,
-and `opencode://`. Likewise, upstream service brands such as **OpenCode Zen**,
+migration exists: the `opencode` executable, `OPENCODE_*`, `@opencode-ai/*`,
+provider IDs, protocol identifiers, and `opencode://`. Fork-owned storage and
+configuration are deliberately migrated: canonical roots/files are `openfork`,
+`.openfork/`, and `openfork.json(c)`; OpenCode-named local paths are migration
+inputs only. Likewise, upstream service brands such as **OpenCode Zen**,
 **OpenCode Go**, and **OpenCode Console** remain upstream names. This distinction
 prevents both accidental upstream branding and accidental compatibility breakage.
 
@@ -65,7 +67,8 @@ through upstream OpenCode npm, Homebrew, Scoop, Chocolatey, GitHub-release, cont
 or install-script channels.
 
 The current CLI self-updater owns only direct POSIX installations at
-`~/.opencode/bin/opencode`. It stages and verifies the downloaded OpenFork binary
+`~/.openfork/bin/opencode`. The legacy `~/.opencode/bin/opencode` path remains
+recognized as a migration source. It stages and verifies the downloaded OpenFork binary
 before atomically replacing the compatibility executable. Package-manager installs,
 Windows CLI installs, and any path whose ownership is not explicit are treated as
 externally managed: OpenFork may report that an update exists, but it does not replace

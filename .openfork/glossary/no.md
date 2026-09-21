@@ -7,8 +7,8 @@
 
 ## Do Not Translate (Locale Additions)
 
-- `OpenCode` (preserve casing in prose; keep `opencode` only in commands, package names, paths, or code)
-- `OpenCode CLI`
+- `OpenFork` (preserve casing in prose; keep `opencode` only in commands, package names, paths, or code)
+- `OpenFork CLI`
 - `CLI`, `TUI`, `MCP`, `OAuth`
 - Sound names (PR #10018 notes these were intentionally left untranslated)
 

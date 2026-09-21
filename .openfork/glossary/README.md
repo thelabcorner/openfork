@@ -1,6 +1,6 @@
 # Locale Glossaries
 
-Use this folder for locale-specific translation guidance that supplements `.opencode/agent/translator.md`.
+Use this folder for locale-specific translation guidance that supplements `.openfork/agent/translator.md`.
 
 The global glossary in `translator.md` remains the source of truth for shared do-not-translate terms (commands, code, paths, product names, etc.). These locale files capture community learnings about phrasing and terminology preferences.
 
@@ -37,7 +37,7 @@ Prefer guidance that is:
 
 ## Do Not Translate (Locale Additions)
 
-- `OpenCode` (preserve casing)
+- `OpenFork` (preserve casing)
 
 ## Preferred Terms
 

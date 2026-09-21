@@ -69,5 +69,5 @@ const processes = process.platform === "win32" ? windowsProcesses() : unixProces
 for (const candidate of processes) {
   if (!candidate.pid || candidate.pid === process.pid || !processIsDevBackend(candidate.commandLine)) continue
   stop(candidate.pid)
-  console.log(`Stopped stale OpenCode dev backend on port ${port} (PID ${candidate.pid}).`)
+  console.log(`Stopped stale OpenFork dev backend on port ${port} (PID ${candidate.pid}).`)
 }

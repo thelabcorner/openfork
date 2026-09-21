@@ -6,10 +6,9 @@ run-name: "dev pre-release ${{ github.run_number }}"
 # GitHub-hosted runners ONLY. This workflow deliberately does not use the
 # `[self-hosted, homelab]` runner that `.github/workflows/ci.yml` targets.
 #
-# This is the dev-channel counterpart to the upstream `publish.yml` that
-# `script/release` dispatches (`gh workflow run publish.yml`) and that
-# `script/publish.ts` drives for npm / desktop releases. That file is not
-# present in this fork, so this workflow is the entry point:
+# This fork deliberately has no upstream-style `publish.yml`. `script/release`
+# fails closed rather than dispatching a missing/upstream publication pipeline.
+# This workflow is the OpenFork-owned dev distribution entry point:
 #
 #   notes         - resolve a dev version/tag and create a DRAFT pre-release,
 #                   with release notes enumerating every commit, package, and
@@ -28,9 +27,10 @@ run-name: "dev pre-release ${{ github.run_number }}"
 #                   credentials and without `packages/desktop/native/`.
 #   release       - flip the draft to a published pre-release.
 #
-# `script/publish.ts` itself is intentionally not run (it publishes npm/AUR/
-# desktop artifacts and needs secrets a dev pre-release must not require); its
-# CLI packaging is what build-cli mirrors.
+# `script/publish.ts` itself is intentionally not run. Upstream npm namespaces
+# are not OpenFork distribution channels, and AUR/Homebrew publication requires
+# explicit fork-owned destinations. build-cli uses only the GitHub-release
+# packaging portion.
 
 on:
   push:
@@ -244,6 +244,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: npx electron-builder ${{ matrix.flag }} --publish never --config electron-builder.config.ts
 
+      - name: Verify packaged OXP tunnel runtime
+        working-directory: packages/desktop
+        run: bun ./scripts/verify-oxp-package.ts
+
       - name: Upload installers to draft pre-release
         if: always()
         shell: bash
@@ -273,7 +277,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opencode-desktop-${{ matrix.label }}
+          name: openfork-desktop-${{ matrix.label }}
           path: |
             packages/desktop/dist/*.dmg
             packages/desktop/dist/*.zip

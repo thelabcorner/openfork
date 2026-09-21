@@ -1,7 +1,5 @@
 node_modules
-plans
 package.json
+package-lock.json
 bun.lock
 .gitignore
-package-lock.json
-references/

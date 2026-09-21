@@ -1,13 +1,13 @@
-# ko Glossary
+# da Glossary
 
 ## Sources
 
-- PR #9817: https://github.com/anomalyco/opencode/pull/9817
+- PR #9821: https://github.com/anomalyco/opencode/pull/9821
 
 ## Do Not Translate (Locale Additions)
 
-- `OpenCode` (preserve casing in prose; keep `opencode` only in commands, package names, paths, or code)
-- `OpenCode CLI`
+- `OpenFork` (preserve casing in prose; keep `opencode` only in commands, package names, paths, or code)
+- `OpenFork CLI`
 - `CLI`, `TUI`, `MCP`, `OAuth`
 - Commands, flags, file paths, and code literals (keep exactly as written)
 
@@ -17,11 +17,11 @@ No PR-backed term mappings yet. Add entries here when review PRs introduce repea
 
 ## Guidance
 
-- Prefer natural Korean phrasing over literal translation
+- Prefer natural Danish phrasing over literal translation
 - Keep tone clear and direct in UI labels and docs prose
 - Preserve technical artifacts exactly: commands, flags, code, URLs, model IDs, and file paths
 
 ## Avoid
 
 - Avoid translating product and protocol names that are fixed identifiers
-- Avoid mixing multiple Korean terms for the same recurring UI action once a preferred term is established
+- Avoid mixing multiple Danish terms for the same recurring UI action once a preferred term is established

@@ -2,7 +2,7 @@
 
 <img src="docs/assets/openfork-wordmark-hero.svg" alt="OpenFork" width="640" />
 
-**A desktop-first, performance-focused fork of OpenCode.**
+**An independent desktop-first product forked from OpenCode.**
 
 OpenFork keeps the OpenCode foundation, then pushes harder on desktop UX, concurrent-session performance, browser integration, model and quota workflows, mobile access, and agent quality-of-life features.
 
@@ -19,7 +19,7 @@ OpenFork keeps the OpenCode foundation, then pushes harder on desktop UX, concur
 </div>
 
 > [!IMPORTANT]
-> OpenFork is an independently maintained branch-fork of [OpenCode](https://github.com/anomalyco/opencode). It is not an official OpenCode distribution. OpenFork preserves upstream licensing and attribution while maintaining a substantial fork-owned desktop and server architecture.
+> OpenFork is an independently maintained branch-fork of [OpenCode](https://github.com/anomalyco/opencode). It is **not an OpenCode-compatible distribution or wrapper**. OpenFork owns and changes its local client/server APIs, runtime, plugins, UI, tools, and features. OpenCode plugins or local API clients may not work with OpenFork unless that exact integration is explicitly supported.
 
 ## Why OpenFork
 
@@ -29,7 +29,7 @@ The project has three priorities:
 
 1. **Keep the app responsive under real multi-session work.** Shared resources are bounded, expensive work is scoped, and token-rate updates avoid full-history recomputation.
 2. **Make the desktop app feel like a complete development environment.** Tabs, session groups, project navigation, a built-in browser, richer context controls, quota visibility, and dense model workflows live in one interface.
-3. **Keep upstream compatibility explicit.** OpenFork tracks OpenCode release tags through a machine-checked sync process instead of drifting through ad hoc merges.
+3. **Keep the real external compatibility boundary explicit.** OpenFork tracks OpenCode release tags as a source donor, while preserving strict compatibility with upstream-operated remote OpenCode services that the fork actually consumes.
 
 ### What OpenFork changes
 
@@ -47,6 +47,17 @@ Relative to the OpenCode release baseline that it tracks, OpenFork owns or subst
 | **Fork maintenance** | Curated KEEP/DROP ownership, release-tag sync, generated-code regeneration rules, semantic verification, and automatic pruning of upstream surfaces that are outside the OpenFork product scope. |
 
 For the canonical ownership map, see [`FORK.md`](FORK.md).
+
+### Compatibility boundary
+
+OpenFork is its own product surface. It does **not** promise compatibility with
+OpenCode's local server API, current/V2 client API, plugin ecosystem, extensions,
+CLI/TUI behavior, configuration assumptions, or UI integrations.
+
+The compatibility-critical boundary is the OpenCode-operated **remote backend/provider
+services that OpenFork chooses to call**. Because OpenFork cannot modify those
+servers, its adapters must preserve the wire and behavioral contracts they require.
+See [`docs/architecture/compatibility-boundary.md`](docs/architecture/compatibility-boundary.md).
 
 ### Concrete fork delta
 
@@ -107,11 +118,19 @@ For a repository-wide orientation map covering V1 vs V2/current, GUI/TUI/server
 surfaces, package ownership, execution flow, and the upstream-vs-fork boundary, start
 with [`docs/map/README.md`](docs/map/README.md).
 
-OpenFork keeps the OpenCode local-server model and builds a richer desktop runtime around it.
+OpenFork retains a local-sidecar architecture descended from OpenCode, but the
+sidecar and its APIs are now OpenFork-owned surfaces rather than an OpenCode
+compatibility layer.
+
+The product intentionally mixes generations by responsibility: **V2/new-layout is
+the forward desktop UI**, while the mature V1 execution/local-API path is repaired
+and extended underneath it. Current/V2 runtime work is mined for semantics and
+features to backport where useful; using the V2 UI does not imply migrating the
+runtime or local client API to upstream's current architecture.
 
 ```mermaid
 flowchart LR
-  R["Desktop renderer<br/>SolidJS"] <-->|"Authenticated HTTP + replayable SSE"| S["Local sidecar<br/>OpenCode server"]
+  R["Desktop renderer<br/>SolidJS"] <-->|"Authenticated HTTP + replayable SSE"| S["OpenFork local sidecar"]
   R <-->|"Typed IPC"| M["Electron main"]
   M --> B["Built-in browser<br/>webview + CDP"]
   P["Mobile PWA"] <-->|"V2 HTTP + SSE"| S
@@ -174,7 +193,7 @@ OpenFork treats provider limits and model selection as first-class operational d
 
 ### Agent workflow and tools
 
-OpenFork adds higher-level agent control around the core OpenCode loop.
+OpenFork adds higher-level agent control around its forked agent/runtime loop.
 
 - **Goal Mode** with durable goal state, worker focus inheritance, crash-safe continuation reservations, and an independent semantic auditor gate.
 - **Prompt Revisor** using the shared special-agent completion protocol.
@@ -222,7 +241,7 @@ This starts the Electron desktop app against the current source with renderer ho
 ### Other development surfaces
 
 ```bash
-# OpenCode CLI / local server source
+# OpenFork CLI / local server source (legacy package/command names may remain)
 bun run dev
 
 # Shared web app
@@ -364,6 +383,6 @@ OpenFork's first-party browser visual-observation workflow is built on [SnapEye]
 
 <div align="center">
 
-**OpenFork** · desktop-first OpenCode, tuned for heavier workflows
+**OpenFork** · independent desktop-first agent environment descended from OpenCode
 
 </div>
