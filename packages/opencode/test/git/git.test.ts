@@ -18,6 +18,36 @@ const scopedTmpdir = (options?: Parameters<typeof tmpdir>[0]) =>
   )
 
 describe("Git", () => {
+  it.live("pins Git EOL policy against hostile inherited config and preserves explicit -c override", () =>
+    Effect.gen(function* () {
+      const tmp = yield* scopedTmpdir({ git: true })
+      const git = yield* Git.Service
+      const names = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] as const
+      const prior = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+      process.env.GIT_CONFIG_COUNT = "1"
+      process.env.GIT_CONFIG_KEY_0 = "core.autocrlf"
+      process.env.GIT_CONFIG_VALUE_0 = "true"
+      try {
+        const pinned = yield* git.run(["config", "--get", "core.autocrlf"], { cwd: tmp.path })
+        expect(pinned.exitCode).toBe(0)
+        expect(pinned.text().trim()).toBe("false")
+
+        const explicit = yield* git.run(
+          ["-c", "core.autocrlf=true", "config", "--get", "core.autocrlf"],
+          { cwd: tmp.path },
+        )
+        expect(explicit.exitCode).toBe(0)
+        expect(explicit.text().trim()).toBe("true")
+      } finally {
+        for (const name of names) {
+          const value = prior[name]
+          if (value === undefined) delete process.env[name]
+          else process.env[name] = value
+        }
+      }
+    }),
+  )
+
   it.live("branch() returns current branch name", () =>
     Effect.gen(function* () {
       const tmp = yield* scopedTmpdir({ git: true })

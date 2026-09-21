@@ -15,6 +15,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { formatPatch, structuredPatch } from "diff"
 import path from "path"
 import { AppProcess } from "@opencode-ai/core/process"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Hash } from "@opencode-ai/core/util/hash"
@@ -27,6 +28,7 @@ import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { ProjectInventory } from "@opencode-ai/core/project-inventory"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import * as Utf8 from "@/util/utf8"
 
 export const Patch = Schema.Struct({
   hash: Schema.String,
@@ -37,10 +39,21 @@ export type Patch = typeof Patch.Type
 export const FileDiff = Info
 export type FileDiff = typeof FileDiff.Type
 
+export interface BoundedDiff {
+  /** Complete metadata projection for the tree pair; patch bodies are empty. */
+  readonly summary: readonly FileDiff[]
+  /** Prefix of patches materialized within maxPatchBytes. */
+  readonly diffs: readonly FileDiff[]
+  /** True when patch materialization stopped before the complete textual diff. */
+  readonly truncated: boolean
+  /** True when the final returned patch body itself was byte-truncated. */
+  readonly patchTruncated: boolean
+}
+
 const prune = "7.days"
 const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
-const cfg = ["-c", "core.autocrlf=false", ...core]
+const cfg = [...GitRuntime.args([]), ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
@@ -87,6 +100,18 @@ export interface Interface {
   readonly restore: (snapshot: string) => Effect.Effect<void>
   readonly revert: (patches: Patch[]) => Effect.Effect<void>
   readonly diff: (hash: string) => Effect.Effect<string>
+  /**
+   * Structured tree diff without blob loading or unified-patch synthesis.
+   * Use this for metadata/preview paths that only need file/status/stat data.
+   */
+  readonly diffSummary: (from: string, to: string) => Effect.Effect<FileDiff[]>
+  /**
+   * Materialize only a bounded prefix of patch text while still returning the
+   * complete cheap metadata projection. The byte budget applies to raw UTF-8
+   * patch bodies; presentation layers remain responsible for their own markup
+   * overhead/escaping budget.
+   */
+  readonly diffFullBounded: (from: string, to: string, maxPatchBytes: number) => Effect.Effect<BoundedDiff>
   readonly diffFull: (from: string, to: string) => Effect.Effect<FileDiff[]>
 }
 
@@ -857,24 +882,104 @@ const layer: Layer.Layer<
           )
         })
 
-        const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+        type DiffRow = {
+          file: string
+          status: "added" | "deleted" | "modified"
+          binary: boolean
+          additions: number
+          deletions: number
+        }
+
+        /**
+         * Tree metadata projection shared by diffSummary/diffFull.
+         *
+         * This intentionally stops before reading blob bodies. Most checkpoint
+         * lifecycle/restore-preview work needs only names + status + numstat;
+         * paying cat-file + JS patch synthesis there made every turn behave like
+         * the user had explicitly requested a full textual diff.
+         */
+        const diffRows = Effect.fnUntraced(function* (from: string, to: string) {
+          const status = new Map<string, "added" | "deleted" | "modified">()
+          const statuses = yield* git(
+            [
+              ...quote,
+              ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", "-z", from, to, "--", "."]),
+            ],
+            { cwd: state.directory },
+          )
+          const statusItems = statuses.text.split("\0")
+          for (let i = 0; i + 1 < statusItems.length; i += 2) {
+            const code = statusItems[i]
+            const file = statusItems[i + 1]
+            if (!code || !file) continue
+            status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
+          }
+
+          const numstat = yield* git(
+            [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", "-z", from, to, "--", "."])],
+            { cwd: state.directory },
+          )
+          const rows = numstat.text
+            .split("\0")
+            .filter(Boolean)
+            .flatMap((item) => {
+              const first = item.indexOf("\t")
+              const second = item.indexOf("\t", first + 1)
+              if (first === -1 || second === -1) return []
+              const adds = item.slice(0, first)
+              const dels = item.slice(first + 1, second)
+              const file = item.slice(second + 1)
+              if (!file) return []
+              const binary = adds === "-" && dels === "-"
+              const additions = binary ? 0 : Number.parseInt(adds, 10)
+              const deletions = binary ? 0 : Number.parseInt(dels, 10)
+              return [
+                {
+                  file,
+                  status: status.get(file) ?? "modified",
+                  binary,
+                  additions: Number.isFinite(additions) ? additions : 0,
+                  deletions: Number.isFinite(deletions) ? deletions : 0,
+                } satisfies DiffRow,
+              ]
+            })
+
+          // Hide ignored-file removals from user-facing checkpoint metadata in
+          // exactly the same way as the full patch path.
+          const ignored = yield* ignore(rows.map((row) => row.file))
+          if (ignored.size === 0) return rows
+          return rows.filter((row) => !ignored.has(row.file))
+        })
+
+        const diffSummary = Effect.fnUntraced(function* (from: string, to: string) {
           return yield* locked(
             Effect.gen(function* () {
-              type Row = {
-                file: string
-                status: "added" | "deleted" | "modified"
-                binary: boolean
-                additions: number
-                deletions: number
-              }
+              const rows = yield* diffRows(from, to)
+              return rows.map(
+                (row): FileDiff => ({
+                  file: row.file,
+                  patch: "",
+                  additions: row.additions,
+                  deletions: row.deletions,
+                  status: row.status,
+                }),
+              )
+            }),
+          )
+        })
 
+        const materializeDiff = Effect.fnUntraced(function* (
+          from: string,
+          to: string,
+          maxPatchBytes?: number,
+        ) {
               type Ref = {
                 file: string
                 side: "before" | "after"
                 ref: string
               }
 
-              const show = Effect.fnUntraced(function* (row: Row) {
+              const show = Effect.fnUntraced(function* (row: DiffRow) {
                 if (row.binary) return ["", ""]
                 if (row.status === "added") {
                   return [
@@ -900,7 +1005,7 @@ const layer: Layer.Layer<
               })
 
               const load = Effect.fnUntraced(
-                function* (rows: Row[]) {
+                function* (rows: DiffRow[]) {
                   const refs = rows.flatMap((row) => {
                     if (row.binary) return []
                     if (row.status === "added")
@@ -995,81 +1100,75 @@ const layer: Layer.Layer<
                 ),
               )
 
+              const rows = yield* diffRows(from, to)
+              const summary = rows.map(
+                (row): FileDiff => ({
+                  file: row.file,
+                  patch: "",
+                  additions: row.additions,
+                  deletions: row.deletions,
+                  status: row.status,
+                }),
+              )
               const result: FileDiff[] = []
-              const status = new Map<string, "added" | "deleted" | "modified">()
-
-              const statuses = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", "."])],
-                { cwd: state.directory },
-              )
-
-              for (const line of statuses.text.trim().split("\n")) {
-                if (!line) continue
-                const [code, file] = line.split("\t")
-                if (!code || !file) continue
-                status.set(file, code.startsWith("A") ? "added" : code.startsWith("D") ? "deleted" : "modified")
-              }
-
-              const numstat = yield* git(
-                [...quote, ...args(["diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", "."])],
-                {
-                  cwd: state.directory,
-                },
-              )
-
-              const rows = numstat.text
-                .trim()
-                .split("\n")
-                .filter(Boolean)
-                .flatMap((line) => {
-                  const [adds, dels, file] = line.split("\t")
-                  if (!file) return []
-                  const binary = adds === "-" && dels === "-"
-                  const additions = binary ? 0 : parseInt(adds)
-                  const deletions = binary ? 0 : parseInt(dels)
-                  return [
-                    {
-                      file,
-                      status: status.get(file) ?? "modified",
-                      binary,
-                      additions: Number.isFinite(additions) ? additions : 0,
-                      deletions: Number.isFinite(deletions) ? deletions : 0,
-                    } satisfies Row,
-                  ]
-                })
-
-              // Hide ignored-file removals from the user-facing diff output.
-              const ignored = yield* ignore(rows.map((r) => r.file))
-              if (ignored.size > 0) {
-                const filtered = rows.filter((r) => !ignored.has(r.file))
-                rows.length = 0
-                rows.push(...filtered)
-              }
-
-              const step = 100
+              const bounded = maxPatchBytes !== undefined
+              const budget = bounded ? Math.max(0, Math.floor(maxPatchBytes)) : Number.POSITIVE_INFINITY
+              let used = 0
+              let truncated = false
+              let patchTruncated = false
+              // Full diffs amortize blob retrieval in large batches. A
+              // producer-bounded diff instead loads one file at a time: a
+              // small caller budget must not speculatively read seven large
+              // blobs that can never contribute to the returned patch prefix.
+              const step = bounded ? 1 : 100
               const patch = (file: string, before: string, after: string) =>
                 formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
 
-              for (let i = 0; i < rows.length; i += step) {
+              outer: for (let i = 0; i < rows.length; i += step) {
+                if (bounded && used >= budget) {
+                  truncated = i < rows.length
+                  break
+                }
                 const run = rows.slice(i, i + step)
                 const text = yield* load(run)
 
-                for (const row of run) {
+                for (let j = 0; j < run.length; j++) {
+                  const row = run[j]!
                   const hit = text?.get(row.file) ?? { before: "", after: "" }
                   const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
+                  const rawPatch = row.binary ? "" : patch(row.file, before, after)
+                  const limited = bounded ? Utf8.truncate(rawPatch, budget - used) : undefined
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: limited?.text ?? rawPatch,
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,
                   })
+                  if (!limited) continue
+                  used += limited.bytes
+                  if (limited.truncated) {
+                    truncated = true
+                    patchTruncated = true
+                    break outer
+                  }
+                  if (used >= budget && i + j + 1 < rows.length) {
+                    truncated = true
+                    break outer
+                  }
                 }
               }
 
-              return result
-            }),
-          )
+              return { summary, diffs: result, truncated, patchTruncated }
+        })
+
+        const diffFullBounded = Effect.fnUntraced(function* (from: string, to: string, maxPatchBytes: number) {
+          return yield* locked(materializeDiff(from, to, maxPatchBytes))
+        })
+
+        const diffFull = Effect.fnUntraced(function* (from: string, to: string) {
+          const result = yield* locked(materializeDiff(from, to))
+          return [...result.diffs]
         })
 
         yield* cleanup().pipe(
@@ -1079,7 +1178,20 @@ const layer: Layer.Layer<
           Effect.forkScoped,
         )
 
-        return { cleanup, track, invalidate, withMutation, diagnostics, patch, restore, revert, diff, diffFull }
+        return {
+          cleanup,
+          track,
+          invalidate,
+          withMutation,
+          diagnostics,
+          patch,
+          restore,
+          revert,
+          diff,
+          diffSummary,
+          diffFullBounded,
+          diffFull,
+        }
       }),
     )
 
@@ -1112,6 +1224,16 @@ const layer: Layer.Layer<
       }),
       diff: Effect.fn("Snapshot.diff")(function* (hash: string) {
         return yield* InstanceState.useEffect(state, (s) => s.diff(hash))
+      }),
+      diffSummary: Effect.fn("Snapshot.diffSummary")(function* (from: string, to: string) {
+        return yield* InstanceState.useEffect(state, (s) => s.diffSummary(from, to))
+      }),
+      diffFullBounded: Effect.fn("Snapshot.diffFullBounded")(function* (
+        from: string,
+        to: string,
+        maxPatchBytes: number,
+      ) {
+        return yield* InstanceState.useEffect(state, (s) => s.diffFullBounded(from, to, maxPatchBytes))
       }),
       diffFull: Effect.fn("Snapshot.diffFull")(function* (from: string, to: string) {
         return yield* InstanceState.useEffect(state, (s) => s.diffFull(from, to))

@@ -1140,6 +1140,60 @@ it.instance(
 )
 
 it.instance(
+  "diffFullBounded returns complete metadata while bounding UTF-8 patch materialization",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const files = Array.from({ length: 24 }, (_, i) => `bounded/${String(i).padStart(2, "0")}.txt`)
+    yield* mkdirp(`${tmp.path}/bounded`)
+    yield* Effect.all(
+      files.map((file, i) =>
+        write(
+          `${tmp.path}/${file}`,
+          Array.from({ length: 64 }, (_, line) => `before-${i}-${line}-🙂-你好-&<>`).join("\n"),
+        ),
+      ),
+      { concurrency: "unbounded" },
+    )
+    const before = yield* snapshot.track()
+    expect(before).toBeTruthy()
+
+    yield* Effect.all(
+      files.map((file, i) =>
+        write(
+          `${tmp.path}/${file}`,
+          Array.from({ length: 64 }, (_, line) => `after-${i}-${line}-🚀-日本語-&<>`).join("\n"),
+        ),
+      ),
+      { concurrency: "unbounded" },
+    )
+    const after = yield* snapshot.track()
+    expect(after).toBeTruthy()
+
+    const budget = 512
+    const result = yield* snapshot.diffFullBounded(before!, after!, budget)
+    expect(result.summary).toHaveLength(files.length)
+    expect(result.summary.map((item) => item.file)).toEqual(files)
+    expect(result.summary.every((item) => item.patch === "")).toBe(true)
+    expect(result.summary.every((item) => item.additions > 0 && item.deletions > 0)).toBe(true)
+    expect(result.truncated).toBe(true)
+    expect(result.patchTruncated).toBe(true)
+    expect(result.diffs.length).toBeGreaterThan(0)
+    expect(result.diffs.length).toBeLessThan(result.summary.length)
+    expect(result.diffs).toHaveLength(1)
+    expect(
+      result.diffs.reduce((bytes, item) => bytes + Buffer.byteLength(item.patch ?? "", "utf8"), 0),
+    ).toBeLessThanOrEqual(budget)
+    for (const item of result.diffs) {
+      const patch = item.patch ?? ""
+      expect(new TextDecoder().decode(new TextEncoder().encode(patch))).toBe(patch)
+    }
+  }),
+  { git: true },
+  120_000,
+)
+
+it.instance(
   "diffFull preserves git diff order across batch boundaries",
   Effect.gen(function* () {
     const tmp = yield* bootstrap()

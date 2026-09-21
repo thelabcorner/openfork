@@ -10,8 +10,11 @@ import { AccessToken, AccountID, OrgID, RefreshToken } from "../../src/account/s
 import { AccountRepo } from "../../src/account/repo"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Session } from "@/session/session"
-import type { SessionID } from "../../src/session/schema"
+import { MessageID, type SessionID } from "../../src/session/schema"
 import { ShareNext } from "@/share/share-next"
+import { Provider } from "@/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionShareTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
@@ -38,19 +41,19 @@ function requestLayer(client: HttpClient.HttpClient) {
   return LayerNode.compile(LayerNode.group([ShareNext.node, AccountRepo.node]), [replacement])
 }
 
-function integrationLayer(client: HttpClient.HttpClient) {
+function integrationLayer(client: HttpClient.HttpClient, providerLayer?: Layer.Layer<Provider.Service>) {
   const replacement = [httpClient, Layer.succeed(HttpClient.HttpClient, client)] as const
-  return LayerNode.compile(
-    LayerNode.group([
-      ShareNext.node,
-      EventV2Bridge.node,
-      Session.node,
-      SessionProjector.node,
-      AccountRepo.node,
-      Database.node,
-    ]),
-    [replacement],
-  )
+  const group = LayerNode.group([
+    ShareNext.node,
+    EventV2Bridge.node,
+    Session.node,
+    SessionProjector.node,
+    AccountRepo.node,
+    Database.node,
+  ])
+  if (!providerLayer) return LayerNode.compile(group, [replacement])
+  const providerReplacement = [Provider.node, providerLayer] as const
+  return LayerNode.compile(group, [replacement, providerReplacement])
 }
 
 const share = (id: SessionID) =>
@@ -317,6 +320,94 @@ describe("ShareNext", () => {
             },
           ])
         }).pipe(Effect.provide(integrationLayer(client)))
+      },
+      { config: { enterprise: { url: "https://legacy-share.example.com" } } },
+    ),
+  )
+
+  it.live("syncs host state and continuations without resolving provider models", () =>
+    provideTmpdirInstance(
+      () => {
+        const seen: Array<{ url: string; body: string }> = []
+        const client = HttpClient.make((req) => {
+          if (req.url.endsWith("/sync") && req.body._tag === "Uint8Array") {
+            seen.push({ url: req.url, body: new TextDecoder().decode(req.body.body) })
+          }
+          return Effect.succeed(json(req, { ok: true }))
+        })
+        const modelCalls: Array<[string, string]> = []
+        const fakeProvider = ProviderTest.fake({
+          getModel: Effect.fn("ShareNextTest.getModel")((providerID, modelID) => {
+            modelCalls.push([providerID, modelID])
+            return Effect.succeed(ProviderTest.model({ id: modelID, providerID }))
+          }),
+        })
+
+        return Effect.gen(function* () {
+          const events = yield* EventV2Bridge.Service
+          const shareService = yield* ShareNext.Service
+          const sessions = yield* Session.Service
+          const info = yield* sessions.create({ title: "provenance share" })
+          const { db } = yield* Database.Service
+          yield* db
+            .insert(SessionShareTable)
+            .values({
+              session_id: info.id,
+              id: "shr_provenance",
+              url: "https://legacy-share.example.com/share/provenance",
+              secret: "sec_provenance",
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          yield* shareService.init()
+          yield* Effect.sleep(25)
+
+          const state = yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            role: "user",
+            provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+              ref: `goal-state:v1:progress:gol_share:${"d".repeat(64)}`,
+            }),
+            sessionID: info.id,
+            agent: "build",
+            model: { providerID: fakeProvider.model.providerID, modelID: fakeProvider.model.id },
+            time: { created: Date.now() },
+          })
+          const continuation = yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            role: "user",
+            provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+              sourceMessageID: MessageID.make("msg_share_worker_root"),
+              ref: "reservation-share",
+            }),
+            sessionID: info.id,
+            agent: "build",
+            model: { providerID: fakeProvider.model.providerID, modelID: fakeProvider.model.id },
+            time: { created: Date.now() + 1 },
+          })
+
+          yield* pollWithTimeout(
+            Effect.sync(() => (seen.length === 1 ? true : undefined)),
+            "timed out waiting for provenance share sync",
+            "5 seconds",
+          )
+
+          expect(modelCalls).toEqual([])
+          const body = JSON.parse(seen[0]!.body) as {
+            data: Array<{ type: string; data: { id?: string; provenance?: unknown } }>
+          }
+          const messages = body.data.filter((item) => item.type === "message")
+          expect(messages.map((item) => item.data.id).sort()).toEqual([state.id, continuation.id].sort())
+          expect(messages.find((item) => item.data.id === state.id)?.data.provenance).toEqual(state.provenance)
+          expect(messages.find((item) => item.data.id === continuation.id)?.data.provenance).toEqual(
+            continuation.provenance,
+          )
+
+          // Keep the event service live through the assertions; listener
+          // delivery is what proves this test exercised ShareNext's subscriber.
+          void events
+        }).pipe(Effect.provide(integrationLayer(client, fakeProvider.layer)))
       },
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
