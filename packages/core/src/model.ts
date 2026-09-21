@@ -14,6 +14,7 @@ export type Family = Model.Family
 
 export const Primitive = Model.Primitive
 export type Primitive = Model.Primitive
+export const isLanguageModel = Model.isLanguageModel
 
 export const Capabilities = Model.Capabilities
 export type Capabilities = Model.Capabilities

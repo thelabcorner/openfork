@@ -257,6 +257,32 @@ describe("CatalogV2", () => {
     }),
   )
 
+  it.effect("skips embedding-shaped models when resolving the default", () =>
+    Effect.gen(function* () {
+      const catalog = yield* Catalog.Service
+      const providerID = ProviderV2.ID.make("test")
+      const embedding = ModelV2.ID.make("text-embedding-nomic-embed-text-v1.5")
+      const language = ModelV2.ID.make("chat-model")
+      yield* catalog.transform((catalog) => {
+        catalog.provider.update(providerID, () => {})
+        catalog.model.update(providerID, embedding, (model) => {
+          model.name = "Nomic Embed Text v1.5"
+          model.time.released = 3000
+        })
+        catalog.model.update(providerID, language, (model) => {
+          model.name = "Chat Model"
+          model.time.released = 2000
+        })
+        catalog.model.default.set(providerID, embedding)
+      })
+
+      expect(yield* catalog.model.default()).toMatchObject({
+        providerID,
+        id: language,
+      })
+    }),
+  )
+
   it.effect("uses a transform-provided default model until that transform is replaced", () =>
     Effect.gen(function* () {
       const catalog = yield* Catalog.Service

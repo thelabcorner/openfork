@@ -342,6 +342,15 @@ describe("SessionRunnerModel", () => {
         ),
       ).toBe(false)
       expect(SessionRunnerModel.supported(model({ type: "native", settings: {} }))).toBe(false)
+      expect(
+        SessionRunnerModel.supported(
+          ModelV2.Info.make({
+            ...model({ type: "aisdk", package: "@ai-sdk/openai-compatible", url: "http://127.0.0.1:1234/v1" }),
+            id: ModelV2.ID.make("text-embedding-nomic-embed-text-v1.5"),
+            name: "Nomic Embed Text v1.5",
+          }),
+        ),
+      ).toBe(false)
     }),
   )
 })

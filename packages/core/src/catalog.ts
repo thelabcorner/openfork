@@ -218,13 +218,14 @@ const layer = Layer.effect(
             const provider = yield* result.provider.get(defaultModel.providerID)
             if (provider && (yield* result.provider.available()).some((item) => item.id === provider.id)) {
               const model = yield* result.model.get(defaultModel.providerID, defaultModel.modelID)
-              if (model?.enabled) return model
+              if (model?.enabled && ModelV2.isLanguageModel(model.providerID, model)) return model
             }
           }
 
           return Option.getOrUndefined(
             pipe(
               yield* result.model.available(),
+              Array.filter((model) => ModelV2.isLanguageModel(model.providerID, model)),
               Array.sortWith((item) => item.time.released, Order.flip(Order.Number)),
               Array.head,
             ),
@@ -253,6 +254,7 @@ const layer = Layer.effect(
                 model.providerID === providerID &&
                 model.enabled &&
                 model.status === "active" &&
+                ModelV2.isLanguageModel(model.providerID, model) &&
                 model.capabilities.input.some((item) => item.startsWith("text")) &&
                 model.capabilities.output.some((item) => item.startsWith("text")),
             ),
