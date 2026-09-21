@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test"
 import { Cause, Effect } from "effect"
 import { IndexSerialization } from "@opencode-ai/core/filesystem/index-serialization"
+import { RelativePath } from "@opencode-ai/core/schema"
 
 const input: IndexSerialization.IndexBlobInput = {
   schemaVersion: 1,
@@ -11,13 +12,13 @@ const input: IndexSerialization.IndexBlobInput = {
     "": {
       at: 1_700_000_000_000,
       entries: [
-        { path: "src/", type: "directory" },
-        { path: "README.md", type: "file" },
+        { path: RelativePath.make("src/"), type: "directory" },
+        { path: RelativePath.make("README.md"), type: "file" },
       ],
     },
     "src": {
       at: 1_700_000_000_000,
-      entries: [{ path: "src/main.ts", type: "file" }],
+      entries: [{ path: RelativePath.make("src/main.ts"), type: "file" }],
     },
   },
 }

@@ -7,7 +7,7 @@ const REAL =
 const doc = JSON.parse(readFileSync(REAL, "utf8")) as { subtrees: Record<string, { entries: { path: string }[] }> }
 const paths: string[] = []
 for (const tree of Object.values(doc.subtrees)) for (const e of tree.entries) paths.push(e.path)
-const pathEntries = paths.map((p) => ({ path: p, isDir: false as const }))
+const pathEntries: Array<{ path: string; isDir: boolean }> = paths.map((p) => ({ path: p, isDir: false }))
 const dirSet = new Set<string>()
 for (const p of paths) {
   const parts = p.split("/")

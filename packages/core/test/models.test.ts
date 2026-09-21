@@ -71,6 +71,7 @@ const fixture2: Record<string, ModelsDev.Provider> = {
 
 interface MockState {
   body: string
+  decisionBody?: string
   status: number
   calls: Array<{ url: string; userAgent: string | null }>
 }
@@ -83,7 +84,8 @@ const makeMockClient = (state: Ref.Ref<MockState>) =>
         calls: [...s.calls, { url: request.url, userAgent: request.headers["user-agent"] ?? null }],
       }))
       const s = yield* Ref.get(state)
-      return HttpClientResponse.fromWeb(request, new Response(s.body, { status: s.status }))
+      const body = request.url.includes("type=decision") ? (s.decisionBody ?? s.body) : s.body
+      return HttpClientResponse.fromWeb(request, new Response(body, { status: s.status }))
     }),
   )
 
@@ -173,6 +175,7 @@ describe("ModelsDev Service", () => {
       expect(yield* Effect.promise(() => readFile(cacheFile, "utf8"))).toBe(JSON.stringify(fixture2))
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
+      expect(final.calls[0]?.url).toContain("/api.json?type=all")
     }),
   )
 
@@ -231,8 +234,8 @@ describe("ModelsDev Service", () => {
       expect(result.after).toEqual(fixture2)
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
-      expect(final.calls[0].url).toContain("/api.json")
-      expect(final.calls[0].userAgent).toContain("/cli")
+      expect(final.calls[0]?.url).toContain("/api.json?type=all")
+      expect(final.calls[0]?.userAgent).toContain("/cli")
     }),
   )
 
@@ -265,6 +268,7 @@ describe("ModelsDev Service", () => {
       )
       const final = yield* Ref.get(state)
       expect(final.calls.length).toBe(1)
+      expect(final.calls[0]?.url).toContain("/api.json?type=all")
       expect(after).toEqual(fixture2)
     }),
   )
