@@ -6,6 +6,7 @@ import { Reference } from "@opencode-ai/core/reference"
 import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { SystemContext } from "@opencode-ai/core/system-context/index"
 import { it } from "./lib/effect"
+import { renderReady } from "./lib/system-context"
 
 const guidanceLayer = (referenceLayer: Layer.Layer<Reference.Service>) =>
   AppNodeBuilder.build(ReferenceGuidance.node, [[Reference.node, referenceLayer]])
@@ -14,12 +15,12 @@ describe("ReferenceGuidance", () => {
   it.effect("lists available references in the system context", () =>
     Effect.gen(function* () {
       const guidance = yield* ReferenceGuidance.Service
-      const generation = yield* SystemContext.initialize(yield* guidance.load())
+      const rendered = yield* renderReady(yield* guidance.load())
 
-      expect(generation.baseline).toContain("<available_references>")
-      expect(generation.baseline).toContain("<name>docs</name>")
-      expect(generation.baseline).toContain("<path>/docs</path>")
-      expect(generation.baseline).toContain("<description>Use for product documentation</description>")
+      expect(rendered).toContain("<available_references>")
+      expect(rendered).toContain("<name>docs</name>")
+      expect(rendered).toContain("<path>/docs</path>")
+      expect(rendered).toContain("<description>Use for product documentation</description>")
     }).pipe(
       Effect.provide(
         guidanceLayer(
@@ -46,16 +47,14 @@ describe("ReferenceGuidance", () => {
   it.effect("omits guidance when no references are available", () =>
     Effect.gen(function* () {
       const guidance = yield* ReferenceGuidance.Service
-      const generation = yield* SystemContext.initialize(yield* guidance.load())
-      expect(generation.baseline).toBe("")
+      expect(yield* renderReady(yield* guidance.load())).toBe("")
     }).pipe(Effect.provide(guidanceLayer(Layer.mock(Reference.Service, { list: () => Effect.succeed([]) })))),
   )
 
   it.effect("omits references without descriptions", () =>
     Effect.gen(function* () {
       const guidance = yield* ReferenceGuidance.Service
-      const generation = yield* SystemContext.initialize(yield* guidance.load())
-      expect(generation.baseline).toBe("")
+      expect(yield* renderReady(yield* guidance.load())).toBe("")
     }).pipe(
       Effect.provide(
         guidanceLayer(

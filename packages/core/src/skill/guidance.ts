@@ -56,15 +56,8 @@ const layer = Layer.effect(
           .toSorted((a, b) => a.name.localeCompare(b.name))
         return SystemContext.make({
           key: SystemContext.Key.make("core/skill-guidance"),
-          codec: Schema.toCodecJson(Schema.Array(Summary)),
           load: Effect.succeed(available),
-          baseline: render,
-          update: (_previous, current) =>
-            [
-              "The available skills have changed. This list supersedes the previous available skills list.",
-              render(current),
-            ].join("\n"),
-          removed: () => "Skill guidance is no longer available. Do not use any previously listed skill.",
+          render,
         })
       }),
     })

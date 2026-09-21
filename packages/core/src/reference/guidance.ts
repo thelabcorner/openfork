@@ -49,15 +49,8 @@ const layer = Layer.effect(
         if (available.length === 0) return SystemContext.empty
         return SystemContext.make({
           key: SystemContext.Key.make("core/reference-guidance"),
-          codec: Schema.toCodecJson(Schema.Array(Summary)),
           load: Effect.succeed(available),
-          baseline: render,
-          update: (_previous, current) =>
-            [
-              "The available project references have changed. This list supersedes the previous reference list.",
-              render(current),
-            ].join("\n"),
-          removed: () => "Project reference guidance is no longer available. Do not use previously listed references.",
+          render,
         })
       }),
     })

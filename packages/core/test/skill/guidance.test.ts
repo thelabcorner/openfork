@@ -6,8 +6,10 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SkillV2 } from "@opencode-ai/core/skill"
 import { SystemContext } from "@opencode-ai/core/system-context"
+import { SystemSurface } from "@opencode-ai/core/system-surface"
 import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { it } from "../lib/effect"
+import { observeReady, renderReady } from "../lib/system-context"
 
 const build = AgentV2.ID.make("build")
 const effect = SkillV2.Info.make({
@@ -42,11 +44,9 @@ describe("SkillGuidance", () => {
     let skills = [hidden, denied, effect]
     return Effect.gen(function* () {
       const guidance = yield* SkillGuidance.Service
-      const initialized = yield* guidance
-        .load({ id: agent.id, info: agent })
-        .pipe(Effect.flatMap(SystemContext.initialize))
+      const initialized = yield* observeReady(yield* guidance.load({ id: agent.id, info: agent }))
 
-      expect(initialized.baseline).toBe(
+      expect(SystemSurface.render(initialized.snapshot)).toBe(
         [
           "Skills provide specialized instructions and workflows for specific tasks.",
           "Use the skill tool to load a skill when a task matches its description.",
@@ -60,14 +60,9 @@ describe("SkillGuidance", () => {
       )
 
       skills = []
-      expect(
-        yield* guidance
-          .load({ id: agent.id, info: agent })
-          .pipe(Effect.flatMap((context) => SystemContext.reconcile(context, initialized.snapshot))),
-      ).toMatchObject({
-        _tag: "Updated",
-        text: expect.stringContaining("No skills are currently available."),
-      })
+      const refreshed = yield* observeReady(yield* guidance.load({ id: agent.id, info: agent }), initialized.snapshot)
+      expect(SystemSurface.render(refreshed.snapshot)).toContain("No skills are currently available.")
+      expect(refreshed.surfaceChanged).toBe(true)
     }).pipe(Effect.provide(layer(() => skills)))
   })
 
@@ -78,12 +73,7 @@ describe("SkillGuidance", () => {
     })
     return Effect.gen(function* () {
       const guidance = yield* SkillGuidance.Service
-      expect(
-        yield* guidance.load({ id: agent.id, info: agent }).pipe(Effect.flatMap(SystemContext.initialize)),
-      ).toEqual({
-        baseline: "",
-        snapshot: {},
-      })
+      expect(yield* renderReady(yield* guidance.load({ id: agent.id, info: agent }))).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 
@@ -97,12 +87,7 @@ describe("SkillGuidance", () => {
     })
     return Effect.gen(function* () {
       const guidance = yield* SkillGuidance.Service
-      expect(
-        yield* guidance.load({ id: agent.id, info: agent }).pipe(Effect.flatMap(SystemContext.initialize)),
-      ).toEqual({
-        baseline: "",
-        snapshot: {},
-      })
+      expect(yield* renderReady(yield* guidance.load({ id: agent.id, info: agent }))).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 
@@ -116,9 +101,7 @@ describe("SkillGuidance", () => {
     })
     return Effect.gen(function* () {
       const guidance = yield* SkillGuidance.Service
-      expect(
-        (yield* guidance.load({ id: agent.id, info: agent }).pipe(Effect.flatMap(SystemContext.initialize))).baseline,
-      ).toContain("<name>effect</name>")
+      expect(yield* renderReady(yield* guidance.load({ id: agent.id, info: agent }))).toContain("<name>effect</name>")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 
@@ -133,12 +116,7 @@ describe("SkillGuidance", () => {
     })
     return Effect.gen(function* () {
       const guidance = yield* SkillGuidance.Service
-      expect(
-        yield* guidance.load({ id: agent.id, info: agent }).pipe(Effect.flatMap(SystemContext.initialize)),
-      ).toEqual({
-        baseline: "",
-        snapshot: {},
-      })
+      expect(yield* renderReady(yield* guidance.load({ id: agent.id, info: agent }))).toBe("")
     }).pipe(Effect.provide(layer(() => [effect])))
   })
 })
