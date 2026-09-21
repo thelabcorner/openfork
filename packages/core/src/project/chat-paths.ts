@@ -1,4 +1,5 @@
 import { CHAT_PROJECT_ID, CHAT_PROJECT_NAME } from "./chat"
+import { STORAGE_NAMESPACE } from "../storage-identity"
 
 export { CHAT_PROJECT_ID, CHAT_PROJECT_NAME }
 
@@ -39,7 +40,7 @@ function comparablePath(value: string): string {
 }
 
 export const chatsRoot = () => {
-  return joinPath(dataDir(), "opencode", "chats")
+  return joinPath(dataDir(), STORAGE_NAMESPACE, "chats")
 }
 
 export const isChatDirectoryWithin = (directory: string, rootDirectory: string): boolean => {

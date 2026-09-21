@@ -201,7 +201,7 @@ const layer = Layer.effect(
     )
 
     // Some default ignore rules match directories/files a project genuinely
-    // tracks (`.opencode/`, `packages/desktop/`, a root `bin/`, a tracked
+    // tracks (`.openfork/` or a tracked legacy `.opencode/`, `packages/desktop/`, a root `bin/`, a tracked
     // `*.log`). A watcher that hides tracked files is a freshness bug, not an
     // optimization, so the ignore set is derived from the tracked set:
     // patterns that would hide tracked files are dropped from the native list,

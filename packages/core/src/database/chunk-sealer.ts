@@ -15,6 +15,7 @@ import {
 } from "./sqlite-maintenance"
 import { Flag } from "../flag/flag"
 import { Flock } from "../util/flock"
+import { RUNTIME_LOCK_DIRNAME } from "../storage-identity"
 import { reclaimOrphanedEventPayloads } from "../event-payload"
 import {
   CHUNKDB_BATCH_SIZE,
@@ -1055,7 +1056,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 // Tie ownership to the physical DB location. Desktop may use a
                 // different XDG_STATE_HOME than ACP, but hosts opening this same
                 // file necessarily share its parent directory.
-                dir: path.join(path.dirname(filename), ".opencode-runtime-locks"),
+                dir: path.join(path.dirname(filename), RUNTIME_LOCK_DIRNAME),
                 staleMs: CHUNKDB_SEALER_LOCK_STALE_MS,
                 timeoutMs: CHUNKDB_SEALER_LOCK_TIMEOUT_MS,
                 baseDelayMs: 75,

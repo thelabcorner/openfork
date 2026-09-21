@@ -8,6 +8,7 @@ import { Global } from "../global"
 import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
 import { Flock } from "../util/flock"
+import { RUNTIME_LOCK_DIRNAME } from "../storage-identity"
 import { Watcher } from "../filesystem/watcher"
 import { ChunkStore, KIND_DIR, KIND_FILE } from "./chunk-store"
 import { compareBytes, frontDecode } from "./front-code"
@@ -346,7 +347,7 @@ const serviceLayer = Layer.effect(
     // re-enumerates the tree and applies the diff. Near-simultaneous hosts share
     // the winner's result instead of each running their own walk.
     const dbPath = ChunkStore.dbPathFor(root, global.data)
-    const lockDir = path.join(path.dirname(dbPath), ".opencode-runtime-locks")
+    const lockDir = path.join(path.dirname(dbPath), RUNTIME_LOCK_DIRNAME)
     const readIndexedAt = store.getMeta(INDEXED_AT_KEY).pipe(
       Effect.catch(() => Effect.succeed(undefined as string | undefined)),
       Effect.map((raw) => {

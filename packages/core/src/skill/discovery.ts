@@ -8,6 +8,7 @@ import { Global } from "../global"
 import { makeGlobalNode } from "../effect/app-node"
 import { httpClient } from "../effect/app-node-platform"
 import { AbsolutePath } from "../schema"
+import { LEGACY_SKILL_VERSION_FILENAME, SKILL_VERSION_FILENAME } from "../storage-identity"
 
 const skillConcurrency = 4
 const fileConcurrency = 8
@@ -126,7 +127,8 @@ const layer = Layer.effect(
             }
 
             const skillUrl = new URL(`${encodeURIComponent(skill.name)}/`, source)
-            const versionFile = path.join(root, ".opencode-version")
+            const versionFile = path.join(root, SKILL_VERSION_FILENAME)
+            const legacyVersionFile = path.join(root, LEGACY_SKILL_VERSION_FILENAME)
             const files = skill.files.map((file) => {
               if (!isSafeRelativePath(file)) return undefined
               let resource: URL
@@ -153,10 +155,23 @@ const layer = Layer.effect(
           ({ skill, root, versionFile, files }) =>
             Effect.gen(function* () {
               const version = skill.version
-              const current =
-                version === undefined
-                  ? undefined
-                  : yield* fs.readFileStringSafe(versionFile).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            const current =
+              version === undefined
+                ? undefined
+                : yield* Effect.gen(function* () {
+                    const canonical = yield* fs
+                      .readFileStringSafe(versionFile)
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (canonical !== undefined) return canonical
+                    const legacy = yield* fs
+                      .readFileStringSafe(legacyVersionFile)
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (legacy !== undefined) {
+                      yield* fs.writeFileString(versionFile, legacy).pipe(Effect.ignore)
+                      yield* fs.remove(legacyVersionFile, { force: true }).pipe(Effect.ignore)
+                    }
+                    return legacy
+                  })
               if (version === undefined || current === version) {
                 yield* Effect.forEach(files, (file) => download(file.url, file.destination), {
                   concurrency: fileConcurrency,
@@ -177,7 +192,7 @@ const layer = Layer.effect(
                     (yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie)) ||
                     (yield* fs.exists(path.join(staging, `${skill.name}.md`)).pipe(Effect.orDie))
                   if (!exists) return
-                  yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
+                  yield* fs.writeFileString(path.join(staging, SKILL_VERSION_FILENAME), version)
                   yield* Effect.uninterruptible(
                     Effect.gen(function* () {
                       const cached = yield* fs.exists(root).pipe(Effect.orDie)

@@ -114,7 +114,9 @@ function canonicalize(value: unknown): unknown {
 }
 
 /**
- * Compact local Brotli manifest (v2) — optimized for `.opencode/file-index.json.br`.
+ * Compact Brotli manifest (v2), retained for decoding/migration compatibility.
+ * Older builds stored this as repo-local `.opencode/file-index.json.br`; current
+ * OpenFork persistence is the unified global SQLite file-index store.
  *
  * Goals vs the canonical `FileIndex.Blob` (which is kept for the global
  * `file-index/*.json` cache):

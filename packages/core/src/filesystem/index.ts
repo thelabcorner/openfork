@@ -12,6 +12,7 @@ import { RelativePath } from "../schema"
 import { Hash } from "../util/hash"
 import { ChunkStore } from "../search/chunk-store"
 import { availableParallelism } from "node:os"
+import { LEGACY_PROJECT_CONFIG_DIRNAME, PROJECT_CONFIG_DIRNAME } from "../storage-identity"
 
 /**
  * Server-side persisted, incrementally-invalidated project file index.
@@ -26,7 +27,8 @@ import { availableParallelism } from "node:os"
  * (`ChunkStore`, same DB as the search index). The explorer snapshot is stored
  * as `meta` key `fileIndex` (canonical JSON + digest via `IndexSerialization`);
  * search chunks + `fileMeta` live in the same DB. There is no per-project
- * JSON file and no repo-local `.opencode/file-index.json.br` Brotli copy —
+ * JSON file and no repo-local `.openfork/file-index.json.br` (or legacy
+ * `.opencode/file-index.json.br`) Brotli copy —
  * both were removed. See `packages/core/src/search/index-service.ts` and
  * `chunk-store.ts` — both indexes now share `Global.data/file-index/` and the
  * same `Watcher` pipeline.
@@ -124,7 +126,10 @@ export const layer = Layer.effect(
     const root = yield* fs.realPath(location.directory).pipe(Effect.orDie)
     const cachePath = path.join(global.data, "file-index", `${Hash.sha256(root)}.json`)
 
-    const isOpencodePath = (p: string) => p === ".opencode" || p.startsWith(".opencode/")
+    const isProductConfigPath = (p: string) =>
+      [PROJECT_CONFIG_DIRNAME, LEGACY_PROJECT_CONFIG_DIRNAME].some(
+        (dir) => p === dir || p.startsWith(`${dir}/`),
+      )
 
     const subtrees = new Map<string, Subtree>()
     const byPath = new Map<string, FileSystem.Entry>()
@@ -328,14 +333,17 @@ export const layer = Layer.effect(
               yield* fs.remove(path.join(dir, name), { force: true }).pipe(Effect.ignore)
             }
           }
-          const legacyLocal = path.join(root, ".opencode", "file-index.json.br")
-          yield* fs.remove(legacyLocal, { force: true }).pipe(Effect.ignore)
-          const legacyDir = path.join(root, ".opencode")
-          const legacyEntries = yield* fs.readDirectoryEntries(legacyDir).pipe(Effect.catch(() => Effect.succeed([] as any)))
-          for (const entry of legacyEntries as any) {
-            const name = (entry as any).name as string
-            if (name.startsWith("file-index.json.br")) {
-              yield* fs.remove(path.join(legacyDir, name), { force: true }).pipe(Effect.ignore)
+          for (const configDir of [PROJECT_CONFIG_DIRNAME, LEGACY_PROJECT_CONFIG_DIRNAME]) {
+            const localDir = path.join(root, configDir)
+            yield* fs.remove(path.join(localDir, "file-index.json.br"), { force: true }).pipe(Effect.ignore)
+            const localEntries = yield* fs
+              .readDirectoryEntries(localDir)
+              .pipe(Effect.catch(() => Effect.succeed([] as any)))
+            for (const entry of localEntries as any) {
+              const name = (entry as any).name as string
+              if (name.startsWith("file-index.json.br")) {
+                yield* fs.remove(path.join(localDir, name), { force: true }).pipe(Effect.ignore)
+              }
             }
           }
         }).pipe(Effect.catch(() => Effect.void))
@@ -381,8 +389,8 @@ export const layer = Layer.effect(
         builtAt = blob.builtAt
         rootStat = blob.rootStat
         for (const [dir, sub] of Object.entries(blob.subtrees)) {
-          if (isOpencodePath(dir)) continue
-          const filtered = sub.entries.filter((e) => !isOpencodePath(String(e.path)))
+          if (isProductConfigPath(dir)) continue
+          const filtered = sub.entries.filter((e) => !isProductConfigPath(String(e.path)))
           setSubtree(dir, normalizeEntries(filtered), sub.at)
           restoredSubtrees.add(dir)
         }
@@ -395,7 +403,11 @@ export const layer = Layer.effect(
         loaded = true
         // Best-effort delete of the repo-local Brotli copy on first load —
         // it is no longer written, but old clones may still have it.
-        yield* fs.remove(path.join(root, ".opencode", "file-index.json.br"), { force: true }).pipe(Effect.ignore)
+        yield* Effect.forEach(
+          [PROJECT_CONFIG_DIRNAME, LEGACY_PROJECT_CONFIG_DIRNAME],
+          (configDir) => fs.remove(path.join(root, configDir, "file-index.json.br"), { force: true }).pipe(Effect.ignore),
+          { discard: true },
+        )
         // Unified SQLite cold start: load only the explorer's own lazy snapshot.
         // Do NOT decode the search index's entire path corpus here. Search keeps
         // those chunks byte-oriented specifically so a 100k+ project does not
@@ -413,8 +425,8 @@ export const layer = Layer.effect(
         builtAt = blob.builtAt
         rootStat = blob.rootStat
         for (const [dir, sub] of Object.entries(blob.subtrees)) {
-          if (isOpencodePath(dir)) continue
-          const filtered = sub.entries.filter((e) => !isOpencodePath(String(e.path)))
+          if (isOpenForkPath(dir)) continue
+          const filtered = sub.entries.filter((e) => !isOpenForkPath(String(e.path)))
           setSubtree(dir, normalizeEntries(filtered), sub.at)
           restoredSubtrees.add(dir)
         }
@@ -438,7 +450,7 @@ export const layer = Layer.effect(
       options?: { readonly changedPaths?: ReadonlySet<string>; readonly forceMetadata?: boolean },
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
-        if (isOpencodePath(dirPath)) return
+        if (isOpenForkPath(dirPath)) return
         const version = (scanVersions.get(dirPath) ?? 0) + 1
         scanVersions.set(dirPath, version)
         const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(
@@ -455,7 +467,7 @@ export const layer = Layer.effect(
           if (dropBranch(dirPath)) yield* markDirty()
           return
         }
-        const entries = normalizeEntries(listed.value).filter((e) => !isOpencodePath(String(e.path)))
+        const entries = normalizeEntries(listed.value).filter((e) => !isOpenForkPath(String(e.path)))
         const previous = subtrees.get(dirPath)
         const previousByPath = new Map(previous?.entries.map((entry) => [catalogKey(String(entry.path)), entry]))
         const restored = restoredSubtrees.has(dirPath)
@@ -599,3 +611,8 @@ export const node = makeLocationNode({
   layer,
   deps: [FSUtil.node, Location.node, FileSystem.node, Global.node],
 })
+
+function isOpenForkPath(input: string): boolean {
+  const normalized = input.replace(/\\/g, "/")
+  return /(^|\/)\.(?:openfork|opencode)(?:\/|$)/.test(normalized)
+}

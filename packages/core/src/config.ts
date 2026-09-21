@@ -25,6 +25,13 @@ import { ConfigToolOutput } from "./config/tool-output"
 import { ConfigWatcher } from "./config/watcher"
 import { ConfigV1 } from "./v1/config/config"
 import { ConfigMigrateV1 } from "./v1/config/migrate"
+import {
+  CONFIG_BASENAME,
+  LEGACY_CONFIG_BASENAME,
+  LEGACY_PROJECT_CONFIG_DIRNAME,
+  PROJECT_CONFIG_DIRNAME,
+  PROJECT_CONFIG_DIRNAMES,
+} from "./storage-identity"
 
 export class Info extends Schema.Class<Info>("Config.Info")({
   $schema: Schema.optional(Schema.String).annotate({
@@ -57,7 +64,8 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   autoupdate: Schema.Union([Schema.Boolean, Schema.Literal("notify")])
     .pipe(Schema.optional)
     .annotate({
-      description: "Automatically update or notify when a new version is available",
+      description:
+        "Check OpenFork releases for updates. Automatic replacement is limited to fork-managed direct installs; externally managed installs are notification-only",
     }),
   share: Schema.Literals(["manual", "auto", "disabled"]).pipe(Schema.optional).annotate({
     description: "Control whether sessions may be shared manually, automatically, or not at all",
@@ -154,7 +162,12 @@ const layer = Layer.effect(
     const global = yield* Global.Service
     const location = yield* Location.Service
     const policy = yield* Policy.Service
-    const names = ["opencode.json", "opencode.jsonc"]
+    const names = [
+      `${LEGACY_CONFIG_BASENAME}.json`,
+      `${LEGACY_CONFIG_BASENAME}.jsonc`,
+      `${CONFIG_BASENAME}.json`,
+      `${CONFIG_BASENAME}.jsonc`,
+    ]
     const decodeOptions = { errors: "all", onExcessProperty: "ignore", propertyOrder: "original" } as const
     const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
     const decodeV1Info = Schema.decodeUnknownOption(ConfigV1.Info, decodeOptions)
@@ -193,7 +206,7 @@ const layer = Layer.effect(
       ? []
       : yield* fs
           .up({
-            targets: [".opencode", ...names.toReversed()],
+            targets: [PROJECT_CONFIG_DIRNAME, LEGACY_PROJECT_CONFIG_DIRNAME, ...names.toReversed()],
             start: location.directory,
             stop: location.project.directory,
           })
@@ -201,20 +214,28 @@ const layer = Layer.effect(
     const directories = [
       globalDirectory,
       ...discovered
-        .filter((item) => path.basename(item) === ".opencode")
+        .filter((item) =>
+          PROJECT_CONFIG_DIRNAMES.includes(path.basename(item) as (typeof PROJECT_CONFIG_DIRNAMES)[number]),
+        )
         .toReversed()
         .map((directory) => AbsolutePath.make(directory)),
     ]
     // A config closer to the opened directory should win over one higher up.
     // Search starts nearby, so reverse the results before applying them.
-    const directPaths = discovered.filter((item) => path.basename(item) !== ".opencode").toReversed()
+    const directPaths = discovered
+      .filter(
+        (item) =>
+          !PROJECT_CONFIG_DIRNAMES.includes(path.basename(item) as (typeof PROJECT_CONFIG_DIRNAMES)[number]),
+      )
+      .toReversed()
     const direct = yield* Effect.forEach(directPaths, loadFile).pipe(
       Effect.orDie,
       Effect.map((configs) => configs.filter((config): config is Document => config !== undefined)),
     )
     const supplementary = yield* Effect.forEach(directories, loadDirectory).pipe(Effect.orDie)
     // Apply general settings first and more specific settings last:
-    // global config, project files, then `.opencode` files.
+    // global config, project files, then project config directories. Legacy
+    // `.opencode` sources are applied before canonical `.openfork` sources.
     const configs = [...(supplementary[0] ?? []), ...direct, ...supplementary.slice(1).flat()]
     // Rules use the opposite order so a user-global rule can override a
     // repository rule. Statement order inside each file stays unchanged.

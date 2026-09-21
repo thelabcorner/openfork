@@ -29,6 +29,7 @@ const FOLDERS = new Set([
   "mypy_cache",
   ".history",
   ".gradle",
+  ".openfork",
   ".opencode",
 ])
 
@@ -55,7 +56,7 @@ const normalize = (file: string) => file.replaceAll("\\", "/")
  *
  * The default ignore rules are folder/glob based and bound event volume, but
  * some of them match directories and files that a project genuinely tracks
- * (`.opencode/`, `packages/desktop/`, a root `bin/`, a tracked `*.log`). A
+ * (`.openfork/` / legacy `.opencode/`, `packages/desktop/`, a root `bin/`, a tracked `*.log`). A
  * watcher that hides tracked files is a freshness bug, not an optimization.
  *
  * `coverage` separates the two:

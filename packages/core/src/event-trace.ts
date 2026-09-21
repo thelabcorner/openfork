@@ -4,6 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { xdgData } from "xdg-basedir"
+import { STORAGE_NAMESPACE } from "./storage-identity"
 
 /**
  * Phase-by-phase trace for the server event pipeline, written as JSONL to a
@@ -11,7 +12,7 @@ import { xdgData } from "xdg-basedir"
  *
  * Opt-in: set `OPENCODE_EVENT_TRACE=1` (or any value other than
  * 0/false/off/no) to enable, and `OPENCODE_EVENT_TRACE_DIR` to override the output directory (default
- * `<xdg-data>/opencode/log/event-trace`). One `trace-<pid>-<timestamp>.jsonl`
+ * `<xdg-data>/openfork/log/event-trace`). One `trace-<pid>-<timestamp>.jsonl`
  * per process, rolled at 25 MiB keeping two rotated files.
  *
  * Cost discipline: the hot path records integer counter updates only. No
@@ -38,7 +39,8 @@ const traceEnv = process.env.OPENCODE_EVENT_TRACE
 let enabled = traceEnv !== undefined && !OFF.has(traceEnv.toLowerCase().trim())
 
 let directory =
-  process.env.OPENCODE_EVENT_TRACE_DIR ?? path.join(xdgData ?? path.join(os.tmpdir(), ".local", "share"), "opencode", "log", "event-trace")
+  process.env.OPENCODE_EVENT_TRACE_DIR ??
+  path.join(xdgData ?? path.join(os.tmpdir(), ".local", "share"), STORAGE_NAMESPACE, "log", "event-trace")
 
 const counters = new Map<string, number>()
 const timings = new Map<string, { count: number; total: number; max: number }>()

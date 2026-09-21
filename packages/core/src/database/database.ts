@@ -15,6 +15,7 @@ import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Flock } from "../util/flock"
+import { DATABASE_BASENAME, RUNTIME_LOCK_DIRNAME, STORAGE_NAMESPACE } from "../storage-identity"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 export type DatabaseShape = Effect.Success<typeof makeDatabase>
@@ -124,7 +125,7 @@ const layer = (filename: string) =>
       // elect one checkpoint owner per pass instead of multiplying identical
       // housekeeping by host count. The DB-local lock path deliberately avoids
       // XDG_STATE_HOME because Desktop and ACP may use different state roots.
-      const checkpointLockDir = join(dirname(filename), ".opencode-runtime-locks")
+      const checkpointLockDir = join(dirname(filename), RUNTIME_LOCK_DIRNAME)
       const checkpoint = Effect.scoped(
         Effect.gen(function* () {
           yield* Flock.effect(`wal-checkpoint:${filename}`, {
@@ -189,7 +190,7 @@ export function layerFromPath(filename: string) {
   // database resources remain alive after the bootstrap lease is released. The
   // lease protects construction only, not the lifetime of the process.
   const databaseFile = resolve(filename)
-  const bootstrapLockDir = join(dirname(databaseFile), ".opencode-runtime-locks")
+  const bootstrapLockDir = join(dirname(databaseFile), RUNTIME_LOCK_DIRNAME)
   return Layer.effectContext(
     Effect.acquireUseRelease(
       Effect.promise(() =>
@@ -248,8 +249,8 @@ export function path() {
     process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" ||
     process.env.OPENCODE_DISABLE_CHANNEL_DB === "true"
   )
-    return join(Global.Path.data, "opencode.db")
-  return join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
+    return join(Global.Path.data, DATABASE_BASENAME)
+  return join(Global.Path.data, `${STORAGE_NAMESPACE}-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
 }
 
 export const node = makeGlobalNode({ service: Service, layer: layerFromPath(path()), deps: [] })
