@@ -67,7 +67,7 @@ type CandidateExample = {
 }
 
 const dbPath = process.argv[2]
-if (!dbPath) throw new Error("Usage: bun run script/spad-db-replay.ts <opencode.db> [output.json]")
+if (!dbPath) throw new Error("Usage: bun run script/spad-db-replay.ts <openfork.db> [output.json]")
 const outputPath = process.argv[3]
 const db = new Database(dbPath, { readonly: true, create: false, strict: true })
 

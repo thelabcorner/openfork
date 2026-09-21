@@ -4,7 +4,7 @@ import path from "node:path"
 import fs from "node:fs/promises"
 import { validateChunkDbCapability } from "./chunkdb-capability"
 
-const AGENT_NAME = "OpenCode (OpenFork)"
+const AGENT_NAME = "OpenFork"
 const root = path.resolve(import.meta.dir, "..")
 const skipBuild = Bun.argv.includes("--skip-build")
 
@@ -25,7 +25,7 @@ if (!skipBuild) {
 const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8")) as { version: string }
 const source = path.join(root, "dist", "opencode-windows-x64", "bin", "opencode.exe")
 await fs.access(source).catch(() => {
-  throw new Error(`Built OpenCode executable not found at ${source}. Run without --skip-build first.`)
+  throw new Error(`Built OpenFork executable not found at ${source}. Run without --skip-build first.`)
 })
 
 const localAppData = process.env.LOCALAPPDATA

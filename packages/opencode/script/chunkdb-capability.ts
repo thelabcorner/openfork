@@ -11,7 +11,7 @@ export type ChunkDbCapabilityResult = {
 }
 
 /**
- * Prove that a compiled OpenCode executable can actually open the newest
+ * Prove that a compiled OpenFork executable can actually open the newest
  * ChunkDB representation supported by this source tree.
  *
  * `--version` is not sufficient for release/install validation: it never opens
@@ -74,7 +74,7 @@ export async function validateChunkDbCapability(binaryPath: string): Promise<Chu
     if (bootstrap.code !== 0) {
       throw new Error(
         [
-          "Compiled OpenCode failed to bootstrap the isolated ChunkDB capability fixture.",
+          "Compiled OpenFork failed to bootstrap the isolated ChunkDB capability fixture.",
           `binary: ${binaryPath}`,
           `exit: ${bootstrap.code}`,
           bootstrap.stderr.trim() ? `stderr:\n${bootstrap.stderr.trim()}` : undefined,
@@ -105,7 +105,7 @@ export async function validateChunkDbCapability(binaryPath: string): Promise<Chu
     if (code !== 0) {
       throw new Error(
         [
-          `Compiled OpenCode failed ChunkDB capability probe for user_version ${CHUNKDB_MAX_USER_VERSION}.`,
+          `Compiled OpenFork failed ChunkDB capability probe for user_version ${CHUNKDB_MAX_USER_VERSION}.`,
           `binary: ${binaryPath}`,
           `exit: ${code}`,
           stderr.trim() ? `stderr:\n${stderr.trim()}` : undefined,

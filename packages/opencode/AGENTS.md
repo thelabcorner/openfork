@@ -2,7 +2,8 @@
 
 Before changing the local host, V1/current seams, or fork/upstream integration,
 read `../../docs/map/architecture.md`, `../../docs/map/v1-v2.md`, and
-`../../docs/map/upstream-fork.md`.
+`../../docs/map/upstream-fork.md`. For external compatibility, also read
+`../../docs/architecture/compatibility-boundary.md`.
 
 ## V1/current lifecycle
 
@@ -17,6 +18,15 @@ is not an OpenFork parity goal. Keep already-used current routes where necessary
 but do not add migrations merely to follow upstream's V1 -> current client API
 direction. The hosted Zen/Go provider API is orthogonal and remains a provider
 compatibility boundary.
+
+The local host itself is **OpenFork-owned**. Do not retain a local route, plugin
+hook, CLI shape, or generated-client behavior solely for generic OpenCode
+compatibility. OpenCode plugins and local clients are unsupported unless an exact
+compatibility exception is explicitly documented and tested.
+
+By contrast, upstream-operated remote OpenCode services consumed by this package
+are strict external contracts. Keep their wire/auth/stream/error/model/quota
+behavior compatible even when the local implementation diverges completely.
 
 ## Server ownership and instance bootstrap — architecture before endpoint reuse
 
@@ -64,6 +74,43 @@ routes, workspace routing, instance services, or any client-facing read path.
 - Add attribution when creating full instances. Logs/tests should answer which
   request created the instance, which explicit location it supplied, whether any
   fallback was used, and which runtime service justified the load.
+
+## Session turn provenance — semantic ownership before provider role
+
+V1 `role: "user"` is a provider/conversation role, not proof that the human owns
+the turn. Goal continuations, recovery/compaction followups, host prompts, and
+other runtime-authored context may intentionally lower to provider role `user`.
+
+- New durable V1 user-role messages must stamp message-level provenance at the
+  trusted producer/admission path. Public prompt input must not be allowed to
+  spoof host/user ownership.
+- Semantic consumers must use the centralized Core V1 turn-provenance classifier
+  and purpose-specific selectors. Do not reconstruct ownership from
+  `TextPart.synthetic`, text contents, or feature-specific metadata.
+- Keep provider lowering and structural model-message grouping role-based where
+  required. Provenance metadata itself must not be serialized into the LLM prompt
+  merely to explain ownership to the model.
+- Treat authority as a separate dimension from provenance. Host-authored
+  `Synthetic` input is not automatically privileged: Goal continuations,
+  scheduled/peer/recovery input, and similar host turns normally occupy the
+  conversational lane and may lower to provider `user`.
+- Do not solve provider/runtime limitations by weakening genuine System
+  authority. Privileged OpenFork policy must be projected through the selected
+  provider/model/runtime's proven capability, conservatively at the privileged
+  head when necessary. Never wrap required System policy as ordinary user text
+  merely to preserve chronology or cache reuse.
+- The adapter/compiler owns the final provider role. Session/Goal producers own
+  semantic kind, provenance, causal lineage, and intended authority; they must
+  not encode SDK-specific role guesses into durable state.
+- Treat current/V2 `User`, `Synthetic`, `Shell`, and `Compaction` message kinds as
+  the behavioral reference for V1 compatibility. A V1 host-owned message may be
+  semantically synthetic while still lowering as provider `user`.
+- Before changing a `role === "user"` predicate, state which question it answers.
+  User-intent/authorization/title/checkpoint/replay/UI attribution predicates are
+  semantic; provider protocol alternation/lowering predicates are structural.
+- Goal/auditor continuations must be durable host-owned turns, never changing
+  entries in the worker system prompt. Tests should assert both the durable
+  provenance and absence from worker system-role provider messages.
 
 ## HttpApi Surfaces and Client Generation — read before editing routes
 

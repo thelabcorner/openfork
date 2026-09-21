@@ -87,6 +87,8 @@ const observed: Array<{
   lane: string
   source: string
   period: number
+  runStart: number
+  runEnd: number
   runLength: number
   policyReason: string | null
 }> = []
@@ -130,6 +132,8 @@ for (const [cls, files] of [...grouped.entries()].sort(([a], [b]) => a.localeCom
         lane: action!.detection.lane,
         source: action!.detection.source,
         period: action!.detection.period,
+        runStart: action!.detection.runStart,
+        runEnd: action!.detection.runEnd,
         runLength: action!.detection.runLength,
         policyReason: action!.policyReason ?? null,
       })

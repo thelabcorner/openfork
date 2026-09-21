@@ -1,12 +1,19 @@
 # V2 Core Instructions
 
+> **OpenFork policy note:** this specification records current/V2 architecture as a
+> donor/reference implementation. It is **not** an OpenFork product migration plan.
+> OpenFork remains V1-first on the **execution/local-API axis** and may backport the
+> useful semantics below without adopting V2's local runtime, client API, or plugin
+> surface. This does not apply to presentation: V2/new-layout UI is a first-class
+> OpenFork product direction.
+
 These notes describe how to work on `../../../packages/core` during the v2 port.
 
 ## Direction
 
 Move behavior out of large application services and into plugins. Core services should become small, typed containers that own state, expose simple operations, and trigger hooks where policy or integration-specific logic belongs.
 
-The target shape is:
+The current/V2 reference shape is:
 
 - `../../../packages/core` contains domain schemas, typed errors, state containers, events, and plugin hook contracts.
 - Plugins implement provider-specific, config-specific, auth-specific, model-discovery, and generation behavior.
