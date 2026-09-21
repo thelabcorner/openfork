@@ -1952,6 +1952,17 @@ describe("session HttpApi", () => {
             : [],
         ),
       ).toContainEqual({ name: SessionTitle.GENERATED_TITLE_TOOL, status: "completed" })
+
+      // The desktop's production local-protocol path hydrates detail Sessions
+      // through the mature V1 message endpoint. Special-agent Sessions own a
+      // current transcript, so that endpoint must expose the same durable
+      // conversation instead of rendering an empty child after navigation.
+      const compat = yield* requestJson<SessionV1.WithParts[]>(
+        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=50`,
+        { headers: { "x-opencode-directory": directory } },
+      )
+      expect(compat.some((item) => item.info.role === "user" && item.info.provenance?.source === CurrentSessionTurnProvenance.Source.SessionTitle)).toBe(true)
+      expect(compat.some((item) => item.info.role === "assistant" && item.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL))).toBe(true)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )

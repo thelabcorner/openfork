@@ -151,6 +151,21 @@ describe("AccountRouter.select", () => {
     expect(selection?.reason).toBe("explicit")
   })
 
+  it("never substitutes a healthy account for an explicitly selected forbidden account", () => {
+    const ready = fakeAccount("wb-aaa-0001", "a@example.com", { state: "READY" })
+    const forbidden = fakeAccount("wb-bad-0009", "restricted@example.com", { state: "ACCOUNT_FORBIDDEN" })
+    const router = new AccountRouter({ registry: fakeRegistry([ready, forbidden]) })
+
+    const selection = router.select("ses_1", MODEL, forbidden.id)
+
+    // Explicit provider-account authority is exact. The provider/governor may
+    // reject this account, but routing must never turn that rejection into
+    // provider roulette by silently moving the request onto another account.
+    expect(selection?.account.id).toBe(forbidden.id)
+    expect(selection?.reason).toBe("explicit")
+    expect(router.binding("ses_1")).toBe(forbidden.id)
+  })
+
   it("returns undefined for an unknown explicit account id", () => {
     const a = fakeAccount("wb-aaa-0001", "a@example.com")
     const router = new AccountRouter({ registry: fakeRegistry([a]) })

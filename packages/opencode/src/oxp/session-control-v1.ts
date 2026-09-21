@@ -118,7 +118,7 @@ const setSelection = (
             ),
           )
 
-        if (runtime.Provider.modelPrimitive(resolved) !== "language") {
+        if (!runtime.Provider.isLanguageModel(resolved)) {
           return yield* Effect.fail(
             new OxpSessionControl.SelectionUnavailable(
               "model",
