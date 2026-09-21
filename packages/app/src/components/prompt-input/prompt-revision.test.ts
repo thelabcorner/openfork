@@ -1,34 +1,15 @@
 import { describe, expect, test } from "bun:test"
 import type { PromptInputV2Prompt } from "@opencode-ai/session-ui/v2/prompt-input/types"
 import {
-  promptRevisionClarifications,
   promptRevisionDraftContext,
   promptRevisionFingerprint,
+  promptRevisionArtifactIsApplied,
   promptRevisionPrefix,
   promptRevisionRevealBoundaries,
-  promptRevisionResponse,
   promptRevisionText,
   promptRevisionUsablePath,
   revisedPromptParts,
 } from "./prompt-revision"
-
-const question = (
-  overrides: Partial<{
-    question: string
-    multiple: boolean
-    custom: boolean
-    options: { label: string; description: string }[]
-  }> = {},
-) => ({
-  question: overrides.question ?? "Scope?",
-  header: "Scope",
-  options: overrides.options ?? [
-    { label: "UI", description: "UI only" },
-    { label: "Core", description: "Core only" },
-  ],
-  multiple: overrides.multiple,
-  custom: overrides.custom,
-})
 
 describe("prompt revision helpers", () => {
   test("preserves structured mentions and image attachments after a rewrite", () => {
@@ -242,6 +223,25 @@ describe("prompt revision helpers", () => {
     expect(revised.at(-1)).toBe(original[1])
   })
 
+  test("does not treat equal visible text as an applied revision when structured references are missing", () => {
+    const text = "Review @src/parser.ts"
+    const current = [{ type: "text" as const, content: text, start: 0, end: text.length }]
+    const start = text.indexOf("@src/parser.ts")
+    const references = [
+      {
+        type: "file" as const,
+        path: "src/parser.ts",
+        content: "@src/parser.ts",
+        start,
+        end: start + "@src/parser.ts".length,
+      },
+    ]
+
+    expect(promptRevisionArtifactIsApplied(current, text, references)).toBe(false)
+    const applied = revisedPromptParts(text, current, references)
+    expect(promptRevisionArtifactIsApplied(applied, text, references)).toBe(true)
+  })
+
   test("preserves tool mentions locally without widening the Revisor reference protocol", () => {
     const original: PromptInputV2Prompt = [
       { type: "text", content: "Use ", start: 0, end: 4 },
@@ -269,34 +269,6 @@ describe("prompt revision helpers", () => {
       exposure: "default",
       source: "registry",
     })
-  })
-
-  test("keeps multi-select labels separate from independent details", () => {
-    expect(promptRevisionResponse([question({ multiple: true })], [["UI", "Core"]], ["Server"])).toEqual({
-      answers: [["UI", "Core"]],
-      details: ["Server"],
-    })
-  })
-
-  test("single-select keeps one provided option plus independent custom details", () => {
-    expect(promptRevisionResponse([question()], [["UI", "Core"]], ["Something else"])).toEqual({
-      answers: [["UI"]],
-      details: ["Something else"],
-    })
-  })
-
-  test("custom false ignores freeform text and keeps only provided choices", () => {
-    expect(promptRevisionResponse([question({ custom: false })], [["UI"]], ["ignored"])).toEqual({
-      answers: [["UI"]],
-      details: [""],
-    })
-  })
-
-  test("builds clarification payloads without conflating selected labels and details", () => {
-    const response = { answers: [["UI"]], details: ["Keep deprecated aliases"] }
-    const result = promptRevisionClarifications([question({ question: "Which?" })], response)
-    response.answers[0]!.push("Core")
-    expect(result).toEqual([{ question: "Which?", answers: ["UI"], detail: "Keep deprecated aliases" }])
   })
 
   test("fingerprint changes when prompt structure changes even if visible text does not", () => {

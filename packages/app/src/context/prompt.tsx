@@ -138,6 +138,7 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
 
     return {
       ready,
+      flush: (scope?: PromptScope) => pick(scope).flush(),
       capture: (scope?: PromptScope) => pick(scope).capture(),
       current: () => session().current(),
       cursor: () => session().cursor(),

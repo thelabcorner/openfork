@@ -248,8 +248,6 @@ type PromptSubmitInput = {
     quickStart: (
       sessionID: string,
       input: {
-        projectID: string
-        workspaceID?: string
         objective: string
         mode: "auto_continue" | "unattended"
       },
@@ -343,7 +341,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     })
   }
 
-  const handleSubmit = async (event: Event) => {
+  const handleSubmit = async (event: Event): Promise<boolean> => {
     event.preventDefault()
 
     const target = prompt.capture()
@@ -360,7 +358,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     if (text.trim().length === 0 && images.length === 0 && input.commentCount() === 0) {
       if (input.working()) void abort()
-      return
+      return false
     }
 
     const modelSelection = input.model ?? local.model
@@ -373,7 +371,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         title: language.t("prompt.toast.modelAgentRequired.title"),
         description: language.t("prompt.toast.modelAgentRequired.description"),
       })
-      return
+      return false
     }
 
     const armKey = input.goal?.key({ sessionID: params.id, draftID: search.draftId, directory: sdk().directory })
@@ -414,7 +412,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             title: language.t("prompt.toast.worktreeCreateFailed.title"),
             description: language.t("common.requestFailed"),
           })
-          return
+          return false
         }
         WorktreeState.pending(sdk().scope, createdWorktree.directory)
         sessionDirectory = createdWorktree.directory
@@ -492,7 +490,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         title: language.t("prompt.toast.promptSendFailed.title"),
         description: language.t("prompt.toast.promptSendFailed.description"),
       })
-      return
+      return false
     }
 
     const authoritativeSession = sync().session.get(session.id)
@@ -502,7 +500,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         title: language.t("goal.error.title"),
         description: language.t("common.requestFailed"),
       })
-      return
+      return false
     }
 
     const model = {
@@ -557,7 +555,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       input.onQueue?.(draft)
       clearContext(submission.target())
       clearInput()
-      return
+      return true
     }
 
     input.onSubmit?.()
@@ -580,7 +578,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           })
           restoreInput()
         })
-      return
+      return true
     }
 
     if (text.startsWith("/")) {
@@ -614,7 +612,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             })
             restoreInput()
           })
-        return
+        return true
       }
     }
 
@@ -690,7 +688,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return true
     }
 
-    void sendFollowupDraft({
+    return sendFollowupDraft({
       api: sdk().api.session,
       sync: sync(),
       serverSync: serverSync(),
@@ -705,24 +703,27 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           mode: next.goal.mode,
         })
       },
-    }).catch(async (err) => {
-      pending.delete(pendingKey(session.id))
-      if (sessionDirectory === projectDirectory) {
-        sync().set("session_status", session.id, { type: "idle" })
-      }
-      if (draft.goal) {
-        await input.goal?.refreshFocused(draft.sessionID).catch(() => undefined)
-        if (!input.goal?.focused(draft.sessionID)) {
-          input.goal?.restore(draft.goal.armKey, { mode: draft.goal.mode })
-        }
-      }
-      showToast({
-        title: language.t("prompt.toast.promptSendFailed.title"),
-        description: errorMessage(err),
-      })
-      removeOptimisticMessage()
-      if (restoreInput()) restoreCommentItems(submission.target(), commentItems)
     })
+      .then((sent) => sent)
+      .catch(async (err) => {
+        pending.delete(pendingKey(session.id))
+        if (sessionDirectory === projectDirectory) {
+          sync().set("session_status", session.id, { type: "idle" })
+        }
+        if (draft.goal) {
+          await input.goal?.refreshFocused(draft.sessionID).catch(() => undefined)
+          if (!input.goal?.focused(draft.sessionID)) {
+            input.goal?.restore(draft.goal.armKey, { mode: draft.goal.mode })
+          }
+        }
+        showToast({
+          title: language.t("prompt.toast.promptSendFailed.title"),
+          description: errorMessage(err),
+        })
+        removeOptimisticMessage()
+        if (restoreInput()) restoreCommentItems(submission.target(), commentItems)
+        return false
+      })
   }
 
   return {

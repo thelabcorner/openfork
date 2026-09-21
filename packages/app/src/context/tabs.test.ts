@@ -6,6 +6,7 @@ import type { SessionTab, Tab } from "./tabs"
 import type { useTabs } from "./tabs"
 import { migrateTabs } from "./tab-migration"
 import type { ServerConnection } from "./server"
+import { appTabPageFromPathname, normalizeAppTabHref } from "./app-tabs"
 
 const server = "local\nhttp://localhost:4096" as ServerConnection.Key
 
@@ -27,6 +28,43 @@ describe("tab migration", () => {
   test("replaces invalid top-level persisted data", () => {
     expect(migrateTabs(null, server)).toEqual([])
     expect(migrateTabs({}, server)).toEqual([])
+  })
+
+  test("restores application tabs without coupling them to a server", () => {
+    expect(
+      migrateTabs(
+        [
+          { type: "app", page: "settings", href: "/settings?tab=models" },
+          { type: "app", page: "usage", href: "/usage" },
+          { type: "app", page: "oxp", href: "/oxp/activity/oxpa_example" },
+          { type: "app", page: "unknown", href: "/unknown" },
+        ],
+        server,
+      ),
+    ).toEqual([
+      { type: "app", page: "settings", href: "/settings?tab=models" },
+      { type: "app", page: "usage", href: "/usage" },
+      { type: "app", page: "oxp", href: "/oxp/activity/oxpa_example" },
+    ])
+  })
+})
+
+describe("application tab routes", () => {
+  test("recognizes only first-class singleton application surfaces", () => {
+    expect(appTabPageFromPathname("/settings")).toBe("settings")
+    expect(appTabPageFromPathname("/usage")).toBe("usage")
+    expect(appTabPageFromPathname("/scheduled")).toBe("scheduled")
+    expect(appTabPageFromPathname("/oxp")).toBe("oxp")
+    expect(appTabPageFromPathname("/oxp/activity/abc")).toBe("oxp")
+    expect(appTabPageFromPathname("/oxp/activity")).toBeUndefined()
+  })
+
+  test("pins persisted hrefs to their own internal surface", () => {
+    expect(normalizeAppTabHref("settings", "/settings?tab=providers#local")).toBe("/settings?tab=providers#local")
+    expect(normalizeAppTabHref("settings", "/usage")).toBe("/settings")
+    expect(normalizeAppTabHref("usage", "https://example.com/usage")).toBe("/usage")
+    expect(normalizeAppTabHref("oxp", "/oxp/activity/oxpa_example")).toBe("/oxp/activity/oxpa_example")
+    expect(normalizeAppTabHref("oxp", "/settings")).toBe("/oxp")
   })
 })
 
@@ -215,6 +253,37 @@ describe("tab batch close", () => {
 
   const sessionIDs = () =>
     tabs.store.flatMap((tab) => (tab.type === "session" ? [tab.sessionId] : []))
+
+  test("opens application surfaces as singleton tabs and refreshes their route", async () => {
+    mount({ tabs: [sessionTab("a")] })
+
+    tabs.openAppTab("settings", "/settings?tab=models")
+    await flush()
+    expect(tabs.store.filter((tab) => tab.type === "app")).toEqual([
+      { type: "app", page: "settings", href: "/settings?tab=models" },
+    ])
+    expect(navigateCalls.at(-1)).toBe("/settings?tab=models")
+
+    tabs.openAppTab("settings", "/settings?tab=providers")
+    await flush()
+    expect(tabs.store.filter((tab) => tab.type === "app")).toEqual([
+      { type: "app", page: "settings", href: "/settings?tab=providers" },
+    ])
+    expect(navigateCalls.at(-1)).toBe("/settings?tab=providers")
+  })
+
+  test("keeps server-neutral application tabs during server pruning", async () => {
+    mount({
+      tabs: [
+        { type: "app", page: "usage", href: "/usage" },
+        sessionTab("a"),
+      ],
+    })
+    await flush()
+
+    expect(tabs.store.some((tab) => tab.type === "app" && tab.page === "usage")).toBe(true)
+    expect(sessionIDs()).toEqual(["a"])
+  })
 
   test("records each batch-closed session tab in the reopen stack with a sane index", async () => {
     mount({ tabs: [sessionTab("a"), sessionTab("b"), sessionTab("c"), sessionTab("d")] })

@@ -14,6 +14,13 @@ import { createTabMemory } from "./tab-memory"
 import { nextTabAfterClose, pushClosedTab, removeClosedTabs, takeClosedTab, type ClosedTab } from "./closed-tabs"
 import type { PromptModel } from "./prompt-state"
 import { migrateTabs } from "./tab-migration"
+import {
+  appTabPageFromPathname,
+  normalizeAppTabHref,
+  type AppTabPage,
+} from "./app-tabs"
+
+export type { AppTabPage } from "./app-tabs"
 
 let promptRuntime: Promise<typeof import("./prompt-state")> | undefined
 const loadPromptRuntime = () => (promptRuntime ??= import("./prompt-state"))
@@ -38,7 +45,13 @@ export type GroupTab = {
   groupId: string
 }
 
-export type Tab = SessionTab | DraftTab | GroupTab
+export type AppTab = {
+  type: "app"
+  page: AppTabPage
+  href: string
+}
+
+export type Tab = SessionTab | DraftTab | GroupTab | AppTab
 
 export type TabInfo = {
   title?: string
@@ -55,12 +68,14 @@ export const groupHref = (server: ServerConnection.Key, groupId: string) =>
   `/server/${base64Encode(server)}/group/${groupId}`
 
 export const tabHref = (tab: Tab) => {
+  if (tab.type === "app") return normalizeAppTabHref(tab.page, tab.href)
   if (tab.type === "draft") return draftHref(tab.draftID)
   if (tab.type === "group") return groupHref(tab.server, tab.groupId)
   return sessionHref(tab.server, tab.sessionId)
 }
 
 export const tabKey = (tab: Tab) => {
+  if (tab.type === "app") return `app:${tab.page}`
   if (tab.type === "draft") return `draft:${tab.draftID}`
   return `${tab.server}\n${tabHref(tab)}`
 }
@@ -167,6 +182,26 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       })
     }
 
+    const upsertAppTab = (page: AppTabPage, href?: string) => {
+      const next: AppTab = { type: "app", page, href: normalizeAppTabHref(page, href) }
+      const index = store.findIndex((tab) => tab.type === "app" && tab.page === page)
+      if (index === -1) {
+        setStore(
+          produce((tabs) => {
+            if (tabs.some((tab) => tab.type === "app" && tab.page === page)) return
+            tabs.push(next)
+          }),
+        )
+        return next
+      }
+
+      const current = store[index]
+      if (current?.type === "app" && current.href !== next.href) {
+        setStore(index, next)
+      }
+      return next
+    }
+
     const updateClosed = (update: (stack: ClosedTab[]) => ClosedTab[]) => {
       const apply = () => {
         setClosed((stack) => {
@@ -200,13 +235,27 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
 
     onCleanup(memory.dispose)
 
+    // Routes remain the source of truth for what is on screen. Any direct
+    // navigation into a first-class application surface therefore creates (or
+    // refreshes) its durable tab too. This catches sidebar buttons, commands,
+    // deep links and restored URLs without requiring every caller to remember a
+    // special tab-opening API.
+    createEffect(() => {
+      if (!ready()) return
+      const page = appTabPageFromPathname(location.pathname)
+      if (!page) return
+      const tab = upsertAppTab(page, `${location.pathname}${location.search}${location.hash}`)
+      const key = tabKey(tab)
+      if (recentKey() !== key) setRecentKey(key)
+    })
+
     createEffect(() => {
       if (!ready() || !recentReady()) return
       const servers = new Set(server.list.map(ServerConnection.key))
-      const next = store.filter((tab) => servers.has(tab.server))
+      const next = store.filter((tab) => tab.type === "app" || servers.has(tab.server))
       if (next.length !== store.length) {
         for (const tab of store) {
-          if (!servers.has(tab.server)) {
+          if (tab.type !== "app" && !servers.has(tab.server)) {
             const key = tabKey(tab)
             memory.remove(key)
             removeInfo(key)
@@ -353,6 +402,11 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         })
         return next
       },
+      openAppTab(page: AppTabPage, href?: string) {
+        const next = upsertAppTab(page, href)
+        navigateTab(next)
+        return next
+      },
       reorder(keys: string[]) {
         setStore(
           produce((tabs) => {
@@ -481,8 +535,8 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       removeServer(key: ServerConnection.Key) {
         updateClosed((stack) => stack.filter((entry) => entry.tab.server !== key))
         const drafts = store.flatMap((tab) => (tab.type === "draft" && tab.server === key ? [tab.draftID] : []))
-        const removed = store.filter((tab) => tab.server === key).map(tabKey)
-        setStore((tabs) => tabs.filter((tab) => tab.server !== key))
+        const removed = store.filter((tab) => tab.type !== "app" && tab.server === key).map(tabKey)
+        setStore((tabs) => tabs.filter((tab) => tab.type === "app" || tab.server !== key))
         for (const key of removed) memory.remove(key)
         for (const key of removed) removeInfo(key)
         if (recent.key && removed.includes(recent.key)) setRecentKey(undefined)

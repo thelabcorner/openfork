@@ -1,4 +1,4 @@
-export type PromptPrimaryAction = "submit" | "revise" | "clarify" | "stop" | "blocked"
+export type PromptPrimaryAction = "submit" | "revise" | "stop" | "blocked"
 export type PromptRevisionAutomaticIntent = "review" | "send"
 
 export function isPromptTextRevisable(text: string) {
@@ -17,11 +17,9 @@ export function resolvePromptPrimaryAction(input: {
   hasRevisableText: boolean
   autoReviseBeforeSending: boolean
   revisionBusy: boolean
-  awaitingClarification?: boolean
   revisionReadyForSend?: boolean
 }): PromptPrimaryAction {
   if (input.revisionBusy) return "blocked"
-  if (input.awaitingClarification) return "clarify"
   if (input.working && !input.canSubmit) return "stop"
   if (
     input.mode === "normal" &&

@@ -69,7 +69,7 @@ export function createDraftStore(driver: Driver): DraftStore {
     await Promise.all(
       entries.map(async ([key, entry]) => {
         clearTimeout(entry.timer)
-        await commit(key, entry.value).catch(() => undefined)
+        await commit(key, entry.value)
       }),
     )
   }
@@ -195,7 +195,7 @@ export function createBrowserDraftStore(): DraftStore {
 }
 
 export function attachDraftFlush(store: DraftStore) {
-  const flush = () => void store.flush()
+  const flush = () => void store.flush().catch(() => undefined)
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flush()
   })

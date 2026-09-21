@@ -1,4 +1,4 @@
-import type { GoalDetail, GoalInfo, OpencodeClient } from "@opencode-ai/sdk/v2/client"
+import type { GoalDetail, GoalInfo } from "@opencode-ai/sdk/v2/client"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import { Popover } from "@opencode-ai/ui/popover"
@@ -9,9 +9,10 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import { For, Show, createEffect, createMemo, createSignal, on, untrack, type JSX } from "solid-js"
+import { useSessionNavigation } from "@opencode-ai/session-ui/context"
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, untrack, type JSX } from "solid-js"
 import { ModelSelectorPopoverV2 } from "./dialog-select-model"
-import { useGoals } from "@/context/goals"
+import { type FocusedGoal, useGoals } from "@/context/goals"
 import { useLanguage } from "@/context/language"
 import { useLocal } from "@/context/local"
 import { useSDK } from "@/context/sdk"
@@ -19,6 +20,12 @@ import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useNow } from "@/hooks/use-now"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
+import {
+  revisionCanApplyNow,
+  revisionRecoveryDecision,
+  revisionWorkspaceSourceFingerprint,
+  type RevisionDraftTarget,
+} from "@/utils/revision-draft"
 import { showToast } from "@/utils/toast"
 import {
   formatGoalElapsed,
@@ -31,15 +38,18 @@ import {
   applyRevisedGoalObjective,
   buildGoalRevisorDraft,
   buildGoalRevisorGuidance,
-  buildGoalStartMessage,
-  buildGoalUpdatedMessage,
 } from "./goal-revisor"
-import { promptRevisionClarifications, promptRevisionResponse } from "./prompt-input/prompt-revision"
 
 type Props = { sessionID: string; promptText?: () => string }
 type LauncherProps = { sessionID?: string; armKey: string; promptText?: () => string }
 type GoalModelRef = { providerID: string; modelID: string }
 type GoalTone = "muted" | "success" | "warning" | "danger"
+type GoalDisplayStatus =
+  | Exclude<GoalInfo["status"], "verifying">
+  | "audit_requested"
+  | "auditing"
+  | "audit_error"
+  | "ready_for_review"
 
 /** One label/typography scale for every dense row inside the Goal surfaces. */
 const LABEL = "text-[9px] font-[620] uppercase leading-[14px] tracking-[0.055em] text-v2-text-text-faint"
@@ -79,17 +89,37 @@ function lifecycleLabel(language: ReturnType<typeof useLanguage>, status: string
   return language.t("goal.resume")
 }
 
-function goalTone(status: string): GoalTone {
+function goalDisplayStatus(
+  status: GoalInfo["status"],
+  mode: GoalInfo["continuationPolicy"]["mode"],
+  runtimePhase?: string,
+): GoalDisplayStatus {
+  if (runtimePhase === "audit_requested") return "audit_requested"
+  if (runtimePhase === "auditing") return "auditing"
+  if (runtimePhase === "audit_error") return "audit_error"
+  // `verifying` is durable Goal lifecycle state, not evidence that the
+  // independent auditor is executing. Never expose it as a live status label.
+  // For automatic Goals, `verifying` with no live runtime is an invalid/orphaned
+  // state. Call it an error, never a passive "waiting" state that can lie forever.
+  if (status === "verifying") return mode === "manual" ? "ready_for_review" : "audit_error"
+  return status
+}
+
+function goalStatusLabel(language: ReturnType<typeof useLanguage>, status: GoalDisplayStatus) {
+  return language.t(`goal.status.${status}` as const)
+}
+
+function goalTone(status: GoalDisplayStatus): GoalTone {
   if (status === "completed") return "success"
-  if (status === "blocked" || status === "verifying") return "warning"
-  if (status === "failed" || status === "cancelled") return "danger"
+  if (status === "blocked" || status === "audit_requested" || status === "auditing" || status === "ready_for_review") return "warning"
+  if (status === "failed" || status === "cancelled" || status === "audit_error") return "danger"
   return "muted"
 }
 
-function goalStatusIcon(status: string) {
+function goalStatusIcon(status: GoalDisplayStatus) {
   if (status === "completed") return "check" as const
-  if (status === "verifying") return "hourglass" as const
-  if (status === "blocked" || status === "failed") return "warning" as const
+  if (status === "audit_requested" || status === "auditing" || status === "ready_for_review") return "hourglass" as const
+  if (status === "blocked" || status === "failed" || status === "audit_error") return "warning" as const
   if (status === "cancelled") return "xmark-small" as const
   if (status === "active") return "star-filled" as const
   if (status === "paused") return "pause" as const
@@ -100,9 +130,46 @@ function promptDraftText(promptText?: () => string) {
   return (promptText?.() ?? "").trim()
 }
 
-/** Post plain text into the session so a started/edited brief reaches the agent immediately. */
-async function postSessionText(client: Pick<OpencodeClient, "session">, sessionID: string, text: string) {
-  await client.session.prompt({ sessionID, parts: [{ type: "text", text }] }, { throwOnError: true })
+function auditorSessionIDOf(value: FocusedGoal | null | undefined) {
+  if (value?.automation?.phase === "auditing") return value.automation.auditorSessionID
+  return value?.auditorSessionID
+}
+
+/**
+ * Goal Auditor execution is a real Session, so opening it must use the same
+ * session-ui navigation contract as Task subagents. This component deliberately
+ * knows nothing about routes, Goal tables, or Session Groups.
+ */
+function GoalAuditorSessionLink(props: { sessionID?: string }) {
+  const language = useLanguage()
+  const navigation = useSessionNavigation(() => props.sessionID)
+  const navigate = (event: MouseEvent) => {
+    event.stopPropagation()
+    navigation.navigate(event)
+  }
+  const navigateKey = (event: KeyboardEvent) => {
+    event.stopPropagation()
+    navigation.navigateKey(event)
+  }
+
+  return (
+    <Show when={navigation.clickable()}>
+      <TooltipV2 placement="top" gutter={4} value={language.t("goal.auditor.openSession")}>
+        <a
+          data-action="goal-open-auditor-session"
+          href={navigation.href()}
+          role={navigation.href() ? undefined : "button"}
+          tabIndex={navigation.href() ? undefined : 0}
+          aria-label={language.t("goal.auditor.openSession")}
+          class="grid size-5 shrink-0 place-items-center rounded-[4px] text-v2-icon-icon-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-icon-icon-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
+          onClick={navigate}
+          onKeyDown={navigateKey}
+        >
+          <Icon name="square-arrow-top-right" size="small" />
+        </a>
+      </TooltipV2>
+    </Show>
+  )
 }
 
 export function GoalComposerShelf(props: Props) {
@@ -113,6 +180,14 @@ export function GoalComposerShelf(props: Props) {
   const current = createMemo(() => goals.focused(props.sessionID))
   const detail = createMemo(() => current()?.detail)
   const goal = createMemo(() => detail()?.goal)
+  const goalID = createMemo(() => goal()?.id)
+  const runtimePhase = createMemo(() => current()?.automation?.phase)
+  const auditorSessionID = createMemo(() => auditorSessionIDOf(current()))
+  const displayStatus = createMemo<GoalDisplayStatus | undefined>(() => {
+    const value = goal()
+    if (!value) return
+    return goalDisplayStatus(value.status, value.continuationPolicy.mode, runtimePhase())
+  })
   const now = useNow(() => !!goal() && !isGoalTerminal(goal()!.status))
   const elapsed = createMemo(() => {
     const value = goal()
@@ -139,7 +214,10 @@ export function GoalComposerShelf(props: Props) {
 
   // A different Goal is a different surface: never inherit the previous one's
   // expansion, or focusing a Goal silently reopens a panel the user closed.
-  createEffect(on(() => goal()?.id, () => setOpen(false), { defer: true }))
+  // Track the primitive ID through its own memo. Goal detail is replaced after
+  // ordinary saves/transitions, and subscribing through the whole Goal object
+  // would collapse the panel even when the focused Goal did not change.
+  createEffect(on(goalID, () => setOpen(false), { defer: true }))
 
   createEffect(() => {
     if (!open() || !goal()) return
@@ -196,6 +274,7 @@ export function GoalComposerShelf(props: Props) {
       <div
         data-component="goal-composer-shelf"
         data-goal-status={goal()!.status}
+        data-goal-runtime-phase={runtimePhase()}
         data-expanded={open() ? "true" : undefined}
         class="mb-1.5 w-full min-w-0 overflow-hidden rounded-xl border-[0.5px] border-v2-border-border-base bg-v2-background-bg-base"
       >
@@ -208,7 +287,7 @@ export function GoalComposerShelf(props: Props) {
           // Named explicitly: the row seats its own buttons, and a name computed
           // from contents would swallow their labels into this one.
           aria-label={goal()!.title}
-          title={`${goal()!.title} · ${goal()!.status} · ${elapsed()}`}
+          title={`${goal()!.title} · ${goalStatusLabel(language, displayStatus()!)} · ${elapsed()}`}
           class="flex h-[42px] min-w-0 cursor-default items-center gap-2 pl-3 pr-2 transition-colors"
           classList={{
             "border-b border-v2-border-border-muted bg-v2-background-bg-layer-01": open(),
@@ -221,7 +300,7 @@ export function GoalComposerShelf(props: Props) {
             setOpen((value) => !value)
           }}
         >
-          <GoalStatusGlyph status={goal()!.status} />
+          <GoalStatusGlyph status={displayStatus()!} />
           <span class="max-w-[46%] shrink-0 truncate text-[13px] font-[500] leading-5 tracking-[-0.04px] text-v2-text-text-base">
             {goal()!.title}
           </span>
@@ -237,7 +316,8 @@ export function GoalComposerShelf(props: Props) {
               </span>
             </Show>
             <span class="shrink-0 text-[11px] tabular-nums leading-4 text-v2-text-text-faint">{elapsed()}</span>
-            <GoalStatusChip status={goal()!.status} />
+            <GoalStatusChip status={displayStatus()!} />
+            <GoalAuditorSessionLink sessionID={auditorSessionID()} />
             <span class="h-4 w-px shrink-0 bg-v2-border-border-muted" />
             <Show when={["draft", "active", "paused", "blocked"].includes(goal()!.status)}>
               <TooltipV2
@@ -338,7 +418,7 @@ function GoalCriteriaTicks(props: { items: { status: string }[] }) {
   )
 }
 
-function GoalStatusGlyph(props: { status: string }) {
+function GoalStatusGlyph(props: { status: GoalDisplayStatus }) {
   const tone = () => goalTone(props.status)
   return (
     <span
@@ -354,10 +434,12 @@ function GoalStatusGlyph(props: { status: string }) {
   )
 }
 
-function GoalStatusChip(props: { status: string }) {
+function GoalStatusChip(props: { status: GoalDisplayStatus }) {
+  const language = useLanguage()
   const tone = () => goalTone(props.status)
   return (
     <span
+      data-slot="goal-status-chip"
       class="shrink-0 rounded-[4px] border border-v2-border-border-muted px-1 text-[9px] font-[620] uppercase leading-[15px] tracking-[0.05em] text-v2-text-text-faint"
       classList={{
         "text-v2-state-fg-success": tone() === "success",
@@ -365,7 +447,7 @@ function GoalStatusChip(props: { status: string }) {
         "text-v2-state-fg-danger": tone() === "danger",
       }}
     >
-      {props.status}
+      {goalStatusLabel(language, props.status)}
     </span>
   )
 }
@@ -385,13 +467,20 @@ function GoalPanel(props: {
 }) {
   const goals = useGoals()
   const language = useLanguage()
-  const sdk = useSDK()
   const current = createMemo(() => goals.focused(props.sessionID))
   const detail = createMemo(() => current()!.detail)
   const goal = createMemo(() => detail().goal)
+  const runtimePhase = createMemo(() => current()?.automation?.phase)
   const expanded = createMemo(() => goals.expanded(goal().id))
   const draft = createMemo(() => goal().status === "draft")
-  const locked = createMemo(() => props.busy || goal().status === "verifying" || isGoalTerminal(goal().status))
+  const locked = createMemo(
+    () =>
+      props.busy ||
+      runtimePhase() === "audit_requested" ||
+      runtimePhase() === "auditing" ||
+      goal().status === "verifying" ||
+      isGoalTerminal(goal().status),
+  )
   const auditorModel = createMemo<GoalModelRef | undefined>(() => {
     const model = goal().auditorPolicy.model
     return model ? { providerID: model.providerID, modelID: model.id } : undefined
@@ -409,6 +498,7 @@ function GoalPanel(props: {
     const value = latestAudit()?.payload.continuationPrompt
     return typeof value === "string" && value.trim() ? value.trim() : undefined
   })
+  const auditorRuns = createMemo(() => Math.max(0, Math.floor(number(goal().auditorRuns))))
   /** Evidence attached per criterion - the visible reason completion is gated. */
   const evidenceCount = createMemo(() => {
     const counts = new Map<string, number>()
@@ -434,7 +524,16 @@ function GoalPanel(props: {
   })
   /** Footer status line: the one sentence that explains the current gate. */
   const status = createMemo(() => {
+    if (runtimePhase() === "audit_error") {
+      const runtime = current()?.automation
+      const error = runtime?.phase === "audit_error" ? runtime.error : language.t("goal.auditErrorUnknown")
+      return language.t("goal.auditErrorHint", { error })
+    }
+    if (runtimePhase() === "audit_requested") return language.t("goal.auditRequestedHint")
+    if (runtimePhase() === "auditing") return language.t("goal.auditingHint")
     if (draft()) return detail().criteria.length === 0 ? language.t("goal.startRequiresCriterion") : startTooltip()
+    if (goal().status === "verifying" && goal().continuationPolicy.mode !== "manual")
+      return language.t("goal.auditNotRunningHint")
     if (goal().status === "verifying")
       return verificationReady() ? language.t("goal.complete") : language.t("goal.completeRequires")
     if (goal().status === "active" && goal().continuationPolicy.mode === "auto_continue")
@@ -448,21 +547,13 @@ function GoalPanel(props: {
       const composerText = promptDraftText(props.promptText)
       const snapshot = goals.focused(props.sessionID)?.detail
       if (!snapshot) throw new Error("No focused Goal")
-      await goals.transition(props.sessionID, "start")
+      const live = await goals.transition(props.sessionID, "start")
       if (composerText) {
         // The composer draft stays untouched: the user presses Send next and
         // the prompt travels with the now-active goal already in context.
         return
       }
-      const live = goals.focused(props.sessionID)?.detail ?? snapshot
-      await postSessionText(
-        sdk().client,
-        props.sessionID,
-        buildGoalStartMessage({
-          objective: live.goal.objective,
-          criteria: live.criteria.map((item) => item.description),
-        }),
-      )
+      await goals.dispatch(props.sessionID, "start", live ?? snapshot)
       showToast({ variant: "success", title: language.t("goal.startedAndSent") })
     })
 
@@ -554,6 +645,10 @@ function GoalPanel(props: {
                 </For>
               </div>
               <div class="ml-auto flex min-w-0 items-center justify-end gap-1.5">
+                <span class="shrink-0 text-[9px] font-[520] tabular-nums leading-[14px] text-v2-text-text-faint">
+                  {language.plural("goal.auditor.runs", auditorRuns(), { count: auditorRuns() })}
+                </span>
+                <span class="h-3 w-px shrink-0 bg-v2-border-border-muted" />
                 <span class={`shrink-0 ${LABEL}`}>{language.t("goal.auditor")}</span>
                 <GoalAuditorModelPicker
                   value={auditorModel()}
@@ -666,14 +761,25 @@ function GoalPanel(props: {
               size="small"
               variant="contrast"
               class="shrink-0 whitespace-nowrap"
-              disabled={props.busy}
+              disabled={props.busy || runtimePhase() === "audit_requested" || runtimePhase() === "auditing"}
               onClick={() => props.onRun(() => goals.transition(props.sessionID, "request_verification"))}
             >
-              {language.t("goal.verify")}
+              {runtimePhase() === "audit_error" ? language.t("goal.retryAudit") : language.t("goal.verify")}
             </ButtonV2>
           </Show>
 
           <Show when={goal().status === "verifying"}>
+            <Show when={goal().continuationPolicy.mode !== "manual" && runtimePhase() !== "auditing"}>
+              <ButtonV2
+                size="small"
+                variant="contrast"
+                class="shrink-0 whitespace-nowrap"
+                disabled={props.busy || runtimePhase() === "audit_requested" || runtimePhase() === "auditing"}
+                onClick={() => props.onRun(() => goals.transition(props.sessionID, "request_verification"))}
+              >
+                {language.t("goal.retryAudit")}
+              </ButtonV2>
+            </Show>
             <TooltipV2 placement="top" gutter={4} value={language.t("goal.resumeWork")}>
               <IconButtonV2
                 type="button"
@@ -925,7 +1031,6 @@ function GoalBriefEditor(props: {
 }) {
   const goals = useGoals()
   const language = useLanguage()
-  const sdk = useSDK()
   const [title, setTitle] = createSignal("")
   const [objective, setObjective] = createSignal("")
   const editable = createMemo(() => ["active", "paused", "blocked"].includes(props.detail().goal.status))
@@ -955,6 +1060,9 @@ function GoalBriefEditor(props: {
   const valid = createMemo(() => !!title().trim() && !!objective().trim())
 
   const refine = createGoalRefine({
+    sessionID: () => props.sessionID,
+    targetKey: () => `goal:${props.detail().goal.id}`,
+    durableObjective: () => props.detail().goal.objective,
     objective,
     criteriaText: () =>
       props
@@ -970,12 +1078,9 @@ function GoalBriefEditor(props: {
     props.onRun(async () => {
       const next = await goals.updateActive(props.sessionID, { title: title().trim(), objective: objective().trim() })
       seed(next)
+      await refine.commit()
       if (!notify) return
-      await postSessionText(
-        sdk().client,
-        props.sessionID,
-        buildGoalUpdatedMessage({ title: next.goal.title, objective: next.goal.objective }),
-      )
+      await goals.dispatch(props.sessionID, "update", next)
       showToast({ variant: "success", title: language.t("goal.sentToAgent") })
     })
 
@@ -1000,7 +1105,6 @@ function GoalBriefEditor(props: {
             placeholder={language.t("goal.field.objectivePlaceholder")}
           />
         </div>
-        {refine.questions()}
         <Show when={editable() && dirty()}>
           <div class="flex h-8 min-w-0 items-center justify-end gap-1 border-t border-v2-border-border-muted px-2">
             <ButtonV2
@@ -1092,6 +1196,9 @@ function GoalDraftSetup(props: {
   })
 
   const refine = createGoalRefine({
+    sessionID: () => props.sessionID,
+    targetKey: () => `goal:${props.detail().goal.id}`,
+    durableObjective: () => props.detail().goal.objective,
     objective,
     criteriaText: criteria,
     promptText: props.promptText,
@@ -1111,6 +1218,7 @@ function GoalDraftSetup(props: {
         },
       })
       seed(next)
+      await refine.commit()
     })
 
   return (
@@ -1150,7 +1258,6 @@ function GoalDraftSetup(props: {
           </div>
         </div>
       </div>
-      {refine.questions()}
       <Show when={dirty()}>
         <div class="flex h-8 min-w-0 items-center justify-end gap-1 border-t border-v2-border-border-muted px-2">
           <ButtonV2
@@ -1169,6 +1276,10 @@ function GoalDraftSetup(props: {
 }
 
 type GoalRefineInput = {
+  sessionID?: () => string | undefined
+  targetKey: () => string
+  durableObjective?: () => string | undefined
+  requireExplicitRecovery?: boolean
   objective: () => string
   criteriaText: () => string
   promptText?: () => string
@@ -1176,20 +1287,12 @@ type GoalRefineInput = {
   onApply: (value: string) => void
 }
 
-type GoalRevisorQuestion = {
-  question: string
-  header: string
-  options: { label: string; description: string }[]
-  multiple?: boolean
-  custom?: boolean
-}
-
 type GoalRevisorFlow = {
   token: number
   draft: string
   guidance: string
-  clarifications: { question: string; answers: string[]; detail?: string }[]
-  round: number
+  directory: string
+  target: RevisionDraftTarget
 }
 
 /**
@@ -1200,8 +1303,8 @@ type GoalRevisorFlow = {
  * goal-objective.md file is created: the goal's `objective` itself is the
  * durable markdown brief the agent reads through GoalContext.
  *
- * Returns the trigger and the clarification panel separately so callers can
- * seat the trigger in a section header and the panel in the section body.
+ * Clarification is owned by the canonical session QuestionV2 surface. This
+ * helper never materializes a second question state machine inside Goal UI.
  */
 function createGoalRefine(input: GoalRefineInput) {
   const sdk = useSDK()
@@ -1209,60 +1312,181 @@ function createGoalRefine(input: GoalRefineInput) {
   const local = useLocal()
   const language = useLanguage()
   const [busy, setBusy] = createSignal(false)
-  const [pending, setPending] = createSignal<
-    { flow: GoalRevisorFlow; items: GoalRevisorQuestion[]; round: number } | undefined
-  >()
-  const [answers, setAnswers] = createSignal<string[][]>([])
-  const [details, setDetails] = createSignal<string[]>([])
   let request = 0
+  let abort: AbortController | undefined
+  const pendingArtifacts = new Map<string, string>()
+  onCleanup(() => {
+    request += 1
+    abort?.abort()
+  })
 
   const sourceText = () => promptDraftText(input.promptText)
   const canRun = () =>
     !busy() && !input.disabled?.() && (!!input.objective().trim() || !!input.criteriaText().trim() || !!sourceText())
 
+  const consumeArtifact = async (id: string | undefined) => {
+    if (!id) return false
+    try {
+      await sdk().api.revisionDraft.consume({ id })
+      for (const [key, pending] of pendingArtifacts) {
+        if (pending === id) pendingArtifacts.delete(key)
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const rememberArtifact = (key: string, id: string | undefined) => {
+    if (id) pendingArtifacts.set(key, id)
+  }
+
+  const commit = () => consumeArtifact(pendingArtifacts.get(input.targetKey()))
+
+  const currentDraft = () =>
+    buildGoalRevisorDraft({
+      objective: input.objective(),
+      criteria: input.criteriaText(),
+      promptText: sourceText(),
+    })
+
+  let recoveredScope: string | undefined
+  createEffect(() => {
+    const directory = sdk().directory
+    const key = input.targetKey()
+    const scope = `${directory}\0${key}`
+    if (scope === recoveredScope) return
+    recoveredScope = scope
+    queueMicrotask(() => {
+      void (async () => {
+        const artifact = await sdk().api.revisionDraft.recover({ kind: "goal", key }).catch(() => null)
+        if (!artifact || artifact.kind !== "goal" || artifact.key !== key || sdk().directory !== directory) return
+        const revised = applyRevisedGoalObjective(artifact.prompt)
+        if (input.durableObjective?.() === revised) {
+          await consumeArtifact(artifact.id)
+          return
+        }
+        const fingerprint = await revisionWorkspaceSourceFingerprint({ directory, source: currentDraft() })
+        if (input.targetKey() !== key || sdk().directory !== directory) return
+        const decision = revisionRecoveryDecision({
+          sourceFingerprint: artifact.sourceFingerprint,
+          currentFingerprint: fingerprint,
+          currentText: input.objective(),
+          revisedText: revised,
+          consumeIfEqual: false,
+          requireExplicitApply: input.requireExplicitRecovery,
+        })
+        if (decision === "consume") {
+          await consumeArtifact(artifact.id)
+          return
+        }
+        const applyRecovered = async (expectedFingerprint: string) => {
+          if (input.targetKey() !== key || sdk().directory !== directory) {
+            showToast({
+              title: language.t("prompt.revision.error.title"),
+              description: language.t("prompt.revision.changedDuringRequest"),
+            })
+            return
+          }
+          const currentFingerprint = await revisionWorkspaceSourceFingerprint({
+            directory: sdk().directory,
+            source: currentDraft(),
+          })
+          if (input.targetKey() !== key || sdk().directory !== directory) {
+            showToast({
+              title: language.t("prompt.revision.error.title"),
+              description: language.t("prompt.revision.changedDuringRequest"),
+            })
+            return
+          }
+          if (
+            !revisionCanApplyNow({
+              expectedFingerprint,
+              currentFingerprint,
+            })
+          ) {
+            showToast({
+              title: language.t("prompt.revision.error.title"),
+              description: language.t("prompt.revision.changedDuringRequest"),
+            })
+            return
+          }
+          input.onApply(revised)
+          rememberArtifact(key, artifact.id)
+          showToast({ variant: "success", title: language.t("prompt.revision.recovery.restored") })
+        }
+        if (decision === "apply") {
+          void applyRecovered(artifact.sourceFingerprint)
+          return
+        }
+        showToast({
+          title: language.t("prompt.revision.recovery.title"),
+          description: language.t("prompt.revision.recovery.description"),
+          actions: [
+            {
+              label: language.t("prompt.revision.recovery.apply"),
+              onClick: () => void applyRecovered(fingerprint),
+            },
+            { label: language.t("common.dismiss"), onClick: () => void consumeArtifact(artifact.id) },
+          ],
+        })
+      })()
+    })
+  })
+
   const send = async (flow: GoalRevisorFlow) => {
     if (flow.token !== request) return
     setBusy(true)
+    const controller = new AbortController()
+    abort?.abort()
+    abort = controller
     try {
       const configured = settings.general.promptRevision()?.model
       const current = local.model.current()
       const result = await sdk().api.promptRevisor.revise({
         prompt: flow.draft,
-        sessionID: undefined,
+        purpose: "goal",
+        target: flow.target,
+        sessionID: input.sessionID?.(),
+        includeSessionContext: false,
         guidance: flow.guidance,
         model: configured ? { providerID: configured.providerID, id: configured.modelID } : undefined,
         fallbackModel: current
           ? { providerID: current.provider.id, id: current.id, variant: local.model.variant.current() ?? undefined }
           : undefined,
-        clarifications: flow.clarifications,
-        clarificationRound: flow.round,
+        location: { directory: flow.directory },
+        signal: controller.signal,
       })
       if (flow.token !== request) return
-      if (result.type === "question") {
-        setPending({
-          flow,
-          items: result.questions as unknown as GoalRevisorQuestion[],
-          round: result.clarificationRound,
+      if (
+        sdk().directory !== flow.directory ||
+        input.targetKey() !== flow.target.key ||
+        currentDraft() !== flow.draft
+      ) {
+        showToast({
+          title: language.t("prompt.revision.error.title"),
+          description: language.t("prompt.revision.changedDuringRequest"),
         })
-        setAnswers(result.questions.map(() => []))
-        setDetails(result.questions.map(() => ""))
         return
       }
+      if (result.type === "cancelled") return
       input.onApply(applyRevisedGoalObjective(result.prompt))
-      setPending(undefined)
+      rememberArtifact(flow.target.key, result.artifactID)
     } catch (error) {
       if (flow.token !== request) return
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return
       showToast({
         variant: "error",
         title: language.t("goal.reviseFailed"),
         description: error instanceof Error ? error.message : String(error),
       })
     } finally {
+      if (abort === controller) abort = undefined
       if (flow.token === request) setBusy(false)
     }
   }
 
-  const run = () => {
+  const run = async () => {
     if (!canRun()) {
       if (!input.objective().trim() && !input.criteriaText().trim() && !sourceText()) {
         showToast({ title: language.t("goal.reviseNeedsInput") })
@@ -1270,45 +1494,23 @@ function createGoalRefine(input: GoalRefineInput) {
       return
     }
     const token = ++request
-    setPending(undefined)
+    const draft = currentDraft()
+    const directory = sdk().directory
+    const key = input.targetKey()
+    const sourceFingerprint = await revisionWorkspaceSourceFingerprint({ directory, source: draft })
+    if (
+      token !== request ||
+      sdk().directory !== directory ||
+      input.targetKey() !== key ||
+      currentDraft() !== draft
+    )
+      return
     void send({
       token,
-      draft: buildGoalRevisorDraft({
-        objective: input.objective(),
-        criteria: input.criteriaText(),
-        promptText: sourceText(),
-      }),
+      draft,
       guidance: buildGoalRevisorGuidance(),
-      clarifications: [],
-      round: 0,
-    })
-  }
-
-  const submit = () => {
-    const current = pending()
-    if (!current || busy()) return
-    const response = promptRevisionResponse(current.items, answers(), details())
-    const clarifications = promptRevisionClarifications(current.items, response)
-    void send({ ...current.flow, clarifications, round: current.round })
-  }
-
-  const cancel = () => {
-    request += 1
-    setBusy(false)
-    setPending(undefined)
-  }
-
-  const toggle = (index: number, label: string, multiple: boolean) => {
-    if (busy()) return
-    setAnswers((current) => {
-      const next = current.map((entry) => [...entry])
-      if (!multiple) {
-        next[index] = [label]
-        return next
-      }
-      const entry = next[index] ?? []
-      next[index] = entry.includes(label) ? entry.filter((item) => item !== label) : [...entry, label]
-      return next
+      directory,
+      target: { kind: "goal", key, sourceFingerprint },
     })
   }
 
@@ -1318,7 +1520,7 @@ function createGoalRefine(input: GoalRefineInput) {
         type="button"
         data-action="goal-refine"
         disabled={!canRun()}
-        onClick={run}
+        onClick={() => void run()}
         class="inline-flex h-6 shrink-0 items-center gap-1 whitespace-nowrap rounded-[5px] px-1.5 text-[10px] font-[560] leading-[14px] text-v2-text-text-muted outline-none transition-colors enabled:hover:bg-v2-overlay-simple-overlay-hover enabled:hover:text-v2-text-text-base focus-visible:bg-v2-overlay-simple-overlay-hover disabled:opacity-40"
       >
         <Icon name="pencil-sparkles" size="small" class="size-3" />
@@ -1327,102 +1529,7 @@ function createGoalRefine(input: GoalRefineInput) {
     </TooltipV2>
   )
 
-  const questions = () => (
-    <Show when={pending()}>
-      {(current) => (
-        <div class="min-w-0 border-t border-v2-border-border-muted bg-v2-background-bg-base">
-          <div class="flex h-6 items-center px-2.5">
-            <span class={LABEL}>{language.t("goal.reviseQuestion")}</span>
-          </div>
-          <div class="flex min-w-0 flex-col gap-1.5 px-2.5 pb-1.5">
-            <For each={current().items}>
-              {(item, index) => {
-                const multiple = () => item.multiple === true
-                const selected = (label: string) => answers()[index()]?.includes(label) ?? false
-                return (
-                  <div class="min-w-0">
-                    <div class={BODY}>{item.question}</div>
-                    <Show when={item.options.length > 0}>
-                      <div class="mt-1 flex flex-col gap-0.5" role={multiple() ? "group" : "radiogroup"}>
-                        <For each={item.options}>
-                          {(option) => (
-                            <button
-                              type="button"
-                              disabled={busy()}
-                              role={multiple() ? "checkbox" : "radio"}
-                              aria-checked={selected(option.label)}
-                              onClick={() => toggle(index(), option.label, multiple())}
-                              class="flex min-h-6 w-full min-w-0 items-start gap-1.5 rounded-[4px] border px-1.5 py-1 text-left transition-colors disabled:opacity-50"
-                              classList={{
-                                "border-v2-border-border-strong bg-v2-overlay-simple-overlay-pressed": selected(
-                                  option.label,
-                                ),
-                                "border-v2-border-border-muted hover:border-v2-border-border-strong hover:bg-v2-overlay-simple-overlay-hover":
-                                  !selected(option.label),
-                              }}
-                            >
-                              <span
-                                class="mt-px flex size-3 shrink-0 items-center justify-center border border-v2-border-border-strong"
-                                classList={{ "rounded-[3px]": multiple(), "rounded-full": !multiple() }}
-                              >
-                                <Show when={selected(option.label)}>
-                                  <Show
-                                    when={multiple()}
-                                    fallback={<span class="size-1.5 rounded-full bg-v2-icon-icon-base" />}
-                                  >
-                                    <Icon name="check" size="small" class="size-2 text-v2-icon-icon-base" />
-                                  </Show>
-                                </Show>
-                              </span>
-                              <span class="min-w-0 flex-1">
-                                <span class="block text-[10px] font-[540] leading-[14px] text-v2-text-text-base">
-                                  {option.label}
-                                </span>
-                                <Show when={option.description}>
-                                  <span class="block text-[9px] leading-[13px] text-v2-text-text-muted">
-                                    {option.description}
-                                  </span>
-                                </Show>
-                              </span>
-                            </button>
-                          )}
-                        </For>
-                      </div>
-                    </Show>
-                    <Show when={item.custom !== false}>
-                      <input
-                        value={details()[index()] ?? ""}
-                        placeholder={language.t("prompt.revision.guidance.placeholder")}
-                        class="mt-1 box-border h-6 w-full min-w-0 rounded-[4px] border border-v2-border-border-muted bg-v2-background-bg-base px-1.5 text-[10px] leading-[14px] text-v2-text-text-base outline-none transition-colors placeholder:text-v2-text-text-faint focus:border-v2-border-border-strong"
-                        onInput={(event) => {
-                          const value = event.currentTarget.value
-                          setDetails((entries) => {
-                            const next = [...entries]
-                            next[index()] = value
-                            return next
-                          })
-                        }}
-                      />
-                    </Show>
-                  </div>
-                )
-              }}
-            </For>
-            <div class="flex items-center justify-end gap-1">
-              <ButtonV2 size="small" variant="ghost-muted" disabled={busy()} onClick={cancel}>
-                {language.t("common.cancel")}
-              </ButtonV2>
-              <ButtonV2 size="small" variant="contrast" disabled={busy()} onClick={submit}>
-                {language.t("prompt.revision.guidance.run")}
-              </ButtonV2>
-            </div>
-          </div>
-        </div>
-      )}
-    </Show>
-  )
-
-  return { trigger, questions, busy }
+  return { trigger, busy, commit }
 }
 
 function CriterionIcon(props: { status: "pending" | "passed" | "failed" }) {
@@ -1542,7 +1649,6 @@ function GoalAuditorModelPicker(props: {
 export function GoalComposerLauncher(props: LauncherProps) {
   const goals = useGoals()
   const sync = useSync()
-  const sdk = useSDK()
   const language = useLanguage()
   const [shown, setShown] = createSignal(false)
   const [list, setList] = createSignal<GoalInfo[]>([])
@@ -1558,6 +1664,9 @@ export function GoalComposerLauncher(props: LauncherProps) {
   )
   const armed = createMemo(() => !!goals.arm(props.armKey))
   const refine = createGoalRefine({
+    sessionID: () => props.sessionID,
+    targetKey: () => `new:${props.armKey}`,
+    requireExplicitRecovery: true,
     objective,
     criteriaText: criteria,
     promptText: props.promptText,
@@ -1599,9 +1708,12 @@ export function GoalComposerLauncher(props: LauncherProps) {
   }
 
   const create = async (start: boolean) => {
-    const current = session()
     const sessionID = props.sessionID
-    if (!sessionID || !current || !objective().trim()) return
+    // Goal.prepare derives project/workspace ownership from the authoritative
+    // Session on the server. Do not gate creation on the UI session index being
+    // hydrated first: that introduces a race where a valid sessionID is already
+    // usable but sync().data.session has not populated yet.
+    if (!sessionID || !objective().trim()) return
     const acceptance = lines(criteria())
     if (start && acceptance.length === 0) return
     setSubmitting(true)
@@ -1616,15 +1728,12 @@ export function GoalComposerLauncher(props: LauncherProps) {
           : undefined,
         start,
       })
+      await refine.commit()
       const composerText = promptDraftText(props.promptText)
       if (start && !composerText) {
-        // No composer text: the agent would otherwise sit idle on a fresh
-        // active goal, so dispatch the brief itself as the first work item.
-        await postSessionText(
-          sdk().client,
-          sessionID,
-          buildGoalStartMessage({ objective: detail.goal.objective, criteria: acceptance }),
-        )
+        // No composer text: publish only the user's start action. The mutable
+        // objective/criteria are already supplied by the Goal STATE projection.
+        await goals.dispatch(sessionID, "start", detail)
         showToast({ variant: "success", title: language.t("goal.startedAndSent") })
       }
       setObjective("")
@@ -1751,14 +1860,14 @@ export function GoalComposerLauncher(props: LauncherProps) {
                             class="flex min-h-9 w-full min-w-0 items-center gap-2 px-2.5 py-1 text-left transition-colors hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none"
                             onClick={() => void focus(item.id)}
                           >
-                            <GoalStatusGlyph status={item.status} />
+                            <GoalStatusGlyph status={goalDisplayStatus(item.status, item.continuationPolicy.mode)} />
                             <div class="min-w-0 flex-1">
                               <div class={`truncate ${BODY}`}>{item.title}</div>
                               <div class="truncate text-[9px] leading-[13px] text-v2-text-text-faint">
                                 {item.objective}
                               </div>
                             </div>
-                            <GoalStatusChip status={item.status} />
+                            <GoalStatusChip status={goalDisplayStatus(item.status, item.continuationPolicy.mode)} />
                           </button>
                         )}
                       </For>
@@ -1792,7 +1901,6 @@ export function GoalComposerLauncher(props: LauncherProps) {
                     description={language.t("goal.field.criteriaDescription")}
                   />
                   <div class="flex h-7 min-w-0 items-center justify-end px-2">{refine.trigger()}</div>
-                  {refine.questions()}
                 </div>
 
                 <div class="flex h-9 shrink-0 items-center justify-between gap-2 border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2">

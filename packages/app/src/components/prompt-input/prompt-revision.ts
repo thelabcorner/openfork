@@ -1,24 +1,4 @@
 import type { PromptInputV2Prompt } from "@opencode-ai/session-ui/v2/prompt-input/types"
-import { normalizeReply } from "@opencode-ai/core/question-normalize"
-
-export type PromptRevisionQuestionLike = {
-  question: string
-  header: string
-  options: { label: string; description: string }[]
-  multiple?: boolean
-  custom?: boolean
-}
-
-export type PromptRevisionClarification = {
-  question: string
-  answers: string[]
-  detail?: string
-}
-
-export type PromptRevisionResponse = {
-  answers: string[][]
-  details: string[]
-}
 
 export type PromptRevisionReference =
   | {
@@ -317,25 +297,18 @@ export function revisedPromptParts(
   return [...parts, ...images]
 }
 
-export function promptRevisionResponse(
-  questions: readonly PromptRevisionQuestionLike[],
-  answers: readonly (readonly string[])[],
-  details: readonly string[],
-): PromptRevisionResponse {
-  const resolved = normalizeReply(questions, { answers, details })
-  return {
-    answers: resolved.answers.map((answer) => [...answer]),
-    details: [...resolved.details],
-  }
-}
-
-export function promptRevisionClarifications(
-  questions: readonly PromptRevisionQuestionLike[],
-  response: PromptRevisionResponse,
-): PromptRevisionClarification[] {
-  return questions.map((question, index) => ({
-    question: question.question,
-    answers: [...(response.answers[index] ?? [])],
-    ...(response.details[index]?.trim() ? { detail: response.details[index]!.trim() } : {}),
-  }))
+/**
+ * Text equality is insufficient for Prompt recovery because a revision may
+ * carry structured file/agent/skill/resource references. Reconstruct the
+ * canonical revised parts over the hydrated durable draft and compare the full
+ * structural fingerprint before treating the artifact as already owned.
+ */
+export function promptRevisionArtifactIsApplied(
+  current: PromptInputV2Prompt,
+  text: string,
+  references: readonly PromptRevisionReference[] = [],
+) {
+  if (promptRevisionText(current) !== text) return false
+  const candidate = revisedPromptParts(text, current, references)
+  return promptRevisionFingerprint(candidate) === promptRevisionFingerprint(current)
 }

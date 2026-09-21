@@ -5,9 +5,10 @@ export type GoalRevisorSource = {
 }
 
 /**
- * Compose the draft text sent to the existing prompt-revisor service.
- * The revisor stays stateless: it only sees this composed brief plus the
- * fixed goal-oriented guidance, so no new backend endpoint is needed.
+ * Compose the explicit brief sent through the shared revision engine by the
+ * first-class Goal Revisor producer. Its Session-owned transcript is durable,
+ * while conversation injection is deliberately disabled so this document is
+ * the complete model-visible Goal revision context.
  */
 export function buildGoalRevisorDraft(source: GoalRevisorSource) {
   const objective = source.objective.trim()
@@ -39,24 +40,4 @@ export function buildGoalRevisorGuidance() {
 /** Normalize a revisor revision back into the editable objective field. */
 export function applyRevisedGoalObjective(revised: string) {
   return revised.trim()
-}
-
-/** Message posted into the session when a goal starts or its brief changes. */
-export function buildGoalStartMessage(input: { objective: string; criteria: string[]; promptText?: string }) {
-  const objective = input.objective.trim()
-  const promptText = (input.promptText ?? "").trim()
-  const lines = ["[GOAL START]", "", objective]
-  if (input.criteria.length) {
-    lines.push("", "Done when:")
-    for (const item of input.criteria) lines.push(`- ${item}`)
-  }
-  if (promptText) {
-    lines.push("", "Composer note from the user:", promptText)
-  }
-  return lines.join("\n")
-}
-
-/** Message posted when an already-active goal brief is edited. */
-export function buildGoalUpdatedMessage(input: { title: string; objective: string }) {
-  return [`[GOAL UPDATED] ${input.title}`.trim(), "", input.objective.trim()].join("\n")
 }

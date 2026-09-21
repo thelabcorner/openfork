@@ -276,8 +276,8 @@ function createPromptStateValue(store: PromptStore, setStore: SetStoreFunction<P
 }
 
 function createPersistedPrompt(target: ReturnType<typeof promptTarget>, initial?: InitialPrompt, platform?: Platform) {
-  const [store, setStore, _, ready] = persisted(target, createStore<PromptStore>(promptStore(initial)), platform)
-  return { ready, ...createPromptStateValue(store, setStore) }
+  const [store, setStore, _, ready, flush] = persisted(target, createStore<PromptStore>(promptStore(initial)), platform)
+  return { ready, flush, ...createPromptStateValue(store, setStore) }
 }
 
 export function createPromptSession(
@@ -306,6 +306,7 @@ export function createPromptState(initial?: InitialPrompt) {
   const ready = Object.assign(() => true, { promise: Promise.resolve(true) })
   return {
     ready,
+    flush: async () => {},
     ...createPromptStateValue(store, setStore),
   }
 }

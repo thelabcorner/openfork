@@ -1,9 +1,11 @@
 import type {
   GoalAuditEvent,
+  GoalAutomationRuntime,
   GoalAuditorPolicy,
   GoalDetail,
   GoalEvidence,
   GoalFocus,
+  GoalFocusedGoal,
   GoalInfo,
 } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
@@ -11,7 +13,7 @@ import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useServerSDK } from "./server-sdk"
 
-export type FocusedGoal = { focus: GoalFocus; detail: GoalDetail }
+export type FocusedGoal = GoalFocusedGoal
 
 function isFocusedGoal(value: unknown): value is FocusedGoal {
   if (!value || typeof value !== "object") return false
@@ -21,6 +23,17 @@ function isFocusedGoal(value: unknown): value is FocusedGoal {
     typeof candidate.detail?.goal?.id === "string" &&
     typeof candidate.detail?.goal?.status === "string"
   )
+}
+
+/**
+ * Core guarantees that a live auditing lease is acquired only after the
+ * durable auditor child is provisioned and linked. Normalize both cold HTTP
+ * responses and hot events into one client projection so consumers never see
+ * "auditing" without the Session identity needed to inspect that execution.
+ */
+function normalizeFocusedGoal(value: FocusedGoal): FocusedGoal {
+  if (value.auditorSessionID || value.automation?.phase !== "auditing") return value
+  return { ...value, auditorSessionID: value.automation.auditorSessionID }
 }
 export type GoalArmIntent = {
   /** Quick Goal Mode intentionally auto-continues by default. */
@@ -72,7 +85,7 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       const promise = sdk()
         .focused({ sessionID }, { throwOnError: true })
         .then((response) => {
-          setState("focused", sessionID, isFocusedGoal(response.data) ? response.data : null)
+          setState("focused", sessionID, isFocusedGoal(response.data) ? normalizeFocusedGoal(response.data) : null)
         })
         .catch(() => {
           // Older servers or a transient route failure should make Goal Mode
@@ -135,13 +148,38 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       const unsub = current.event.listen((envelope) => {
         const event = envelope.details
         const type = event.type as string
-        const properties = event.properties as { goalID?: string; sessionID?: string } | undefined
+        const properties = event.properties as
+          | { goalID?: string; sessionID?: string; automation?: GoalAutomationRuntime }
+          | undefined
         if (type === "goal.focused" && properties?.sessionID) {
           void refreshFocused(properties.sessionID)
           return
         }
         if (type === "goal.unfocused" && properties?.sessionID) {
           setState("focused", properties.sessionID, null)
+          return
+        }
+        if (type === "goal.automation.updated" && properties?.sessionID && properties.goalID) {
+          const focused = state.focused[properties.sessionID]
+          if (!focused) {
+            void refreshFocused(properties.sessionID)
+            return
+          }
+          if (focused.detail.goal.id !== properties.goalID) return
+          // Publish runtime + inspection identity atomically. When automation
+          // settles, retain the linked child instead of erasing the durable
+          // transcript identity with ephemeral execution state.
+          setState(
+            "focused",
+            properties.sessionID,
+            normalizeFocusedGoal({
+              ...focused,
+              ...(properties.automation?.phase === "auditing"
+                ? { auditorSessionID: properties.automation.auditorSessionID }
+                : {}),
+              automation: properties.automation,
+            }),
+          )
           return
         }
         if ((type === "goal.updated" || type === "goal.created") && properties?.goalID) {
@@ -318,15 +356,35 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         const current = state.focused[sessionID]
         if (!current) throw new Error("No focused Goal")
         const response = await sdk().transition(
-          { goalID: current.detail.goal.id, expectedRevision: current.detail.goal.revision, action, blocker },
+          { goalID: current.detail.goal.id, expectedRevision: current.detail.goal.revision, sessionID, action, blocker },
           { throwOnError: true },
         )
         if (response.data) setState("focused", sessionID, "detail", response.data)
+        // request_verification dispatches the independent auditor asynchronously
+        // in every continuation mode. Re-read after the dispatch response so a
+        // fast audit-request/auditing event cannot be overwritten by the older
+        // pre-dispatch Goal snapshot returned by the transition endpoint.
+        if (action === "request_verification") {
+          await refreshFocused(sessionID)
+        }
         if (response.data?.goal.status === "completed" || response.data?.goal.status === "cancelled" || response.data?.goal.status === "failed") {
           await sdk().unfocus({ sessionID }, { throwOnError: true }).catch(() => undefined)
           setState("focused", sessionID, null)
         }
-        return response.data
+        return state.focused[sessionID]?.detail ?? response.data
+      },
+      async dispatch(sessionID: string, action: "start" | "update", detail?: GoalDetail) {
+        const current = detail ?? state.focused[sessionID]?.detail
+        if (!current) throw new Error("No focused Goal")
+        await sdk().dispatch(
+          {
+            sessionID,
+            goalID: current.goal.id,
+            revision: current.goal.revision,
+            action,
+          },
+          { throwOnError: true },
+        )
       },
       async setContinuationMode(sessionID: string, mode: "manual" | "auto_continue" | "unattended") {
         const current = state.focused[sessionID]
@@ -380,9 +438,9 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
        * Realtime brief edit for a live Goal. The backend only allows
        * title/objective (plus policy) replacement once a Goal has left
        * draft, so criteria/steps stay read-only here by construction.
-       * The updated detail flows to the agent through GoalContext on its
-       * next turn; callers that need an immediate nudge should additionally
-       * post {@link buildGoalUpdatedMessage}-style session text.
+       * The updated detail flows through the durable Goal STATE projection.
+       * Callers that need an immediate worker turn use `dispatch("update")`,
+       * which publishes only user action intent and never copies Goal state.
        */
       async updateActive(sessionID: string, input: { title: string; objective: string }) {
         const current = state.focused[sessionID]

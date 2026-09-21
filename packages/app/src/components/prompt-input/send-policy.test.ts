@@ -113,20 +113,6 @@ describe("Prompt Input V2 send policy", () => {
     ).toBe("blocked")
   })
 
-  test("reopens a pending clarification instead of starting another revision", () => {
-    expect(
-      resolvePromptPrimaryAction({
-        mode: "normal",
-        working: false,
-        canSubmit: true,
-        hasRevisableText: true,
-        autoReviseBeforeSending: true,
-        revisionBusy: false,
-        awaitingClarification: true,
-      }),
-    ).toBe("clarify")
-  })
-
   test("one-shot menu action inverts around the persistent auto-revise preference", () => {
     expect(promptOneShotRevisionAction(false)).toBe("send-with-revisor")
     expect(promptOneShotRevisionAction(true)).toBe("send-without-revisor")

@@ -68,6 +68,7 @@ const prompt = {
     replaceComments: () => undefined,
     items: () => [],
   },
+  flush: async () => undefined,
   capture: () => prompt,
 }
 

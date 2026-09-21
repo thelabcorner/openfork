@@ -8,7 +8,7 @@ import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Popover } from "@opencode-ai/ui/popover"
-import { ScrollView, ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
+import { ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { getFilename } from "@opencode-ai/core/util/path"
 import {
@@ -16,7 +16,6 @@ import {
   createMemo,
   createResource,
   createSignal,
-  For,
   lazy,
   on,
   onCleanup,
@@ -24,7 +23,6 @@ import {
   Suspense,
   untrack,
 } from "solid-js"
-import { createStore } from "solid-js/store"
 import { useParams, useSearchParams } from "@solidjs/router"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 const ModelSelectorPopoverV2 = lazy(async () => {
@@ -46,17 +44,14 @@ import {
   resolvePromptPrimaryAction,
 } from "@/components/prompt-input/send-policy"
 import {
-  promptRevisionClarifications,
   promptRevisionDraftContext,
+  promptRevisionArtifactIsApplied,
   promptRevisionUsablePath,
   promptRevisionFingerprint,
   promptRevisionPrefix,
   promptRevisionRevealBoundaries,
-  promptRevisionResponse,
   promptRevisionText,
   revisedPromptParts,
-  type PromptRevisionClarification,
-  type PromptRevisionResponse,
 } from "@/components/prompt-input/prompt-revision"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { useComments } from "@/context/comments"
@@ -79,6 +74,14 @@ import { useNow } from "@/hooks/use-now"
 import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-arc"
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
+import type { CompatibleRevisionDraftArtifact } from "@/utils/server-compat"
+import {
+  promptRevisionTargetKey,
+  promptRevisionSourceFingerprint,
+  revisionCanApplyNow,
+  revisionRecoveryDecision,
+  type RevisionDraftTarget,
+} from "@/utils/revision-draft"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
 import { GoalComposerLauncher } from "@/components/goal-composer-shelf"
 import { goalArmKey, useGoals } from "@/context/goals"
@@ -118,9 +121,7 @@ export type PromptInputV2QuestionIntegration = {
 type PromptRevisionSendRegistration = {
   run: (intent: PromptRevisionFlow["intent"]) => void
   busy: () => boolean
-  awaitingClarification: () => boolean
   readyForSend: () => boolean
-  showPending: () => void
   cancel: () => void
 }
 
@@ -134,12 +135,14 @@ export type PromptInputV2ComposerController = PromptInputV2Interaction & {
     autoSendAfterRevision: () => boolean
     setAutoSendAfterRevision: (value: boolean) => void
     busy: () => boolean
-    awaitingClarification: () => boolean
     readyForSend: () => boolean
     register: (registration: PromptRevisionSendRegistration) => () => void
     sendWithRevision: () => void
-    sendWithoutRevision: () => void
+    sendWithoutRevision: () => Promise<boolean>
   }
+  readonly questionActive: () => boolean
+  readonly awaitDraftReady: () => Promise<void>
+  readonly flushDraft: () => Promise<void>
 }
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
@@ -172,7 +175,13 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         goalControl={
           <GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} promptText={() => props.controller.value()} />
         }
-        revisionControl={<PromptInputV2RevisionControl controller={props.controller} sessionID={sessionID()} />}
+        revisionControl={
+          <PromptInputV2RevisionControl
+            controller={props.controller}
+            sessionID={sessionID()}
+            draftID={search.draftId}
+          />
+        }
         submitControl={<PromptInputV2SendControl controller={props.controller} />}
         footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
@@ -195,14 +204,6 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   )
 }
 
-type PromptRevisionQuestion = {
-  question: string
-  header: string
-  options: { label: string; description: string }[]
-  multiple?: boolean
-  custom?: boolean
-}
-
 type PromptRevisionFlow = {
   token: number
   intent: "review" | "send"
@@ -216,200 +217,7 @@ type PromptRevisionFlow = {
   fallbackModel?: { providerID: string; id: string; variant?: string }
   directory: string
   sessionID?: string
-  clarifications: PromptRevisionClarification[]
-  clarificationRound: number
-}
-
-function PromptRevisionQuestions(props: {
-  questions: PromptRevisionQuestion[]
-  busy: boolean
-  onSubmit: (response: PromptRevisionResponse) => void
-  onCancel: () => void
-}) {
-  const language = useLanguage()
-  const [state, setState] = createStore({
-    selected: [] as string[][],
-    custom: [] as string[],
-  })
-
-  createEffect(
-    on(
-      () => props.questions,
-      (questions) => {
-        setState(
-          "selected",
-          questions.map(() => []),
-        )
-        setState(
-          "custom",
-          questions.map(() => ""),
-        )
-      },
-      { defer: false },
-    ),
-  )
-
-  const toggle = (index: number, label: string, multiple: boolean) => {
-    if (props.busy) return
-    if (!multiple) {
-      setState("selected", index, [label])
-      return
-    }
-    setState("selected", index, (current = []) =>
-      current.includes(label) ? current.filter((item) => item !== label) : [...current, label],
-    )
-  }
-
-  const setCustom = (index: number, value: string) => {
-    setState("custom", index, value)
-  }
-
-  const response = () => promptRevisionResponse(props.questions, state.selected, state.custom)
-
-  const complete = () =>
-    props.questions.every(
-      (_, index) => (response().answers[index]?.length ?? 0) > 0 || (response().details[index]?.length ?? 0) > 0,
-    )
-
-  return (
-    <div class="flex max-h-[min(440px,64vh)] flex-col overflow-hidden bg-v2-background-bg-base">
-      <div class="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5">
-        <div class="flex min-w-0 items-center gap-1.5">
-          <Icon name="pencil-sparkles" size="small" class="size-3.5 shrink-0 text-v2-icon-icon-muted" />
-          <span class="truncate text-[11px] font-[600] leading-4 text-v2-text-text-base">
-            {language.t("prompt.revision.question.title")}
-          </span>
-        </div>
-        <Show when={props.questions.length > 1}>
-          <span class="shrink-0 text-[9px] font-[540] tabular-nums text-v2-text-text-faint">
-            {props.questions.length} questions
-          </span>
-        </Show>
-      </div>
-
-      <ScrollView class="min-h-0 flex-1 bg-v2-background-bg-base">
-        <div class="flex flex-col divide-y divide-v2-border-border-muted">
-          <For each={props.questions}>
-            {(question, index) => {
-              const multi = () => question.multiple === true
-              const selected = (label: string) => state.selected[index()]?.includes(label) ?? false
-              return (
-                <section class="bg-v2-background-bg-base px-2.5 py-1.5">
-                  <div class="flex items-start justify-between gap-2">
-                    <div class="min-w-0">
-                      <div class="text-[9px] font-[620] uppercase tracking-[0.055em] text-v2-text-text-faint">
-                        {question.header}
-                      </div>
-                      <div class="mt-0.5 text-[11px] font-[500] leading-[15px] text-v2-text-text-base">
-                        {question.question}
-                      </div>
-                    </div>
-                    <Show when={multi()}>
-                      <span class="mt-px shrink-0 rounded-sm bg-v2-overlay-simple-overlay-hover px-1 py-0.5 text-[8px] font-[560] uppercase tracking-[0.04em] leading-3 text-v2-text-text-faint">
-                        {language.t("prompt.revision.question.multiple")}
-                      </span>
-                    </Show>
-                  </div>
-
-                  <Show when={question.options.length > 0}>
-                    <div class="mt-1 flex flex-col gap-0.5" role={multi() ? "group" : "radiogroup"}>
-                      <For each={question.options}>
-                        {(option) => (
-                          <button
-                            type="button"
-                            disabled={props.busy}
-                            role={multi() ? "checkbox" : "radio"}
-                            aria-checked={selected(option.label)}
-                            onClick={() => toggle(index(), option.label, multi())}
-                            class="group flex min-h-7 w-full items-start gap-1.5 rounded-[4px] border px-1.5 py-1 text-left transition-colors disabled:opacity-50"
-                            classList={{
-                              "border-v2-border-border-strong bg-v2-overlay-simple-overlay-pressed": selected(
-                                option.label,
-                              ),
-                              "border-v2-border-border-muted bg-transparent hover:border-v2-border-border-strong hover:bg-v2-overlay-simple-overlay-hover":
-                                !selected(option.label),
-                            }}
-                          >
-                            <span
-                              class="mt-[2px] flex size-3 shrink-0 items-center justify-center border border-v2-border-border-strong"
-                              classList={{ "rounded-[3px]": multi(), "rounded-full": !multi() }}
-                            >
-                              <Show when={selected(option.label)}>
-                                <Show
-                                  when={multi()}
-                                  fallback={<span class="size-1.5 rounded-full bg-v2-icon-icon-base" />}
-                                >
-                                  <Icon name="check" size="small" class="size-2 text-v2-icon-icon-base" />
-                                </Show>
-                              </Show>
-                            </span>
-                            <span class="min-w-0 flex-1">
-                              <span class="block text-[10.5px] font-[540] leading-[14px] text-v2-text-text-base">
-                                {option.label}
-                              </span>
-                              <Show when={option.description}>
-                                <span class="block text-[9px] leading-3.5 text-v2-text-text-muted">
-                                  {option.description}
-                                </span>
-                              </Show>
-                            </span>
-                          </button>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-
-                  <Show when={question.custom !== false}>
-                    <div class="mt-1.5 overflow-hidden rounded-[5px] border border-v2-border-border-muted bg-v2-background-bg-base focus-within:border-v2-border-border-strong">
-                      <div class="flex h-5 items-center border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-1.5">
-                        <span class="text-[8px] font-[600] uppercase tracking-[0.045em] text-v2-text-text-faint">
-                          {question.options.length === 0
-                            ? language.t("prompt.revision.question.customOnly")
-                            : multi()
-                              ? language.t("prompt.revision.question.customMultiple")
-                              : language.t("prompt.revision.question.custom")}
-                        </span>
-                      </div>
-                      <textarea
-                        rows={1}
-                        maxlength={800}
-                        disabled={props.busy}
-                        value={state.custom[index()] ?? ""}
-                        placeholder={language.t("prompt.revision.question.customPlaceholder")}
-                        class="min-h-8 w-full resize-none border-0 bg-v2-background-bg-base px-1.5 py-1.5 text-[10.5px] leading-[14px] text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint disabled:opacity-50"
-                        onInput={(event) => setCustom(index(), event.currentTarget.value)}
-                        onKeyDown={(event) => {
-                          if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && complete()) {
-                            event.preventDefault()
-                            props.onSubmit(response())
-                          }
-                        }}
-                      />
-                    </div>
-                  </Show>
-                </section>
-              )
-            }}
-          </For>
-        </div>
-      </ScrollView>
-
-      <div class="flex min-h-8 shrink-0 items-center justify-between gap-2 border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1">
-        <ButtonV2 type="button" size="small" variant="ghost-muted" disabled={props.busy} onClick={props.onCancel}>
-          {language.t("prompt.revision.question.cancel")}
-        </ButtonV2>
-        <ButtonV2
-          type="button"
-          size="small"
-          variant="contrast"
-          disabled={props.busy || !complete()}
-          onClick={() => props.onSubmit(response())}
-        >
-          {language.t("prompt.revision.question.continue")}
-        </ButtonV2>
-      </div>
-    </div>
-  )
+  target: RevisionDraftTarget
 }
 
 function PromptRevisionBusyIcon() {
@@ -483,8 +291,13 @@ function PromptRevisionBusyIcon() {
   )
 }
 
-function PromptInputV2RevisionControl(props: { controller: PromptInputV2ComposerController; sessionID?: string }) {
+function PromptInputV2RevisionControl(props: {
+  controller: PromptInputV2ComposerController
+  sessionID?: string
+  draftID?: string
+}) {
   const sdk = useSDK()
+  const platform = usePlatform()
   const language = useLanguage()
   const settings = useSettings()
   const [busy, setBusy] = createSignal(false)
@@ -495,23 +308,146 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     before: ReturnType<PromptInputV2ComposerController["parts"]>
     text: string
     afterFingerprint: string
-  }>()
-  const [questionState, setQuestionState] = createSignal<{
-    flow: PromptRevisionFlow
-    questions: PromptRevisionQuestion[]
-    clarificationRound: number
+    artifactID?: string
+    targetKey: string
+    directory: string
   }>()
   let guidanceTextarea: HTMLTextAreaElement | undefined
   let guidanceEditorArea: HTMLDivElement | undefined
   let request = 0
+  let abort: AbortController | undefined
+  const questionReleaseWaiters = new Set<() => void>()
+  const releaseQuestionWaiters = () => {
+    for (const resolve of questionReleaseWaiters) resolve()
+    questionReleaseWaiters.clear()
+  }
+  createEffect(() => {
+    if (props.controller.questionActive()) return
+    releaseQuestionWaiters()
+  })
   onCleanup(() => {
     request += 1
+    abort?.abort()
+    releaseQuestionWaiters()
   })
 
+  const awaitQuestionRelease = () =>
+    props.controller.questionActive()
+      ? new Promise<void>((resolve) => questionReleaseWaiters.add(resolve))
+      : Promise.resolve()
+
+  const targetKey = () =>
+    promptRevisionTargetKey({
+      sessionID: props.sessionID,
+      draftID: props.draftID,
+      directory: sdk().directory,
+      windowID: platform.windowID,
+    })
+  let recoveredScope: string | undefined
+
+  const consumeArtifact = async (id: string | undefined) => {
+    if (!id) return false
+    try {
+      await sdk().api.revisionDraft.consume({ id })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const applyRecovered = async (artifact: CompatibleRevisionDraftArtifact, expectedFingerprint: string) => {
+    if (!artifact) return
+    if (artifact.key !== targetKey()) {
+      changedToast()
+      return
+    }
+    const currentFingerprint = await promptRevisionSourceFingerprint({
+      directory: sdk().directory,
+      promptFingerprint: promptRevisionFingerprint(props.controller.parts()),
+    })
+    if (artifact.key !== targetKey()) {
+      changedToast()
+      return
+    }
+    if (
+      !revisionCanApplyNow({
+        expectedFingerprint,
+        currentFingerprint,
+      })
+    ) {
+      changedToast()
+      return
+    }
+    const before = props.controller.parts().map((part) => ({ ...part })) as ReturnType<
+      PromptInputV2ComposerController["parts"]
+    >
+    const next = revisedPromptParts(artifact.prompt, before, artifact.references)
+    props.controller.addHistory(before, "normal")
+    props.controller.onInput(artifact.prompt, next, artifact.prompt.length)
+    props.controller.restoreFocus()
+    await props.controller.flushDraft()
+    await consumeArtifact(artifact.id)
+    showToast({
+      variant: "success",
+      title: language.t("prompt.revision.recovery.restored"),
+    })
+  }
+
+  createEffect(() => {
+    const directory = sdk().directory
+    const key = targetKey()
+    const scope = `${directory}\0${key}`
+    if (scope === recoveredScope) return
+    recoveredScope = scope
+    void (async () => {
+      const [artifact] = await Promise.all([
+        sdk().api.revisionDraft.recover({ kind: "prompt", key }).catch(() => null),
+        props.controller.awaitDraftReady(),
+      ])
+      if (!artifact || artifact.kind !== "prompt" || artifact.key !== key || sdk().directory !== directory) return
+      const current = props.controller.parts()
+      const currentText = props.controller.value()
+      const structurallyApplied = promptRevisionArtifactIsApplied(current, artifact.prompt, artifact.references)
+      const currentFingerprint = await promptRevisionSourceFingerprint({
+        directory,
+        promptFingerprint: promptRevisionFingerprint(current),
+      })
+      if (targetKey() !== key || sdk().directory !== directory) return
+      if (structurallyApplied) {
+        await props.controller.flushDraft()
+        await consumeArtifact(artifact.id)
+        return
+      }
+      const decision = revisionRecoveryDecision({
+        sourceFingerprint: artifact.sourceFingerprint,
+        currentFingerprint,
+        currentText,
+        revisedText: artifact.prompt,
+        consumeIfEqual: false,
+      })
+      if (decision === "apply") {
+        await applyRecovered(artifact, artifact.sourceFingerprint)
+        return
+      }
+      showToast({
+        title: language.t("prompt.revision.recovery.title"),
+        description: language.t("prompt.revision.recovery.description"),
+        actions: [
+          {
+            label: language.t("prompt.revision.recovery.apply"),
+            onClick: () => void applyRecovered(artifact, currentFingerprint),
+          },
+          { label: language.t("common.dismiss"), onClick: () => void consumeArtifact(artifact.id) },
+        ],
+      })
+    })()
+  })
+
+  const targetChanged = (flow: PromptRevisionFlow) =>
+    sdk().directory !== flow.directory || targetKey() !== flow.target.key || props.sessionID !== flow.sessionID
+
   const changed = (flow: PromptRevisionFlow) =>
-    promptRevisionFingerprint(props.controller.parts()) !== flow.beforeFingerprint ||
-    sdk().directory !== flow.directory ||
-    props.sessionID !== flow.sessionID
+    promptRevisionFingerprint(props.controller.parts()) !== flow.beforeFingerprint || targetChanged(flow)
 
   const changedToast = () =>
     showToast({
@@ -522,19 +458,28 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
   const restorable = createMemo(() => {
     const state = restoreState()
     if (!state) return undefined
+    if (state.targetKey !== targetKey() || state.directory !== sdk().directory) return undefined
     return promptRevisionFingerprint(props.controller.parts()) === state.afterFingerprint ? state : undefined
   })
 
   createEffect(() => {
     const state = restoreState()
     if (!state || busy()) return
+    if (state.targetKey !== targetKey() || state.directory !== sdk().directory) {
+      setRestoreState(undefined)
+      return
+    }
     if (promptRevisionFingerprint(props.controller.parts()) === state.afterFingerprint) return
     setRestoreState(undefined)
   })
 
-  const restoreOriginal = (state = restorable()) => {
+  const restoreOriginal = async (state = restorable()) => {
     if (!state || busy()) return
-    if (promptRevisionFingerprint(props.controller.parts()) !== state.afterFingerprint) {
+    if (
+      state.targetKey !== targetKey() ||
+      state.directory !== sdk().directory ||
+      promptRevisionFingerprint(props.controller.parts()) !== state.afterFingerprint
+    ) {
       setRestoreState(undefined)
       return
     }
@@ -545,6 +490,8 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     setRestoreState(undefined)
     props.controller.onInput(state.text, state.before, state.text.length)
     props.controller.restoreFocus()
+    await props.controller.flushDraft()
+    await consumeArtifact(state.artifactID)
   }
 
   const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
@@ -553,11 +500,11 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     flow: PromptRevisionFlow,
     prompt: string,
     references: Parameters<typeof revisedPromptParts>[2] = [],
+    artifactID?: string,
   ) => {
     const next = revisedPromptParts(prompt, flow.before, references)
     const appliedFingerprint = promptRevisionFingerprint(next)
     props.controller.addHistory(flow.before, "normal")
-    setQuestionState(undefined)
     setOpen(false)
     props.controller.restoreFocus()
 
@@ -569,7 +516,11 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       const boundaries = promptRevisionRevealBoundaries(next)
       const empty = promptRevisionPrefix(next, 0)
       let expectedFingerprint = flow.beforeFingerprint
-      if (flow.token !== request || promptRevisionFingerprint(props.controller.parts()) !== expectedFingerprint)
+      if (
+        flow.token !== request ||
+        targetChanged(flow) ||
+        promptRevisionFingerprint(props.controller.parts()) !== expectedFingerprint
+      )
         return false
 
       props.controller.onInput("", empty, 0)
@@ -585,6 +536,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
         const punctuationPause = /\n\s*$/u.test(segment) ? 42 : /[.!?;:]\s*$/u.test(segment) ? 16 : 0
         await wait(baseDelay + punctuationPause)
         if (flow.token !== request) return false
+        if (targetChanged(flow)) return false
         if (promptRevisionFingerprint(props.controller.parts()) !== expectedFingerprint) return false
 
         const partial = promptRevisionPrefix(next, boundary)
@@ -595,18 +547,17 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       }
     }
 
-    if (flow.token !== request || promptRevisionFingerprint(props.controller.parts()) !== appliedFingerprint)
+    if (
+      flow.token !== request ||
+      targetChanged(flow) ||
+      promptRevisionFingerprint(props.controller.parts()) !== appliedFingerprint
+    )
       return false
     setGuidance("")
     setModelOverride(undefined)
     props.controller.restoreFocus()
     if (flow.intent === "send") {
-      // Revise-and-send is an atomic user intent. Once the revised draft has
-      // finished its reveal animation, bypass the auto-revise interceptor so
-      // the exact artifact we just committed is submitted once rather than
-      // recursively entering another revision cycle.
       setRestoreState(undefined)
-      props.controller.revisionSend.sendWithoutRevision()
       return true
     }
 
@@ -614,6 +565,9 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       before: flow.restoreBefore,
       text: flow.restoreDraft,
       afterFingerprint: appliedFingerprint,
+      artifactID,
+      targetKey: flow.target.key,
+      directory: flow.directory,
     }
     setRestoreState(restored)
     showToast({
@@ -623,7 +577,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       actions: [
         {
           label: language.t("prompt.revision.restore"),
-          onClick: () => restoreOriginal(restored),
+          onClick: () => void restoreOriginal(restored),
         },
       ],
     })
@@ -634,53 +588,60 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     if (flow.token !== request) return
     if (changed(flow)) {
       changedToast()
-      setQuestionState(undefined)
       setOpen(false)
       return
     }
     setBusy(true)
+    const controller = new AbortController()
+    abort?.abort()
+    abort = controller
     try {
       const result = await sdk().api.promptRevisor.revise({
         prompt: flow.draft,
+        target: flow.target,
         draft: promptRevisionDraftContext(flow.before),
         sessionID: flow.sessionID,
         guidance: flow.guidance,
         model: flow.model,
         fallbackModel: flow.fallbackModel,
-        clarifications: flow.clarifications,
-        clarificationRound: flow.clarificationRound,
         location: { directory: flow.directory },
+        signal: controller.signal,
       })
+      if (flow.token !== request) return
+      await awaitQuestionRelease()
       if (flow.token !== request) return
       if (changed(flow)) {
         changedToast()
-        setQuestionState(undefined)
         setOpen(false)
         return
       }
-      if (result.type === "question") {
-        setQuestionState({
-          flow,
-          questions: result.questions,
-          clarificationRound: result.clarificationRound,
-        })
-        setOpen(true)
+      if (result.type === "cancelled") return
+      const applied = await apply(flow, result.prompt, result.references ?? [], result.artifactID)
+      if (!applied) return
+      await props.controller.flushDraft()
+      if (flow.intent === "send") {
+        // Revise-and-send remains recoverable while the optimistic composer clear
+        // is in flight. Acknowledgement happens only after server admission.
+        const sent = await props.controller.revisionSend.sendWithoutRevision()
+        if (sent) await consumeArtifact(result.artifactID)
         return
       }
-      await apply(flow, result.prompt, result.references ?? [])
+      await consumeArtifact(result.artifactID)
     } catch (error) {
       if (flow.token !== request) return
+      if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return
       showToast({
         variant: "error",
         title: language.t("prompt.revision.error.title"),
         description: error instanceof Error ? error.message : String(error),
       })
     } finally {
+      if (abort === controller) abort = undefined
       if (flow.token === request) setBusy(false)
     }
   }
 
-  const run = (extra?: string, intent: PromptRevisionFlow["intent"] = "review") => {
+  const run = async (extra?: string, intent: PromptRevisionFlow["intent"] = "review") => {
     const draft = props.controller.value()
     if (busy() || !draft.trim()) return
     const token = ++request
@@ -688,11 +649,23 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       PromptInputV2ComposerController["parts"]
     >
     const beforeFingerprint = promptRevisionFingerprint(before)
+    const directory = sdk().directory
+    const key = targetKey()
+    const sourceFingerprint = await promptRevisionSourceFingerprint({
+      directory,
+      promptFingerprint: beforeFingerprint,
+    })
+    if (
+      token !== request ||
+      sdk().directory !== directory ||
+      targetKey() !== key ||
+      promptRevisionFingerprint(props.controller.parts()) !== beforeFingerprint
+    )
+      return
     const priorRestore = restorable()
     const configured = modelOverride() ?? settings.general.promptRevision()?.model
     const current = props.controller.model.selection.current()
     const variant = props.controller.model.selection.variant.current()
-    setQuestionState(undefined)
     if (intent === "send") setOpen(false)
     void send({
       token,
@@ -705,49 +678,32 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
       guidance: extra?.trim() || undefined,
       model: configured ? { providerID: configured.providerID, id: configured.modelID } : undefined,
       fallbackModel: current ? { providerID: current.provider.id, id: current.id, variant } : undefined,
-      directory: sdk().directory,
+      directory,
       sessionID: props.sessionID,
-      clarifications: [],
-      clarificationRound: 0,
+      target: {
+        kind: "prompt",
+        key,
+        sourceFingerprint,
+      },
     })
   }
 
-  const answerQuestions = (response: PromptRevisionResponse) => {
-    const pending = questionState()
-    if (!pending || busy()) return
-    if (changed(pending.flow)) {
-      changedToast()
-      setQuestionState(undefined)
-      setOpen(false)
-      return
-    }
-    const clarifications = promptRevisionClarifications(pending.questions, response)
-    const next: PromptRevisionFlow = {
-      ...pending.flow,
-      clarifications: [...pending.flow.clarifications, ...clarifications],
-      clarificationRound: pending.clarificationRound,
-    }
-    void send(next)
-  }
-
-  const cancelQuestions = () => {
+  const cancelRevision = () => {
     request += 1
+    abort?.abort()
+    abort = undefined
+    releaseQuestionWaiters()
     setBusy(false)
-    setQuestionState(undefined)
     setOpen(false)
     setModelOverride(undefined)
     props.controller.restoreFocus()
   }
 
   const unregisterRevisionSend = props.controller.revisionSend.register({
-    run: (intent) => run(undefined, intent),
+    run: (intent) => void run(undefined, intent),
     busy,
-    awaitingClarification: () => !!questionState(),
     readyForSend: () => !!restorable(),
-    showPending: () => {
-      if (questionState()) setOpen(true)
-    },
-    cancel: cancelQuestions,
+    cancel: cancelRevision,
   })
   onCleanup(unregisterRevisionSend)
 
@@ -760,13 +716,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
           type="button"
           size="large"
           variant="ghost-muted"
-          class={`shrink-0 !rounded-r-[3px] ${
-            busy()
-              ? "!text-v2-icon-icon-accent !opacity-100"
-              : questionState()
-                ? "!text-v2-icon-icon-accent bg-v2-overlay-simple-overlay-hover"
-                : ""
-          }`}
+          class={`shrink-0 !rounded-r-[3px] ${busy() ? "!text-v2-icon-icon-accent !opacity-100" : ""}`}
           disabled={busy() || !hasDraft()}
           aria-label={language.t("prompt.revision.title")}
           icon={
@@ -774,7 +724,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
               <PromptRevisionBusyIcon />
             </Show>
           }
-          onClick={() => (questionState() ? setOpen(true) : run())}
+          onClick={() => void run()}
         />
       </TooltipV2>
       <Show when={restorable()}>
@@ -811,10 +761,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
         trigger={<Icon name="chevron-down" size="small" class="size-3" />}
         class="w-[min(370px,calc(100vw-16px))] overflow-hidden rounded-[8px] border border-v2-border-border-muted bg-v2-background-bg-base shadow-[var(--v2-elevation-floating)] [&_[data-slot=popover-body]]:p-0"
       >
-        <Show
-          when={questionState()}
-          fallback={
-            <div class="flex flex-col bg-v2-background-bg-base">
+        <div class="flex flex-col bg-v2-background-bg-base">
               <div class="flex h-8 items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5">
                 <div class="flex min-w-0 items-center gap-1.5">
                   <Icon name="pencil-sparkles" size="small" class="size-3.5 shrink-0 text-v2-icon-icon-muted" />
@@ -848,7 +795,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
                   onKeyDown={(event) => {
                     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                       event.preventDefault()
-                      run(guidance())
+                      void run(guidance())
                     }
                   }}
                 />
@@ -861,23 +808,12 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
                   size="small"
                   variant="contrast"
                   disabled={busy() || !hasDraft()}
-                  onClick={() => run(guidance())}
+                  onClick={() => void run(guidance())}
                 >
                   {language.t("prompt.revision.guidance.run")}
                 </ButtonV2>
               </div>
-            </div>
-          }
-        >
-          {(pending) => (
-            <PromptRevisionQuestions
-              questions={pending().questions}
-              busy={busy()}
-              onSubmit={answerQuestions}
-              onCancel={cancelQuestions}
-            />
-          )}
-        </Show>
+        </div>
       </Popover>
     </div>
   )
@@ -891,7 +827,6 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
   const autoRevise = () => props.controller.revisionSend.autoBeforeSend()
   const autoSend = () => props.controller.revisionSend.autoSendAfterRevision()
   const revisionBusy = () => props.controller.revisionSend.busy()
-  const awaitingClarification = () => props.controller.revisionSend.awaitingClarification()
   const revisionReadyForSend = () => props.controller.revisionSend.readyForSend()
   const hasRevisableText = () => isPromptTextRevisable(props.controller.value())
   const action = createMemo(() =>
@@ -902,17 +837,14 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
       hasRevisableText: hasRevisableText(),
       autoReviseBeforeSending: autoRevise(),
       revisionBusy: revisionBusy(),
-      awaitingClarification: awaitingClarification(),
       revisionReadyForSend: revisionReadyForSend(),
     }),
   )
-  const oneShot = createMemo(() => promptOneShotRevisionAction(autoRevise() || awaitingClarification()))
+  const oneShot = createMemo(() => promptOneShotRevisionAction(autoRevise()))
   const menuAvailable = () => working() || mode() === "normal"
-  const primaryDisabled = () =>
-    action() === "blocked" || (!canSubmit() && action() !== "stop" && action() !== "clarify")
+  const primaryDisabled = () => action() === "blocked" || (!canSubmit() && action() !== "stop")
   const primaryLabel = () => {
     if (revisionBusy()) return language.t("prompt.revision.send.revising")
-    if (action() === "clarify") return language.t("prompt.revision.send.needsInput")
     if (action() === "stop") return language.t("prompt.action.stop")
     if (action() === "revise")
       return autoSend()
@@ -995,15 +927,8 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
                 <Show
                   when={action() === "stop"}
                   fallback={
-                    <Show
-                      when={action() === "clarify"}
-                      fallback={
-                        <Show when={mode() === "shell"} fallback={<Icon name="arrow-up" size="small" />}>
-                          <Icon name="arrow-undo-down" size="small" />
-                        </Show>
-                      }
-                    >
-                      <Icon name="pencil-sparkles" size="small" class="text-v2-icon-icon-accent" />
+                    <Show when={mode() === "shell"} fallback={<Icon name="arrow-up" size="small" />}>
+                      <Icon name="arrow-undo-down" size="small" />
                     </Show>
                   }
                 >
@@ -1536,7 +1461,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   }
   const directSubmit = () => {
     revisionSendRegistration?.cancel()
-    void submission.handleSubmit(new Event("submit"))
+    return submission.handleSubmit(new Event("submit"))
   }
   const revisionUnavailable = () =>
     showToast({
@@ -1547,7 +1472,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const runRevision = (intent: PromptRevisionFlow["intent"]) => {
     if (mode() !== "normal" || !controller.canSubmit()) return
     if (!isPromptTextRevisable(controller.value())) {
-      directSubmit()
+      void directSubmit()
       return
     }
     const registration = revisionSendRegistration
@@ -1556,10 +1481,6 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       return
     }
     if (registration.busy()) return
-    if (registration.awaitingClarification()) {
-      registration.showPending()
-      return
-    }
     registration.run(intent)
   }
   const sendWithRevision = () => runRevision("send")
@@ -1569,7 +1490,6 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     autoSendAfterRevision,
     setAutoSendAfterRevision,
     busy: () => revisionSendRegistration?.busy() ?? false,
-    awaitingClarification: () => revisionSendRegistration?.awaitingClarification() ?? false,
     readyForSend: () => revisionSendRegistration?.readyForSend() ?? false,
     register(registration: PromptRevisionSendRegistration) {
       revisionSendRegistration = registration
@@ -1596,16 +1516,11 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       hasRevisableText: isPromptTextRevisable(controller.value()),
       autoReviseBeforeSending: autoReviseBeforeSending(),
       revisionBusy: revisionSend.busy(),
-      awaitingClarification: revisionSend.awaitingClarification(),
       revisionReadyForSend: revisionSend.readyForSend(),
     })
     if (action === "blocked") return
     if (action === "stop") {
       void submission.abort()
-      return
-    }
-    if (action === "clarify") {
-      sendWithRevision()
       return
     }
     if (action === "revise") {
@@ -1977,6 +1892,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   Object.defineProperty(controller, "liveRate", { get: () => liveRate })
   Object.defineProperty(controller, "revisionSend", { get: () => revisionSend })
+  Object.defineProperty(controller, "questionActive", { get: () => questionActive })
+  Object.defineProperty(controller, "awaitDraftReady", {
+    value: async () => {
+      const pending = prompt.ready.promise
+      if (pending) await pending.catch(() => undefined)
+    },
+  })
+  Object.defineProperty(controller, "flushDraft", { value: () => prompt.flush() })
 
   // While a question owns the composer the send affordance follows the
   // question's readiness, not "is there a draft" — picking an option with no

@@ -3,8 +3,6 @@ import {
   applyRevisedGoalObjective,
   buildGoalRevisorDraft,
   buildGoalRevisorGuidance,
-  buildGoalStartMessage,
-  buildGoalUpdatedMessage,
 } from "./goal-revisor"
 
 describe("Goal revisor", () => {
@@ -33,18 +31,4 @@ describe("Goal revisor", () => {
     expect(applyRevisedGoalObjective("\n\n# Goal\nDone\n\n")).toBe("# Goal\nDone")
   })
 
-  test("start message covers both empty-prompt and with-prompt cases", () => {
-    const withoutPrompt = buildGoalStartMessage({ objective: "Ship it", criteria: ["a", "b"] })
-    expect(withoutPrompt).toContain("[GOAL START]")
-    expect(withoutPrompt).toContain("Ship it")
-    expect(withoutPrompt).not.toContain("Composer note")
-
-    const withPrompt = buildGoalStartMessage({ objective: "Ship it", criteria: [], promptText: "hello" })
-    expect(withPrompt).toContain("Composer note")
-    expect(withPrompt).toContain("hello")
-  })
-
-  test("update message carries the edited brief", () => {
-    expect(buildGoalUpdatedMessage({ title: "T", objective: "O" })).toContain("[GOAL UPDATED] T")
-  })
 })
