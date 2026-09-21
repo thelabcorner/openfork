@@ -80,10 +80,12 @@ function applyModel(
     readonly name?: string
     readonly cost?: ModelV2Info["cost"]
     readonly request?: NonNullable<NonNullable<ModelsDev.Model["experimental"]>["modes"]>[string]["provider"]
+    readonly primitive?: ModelV2Info["primitive"]
   } = {},
 ) {
   draft.name = input.name ?? model.name
   draft.family = model.family
+  draft.primitive = input.primitive ?? "language"
   draft.api = model.provider?.npm
     ? {
         id: model.id,
@@ -161,13 +163,15 @@ export const ModelsDevPlugin = define({
 
           for (const model of Object.values(item.models)) {
             const baseCost = cost(model.cost)
-            catalog.model.update(providerID, model.id, (draft) => applyModel(draft, model, { cost: baseCost }))
+            const primitive = ModelsDev.modelPrimitive(item.id, model)
+            catalog.model.update(providerID, model.id, (draft) => applyModel(draft, model, { cost: baseCost, primitive }))
             for (const [mode, options] of Object.entries(model.experimental?.modes ?? {})) {
               catalog.model.update(providerID, `${model.id}-${mode}`, (draft) =>
                 applyModel(draft, model, {
                   name: modeName(model, mode),
                   cost: mergeCost(baseCost, options.cost),
                   request: options.provider,
+                  primitive,
                 }),
               )
             }

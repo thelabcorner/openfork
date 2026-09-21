@@ -1,19 +1,18 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Effect, Exit, Scope } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { SystemContext } from "@opencode-ai/core/system-context"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { testEffect } from "../lib/effect"
+import { renderReady } from "../lib/system-context"
 
 const entry = (key: string, text: string, sourceKey = key) => ({
   key: SystemContext.Key.make(key),
   load: Effect.succeed(
     SystemContext.make({
       key: SystemContext.Key.make(sourceKey),
-      codec: Schema.toCodecJson(Schema.String),
       load: Effect.succeed(text),
-      baseline: String,
-      update: (_previous, current) => current,
+      render: String,
     }),
   ),
 })
@@ -25,7 +24,7 @@ describe("SystemContextRegistry", () => {
     Effect.gen(function* () {
       const registry = yield* SystemContextRegistry.Service
 
-      expect(yield* SystemContext.initialize(yield* registry.load())).toEqual({ baseline: "", snapshot: {} })
+      expect(yield* renderReady(yield* registry.load())).toBe("")
     }),
   )
 
@@ -35,7 +34,7 @@ describe("SystemContextRegistry", () => {
       yield* registry.register(entry("test/second", "second"))
       yield* registry.register(entry("test/first", "first"))
 
-      expect((yield* SystemContext.initialize(yield* registry.load())).baseline).toBe("first\n\nsecond")
+      expect(yield* renderReady(yield* registry.load())).toBe("first\n\nsecond")
     }),
   )
 
@@ -105,10 +104,10 @@ describe("SystemContextRegistry", () => {
       const scope = yield* Scope.make()
       yield* registry.register(entry("test/scoped", "scoped")).pipe(Scope.provide(scope))
 
-      expect((yield* SystemContext.initialize(yield* registry.load())).baseline).toBe("scoped")
+      expect(yield* renderReady(yield* registry.load())).toBe("scoped")
 
       yield* Scope.close(scope, Exit.void)
-      expect(yield* SystemContext.initialize(yield* registry.load())).toEqual({ baseline: "", snapshot: {} })
+      expect(yield* renderReady(yield* registry.load())).toBe("")
     }),
   )
 })

@@ -36,7 +36,9 @@ export function isToolChoiceCompatibilityError(error: unknown): boolean {
   if (
     normalized.includes('only "auto" is supported') ||
     normalized.includes("only 'auto' is supported") ||
-    normalized.includes("only auto is supported")
+    normalized.includes("only auto is supported") ||
+    normalized.includes("does not support this tool_choice") ||
+    normalized.includes("does not support this tool choice")
   ) {
     return true
   }

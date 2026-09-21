@@ -57,6 +57,11 @@ export const InferInput = Schema.Struct({
   providerID: Provider.ID,
   modelID: Model.ID,
   accountID: Schema.String.pipe(optional),
+  /**
+   * Optional caller-owned routing/cache affinity key. This is not a persisted
+   * OpenFork Session id and is never sent in the System One JSON payload.
+   */
+  affinityID: Schema.String.pipe(optional),
   state: Content,
   questions: Questions,
   timeoutMs: Schema.Int.pipe(optional),

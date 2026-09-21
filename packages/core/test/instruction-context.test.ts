@@ -10,10 +10,12 @@ import { InstructionContext } from "@opencode-ai/core/instruction-context"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SystemContext } from "@opencode-ai/core/system-context"
+import { SystemSurface } from "@opencode-ai/core/system-surface"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
+import { observeReady } from "./lib/system-context"
 
 const it = testEffect(Layer.empty)
 
@@ -70,40 +72,33 @@ describe("InstructionContext", () => {
             ),
           )
 
-          const initialized = yield* SystemContext.initialize(yield* load)
-          expect(initialized.baseline).toBe(
+          const initialized = yield* observeReady(yield* load)
+          expect(SystemSurface.render(initialized.snapshot)).toBe(
             [
               `Instructions from: ${globalFile}\nglobal`,
               `Instructions from: ${packageFile}\npackage`,
               `Instructions from: ${projectFile}\nproject`,
             ].join("\n\n"),
           )
-          expect(initialized.baseline).not.toContain("outside")
+          expect(SystemSurface.render(initialized.snapshot)).not.toContain("outside")
 
           yield* Effect.promise(() => fs.writeFile(packageFile, "changed"))
-          expect(yield* SystemContext.reconcile(yield* load, initialized.snapshot)).toMatchObject({
-            _tag: "Updated",
-            text: expect.stringContaining(`Instructions from: ${packageFile}\nchanged`),
-          })
+          const changed = yield* observeReady(yield* load, initialized.snapshot)
+          expect(SystemSurface.render(changed.snapshot)).toContain(`Instructions from: ${packageFile}\nchanged`)
+          expect(changed.surfaceChanged).toBe(true)
 
           yield* Effect.promise(() => fs.rm(packageFile))
-          const partial = yield* SystemContext.reconcile(yield* load, initialized.snapshot)
-          expect(partial).toEqual({
-            _tag: "Updated",
-            text: [
-              "These instructions replace all previously loaded ambient instructions.",
-              `Instructions from: ${globalFile}\nglobal`,
-              `Instructions from: ${projectFile}\nproject`,
-            ].join("\n\n"),
-            snapshot: expect.any(Object),
-          })
+          const partial = yield* observeReady(yield* load, initialized.snapshot)
+          expect(SystemSurface.render(partial.snapshot)).toBe(
+            [`Instructions from: ${globalFile}\nglobal`, `Instructions from: ${projectFile}\nproject`].join("\n\n"),
+          )
 
           yield* Effect.promise(() => Promise.all([fs.rm(globalFile), fs.rm(projectFile)]))
-          expect(yield* SystemContext.reconcile(yield* load, initialized.snapshot)).toEqual({
-            _tag: "Updated",
-            text: "Previously loaded instructions no longer apply.",
-            snapshot: {},
-          })
+          const removed = yield* observeReady(yield* load, initialized.snapshot)
+          expect(SystemSurface.render(removed.snapshot)).toBe("")
+          expect(removed.changes).toEqual([
+            expect.objectContaining({ type: "remove", key: SystemSurface.Key.make("core/instructions") }),
+          ])
         }),
       ),
     ),
@@ -131,7 +126,7 @@ describe("InstructionContext", () => {
             ),
           )
 
-          expect((yield* SystemContext.initialize(context)).baseline).toBe(`Instructions from: ${file}\n`)
+          expect(SystemSurface.render((yield* observeReady(context)).snapshot)).toBe(`Instructions from: ${file}\n`)
         }),
       ),
     ),
@@ -161,14 +156,14 @@ describe("InstructionContext", () => {
         ),
       )
 
-      expect(
-        yield* SystemContext.reconcile(context, {
-          "core/instructions": {
-            value: [{ path: "/repo/AGENTS.md", content: "old" }],
-            removed: "Previously loaded instructions no longer apply.",
-          },
-        }),
-      ).toEqual({ _tag: "Unchanged" })
+      const previous: SystemSurface.Snapshot = {
+        projectionVersion: SystemSurface.CURRENT_PROJECTION_VERSION,
+        order: [SystemSurface.Key.make("core/instructions")],
+        sections: { [SystemSurface.Key.make("core/instructions")]: "Instructions from: /repo/AGENTS.md\nold" },
+      }
+      const refreshed = yield* observeReady(context, previous)
+      expect(refreshed.surfaceChanged).toBe(false)
+      expect(refreshed.snapshot).toEqual(previous)
     }),
   )
 
@@ -201,14 +196,14 @@ describe("InstructionContext", () => {
         ),
       )
 
-      expect(
-        yield* SystemContext.reconcile(context, {
-          "core/instructions": {
-            value: [{ path: file, content: "old" }],
-            removed: "Previously loaded instructions no longer apply.",
-          },
-        }),
-      ).toEqual({ _tag: "Unchanged" })
+      const previous: SystemSurface.Snapshot = {
+        projectionVersion: SystemSurface.CURRENT_PROJECTION_VERSION,
+        order: [SystemSurface.Key.make("core/instructions")],
+        sections: { [SystemSurface.Key.make("core/instructions")]: `Instructions from: ${file}\nold` },
+      }
+      const refreshed = yield* observeReady(context, previous)
+      expect(refreshed.surfaceChanged).toBe(false)
+      expect(refreshed.snapshot).toEqual(previous)
     }),
   )
 

@@ -2,6 +2,7 @@ export * as ConfigProviderV1 from "./provider"
 
 import { Schema } from "effect"
 import { PositiveInt } from "../../schema"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
 
 export const ModelStatus = Schema.Literals(["alpha", "beta", "deprecated", "active"])
 
@@ -14,6 +15,7 @@ export const Model = Schema.Struct({
   id: Schema.optional(Schema.String),
   name: Schema.optional(Schema.String),
   family: Schema.optional(Schema.String),
+  primitive: Schema.optional(ModelContract.Primitive),
   release_date: Schema.optional(Schema.String),
   attachment: Schema.optional(Schema.Boolean),
   reasoning: Schema.optional(Schema.Boolean),

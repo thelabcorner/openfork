@@ -16,7 +16,6 @@ class File extends Schema.Class<File>("InstructionContext.File")({
   content: Schema.String,
 }) {}
 
-const Files = Schema.Array(File)
 const key = SystemContext.Key.make("core/instructions")
 
 const layer = Layer.effectDiscard(
@@ -29,12 +28,8 @@ const layer = Layer.effectDiscard(
     const source = (value: ReadonlyArray<File> | SystemContext.Unavailable) =>
       SystemContext.make({
         key,
-        codec: Schema.toCodecJson(Files),
         load: Effect.succeed(value),
-        baseline: render,
-        update: (_previous, current) =>
-          `These instructions replace all previously loaded ambient instructions.\n\n${render(current)}`,
-        removed: () => "Previously loaded instructions no longer apply.",
+        render,
       })
 
     const observe = Effect.fn("InstructionContext.observe")(function* () {

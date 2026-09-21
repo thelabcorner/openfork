@@ -224,6 +224,7 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type, packageName?: st
   return {
     family: info.family,
     name: info.name,
+    primitive: info.primitive,
     api: info.provider?.npm
       ? {
           ...(info.id === undefined ? {} : { id: info.id }),

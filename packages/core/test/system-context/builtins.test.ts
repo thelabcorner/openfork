@@ -8,10 +8,12 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SystemContext } from "@opencode-ai/core/system-context"
+import { SystemSurface } from "@opencode-ai/core/system-surface"
 import { SystemContextBuiltIns } from "@opencode-ai/core/system-context/builtins"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
+import { observeReady, renderReady } from "../lib/system-context"
 
 const directory = AbsolutePath.make(FSUtil.resolve("/repo/packages/core"))
 const projectDirectory = AbsolutePath.make(FSUtil.resolve("/repo"))
@@ -59,9 +61,9 @@ describe("SystemContextBuiltIns", () => {
     Effect.gen(function* () {
       yield* TestClock.setTime(timestamp)
       const context = yield* SystemContextRegistry.Service
-      const initialized = yield* SystemContext.initialize(yield* context.load())
+      const rendered = yield* renderReady(yield* context.load())
 
-      expect(initialized.baseline).toBe(
+      expect(rendered).toBe(
         [
           "Here is some useful information about the environment you are running in:",
           "<env>",
@@ -81,15 +83,19 @@ describe("SystemContextBuiltIns", () => {
     Effect.gen(function* () {
       yield* TestClock.setTime(timestamp)
       const context = yield* SystemContextRegistry.Service
-      const initialized = yield* SystemContext.initialize(yield* context.load())
+      const initialized = yield* observeReady(yield* context.load())
 
       yield* TestClock.setTime(timestamp + 24 * 60 * 60 * 1000)
-      const refreshed = yield* SystemContext.reconcile(yield* context.load(), initialized.snapshot)
+      const refreshed = yield* observeReady(yield* context.load(), initialized.snapshot)
 
-      expect(refreshed).toMatchObject({
-        _tag: "Updated",
-        text: `Today's date is now: ${localDate(timestamp + 24 * 60 * 60 * 1000)}`,
-      })
+      expect(refreshed.changes).toEqual([
+        {
+          type: "replace",
+          key: SystemSurface.Key.make("core/date"),
+          previous: `Today's date: ${localDate(timestamp)}`,
+          rendered: `Today's date: ${localDate(timestamp + 24 * 60 * 60 * 1000)}`,
+        },
+      ])
     }),
   )
 
@@ -97,10 +103,10 @@ describe("SystemContextBuiltIns", () => {
     Effect.gen(function* () {
       yield* TestClock.setTime(timestamp)
       const context = yield* SystemContextRegistry.Service
-      const initialized = yield* SystemContext.initialize(yield* context.load())
+      const initialized = yield* observeReady(yield* context.load())
 
       yield* TestClock.setTime(timestamp + 60 * 60 * 1000)
-      expect(yield* SystemContext.reconcile(yield* context.load(), initialized.snapshot)).toEqual({ _tag: "Unchanged" })
+      expect((yield* observeReady(yield* context.load(), initialized.snapshot)).surfaceChanged).toBe(false)
     }),
   )
 
@@ -109,7 +115,7 @@ describe("SystemContextBuiltIns", () => {
       yield* TestClock.setTime(timestamp)
       const context = yield* SystemContextRegistry.Service
 
-      expect((yield* SystemContext.initialize(yield* context.load())).baseline).toBe(
+      expect(yield* renderReady(yield* context.load())).toBe(
         [
           "Here is some useful information about the environment you are running in:",
           "<env>",

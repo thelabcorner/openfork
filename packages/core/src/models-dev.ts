@@ -2,6 +2,7 @@ import path from "path"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { ModelsDev } from "@opencode-ai/schema/models-dev"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
 import { Global } from "./global"
 import { Flag } from "./flag/flag"
 import { Flock } from "./util/flock"
@@ -66,8 +67,10 @@ const ReasoningOption = Schema.Union([
 
 export const Model = Schema.Struct({
   id: Schema.String,
+  type: Schema.optional(Schema.Literal("decision")),
   name: Schema.String,
   family: Schema.optional(Schema.String),
+  primitive: Schema.optional(ModelContract.Primitive),
   release_date: Schema.String,
   attachment: Schema.Boolean,
   reasoning: Schema.Boolean,
@@ -120,6 +123,22 @@ export const Model = Schema.Struct({
 })
 export type Model = Schema.Schema.Type<typeof Model>
 
+/**
+ * Resolve the computational primitive represented by one models.dev entry.
+ *
+ * Specialized catalog rows publish their computational class through the model
+ * type field. Keep the older provider/model compatibility resolver as a
+ * fallback for stale snapshots that predate specialized decision-model catalog
+ * ingestion.
+ */
+export function modelPrimitive(
+  providerID: string,
+  model: Pick<Model, "id" | "primitive" | "type">,
+): ModelContract.Primitive {
+  if (model.type === "decision") return "system-one"
+  return ModelContract.resolvePrimitive(providerID, model)
+}
+
 export const Provider = Schema.Struct({
   api: Schema.optional(Schema.String),
   name: Schema.String,
@@ -137,6 +156,7 @@ declare const OPENCODE_MODELS_DEV: Record<string, Provider> | undefined
 
 export interface Interface {
   readonly get: () => Effect.Effect<Record<string, Provider>>
+  readonly getDecisionModels: () => Effect.Effect<Record<string, Model>>
   readonly refresh: (force?: boolean) => Effect.Effect<void>
 }
 
@@ -173,12 +193,27 @@ const layer = Layer.effect(
     })
 
     const fetchApi = Effect.fn("ModelsDev.fetchApi")(function* () {
-      return yield* HttpClientRequest.get(`${source}/api.json`).pipe(
+      return yield* HttpClientRequest.get(source + "/api.json?type=all").pipe(
         HttpClientRequest.setHeader("User-Agent", USER_AGENT),
         http.execute,
         Effect.flatMap((res) => res.text),
         Effect.timeout("10 seconds"),
       )
+    })
+
+    const fetchDecisionModels = Effect.fn("ModelsDev.fetchDecisionModels")(function* () {
+      const text = yield* HttpClientRequest.get(source + "/models.json?type=decision").pipe(
+        HttpClientRequest.setHeader("User-Agent", USER_AGENT),
+        http.execute,
+        Effect.flatMap((res) => res.text),
+        Effect.timeout("10 seconds"),
+      )
+      return JSON.parse(text) as Record<string, Model>
+    })
+
+    const fetchCatalog = Effect.fn("ModelsDev.fetchCatalog")(function* () {
+      const text = yield* fetchApi()
+      return JSON.parse(text) as Record<string, Provider>
     })
 
     const loadFromDisk = fs.readJson(Flag.OPENCODE_MODELS_PATH ?? filepath).pipe(
@@ -200,7 +235,8 @@ const layer = Layer.effect(
     )
 
     const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {
-      const text = yield* fetchApi()
+      const catalog = yield* fetchCatalog()
+      const text = JSON.stringify(catalog)
       const tempfile = `${filepath}.${process.pid}.${Date.now()}.tmp`
       yield* fs.writeWithDirs(tempfile, text).pipe(
         Effect.andThen(fs.rename(tempfile, filepath)),
@@ -211,7 +247,7 @@ const layer = Layer.effect(
           }),
         ),
       )
-      return text
+      return catalog
     })
 
     const populate = Effect.gen(function* () {
@@ -221,18 +257,27 @@ const layer = Layer.effect(
       if (snapshot) return snapshot
       if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
       // Flock is cross-process: concurrent opencode CLIs can race on this cache file.
-      const text = yield* Effect.scoped(
+      const catalog = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Flock.effect(lockKey)
           return yield* fetchAndWrite()
         }),
       )
-      return JSON.parse(text) as Record<string, Provider>
+      return catalog
     }).pipe(Effect.withSpan("ModelsDev.populate"), Effect.orDie)
 
     const [cachedGet, invalidate] = yield* Effect.cachedInvalidateWithTTL(populate, Duration.infinity)
-
+    const [cachedDecisionModels, invalidateDecisionModels] = yield* Effect.cachedInvalidateWithTTL(
+      Flag.OPENCODE_DISABLE_MODELS_FETCH
+        ? Effect.succeed({} as Record<string, Model>)
+        : fetchDecisionModels().pipe(
+            Effect.tapCause((cause) => Effect.logWarning("Failed to fetch models.dev decision metadata", { cause })),
+            Effect.catch(() => Effect.succeed({} as Record<string, Model>)),
+          ),
+      Duration.infinity,
+    )
     const get = (): Effect.Effect<Record<string, Provider>> => cachedGet
+    const getDecisionModels = (): Effect.Effect<Record<string, Model>> => cachedDecisionModels
 
     const refresh = Effect.fn("ModelsDev.refresh")(function* (force = false) {
       if (!force && (yield* fresh())) return
@@ -244,6 +289,7 @@ const layer = Layer.effect(
           if (!force && (yield* fresh())) return
           yield* fetchAndWrite()
           yield* invalidate
+          yield* invalidateDecisionModels
           yield* events.publish(Event.Refreshed, {})
         }),
       ).pipe(
@@ -257,7 +303,7 @@ const layer = Layer.effect(
       yield* Effect.forkScoped(refresh().pipe(Effect.repeat(Schedule.spaced("60 minutes")), Effect.ignore))
     }
 
-    return Service.of({ get, refresh })
+    return Service.of({ get, getDecisionModels, refresh })
   }),
 )
 

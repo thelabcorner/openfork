@@ -14,12 +14,29 @@ export type VariantID = typeof VariantID.Type
 export const Ref = Schema.Struct({
   id: ID,
   providerID: Provider.ID,
+  /**
+   * Stable provider-account identity. This is deliberately separate from
+   * Model.ID: providers that still route through an account-qualified model id
+   * lower this field only at their runtime/catalog boundary.
+   */
+  accountID: Schema.String.pipe(optional),
   variant: VariantID.pipe(optional),
 }).annotate({ identifier: "Model.Ref" })
 export interface Ref extends Schema.Schema.Type<typeof Ref> {}
 
 export const Family = Schema.String.pipe(Schema.brand("Family"))
 export type Family = typeof Family.Type
+
+export const Primitive = Schema.Literals(["language", "system-one"]).annotate({ identifier: "Model.Primitive" })
+export type Primitive = typeof Primitive.Type
+
+/** Resolve the computational primitive represented by one materialized model. */
+export function resolvePrimitive(
+  _providerID: string,
+  model: { readonly id: string; readonly primitive?: Primitive },
+): Primitive {
+  return model.primitive ?? "language"
+}
 
 export interface Capabilities extends Schema.Schema.Type<typeof Capabilities> {}
 export const Capabilities = Schema.Struct({
@@ -62,6 +79,7 @@ export const Info = Schema.Struct({
   providerID: Provider.ID,
   family: Family.pipe(optional),
   name: Schema.String,
+  primitive: Primitive.pipe(optional),
   api: Api,
   capabilities: Capabilities,
   request: Schema.Struct({
@@ -92,6 +110,7 @@ export const Info = Schema.Struct({
           id: modelID,
           providerID,
           name: modelID,
+          primitive: "language",
           api: { id: modelID, type: "native", settings: {} },
           capabilities: { tools: false, input: [], output: [] },
           request: { headers: {}, body: {} },

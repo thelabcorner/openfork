@@ -1,5 +1,5 @@
 import path from "path"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect, Layer } from "effect"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { Integration } from "@opencode-ai/core/integration"
@@ -27,6 +27,17 @@ const layer = AppNodeBuilder.build(LayerNode.group([Catalog.node, Integration.no
 const it = testEffect(layer)
 
 describe("ModelsDevPlugin", () => {
+  test("classifies models.dev decision rows as System One regardless of provider", () => {
+    expect(ModelsDev.modelPrimitive("typesafe", { id: "jev-latest", type: "decision" })).toBe("system-one")
+    expect(ModelsDev.modelPrimitive("acme", { id: "semantic-router", type: "decision" })).toBe("system-one")
+    expect(ModelsDev.modelPrimitive("opencode", { id: "jev-1.13-free" })).toBe("language")
+    expect(ModelsDev.modelPrimitive("opencode-go", { id: "jev-latest" })).toBe("language")
+    expect(ModelsDev.modelPrimitive("opencode", { id: "gpt-5.4" })).toBe("language")
+    expect(ModelsDev.modelPrimitive("opencode-go", { id: "kimi-k3" })).toBe("language")
+    expect(ModelsDev.modelPrimitive("acme", { id: "jev-1.13-free" })).toBe("language")
+    expect(ModelsDev.modelPrimitive("acme", { id: "anything", primitive: "system-one" })).toBe("system-one")
+  })
+
   it.effect("projects models.dev modes as separate models instead of variants", () =>
     Effect.gen(function* () {
       const integrations = yield* Integration.Service
@@ -79,6 +90,7 @@ describe("ModelsDevPlugin", () => {
               },
             },
           } satisfies Record<string, ModelsDev.Provider>),
+        getDecisionModels: () => Effect.succeed({}),
         refresh: () => Effect.void,
       })
 
@@ -94,6 +106,7 @@ describe("ModelsDevPlugin", () => {
       const fast = yield* catalog.model.get(providerID, ModelV2.ID.make("gpt-5.4-fast"))
 
       expect(base?.variants).toEqual([])
+      expect(base?.primitive).toBe("language")
       expect(base?.request.body).toEqual({})
       expect(fast).toMatchObject({
         id: "gpt-5.4-fast",
