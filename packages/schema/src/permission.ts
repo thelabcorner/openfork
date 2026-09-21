@@ -63,3 +63,11 @@ export const Rule = Schema.Struct({
 
 export const Ruleset = Schema.Array(Rule).annotate({ identifier: "PermissionV2.Ruleset" })
 export type Ruleset = typeof Ruleset.Type
+
+/**
+ * Session/domain hard execution ceiling. It deliberately shares the Rule wire
+ * shape with agent permissions, but it is a distinct semantic contract: saved
+ * approvals may resolve ASK, never override a DENY imposed by this boundary.
+ */
+export const Boundary = Schema.Array(Rule).annotate({ identifier: "PermissionV2.Boundary" })
+export type Boundary = typeof Boundary.Type

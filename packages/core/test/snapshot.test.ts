@@ -164,6 +164,70 @@ describe("Snapshot", () => {
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
   )
+
+  testEffect(Layer.empty).live("retention ownership isolates identical trees", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const project = path.join(tmp.path, "project")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(project)
+            await fs.writeFile(path.join(project, "tracked.txt"), "one\n")
+            await $`git init`.cwd(project).quiet()
+            await $`git config core.fsmonitor false`.cwd(project).quiet()
+            await $`git config commit.gpgsign false`.cwd(project).quiet()
+            await $`git config user.email test@opencode.test`.cwd(project).quiet()
+            await $`git config user.name Test`.cwd(project).quiet()
+            await $`git add .`.cwd(project).quiet()
+            await $`git commit -m initial`.cwd(project).quiet()
+          })
+
+          const projectID = yield* Effect.gen(function* () {
+            return (yield* Location.Service).project.id
+          }).pipe(
+            Effect.provide(
+              AppNodeBuilder.build(Location.boundNode(Location.Ref.make({ directory: AbsolutePath.make(project) }))),
+            ),
+          )
+
+          yield* Effect.gen(function* () {
+            const snapshot = yield* Snapshot.Service
+            const tree = yield* snapshot.capture()
+            expect(tree).toBeDefined()
+            if (!tree) return
+
+            const ownerA = `checkpoint/cp_a/after/${tree}`
+            const ownerB = `checkpoint/cp_b/after/${tree}`
+            yield* snapshot.retain(tree, ownerA)
+            yield* snapshot.retain(tree, ownerB)
+            expect((yield* snapshot.retained({ prefix: "checkpoint/", limit: 16 })).keys).toEqual([
+              ownerA,
+              ownerB,
+            ])
+
+            const gitdir = path.join(tmp.path, "snapshot", projectID, Hash.fast(project))
+            const verify = (owner: string) =>
+              Bun.spawnSync([
+                "git",
+                `--git-dir=${gitdir}`,
+                "show-ref",
+                "--verify",
+                `refs/opencode/retained/${owner}`,
+              ]).exitCode
+
+            expect(verify(ownerA)).toBe(0)
+            expect(verify(ownerB)).toBe(0)
+
+            yield* snapshot.release(ownerA)
+            expect(verify(ownerA)).not.toBe(0)
+            expect(verify(ownerB)).toBe(0)
+            expect((yield* snapshot.retained({ prefix: "checkpoint/", limit: 16 })).keys).toEqual([ownerB])
+          }).pipe(Effect.provide(snapshotLayer(tmp.path, project)))
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
 })
 
 function snapshotLayer(data: string, directory: string) {

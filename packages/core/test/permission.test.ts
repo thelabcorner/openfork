@@ -15,6 +15,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionExecutionBoundaryTable } from "@opencode-ai/core/session/execution-boundary.sql"
 import { eq } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
@@ -247,6 +248,54 @@ describe("PermissionV2", () => {
         id: PermissionV2.ID.create("per_test"),
         effect: "deny",
       })
+    }),
+  )
+
+  it.effect("hard Session boundary deny cannot be widened by agent allow or saved approval", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "edit", resource: "*", effect: "allow" }])
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(SessionExecutionBoundaryTable)
+        .values({
+          session_id: SessionV2.ID.make("ses_test"),
+          boundary: [{ action: "edit", resource: "*", effect: "deny" }],
+          time_updated: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({ projectID: Project.ID.global, action: "edit", resources: ["src/index.ts"] })
+
+      const service = yield* PermissionV2.Service
+      expect(yield* service.ask(assertion({ action: "edit" }))).toMatchObject({ effect: "deny" })
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
+  it.effect("hard Session boundary ask is approval-resolvable but never widens an agent deny", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "bash", resource: "*", effect: "allow" }])
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(SessionExecutionBoundaryTable)
+        .values({
+          session_id: SessionV2.ID.make("ses_test"),
+          boundary: [{ action: "bash", resource: "*", effect: "ask" }],
+          time_updated: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      const service = yield* PermissionV2.Service
+      expect(yield* service.ask(assertion({ action: "bash", resources: ["pwd"] }))).toMatchObject({ effect: "ask" })
+
+      const saved = yield* PermissionSaved.Service
+      yield* saved.add({ projectID: Project.ID.global, action: "bash", resources: ["pwd"] })
+      expect(yield* service.ask(assertion({ id: PermissionV2.ID.create("per_after_save"), action: "bash", resources: ["pwd"] }))).toMatchObject({ effect: "allow" })
+
+      yield* setRules([{ action: "bash", resource: "*", effect: "deny" }])
+      expect(yield* service.ask(assertion({ id: PermissionV2.ID.create("per_denied"), action: "bash", resources: ["pwd"] }))).toMatchObject({ effect: "deny" })
     }),
   )
 

@@ -13,6 +13,7 @@ import { Location } from "./location"
 import { AppProcess } from "./process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { Hash } from "./util/hash"
+import { GitRuntime } from "./git-runtime"
 
 export const ID = Schema.String.pipe(Schema.brand("Snapshot.ID"))
 export type ID = typeof ID.Type
@@ -36,6 +37,11 @@ export interface DiffInput extends CompareInput {
 export interface RestoreInput {
   /** Paths are relative to the project root. */
   readonly files: ReadonlyMap<RelativePath, ID>
+}
+
+export interface RetainedPage {
+  readonly keys: readonly string[]
+  readonly next?: string
 }
 
 export interface PreviewInput extends RestoreInput {
@@ -84,17 +90,29 @@ export interface Interface {
 
   /**
    * Pin a captured tree object inside the shadow repository so it survives
-   * `Snapshot.cleanup()` GC pruning (which runs `git gc --prune=7.days`). A
-   * detached commit is created from the tree and referenced under
-   * `refs/opencode/retained/<hash>`; the ref keeps the object reachable. Idempotent.
+   * `Snapshot.cleanup()` GC pruning (which runs `git gc --prune=7.days`).
+   *
+   * `key` is the durable owner's identity, not the tree identity. Multiple
+   * owners may intentionally retain the same content-addressed tree without
+   * sharing one releasable ref.
    */
-  readonly retain: (hash: ID) => Effect.Effect<void, any>
+  readonly retain: (hash: ID, key: string) => Effect.Effect<void, any>
 
   /**
-   * Drop the pin created by `retain` for a tree object. Safe to call when no pin
-   * exists.
+   * Drop exactly one owner's pin created by `retain`. Safe to call when no pin
+   * exists. Releasing one key cannot invalidate another owner's identical tree.
    */
-  readonly release: (hash: ID) => Effect.Effect<void, any>
+  readonly release: (key: string) => Effect.Effect<void, any>
+
+  /**
+   * Bounded inventory of retained owner keys. Snapshot owns physical refs;
+   * higher-level domains decide which keys remain semantically valid.
+   */
+  readonly retained: (input: {
+    readonly prefix?: string
+    readonly after?: string
+    readonly limit: number
+  }) => Effect.Effect<RetainedPage, any>
 
   /**
    * Stable identity of the snapshot store for the current project + worktree.
@@ -191,7 +209,7 @@ const layer = Layer.effect(
         .run(
           ChildProcess.make(
             "git",
-            ["--git-dir", gitDirectory, "--work-tree", worktree, "add", "--all", "--sparse", "--", "."],
+            GitRuntime.args(["--git-dir", gitDirectory, "--work-tree", worktree, "add", "--all", "--sparse", "--", "."]),
             { cwd: worktree, extendEnv: true },
           ),
         )
@@ -301,13 +319,36 @@ const layer = Layer.effect(
       return Hash.fast(`${location.project.id}:${worktree}`)
     })
 
-    const retain = Effect.fn("Snapshot.retain")(function* (hash: ID) {
+    const retainedRef = (key: string) => {
+      if (
+        key.length === 0 ||
+        key.startsWith("/") ||
+        key.endsWith("/") ||
+        key.includes("..") ||
+        !/^[A-Za-z0-9._/-]+$/.test(key)
+      ) {
+        throw new TypeError(`Invalid snapshot retention key: ${key}`)
+      }
+      return `refs/opencode/retained/${key}`
+    }
+
+    const retainedPrefix = (prefix: string) => {
+      if (prefix.startsWith("/") || prefix.includes("..") || !/^[A-Za-z0-9._/-]*$/.test(prefix)) {
+        throw new TypeError(`Invalid snapshot retention prefix: ${prefix}`)
+      }
+      return `refs/opencode/retained/${prefix}`
+    }
+
+    const retain = Effect.fn("Snapshot.retain")(function* (hash: ID, key: string) {
       if (!(yield* enabled())) return
       const repo = yield* repository().pipe(Effect.mapError((cause) => failure("capture", cause)))
-      const ref = `refs/opencode/retained/${hash}`
+      const ref = retainedRef(key)
       const commit = yield* appProcess
         .run(
-          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, "commit-tree", hash, "-m", `opencode retain ${hash}`]),
+          ChildProcess.make(
+            "git",
+            GitRuntime.args(["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, "commit-tree", hash, "-m", `opencode retain ${hash}`]),
+          ),
           { stdin: "ignore" },
         )
         .pipe(Effect.mapError((cause) => new Error({ operation: "capture", message: `failed to retain ${hash}`, cause })))
@@ -318,7 +359,10 @@ const layer = Layer.effect(
         })
       const update = yield* appProcess
         .run(
-          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "update-ref", ref, commit.stdout.toString("utf8").trim()]),
+          ChildProcess.make(
+            "git",
+            GitRuntime.args(["--git-dir", repo.gitDirectory, "update-ref", ref, commit.stdout.toString("utf8").trim()]),
+          ),
           { stdin: "ignore" },
         )
         .pipe(Effect.mapError((cause) => new Error({ operation: "capture", message: `failed to pin ${ref}`, cause })))
@@ -329,13 +373,65 @@ const layer = Layer.effect(
         })
     })
 
-    const release = Effect.fn("Snapshot.release")(function* (hash: ID) {
+    const release = Effect.fn("Snapshot.release")(function* (key: string) {
       if (!(yield* enabled())) return
       const repo = yield* repository().pipe(Effect.mapError((cause) => failure("capture", cause)))
-      const ref = `refs/opencode/retained/${hash}`
+      const ref = retainedRef(key)
       yield* appProcess
-        .run(ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "update-ref", "-d", ref]), { stdin: "ignore" })
+        .run(
+          ChildProcess.make("git", GitRuntime.args(["--git-dir", repo.gitDirectory, "update-ref", "-d", ref])),
+          { stdin: "ignore" },
+        )
         .pipe(Effect.catch(() => Effect.void))
+    })
+
+    const retained = Effect.fn("Snapshot.retained")(function* (input: {
+      readonly prefix?: string
+      readonly after?: string
+      readonly limit: number
+    }) {
+      if (!(yield* enabled())) return { keys: [] } satisfies RetainedPage
+      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("capture", cause)))
+      const limit = Math.min(512, Math.max(1, Math.floor(input.limit)))
+      const root = retainedPrefix(input.prefix ?? "")
+      const after = input.after ? retainedRef(input.after) : undefined
+      const result = yield* appProcess
+        .run(
+          ChildProcess.make(
+            "git",
+            GitRuntime.args([
+              "--git-dir",
+              repo.gitDirectory,
+              "for-each-ref",
+              `--count=${limit}`,
+              "--format=%(refname)",
+              ...(after ? [`--start-after=${after}`] : []),
+              root,
+            ]),
+          ),
+          { stdin: "ignore" },
+        )
+        .pipe(
+          Effect.mapError(
+            (cause) => new Error({ operation: "capture", message: "failed to list retained refs", cause }),
+          ),
+        )
+      if (result.exitCode !== 0)
+        return yield* new Error({
+          operation: "capture",
+          message: `for-each-ref failed: ${result.stderr.toString("utf8").trim()}`,
+        })
+      const refRoot = "refs/opencode/retained/"
+      const keys = result.stdout
+        .toString("utf8")
+        .split(/\r?\n/)
+        .map((value) => value.trim())
+        .filter((value) => value.startsWith(refRoot))
+        .map((value) => value.slice(refRoot.length))
+      return {
+        keys,
+        ...(keys.length === limit ? { next: keys[keys.length - 1] } : {}),
+      } satisfies RetainedPage
     })
 
     const excludedFiles = Effect.fn("Snapshot.excludedFiles")(function* (input: CompareInput) {
@@ -345,7 +441,10 @@ const layer = Layer.effect(
       const inTo = new Set(yield* git.tree.files({ repository: repo, from: toTree, to: toTree }))
       const list = (args: string[]) =>
         appProcess.run(
-          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, ...args]),
+          ChildProcess.make(
+            "git",
+            GitRuntime.args(["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, ...args]),
+          ),
           { stdin: "ignore" },
         )
       const [untracked, modified] = yield* Effect.all(
@@ -373,7 +472,7 @@ const layer = Layer.effect(
       return excluded.filter((item) => item !== undefined) as unknown as readonly ExcludedFile[]
     })
 
-    return Service.of({ capture, files, diff, preview, restore, checkout, retain, release, epoch, excludedFiles })
+    return Service.of({ capture, files, diff, preview, restore, checkout, retain, release, retained, epoch, excludedFiles })
   }),
 )
 
@@ -396,6 +495,7 @@ export const noopLayer = Layer.succeed(
     checkout: () => Effect.void,
     retain: () => Effect.void as any,
     release: () => Effect.void as any,
+    retained: () => Effect.succeed({ keys: [] }) as any,
     epoch: () => Effect.succeed("noop") as any,
     excludedFiles: () => Effect.succeed([]) as any,
   }),

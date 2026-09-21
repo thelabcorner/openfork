@@ -10,6 +10,7 @@ import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
 import { PermissionSaved } from "./permission/saved"
+import { SessionExecutionBoundary } from "./session/execution-boundary"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
 const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
@@ -89,6 +90,24 @@ export function merge(...rulesets: Permission.Ruleset[]): Permission.Ruleset {
   return rulesets.flat()
 }
 
+const restrictiveness: Record<Permission.Effect, number> = { deny: 0, ask: 1, allow: 2 }
+
+/** Hard-boundary evaluation differs from an agent ruleset: no matching rule is
+ * unrestricted (`allow`), not interactive (`ask`). */
+export function evaluateBoundary(action: string, resource: string, boundary: Permission.Boundary): Permission.Rule {
+  return (
+    boundary.findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
+      action,
+      resource: "*",
+      effect: "allow",
+    }
+  )
+}
+
+export function restrict(...effects: Permission.Effect[]): Permission.Effect {
+  return effects.reduce((left, right) => (restrictiveness[right] < restrictiveness[left] ? right : left), "allow")
+}
+
 export interface Interface {
   readonly ask: (input: AssertInput) => EffectRuntime.Effect<AskResult, SessionV2.NotFoundError>
   readonly assert: (input: AssertInput) => EffectRuntime.Effect<void, Error | SessionV2.NotFoundError>
@@ -114,6 +133,7 @@ const layer = Layer.effect(
     const agents = yield* AgentV2.Service
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
+    const boundaries = yield* SessionExecutionBoundary.Service
     const pending = new Map<ID, Pending>()
 
     yield* EffectRuntime.addFinalizer(() =>
@@ -144,21 +164,24 @@ const layer = Layer.effect(
       return agent?.permissions ?? missingAgentPermissions
     })
 
-    function denied(input: AssertInput, rules: Permission.Ruleset) {
-      return input.resources.some((resource) => evaluate(input.action, resource, rules).effect === "deny")
-    }
-
     function relevant(input: AssertInput, rules: Permission.Ruleset) {
       return rules.filter((rule) => Wildcard.match(input.action, rule.action))
     }
 
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
-      const rules = yield* configured(input.sessionID, input.agent)
-      if (denied(input, rules)) return { effect: "deny" as const, rules }
-      const all = [...rules, ...(yield* savedRules())]
-      const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
+      const agentRules = yield* configured(input.sessionID, input.agent)
+      const boundary = (yield* boundaries.get(input.sessionID)) ?? []
+      const approvals = yield* savedRules()
+      const effects = input.resources.map((resource) => {
+        const hard = restrict(
+          evaluate(input.action, resource, agentRules).effect,
+          evaluateBoundary(input.action, resource, boundary).effect,
+        )
+        if (hard !== "ask") return hard
+        return evaluate(input.action, resource, approvals).effect === "allow" ? "allow" : "ask"
+      })
       const effect: Permission.Effect = effects.includes("deny") ? "deny" : effects.includes("ask") ? "ask" : "allow"
-      return { effect, rules: all }
+      return { effect, rules: [...agentRules, ...boundary, ...approvals] }
     })
 
     function request(input: AssertInput): Request {
@@ -264,21 +287,11 @@ const layer = Layer.effect(
           pending.delete(input.requestID)
           if (input.reply !== "always" || !existing.request.save?.length) return
 
-          const rememberedRules = yield* savedRules()
           for (const [id, item] of pending) {
-            const input = { ...item.request }
-            const rules = yield* configured(item.request.sessionID, item.agent).pipe(
+            const result = yield* evaluateInput({ ...item.request, agent: item.agent }).pipe(
               EffectRuntime.catchTag("Session.NotFoundError", () => EffectRuntime.succeed(undefined)),
             )
-            if (!rules) continue
-            if (denied(input, rules)) continue
-            const effective = [...rules, ...rememberedRules]
-            if (
-              !item.request.resources.every(
-                (resource) => evaluate(item.request.action, resource, effective).effect === "allow",
-              )
-            )
-              continue
+            if (!result || result.effect !== "allow") continue
             yield* events.publish(Event.Replied, {
               sessionID: item.request.sessionID,
               requestID: item.request.id,
@@ -312,5 +325,12 @@ export const locationLayer = layer.pipe(Layer.provideMerge(AgentV2.locationLayer
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node],
+  deps: [
+    EventV2.node,
+    Location.node,
+    AgentV2.node,
+    SessionStore.node,
+    SessionExecutionBoundary.node,
+    PermissionSaved.node,
+  ],
 })
