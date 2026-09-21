@@ -9,9 +9,9 @@ const execFileAsync = promisify(execFile)
 const packageDir = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(packageDir, "../..")
 const signScript = path.join(rootDir, "script", "sign-windows.ps1")
-// The Electron 42 packaging update briefly installed Linux launchers/icons under
-// "opencode-desktop". Keep that hidden desktop entry around so existing GNOME/KDE
-// pins still resolve after the canonical app id changes back to ai.opencode.desktop.
+// Older OpenCode-branded builds installed Linux launchers/icons under
+// "opencode-desktop". Keep that hidden desktop entry as a compatibility alias
+// while the canonical OpenFork desktop identity is ai.openfork.desktop.
 const legacyDesktopEntry = path.join(packageDir, "resources", "linux", "opencode-desktop.desktop")
 const legacyDesktopEntryFpm = `${legacyDesktopEntry}=/usr/share/applications/opencode-desktop.desktop`
 
@@ -36,13 +36,13 @@ const channel = (() => {
 })()
 
 const APP_IDS = {
-  dev: "ai.opencode.desktop.dev",
-  beta: "ai.opencode.desktop.beta",
-  prod: "ai.opencode.desktop",
+  dev: "ai.openfork.desktop.dev",
+  beta: "ai.openfork.desktop.beta",
+  prod: "ai.openfork.desktop",
 } as const
 
 const getBase = (appId: string): Configuration => ({
-  artifactName: "opencode-desktop-${os}-${arch}.${ext}",
+  artifactName: "openfork-desktop-${os}-${arch}.${ext}",
   directories: {
     output: "dist",
     buildResources: "resources",
@@ -62,14 +62,14 @@ const getBase = (appId: string): Configuration => ({
     },
   ],
   // Linux launchers are .desktop files, so this is the desktop file name,
-  // not just the app id. For prod, app id "ai.opencode.desktop" becomes
-  // "ai.opencode.desktop.desktop".
+  // not just the app id. For prod, app id "ai.openfork.desktop" becomes
+  // "ai.openfork.desktop.desktop".
   // https://developer.gnome.org/documentation/guidelines/maintainer/integrating.html
   // https://www.electron.build/docs/linux/
   extraMetadata: {
     desktopName: `${appId}.desktop`,
   },
-  files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*"],
+  files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*", "!resources/tunnel/**/*"],
   extraResources: [
     ...(channel === "dev"
       ? [
@@ -92,6 +92,12 @@ const getBase = (appId: string): Configuration => ({
       from: "../browser-visual/THIRD_PARTY_NOTICES.txt",
       to: "licenses/SnapEye-THIRD_PARTY_NOTICES.txt",
     },
+    {
+      // OXP's pinned OpenAI runtime is a real filesystem executable. Keep it
+      // outside app.asar, together with its release license/SBOM sidecars.
+      from: "resources/tunnel/",
+      to: "tunnel/",
+    },
   ],
   mac: {
     category: "public.app-category.developer-tools",
@@ -109,7 +115,7 @@ const getBase = (appId: string): Configuration => ({
     sign: true,
   },
   protocols: {
-    name: "OpenCode",
+    name: "OpenFork",
     schemes: ["opencode"],
   },
   win: {
@@ -150,34 +156,31 @@ function getConfig() {
       return {
         ...base,
         appId,
-        productName: "OpenCode Dev",
+        productName: "OpenFork Dev",
         deb: { fpm: [metainfoFpm(appId)] },
-        rpm: { packageName: "opencode-dev", fpm: [metainfoFpm(appId)] },
+        rpm: { packageName: "openfork-dev", fpm: [metainfoFpm(appId)] },
       }
     }
     case "beta": {
       return {
         ...base,
         appId,
-        productName: "OpenCode Beta",
-        protocols: { name: "OpenCode Beta", schemes: ["opencode"] },
-        // OpenFork: no publish feed. The upstream config pointed at
-        // anomalyco/opencode, which would let official OpenCode install over
-        // this fork via electron-updater. Retarget to thelabcorner/openfork
-        // only if this fork starts publishing installers.
+        productName: "OpenFork Beta",
+        protocols: { name: "OpenFork Beta", schemes: ["opencode"] },
+        // Keep updater metadata on the OpenFork release feed configured above.
         deb: { fpm: [metainfoFpm(appId)] },
-        rpm: { packageName: "opencode-beta", fpm: [metainfoFpm(appId)] },
+        rpm: { packageName: "openfork-beta", fpm: [metainfoFpm(appId)] },
       }
     }
     case "prod": {
       return {
         ...base,
         appId,
-        productName: "OpenCode",
-        protocols: { name: "OpenCode", schemes: ["opencode"] },
-        // See the beta note above: deliberately no publish feed on OpenFork.
+        productName: "OpenFork",
+        protocols: { name: "OpenFork", schemes: ["opencode"] },
+        // Keep updater metadata on the OpenFork release feed configured above.
         deb: { fpm: [metainfoFpm(appId), legacyDesktopEntryFpm] },
-        rpm: { packageName: "opencode", fpm: [metainfoFpm(appId), legacyDesktopEntryFpm] },
+        rpm: { packageName: "openfork", fpm: [metainfoFpm(appId), legacyDesktopEntryFpm] },
       }
     }
   }

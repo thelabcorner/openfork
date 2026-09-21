@@ -33,6 +33,7 @@ import {
 import { createMobileHandshake } from "./mobile-handshake"
 import { setupAutoUpdater, showUpdaterDialog } from "./updater"
 import { safeWebContentsURL } from "./window-state"
+import { migrateLegacyUserData, USER_DATA_NAMES } from "./user-data"
 import {
   getLastFocusedWindow,
   registerRendererProtocol,
@@ -41,6 +42,7 @@ import {
   setBackgroundColor,
   setDockIcon,
   restoreMainWindows,
+  showMainWindows,
 } from "./windows"
 import { createWslServersController } from "./wsl/servers"
 import { registerWslIpcHandlers } from "./wsl/ipc"
@@ -53,15 +55,18 @@ import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { registerBrowserIpcHandlers } from "./ipc"
 import { RendererTrust } from "./browser/renderer-trust"
 import { wireWebviewHardening } from "./windows"
+import { OxpController } from "./oxp/controller"
+import { registerOxpIpc } from "./oxp/ipc"
+import { OxpCredentials } from "./oxp/credentials"
 const APP_NAMES: Record<string, string> = {
-  dev: "OpenCode Dev",
-  beta: "OpenCode Beta",
-  prod: "OpenCode",
+  dev: "OpenFork Dev",
+  beta: "OpenFork Beta",
+  prod: "OpenFork",
 }
 const APP_IDS: Record<string, string> = {
-  dev: "ai.opencode.desktop.dev",
-  beta: "ai.opencode.desktop.beta",
-  prod: "ai.opencode.desktop",
+  dev: "ai.openfork.desktop.dev",
+  beta: "ai.openfork.desktop.beta",
+  prod: "ai.openfork.desktop",
 }
 const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
 const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
@@ -115,7 +120,8 @@ const main = Effect.gen(function* () {
     process.chdir(homedir())
   } catch {}
   process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
-  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
+  const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.openfork.desktop.dev"
+  const userDataChannel = app.isPackaged ? CHANNEL : "dev"
   const onboardingTestRoot = ((): string | undefined => {
     if (!TEST_ONBOARDING) return
     const root = join(tmpdir(), `opencode-onboarding-${randomUUID()}`)
@@ -130,11 +136,14 @@ const main = Effect.gen(function* () {
     process.env.XDG_STATE_HOME = join(root, "state")
     return root
   })()
-  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
+  app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenFork Dev")
   app.setAppUserModelId(appId)
+  const canonicalUserData = onboardingTestRoot
+    ? join(onboardingTestRoot, "desktop")
+    : yield* Effect.promise(() => migrateLegacyUserData(app.getPath("appData"), userDataChannel))
   app.setPath(
     "userData",
-    onboardingTestRoot ? join(onboardingTestRoot, "desktop") : join(app.getPath("appData"), appId),
+    canonicalUserData,
   )
   if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
   initializeOldLayoutEligibility(app.getPath("userData"))
@@ -148,6 +157,8 @@ const main = Effect.gen(function* () {
     channel: CHANNEL,
     onLog: (message, meta) => logger.log(message, meta),
   })
+  const desktopCredentials = new OxpCredentials(app.getPath("userData"))
+  const oxpController = new OxpController(app.getPath("userData"), desktopCredentials)
   const wslServers = createWslServersController(
     app.getVersion(),
     async (distro) => {
@@ -163,11 +174,31 @@ const main = Effect.gen(function* () {
       },
     },
   )
-  const stopSidecars = async () => {
-    handshake.revoke()
-    await killSidecar()
-    wslServers.stopAll()
-  }
+  let stopSidecarsInFlight: Promise<void> | undefined
+  let sidecarsTeardownFinished = false
+  const stopSidecars = () =>
+    (stopSidecarsInFlight ??= (async () => {
+      handshake.revoke()
+      let firstError: unknown
+      try {
+        await oxpController.shutdown()
+      } catch (error) {
+        firstError = error
+      }
+      try {
+        await killSidecar()
+      } catch (error) {
+        firstError ??= error
+      }
+      try {
+        wslServers.stopAll()
+      } catch (error) {
+        firstError ??= error
+      }
+      if (firstError) throw firstError
+    })().finally(() => {
+      sidecarsTeardownFinished = true
+    }))
   const relaunch = () => {
     setAppQuitting()
     void stopSidecars().finally(() => {
@@ -222,13 +253,19 @@ const main = Effect.gen(function* () {
     logger.log("deep link received via open-url", { url })
     emitDeepLinks([url])
   })
-  app.on("before-quit", () => {
+  let quitTeardownStarted = false
+  app.on("before-quit", (event) => {
     setAppQuitting()
+    if (sidecarsTeardownFinished) return
+    event.preventDefault()
+    if (quitTeardownStarted) return
+    quitTeardownStarted = true
     void stopSidecars()
+      .catch((error) => writeLog("oxp", "bounded application teardown reported an error", undefined, "error"))
+      .finally(() => app.quit())
   })
   app.on("will-quit", () => {
     setAppQuitting()
-    void stopSidecars()
   })
   app.on("child-process-gone", (_event, details) => {
     writeLog("utility", "child process gone", { details }, "error")
@@ -249,6 +286,9 @@ const main = Effect.gen(function* () {
   autopsyMark("whenReady-wait-start") // STARTUP-AUTOPSY
   yield* Effect.promise(() => app.whenReady())
   autopsyMark("whenReady-done") // STARTUP-AUTOPSY
+  // Read only OXP's tiny non-secret lifecycle config on the startup path.
+  // Keyring work, endpoint creation, and tunnel processes remain lazy.
+  yield* Effect.promise(() => oxpController.initialize())
   if (!TEST_ONBOARDING) migrate()
   autopsyMark("migrate-done") // STARTUP-AUTOPSY
   app.setAsDefaultProtocolClient("opencode")
@@ -268,7 +308,13 @@ const main = Effect.gen(function* () {
     relaunch,
   }
   registerIpcHandlers({
-    killSidecar: () => killSidecar(),
+    killSidecar: async () => {
+      try {
+        await oxpController.shutdown()
+      } finally {
+        await killSidecar()
+      }
+    },
     relaunch,
     awaitInitialization: Effect.fnUntraced(
       function* () {
@@ -330,6 +376,7 @@ const main = Effect.gen(function* () {
     win.webContents.once("destroyed", () => rendererTrust.unregister(win.webContents.id))
   })
   registerBrowserIpcHandlers(browserEngine, rendererTrust)
+  registerOxpIpc(oxpController, rendererTrust)
   if (updater) {
     void updater.start()
     const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
@@ -358,7 +405,10 @@ const main = Effect.gen(function* () {
     app.quit()
   })
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length > 0) return
+    if (BrowserWindow.getAllWindows().length > 0) {
+      showMainWindows()
+      return
+    }
     restoreMainWindows()
   })
   autopsyMark("windows-restore-start") // STARTUP-AUTOPSY
@@ -508,9 +558,12 @@ const main = Effect.gen(function* () {
       )
     }
     const url = `http://${hostname}:${port}`
-    const { listener, health } = spawnResult!
+    const { listener, health, oxp } = spawnResult!
     autopsyMark("sidecar-ready-msg") // STARTUP-AUTOPSY (utility process sent {type:"ready"})
     server = listener
+    void oxpController.attachSidecar(oxp).catch(() =>
+      writeLog("oxp", "failed to attach OXP sidecar bridge", undefined, "warn"),
+    )
     readyData = { url, username: "opencode", password }
     handshake.publish(url)
     // Off the critical path: nothing the desktop does depends on this token.

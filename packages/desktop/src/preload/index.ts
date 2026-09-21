@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
-import type { BrowserAPI, ElectronAPI, WslServersEvent } from "./types"
+import type { BrowserAPI, ElectronAPI, OxpDesktopState, WslServersEvent } from "./types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 
 const updaterCallbacks = new Set<(state: UpdaterState) => void>()
@@ -8,6 +8,39 @@ let updaterSubscription: Promise<void> | undefined
 const updaterHandler = (_: unknown, state: UpdaterState) => {
   updaterState = state
   updaterCallbacks.forEach((callback) => callback(state))
+}
+
+const oxpCallbacks = new Set<(state: OxpDesktopState) => void>()
+let oxpRemoteSubscribed = false
+let oxpSubscriptionTransition: Promise<void> = Promise.resolve()
+const oxpHandler = (_: unknown, state: OxpDesktopState) => {
+  for (const callback of oxpCallbacks) callback(state)
+}
+
+function reconcileOxpSubscription() {
+  const reconcile = async () => {
+    while (true) {
+      const wanted = oxpCallbacks.size > 0
+      if (wanted === oxpRemoteSubscribed) return
+      if (wanted) {
+        ipcRenderer.on("oxp-state", oxpHandler)
+        try {
+          await ipcRenderer.invoke("oxp-subscribe")
+          oxpRemoteSubscribed = true
+        } catch (error) {
+          ipcRenderer.removeListener("oxp-state", oxpHandler)
+          throw error
+        }
+        continue
+      }
+      await ipcRenderer.invoke("oxp-unsubscribe")
+      oxpRemoteSubscribed = false
+      ipcRenderer.removeListener("oxp-state", oxpHandler)
+    }
+  }
+  const run = oxpSubscriptionTransition.then(reconcile, reconcile)
+  oxpSubscriptionTransition = run.catch(() => undefined)
+  return run
 }
 
 const browserApi: BrowserAPI = {
@@ -111,6 +144,44 @@ const api: ElectronAPI = {
     },
     check: () => ipcRenderer.invoke("updater-check"),
     install: () => ipcRenderer.invoke("updater-install"),
+  },
+  oxp: {
+    getState: () => ipcRenderer.invoke("oxp-get-state"),
+    subscribe: async (cb) => {
+      oxpCallbacks.add(cb)
+      try {
+        await reconcileOxpSubscription()
+      } catch (error) {
+        oxpCallbacks.delete(cb)
+        void reconcileOxpSubscription().catch(() => undefined)
+        throw error
+      }
+      let active = true
+      return () => {
+        if (!active) return
+        active = false
+        oxpCallbacks.delete(cb)
+        void reconcileOxpSubscription().catch(() => undefined)
+      }
+    },
+    setEnabled: (enabled) => ipcRenderer.invoke("oxp-set-enabled", enabled),
+    setGrant: (patch) => ipcRenderer.invoke("oxp-set-grant", patch),
+    addRoot: () => ipcRenderer.invoke("oxp-add-root"),
+    syncProjectRoots: (paths) => ipcRenderer.invoke("oxp-sync-project-roots", paths),
+    renameRoot: (rootID, alias) => ipcRenderer.invoke("oxp-rename-root", rootID, alias),
+    removeRoot: (rootID) => ipcRenderer.invoke("oxp-remove-root", rootID),
+    revealRoot: (rootID) => ipcRenderer.invoke("oxp-reveal-root", rootID),
+    setTunnelID: (value) => ipcRenderer.invoke("oxp-set-tunnel-id", value),
+    setOpenAiApiKey: (value) => ipcRenderer.invoke("oxp-set-openai-api-key", value),
+    clearOpenAiApiKey: () => ipcRenderer.invoke("oxp-clear-openai-api-key"),
+    resetUnreadableCredentialStore: () => ipcRenderer.invoke("oxp-reset-unreadable-credential-store"),
+    setLifecycle: (patch) => ipcRenderer.invoke("oxp-set-lifecycle", patch),
+    importLocalMcp: () => ipcRenderer.invoke("oxp-import-localmcp"),
+    autoImportLocalMcp: () => ipcRenderer.invoke("oxp-auto-import-localmcp"),
+    retireLocalMcp: () => ipcRenderer.invoke("oxp-retire-localmcp"),
+    connect: () => ipcRenderer.invoke("oxp-connect"),
+    disconnect: () => ipcRenderer.invoke("oxp-disconnect"),
+    exportDiagnostics: () => ipcRenderer.invoke("oxp-export-diagnostics"),
   },
   consumeInitialDeepLinks: () => ipcRenderer.invoke("consume-initial-deep-links"),
   getDefaultServerUrl: () => ipcRenderer.invoke("get-default-server-url"),

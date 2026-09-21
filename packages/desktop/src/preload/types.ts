@@ -17,6 +17,9 @@ import type {
   VisualProjectContext,
   WireGuestTabState,
 } from "../main/browser/contracts"
+import type { OxpDesktopState } from "../main/oxp/contracts"
+import type { OxpLifecycle } from "../main/oxp/config"
+import type { SidecarOxpGrant } from "../main/sidecar-protocol"
 export type { BrowserAnnotationResult } from "../main/browser/contracts"
 export type ChromePairingStatus = {
   installed: boolean
@@ -60,6 +63,29 @@ export type UpdaterAPI = {
   subscribe: (cb: (state: UpdaterState) => void) => Promise<() => void>
   check: () => Promise<UpdaterState>
   install: () => Promise<void>
+}
+export type { OxpDesktopState }
+export type OxpAPI = {
+  getState: () => Promise<OxpDesktopState>
+  subscribe: (cb: (state: OxpDesktopState) => void) => Promise<() => void>
+  setEnabled: (enabled: boolean) => Promise<OxpDesktopState>
+  setGrant: (patch: Partial<SidecarOxpGrant>) => Promise<OxpDesktopState>
+  addRoot: () => Promise<OxpDesktopState>
+  syncProjectRoots: (paths: string[]) => Promise<OxpDesktopState>
+  renameRoot: (rootID: string, alias: string) => Promise<OxpDesktopState>
+  removeRoot: (rootID: string) => Promise<OxpDesktopState>
+  revealRoot: (rootID: string) => Promise<boolean>
+  setTunnelID: (value: string) => Promise<OxpDesktopState>
+  setOpenAiApiKey: (value: string) => Promise<OxpDesktopState>
+  clearOpenAiApiKey: () => Promise<OxpDesktopState>
+  resetUnreadableCredentialStore: () => Promise<OxpDesktopState>
+  setLifecycle: (patch: Partial<OxpLifecycle>) => Promise<OxpDesktopState>
+  importLocalMcp: () => Promise<OxpDesktopState>
+  autoImportLocalMcp: () => Promise<OxpDesktopState>
+  retireLocalMcp: () => Promise<OxpDesktopState>
+  connect: () => Promise<OxpDesktopState>
+  disconnect: () => Promise<OxpDesktopState>
+  exportDiagnostics: () => Promise<boolean>
 }
 
 export type LinuxDisplayBackend = "wayland" | "auto"
@@ -122,6 +148,7 @@ export type ElectronAPI = {
   awaitInitialization: () => Promise<ServerReadyData>
   wslServers: WslServersAPI
   updater: UpdaterAPI
+  oxp: OxpAPI
   consumeInitialDeepLinks: () => Promise<string[]>
   getDefaultServerUrl: () => Promise<string | null>
   setDefaultServerUrl: (url: string | null) => Promise<void>
