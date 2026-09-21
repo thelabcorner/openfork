@@ -62,20 +62,21 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ScheduledTaskExecutor") {}
 
-/** Tighter unattended defaults than an interactive Goal (T0 decision 6). */
+/**
+ * Scheduled Goals are unattended by default because the scheduler is the
+ * initiating producer. Resource/attempt limits belong to ScheduledTask policy;
+ * Goal continuation limits remain opt-in and are never silently injected here.
+ */
 export const SCHEDULED_GOAL_DEFAULTS = {
   mode: "unattended",
-  maxConsecutiveTurns: 16,
-  maxNoProgressTurns: 2,
-  maxDurationMs: 30 * 60_000,
 } as const
 
 export function scheduledGoalPolicy(policy: GoalModel.ContinuationPolicy | undefined): GoalModel.ContinuationPolicy {
   return {
     mode: policy?.mode ?? SCHEDULED_GOAL_DEFAULTS.mode,
-    maxConsecutiveTurns: policy?.maxConsecutiveTurns ?? SCHEDULED_GOAL_DEFAULTS.maxConsecutiveTurns,
-    maxNoProgressTurns: policy?.maxNoProgressTurns ?? SCHEDULED_GOAL_DEFAULTS.maxNoProgressTurns,
-    maxDurationMs: policy?.maxDurationMs ?? SCHEDULED_GOAL_DEFAULTS.maxDurationMs,
+    ...(policy?.maxConsecutiveTurns !== undefined ? { maxConsecutiveTurns: policy.maxConsecutiveTurns } : {}),
+    ...(policy?.maxNoProgressTurns !== undefined ? { maxNoProgressTurns: policy.maxNoProgressTurns } : {}),
+    ...(policy?.maxDurationMs !== undefined ? { maxDurationMs: policy.maxDurationMs } : {}),
     ...(policy?.tokenBudget !== undefined ? { tokenBudget: policy.tokenBudget } : {}),
   }
 }

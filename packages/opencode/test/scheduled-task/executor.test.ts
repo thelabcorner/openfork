@@ -518,9 +518,6 @@ describe("ScheduledTaskExecutor", () => {
         actor: "system",
         continuationPolicy: {
           mode: "unattended",
-          maxConsecutiveTurns: 16,
-          maxNoProgressTurns: 2,
-          maxDurationMs: 1_800_000,
         },
       })
       expect(hostPromptProvenance).toMatchObject({
