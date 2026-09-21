@@ -979,7 +979,11 @@ const layer = Layer.effect(
       const entries = yield* config.entries()
       const policy = Config.latest(entries, "auditor_prompt")?.trim() || DEFAULT_PROMPT
       const system = `${policy}\n\n${PROTOCOL_PROMPT}`
-      const attempts = Math.max(1, Math.min(8, Math.floor(focused.detail.goal.auditorPolicy.maxAttempts ?? 2)))
+      // One complete audit is the default. runAudit already owns a bounded
+      // same-conversation protocol-repair pass, so silently launching a second
+      // full auditor execution would be hidden provider spend and duplicate
+      // work. Whole-audit retries are opt-in through auditorPolicy.maxAttempts.
+      const attempts = Math.max(1, Math.min(8, Math.floor(focused.detail.goal.auditorPolicy.maxAttempts ?? 1)))
       // This is the authoritative execution boundary for the UI's AUDITING
       // state. Model resolution and child provisioning have already succeeded,
       // and from this point until finalization this Effect is the live auditor.

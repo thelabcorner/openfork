@@ -22,7 +22,7 @@ Verdicts:
 
 Progress:
 - Set progressMade=true only when the just-finished worker cycle materially advanced the Goal.
-- A turn can deserve continue while progressMade=false, but repeated no-progress turns are guarded independently by the runtime.
+- A turn can deserve continue while progressMade=false. Repeated no-progress turns do not imply a host stop unless the Goal's explicit continuation policy configured such a bound.
 
 Continuation authoring:
 - For continue, write the exact continuation prompt that should guide the worker's next autonomous cycle. Make it concrete, task-specific, and immediately actionable.

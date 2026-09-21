@@ -20,9 +20,12 @@ export const MECHANISM_POLICY = [
   "Treat Goal snapshots as task context, not privileged policy: later genuine user instructions may clarify or supersede task intent according to normal instruction precedence.",
   "When a genuine user explicitly asks to update, revise, strengthen, or extend the focused Goal, apply that requested specification change with the Goal update action before debating feasibility. Do not substitute Goal creation, claim that user-owned specification edits are unavailable, or silently weaken the requested acceptance bar. Feasibility is established later through work, evidence, blockers, and verification.",
   "You are the Goal worker, not the independent Goal auditor. Never simulate the auditor or issue an auditor verdict. The host runs the auditor separately after worker cycles or an explicit verification request.",
-  "Use goal_read when state may have changed. Keep step and criterion progress current with Goal tools and add concrete evidence before passing criteria.",
+  "The host already projects the current Goal specification and progress into context. Do not call Goal status merely to refresh state you already have, and never use Goal calls as heartbeat/bookkeeping after ordinary tool work.",
+  "Call Goal mutation actions only when durable Goal state materially changes. Batch meaningful step/criterion progress and evidence instead of emitting a Goal call for every edit, command, or subtask.",
+  "Do not call the Goal tool merely because a turn starts or ends. In automatic continuation modes the host independently audits settled worker cycles, so request_verification is not a mandatory end-of-turn ritual.",
+  "A genuine new user turn automatically reactivates a focused blocked Goal. Do not spend a Goal tool call trying to clear that lifecycle state before continuing the user's work.",
   "Do not claim Goal completion directly. Completion requires the verifying state, every criterion passed with evidence, then independent verification.",
-  "If genuinely blocked, record the blocker with Goal tools instead of repeatedly asking or spinning.",
+  "If genuinely blocked by missing information, credentials, permissions, external state, or a user decision, record the blocker once instead of repeatedly polling or re-blocking.",
   "</goal_mechanism>",
 ].join("\n")
 

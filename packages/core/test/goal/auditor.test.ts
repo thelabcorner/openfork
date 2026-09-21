@@ -231,7 +231,7 @@ const focusedGoal = (options: { maxAttempts?: number; configuredModel?: boolean 
         criteria: ["The implementation is present and supported by evidence"],
         continuationPolicy: { mode: "auto_continue" },
         auditorPolicy: {
-          maxAttempts: options.maxAttempts ?? 1,
+          ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
           ...(options.configuredModel ? { model: auditorRef } : {}),
         },
       })
@@ -725,6 +725,23 @@ describe("GoalAuditor", () => {
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain("Invalid audit_verdict payload")
+      expect(result.error).toContain("after 1 auditor attempt")
+      expect(generateRequests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("does not launch a hidden second full audit when maxAttempts is omitted", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      // One full audit attempt receives exactly one same-conversation protocol
+      // repair. Extra queued responses would only be consumed by an implicit
+      // whole-audit retry, which the default policy must not perform.
+      generateResponses = [response(), response(), response(), response()]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
       expect(result.error).toContain("after 1 auditor attempt")
       expect(generateRequests).toHaveLength(2)
     }),

@@ -228,6 +228,12 @@ export interface Interface {
   readonly focused: (
     sessionID: typeof SessionTable.$inferSelect.id,
   ) => Effect.Effect<Focused | undefined>
+  /**
+   * A new genuine user turn re-opens a focused blocked Goal. Paused Goals stay
+   * paused because pause is an explicit lifecycle choice; terminal/verifying
+   * Goals are untouched. This is an admission semantic, not a model tool action.
+   */
+  readonly reactivateBlockedForSession: (sessionID: typeof SessionTable.$inferSelect.id) => Effect.Effect<boolean>
   readonly focuses: (goalID: ID) => Effect.Effect<ReadonlyArray<Focus>>
   readonly auditorSession: (input: {
     parentSessionID: SessionSchema.ID
@@ -999,6 +1005,69 @@ const layer = Layer.effect(
       return detail
     })
 
+    const reactivateBlockedForSession = Effect.fn("Goal.reactivateBlockedForSession")(function* (
+      sessionID: typeof SessionTable.$inferSelect.id,
+    ) {
+      const now = Date.now()
+      const detail = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const focus = yield* tx
+                .select({ goalID: GoalFocusTable.goal_id })
+                .from(GoalFocusTable)
+                .where(eq(GoalFocusTable.session_id, sessionID))
+                .get()
+                .pipe(Effect.orDie)
+              if (!focus) return undefined
+
+              const current = yield* requireRow(tx, focus.goalID).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
+              if (current.status !== "blocked") return undefined
+
+              const updated = yield* tx
+                .update(GoalTable)
+                .set({
+                  status: "active",
+                  blocker: null,
+                  revision: sql`${GoalTable.revision} + 1`,
+                  time_updated: now,
+                })
+                .where(
+                  and(
+                    eq(GoalTable.id, focus.goalID),
+                    eq(GoalTable.status, "blocked"),
+                    eq(GoalTable.revision, current.revision),
+                  ),
+                )
+                .returning({ revision: GoalTable.revision })
+                .get()
+                .pipe(Effect.orDie)
+              if (!updated) return undefined
+
+              yield* appendAudit(tx, {
+                goalID: focus.goalID,
+                type: "transitioned",
+                actor: "user",
+                payload: {
+                  from: "blocked",
+                  to: "active",
+                  action: "resume",
+                  source: "user_prompt",
+                  revision: updated.revision,
+                },
+                now,
+              })
+              return yield* detailTx(tx, focus.goalID).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+
+      if (!detail) return false
+      yield* events.publish(Event.Updated, { goalID: detail.goal.id, info: detail.goal })
+      return true
+    })
+
     const updateCriterion = Effect.fn("Goal.updateCriterion")(function* (input: CriterionUpdateInput) {
       const now = Date.now()
       const detail = yield* db
@@ -1020,6 +1089,10 @@ const layer = Layer.effect(
               .get()
               .pipe(Effect.orDie)
             if (!criterion) return yield* new GoalSchema.ValidationError({ reason: `criterion does not belong to Goal: ${input.criterionID}` })
+            // Goal bookkeeping is retry-safe and semantic. Reasserting the
+            // current state is not progress and must not manufacture a revision
+            // bump/audit event that can fool automation progress detection.
+            if (criterion.status === input.status) return yield* detailTx(tx, input.goalID)
             yield* tx
               .update(GoalCriterionTable)
               .set({ status: input.status })
@@ -1067,6 +1140,12 @@ const layer = Layer.effect(
               .get()
               .pipe(Effect.orDie)
             if (!step) return yield* new GoalSchema.ValidationError({ reason: `step does not belong to Goal: ${input.stepID}` })
+            const nextStatus = input.status ?? step.status
+            const nextAssignedSessionID =
+              input.assignedSessionID === undefined ? step.assigned_session_id : input.assignedSessionID
+            if (nextStatus === step.status && nextAssignedSessionID === step.assigned_session_id) {
+              return yield* detailTx(tx, input.goalID)
+            }
             if (input.assignedSessionID) {
               const session = yield* tx
                 .select({ projectID: SessionTable.project_id, workspaceID: SessionTable.workspace_id })
@@ -1079,7 +1158,6 @@ const layer = Layer.effect(
                 return yield* new GoalSchema.ValidationError({ reason: "step assignment must stay inside the Goal scope" })
               }
             }
-            const nextStatus = input.status ?? step.status
             yield* tx
               .update(GoalStepTable)
               .set({
@@ -1201,6 +1279,9 @@ const layer = Layer.effect(
               .get()
               .pipe(Effect.orDie)
             if (!step) return yield* new GoalSchema.ValidationError({ reason: `step does not belong to Goal: ${input.stepID}` })
+            // A retry after a successful release is a no-op rather than a fake
+            // ownership error. This mirrors claimStep's existing idempotence.
+            if (step.assigned_session_id === null && step.status === "pending") return yield* detailTx(tx, input.goalID)
             if (step.assigned_session_id !== input.sessionID) {
               return yield* new GoalSchema.ValidationError({ reason: "a worker may only release its own step claim" })
             }
@@ -1983,6 +2064,7 @@ const layer = Layer.effect(
       unfocus,
       unfocusExpected,
       focused,
+      reactivateBlockedForSession,
       focuses,
       auditorSession,
       auditorSessionFor,
