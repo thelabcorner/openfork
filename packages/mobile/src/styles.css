@@ -584,6 +584,20 @@ a, button, [role="button"] { touch-action: manipulation; }
 @keyframes reasoning-dot { 0%, 100% { opacity: 0.25; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
 
 .msg-system { display: flex; align-items: center; gap: 6px; color: var(--text-weakest); font-size: var(--font-xs); }
+.msg-automation { display: block; }
+.msg-automation summary { display: flex; align-items: center; gap: 6px; cursor: pointer; list-style: none; }
+.msg-automation summary::-webkit-details-marker { display: none; }
+.msg-automation .label { font-weight: 650; }
+.msg-automation .source { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.75; }
+.msg-automation .body {
+  margin-top: 6px;
+  margin-left: 16px;
+  padding-left: 10px;
+  border-left: 1px solid var(--surface-border);
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+  line-height: 1.5;
+}
 
 .msg-error-box {
   display: flex; align-items: flex-start; gap: 8px; background: rgba(248,113,113,0.06); border: 1px solid rgba(248,113,113,0.2);

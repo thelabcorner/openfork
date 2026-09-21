@@ -1,4 +1,5 @@
 import type { AssistantMessage, Message, Part, ToolPart } from "@opencode-ai/sdk/v2/client"
+import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import type { KillShellFn } from "./tools/registry"
 import { Index, Show, createMemo, createSignal } from "solid-js"
 import { formatCost, formatDuration, formatTokens, shortModel } from "../format"
@@ -18,6 +19,15 @@ import {
 } from "../icons"
 
 type Segment = { kind: "tools"; parts: ToolPart[] } | { kind: "part"; part: Part }
+
+function isSemanticUserMessage(message: Message) {
+  return message.role === "user" && SessionTurnProvenance.isSemanticUserInfo(message)
+}
+
+function hostAutomationSource(message: Message) {
+  if (message.role !== "user" || message.provenance?.owner !== "host") return
+  return message.provenance.source
+}
 
 function segmentParts(parts: Part[]): Segment[] {
   const segments: Segment[] = []
@@ -181,6 +191,32 @@ export function MessageGroup(props: {
 }) {
   const [showActions, setShowActions] = createSignal(false)
   const segments = createMemo(() => segmentParts(props.parts))
+
+  const automationSource = hostAutomationSource(props.info)
+  if (automationSource) {
+    const text = createMemo(() =>
+      props.parts
+        .filter((p): p is Extract<Part, { type: "text" }> => p.type === "text" && !!p.text.trim())
+        .map((p) => p.text)
+        .join("\n\n"),
+    )
+    return (
+      <details class="msg-system msg-automation">
+        <summary>
+          <IconInfo size={10} />
+          <span class="label">Automation</span>
+          <span class="source">{automationSource}</span>
+        </summary>
+        <Show when={text()}>
+          <div class="body">
+            <Markdown text={text()} />
+          </div>
+        </Show>
+      </details>
+    )
+  }
+
+  if (props.info.role === "user" && !isSemanticUserMessage(props.info)) return null
 
   if (props.info.role === "user") {
     const text = createMemo(() =>

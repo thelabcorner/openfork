@@ -89,7 +89,7 @@ async function upstream(input: { instanceID?: string } = {}) {
 async function front(resolution: () => Promise<TargetResolution> | TargetResolution) {
   const api = createApiProxy({
     resolver: { resolve: async () => resolution() },
-    apiPrefixes: ["session", "event", "instance", "pair"],
+    apiPrefixes: ["session", "event", "goal", "instance", "pair"],
   })
   const server = http.createServer((request, response) => {
     api.handle(request, response, () => {
@@ -142,6 +142,23 @@ describe("dev API proxy", () => {
     expect(back.seen[0]!.method).toBe("POST")
     expect(back.seen[0]!.body).toBe(JSON.stringify({ text: "hello" }))
     expect(back.seen[0]!.headers.authorization).toBe("Bearer token")
+  })
+
+  test("forwards direct Goal lifecycle routes instead of falling through to the SPA", async () => {
+    const back = await upstream()
+    const dev = await front(() => bound(back.url))
+    const body = JSON.stringify({ expectedRevision: 6, sessionID: "ses_parent", action: "request_verification" })
+
+    const response = await fetch(`${dev.url}/goal/gol_test/transition`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get("x-upstream")).toBe("yes")
+    expect(back.seen).toHaveLength(1)
+    expect(back.seen[0]).toMatchObject({ method: "POST", url: "/goal/gol_test/transition", body })
   })
 
   test("pins every forwarded request to the verified instance", async () => {

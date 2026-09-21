@@ -13,7 +13,7 @@ function enableErrorCopy(reason?: string) {
       return "Push needs a secure origin (HTTPS or localhost). HTTP on a LAN IP will not work — install the app or use HTTPS."
     case "not-found":
     case "no-public-key":
-      return "This OpenCode server doesn't support push yet. Update it to a build that includes Web Push and restart the server."
+      return "This OpenFork server doesn't support push yet. Update it to a build that includes Web Push and restart the server."
     case "unauthorized":
       return "The server rejected this device. Re-pair from Settings and try again."
     case "unsupported":
@@ -67,7 +67,7 @@ export function NotificationSettings(props: { client?: OpencodeClient }) {
       <div class="settings-card">
         <p class="settings-blurb">
           Get notified when an agent needs approval, asks a question, finishes, or hits an error — even when this app
-          isn't open. Sent by your own opencode server, not a third party.
+          isn't open. Sent by your own OpenFork server, not a third party.
         </p>
 
         <Show when={pushState() === "needs-install"}>

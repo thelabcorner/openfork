@@ -1191,7 +1191,7 @@ export function App() {
       setState({
         status: "error",
         error:
-          'No server URL set — open "Advanced: server URL & device token" below, enter your OpenCode server address, then try again.',
+          'No server URL set — open "Advanced: server URL & device token" below, enter your OpenFork server address, then try again.',
       })
       setAdvancedOpen(true)
       if (fromScan) setPairMode("code")
@@ -1215,7 +1215,7 @@ export function App() {
       // Wrong-instance 500s and network errors are always a server-URL
       // problem — surface Advanced so the user can see/correct it.
       if (
-        msg.includes("not an opencode server") ||
+          msg.includes("not an OpenFork server") ||
         msg.includes("could not reach the API") ||
         msg.includes("No server URL")
       ) {
@@ -1901,7 +1901,7 @@ export function App() {
           <header class="mobile-header">
             <div>
               <p class="eyebrow">First-party mobile client</p>
-              <h1>OpenCode</h1>
+              <h1>OpenFork</h1>
             </div>
           </header>
 

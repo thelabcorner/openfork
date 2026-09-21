@@ -1,4 +1,4 @@
-# OpenCode Mobile
+# OpenFork Mobile
 
 This is a separate first-party PWA. It is hosted independently from the
 Electron renderer and does not depend on the sidecar serving an HTML bundle.
@@ -17,7 +17,7 @@ bun run dev
 
 This launches Electron, its ephemeral sidecar, and the PWA on `:3301` with a
 per-launch identity handshake. The PWA refuses to proxy to a stale, recycled,
-or unrelated OpenCode process, even if one happens to be listening on the old
+or unrelated OpenFork process, even if one happens to be listening on the old
 port. Open `http://localhost:3301` after the stack is ready.
 
 For an intentionally standalone PWA server, set `VITE_OPENCODE_SERVER_URL` or

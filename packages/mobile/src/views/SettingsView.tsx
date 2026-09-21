@@ -104,7 +104,7 @@ export function SettingsView(props: {
         <div class="settings-card">
           <div class="settings-static-row">
             <span class="label">Client</span>
-            <span class="value">OpenCode Mobile</span>
+            <span class="value">OpenFork Mobile</span>
           </div>
         </div>
 

@@ -22,6 +22,7 @@ const API_PREFIXES = [
   "formatter",
   "fs",
   "global",
+  "goal",
   "instance",
   "log",
   "lsp",

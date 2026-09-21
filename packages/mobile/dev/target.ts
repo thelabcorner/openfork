@@ -272,22 +272,22 @@ function failure(
         ok: false,
         code: "DesktopSidecarUnavailableError",
         message: `The desktop sidecar at ${where} is not answering.`,
-        hint: "It is still starting, or it exited. Keep OpenCode Desktop running — the proxy rebinds by itself once it answers.",
+        hint: "It is still starting, or it exited. Keep OpenFork Desktop running — the proxy rebinds by itself once it answers.",
         detail: probe.detail,
       }
     case "mismatch":
       return {
         ok: false,
         code: "DesktopSidecarInstanceMismatchError",
-        message: `A different opencode instance is listening on ${where}.`,
-        hint: `Expected instance ${short(expect ?? "?")}. The sidecar's ephemeral port was taken over by another opencode process. Restart \`bun run dev\` from packages/desktop — the proxy will not bind to the wrong backend.`,
+        message: `A different OpenFork instance is listening on ${where}.`,
+        hint: `Expected instance ${short(expect ?? "?")}. The sidecar's ephemeral port was taken over by another OpenFork process. Restart \`bun run dev\` from packages/desktop — the proxy will not bind to the wrong backend.`,
         detail: probe.detail,
       }
     case "unmanaged":
       return {
         ok: false,
         code: "DesktopSidecarUnmanagedInstanceError",
-        message: `The opencode at ${where} was not launched by this desktop.`,
+        message: `The OpenFork server at ${where} was not launched by this desktop.`,
         hint: "It is an unrelated instance (`opencode serve`, a JetBrains ACP agent, another checkout) holding this port. Restart `bun run dev` from packages/desktop.",
         detail: probe.detail,
       }
@@ -295,7 +295,7 @@ function failure(
       return {
         ok: false,
         code: "DesktopSidecarOutdatedError",
-        message: `The server at ${where} is an older opencode without ${IDENTITY_PATH}.`,
+        message: `The server at ${where} is an older OpenFork build without ${IDENTITY_PATH}.`,
         hint:
           source === "override"
             ? "Point the override at a backend built from this checkout, or drop the override and use `bun run dev`."
@@ -306,7 +306,7 @@ function failure(
       return {
         ok: false,
         code: "DesktopSidecarNotOpencodeError",
-        message: `Whatever is listening on ${where} is not an opencode server.`,
+        message: `Whatever is listening on ${where} is not an OpenFork server.`,
         hint: "A listening port is not evidence of a backend. Restart `bun run dev` from packages/desktop so the sidecar takes a fresh port.",
         detail: probe.detail,
       }

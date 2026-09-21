@@ -295,7 +295,7 @@ export const mockProviders = [
   },
   {
     id: "opencode",
-    name: "OpenCode",
+    name: "OpenCode Zen",
     source: "custom",
     key: "oc_",
     models: {

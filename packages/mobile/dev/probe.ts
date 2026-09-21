@@ -3,11 +3,13 @@
  *
  *   bun packages/mobile/dev/probe.ts /session?limit=3
  *   bun packages/mobile/dev/probe.ts /session/<id>/message?limit=2
+ *   bun packages/mobile/dev/probe.ts /goal/<id>/transition POST '{"expectedRevision":1,"action":"pause"}'
  *
- * Hits the path twice — through the Vite dev proxy on :3301 and straight at
- * the sidecar — and prints both, because "does the proxy change the answer?"
- * is the question that matters and the one that used to be unanswerable
- * without a credential. Read-only: it starts nothing and restarts nothing.
+ * Read-only requests hit the path twice — through the Vite dev proxy on :3301
+ * and straight at the sidecar — because "does the proxy change the answer?"
+ * is the question that matters and the one that used to be unanswerable without
+ * a credential. Mutating requests execute only through the verified proxy: a
+ * diagnostic must never duplicate a POST/PATCH/DELETE against the same backend.
  */
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -20,6 +22,7 @@ const DEV_SERVER = process.env.OPENCODE_DEV_SERVER_URL?.trim() || "http://127.0.
 
 const path = process.argv[2] ?? DEV_TARGET_STATUS_PATH
 const method = (process.argv[3] ?? "GET").toUpperCase()
+const body = process.argv[4]
 
 const handshake = readHandshake(handshakePath(mobileDir))?.handshake
 const agent = readAgentToken(agentTokenPath(mobileDir))
@@ -41,7 +44,12 @@ async function hit(label: string, base: string) {
   try {
     const response = await fetch(url, {
       method,
-      headers: { authorization: deviceAuthorization(agent!.token), accept: "application/json" },
+      headers: {
+        authorization: deviceAuthorization(agent!.token),
+        accept: "application/json",
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body }),
       signal: AbortSignal.timeout(15000),
     })
     const text = await response.text()
@@ -61,7 +69,10 @@ console.log(`handshake: ${handshake ? `${handshake.url} instance ${handshake.ins
 console.log(`device:    ${agent.deviceName} (${agent.deviceID}) created ${agent.createdAt}`)
 
 const viaProxy = await hit("via dev proxy", DEV_SERVER)
-const direct = handshake ? await hit("direct sidecar", handshake.url) : undefined
+const compareDirect = method === "GET" || method === "HEAD"
+const direct = compareDirect && handshake ? await hit("direct sidecar", handshake.url) : undefined
+
+if (!compareDirect) console.log("\ndirect sidecar comparison skipped for mutating request")
 
 if (direct) {
   const same = viaProxy.status === direct.status

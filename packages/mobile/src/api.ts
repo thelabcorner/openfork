@@ -203,7 +203,7 @@ export function createClient(serverUrl: string, token?: string): OpencodeClient 
 }
 
 export async function claimPair(serverUrl: string, code: string) {
-  const response = await createClient(serverUrl).pair.claim({ code, name: "OpenCode Mobile" }, { throwOnError: true })
+  const response = await createClient(serverUrl).pair.claim({ code, name: "OpenFork Mobile" }, { throwOnError: true })
   if (!response.data) throw new Error("The server did not return a device token")
   return { token: response.data.token, deviceID: response.data.device.id }
 }
@@ -238,7 +238,7 @@ export function pairClaimErrorMessage(error: unknown): string {
   const raw = error.message || ""
   if (cause?.status === 500 && (!body || Object.keys(body as object).length === 0)) {
     return raw.includes("/pair/claim")
-      ? `${raw} — the API at this address is not an opencode server. Check the Server URL in Advanced and make sure the tunnel (OPENCODE_PUBLIC_URL) is running.`
+      ? `${raw} — the API at this address is not an OpenFork server. Check the Server URL in Advanced and make sure the tunnel (OPENCODE_PUBLIC_URL) is running.`
       : raw
   }
   if (raw.includes("Failed to fetch") || raw.includes("NetworkError") || raw.includes("Load failed")) {
