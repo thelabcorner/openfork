@@ -37,11 +37,13 @@ import { Vcs } from "@/project/vcs"
 import { ProviderAuth } from "@/provider/auth"
 import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
+import { SystemOne } from "@/system-one/system-one"
 import { SessionCompaction } from "@/session/compaction"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
 import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
+import { GoalAuditRecovery } from "@/session/goal-audit-recovery"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
@@ -50,6 +52,13 @@ import { Goal } from "@opencode-ai/core/goal"
 import { GoalContext } from "@opencode-ai/core/goal/context"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
+import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
+import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
+import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { ScheduledTaskRunner } from "@/scheduled-task/runner"
+import { ScheduledTaskExecutor } from "@/scheduled-task/executor"
 import * as SessionContextProjector from "@/session/context/projector"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -90,7 +99,14 @@ import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/loca
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { UsageRecord } from "@opencode-ai/core/usage/record"
+import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
+import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OfxpInvocation } from "@opencode-ai/core/ofxp-invocation"
+import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { Usage } from "@/usage/usage"
+import { OfxpRuntime } from "@/ofxp/runtime"
+import { OfxpRoot } from "@/ofxp/root"
 import { lazy } from "@/util/lazy"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
@@ -120,6 +136,7 @@ import { fileHandlers } from "./handlers/file"
 import { globalHandlers } from "./handlers/global"
 import { instanceHandlers } from "./handlers/instance"
 import { mcpHandlers } from "./handlers/mcp"
+import { ofxpHandlers } from "./handlers/ofxp"
 import { permissionHandlers } from "./handlers/permission"
 import { projectHandlers } from "./handlers/project"
 import { projectCopyHandlers } from "./handlers/project-copy"
@@ -132,10 +149,14 @@ import { sessionHandlers } from "./handlers/session"
 import { sessionContextHandlers } from "./handlers/session-context"
 import { sessionGroupHandlers } from "./handlers/session-group"
 import { goalHandlers } from "./handlers/goal"
+import { scheduledTaskHandlers } from "./handlers/scheduled-task"
+import { swarmHandlers } from "./handlers/swarm"
+import { systemOneHandlers } from "./handlers/system-one"
 import { syncHandlers } from "./handlers/sync"
 import { toolHandlers } from "./handlers/tool"
 import { tuiHandlers } from "./handlers/tui"
 import { usageHandlers } from "./handlers/usage"
+import { revisionDraftHandlers } from "./handlers/revision-draft"
 import { handlers } from "@opencode-ai/server/handlers"
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { layer as locationLayer } from "@opencode-ai/server/location"
@@ -145,6 +166,7 @@ import { schemaErrorLayer as v2SchemaErrorLayer } from "@opencode-ai/server/midd
 import { workspaceHandlers } from "./handlers/workspace"
 import { promptRevisorHandlers } from "./handlers/prompt-revisor"
 import { instanceContextLayer } from "./middleware/instance-context"
+import { explicitWorkspaceLocationLayer } from "./middleware/explicit-workspace-location"
 import { workspaceRoutingLayer } from "./middleware/workspace-routing"
 import { disposeMiddleware } from "./lifecycle"
 import { memoMap } from "@opencode-ai/core/effect/memo-map"
@@ -206,6 +228,10 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
     globalHandlers,
     providerSettingsHandlers,
     usageHandlers,
+    ofxpHandlers,
+    revisionDraftHandlers,
+    scheduledTaskHandlers,
+    swarmHandlers,
   ]),
   Layer.provide(schemaErrorLayer),
   Layer.provide(httpApiAuthLayer),
@@ -250,6 +276,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     sessionContextHandlers,
     sessionGroupHandlers,
     goalHandlers,
+    systemOneHandlers,
     syncHandlers,
     toolHandlers,
     tuiHandlers,
@@ -259,7 +286,13 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
 )
 
 const instanceRoutes = instanceApiRoutes.pipe(
-  Layer.provide([httpApiAuthLayer, workspaceRoutingLive, instanceContextLayer, schemaErrorLayer]),
+  Layer.provide([
+    httpApiAuthLayer,
+    explicitWorkspaceLocationLayer,
+    workspaceRoutingLive,
+    instanceContextLayer,
+    schemaErrorLayer,
+  ]),
 )
 const serverRoutes = HttpApiBuilder.layer(Api).pipe(
   Layer.provide(handlers),
@@ -284,13 +317,23 @@ const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effe
 // can refuse to bind to a stale port that some other opencode now owns.
 // Carries no user data; see server/shared/instance-identity.ts.
 const identityRoute = HttpRouter.use((router) =>
-  router.add("GET", INSTANCE_IDENTITY_PATH, () =>
-    Effect.sync(() =>
-      HttpServerResponse.jsonUnsafe(instanceIdentity(), {
-        headers: { "cache-control": "no-store" },
+  Effect.gen(function* () {
+    const ofxp = yield* OfxpRuntime.Service
+    yield* router.add("GET", INSTANCE_IDENTITY_PATH, () =>
+      Effect.gen(function* () {
+        const bootstrap = yield* ofxp.bootstrap()
+        return HttpServerResponse.jsonUnsafe(
+          {
+            ...instanceIdentity(),
+            ofxp: bootstrap,
+          },
+          {
+            headers: { "cache-control": "no-store" },
+          },
+        )
       }),
-    ),
-  ),
+    )
+  }),
 )
 
 const uiRoute = HttpRouter.use((router) =>
@@ -329,6 +372,7 @@ const app = LayerNode.group([
   Plugin.node,
   ModelsDev.node,
   Provider.node,
+  SystemOne.node,
   ProviderAuth.node,
   Agent.node,
   Skill.node,
@@ -343,14 +387,28 @@ const app = LayerNode.group([
   GoalContext.node,
   GoalAutomation.node,
   GoalAgent.node,
+  ScheduledTask.node,
+  ScheduledTaskSessionBinding.node,
+  ScheduledTaskLease.node,
+  ScheduledTaskExecutor.node,
+  ScheduledTaskRunner.node,
+  SwarmV2.node,
+  SwarmMemberSessionWake.node,
   SessionProjector.node,
   SessionContextProjector.node,
   SessionStatus.node,
   SessionUsage.node,
   SessionTelemetry.node,
+  OxpActivity.node,
+  OxpActivityInspection.node,
   UsageRecord.node,
+  RevisionDraft.node,
   BackgroundJob.node,
   RuntimeFlags.node,
+  OfxpInvocation.node,
+  OfxpPeer.node,
+  OfxpRoot.node,
+  OfxpRuntime.node,
   EventV2Bridge.node,
   SessionRunState.node,
   SessionProcessor.node,
@@ -358,6 +416,7 @@ const app = LayerNode.group([
   SessionRevert.node,
   SessionSummary.node,
   SessionPrompt.node,
+  GoalAuditRecovery.node,
   Instruction.node,
   LLM.node,
   LSP.node,

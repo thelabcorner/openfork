@@ -7,8 +7,11 @@ import {
 } from "@opencode-ai/core/session-stream-content"
 import { EventManifest } from "@/event-manifest"
 import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
 import { Project } from "@/project/project"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionTelemetry } from "@opencode-ai/schema/session-telemetry"
+import { OxpActivitySchema } from "@opencode-ai/core/oxp-activity/schema"
 import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
 import "@/server/event"
@@ -136,6 +139,7 @@ const GlobalResetLocalDataResult = Schema.Struct({
 
 export const GlobalSessionRootsQuery = Schema.Struct({
   directory: Schema.String,
+  projectID: Schema.optional(ProjectV2.ID),
   limit: Schema.optional(
     Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(500)),
   ),
@@ -148,6 +152,119 @@ export const GlobalSessionTelemetryInput = Schema.Struct({
 const GlobalSessionTelemetryResult = Schema.Record(Schema.String, SessionTelemetry.Info).annotate({
   identifier: "GlobalSessionTelemetryResult",
 })
+
+const OxpActivitySummary = Schema.Struct({
+  id: OxpActivitySchema.ActivityID,
+  title: Schema.optional(Schema.String),
+  firstSeenAt: Schema.Finite,
+  lastSeenAt: Schema.Finite,
+  callCount: Schema.Number,
+  failureCount: Schema.Number,
+  augmentationCalls: Schema.Number,
+  supervisionCalls: Schema.Number,
+  delegationCalls: Schema.Number,
+  observedEpochCount: Schema.Number,
+  lastTool: Schema.optional(Schema.String),
+  lastRootAlias: Schema.optional(Schema.String),
+  archivedAt: Schema.optional(Schema.Finite),
+}).annotate({ identifier: "OxpParentActivitySummary" })
+
+const OxpInvocationLinkInfo = Schema.Struct({
+  kind: OxpActivitySchema.LinkKind,
+  ref: Schema.String,
+  relation: Schema.String,
+  label: Schema.optional(Schema.String),
+}).annotate({ identifier: "OxpInvocationLinkInfo" })
+
+const OxpInvocationInfo = Schema.Struct({
+  id: OxpActivitySchema.InvocationID,
+  activityID: OxpActivitySchema.ActivityID,
+  hostRunID: Schema.String,
+  observedEpoch: Schema.optional(Schema.Number),
+  plane: OxpActivitySchema.Plane,
+  tool: Schema.String,
+  action: Schema.optional(Schema.String),
+  rootID: Schema.optional(Schema.String),
+  rootAlias: Schema.optional(Schema.String),
+  status: OxpActivitySchema.Status,
+  continuityMarker: Schema.optional(OxpActivitySchema.ContinuityMarker),
+  errorCode: Schema.optional(Schema.String),
+  mutationAttempted: Schema.Boolean,
+  mutationCommitted: Schema.Boolean,
+  startedAt: Schema.Finite,
+  completedAt: Schema.optional(Schema.Finite),
+  links: Schema.Array(OxpInvocationLinkInfo),
+}).annotate({ identifier: "OxpInvocationInfo" })
+
+export const GlobalOxpActivityListQuery = Schema.Struct({
+  limit: Schema.optional(
+    Schema.NumberFromString.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(1),
+      Schema.isLessThanOrEqualTo(100),
+    ),
+  ),
+  includeArchived: Schema.optional(Schema.Literals(["true", "false"])),
+  beforeLastSeenAt: Schema.optional(Schema.NumberFromString),
+  beforeID: Schema.optional(OxpActivitySchema.ActivityID),
+})
+
+export const GlobalOxpInvocationQuery = Schema.Struct({
+  limit: Schema.optional(
+    Schema.NumberFromString.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(1),
+      Schema.isLessThanOrEqualTo(200),
+    ),
+  ),
+  beforeStartedAt: Schema.optional(Schema.NumberFromString),
+  beforeID: Schema.optional(OxpActivitySchema.InvocationID),
+})
+
+export const GlobalOxpResourceQuery = Schema.Struct({
+  kind: OxpActivitySchema.LinkKind,
+  ref: Schema.String.check(Schema.isMaxLength(2048)),
+  limit: Schema.optional(
+    Schema.NumberFromString.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(1),
+      Schema.isLessThanOrEqualTo(50),
+    ),
+  ),
+})
+
+const OxpResourceProvenanceInfo = Schema.Struct({
+  activityID: OxpActivitySchema.ActivityID,
+  invocationID: OxpActivitySchema.InvocationID,
+  kind: OxpActivitySchema.LinkKind,
+  ref: Schema.String,
+  relation: Schema.String,
+  label: Schema.optional(Schema.String),
+  tool: Schema.String,
+  action: Schema.optional(Schema.String),
+  startedAt: Schema.Finite,
+}).annotate({ identifier: "OxpResourceProvenanceInfo" })
+
+const OxpInvocationPage = Schema.Struct({
+  items: Schema.Array(OxpInvocationInfo),
+  more: Schema.Boolean,
+  before: Schema.optional(
+    Schema.Struct({
+      startedAt: Schema.Finite,
+      id: OxpActivitySchema.InvocationID,
+    }),
+  ),
+}).annotate({ identifier: "OxpInvocationPage" })
+
+export const GlobalOxpActivityPatch = Schema.Struct({
+  title: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
+  clearTitle: Schema.optional(Schema.Boolean),
+  archived: Schema.optional(Schema.Boolean),
+}).annotate({ identifier: "GlobalOxpActivityPatch" })
+
+const GlobalOxpActivityDeleteResult = Schema.Struct({
+  deleted: Schema.Boolean,
+}).annotate({ identifier: "GlobalOxpActivityDeleteResult" })
 
 export const GlobalEventInterestInput = Schema.Struct({
   subscriber: Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SUBSCRIBER_CHARS)),
@@ -213,7 +330,12 @@ export const GlobalPaths = {
   event: "/global/event",
   eventInterest: "/global/event/interest",
   sessionRoots: "/global/session/roots",
+  sessionGet: "/global/session/:sessionID",
   sessionTelemetry: "/global/session/telemetry",
+  oxpActivities: "/global/oxp/activity",
+  oxpActivity: "/global/oxp/activity/:activityID",
+  oxpInvocations: "/global/oxp/activity/:activityID/invocations",
+  oxpResource: "/global/oxp/resource",
   projects: "/global/project",
   config: "/global/config",
   preferences: "/global/preferences",
@@ -231,7 +353,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.health",
           summary: "Get health",
-          description: "Get health information about the OpenCode server.",
+          description: "Get health information about the OpenFork server.",
         }),
       ),
       HttpApiEndpoint.get("event", GlobalPaths.event, {
@@ -240,7 +362,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.event",
           summary: "Get global events",
-          description: "Subscribe to global events from the OpenCode system using server-sent events.",
+          description: "Subscribe to global events from the OpenFork system using server-sent events.",
         }),
       ),
       HttpApiEndpoint.post("eventInterest", GlobalPaths.eventInterest, {
@@ -266,7 +388,18 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.sessionRoots",
           summary: "List recent root sessions without instance bootstrap",
           description:
-            "List recent non-archived root sessions for one directory directly from durable session storage. This read-only startup surface intentionally does not materialize directory config, plugins, providers, or tools.",
+            "List recent non-archived root sessions directly from durable session storage. When projectID is supplied it is authoritative and the directory is retained only as the caller's canonical cache location; otherwise the read is directory-scoped. This startup surface never materializes directory config, plugins, providers, or tools.",
+        }),
+      ),
+      HttpApiEndpoint.get("sessionGet", GlobalPaths.sessionGet, {
+        params: { sessionID: SessionID },
+        success: described(Schema.NullOr(Session.Info), "Durable session metadata"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.sessionGet",
+          summary: "Locate a session without instance bootstrap",
+          description:
+            "Read one durable session record directly from global storage. Returns null when absent and never materializes directory config, plugins, providers, tools, or a workspace runtime.",
         }),
       ),
       HttpApiEndpoint.post("sessionTelemetry", GlobalPaths.sessionTelemetry, {
@@ -278,6 +411,89 @@ export const GlobalApi = HttpApi.make("global").add(
           summary: "Get compact session telemetry without instance bootstrap",
           description:
             "Read bounded live/settled session telemetry directly from global memory and durable telemetry storage. This endpoint never materializes directory config, plugins, providers, tools, or a workspace runtime.",
+        }),
+      ),
+      HttpApiEndpoint.get("oxpActivities", GlobalPaths.oxpActivities, {
+        query: GlobalOxpActivityListQuery,
+        success: described(
+          Schema.Array(OxpActivitySummary),
+          "OXP parent activity summaries",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpActivities",
+          summary: "List OXP parent activities without workspace bootstrap",
+          description:
+            "List compact durable ChatGPT/OXP parent-activity summaries. The response contains no upstream correlation identifiers and never materializes a workspace runtime.",
+        }),
+      ),
+      HttpApiEndpoint.get("oxpActivityGet", GlobalPaths.oxpActivity, {
+        params: { activityID: OxpActivitySchema.ActivityID },
+        success: described(
+          Schema.NullOr(OxpActivitySummary),
+          "OXP parent activity summary",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpActivityGet",
+          summary: "Get one OXP parent activity",
+          description:
+            "Read one durable OXP parent-activity summary directly from global storage without workspace bootstrap.",
+        }),
+      ),
+      HttpApiEndpoint.get("oxpInvocations", GlobalPaths.oxpInvocations, {
+        params: { activityID: OxpActivitySchema.ActivityID },
+        query: GlobalOxpInvocationQuery,
+        success: described(
+          OxpInvocationPage,
+          "Paginated OXP invocation history",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpInvocations",
+          summary: "Read OXP invocation history",
+          description:
+            "Read one parent activity's bounded invocation spans and causal links without hydrating Sessions, messages, providers, plugins, or workspace runtime state.",
+        }),
+      ),
+      HttpApiEndpoint.get("oxpResource", GlobalPaths.oxpResource, {
+        query: GlobalOxpResourceQuery,
+        success: described(
+          Schema.Array(OxpResourceProvenanceInfo),
+          "Reverse OXP provenance for one durable resource handle",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpResource",
+          summary: "Find OXP provenance for a native resource",
+          description:
+            "Reverse lookup over durable OXP causal links. This is observability-only history and never grants authority over the referenced resource.",
+        }),
+      ),
+      HttpApiEndpoint.patch("oxpActivityUpdate", GlobalPaths.oxpActivity, {
+        params: { activityID: OxpActivitySchema.ActivityID },
+        payload: GlobalOxpActivityPatch,
+        success: described(Schema.Boolean, "OXP activity updated"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpActivityUpdate",
+          summary: "Rename or archive OXP activity history",
+          description:
+            "Update local presentation/history state only. This never mutates resources referenced by the activity.",
+        }),
+      ),
+      HttpApiEndpoint.delete("oxpActivityDelete", GlobalPaths.oxpActivity, {
+        params: { activityID: OxpActivitySchema.ActivityID },
+        success: described(
+          GlobalOxpActivityDeleteResult,
+          "OXP activity deletion result",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpActivityDelete",
+          summary: "Delete OXP activity history",
+          description:
+            "Delete only OXP activity-history rows. Native Sessions, workers, tasks, files, commits, and other linked resources are never cascaded by this operation.",
         }),
       ),
       HttpApiEndpoint.get("projects", GlobalPaths.projects, {
@@ -296,7 +512,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.config.get",
           summary: "Get global configuration",
-          description: "Retrieve the current global OpenCode configuration settings and preferences.",
+          description: "Retrieve the current global OpenFork configuration settings and preferences.",
         }),
       ),
       HttpApiEndpoint.patch("configUpdate", GlobalPaths.config, {
@@ -307,7 +523,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.config.update",
           summary: "Update global configuration",
-          description: "Update global OpenCode configuration settings and preferences.",
+          description: "Update global OpenFork configuration settings and preferences.",
         }),
       ),
       HttpApiEndpoint.get("preferencesGet", GlobalPaths.preferences, {
@@ -338,7 +554,7 @@ export const GlobalApi = HttpApi.make("global").add(
         OpenApi.annotations({
           identifier: "global.dispose",
           summary: "Dispose instance",
-          description: "Clean up and dispose all OpenCode instances, releasing all resources.",
+          description: "Clean up and dispose all OpenFork instances, releasing all resources.",
         }),
       ),
       HttpApiEndpoint.post("resetLocalData", GlobalPaths.resetLocalData, {
@@ -347,7 +563,7 @@ export const GlobalApi = HttpApi.make("global").add(
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.resetLocalData",
-          summary: "Reset local OpenCode history",
+          summary: "Reset local OpenFork history",
           description:
             "Delete sessions, goals, memory, usage history, and derived database indexes while preserving provider authentication, credentials, accounts, paired devices, application settings, project/workspace configuration, saved project permissions, and database migration state.",
         }),

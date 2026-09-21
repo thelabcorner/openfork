@@ -1,10 +1,11 @@
 import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
-import { PermissionNotFoundError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
+import { InvalidRequestError, PermissionNotFoundError, SessionNotFoundError } from "@opencode-ai/protocol/errors"
 import { response } from "../location"
 
 function missingRequest(id: PermissionV2.ID) {
@@ -13,6 +14,8 @@ function missingRequest(id: PermissionV2.ID) {
 
 export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", (handlers) =>
   Effect.gen(function* () {
+    const sessions = yield* SessionV2.Service
+
     return handlers
       .handle(
         "permission.request.list",
@@ -23,6 +26,22 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
       .handle(
         "session.permission.create",
         Effect.fn(function* (ctx) {
+          const producerOwned = yield* sessions.producerOwned(ctx.params.sessionID).pipe(
+            Effect.catchTag(
+              "Session.NotFoundError",
+              (error) =>
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+            ),
+          )
+          if (producerOwned) {
+            return yield* new InvalidRequestError({
+              message:
+                "This Session is owned by a host producer and cannot create permission requests through the generic public Session API",
+            })
+          }
           const permission = yield* PermissionV2.Service
           return {
             data: yield* permission

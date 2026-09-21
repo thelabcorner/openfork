@@ -145,7 +145,7 @@ export const SessionContextApi = HttpApi.make("session-context")
   )
   .annotateMerge(
     OpenApi.annotations({
-      title: "opencode session-context HttpApi",
+      title: "OpenFork session-context HttpApi",
       version: "0.0.1",
       description: "Fork-owned conversation control routes.",
     }),

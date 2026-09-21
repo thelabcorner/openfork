@@ -10,6 +10,7 @@ const root = "/ofxp"
 export const OfxpPaths = {
   state: `${root}/state`,
   runtime: `${root}/runtime`,
+  serverSeeds: `${root}/discovery/server-seeds`,
   rotateIdentity: `${root}/runtime/rotate-identity`,
   finalizeIdentityRotation: `${root}/runtime/rotation/finalize`,
   pair: `${root}/peer/:peerID/pair`,
@@ -129,6 +130,30 @@ export const OfxpRuntimePayload = Schema.Struct({ enabled: Schema.Boolean }).ann
   identifier: "OfxpSettings.RuntimePayload",
 })
 
+export const OfxpServerSeed = Schema.Struct({
+  id: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512)),
+  peerID: Ofxp.PeerID,
+  realmID: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+  openforkVersion: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  protocolVersion: Schema.Int,
+  pairing: Schema.Boolean,
+  endpoint: Schema.Struct({
+    host: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(253)),
+    port: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(65_535)),
+    addresses: Schema.optionalKey(
+      Schema.Array(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64))).check(Schema.isMaxLength(16)),
+    ),
+  }),
+}).annotate({ identifier: "OfxpSettings.ServerSeed" })
+
+export const OfxpServerSeedsPayload = Schema.Struct({
+  seeds: Schema.Array(OfxpServerSeed).check(Schema.isMaxLength(256)),
+}).annotate({ identifier: "OfxpSettings.ServerSeedsPayload" })
+
+export const OfxpServerSeedsResult = Schema.Struct({
+  accepted: Schema.Int,
+}).annotate({ identifier: "OfxpSettings.ServerSeedsResult" })
+
 export const OfxpIdentityMutationPayload = Schema.Struct({
   expectedPeerID: Ofxp.PeerID,
 }).annotate({ identifier: "OfxpSettings.IdentityMutationPayload" })
@@ -179,6 +204,18 @@ export const OfxpApi = HttpApi.make("ofxp").add(
           summary: "Enable or disable OpenFork peer networking",
           description:
             "Start or stop the narrow OFXP listener and discovery owner for this OpenFork process. Disabling OFXP stops its listener and mDNS work without affecting the ordinary OpenFork server API.",
+        }),
+      ),
+      HttpApiEndpoint.put("serverSeeds", OfxpPaths.serverSeeds, {
+        payload: OfxpServerSeedsPayload,
+        success: OfxpServerSeedsResult,
+        error: operatorErrors,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "ofxp.discovery.serverSeeds",
+          summary: "Replace configured-server OFXP discovery hints",
+          description:
+            "Replace the bounded secret-free discovery hints projected from the caller's already configured OpenFork ServerConnections. These hints are untrusted routing metadata only and never grant peer trust or capability authority.",
         }),
       ),
       HttpApiEndpoint.post("rotateIdentity", OfxpPaths.rotateIdentity, {

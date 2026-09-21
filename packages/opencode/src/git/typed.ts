@@ -3,6 +3,7 @@ import { Cause, Effect, Option, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { AppProcess } from "@opencode-ai/core/process"
 import { GitRuntime } from "@opencode-ai/core/git-runtime"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 
 const GIT = [
   "--no-pager",
@@ -68,35 +69,35 @@ const SHELL_FORBIDDEN = [
 export const Fields = {
   mode: Schema.optional(
     Schema.Literals(["help", "status", "summary", "diff", "log", "show", "stage", "unstage", "restore", "commit", "shell"]),
-  ).annotate({ description: "Operation to run (default: status)" }),
+  ).annotate({ description: "Operation; default status." }),
   paths: Schema.optional(Schema.Array(Schema.String).check(Schema.isMaxLength(500))).annotate({
-    description: "Relative repository paths to operate on (max 500)",
+    description: "Repository-relative paths; max 500.",
   }),
-  ref: Schema.optional(Schema.String).annotate({ description: "Revision for diff/log/show" }),
-  staged: Schema.optional(Schema.Boolean).annotate({ description: "diff mode: show staged changes (--cached)" }),
+  ref: Schema.optional(Schema.String).annotate({ description: "Revision for diff/log/show." }),
+  staged: Schema.optional(Schema.Boolean).annotate({ description: "Show staged diff." }),
   maxBytes: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 2000, maximum: 500_000 }))).annotate({
-    description: "Output cap in bytes (default 80000, max 500000)",
+    description: "Output bytes; max 500000.",
   }),
   maxCount: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 200 }))).annotate({
-    description: "log: max commits (default 20, max 200)",
+    description: "Log commits; max 200.",
   }),
   contextLines: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 200 }))).annotate({
-    description: "diff: context lines (default 3, max 200)",
+    description: "Diff context lines; max 200.",
   }),
-  message: Schema.optional(Schema.String).annotate({ description: "commit: commit message (required for commit)" }),
-  dryRun: Schema.optional(Schema.Boolean).annotate({ description: "commit: preview only (default true)" }),
+  message: Schema.optional(Schema.String).annotate({ description: "Commit message." }),
+  dryRun: Schema.optional(Schema.Boolean).annotate({ description: "Preview commit; default true." }),
   confirm: Schema.optional(
     Schema.Literals(["STAGE_ALL", "UNSTAGE_ALL", "RESTORE_WORKTREE", "RESTORE_BOTH", "RESTORE_ALL", "COMMIT"]),
   ).annotate({
-    description: "In-tool confirm token required for destructive/all-path operations",
+    description: "Confirm token for broad/destructive writes.",
   }),
-  allowEmpty: Schema.optional(Schema.Boolean).annotate({ description: "commit: allow empty commit" }),
-  sign: Schema.optional(Schema.Boolean).annotate({ description: "commit: sign the commit (default false)" }),
+  allowEmpty: Schema.optional(Schema.Boolean).annotate({ description: "Allow empty commit." }),
+  sign: Schema.optional(Schema.Boolean).annotate({ description: "Sign commit." }),
   restoreTarget: Schema.optional(Schema.Literals(["worktree", "staged", "both"])).annotate({
-    description: "restore: what to restore (default worktree)",
+    description: "Restore target; default worktree.",
   }),
   argv: Schema.optional(Schema.Array(Schema.String).check(Schema.isMaxLength(80))).annotate({
-    description: "shell mode: restricted read-only git argv (max 80)",
+    description: "Restricted read-only Git argv; max 80.",
   }),
 } as const
 
@@ -200,12 +201,17 @@ export const resolveWorktreeRoot = Effect.fn("GitTyped.resolveWorktreeRoot")(fun
   app: AppProcess.Interface,
   cwd: string,
 ) {
-  const inside = yield* run(app, ["rev-parse", "--is-inside-work-tree"], cwd, { maxBytes: 4096, timeoutMs: 5000 })
-  if (inside.exitCode !== 0 || inside.stdout.trim() !== "true") throw new Error("Location is not inside a Git worktree")
-  const top = yield* run(app, ["rev-parse", "--show-toplevel"], cwd, { maxBytes: 4096, timeoutMs: 5000 })
+  const location = FSUtil.normalizePath(cwd)
+  const inside = yield* run(app, ["rev-parse", "--is-inside-work-tree"], location, { maxBytes: 4096, timeoutMs: 5000 })
+  if (inside.exitCode !== 0 || inside.stdout.trim() !== "true") {
+    return yield* Effect.fail(new Error("Location is not inside a Git worktree"))
+  }
+  const top = yield* run(app, ["rev-parse", "--show-toplevel"], location, { maxBytes: 4096, timeoutMs: 5000 })
   const root = top.stdout.trim()
-  if (top.exitCode !== 0 || !root) throw new Error("Could not resolve Git worktree root")
-  return path.resolve(root)
+  if (top.exitCode !== 0 || !root) {
+    return yield* Effect.fail(new Error("Could not resolve Git worktree root"))
+  }
+  return FSUtil.normalizePath(root)
 })
 
 function requireConfirm(expected: string, actual: string | undefined, what: string) {

@@ -49,11 +49,16 @@ export const ForkCredentialUsage = Schema.Struct({
 export const ForkUsageResult = Schema.Struct({
   aggregate: Schema.Array(ForkWindowUsage),
   byCredential: Schema.Array(ForkCredentialUsage),
-  // The pool account a bare opencode-go request will route to (env-first
-  // default, else the vault-designated default). Absent when the pool is
-  // empty or on old servers.
+  // The shared pool default (env-first, else vault-designated). A separately
+  // connected opencode-go provider credential can take precedence for bare Go
+  // traffic; these fields describe the pool rather than every auth source.
   defaultAccountID: Schema.optional(Schema.String),
   defaultAccountLabel: Schema.optional(Schema.String),
+  // Actual account identity used by a bare opencode-go request after applying
+  // direct-provider-auth > shared-pool precedence. Additive for old clients.
+  routedAccountID: Schema.optional(Schema.String),
+  routedAccountLabel: Schema.optional(Schema.String),
+  routedAccountSource: Schema.optional(Schema.Literals(["provider", "pool"])),
 })
 
 const root = "/fork/credential"
@@ -62,9 +67,9 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
   HttpApiGroup.make("fork-credential")
     .add(
       HttpApiEndpoint.get("list", root, {
-        success: described(Schema.Array(ForkCredentialInfo), "Stored OpenCode credentials"),
+        success: described(Schema.Array(ForkCredentialInfo), "Stored OpenCode Zen credentials"),
       }).annotateMerge(
-        OpenApi.annotations({ identifier: "fork.credential.list", summary: "List OpenCode credentials" }),
+        OpenApi.annotations({ identifier: "fork.credential.list", summary: "List OpenCode Zen credentials" }),
       ),
     )
     .add(
@@ -73,7 +78,7 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
         payload: Schema.Struct({ key: Schema.String, label: Schema.optional(Schema.String) }),
         success: described(ForkCredentialInfo, "Added credential"),
         error: HttpApiError.BadRequest,
-      }).annotateMerge(OpenApi.annotations({ identifier: "fork.credential.add", summary: "Add an OpenCode key" })),
+      }).annotateMerge(OpenApi.annotations({ identifier: "fork.credential.add", summary: "Add an OpenCode Zen key" })),
     )
     .add(
       HttpApiEndpoint.post("setDefault", `${root}/:id/default`, {
@@ -106,5 +111,5 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
         success: described(ForkUsageResult, "Aggregate and per-credential OpenCode Go usage"),
       }).annotateMerge(OpenApi.annotations({ identifier: "fork.usage.get", summary: "Get OpenCode Go usage" })),
     )
-    .annotateMerge(OpenApi.annotations({ title: "fork-credential", description: "Fork-owned OpenCode credential store." })),
+    .annotateMerge(OpenApi.annotations({ title: "fork-credential", description: "Fork-owned OpenCode Zen credential store." })),
 )

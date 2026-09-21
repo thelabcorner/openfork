@@ -433,7 +433,9 @@ export function formatViewport(viewport: Schema.Schema.Type<typeof Viewport>): s
 }
 
 export function formatOwner(owner: Schema.Schema.Type<typeof HostOwner>): string {
-  return owner.kind === "user" ? "user" : `agent(${owner.sessionId})`
+  if (owner.kind === "user") return "user"
+  if (owner.kind === "agent") return `agent(${owner.sessionId})`
+  return `external(${owner.principalId})`
 }
 
 export function formatTarget(target: Schema.Schema.Type<typeof ResolvedTarget>): string {

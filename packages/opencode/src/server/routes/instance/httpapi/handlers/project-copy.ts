@@ -2,6 +2,7 @@ import { Agent } from "@/agent/agent"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { MessageID, SessionID } from "@/session/schema"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Effect, Stream } from "effect"
@@ -38,6 +39,7 @@ export const projectCopyHandlers = HttpApiBuilder.group(InstanceHttpApi, "projec
             id: MessageID.ascending(),
             sessionID,
             role: "user",
+            provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.ProjectCopyName),
             time: { created: Date.now() },
             agent: COPY_NAME_AGENT.name,
             model: { providerID: model.providerID, modelID: model.id },

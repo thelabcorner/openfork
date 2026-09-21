@@ -1,6 +1,8 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
@@ -89,11 +91,41 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
     })
 
-    const requireInteractiveSession = Effect.fn("SessionHttpApi.requireInteractiveSession")(function* (
+    const authorizePublicMutableSession = Effect.fn("SessionHttpApi.authorizePublicMutableSession")(function* (
+      current: Session.Info,
+    ) {
+      if (SessionMetadataOwnership.isProducerOwned(current.metadata ?? undefined)) {
+        return yield* new HttpApiError.BadRequest({})
+      }
+      return current
+    })
+
+    const requirePublicMutableSession = Effect.fn("SessionHttpApi.requirePublicMutableSession")(function* (
       sessionID: SessionID,
     ) {
       const current = yield* requireSession(sessionID)
+      return yield* authorizePublicMutableSession(current)
+    })
+
+    const requireInteractiveSession = Effect.fn("SessionHttpApi.requireInteractiveSession")(function* (
+      sessionID: SessionID,
+    ) {
+      const current = yield* requirePublicMutableSession(sessionID)
       if (current.parentID) return yield* new HttpApiError.BadRequest({})
+      return current
+    })
+
+    const requirePromptableSession = Effect.fn("SessionHttpApi.requirePromptableSession")(function* (
+      sessionID: SessionID,
+    ) {
+      // Keep aggregate mutation ownership separate from conversational
+      // authority. Scheduled run roots are producer-owned (so update/delete/
+      // fork/etc remain fenced) but are intentionally user-drivable through the
+      // ordinary Session conversation surface.
+      const current = yield* requireSession(sessionID)
+      yield* promptSvc.assertUserPromptable(sessionID).pipe(
+        Effect.mapError(() => new HttpApiError.BadRequest({})),
+      )
       return current
     })
 
@@ -177,7 +209,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       if (ctx.payload?.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
         return yield* new HttpApiError.BadRequest({})
       }
-      return yield* shareSvc.create(ctx.payload)
+      const payload = ctx.payload
+        ? {
+            ...ctx.payload,
+            metadata: SessionMetadataOwnership.forPublicCreate(ctx.payload.metadata),
+          }
+        : ctx.payload
+      return yield* shareSvc.create(payload)
     })
 
     const createRaw = Effect.fn("SessionHttpApi.createRaw")(function* (ctx: {
@@ -200,6 +238,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       yield* SessionError.mapStorageNotFound(session.remove(ctx.params.sessionID))
       // Browser lifecycle (D10): the session's browser tabs are ORPHANED — owner
       // flips to `user`, content kept for the human. Best-effort after the row
@@ -212,7 +251,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof UpdatePayload.Type
     }) {
-      const current = yield* requireSession(ctx.params.sessionID)
+      const current = yield* requirePublicMutableSession(ctx.params.sessionID)
       if (ctx.payload.title !== undefined) {
         yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
       }
@@ -269,6 +308,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload?: typeof ForkPayload.Type
     }) {
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       return yield* SessionError.mapStorageNotFound(
         session.fork({
           sessionID: ctx.params.sessionID,
@@ -295,6 +335,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
+      // Abort is historically idempotent for a missing Session. Preserve that
+      // contract while still refusing public control takeover of an existing
+      // producer-owned aggregate.
+      const current = yield* session.get(ctx.params.sessionID).pipe(Effect.option)
+      if (Option.isSome(current)) yield* authorizePublicMutableSession(current.value)
       yield* promptSvc.cancel(ctx.params.sessionID)
       return true
     })
@@ -303,15 +348,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // existing session.updated event. V1 runs bypass the V2 drain, so pause also
     // cancels the in-flight V1 run and resume drains admitted-but-not-run input.
     const pause = Effect.fn("SessionHttpApi.pause")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      const current = yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      yield* authorizePublicMutableSession(current)
       yield* promptSvc.cancel(ctx.params.sessionID)
-      const current = yield* session.get(ctx.params.sessionID).pipe(Effect.orDie)
       yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: current.pausedAt ?? Date.now() })
       return HttpApiSchema.NoContent.make()
     })
 
     const resume = Effect.fn("SessionHttpApi.resume")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      const current = yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      yield* authorizePublicMutableSession(current)
       yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: undefined })
       // Drain messages admitted while paused (each loop invocation answers the
       // latest pending user message; never auto-retries an interrupted turn).
@@ -336,6 +382,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         ctx.params.sessionID,
         session.get(ctx.params.sessionID),
       )
+      yield* authorizePublicMutableSession(baseline)
       yield* Effect.logInfo("regenerate title request", {
         sessionID: ctx.params.sessionID,
         baselineTitle: baseline.title,
@@ -410,7 +457,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof InitPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requireInteractiveSession(ctx.params.sessionID)
       // Project marks the worktree initialized by listening for the INIT
       // command's Executed event — a subscription registered inside lazy
       // instance state. Since F1 split bootstrap, requests can run before
@@ -436,13 +483,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // ErrorMiddleware → NamedError.Unknown 500) instead of blanket-mapping
     // every failure to a 400 BadRequest.
     const share = Effect.fn("SessionHttpApi.share")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       yield* shareSvc.share(ctx.params.sessionID).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
       return yield* requireSession(ctx.params.sessionID)
     })
 
     const unshare = Effect.fn("SessionHttpApi.unshare")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       yield* shareSvc
         .unshare(ctx.params.sessionID)
         .pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
@@ -453,16 +500,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      const current = yield* requireSession(ctx.params.sessionID)
+      const current = yield* requirePublicMutableSession(ctx.params.sessionID)
       const wasRunning = (yield* statusSvc.get(ctx.params.sessionID)).type !== "idle"
       yield* revertSvc.cleanup(current)
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
-      const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
+      const currentPrompt = messages.findLast(SessionTurnProvenance.isWorkerPromptTurn)
+      if (!currentPrompt || currentPrompt.info.role !== "user") return yield* new HttpApiError.BadRequest({})
+      const currentAgent = currentPrompt.info.agent || defaultAgent
 
       yield* compactSvc.create({
         sessionID: ctx.params.sessionID,
         agent: currentAgent,
+        sourceMessageID: currentPrompt.info.id,
         model: {
           providerID: ctx.payload.providerID,
           modelID: ctx.payload.modelID,
@@ -478,7 +528,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requireInteractiveSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       const message = yield* promptSvc
         .prompt({
           ...ctx.payload,
@@ -494,10 +544,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      // Async prompt acknowledges before its execution fiber settles. Reject a
-      // host-owned child synchronously here so callers can never receive a false
-      // 204-success for a prompt that the service boundary will refuse.
-      yield* requireInteractiveSession(ctx.params.sessionID)
+      // Async prompt acknowledges before its execution fiber settles. Reject any
+      // non-user-promptable Session synchronously here so callers can never
+      // receive a false 204-success for work the service boundary will refuse.
+      yield* requirePromptableSession(ctx.params.sessionID)
       // `prompt_async` acknowledges with 204 before the fork settles, so
       // deterministic admission errors must be rejected BEFORE forking. An
       // invalid agent used to return success and only fail asynchronously,
@@ -532,7 +582,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
     }) {
-      yield* requireInteractiveSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
@@ -542,7 +592,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof ShellPayload.Type
     }) {
-      yield* requireInteractiveSession(ctx.params.sessionID)
+      yield* requirePromptableSession(ctx.params.sessionID)
       return yield* promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchTag("SessionPrompt.HostOwnedSessionError", () => Effect.fail(new HttpApiError.BadRequest({}))),
         Effect.catchTag("SessionBusyError", (error) =>
@@ -560,12 +610,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof RevertPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       return yield* SessionError.mapBusy(revertSvc.revert({ sessionID: ctx.params.sessionID, ...ctx.payload }))
     })
 
     const unrevert = Effect.fn("SessionHttpApi.unrevert")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       return yield* SessionError.mapBusy(revertSvc.unrevert({ sessionID: ctx.params.sessionID }))
     })
 
@@ -587,11 +637,48 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    const authorizePublicMessageMutation = Effect.fn("SessionHttpApi.authorizePublicMessageMutation")(function* (
+      input: {
+        sessionID: SessionID
+        messageID: MessageID
+      },
+      options?: { stabilizeLegacyParts?: boolean },
+    ) {
+      const current = yield* SessionError.mapStorageNotFound(
+        MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }),
+      )
+      if (current.info.role !== "user") return current
+
+      const resolved = SessionTurnProvenance.resolve(current)
+      // Provider role=user is not mutation authority. Host-owned STATE,
+      // compaction/continuation, scheduled-task, special-agent, and other
+      // orchestration turns may be rendered through that wire role but cannot
+      // be rewritten through the public message-part endpoint.
+      if (!resolved || resolved.owner !== "user") return yield* new HttpApiError.BadRequest({})
+
+      if (!current.info.provenance && options?.stabilizeLegacyParts) {
+        // Public mutation is the first durable rewrite boundary for this old
+        // row. Resolve legacy shape once *before* changing parts, then freeze an
+        // equivalent canonical user provenance so deleting/editing the shape
+        // cannot later change worker/Goal authority by inference.
+        const source =
+          SessionTurnProvenance.semanticKind(current) === "shell"
+            ? SessionTurnProvenance.Source.Shell
+            : SessionTurnProvenance.Source.Prompt
+        yield* session.updateMessage({
+          ...current.info,
+          provenance: SessionTurnProvenance.user(source),
+        })
+      }
+      return current
+    })
+
     const deleteMessage = Effect.fn("SessionHttpApi.deleteMessage")(function* (ctx: {
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
       yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
+      yield* authorizePublicMessageMutation(ctx.params)
       yield* session.removeMessage(ctx.params)
       return true
     })
@@ -599,7 +686,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const deletePart = Effect.fn("SessionHttpApi.deletePart")(function* (ctx: {
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
+      yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
+      yield* authorizePublicMessageMutation(ctx.params, { stabilizeLegacyParts: true })
       yield* session.removePart(ctx.params)
       return true
     })
@@ -608,7 +697,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID; messageID: MessageID; partID: PartID }
       payload: typeof SessionV1.Part.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requirePublicMutableSession(ctx.params.sessionID)
+      yield* SessionError.mapBusy(runState.assertNotBusy(ctx.params.sessionID))
       const payload = ctx.payload as SessionV1.Part
       if (
         payload.id !== ctx.params.partID ||
@@ -617,6 +707,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       ) {
         return yield* new HttpApiError.BadRequest({})
       }
+      yield* authorizePublicMessageMutation(ctx.params, { stabilizeLegacyParts: true })
       return yield* session.updatePart(payload)
     })
 

@@ -1,4 +1,6 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
+import path from "node:path"
+import { Global } from "@opencode-ai/core/global"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 
 /**
@@ -25,6 +27,12 @@ export const INSTANCE_IDENTITY_PATH = "/instance/identity"
 export const INSTANCE_EXPECT_HEADER = "x-opencode-expect-instance"
 
 export type InstanceIdentity = {
+  /**
+   * Stable identity for the durable OpenCode state/profile this process uses.
+   * Multiple processes sharing one state/database intentionally share this id;
+   * process restarts and ephemeral listener ports do not change it.
+   */
+  realmID: string
   instanceID: string
   processID: number
   startedAt: string
@@ -34,6 +42,17 @@ export type InstanceIdentity = {
 
 const fallback = `anon:${randomUUID()}`
 const startedAt = new Date().toISOString()
+
+/**
+ * A realm is the durable state boundary, not a process and not a port. Hash the
+ * normalized state root so clients can group processes that share credentials
+ * and session storage without publishing a local filesystem path.
+ */
+export function serviceRealmID(stateRoot = Global.Path.state): string {
+  const resolved = path.normalize(path.resolve(stateRoot))
+  const canonical = process.platform === "win32" ? resolved.toLowerCase() : resolved
+  return `realm:${createHash("sha256").update(canonical, "utf8").digest("hex").slice(0, 32)}`
+}
 
 /**
  * Processes nobody claimed still answer, with an `anon:` id: callers need to
@@ -48,6 +67,7 @@ export function instanceIdentity(): InstanceIdentity {
   const configured = process.env[INSTANCE_ID_ENV]?.trim()
   const client = process.env["OPENCODE_CLIENT"]?.trim()
   return {
+    realmID: serviceRealmID(),
     instanceID: configured || fallback,
     processID: process.pid,
     startedAt,

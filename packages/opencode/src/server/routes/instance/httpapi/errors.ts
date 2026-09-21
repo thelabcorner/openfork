@@ -22,6 +22,25 @@ export class ForbiddenError extends Schema.TaggedErrorClass<ForbiddenError>()(
   { httpApiStatus: 403 },
 ) {}
 
+export class RateLimitError extends Schema.TaggedErrorClass<RateLimitError>()(
+  "RateLimitError",
+  {
+    message: Schema.String,
+    service: Schema.optional(Schema.String),
+    retryAfterMs: Schema.optional(Schema.Number),
+  },
+  { httpApiStatus: 429 },
+) {}
+
+export class QuotaExceededError extends Schema.TaggedErrorClass<QuotaExceededError>()(
+  "QuotaExceededError",
+  {
+    message: Schema.String,
+    service: Schema.optional(Schema.String),
+  },
+  { httpApiStatus: 429 },
+) {}
+
 export class ConflictError extends Schema.TaggedErrorClass<ConflictError>()(
   "ConflictError",
   {

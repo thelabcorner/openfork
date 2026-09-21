@@ -48,6 +48,7 @@ describe("instanceIdentity", () => {
     const identity = await withEnv(INSTANCE_ID_ENV, "desktop:abc-123", () => instanceIdentity())
     expect(identity.instanceID).toBe("desktop:abc-123")
     expect(identity.processID).toBe(process.pid)
+    expect(identity.realmID).toStartWith("realm:")
     expect(identity.version).toBeString()
     expect(Number.isNaN(Date.parse(identity.startedAt))).toBe(false)
   })
@@ -68,7 +69,7 @@ describe("instanceIdentity", () => {
 
   test("carries no user data", async () => {
     const identity = await withEnv(INSTANCE_ID_ENV, "desktop:abc-123", () => instanceIdentity())
-    expect(Object.keys(identity).sort()).toEqual(["instanceID", "processID", "startedAt", "version"])
+    expect(Object.keys(identity).sort()).toEqual(["instanceID", "processID", "realmID", "startedAt", "version"])
   })
 })
 
@@ -78,15 +79,24 @@ describe("GET /instance/identity", () => {
     const response = await withEnv(INSTANCE_ID_ENV, "desktop:route-test", () => request(INSTANCE_IDENTITY_PATH))
     expect(response.status).toBe(200)
     expect(response.headers.get("cache-control")).toBe("no-store")
-    const body = (await response.json()) as { instanceID: string; processID: number }
+    const body = (await response.json()) as {
+      instanceID: string
+      processID: number
+      ofxp: { enabled: boolean }
+    }
     expect(body.instanceID).toBe("desktop:route-test")
     expect(body.processID).toBe(process.pid)
+    expect(body.ofxp).toEqual({ enabled: false })
   })
 
   test("does not need an instance directory header", async () => {
     const response = await app()(INSTANCE_IDENTITY_PATH)
     expect(response.status).toBe(200)
-    expect((await response.json()).instanceID).toBeString()
+    const body = await response.json()
+    expect(body.instanceID).toBeString()
+    expect(body.ofxp).toEqual({ enabled: false })
+    expect(JSON.stringify(body)).not.toContain("privateKey")
+    expect(JSON.stringify(body)).not.toContain("password")
   })
 })
 

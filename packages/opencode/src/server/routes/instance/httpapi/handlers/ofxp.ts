@@ -11,6 +11,7 @@ import type {
   OfxpIdentityMutationPayload,
   OfxpRevokePayload,
   OfxpRootPayload,
+  OfxpServerSeedsPayload,
 } from "../groups/ofxp"
 
 function message(error: unknown) {
@@ -147,6 +148,11 @@ export const ofxpHandlers = HttpApiBuilder.group(RootHttpApi, "ofxp", (handlers)
       .handle("state", () => state())
       .handle("runtime", ({ payload }) =>
         runtime.setEnabled(payload.enabled).pipe(Effect.mapError(runtimeError), Effect.andThen(state())),
+      )
+      .handle("serverSeeds", ({ payload }: { payload: typeof OfxpServerSeedsPayload.Type }) =>
+        runtime
+          .replaceServerSeeds(payload.seeds.map((seed) => ({ ...seed, source: "server" as const })))
+          .pipe(Effect.map((accepted) => ({ accepted }))),
       )
       .handle("rotateIdentity", ({ payload }: { payload: typeof OfxpIdentityMutationPayload.Type }) =>
         runtime.rotateIdentity(payload.expectedPeerID).pipe(Effect.mapError(runtimeError), Effect.andThen(state())),

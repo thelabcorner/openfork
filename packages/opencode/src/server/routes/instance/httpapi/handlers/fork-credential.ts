@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { disposeInstance } from "@/effect/instance-registry"
@@ -29,10 +30,18 @@ type CredentialWindows = {
   }
 }
 
+function authBearer(info: Auth.Info | undefined): string | undefined {
+  if (!info) return
+  if (info.type === "api") return info.key || undefined
+  if (info.type === "oauth") return info.access || undefined
+  if (info.type === "wellknown") return info.token || undefined
+}
+
 export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-credential", (handlers) =>
   Effect.gen(function* () {
     const credentials = yield* ForkCredentials.Service
     const usage = yield* SessionUsage.Service
+    const auth = yield* Auth.Service
 
     const refresh = (directory?: string) =>
       directory ? Effect.promise(() => disposeInstance(directory)).pipe(Effect.asVoid) : Effect.void
@@ -114,19 +123,33 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
     const getUsage = Effect.fn("ForkCredentialHttpApi.usage")(function* () {
       const { bounds, allCredentials, byCredential, aggregate } = yield* getLocal()
 
-      // The pool default a bare opencode-go request routes to (may be an env
-      // key the vault knows nothing about). Added so the client can label the
-      // "active" account and key per-account spend off the pool id, not just
-      // the vault UUID.
+      // Shared pool default is retained separately for credential-management
+      // compatibility. Bare Go routing may instead use a directly connected
+      // opencode-go provider credential.
       const snapshot = zenLimitSnapshot()
       const poolDefault = snapshot.find((entry) => entry.isDefault) ?? snapshot[0]
+      const directAuth = yield* auth.get("opencode-go").pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      const directKey = authBearer(directAuth)
+      const directAccountID = directKey ? stableZenIdentity(directKey) : undefined
+      const directLabel =
+        directAuth?.type === "api" && directAuth.metadata?.label ? directAuth.metadata.label : "OpenCode Go"
+      const routed = directAccountID
+        ? { routedAccountID: directAccountID, routedAccountLabel: directLabel, routedAccountSource: "provider" as const }
+        : poolDefault
+          ? {
+              routedAccountID: poolDefault.accountId,
+              routedAccountLabel: poolDefault.label,
+              routedAccountSource: "pool" as const,
+            }
+          : {}
 
-      if (allCredentials.length === 0) {
+      if (allCredentials.length === 0 && !directKey) {
         // Zero credentials: local aggregate + empty per-credential, and NO
         // external calls (nothing to ask the official API about).
         return {
           aggregate,
           byCredential: [],
+          ...routed,
           ...(poolDefault
             ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
             : {}),
@@ -154,9 +177,23 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
         { concurrency: 4 },
       )
 
+      // Direct /connect OpenCode Go credentials live in auth.json rather than
+      // the fork vault. Project them as a synthetic, key-free usage row so UI
+      // quota indicators follow the same account that request routing uses.
+      if (directKey && directAccountID && !officialByCredential.some((entry) => entry.accountID === directAccountID)) {
+        const official = yield* officialUsageCache.get(`auth:opencode-go:${directAccountID}`, directKey)
+        officialByCredential.push({
+          credentialID: `auth:opencode-go:${directAccountID}`,
+          accountID: directAccountID,
+          windows: mergeOfficial(buildLocalWindows(bounds, []), official.snapshot ?? {}),
+          official: { fetchedAt: official.fetchedAt, ageMs: official.ageMs, status: official.status },
+        })
+      }
+
       return {
         aggregate: aggregateWindows(aggregate, officialByCredential.map((entry) => entry.windows)),
         byCredential: officialByCredential,
+        ...routed,
         ...(poolDefault
           ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
           : {}),

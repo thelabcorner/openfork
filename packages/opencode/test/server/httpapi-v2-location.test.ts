@@ -4,7 +4,7 @@ import { Location } from "@opencode-ai/core/location"
 import { Context, Schema } from "effect"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { resetDatabase } from "../fixture/db"
-import { disposeAllInstances, tmpdir } from "../fixture/fixture"
+import { tmpdir } from "../fixture/fixture"
 
 const context = Context.empty() as Context.Context<unknown>
 
@@ -84,7 +84,6 @@ async function readEventType(reader: AsyncIterator<StreamEvent>, type: string) {
 }
 
 afterEach(async () => {
-  await disposeAllInstances()
   await resetDatabase()
 })
 
@@ -123,7 +122,7 @@ describe("v2 location HttpApi", () => {
     const reader = eventStream(response.body!)
     const connected = await readEvent(reader)
     expect(connected.type).toBe("server.connected")
-    expect(connected.location).toBeUndefined()
+    expect("location" in connected ? connected.location : undefined).toBeUndefined()
 
     const created = await request("/session", publisher.path, { method: "POST" })
     expect(created.status).toBe(200)

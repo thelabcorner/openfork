@@ -66,6 +66,26 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       return { checkpoint: yield* Checkpoint.Service, snapshot: yield* Snapshot.Service }
     })
 
+    const requirePublicMutableSession = Effect.fn("SessionHandler.requirePublicMutableSession")(function* (
+      sessionID: Parameters<typeof session.producerOwned>[0],
+    ) {
+      const producerOwned = yield* session.producerOwned(sessionID).pipe(
+        Effect.catchTag("Session.NotFoundError", (error) =>
+          Effect.fail(
+            new SessionNotFoundError({
+              sessionID: error.sessionID,
+              message: `Session not found: ${error.sessionID}`,
+            }),
+          ),
+        ),
+      )
+      if (producerOwned) {
+        return yield* new InvalidRequestError({
+          message: "This Session is owned by a host producer and cannot be mutated through the generic public Session API",
+        })
+      }
+    })
+
     return handlers
       .handle(
         "session.list",
@@ -206,6 +226,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.switchAgent",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.switchAgent({ sessionID: ctx.params.sessionID, agent: ctx.payload.agent }).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -222,6 +243,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.switchModel",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.switchModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model }).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -238,6 +260,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.prompt",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           return {
             data: yield* session
               .prompt({
@@ -264,6 +287,13 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                     }),
                   ),
                 ),
+                Effect.catchTag("Session.OperationUnavailableError", () =>
+                  Effect.fail(
+                    new InvalidRequestError({
+                      message: "This Session does not accept generic public prompts",
+                    }),
+                  ),
+                ),
               ),
           }
         }),
@@ -271,6 +301,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.compact",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.compact({ sessionID: ctx.params.sessionID }).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -319,6 +350,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.revert.stage",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           return {
             data: yield* session.revert.stage({ ...ctx.params, ...ctx.payload }).pipe(
               Effect.catchTag(
@@ -358,6 +390,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.revert.clear",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.revert.clear(ctx.params.sessionID).pipe(
             Effect.catchTag(
               "Session.NotFoundError",
@@ -387,6 +420,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.revert.commit",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.revert.commit(ctx.params.sessionID).pipe(
             Effect.catchTag(
               "Session.NotFoundError",
@@ -464,6 +498,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.interrupt",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.interrupt(ctx.params.sessionID)
           return HttpApiSchema.NoContent.make()
         }),
@@ -471,6 +506,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.pause",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.pause(ctx.params.sessionID).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -487,6 +523,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.resume",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.resume(ctx.params.sessionID).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -503,6 +540,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.regenerateTitle",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           yield* session.regenerateTitle({ sessionID: ctx.params.sessionID, ...ctx.payload }).pipe(
             Effect.catchTag("Session.NotFoundError", (error) =>
               Effect.fail(
@@ -666,6 +704,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.checkpoint.revert",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           const { checkpoint, snapshot } = yield* locationDeps
           const cp = yield* checkpoint.get({
             sessionID: ctx.params.sessionID,
@@ -739,6 +778,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.checkpoint.create",
         Effect.fn(function* (ctx) {
+          yield* requirePublicMutableSession(ctx.params.sessionID)
           const { checkpoint, snapshot } = yield* locationDeps
           const info = yield* session.get(ctx.params.sessionID).pipe(
             Effect.catchTag("Session.NotFoundError", () =>

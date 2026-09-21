@@ -47,7 +47,12 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { groupID: SessionGroup.ID }
       payload: typeof RenamePayload.Type
     }) {
-      yield* SessionError.mapStorageNotFound(svc.rename({ id: ctx.params.groupID, name: ctx.payload.name }))
+      yield* svc.rename({ id: ctx.params.groupID, name: ctx.payload.name }).pipe(
+        Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
+        Effect.catchTag("SessionGroupManagedProjectionError", (error) =>
+          Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+        ),
+      )
       return HttpApiSchema.NoContent.make()
     })
 
@@ -62,6 +67,8 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
             Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
           SessionGroupOwnerMismatchError: (error) =>
             Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+          SessionGroupManagedProjectionError: (error) =>
+            Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
         }),
       )
       return HttpApiSchema.NoContent.make()
@@ -71,7 +78,12 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { groupID: SessionGroup.ID }
       payload: typeof ReorderPayload.Type
     }) {
-      yield* SessionError.mapStorageNotFound(svc.reorder({ id: ctx.params.groupID, position: ctx.payload.position }))
+      yield* svc.reorder({ id: ctx.params.groupID, position: ctx.payload.position }).pipe(
+        Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
+        Effect.catchTag("SessionGroupManagedProjectionError", (error) =>
+          Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+        ),
+      )
       return HttpApiSchema.NoContent.make()
     })
 
@@ -79,16 +91,21 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { groupID: SessionGroup.ID }
       payload: typeof AddSessionPayload.Type
     }) {
-      yield* SessionError.mapStorageNotFound(
-        svc.addSession({
+      yield* svc
+        .addSession({
           groupId: ctx.params.groupID,
           sessionId: ctx.payload.sessionId,
           locked: ctx.payload.locked,
           origin: ctx.payload.origin,
           originPlugin: ctx.payload.originPlugin,
           originRef: ctx.payload.originRef,
-        }),
-      )
+        })
+        .pipe(
+          Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
+          Effect.catchTag("SessionGroupManagedProjectionError", (error) =>
+            Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+          ),
+        )
       return HttpApiSchema.NoContent.make()
     })
 
@@ -108,6 +125,8 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
             SessionGroupMemberLockedError: (error) =>
               Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
             SessionGroupOwnerMismatchError: (error) =>
+              Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+            SessionGroupManagedProjectionError: (error) =>
               Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
           }),
         )
@@ -137,8 +156,11 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { groupID: SessionGroup.ID }
       payload: typeof ReorderMembersPayload.Type
     }) {
-      yield* SessionError.mapStorageNotFound(
-        svc.reorderMembers({ id: ctx.params.groupID, sessionIds: [...ctx.payload.sessionIds] }),
+      yield* svc.reorderMembers({ id: ctx.params.groupID, sessionIds: [...ctx.payload.sessionIds] }).pipe(
+        Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
+        Effect.catchTag("SessionGroupManagedProjectionError", (error) =>
+          Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+        ),
       )
       return HttpApiSchema.NoContent.make()
     })
@@ -147,7 +169,12 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       params: { groupID: SessionGroup.ID }
       payload: typeof PolicyPayload.Type
     }) {
-      yield* SessionError.mapStorageNotFound(svc.setPolicy({ id: ctx.params.groupID, policy: ctx.payload }))
+      yield* svc.setPolicy({ id: ctx.params.groupID, policy: ctx.payload }).pipe(
+        Effect.catchTag("NotFoundError", (error) => Effect.fail(ApiError.notFound(error.message))),
+        Effect.catchTag("SessionGroupManagedProjectionError", (error) =>
+          Effect.fail(new ApiError.ConflictError({ message: error.message, code: error.code })),
+        ),
+      )
       return HttpApiSchema.NoContent.make()
     })
 

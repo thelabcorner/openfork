@@ -43,11 +43,13 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
       const { sessionID } = params as { sessionID: string }
       // Validate session exists
       yield* session.get(sessionID as any)
-      // Validate ops — gate signed-reasoning edits/excludes
+      // Validate ops at admission. The compiler repeats these guards for old
+      // persisted rows, but invalid operations must not enter the durable event
+      // log/projector in the first place.
       const ops = (payload as { operations: any[] }).operations
       if (ops.length === 0) return { batchID: "", timestamp: Date.now() }
 
-      // Pre-validate: load messages once to check signed reasoning
+      // Pre-validate against one already-loaded transcript snapshot.
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
         Effect.catch(() => Effect.succeed([] as never)),
@@ -57,12 +59,10 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
       for (const op of ops) {
         const msg = byId.get(op.messageID)
         if (!msg) continue
-        const hasSigned = (msg as any).parts?.some(
-          (p: any) => p.type === "reasoning" && p.metadata?.anthropic?.signature != null,
-        )
-        if (hasSigned && (op.type === "message.exclude" || op.type === "text.replace")) {
+        const check = EffectiveContextCompiler.canApplyContextOperation(msg as any, op.type)
+        if (!check.allowed) {
           return yield* Effect.fail(
-            new Error(`Operation ${op.type} blocked: message ${op.messageID} contains signed reasoning`),
+            new Error(`Operation ${op.type} blocked for message ${op.messageID}: ${check.reason}`),
           )
         }
       }
@@ -123,13 +123,17 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
           }
         }
       }
-      // Find earliest mutation index
-      const stateMap = yield* SessionContextState.getState(sessionID as any).pipe(
-        Effect.catch(() => Effect.succeed(new Map())),
+      // Find earliest *effective* mutation from the already materialized ledger.
+      // This avoids a second SQLite read and ignores legacy overlay rows that the
+      // compiler deliberately treats as semantically inert (for example STATE).
+      const mutated = new Set(
+        ledgerData.entries
+          .filter((entry) => entry.excluded || entry.pinned || entry.edited)
+          .map((entry) => entry.messageID),
       )
       let earliestMutationIndex: number | undefined
       for (let i = 0; i < filtered.length; i++) {
-        if ((stateMap as Map<string, any>).has(filtered[i]!.info.id)) {
+        if (mutated.has(filtered[i]!.info.id as any)) {
           earliestMutationIndex = i
           break
         }

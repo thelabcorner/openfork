@@ -30,7 +30,11 @@ import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from ".
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionHistory } from "@opencode-ai/core/session/history"
+import { SessionTurnProvenance as CurrentSessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
+import { SessionTurnProvenance as V1SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionTitle } from "@opencode-ai/core/session/title"
+import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -473,7 +477,11 @@ describe("session HttpApi", () => {
       expect(updated.status).toBe(200)
       const selected = (yield* responseJson(updated)) as Session.Info
       expect(selected.agent).toBe("build")
-      expect(selected.model).toEqual({ providerID: "test", id: "test-model", variant: "default" })
+      expect(selected.model).toEqual({
+        providerID: ProviderV2.ID.make("test"),
+        id: ModelV2.ID.make("test-model"),
+        variant: ModelV2.VariantID.make("default"),
+      })
 
       // Selection is session state, not a synthetic conversation turn.
       expect(yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie)).toHaveLength(0)
@@ -491,7 +499,11 @@ describe("session HttpApi", () => {
       expect(fetched.status).toBe(200)
       const after = (yield* responseJson(fetched)) as Session.Info
       expect(after.agent).toBe("build")
-      expect(after.model).toEqual({ providerID: "test", id: "test-model", variant: "default" })
+      expect(after.model).toEqual({
+        providerID: ProviderV2.ID.make("test"),
+        id: ModelV2.ID.make("test-model"),
+        variant: ModelV2.VariantID.make("default"),
+      })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
@@ -732,6 +744,108 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "keeps V1 producer-owned Sessions outside the current public mutation and control surface",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const owned = yield* createSession({
+          title: "cross-generation scheduled run",
+          metadata: { scheduledTaskID: "stk_v2_fence", scheduledTaskRunID: "str_v2_fence" },
+        })
+        const seeded = yield* createTextMessage(owned.id, "producer-owned transcript")
+
+        // Current/Core deliberately does not surface the V1 compatibility
+        // metadata bag, but the public mutation boundary must still consume its
+        // canonical producer-ownership projection from the shared durable row.
+        const readable = yield* request(`/api/session/${owned.id}`, { headers })
+        expect(readable.status).toBe(200)
+        const currentInfo = (yield* responseJson(readable)) as { data: Record<string, unknown> }
+        expect(currentInfo.data).toMatchObject({ id: owned.id, title: "cross-generation scheduled run" })
+        expect(Object.hasOwn(currentInfo.data, "metadata")).toBe(false)
+
+        const blocked = [
+          { name: "switchAgent", path: `/api/session/${owned.id}/agent`, body: { agent: "build" } },
+          {
+            name: "switchModel",
+            path: `/api/session/${owned.id}/model`,
+            body: { model: { providerID: "test", id: "test-model" } },
+          },
+          {
+            name: "prompt",
+            path: `/api/session/${owned.id}/prompt`,
+            body: { prompt: { text: "public takeover" }, resume: false },
+          },
+          { name: "compact", path: `/api/session/${owned.id}/compact` },
+          {
+            name: "revert.stage",
+            path: `/api/session/${owned.id}/revert/stage`,
+            body: { messageID: seeded.info.id },
+          },
+          { name: "revert.clear", path: `/api/session/${owned.id}/revert/clear` },
+          { name: "revert.commit", path: `/api/session/${owned.id}/revert/commit` },
+          { name: "interrupt", path: `/api/session/${owned.id}/interrupt` },
+          { name: "pause", path: `/api/session/${owned.id}/pause` },
+          { name: "resume", path: `/api/session/${owned.id}/resume` },
+          { name: "regenerateTitle", path: `/api/session/${owned.id}/title/regenerate`, body: {} },
+          {
+            name: "permission.create",
+            path: `/api/session/${owned.id}/permission`,
+            body: { action: "shell", resources: ["*"] },
+          },
+          {
+            name: "checkpoint.revert",
+            path: `/api/session/${owned.id}/checkpoint/cp_public_takeover/revert`,
+            body: {},
+          },
+          { name: "checkpoint.create", path: `/api/session/${owned.id}/checkpoint`, body: { kind: "manual" } },
+        ] as const
+
+        for (const operation of blocked) {
+          const response = yield* request(operation.path, {
+            method: "POST",
+            headers,
+            ...("body" in operation ? { body: JSON.stringify(operation.body) } : {}),
+          })
+          expect(response.status, operation.name).toBe(400)
+          expect(yield* responseJson(response), operation.name).toMatchObject({ _tag: "InvalidRequestError" })
+        }
+
+        const { readDb } = yield* Database.Service
+        const durable = yield* readDb
+          .select({ title: SessionTable.title, metadata: SessionTable.metadata, pausedAt: SessionTable.paused_at })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, owned.id))
+          .get()
+          .pipe(Effect.orDie)
+        expect(durable).toEqual({
+          title: "cross-generation scheduled run",
+          metadata: { scheduledTaskID: "stk_v2_fence", scheduledTaskRunID: "str_v2_fence" },
+          pausedAt: null,
+        })
+        expect(
+          yield* readDb.select().from(SessionInputTable).where(eq(SessionInputTable.session_id, owned.id)).all().pipe(Effect.orDie),
+        ).toHaveLength(0)
+        const stored = (yield* Session.Service.use((svc) => svc.messages({ sessionID: owned.id }))).find(
+          (message) => message.info.id === seeded.info.id,
+        )
+        expect(stored?.parts).toMatchObject([{ id: seeded.part.id, text: "producer-owned transcript" }])
+
+        const parent = yield* createSession({ title: "current public parent" })
+        const child = yield* createSession({ title: "current public child", parentID: parent.id })
+        const childPrompt = yield* request(`/api/session/${child.id}/prompt`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ prompt: { text: "do not bypass parent authority" }, resume: false }),
+        })
+        expect(childPrompt.status).toBe(400)
+        expect(yield* responseJson(childPrompt)).toMatchObject({ _tag: "InvalidRequestError" })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    20_000,
+  )
+
+  it.instance(
     "returns safe v2 unknown errors for corrupt projected messages",
     () =>
       Effect.gen(function* () {
@@ -861,6 +975,139 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "strips producer identity from public metadata and rejects generic mutation of producer-owned Sessions",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+
+        const publicCreated = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            title: "public metadata",
+            metadata: {
+              ordinary: "keep",
+              scheduledTaskID: "stk_spoof",
+              scheduledTaskRunID: "str_spoof",
+              specialAgent: "goal_auditor",
+              specialAgentOwnerKind: "goal",
+              specialAgentOwnerID: "spoof-owner",
+              goalID: "goal_spoof",
+              parentSessionID: "ses_spoof",
+            },
+          }),
+        })
+        expect(publicCreated.metadata).toEqual({ ordinary: "keep" })
+
+        const publicUpdated = yield* requestJson<Session.Info>(
+          pathFor(SessionPaths.update, { sessionID: publicCreated.id }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({
+              metadata: {
+                ordinary: "replaced",
+                scheduledTaskID: "stk_spoof",
+                scheduledTaskRunID: "str_spoof",
+                specialAgent: "goal_auditor",
+                specialAgentOwnerKind: "goal",
+                specialAgentOwnerID: "spoof-owner",
+              },
+            }),
+          },
+        )
+        expect(publicUpdated.metadata).toEqual({ ordinary: "replaced" })
+
+        const trusted = yield* createSession({
+          title: "trusted scheduled metadata",
+          metadata: {
+            ordinaryOld: true,
+            scheduledTaskID: "stk_real",
+            scheduledTaskRunID: "str_real",
+          },
+        })
+
+        const updated = yield* request(pathFor(SessionPaths.update, { sessionID: trusted.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            metadata: {
+              ordinaryNew: true,
+              scheduledTaskID: "stk_spoof",
+              scheduledTaskRunID: "str_spoof",
+              specialAgent: "goal_auditor",
+            },
+          }),
+        })
+        expect(updated.status).toBe(400)
+
+        const forked = yield* request(pathFor(SessionPaths.fork, { sessionID: trusted.id }), {
+          method: "POST",
+          headers,
+        })
+        expect(forked.status).toBe(400)
+        expect(
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: trusted.id }), { headers })).metadata,
+        ).toEqual({
+          ordinaryOld: true,
+          scheduledTaskID: "stk_real",
+          scheduledTaskRunID: "str_real",
+        })
+
+        const specialAgent = yield* createSession({
+          title: "trusted special-agent metadata",
+          metadata: {
+            specialAgent: "goal_auditor",
+            specialAgentOwnerKind: "goal",
+            specialAgentOwnerID: "ses_parent\u0000goal_real",
+            goalID: "goal_real",
+            parentSessionID: "ses_parent",
+            ordinaryOld: true,
+          },
+        })
+        const specialUpdated = yield* request(
+          pathFor(SessionPaths.update, { sessionID: specialAgent.id }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({
+              metadata: {
+                specialAgent: "prompt_revisor",
+                specialAgentOwnerKind: "session",
+                specialAgentOwnerID: "spoof-owner",
+                goalID: "goal_spoof",
+                parentSessionID: "ses_spoof",
+                ordinaryNew: true,
+              },
+            }),
+          },
+        )
+        expect(specialUpdated.status).toBe(400)
+
+        const specialFork = yield* request(
+          pathFor(SessionPaths.fork, { sessionID: specialAgent.id }),
+          {
+            method: "POST",
+            headers,
+          },
+        )
+        expect(specialFork.status).toBe(400)
+        expect(
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: specialAgent.id }), { headers })).metadata,
+        ).toEqual({
+          specialAgent: "goal_auditor",
+          specialAgentOwnerKind: "goal",
+          specialAgentOwnerID: "ses_parent\u0000goal_real",
+          goalID: "goal_real",
+          parentSessionID: "ses_parent",
+          ordinaryOld: true,
+        })
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
+  )
+
+  it.instance(
     "persists selected workspace id when creating a session",
     () =>
       Effect.gen(function* () {
@@ -973,8 +1220,54 @@ describe("session HttpApi", () => {
         const bootstrapFree = yield* requestJson<Session.Info[]>(`${GlobalPaths.sessionRoots}?${bootstrapFreeQuery}`)
         expect(bootstrapFree.map((item) => item.id)).toContain(created.id)
 
+        const bootstrapFreeGet = yield* requestJson<Session.Info>(
+          GlobalPaths.sessionGet.replace(":sessionID", created.id),
+        )
+        expect(bootstrapFreeGet.id).toBe(created.id)
+        expect(FSUtil.resolve(bootstrapFreeGet.directory)).toBe(FSUtil.resolve(created.directory))
+        const missingBootstrapFree = yield* requestJson<Session.Info | null>(
+          GlobalPaths.sessionGet.replace(":sessionID", SessionID.make("ses_missing_bootstrap_free")),
+        )
+        expect(missingBootstrapFree).toBeNull()
+
         const projects = yield* requestJson<Project.Info[]>(GlobalPaths.projects)
         expect(projects.some((project) => FSUtil.resolve(project.worktree) === FSUtil.resolve(test.directory))).toBe(true)
+      }),
+    { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
+  )
+
+  it.instance(
+    "project-scoped global roots include root Sessions outside the canonical worktree directory",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const nested = path.join(test.directory, ".scheduled", "task-a")
+        yield* Effect.promise(() => mkdir(nested, { recursive: true }))
+
+        const root = yield* createSession({ title: "canonical root" })
+        const store = yield* InstanceStore.Service
+        const foreign = yield* store.provide(
+          { directory: nested },
+          createSession({ title: "scheduled foreign-directory root" }).pipe(
+            Effect.provideService(TestInstance, { directory: nested }),
+          ),
+        )
+        expect(foreign.projectID).toBe(root.projectID)
+        expect(FSUtil.resolve(foreign.directory)).not.toBe(FSUtil.resolve(root.directory))
+
+        const directoryOnly = new URLSearchParams({ directory: test.directory, limit: "50" })
+        const oldCensus = yield* requestJson<Session.Info[]>(GlobalPaths.sessionRoots + "?" + directoryOnly)
+        expect(oldCensus.map((item) => item.id)).toContain(root.id)
+        expect(oldCensus.map((item) => item.id)).not.toContain(foreign.id)
+
+        const projectWide = new URLSearchParams({
+          directory: test.directory,
+          projectID: root.projectID,
+          limit: "50",
+        })
+        const projectCensus = yield* requestJson<Session.Info[]>(GlobalPaths.sessionRoots + "?" + projectWide)
+        expect(projectCensus.map((item) => item.id)).toContain(root.id)
+        expect(projectCensus.map((item) => item.id)).toContain(foreign.id)
       }),
     { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )
@@ -1070,6 +1363,15 @@ describe("session HttpApi", () => {
           },
         )
         expect(updated).toMatchObject({ id: first.part.id, type: "text", text: "updated" })
+        const stabilized = yield* Session.Service.use((svc) =>
+          svc.messages({ sessionID: session.id }).pipe(
+            Effect.map((messages) => messages.find((message) => message.info.id === first.info.id)),
+          ),
+        )
+        expect(stabilized?.info).toMatchObject({
+          role: "user",
+          provenance: { owner: "user", source: V1SessionTurnProvenance.Source.Prompt },
+        })
 
         expect(
           yield* requestJson<boolean>(
@@ -1088,6 +1390,258 @@ describe("session HttpApi", () => {
             { method: "DELETE", headers },
           ),
         ).toBe(true)
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "rejects public part mutation of host-owned user-role turns",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({ title: "host-owned part mutation" })
+        const svc = yield* Session.Service
+        const info = yield* svc.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          provenance: V1SessionTurnProvenance.host(V1SessionTurnProvenance.Source.GoalProgress, {
+            ref: "goal-state:httpapi-mutation",
+          }),
+          agent: "build",
+          model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+          time: { created: Date.now() },
+        })
+        const part = yield* svc.updatePart({
+          id: PartID.ascending(),
+          sessionID: session.id,
+          messageID: info.id,
+          type: "text",
+          text: "authoritative state",
+          synthetic: true,
+        })
+
+        const update = yield* request(
+          pathFor(SessionPaths.updatePart, {
+            sessionID: session.id,
+            messageID: info.id,
+            partID: part.id,
+          }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ ...part, text: "spoofed state" }),
+          },
+        )
+        expect(update.status).toBe(400)
+
+        const remove = yield* request(
+          pathFor(SessionPaths.deletePart, {
+            sessionID: session.id,
+            messageID: info.id,
+            partID: part.id,
+          }),
+          { method: "DELETE", headers },
+        )
+        expect(remove.status).toBe(400)
+
+        const removeMessage = yield* request(
+          pathFor(SessionPaths.deleteMessage, {
+            sessionID: session.id,
+            messageID: info.id,
+          }),
+          { method: "DELETE", headers },
+        )
+        expect(removeMessage.status).toBe(400)
+
+        const stored = (yield* svc.messages({ sessionID: session.id })).find((message) => message.info.id === info.id)
+        expect(stored?.parts).toMatchObject([{ id: part.id, text: "authoritative state", synthetic: true }])
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "keeps scheduled-task aggregate mutation fenced while allowing ordinary Session prompting",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const session = yield* createSession({
+          title: "scheduled run",
+          metadata: { scheduledTaskID: "stk_http_test", scheduledTaskRunID: "str_http_test" },
+        })
+        const seeded = yield* createTextMessage(session.id, "producer-owned transcript")
+
+        const prompt = yield* request(
+          pathFor(SessionPaths.promptAsync, { sessionID: session.id }),
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              noReply: true,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "human follow-up" }],
+            }),
+          },
+        )
+        expect(prompt.status).toBe(204)
+        yield* pollWithTimeout(
+          Session.Service.use((svc) => svc.messages({ sessionID: session.id })).pipe(
+            Effect.map((messages) =>
+              messages.some(
+                (message) =>
+                  message.info.role === "user" &&
+                  message.info.provenance?.owner === "user" &&
+                  message.parts.some((part) => part.type === "text" && part.text === "human follow-up"),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+          "timed out waiting for Scheduled root human prompt",
+        )
+
+        const malformed = yield* createSession({
+          title: "malformed scheduled run",
+          // scheduledTaskID alone is the canonical task-owned Session shape.
+          // A run id without its owning task is the malformed protected origin.
+          metadata: { scheduledTaskRunID: "str_http_malformed" },
+        })
+        const malformedPrompt = yield* request(
+          pathFor(SessionPaths.promptAsync, { sessionID: malformed.id }),
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              noReply: true,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "must fail before async acknowledgement" }],
+            }),
+          },
+        )
+        expect(malformedPrompt.status).toBe(400)
+
+        const blockedAggregateOperations = [
+          {
+            name: "update",
+            path: pathFor(SessionPaths.update, { sessionID: session.id }),
+            method: "PATCH",
+            body: { title: "public takeover" },
+          },
+          {
+            name: "fork",
+            path: pathFor(SessionPaths.fork, { sessionID: session.id }),
+            method: "POST",
+          },
+          {
+            name: "abort",
+            path: pathFor(SessionPaths.abort, { sessionID: session.id }),
+            method: "POST",
+          },
+          {
+            name: "pause",
+            path: pathFor(SessionPaths.pause, { sessionID: session.id }),
+            method: "POST",
+          },
+          {
+            name: "resume",
+            path: pathFor(SessionPaths.resume, { sessionID: session.id }),
+            method: "POST",
+          },
+          {
+            name: "regenerateTitle",
+            path: pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }),
+            method: "POST",
+            body: {},
+          },
+          {
+            name: "init",
+            path: pathFor(SessionPaths.init, { sessionID: session.id }),
+            method: "POST",
+            body: { providerID: "test", modelID: "test", messageID: MessageID.ascending() },
+          },
+          {
+            name: "share",
+            path: pathFor(SessionPaths.share, { sessionID: session.id }),
+            method: "POST",
+          },
+          {
+            name: "unshare",
+            path: pathFor(SessionPaths.share, { sessionID: session.id }),
+            method: "DELETE",
+          },
+          {
+            name: "summarize",
+            path: pathFor(SessionPaths.summarize, { sessionID: session.id }),
+            method: "POST",
+            body: { providerID: "test", modelID: "test" },
+          },
+          {
+            name: "revert",
+            path: pathFor(SessionPaths.revert, { sessionID: session.id }),
+            method: "POST",
+            body: { messageID: seeded.info.id },
+          },
+          {
+            name: "unrevert",
+            path: pathFor(SessionPaths.unrevert, { sessionID: session.id }),
+            method: "POST",
+          },
+        ] as const
+
+        for (const operation of blockedAggregateOperations) {
+          const response = yield* request(operation.path, {
+            method: operation.method,
+            headers,
+            ...("body" in operation ? { body: JSON.stringify(operation.body) } : {}),
+          })
+          expect(response.status, operation.name).toBe(400)
+        }
+
+        const update = yield* request(
+          pathFor(SessionPaths.updatePart, {
+            sessionID: session.id,
+            messageID: seeded.info.id,
+            partID: seeded.part.id,
+          }),
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ ...seeded.part, text: "rewritten" }),
+          },
+        )
+        expect(update.status).toBe(400)
+
+        const remove = yield* request(
+          pathFor(SessionPaths.deleteMessage, { sessionID: session.id, messageID: seeded.info.id }),
+          { method: "DELETE", headers },
+        )
+        expect(remove.status).toBe(400)
+
+        const stored = (yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id }))).find(
+          (message) => message.info.id === seeded.info.id,
+        )
+        expect(stored?.parts).toMatchObject([{ id: seeded.part.id, text: "producer-owned transcript" }])
+
+        const aggregate = yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })
+        expect(aggregate).toMatchObject({
+          id: session.id,
+          title: "scheduled run",
+          metadata: { scheduledTaskID: "stk_http_test", scheduledTaskRunID: "str_http_test" },
+        })
+        expect(aggregate.pausedAt).toBeUndefined()
+
+        const removeSession = yield* request(pathFor(SessionPaths.remove, { sessionID: session.id }), {
+          method: "DELETE",
+          headers,
+        })
+        expect(removeSession.status).toBe(400)
+        expect((yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })).id).toBe(
+          session.id,
+        )
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )
@@ -1371,7 +1925,35 @@ describe("session HttpApi", () => {
         "10 seconds",
       )
       expect(titled).toBe("Generated Title")
+
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: session.id,
+        agent: "session_title",
+      })
+      const { readDb } = yield* Database.Service
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const prompts = history.filter(
+        (item) =>
+          item.type === "synthetic" &&
+          item.provenance?.owner === "host" &&
+          item.provenance.source === CurrentSessionTurnProvenance.Source.SessionTitle,
+      )
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0] && CurrentSessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+      const assistants = history.filter((item) => item.type === "assistant")
+      expect(assistants).toHaveLength(1)
+      expect(
+        assistants.flatMap((assistant) =>
+          assistant.type === "assistant"
+            ? assistant.content
+                .filter((part) => part.type === "tool")
+                .map((part) => ({ name: part.name, status: part.state.status }))
+            : [],
+        ),
+      ).toContainEqual({ name: SessionTitle.GENERATED_TITLE_TOOL, status: "completed" })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    20_000,
   )
 
   it.live("regenerateTitle repairs prose in the same title-agent conversation", () =>

@@ -28,7 +28,7 @@ import { InvalidRequestError } from "../errors"
  */
 
 /** Broker wire version. The host's hello is rejected when it mismatches. */
-export const BROWSER_PROTOCOL_VERSION = 2
+export const BROWSER_PROTOCOL_VERSION = 3
 
 export const BROKER_REQUEST_PATH = "/v1/browser/request"
 export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
@@ -97,14 +97,23 @@ export const HostGuestState = Schema.Struct({
 })
 export type HostGuestState = Schema.Schema.Type<typeof HostGuestState>
 
+/** Browser control identity. Native chat Sessions retain their branded Session
+ * id; external controllers use an opaque host-issued principal id. */
+export const BrowserPrincipal = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("session"), sessionId: Session.ID }),
+  Schema.Struct({ kind: Schema.Literal("external"), principalId: Schema.String }),
+])
+export type BrowserPrincipal = Schema.Schema.Type<typeof BrowserPrincipal>
+
 /**
- * A tab's owner — exactly one of `user` (human-opened / orphaned / unassigned)
- * or `agent(<sessionId>)` (a chat session owns the tab). A tab is never owned by
- * two owners; two agents never share a tab (single-agent exclusivity).
+ * A tab has exactly one owner. `agent(<sessionId>)` is retained as the native
+ * Session wire shape; `external(<principalId>)` is for sessionless controllers
+ * such as OXP. The opaque external id is never an upstream/raw conversation id.
  */
 export const HostOwner = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("user") }),
   Schema.Struct({ kind: Schema.Literal("agent"), sessionId: Session.ID }),
+  Schema.Struct({ kind: Schema.Literal("external"), principalId: Schema.String }),
 ])
 export type HostOwner = Schema.Schema.Type<typeof HostOwner>
 
@@ -1249,11 +1258,13 @@ export type BrowserOperationName = BrowserOperation["name"]
 
 export const BrokerRequest = Schema.Struct({
   requestId: Schema.String,
-  sessionId: Session.ID,
+  /** Native-v2 compatibility projection. New non-Session callers use principal. */
+  sessionId: Schema.optional(Session.ID),
+  principal: Schema.optional(BrowserPrincipal),
   windowId: Schema.String,
   workspaceId: Schema.optional(Workspace.ID),
   directory: Schema.optional(AbsolutePath),
-  messageId: SessionMessage.ID,
+  messageId: Schema.optional(SessionMessage.ID),
   toolCallId: Schema.optional(Schema.String),
   tabId: Schema.optional(Schema.String),
   operation: BrowserOperation,

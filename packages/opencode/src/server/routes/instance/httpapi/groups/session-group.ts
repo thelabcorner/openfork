@@ -26,7 +26,7 @@ export const SessionGroupPaths = {
 
 export const CreatePayload = Schema.Struct({
   name: Schema.String,
-  kind: Schema.optionalKey(SessionGroup.Kind),
+  kind: Schema.optionalKey(SessionGroup.MutableKind),
   anchorSessionID: Schema.optionalKey(Schema.String),
   ownerPlugin: Schema.optionalKey(Schema.String),
   ownerRef: Schema.optionalKey(Schema.String),
@@ -35,7 +35,7 @@ export const CreatePayload = Schema.Struct({
 
 export const ResolvePayload = Schema.Struct({
   name: Schema.String,
-  kind: SessionGroup.Kind,
+  kind: SessionGroup.MutableKind,
   anchorSessionID: Schema.optionalKey(Schema.String),
   ownerPlugin: Schema.optionalKey(Schema.String),
   ownerRef: Schema.optionalKey(Schema.String),
@@ -53,7 +53,7 @@ export const ReorderPayload = Schema.Struct({
 export const AddSessionPayload = Schema.Struct({
   sessionId: Schema.String,
   locked: Schema.optionalKey(Schema.Boolean),
-  origin: Schema.optionalKey(SessionGroup.MemberOrigin),
+  origin: Schema.optionalKey(SessionGroup.MutableMemberOrigin),
   originPlugin: Schema.optionalKey(Schema.String),
   originRef: Schema.optionalKey(Schema.String),
 })
@@ -96,7 +96,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
         HttpApiEndpoint.get("get", SessionGroupPaths.get, {
           params: { groupID: SessionGroup.ID },
           success: described(SessionGroup.Detail, "Session group with sessions"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.get",
@@ -117,7 +117,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           params: { groupID: SessionGroup.ID },
           payload: RenamePayload,
           success: described(HttpApiSchema.NoContent, "Successfully renamed session group"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.rename",
@@ -141,7 +141,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           params: { groupID: SessionGroup.ID },
           payload: ReorderPayload,
           success: described(HttpApiSchema.NoContent, "Successfully reordered session group"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.reorder",
@@ -153,7 +153,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           params: { groupID: SessionGroup.ID },
           payload: AddSessionPayload,
           success: described(HttpApiSchema.NoContent, "Successfully added session to group"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.addSession",
@@ -207,7 +207,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           params: { groupID: SessionGroup.ID },
           payload: ReorderMembersPayload,
           success: described(HttpApiSchema.NoContent, "Successfully reordered group members"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.reorderMembers",
@@ -219,7 +219,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           params: { groupID: SessionGroup.ID },
           payload: PolicyPayload,
           success: described(HttpApiSchema.NoContent, "Successfully updated group policy"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.setPolicy",
@@ -238,7 +238,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
   )
   .annotateMerge(
     OpenApi.annotations({
-      title: "opencode experimental HttpApi",
+      title: "OpenFork experimental HttpApi",
       version: "0.0.1",
       description: "Experimental HttpApi surface for selected instance routes.",
     }),

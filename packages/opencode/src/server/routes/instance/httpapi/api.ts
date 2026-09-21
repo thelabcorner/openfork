@@ -17,6 +17,7 @@ import { ExperimentalApi } from "./groups/experimental"
 import { FileApi } from "./groups/file"
 import { InstanceApi } from "./groups/instance"
 import { McpApi } from "./groups/mcp"
+import { OfxpApi } from "./groups/ofxp"
 import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { PermissionApi } from "./groups/permission"
 import { ProjectApi } from "./groups/project"
@@ -30,12 +31,16 @@ import { SessionApi } from "./groups/session"
 import { SessionContextApi } from "./groups/session-context"
 import { SessionGroupApi } from "./groups/session-group"
 import { GoalApi } from "./groups/goal"
+import { ScheduledTaskApi } from "./groups/scheduled-task"
+import { SwarmApi } from "./groups/swarm"
+import { SystemOneApi } from "./groups/system-one"
 import { SyncApi } from "./groups/sync"
 import { ToolApi } from "./groups/tool"
 import { TuiApi } from "./groups/tui"
 import { UsageApi } from "./groups/usage"
 import { WorkspaceApi } from "./groups/workspace"
 import { PromptRevisorApi } from "./groups/prompt-revisor"
+import { RevisionDraftApi } from "./groups/revision-draft"
 import { makeApi } from "@opencode-ai/protocol/api"
 import { LocationMiddleware } from "@opencode-ai/server/location"
 import { SessionLocationMiddleware } from "@opencode-ai/server/middleware/session-location"
@@ -69,6 +74,14 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(GlobalApi)
   .addHttpApi(ProviderSettingsApi)
   .addHttpApi(UsageApi)
+  // Tier 0/1 OFXP operator control plane. Never route peer settings through a workspace Instance.
+  .addHttpApi(OfxpApi)
+  // Bootstrap-free revision mailbox: stable target identity + durable SQLite only.
+  .addHttpApi(RevisionDraftApi)
+  // Tier 0 scheduling: durable global catalog state, never behind instance middleware.
+  .addHttpApi(ScheduledTaskApi)
+  // Tier 0 Swarm projection: durable orchestration state only; live Session truth stays elsewhere.
+  .addHttpApi(SwarmApi)
   .middleware(SchemaErrorMiddleware)
   .middleware(Authorization)
 
@@ -89,6 +102,8 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(SessionContextApi)
   .addHttpApi(SessionGroupApi)
   .addHttpApi(GoalApi)
+  // Tier 2 provider/catalog semantic inference; independent of Session/chat execution.
+  .addHttpApi(SystemOneApi)
   .addHttpApi(SyncApi)
   .addHttpApi(ToolApi)
   .addHttpApi(TuiApi)

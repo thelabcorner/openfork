@@ -49,6 +49,10 @@ type TriggerName = {
   [K in keyof Hooks]-?: NonNullable<Hooks[K]> extends (input: any, output: any) => Promise<void> ? K : never
 }[keyof Hooks]
 
+type ChatMessageTransformOutput = Parameters<
+  NonNullable<Hooks["experimental.chat.messages.transform"]>
+>[1]
+
 export interface Interface {
   readonly trigger: <
     Name extends TriggerName,
@@ -60,6 +64,22 @@ export interface Interface {
     output: Output,
   ) => Effect.Effect<Output>
   readonly list: () => Effect.Effect<Hooks[]>
+  /**
+   * Apply the provider-context message transform on an isolated copy.
+   *
+   * The hook is intentionally mutable for plugin ergonomics, but Session
+   * history also carries provenance/authority fields. Never hand plugins the
+   * authoritative in-memory history objects: a provider-context customization
+   * must not mutate later rollback, Goal, checkpoint, or worker-root decisions.
+   * No copy is paid when no transform hook is installed.
+   */
+  /**
+   * The public plugin hook owns its SDK wire shape, while the V1 runtime owns
+   * its richer persisted message schema. The transform is shape-preserving, so
+   * keep the nominal bridge here at the plugin boundary instead of spreading
+   * SDK/Core casts through Session callers.
+   */
+  readonly transformChatMessages: <M>(messages: M[]) => Effect.Effect<M[]>
   readonly init: () => Effect.Effect<void>
 }
 
@@ -344,11 +364,28 @@ const layer = Layer.effect(
       return s.hooks
     })
 
+    const transformChatMessages = Effect.fn("Plugin.transformChatMessages")(function* <M>(messages: M[]) {
+      const s = yield* InstanceState.get(state)
+      const transforms = s.hooks.flatMap((hook) => {
+        const fn = hook["experimental.chat.messages.transform"]
+        return fn ? [fn] : []
+      })
+      if (transforms.length === 0) return messages
+
+      const output = {
+        messages: structuredClone(messages),
+      } as unknown as ChatMessageTransformOutput
+      for (const transform of transforms) {
+        yield* Effect.promise(async () => transform({}, output))
+      }
+      return output.messages as unknown as M[]
+    })
+
     const init = Effect.fn("Plugin.init")(function* () {
       yield* InstanceState.get(state)
     })
 
-    return Service.of({ trigger, list, init })
+    return Service.of({ trigger, list, transformChatMessages, init })
   }),
 )
 

@@ -4,6 +4,12 @@ import { Context, Deferred, Effect, Layer, Option, Schema, Stream } from "effect
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
+import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
+import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { ForkCredentials } from "../../src/fork/credentials"
@@ -19,6 +25,10 @@ import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi
 import { globalHandlers, MAX_REPLAY_FRAMES, SUBSCRIBER_HEADROOM } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
+import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
+import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
+import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { Usage } from "../../src/usage/usage"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
@@ -60,6 +70,9 @@ const apiLayer = HttpRouter.serve(
       globalHandlers,
       providerSettingsHandlers,
       usageHandlers,
+      revisionDraftHandlers,
+      scheduledTaskHandlers,
+      swarmHandlers,
     ]),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
@@ -72,6 +85,13 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(ForkCredentials.Service)({})),
   Layer.provide(Layer.mock(SessionUsage.Service)({})),
+  Layer.provide(Layer.mock(OxpActivity.Service)({})),
+  Layer.provide(Layer.mock(OxpActivityInspection.Service)({})),
+  Layer.provide(Layer.mock(RevisionDraft.Service)({})),
+  Layer.provide(Layer.mock(ScheduledTask.Service)({})),
+  Layer.provide(Layer.mock(ScheduledTaskSessionBinding.Service)({})),
+  Layer.provide(Layer.mock(SwarmV2.Service)({})),
+  Layer.provide(Layer.mock(SwarmMemberSessionWake.Service)({})),
   Layer.provide(
     Layer.mock(Usage.Service)({
       summary: () => Effect.die("unused usage summary"),
@@ -82,7 +102,7 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(MoveSession.Service)({})),
   Layer.provide(
     Layer.mock(Installation.Service)({
-      method: () => Effect.succeed("npm"),
+      method: () => Effect.succeed("curl"),
       latest: () => Effect.succeed("9.9.9"),
       upgrade: () => Effect.void,
     }),

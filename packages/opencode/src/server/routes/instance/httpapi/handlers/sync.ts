@@ -87,13 +87,14 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
         .orderBy(asc(EventTable.seq))
         .all()
         .pipe(Effect.orDie)
-      const byAggregate = new Map<string, typeof rows>()
+      type EventRow = (typeof rows)[number]
+      const byAggregate = new Map<string, EventRow[]>()
       for (const row of rows) {
         const group = byAggregate.get(row.aggregate_id)
         if (group) group.push(row)
         else byAggregate.set(row.aggregate_id, [row])
       }
-      const hydratedByAggregate = new Map<string, typeof rows>()
+      const hydratedByAggregate = new Map<string, ReadonlyArray<EventRow>>()
       for (const [aggregateID, group] of byAggregate) {
         const hydrated = yield* EventV2.rehydrateEvents(db, aggregateID, group)
         hydratedByAggregate.set(aggregateID, hydrated)
@@ -103,7 +104,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
       for (const frontier of frontiers) {
         const after = ctx.payload[frontier.aggregate_id] ?? -1
         if (frontier.seq <= after) continue
-        const compaction = yield* loadCompaction(db, frontier.aggregate_id)
+        const compaction = yield* loadCompaction(db, frontier.aggregate_id).pipe(Effect.orDie)
         const contiguous = inflateCompactedHistory({
           aggregateID: frontier.aggregate_id,
           rows: hydratedByAggregate.get(frontier.aggregate_id) ?? [],
@@ -111,7 +112,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
           after,
           through: frontier.seq,
         })
-        output.push(...(contiguous as Array<(typeof rows)[number]>))
+        output.push(...contiguous)
       }
       return output
     })

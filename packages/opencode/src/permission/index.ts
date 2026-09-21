@@ -7,12 +7,15 @@ import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Plugin } from "@/plugin"
+import type { ExternalActor } from "@/session/external-actor"
 
 export const Event = PermissionV1.Event
 
 export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
-  readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
+  readonly reply: (
+    input: PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref },
+  ) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
 }
 
@@ -112,7 +115,9 @@ const layer = Layer.effect(
       )
     })
 
-    const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
+    const reply = Effect.fn("Permission.reply")(function* (
+      input: PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref },
+    ) {
       const { approved, pending } = yield* InstanceState.get(state)
       const existing = pending.get(input.requestID)
       if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
@@ -122,7 +127,7 @@ const layer = Layer.effect(
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
         reply: input.reply,
-      })
+      }, input.actor ? { metadata: { actor: input.actor } } : undefined)
 
       if (input.reply === "reject") {
         yield* Deferred.fail(
@@ -139,7 +144,7 @@ const layer = Layer.effect(
             sessionID: item.info.sessionID,
             requestID: item.info.id,
             reply: "reject",
-          })
+          }, input.actor ? { metadata: { actor: input.actor } } : undefined)
           yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
         }
         return
@@ -167,7 +172,7 @@ const layer = Layer.effect(
           sessionID: item.info.sessionID,
           requestID: item.info.id,
           reply: "always",
-        })
+        }, input.actor ? { metadata: { actor: input.actor } } : undefined)
         yield* Deferred.succeed(item.deferred, undefined)
       }
     })
