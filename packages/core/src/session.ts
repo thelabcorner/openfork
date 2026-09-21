@@ -34,6 +34,10 @@ import { LocationServiceMap } from "./location-service-map"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
+import { SessionTurnProvenance } from "./session/turn-provenance"
+import { SessionMetadataOwnership } from "./session/metadata-ownership"
+import { Goal } from "./goal"
+import { GoalAutomation } from "./goal/automation"
 import { SessionTitle } from "./session/title"
 import { Snapshot } from "./snapshot"
 import { SessionRevert } from "./session/revert"
@@ -92,6 +96,14 @@ type CompactInput = {
   prompt?: Prompt
 }
 
+type PromptRequest = {
+  id?: SessionMessage.ID
+  sessionID: SessionSchema.ID
+  prompt: PromptInput.Prompt
+  delivery?: SessionInput.Delivery
+  resume?: boolean
+}
+
 export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Session.NotFoundError", {
   sessionID: SessionSchema.ID,
 }) {}
@@ -121,6 +133,8 @@ export interface Interface {
   ) => Effect.Effect<SessionSearch.SearchResult, SessionSearch.SearchError>
   readonly create: (input: CreateInput) => Effect.Effect<SessionSchema.Info>
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info, NotFoundError>
+  /** O(1) durable aggregate-ownership projection; does not expose the V1 metadata compatibility bag. */
+  readonly producerOwned: (sessionID: SessionSchema.ID) => Effect.Effect<boolean, NotFoundError>
   readonly messages: (input: {
     sessionID: SessionSchema.ID
     limit?: number
@@ -146,18 +160,31 @@ export interface Interface {
     after?: number
     limit: number
   }) => Effect.Effect<{ events: ReadonlyArray<SessionEvent.DurableEvent>; hasMore: boolean }, NotFoundError>
-  readonly switchAgent: (input: { sessionID: SessionSchema.ID; agent: string }) => Effect.Effect<void, NotFoundError>
+  readonly switchAgent: (input: {
+    sessionID: SessionSchema.ID
+    agent: string
+    provenance?: SessionMessage.Provenance
+  }) => Effect.Effect<void, NotFoundError>
   readonly switchModel: (input: {
     sessionID: SessionSchema.ID
     model: ModelV2.Ref
+    provenance?: SessionMessage.Provenance
   }) => Effect.Effect<void, NotFoundError>
-  readonly prompt: (input: {
-    id?: SessionMessage.ID
-    sessionID: SessionSchema.ID
-    prompt: PromptInput.Prompt
-    delivery?: SessionInput.Delivery
-    resume?: boolean
-  }) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | OperationUnavailableError>
+  readonly prompt: (
+    input: PromptRequest,
+  ) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | OperationUnavailableError>
+  /** Trusted host admission. Never expose caller-controlled provenance through the public HTTP prompt contract. */
+  readonly hostPrompt: (
+    input: PromptRequest,
+  ) => Effect.Effect<SessionInput.Admitted, NotFoundError | PromptConflictError | OperationUnavailableError>
+  /**
+   * Trusted typed host/automatic admission. This is an internal domain seam,
+   * not a public caller-controlled provenance surface. `commit` participates in
+   * the same durable Session EventV2 transaction as the input projector.
+   */
+  readonly admitSynthetic: (
+    input: SessionInput.SyntheticAdmission & { readonly resume?: boolean },
+  ) => Effect.Effect<SessionInput.Entry, NotFoundError | PromptConflictError>
   readonly shell: (input: {
     id?: EventV2.ID
     sessionID: SessionSchema.ID
@@ -212,6 +239,8 @@ const layer = Layer.effect(
     const projects = yield* ProjectV2.Service
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
+    const goals = yield* Goal.Service
+    const goalAutomation = yield* GoalAutomation.Service
     const locations = yield* LocationServiceMap.Service
     const scope = yield* Scope.Scope
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
@@ -226,6 +255,59 @@ const layer = Layer.effect(
         Effect.andThen(Effect.void),
       )
     }
+
+    const requireSession = Effect.fn("V2Session.requireSession")(function* (sessionID: SessionSchema.ID) {
+      const session = yield* store.get(sessionID)
+      if (!session) return yield* new NotFoundError({ sessionID })
+      return session
+    })
+
+    const promptInternal = Effect.fn("V2Session.promptInternal")(function* (
+      input: PromptRequest,
+      provenance: SessionMessage.Provenance,
+    ) {
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const session = yield* requireSession(input.sessionID)
+          if (session.parentID !== undefined) return yield* new OperationUnavailableError({ operation: "prompt" })
+          const prompt = resolvePrompt(input.prompt)
+          const messageID = input.id ?? SessionMessage.ID.create()
+          const delivery = input.delivery ?? "steer"
+          const expected = { sessionID: input.sessionID, prompt, delivery, provenance }
+          const admission = yield* SessionInput.admitWithState(db, events, {
+            id: messageID,
+            sessionID: input.sessionID,
+            prompt,
+            delivery,
+            provenance,
+          }).pipe(
+            Effect.catchDefect((defect) =>
+              defect instanceof SessionInput.LifecycleConflict
+                ? new PromptConflictError({ sessionID: input.sessionID, messageID })
+                : Effect.die(defect),
+            ),
+          )
+          const admitted = admission.admitted
+          if (!SessionInput.equivalent(admitted, expected))
+            return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+          // A real user turn is new information by definition. If the focused
+          // Goal was blocked, reopen it at durable admission time so paused or
+          // admit-only Sessions get the same semantics as actively running ones.
+          if (provenance.owner === "user" && admission.created) {
+            // User admission supersedes Goal orchestration immediately, not only
+            // when a runner later promotes this input. This matters for paused
+            // and resume:false admissions: they must not leave a stale
+            // continuation/audit cursor visible or recoverable in the meantime.
+            yield* goalAutomation.cancel(input.sessionID)
+            yield* goals.reactivateBlockedForSession(input.sessionID)
+          }
+          // Pause gate: admit-only while paused. Delivery is preserved (S3) —
+          // a steer typed while paused promotes ahead of held queues on resume.
+          if (input.resume !== false && session.pausedAt === undefined) yield* execution.wake(admitted.sessionID)
+          return admitted
+        }),
+      )
+    })
 
     const result = Service.of({
       create: Effect.fn("V2Session.create")(function* (input) {
@@ -254,6 +336,7 @@ const layer = Layer.effect(
             ? {
                 id: ModelV2.ID.make(input.model.id),
                 providerID: input.model.providerID,
+                accountID: input.model.accountID,
                 variant: input.model.variant,
               }
             : undefined,
@@ -283,10 +366,28 @@ const layer = Layer.effect(
         // TODO: Restore recorded sessions onto replacement synchronized workspaces in a future API slice.
         return yield* result.get(sessionID).pipe(Effect.orDie)
       }),
-      get: Effect.fn("V2Session.get")(function* (sessionID) {
-        const session = yield* store.get(sessionID)
-        if (!session) return yield* new NotFoundError({ sessionID })
-        return session
+      admitSynthetic: Effect.fn("V2Session.admitSynthetic")(function* (input) {
+        const session = yield* requireSession(input.sessionID)
+        const admitted = yield* SessionInput.admitSynthetic(db, events, input).pipe(
+          Effect.catchDefect((defect) =>
+            defect instanceof SessionInput.LifecycleConflict
+              ? new PromptConflictError({ sessionID: input.sessionID, messageID: input.id })
+              : Effect.die(defect),
+          ),
+        )
+        if (input.resume !== false && session.pausedAt === undefined) yield* execution.wake(input.sessionID)
+        return admitted
+      }),
+      get: requireSession,
+      producerOwned: Effect.fn("V2Session.producerOwned")(function* (sessionID) {
+        const row = yield* readDb
+          .select({ metadata: SessionTable.metadata })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) return yield* new NotFoundError({ sessionID })
+        return SessionMetadataOwnership.isProducerOwned(row.metadata ?? undefined)
       }),
       list: Effect.fn("V2Session.list")(function* (input = {}) {
         const direction = input.anchor?.direction ?? "next"
@@ -383,34 +484,10 @@ const layer = Layer.effect(
         })
       }),
       prompt: Effect.fn("V2Session.prompt")((input) =>
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            const session = yield* result.get(input.sessionID)
-            if (session.parentID !== undefined) return yield* new OperationUnavailableError({ operation: "prompt" })
-            const prompt = resolvePrompt(input.prompt)
-            const messageID = input.id ?? SessionMessage.ID.create()
-            const delivery = input.delivery ?? "steer"
-            const expected = { sessionID: input.sessionID, messageID, prompt, delivery }
-            const admitted = yield* SessionInput.admit(db, events, {
-              id: messageID,
-              sessionID: input.sessionID,
-              prompt,
-              delivery,
-            }).pipe(
-              Effect.catchDefect((defect) =>
-                defect instanceof SessionInput.LifecycleConflict
-                  ? new PromptConflictError({ sessionID: input.sessionID, messageID })
-                  : Effect.die(defect),
-              ),
-            )
-            if (!SessionInput.equivalent(admitted, expected))
-              return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
-            // Pause gate: admit-only while paused. Delivery is preserved (S3) —
-            // a steer typed while paused promotes ahead of held queues on resume.
-            if (input.resume !== false && session.pausedAt === undefined) yield* execution.wake(admitted.sessionID)
-            return admitted
-          }),
-        ),
+        promptInternal(input, SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)),
+      ),
+      hostPrompt: Effect.fn("V2Session.hostPrompt")((input) =>
+        promptInternal(input, SessionTurnProvenance.host(SessionTurnProvenance.Source.HostPrompt)),
       ),
       shell: Effect.fn("V2Session.shell")(function* () {
         return yield* new OperationUnavailableError({ operation: "shell" })
@@ -424,6 +501,7 @@ const layer = Layer.effect(
           sessionID: input.sessionID,
           messageID: SessionMessage.ID.create(),
           timestamp: yield* DateTime.now,
+          provenance: input.provenance,
           agent: input.agent,
         })
       }),
@@ -432,6 +510,7 @@ const layer = Layer.effect(
         if (
           session.model?.providerID === input.model.providerID &&
           session.model.id === input.model.id &&
+          session.model.accountID === input.model.accountID &&
           (session.model.variant ?? "default") === (input.model.variant ?? "default")
         )
           return
@@ -439,6 +518,7 @@ const layer = Layer.effect(
           sessionID: input.sessionID,
           messageID: SessionMessage.ID.create(),
           timestamp: yield* DateTime.now,
+          provenance: input.provenance,
           model: input.model,
         })
       }),
@@ -588,6 +668,8 @@ export const node = makeGlobalNode({
     ProjectV2.node,
     SessionExecution.node,
     SessionStore.node,
+    Goal.node,
+    GoalAutomation.node,
     LocationServiceMap.node,
     SessionProjector.node,
   ],

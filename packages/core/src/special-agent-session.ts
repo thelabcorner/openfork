@@ -1,6 +1,6 @@
 export * as SpecialAgentSession from "./special-agent-session"
 
-import { Context, DateTime, Effect, Layer, Schema } from "effect"
+import { Cause, Context, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { sql } from "drizzle-orm"
 import { LLMEvent, LLMResponse, type ToolResultValue } from "@opencode-ai/llm"
 import { makeGlobalNode } from "./effect/app-node"
@@ -11,6 +11,8 @@ import { SessionEvent } from "./session/event"
 import { SessionHostChild } from "./session/host-child"
 import { SessionMessage } from "./session/message"
 import { SessionSchema } from "./session/schema"
+import { SessionMetadataOwnership } from "./session/metadata-ownership"
+import { SessionTurnProvenance } from "./session/turn-provenance"
 import { SessionTable } from "./session/sql"
 import { UsageRecord } from "./usage/record"
 import { createLLMEventPublisher } from "./session/runner/publish-llm-event"
@@ -32,14 +34,26 @@ import { Hash } from "./util/hash"
  * union and the session-group/V1 guards that key off it, not inventing a second
  * execution contract.
  */
-export const Kind = Schema.Literals(["goal_auditor", "prompt_revisor", "session_title", "spad_auditor"]).annotate({
-  identifier: "SpecialAgentSession.Kind",
-})
+export const Kind = Schema.Literals([
+  "goal_auditor",
+  "goal_revisor",
+  "prompt_revisor",
+  "session_title",
+  "spad_auditor",
+]).annotate({ identifier: "SpecialAgentSession.Kind" })
 export type Kind = typeof Kind.Type
 
-export const METADATA_KEY = "specialAgent"
-export const OWNER_KIND_KEY = "specialAgentOwnerKind"
-export const OWNER_ID_KEY = "specialAgentOwnerID"
+export const SourceByKind = {
+  goal_auditor: SessionTurnProvenance.Source.GoalAuditor,
+  goal_revisor: SessionTurnProvenance.Source.GoalRevisor,
+  prompt_revisor: SessionTurnProvenance.Source.PromptRevisor,
+  session_title: SessionTurnProvenance.Source.SessionTitle,
+  spad_auditor: SessionTurnProvenance.Source.SpadAuditor,
+} as const satisfies Record<Kind, SessionTurnProvenance.Source>
+
+export const METADATA_KEY = SessionMetadataOwnership.Keys.specialAgent
+export const OWNER_KIND_KEY = SessionMetadataOwnership.Keys.specialAgentOwnerKind
+export const OWNER_ID_KEY = SessionMetadataOwnership.Keys.specialAgentOwnerID
 
 export const OWNER_GOAL = "goal"
 export const OWNER_SESSION = "session"
@@ -65,6 +79,13 @@ export interface Interface {
   readonly is: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** Publish one durable mid-conversation system instruction into the transcript. */
   readonly publishSystem: (input: { readonly sessionID: SessionSchema.ID; readonly text: string }) => Effect.Effect<void>
+  /** Publish the host-owned logical request that caused a special-agent operation. */
+  readonly publishPrompt: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly agent: Kind
+    readonly text: string
+    readonly ref?: string
+  }) => Effect.Effect<SessionMessage.ID>
   /** Shared provider-turn publisher for this transcript. */
   readonly publisher: (input: {
     readonly sessionID: SessionSchema.ID
@@ -92,6 +113,41 @@ export interface Interface {
       readonly reasoning: number
       readonly cache: { readonly read: number; readonly write: number }
     }
+    readonly finish?: string
+    readonly cost?: number
+  }) => Effect.Effect<SessionMessage.ID>
+  /** Close an interrupted/failed physical provider request and all tool state. */
+  readonly failTurn: (input: {
+    readonly publisher: ReturnType<typeof createLLMEventPublisher>
+    readonly message: string
+  }) => Effect.Effect<void>
+  /**
+   * Own the failure boundary for one physical provider request. Any non-success
+   * Cause — typed failure, defect, or interruption — closes the durable
+   * assistant step exactly once before propagating the original Cause.
+   */
+  readonly guardProviderTurn: <A, E, R>(input: {
+    readonly publisher: ReturnType<typeof createLLMEventPublisher>
+    readonly label: string
+    readonly effect: Effect.Effect<A, E, R>
+  }) => Effect.Effect<A, E, R>
+  /**
+   * Close a provider response that completed successfully but was rejected or
+   * abandoned before the host could interpret its tool calls. Provider-executed
+   * tools keep their authoritative provider results; only host-owned calls are
+   * converted into explicit error settlements.
+   */
+  readonly rejectTurn: (input: {
+    readonly sessionID: SessionSchema.ID
+    readonly publisher: ReturnType<typeof createLLMEventPublisher>
+    readonly response: LLMResponse
+    readonly tokens: {
+      readonly input: number
+      readonly output: number
+      readonly reasoning: number
+      readonly cache: { readonly read: number; readonly write: number }
+    }
+    readonly reason: string
     readonly finish?: string
     readonly cost?: number
   }) => Effect.Effect<SessionMessage.ID>
@@ -130,12 +186,12 @@ const layer = Layer.effect(
         parentSessionID: input.parentSessionID,
         title: input.title,
         ...(input.model ? { model: input.model } : {}),
-        metadata: {
-          [METADATA_KEY]: input.agent,
-          [OWNER_KIND_KEY]: input.ownerKind,
-          [OWNER_ID_KEY]: input.ownerID,
-          ...input.metadata,
-        },
+        metadata: SessionMetadataOwnership.specialAgent({
+          agent: input.agent,
+          ownerKind: input.ownerKind,
+          ownerID: input.ownerID,
+          metadata: input.metadata,
+        }),
       })
       return sessionID
     })
@@ -144,7 +200,7 @@ const layer = Layer.effect(
       const row = yield* database.readDb
         .select({ sessionID: SessionTable.id })
         .from(SessionTable)
-        .where(sql`${SessionTable.id} = ${sessionID} AND json_extract(${SessionTable.metadata}, '$.specialAgent') IS NOT NULL`)
+        .where(sql`${SessionTable.id} = ${sessionID} AND json_type(${SessionTable.metadata}, '$.specialAgent') = 'text'`)
         .get()
         .pipe(Effect.orDie)
       return row !== undefined
@@ -162,8 +218,54 @@ const layer = Layer.effect(
       })
     })
 
+    const publishPrompt = Effect.fn("SpecialAgentSession.publishPrompt")(function* (input: {
+      readonly sessionID: SessionSchema.ID
+      readonly agent: Kind
+      readonly text: string
+      readonly ref?: string
+    }) {
+      const messageID = SessionMessage.ID.create()
+      yield* events.publish(SessionEvent.Synthetic, {
+        sessionID: input.sessionID,
+        messageID,
+        timestamp: yield* DateTime.now,
+        text: input.text,
+        provenance: SessionTurnProvenance.host(SourceByKind[input.agent], input.ref ? { ref: input.ref } : undefined),
+      })
+      return messageID
+    })
+
     const publisher: Interface["publisher"] = (input) =>
       createLLMEventPublisher(events, { sessionID: input.sessionID, agent: input.agent, model: input.model })
+
+    type Publisher = ReturnType<typeof createLLMEventPublisher>
+    const closedTurns = new WeakMap<Publisher, { readonly type: "ended"; readonly id: SessionMessage.ID } | { readonly type: "failed" }>()
+
+    const failTurn = Effect.fn("SpecialAgentSession.failTurn")(function* (input: {
+      readonly publisher: Publisher
+      readonly message: string
+    }) {
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (closedTurns.has(input.publisher)) return
+          yield* input.publisher.failUnsettledTools(input.message)
+          yield* input.publisher.failAssistant(input.message)
+          closedTurns.set(input.publisher, { type: "failed" })
+        }),
+      )
+    })
+
+    const guardProviderTurn: Interface["guardProviderTurn"] = (input) =>
+      input.effect.pipe(
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit)
+            ? failTurn({
+                publisher: input.publisher,
+                message: `${input.label} provider turn ${Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failed"}`,
+              })
+            : Effect.void,
+        ),
+      )
 
     const settleTurn = Effect.fn("SpecialAgentSession.settleTurn")(function* (input: {
       readonly sessionID: SessionSchema.ID
@@ -183,30 +285,67 @@ const layer = Layer.effect(
       readonly finish?: string
       readonly cost?: number
     }) {
-      for (const result of input.toolResults ?? []) {
-        yield* input.publisher.publish(LLMEvent.toolResult({ id: result.id, name: result.name, result: result.result }))
-      }
-      yield* input.publisher.flush()
-      const assistantMessageID = yield* input.publisher.startAssistant()
-      const settlement = input.publisher.stepSettlement()
-      yield* events.publish(SessionEvent.Step.Ended, {
-        sessionID: input.sessionID,
-        timestamp: yield* DateTime.now,
-        assistantMessageID,
-        finish: settlement?.finish ?? input.finish ?? input.response.finishReason,
-        cost: input.cost ?? 0,
-        tokens: settlement?.tokens ?? input.tokens,
-      })
-      return assistantMessageID
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const closed = closedTurns.get(input.publisher)
+          if (closed?.type === "ended") return closed.id
+          if (closed?.type === "failed") return yield* Effect.die("Cannot settle a failed special-agent provider turn")
+          for (const result of input.toolResults ?? []) {
+            yield* input.publisher.publish(LLMEvent.toolResult({ id: result.id, name: result.name, result: result.result }))
+          }
+          // A special-agent turn is not durably complete while any provider tool
+          // call remains unresolved. Producers should settle accepted/rejected tools
+          // explicitly so replay reflects the real host decision; this shared
+          // fail-safe catches omissions and future agents without scanning history
+          // or duplicating tool state outside the publisher that already owns it.
+          yield* input.publisher.failUnsettledTools(
+            "Special-agent provider turn ended without a host tool settlement.",
+          )
+          yield* input.publisher.flush()
+          const assistantMessageID = yield* input.publisher.startAssistant()
+          const settlement = input.publisher.stepSettlement()
+          yield* events.publish(SessionEvent.Step.Ended, {
+            sessionID: input.sessionID,
+            timestamp: yield* DateTime.now,
+            assistantMessageID,
+            finish: settlement?.finish ?? input.finish ?? input.response.finishReason,
+            cost: input.cost ?? 0,
+            tokens: settlement?.tokens ?? input.tokens,
+          })
+          closedTurns.set(input.publisher, { type: "ended", id: assistantMessageID })
+          return assistantMessageID
+        }),
+      )
     })
+
+    const rejectTurn: Interface["rejectTurn"] = (input) =>
+      settleTurn({
+        sessionID: input.sessionID,
+        publisher: input.publisher,
+        response: input.response,
+        tokens: input.tokens,
+        ...(input.finish === undefined ? {} : { finish: input.finish }),
+        ...(input.cost === undefined ? {} : { cost: input.cost }),
+        toolResults: input.response.toolCalls
+          .filter((call) => call.providerExecuted !== true)
+          .map((call) => ({
+            id: call.id,
+            name: call.name,
+            result: { type: "error" as const, value: input.reason } satisfies ToolResultValue,
+          })),
+      })
 
     return Service.of({
       provision,
       sessionFor,
       is,
       publishSystem,
+      publishPrompt,
       publisher,
       settleTurn,
+      failTurn,
+      guardProviderTurn,
+      rejectTurn,
       recordMaintenance: usage.recordMaintenance,
     })
   }),

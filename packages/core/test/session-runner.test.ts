@@ -23,6 +23,7 @@ import { EventTable } from "@opencode-ai/core/event/sql"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { GoalV2 } from "@opencode-ai/core/goal"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { Goal } from "@opencode-ai/schema/goal"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -270,6 +271,7 @@ const it = testEffect(
       SessionProjector.node,
       SessionStore.node,
       GoalV2.node,
+      GoalAutomation.node,
       ApplicationTools.node,
       AgentV2.node,
       ToolRegistry.node,
@@ -584,7 +586,7 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
-  it.effect("runs multiple provider-backed autonomous Goal cycles before the no-progress guardrail stops the chain", () =>
+  it.effect("runs multiple provider-backed autonomous Goal cycles until an explicit no-progress policy limit stops re-entry", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
@@ -689,8 +691,8 @@ describe("SessionRunnerLLM", () => {
 
       const stopped = yield* goals.get(created.goal.id).pipe(Effect.orDie)
       expect(stopped.goal).toMatchObject({
-        status: "blocked",
-        blocker: "Automation guardrail: no Goal-state progress for 2 automatic turns",
+        status: "active",
+        blocker: undefined,
       })
       expect(yield* session.context(sessionID)).toMatchObject([
         {
@@ -727,12 +729,91 @@ describe("SessionRunnerLLM", () => {
           },
         },
         { type: "assistant" },
-        {
-          type: "synthetic",
-          text: expect.stringContaining("Automation guardrail: no Goal-state progress for 2 automatic turns"),
-          provenance: { owner: "host", source: "goal.progress", ref: expect.any(String) },
-        },
       ])
+    }),
+  )
+
+  it.effect("reactivates a blocked focused Goal as soon as a genuine user prompt is durably admitted", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const session = yield* SessionV2.Service
+      const created = yield* goals
+        .create({
+          projectID: Project.ID.global,
+          title: "User prompt reactivation",
+          objective: "Resume blocked work when the user speaks again",
+          criteria: ["Goal is active after admission"],
+          continuationPolicy: { mode: "auto_continue" },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
+      const reservation = yield* automation.afterTurn({
+        sessionID,
+        origin: "user",
+        audit: {
+          ok: true,
+          verdict: {
+            decision: "continue",
+            rationale: "A stale autonomous continuation exists before the user intervenes.",
+            progressMade: true,
+            criteria: active.criteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending" as const,
+              evidence: "Still pending before the user takes control.",
+            })),
+            continuationPrompt: "This continuation must be superseded by the genuine user turn.",
+          },
+        },
+      })
+      expect(reservation.reservation).toBeDefined()
+      expect(yield* automation.runtime(sessionID)).toMatchObject({ phase: "continuation_pending" })
+      const blocked = yield* goals
+        .transition({
+          id: active.goal.id,
+          expectedRevision: active.goal.revision,
+          action: "block",
+          blocker: "Waiting for the user",
+        })
+        .pipe(Effect.orDie)
+      expect(blocked.goal.status).toBe("blocked")
+
+      const messageID = SessionMessage.ID.make("msg_goal_user_reactivation_retry")
+      yield* session.prompt({
+        id: messageID,
+        sessionID,
+        prompt: Prompt.make({ text: "Continue with this goal" }),
+        resume: false,
+      })
+
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({ status: "active", blocker: undefined })
+      expect(yield* automation.runtime(sessionID)).toBeUndefined()
+
+      // The same durable input may be retried later. It must not gain fresh
+      // authority over a blocker established after the original admission.
+      const reblocked = yield* goals
+        .transition({
+          id: created.goal.id,
+          expectedRevision: (yield* goals.get(created.goal.id)).goal.revision,
+          action: "block",
+          blocker: "A newer blocker established after the original user turn",
+        })
+        .pipe(Effect.orDie)
+      expect(reblocked.goal.status).toBe("blocked")
+      yield* session.prompt({
+        id: messageID,
+        sessionID,
+        prompt: Prompt.make({ text: "Continue with this goal" }),
+        resume: false,
+      })
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
+        status: "blocked",
+        blocker: "A newer blocker established after the original user turn",
+      })
     }),
   )
 

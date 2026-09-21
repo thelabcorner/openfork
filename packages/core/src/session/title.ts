@@ -1,6 +1,6 @@
 export * as SessionTitle from "./title"
 
-import { LLM, LLMClient, Message, SystemPart, Tool, toDefinitions } from "@opencode-ai/llm"
+import { LLM, LLMClient, LLMResponse, Message, SystemPart, Tool, toDefinitions, type ToolResultValue } from "@opencode-ai/llm"
 import { eq } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer, Ref, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
@@ -10,6 +10,7 @@ import { Config } from "../config"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { makeLocationNode } from "../effect/app-node"
+import { KeyedMutex } from "../effect/keyed-mutex"
 import { llmClient } from "../effect/app-node-platform"
 import { Integration } from "../integration"
 import { ModelV2 } from "../model"
@@ -27,6 +28,7 @@ import {
 } from "../special-agent-completion"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
+import { SessionTurnProvenance } from "./turn-provenance"
 import { SpecialAgentSessionContext } from "../special-agent-session-context"
 import { SessionRunnerModel } from "./runner/model"
 import { SessionSchema } from "./schema"
@@ -159,6 +161,7 @@ const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const scope = yield* Scope.Scope
     const pending = yield* Ref.make(new Map<SessionSchema.ID, PendingEntry>())
+    const titleLocks = KeyedMutex.makeUnsafe<SessionSchema.ID>()
     const generatedTitleTool = Tool.make({
       description:
         "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
@@ -172,6 +175,18 @@ const layer = Layer.effect(
         if (map.get(sessionID)?.requestID === requestID) map.delete(sessionID)
         return map
       })
+
+    const runCurrent = <A, E, R>(
+      sessionID: SessionSchema.ID,
+      requestID: string,
+      effect: Effect.Effect<A, E, R>,
+    ) =>
+      titleLocks.withLock(sessionID)(
+        Effect.gen(function* () {
+          if ((yield* Ref.get(pending)).get(sessionID)?.requestID !== requestID) return undefined
+          return yield* effect
+        }),
+      )
 
     const resolveFromCatalog = Effect.fn("SessionTitle.resolveFromCatalog")(function* (ref: {
       readonly providerID: ProviderV2.ID
@@ -288,8 +303,8 @@ const layer = Layer.effect(
               }),
           ),
         ))
-      // Nothing to title without at least one real user message (edge #5).
-      if (messages.filter((message) => message.type === "user").length === 0) return false
+      // Nothing to title without at least one worker-root prompt (edge #5).
+      if (!messages.some(SessionTurnProvenance.isWorkerPromptTurn)) return false
       const context = assembleContext(messages)
       const entries = yield* config.entries()
       const configured = Config.latest(entries, "title_prompt")
@@ -333,18 +348,21 @@ const layer = Layer.effect(
               }),
           ),
         )
+      const requestText = `<title-generation-context>\n${JSON.stringify({
+        generationPurpose: input.defaultOnly ? "initial" : "regenerate",
+        currentTitle: session.title,
+        conversation: context,
+      })}\n</title-generation-context>`
+      yield* specialAgents.publishPrompt({
+        sessionID: transcriptID,
+        agent: "session_title",
+        text: requestText,
+        ref: input.requestID,
+      })
       const request = LLM.request({
         model,
         system: [SystemPart.make(system)],
-        messages: [
-          Message.user(
-            `<title-generation-context>\n${JSON.stringify({
-              generationPurpose: input.defaultOnly ? "initial" : "regenerate",
-              currentTitle: session.title,
-              conversation: context,
-            })}\n</title-generation-context>`,
-          ),
-        ],
+        messages: [Message.user(requestText)],
         tools: toDefinitions({ [GENERATED_TITLE_TOOL]: generatedTitleTool }),
         // There is exactly one available tool. `required` is semantically the
         // same as a named forced choice here, but is supported by more provider
@@ -352,27 +370,106 @@ const layer = Layer.effect(
         toolChoice: "required",
         generation: { maxTokens: boundedMaxTokens(model, TITLE_MAX_TOKENS), temperature: 0.2 },
       })
+      type TranscriptTurn = {
+        readonly response: LLMResponse
+        readonly publisher: ReturnType<SpecialAgentSession.Interface["publisher"]>
+        readonly tokens: {
+          readonly input: number
+          readonly output: number
+          readonly reasoning: number
+          readonly cache: { readonly read: number; readonly write: number }
+        }
+        readonly startedAt: number
+        readonly completedAt: number
+      }
+      const pendingTranscriptTurns = new Map<LLMResponse, TranscriptTurn>()
+      const settleTranscriptTurn = Effect.fn("SessionTitle.settleTranscriptTurn")(function* (
+        response: LLMResponse,
+        toolResults: ReadonlyArray<{ readonly id: string; readonly name: string; readonly result: ToolResultValue }> = [],
+      ) {
+        const turn = pendingTranscriptTurns.get(response)
+        if (!turn) return
+        yield* specialAgents.settleTurn({
+          sessionID: transcriptID,
+          publisher: turn.publisher,
+          response,
+          toolResults,
+          tokens: turn.tokens,
+        })
+        pendingTranscriptTurns.delete(response)
+      })
+      const rejectPendingTranscriptTurns = Effect.fn("SessionTitle.rejectPendingTranscriptTurns")(function* (
+        reason: string,
+      ) {
+        for (const [response, turn] of pendingTranscriptTurns) {
+          yield* specialAgents.rejectTurn({
+            sessionID: transcriptID,
+            publisher: turn.publisher,
+            response,
+            tokens: turn.tokens,
+            reason,
+          })
+          pendingTranscriptTurns.delete(response)
+        }
+      })
+      const settleAcceptedTerminal = (response: LLMResponse, call: LLMResponse["toolCalls"][number]) =>
+        settleTranscriptTurn(
+          response,
+          response.toolCalls
+            .filter((item) => item.providerExecuted !== true)
+            .map((item) => ({
+              id: item.id,
+              name: item.name,
+              result:
+                item.id === call.id && item.name === call.name
+                  ? ({ type: "text" as const, value: terminalCompletionAccepted(GENERATED_TITLE_TOOL) } satisfies ToolResultValue)
+                  : ({ type: "error" as const, value: "Session title protocol rejected this extra tool call." } satisfies ToolResultValue),
+            })),
+        )
+
       const generate = (current: typeof request, preferred: "required" | "auto") =>
         Effect.gen(function* () {
-          const publisher = specialAgents.publisher({ sessionID: transcriptID, agent: "session_title", model: modelRef })
-          publisher.setRequestSentAt(yield* DateTime.now)
-          const startedAt = Date.now()
+          yield* rejectPendingTranscriptTurns("Session title protocol rejected this provider turn.")
           const generated = yield* generateAdaptive({
             identity: capability,
             requested: preferred,
             generate: (toolChoice) =>
-              collectUntilTerminalTool(
-                llm
-                  .stream(LLM.updateRequest(current, { toolChoice }))
-                  .pipe(Stream.tap((event) => publisher.publish(event))),
-                GENERATED_TITLE_TOOL,
-              ).pipe(
-                Effect.flatMap((response) =>
-                  response
-                    ? Effect.succeed(response)
-                    : Effect.fail(new Error("Title generation ended without a terminal response")),
-                ),
-              ),
+              Effect.gen(function* () {
+                const publisher = specialAgents.publisher({
+                  sessionID: transcriptID,
+                  agent: "session_title",
+                  model: modelRef,
+                })
+                publisher.setRequestSentAt(yield* DateTime.now)
+                const startedAt = Date.now()
+                const response = yield* specialAgents.guardProviderTurn({
+                  publisher,
+                  label: "Session title",
+                  effect: collectUntilTerminalTool(
+                    llm
+                      .stream(LLM.updateRequest(current, { toolChoice }))
+                      .pipe(Stream.tap((event) => publisher.publish(event))),
+                    GENERATED_TITLE_TOOL,
+                  ).pipe(
+                    Effect.flatMap((response) =>
+                      response
+                        ? Effect.succeed(response)
+                        : Effect.fail(new Error("Title generation ended without a terminal response")),
+                    ),
+                  ),
+                })
+                const reported = response.usage
+                const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
+                const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
+                const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
+                const tokens = {
+                  input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
+                  output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
+                  reasoning,
+                  cache: { read: cacheRead, write: cacheWrite },
+                }
+                return { response, publisher, tokens, startedAt, completedAt: Date.now() }
+              }),
           }).pipe(
             Effect.mapError(
               (error) =>
@@ -382,23 +479,9 @@ const layer = Layer.effect(
                 }),
             ),
           )
-          const reported = generated.response.usage
-          const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
-          const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
-          const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
-          const tokens = {
-            input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
-            output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
-            reasoning,
-            cache: { read: cacheRead, write: cacheWrite },
-          }
-          const completedAt = Date.now()
-          yield* specialAgents.settleTurn({
-            sessionID: transcriptID,
-            publisher,
-            response: generated.response,
-            tokens,
-          })
+          const turn = generated.response
+          pendingTranscriptTurns.set(turn.response, turn)
+          const reported = turn.response.usage
           yield* specialAgents.recordMaintenance({
             agent: "session_title",
             providerID: modelRef.providerID,
@@ -406,19 +489,20 @@ const layer = Layer.effect(
             sessionID: session.id,
             costEstimated: reported === undefined,
             tokens: {
-              input: tokens.input,
-              cacheRead: tokens.cache.read,
-              cacheWrite: tokens.cache.write,
-              output: tokens.output,
-              reasoning: tokens.reasoning,
+              input: turn.tokens.input,
+              cacheRead: turn.tokens.cache.read,
+              cacheWrite: turn.tokens.cache.write,
+              output: turn.tokens.output,
+              reasoning: turn.tokens.reasoning,
             },
-            totalTokens: reported?.totalTokens ?? tokens.input + tokens.output + reasoning,
-            startedAt,
-            completedAt,
+            totalTokens: reported?.totalTokens ?? turn.tokens.input + turn.tokens.output + turn.tokens.reasoning,
+            startedAt: turn.startedAt,
+            completedAt: turn.completedAt,
           })
-          return generated
+          return { response: turn.response, toolChoice: generated.toolChoice } as const
         })
 
+      return yield* Effect.gen(function* () {
       let preferred: "required" | "auto" = "required"
       const terminal = yield* runTerminalCompletion({
         messages: request.messages,
@@ -465,7 +549,8 @@ const layer = Layer.effect(
                     ? `Title generation produced invalid ${GENERATED_TITLE_TOOL}: ${failure.detail ?? "invalid payload"}`
                     : `${GENERATED_TITLE_TOOL} must be the only content-producing action in the response`,
           }),
-      })
+      }).pipe(Effect.tapError(() => rejectPendingTranscriptTurns("Session title generation failed protocol validation.")))
+      yield* settleAcceptedTerminal(terminal.response, terminal.call)
       const title = terminal.artifact
       return yield* applyTitle({
         sessionID: session.id,
@@ -474,6 +559,11 @@ const layer = Layer.effect(
         title,
         defaultOnly: input.defaultOnly,
       })
+      }).pipe(
+        Effect.ensuring(
+          rejectPendingTranscriptTurns("Session title operation ended before the provider turn was interpreted."),
+        ),
+      )
     })
 
     return Service.of({
@@ -487,46 +577,54 @@ const layer = Layer.effect(
           map.set(input.session.id, { requestID, baselineTitle: input.session.title })
           return map
         })
-        yield* withSpecialAgentTimeout(
-          runGeneration({
-            session: input.session,
-            requestID,
-            baselineTitle: input.session.title,
-            prompt: input.prompt,
-            model: input.model,
-            defaultOnly: false,
-          }),
-          () =>
-            Effect.fail(
-              new UnavailableError({
-                sessionID: input.session.id,
-                message: "Title generation timed out after 5 minutes",
-              }),
-            ),
+        yield* runCurrent(
+          input.session.id,
+          requestID,
+          withSpecialAgentTimeout(
+            runGeneration({
+              session: input.session,
+              requestID,
+              baselineTitle: input.session.title,
+              prompt: input.prompt,
+              model: input.model,
+              defaultOnly: false,
+            }),
+            () =>
+              Effect.fail(
+                new UnavailableError({
+                  sessionID: input.session.id,
+                  message: "Title generation timed out after 5 minutes",
+                }),
+              ),
+          ),
         ).pipe(Effect.asVoid, Effect.ensuring(clearPending(input.session.id, requestID)))
       }),
       autoTitle: Effect.fn("SessionTitle.autoTitle")(function* (input) {
         const session = input.session
         if (session.parentID !== undefined) return
         if (!isDefaultTitle(session.title)) return
-        if (input.messages.filter((message) => message.type === "user").length !== 1) return
+        if (input.messages.filter(SessionTurnProvenance.isWorkerPromptTurn).length !== 1) return
         const requestID = crypto.randomUUID()
         yield* Ref.update(pending, (map) => {
           map.set(session.id, { requestID, baselineTitle: session.title })
           return map
         })
-        yield* withSpecialAgentTimeout(
-          runGeneration({
-            session,
-            requestID,
-            baselineTitle: session.title,
-            defaultOnly: true,
-            messages: input.messages,
-          }),
-          () =>
-            Effect.fail(
-              new UnavailableError({ sessionID: session.id, message: "Title generation timed out after 5 minutes" }),
-            ),
+        yield* runCurrent(
+          session.id,
+          requestID,
+          withSpecialAgentTimeout(
+            runGeneration({
+              session,
+              requestID,
+              baselineTitle: session.title,
+              defaultOnly: true,
+              messages: input.messages,
+            }),
+            () =>
+              Effect.fail(
+                new UnavailableError({ sessionID: session.id, message: "Title generation timed out after 5 minutes" }),
+              ),
+          ),
         ).pipe(
           Effect.catch((error) => Effect.logError("Failed to auto-title session", { sessionID: session.id, error })),
           Effect.ensuring(clearPending(session.id, requestID)),

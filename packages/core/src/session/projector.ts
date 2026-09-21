@@ -206,6 +206,24 @@ const projectLegacyPrompted = Effect.fnUntraced(function* (
   db: DatabaseService,
   event: typeof SessionEvent.Prompted.Type,
 ) {
+  // V1 prompt admission materializes the mature legacy transcript before it is
+  // promoted from SessionInput. When that durable input is later drained, the
+  // Prompted event owns the current semantic projection but must not attempt to
+  // recreate the already-authoritative V1 row (whose richer fields may include
+  // tools/system/format selections absent from the current Prompt contract).
+  const existingLegacy = yield* db
+    .select({ id: MessageTable.id })
+    .from(MessageTable)
+    .where(
+      and(
+        eq(MessageTable.id, SessionV1.MessageID.ascending(event.data.messageID)),
+        eq(MessageTable.session_id, event.data.sessionID),
+      ),
+    )
+    .get()
+    .pipe(Effect.orDie)
+  if (existingLegacy) return
+
   const session = yield* db
     .select({ agent: SessionTable.agent, model: SessionTable.model })
     .from(SessionTable)
@@ -775,7 +793,7 @@ const layer = Layer.effectDiscard(
           event.data.info.provenance?.owner === "user" &&
           SharedTurnProvenance.policy(event.data.info.provenance.source)?.kind === "user"
         ) {
-          yield* SessionInput.projectLegacyPromotedUser(db, {
+          yield* SessionInput.projectLegacyUserAdmission(db, {
             seq: event.durable.seq,
             id: SessionMessage.ID.make(event.data.info.id),
             sessionID: SessionSchema.ID.make(sessionID),

@@ -144,6 +144,26 @@ describe("QuestionV2", () => {
     }),
   )
 
+  it.effect("publishes rejection when the question owner is interrupted", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const events = yield* EventV2.Service
+      const rejected = yield* Deferred.make<unknown>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === QuestionV2.Event.Rejected.type
+          ? Deferred.succeed(rejected, event.data).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const { fiber, request } = yield* waitForAsk(service, { sessionID, questions: [question] })
+
+      yield* Fiber.interrupt(fiber)
+
+      expect(yield* Deferred.await(rejected)).toEqual({ sessionID, requestID: request.id })
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("isolates pending requests by location-layer instance and rejects them on finalization", () =>
     Effect.gen(function* () {
       const firstScope = yield* Scope.make()

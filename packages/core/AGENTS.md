@@ -53,6 +53,20 @@ state from rendered artifacts.
 - Snapshot reads for dense UI must be batched by session ID and must remain
   bootstrap-free: SQLite/global memory only, no Location or Instance materialize.
 
+## Session producer metadata
+
+- V1 root Session metadata is a compatibility bag, not a uniformly caller-owned
+  namespace. Producer identity used for routing, grouping, notification, or
+  safety decisions is host-owned and must be registered in
+  `SessionMetadataOwnership`.
+- Public creation cannot mint registered producer identity, caller metadata
+  replacement cannot overwrite or erase it, and a fork/derived Session must not
+  inherit the source aggregate's producer identity.
+- Keep the reserved set narrow. Mutable runtime policy such as `localMcp` is
+  not producer identity merely because the host currently writes it.
+- Turn provenance and Session producer identity are separate axes. Never infer
+  prompt authority/provenance from Session metadata.
+
 ## Regression expectations
 
 - Tests for global/session projections should assert both the returned data and
@@ -60,6 +74,27 @@ state from rendered artifacts.
   history hydration unless the API is explicitly a detail/history API.
 - When a bug was caused by frontend reconstruction, add at least one Core-level
   test proving the semantic producer emits the compact state directly.
+
+## SQLite writer transaction ownership
+
+OpenFork can have more than one SQLite writer connection to the same WAL database:
+the foreground Core connection plus low-priority ChunkDB/backfill maintenance.
+Transaction mode must therefore match ownership semantics rather than relying on
+SQLite's default DEFERRED behavior.
+
+- A transaction that **may mutate durable state and reads before its first
+  write** must use `{ behavior: "immediate" }`. Acquiring the writer reservation
+  before establishing the read snapshot prevents `SQLITE_BUSY_SNAPSHOT` when a
+  peer writer commits between the read and the attempted write.
+- A genuinely read-only transaction whose purpose is a coherent WAL snapshot
+  should remain DEFERRED; do not acquire the writer slot for snapshot reads.
+- Background maintenance owns a dedicated connection, a short busy timeout, and
+  bounded idempotent retry/backoff. Foreground domain transactions own priority.
+- Do not paper over a stale-snapshot bug by replaying an arbitrary high-level
+  business transaction after it has made decisions from an old snapshot. Fix
+  writer ownership at the transaction boundary.
+- `busy_timeout` cannot repair `SQLITE_BUSY_SNAPSHOT` (extended code 517);
+  waiting cannot make an obsolete snapshot writable.
 
 ## Project filesystem inventory rules
 
@@ -77,7 +112,8 @@ state from rendered artifacts.
   not own the root, or when an inventory file would be hidden by the watcher's
   ignore rules. Coverage is tracked-aware: `Ignore.coverage` drops any pattern
   that would hide a tracked file from the native subscription and emits the
-  exact path globs the callback guard must not drop (`.opencode/`, a package's
+  exact path globs the callback guard must not drop (`.openfork/` or a tracked
+  legacy `.opencode/`, a package's
   `desktop`/`bin`, a tracked `*.log`, ...). Never reintroduce a segment-based
   ignore check that hides tracked files; a watcher that hides tracked files is
   a freshness bug, not an optimization. Consumers that need exact freshness

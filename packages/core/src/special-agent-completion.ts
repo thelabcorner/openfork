@@ -1,5 +1,5 @@
 import { LLMEvent, LLMResponse, Message, type Model } from "@opencode-ai/llm"
-import { Duration, Effect } from "effect"
+import { Clock, Duration, Effect } from "effect"
 import * as Stream from "effect/Stream"
 import {
   preferredToolChoice,
@@ -10,6 +10,55 @@ import {
 export type ToolChoice = "required" | "auto"
 
 export const DEFAULT_SPECIAL_AGENT_TIMEOUT = Duration.minutes(5)
+
+/**
+ * Soft wall-clock window for long-running special agents. Each time a window
+ * elapses the host injects a privileged "time limit reached" instruction and
+ * silently opens the next window, so the agent always believes it is spending
+ * one final five-minute allowance. Renewal is deliberately never disclosed: the
+ * obvious constraint is what pushes the agent to commit instead of exploring.
+ */
+export const SPECIAL_AGENT_TIME_WINDOW_MS = 5 * 60_000
+/**
+ * Absolute fallback cap. Soft pressure does not guarantee that a misbehaving
+ * run terminates, so every special-agent invocation still has a hard stop.
+ */
+export const SPECIAL_AGENT_HARD_TIMEOUT_MS = 60 * 60_000
+const SPECIAL_AGENT_TIME_WINDOW_NANOS = BigInt(SPECIAL_AGENT_TIME_WINDOW_MS) * 1_000_000n
+
+export interface TimeWindow {
+  /** True exactly when the current window elapsed; then opens the next one. */
+  readonly elapsed: () => Effect.Effect<boolean>
+}
+
+export const makeTimeWindow = Effect.fnUntraced(function* () {
+  let deadline = (yield* Clock.currentTimeNanos) + SPECIAL_AGENT_TIME_WINDOW_NANOS
+  const elapsed = Effect.fnUntraced(function* () {
+    const now = yield* Clock.currentTimeNanos
+    if (now < deadline) return false
+    while (deadline <= now) deadline += SPECIAL_AGENT_TIME_WINDOW_NANOS
+    return true
+  })
+  return { elapsed } satisfies TimeWindow
+})
+
+/**
+ * Privileged mid-conversation instruction for the moment a special-agent time
+ * window elapses. The wording is intentionally final: agents are never told
+ * that the window renews.
+ */
+export function specialAgentTimeLimitReached(input: {
+  readonly label: string
+  readonly toolName: string
+  readonly instruction: string
+}) {
+  return [
+    `[${input.label} time limit reached — privileged system instruction]`,
+    "Your available time has elapsed. You now have one final five-minute window to deliver the result.",
+    input.instruction,
+    `Stop reconnaissance and investigation now, and do not answer with prose. Commit ${input.toolName} immediately with the best artifact the evidence already supports.`,
+  ].join(" ")
+}
 
 /**
  * Defensive terminal-tool result for runtimes that actually dispatch a
@@ -43,8 +92,22 @@ export function collectUntilTerminalTool<E>(
   toolName: string,
 ): Effect.Effect<LLMResponse | undefined, E> {
   const terminal = isTerminalToolCall(toolName)
+  const providerTools = new Set<string>()
+  let terminalSeen = false
+  const complete = (event: LLMEvent) => {
+    if (LLMEvent.is.toolCall(event) && event.providerExecuted === true) providerTools.add(event.id)
+    if ((event.type === "tool-result" || event.type === "tool-error") && providerTools.has(event.id)) {
+      providerTools.delete(event.id)
+    }
+    if (terminal(event)) terminalSeen = true
+    // A terminal host tool is an early-cancel boundary only after every
+    // provider-executed tool that was already in flight has published its
+    // authoritative result. This preserves provider-hosted semantics without
+    // consuming arbitrary model work after the terminal artifact.
+    return terminalSeen && providerTools.size === 0
+  }
   return stream.pipe(
-    Stream.takeUntil(terminal),
+    Stream.takeUntil(complete),
     Stream.runCollect,
     Effect.map((chunk) => {
       const events = Array.from(chunk)

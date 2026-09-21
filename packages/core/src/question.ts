@@ -1,7 +1,7 @@
 export * as QuestionV2 from "./question"
 
 import { makeLocationNode } from "./effect/app-node"
-import { Context, Deferred, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Layer, Schema } from "effect"
 import { Question } from "@opencode-ai/schema/question"
 import { EventV2 } from "./event"
 import { SessionSchema } from "./session/schema"
@@ -104,7 +104,19 @@ const layer = Layer.effect(
           const request: Request = { id, ...input }
           pending.set(id, { request, deferred })
           return yield* events.publish(Event.Asked, request).pipe(
-            Effect.andThen(restore(Deferred.await(deferred))),
+            Effect.andThen(
+              restore(Deferred.await(deferred)).pipe(
+                // An interrupted owner (HTTP disconnect, stopped Session, or
+                // Location teardown) must terminate the published projection
+                // too. Deleting only the in-memory deferred leaves consumers
+                // with a ghost `question.asked` that can never be answered.
+                Effect.onExit((exit) =>
+                  Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) && pending.has(id)
+                    ? events.publish(Event.Rejected, { sessionID: request.sessionID, requestID: request.id })
+                    : Effect.void,
+                ),
+              ),
+            ),
             Effect.ensuring(
               Effect.sync(() => {
                 pending.delete(id)

@@ -89,6 +89,12 @@ export interface Interface {
    */
   readonly tryClaimRecovery: (sessionID: SessionSchema.ID) => Effect.Effect<RecoveryClaimResult>
   /**
+   * Completes recovery only for the exact dead-owner generation and exact
+   * recovery owner that proved quiescence. Pending SessionInput is preserved;
+   * the next activation acquires generation + 1.
+   */
+  readonly completeRecovery: (token: RecoveryToken) => Effect.Effect<ExactReleaseResult>
+  /**
    * Releases only this process's exact recovery claim. It never clears the old
    * execution owner or advances the Session generation.
    */
@@ -333,6 +339,39 @@ const layer = Layer.effect(
             tx
               .update(SessionExecutionOwnerTable)
               .set({
+                recovery_owner_id: null,
+                recovery_started_at: null,
+              })
+              .where(
+                and(
+                  eq(SessionExecutionOwnerTable.session_id, token.sessionID),
+                  eq(SessionExecutionOwnerTable.owner_id, token.ownerID),
+                  eq(SessionExecutionOwnerTable.generation, token.generation),
+                  eq(SessionExecutionOwnerTable.recovery_owner_id, token.recoveryOwnerID),
+                ),
+              )
+              .returning({ sessionID: SessionExecutionOwnerTable.session_id })
+              .get()
+              .pipe(Effect.orDie),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      yield* releaseRecoveryRetention(token)
+      return released ? ("released" as const) : ("stale" as const)
+    })
+
+    const completeRecovery = Effect.fn("SessionExecutionOwner.completeRecovery")(function* (token: RecoveryToken) {
+      const released = yield* db
+        .transaction(
+          (tx) =>
+            tx
+              .update(SessionExecutionOwnerTable)
+              .set({
+                owner_id: null,
+                acquired_at: null,
+                interrupt_generation: null,
+                interrupt_reason: null,
+                interrupt_requested_at: null,
                 recovery_owner_id: null,
                 recovery_started_at: null,
               })
@@ -603,6 +642,7 @@ const layer = Layer.effect(
       snapshot,
       requestInterrupt,
       tryClaimRecovery,
+      completeRecovery,
       abandonRecovery,
     })
   }),

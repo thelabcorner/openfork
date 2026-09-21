@@ -1,15 +1,18 @@
 import { describe, expect, test } from "bun:test"
 import { Cause, Effect } from "effect"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import { LLMEvent, LLMResponse, Message } from "@opencode-ai/llm"
 import {
   appendCompletionRepair,
   collectUntilTerminalTool,
   inspectTerminalCompletion,
+  makeTimeWindow,
   retryMaxTokens,
   runAdaptiveToolChoice,
   runTerminalCompletion,
   runTerminalCompletionWithTranscript,
+  SPECIAL_AGENT_TIME_WINDOW_MS,
   terminalCompletionAccepted,
   withSpecialAgentTimeout,
   type TerminalAttempt,
@@ -82,6 +85,40 @@ describe("special-agent completion runtime", () => {
     expect(finalized).toBe(true)
   })
 
+  test("terminal collection waits for an already-running provider tool result before cancelling trailing work", async () => {
+    let trailingPulled = false
+    const upstream = Stream.concat(
+      Stream.make(
+        LLMEvent.toolCall({
+          id: "hosted",
+          name: "web_search",
+          input: { query: "status" },
+          providerExecuted: true,
+        }),
+        LLMEvent.toolCall({ id: "done", name: "finish", input: { value: "done" } }),
+        LLMEvent.toolResult({
+          id: "hosted",
+          name: "web_search",
+          result: { type: "text", value: "provider result" },
+          providerExecuted: true,
+        }),
+      ),
+      Stream.fromEffect(
+        Effect.sync(() => {
+          trailingPulled = true
+          return LLMEvent.textStart({ id: "after" })
+        }),
+      ),
+    )
+
+    const response = await Effect.runPromise(collectUntilTerminalTool(upstream, "finish"))
+    expect(response?.toolCalls.map((call) => [call.name, call.providerExecuted])).toEqual([
+      ["web_search", true],
+      ["finish", undefined],
+    ])
+    expect(trailingPulled).toBe(false)
+  })
+
   test("wall-clock timeout interrupts rather than leaving special-agent work running", async () => {
     let interrupted = false
     const never = Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => (interrupted = true))))
@@ -90,6 +127,23 @@ describe("special-agent completion runtime", () => {
     )
     expect(result).toBe("timed-out")
     expect(interrupted).toBe(true)
+  })
+
+  test("opens a fresh time window only after the previous one fully elapsed", async () => {
+    const states = await Effect.runPromise(
+      Effect.gen(function* () {
+        const window = yield* makeTimeWindow()
+        const observed: boolean[] = []
+        observed.push(yield* window.elapsed())
+        yield* TestClock.adjust(SPECIAL_AGENT_TIME_WINDOW_MS)
+        observed.push(yield* window.elapsed())
+        observed.push(yield* window.elapsed())
+        yield* TestClock.adjust(SPECIAL_AGENT_TIME_WINDOW_MS)
+        observed.push(yield* window.elapsed())
+        return observed
+      }).pipe(Effect.provide(TestClock.layer())),
+    )
+    expect(states).toEqual([false, true, false, true])
   })
 
   test("shares required-to-auto capability learning across callers", async () => {
@@ -126,6 +180,26 @@ describe("special-agent completion runtime", () => {
     )
     expect(second.toolChoice).toBe("auto")
     expect(secondChoices).toEqual(["auto"])
+  })
+
+  test("downgrades required tool choice when thinking mode rejects the choice", async () => {
+    resetToolChoiceCapabilityMemory()
+    const choices: string[] = []
+    const result = await Effect.runPromise(
+      runAdaptiveToolChoice({
+        identity,
+        run: (toolChoice) => {
+          choices.push(toolChoice)
+          return toolChoice === "required"
+            ? Effect.fail(new Error("[invalid_request_error] Thinking mode does not support this tool_choice"))
+            : Effect.succeed("success")
+        },
+      }),
+    )
+
+    expect(result.value).toBe("success")
+    expect(result.toolChoice).toBe("auto")
+    expect(choices).toEqual(["required", "auto"])
   })
 
   test("repairs prose in the same canonical transcript before accepting the completion tool", async () => {

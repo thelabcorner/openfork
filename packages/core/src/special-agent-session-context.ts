@@ -1,6 +1,7 @@
 export * as SpecialAgentSessionContext from "./special-agent-session-context"
 
 import { SessionMessage } from "./session/message"
+import { SessionTurnProvenance } from "./session/turn-provenance"
 
 export interface Options {
   readonly maxChars: number
@@ -114,7 +115,8 @@ export function assemble(messages: readonly SessionMessage.Message[], options: O
     const summary = rendered.find((block) => block.index === latestCompaction && block.kind === "compaction")
     if (summary) add(summary, true)
   } else if (pinOpeningUser) {
-    const opening = rendered.find((block) => block.kind === "user")
+    const openingIndex = messages.findIndex(SessionTurnProvenance.isWorkerPromptTurn)
+    const opening = rendered.find((block) => block.index === openingIndex)
     if (opening) add(opening, true)
   }
 

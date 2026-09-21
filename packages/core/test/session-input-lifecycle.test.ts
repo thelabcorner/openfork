@@ -102,6 +102,30 @@ const eventCount = (type: string) =>
   )
 
 describe("SessionInput generalized lifecycle", () => {
+  it.effect("distinguishes a fresh semantic User admission from an idempotent replay", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const id = SessionMessage.ID.make("msg_user_admission_idempotency")
+      const input = {
+        id,
+        sessionID,
+        prompt: Prompt.make({ text: "continue" }),
+        delivery: "queue" as const,
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      }
+
+      const first = yield* SessionInput.admitWithState(db, events, input)
+      const retry = yield* SessionInput.admitWithState(db, events, input)
+
+      expect(first.created).toBe(true)
+      expect(retry.created).toBe(false)
+      expect(retry.admitted.admittedSeq).toBe(first.admitted.admittedSeq)
+      expect(retry.admitted.id).toBe(first.admitted.id)
+    }),
+  )
+
   it.effect("derives delegated agent authority from typed input only", () =>
     Effect.sync(() => {
       expect(

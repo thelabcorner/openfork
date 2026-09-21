@@ -162,4 +162,20 @@ describe("turnThroughputByTurn", () => {
     expect(bulk.has("u1")).toBe(false)
     expect(bulk.has("u2")).toBe(false)
   })
+
+  test("treats replaceable state as transparent rather than a turn boundary", () => {
+    const messages: ThroughputMessage[] = [
+      user("u1"),
+      step("a1", { sent: 100, first: 200, streamed: 1100 }, { output: 20 }),
+      { id: "goal-state", role: "state" },
+      step("a2", { sent: 1200, first: 1300, streamed: 2200 }, { output: 30 }),
+      user("u2"),
+      step("a3", { sent: 2300, first: 2400, streamed: 3300 }, { output: 40 }),
+    ]
+    const bulk = turnThroughputByTurn(messages)
+    expect(bulk.get("u1")?.steps).toBe(2)
+    expect(bulk.get("u1")?.requestRate).toBe(25)
+    expect(turnThroughput(messages, "u1")).toEqual(bulk.get("u1"))
+    expect(bulk.get("u2")?.steps).toBe(1)
+  })
 })

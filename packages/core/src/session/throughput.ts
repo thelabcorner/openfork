@@ -145,7 +145,7 @@ export function turnThroughputByTurn(messages: readonly ThroughputMessage[]): Ma
       if (turn) turn.invalid = true
       continue
     }
-    if (message.role === "agent-switched") continue
+    if (message.role === "agent-switched" || message.role === "state") continue
     if (isBoundary(message.role)) {
       finish()
       continue
@@ -184,7 +184,7 @@ export function turnThroughput(
   for (let i = index + 1; i < messages.length; i++) {
     const message = messages[i]
     if (message.role === "model-switched") return undefined
-    if (message.role === "agent-switched") continue
+    if (message.role === "agent-switched" || message.role === "state") continue
     if (isBoundary(message.role)) break
     if (message.role !== "assistant") continue
     if (message.failed) return undefined
