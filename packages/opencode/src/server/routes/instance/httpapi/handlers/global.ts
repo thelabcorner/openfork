@@ -5,6 +5,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
+import { PRODUCT_RELEASES_URL } from "@opencode-ai/core/brand"
 import { EventReplayBuffer, estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import {
   coalesceEventBatch,
@@ -40,7 +41,11 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { ModelPreferences } from "@/preference/model-preferences"
 import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
+import { NotFoundError } from "@/storage/storage"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
+import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
@@ -49,9 +54,71 @@ import { RootHttpApi } from "../api"
 import {
   GlobalSessionRootsQuery,
   GlobalSessionTelemetryInput,
+  GlobalOxpActivityListQuery,
+  GlobalOxpActivityPatch,
+  GlobalOxpInvocationQuery,
+  GlobalOxpResourceQuery,
   GlobalUpgradeInput,
   ModelPreferencesPatch,
 } from "../groups/global"
+
+function projectOxpActivity(
+  row: OxpActivityInspection.ParentSummary,
+) {
+  return {
+    id: row.id,
+    ...(row.title ? { title: row.title } : {}),
+    firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+    callCount: row.call_count,
+    failureCount: row.failure_count,
+    augmentationCalls: row.augmentation_calls,
+    supervisionCalls: row.supervision_calls,
+    delegationCalls: row.delegation_calls,
+    observedEpochCount: row.observed_epoch_count,
+    ...(row.last_tool ? { lastTool: row.last_tool } : {}),
+    ...(row.last_root_alias ? { lastRootAlias: row.last_root_alias } : {}),
+    ...(row.time_archived === null || row.time_archived === undefined
+      ? {}
+      : { archivedAt: row.time_archived }),
+  }
+}
+
+function projectOxpInvocation(
+  row: OxpActivityInspection.Invocation,
+  links: readonly OxpActivityInspection.InvocationLink[],
+) {
+  return {
+    id: row.id,
+    activityID: row.activity_id,
+    hostRunID: row.host_run_id,
+    ...(row.observed_epoch === null || row.observed_epoch === undefined
+      ? {}
+      : { observedEpoch: row.observed_epoch }),
+    plane: row.plane,
+    tool: row.tool,
+    ...(row.action ? { action: row.action } : {}),
+    ...(row.root_id ? { rootID: row.root_id } : {}),
+    ...(row.root_alias ? { rootAlias: row.root_alias } : {}),
+    status: row.status,
+    ...(row.safe_summary?.continuityMarker === "handoff_advisory"
+      ? { continuityMarker: "handoff_advisory" as const }
+      : {}),
+    ...(row.error_code ? { errorCode: row.error_code } : {}),
+    mutationAttempted: row.mutation_attempted,
+    mutationCommitted: row.mutation_committed,
+    startedAt: row.time_started,
+    ...(row.time_completed === null || row.time_completed === undefined
+      ? {}
+      : { completedAt: row.time_completed }),
+    links: links.map((link) => ({
+      kind: link.kind,
+      ref: link.ref,
+      relation: link.relation,
+      ...(link.label ? { label: link.label } : {}),
+    })),
+  }
+}
 
 // `sequence` is optional because control frames (heartbeat, gap) are not
 // replayable domain state: they must not mint or reuse a Last-Event-ID cursor.
@@ -532,6 +599,8 @@ function eventResponse(gate: GlobalReplayGate) {
 export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
   Effect.gen(function* () {
     const gate = new GlobalReplayGate()
+    const oxpActivity = yield* OxpActivity.Service
+    const oxpInspection = yield* OxpActivityInspection.Service
     // Capture is registered for the route's lifetime but only APPENDS while a
     // subscriber is connected. Registering unconditionally keeps the
     // documented invariant that replay capture must remain complete even if a
@@ -586,9 +655,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       query: typeof GlobalSessionRootsQuery.Type
     }) {
       const sessions = yield* Session.Service
-      const directory = FSUtil.resolve(ctx.query.directory)
       const rows = yield* sessions.listGlobal({
-        directory,
+        ...(ctx.query.projectID
+          ? { projectID: ctx.query.projectID }
+          : { directory: FSUtil.resolve(ctx.query.directory) }),
         roots: true,
         archived: false,
         limit: ctx.query.limit ?? 50,
@@ -599,12 +669,126 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return rows.map(({ project: _project, ...session }) => session)
     })
 
+    const sessionGet = Effect.fn("GlobalHttpApi.sessionGet")(function* (ctx: {
+      params: { sessionID: SessionID }
+    }) {
+      const sessions = yield* Session.Service
+      return yield* sessions.get(ctx.params.sessionID).pipe(
+        Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(null)),
+      )
+    })
+
     const sessionTelemetry = Effect.fn("GlobalHttpApi.sessionTelemetry")(function* (ctx: {
       payload: typeof GlobalSessionTelemetryInput.Type
     }) {
       const telemetry = yield* SessionTelemetry.Service
       return yield* telemetry.snapshot(ctx.payload.sessions)
     })
+
+    const oxpActivities = Effect.fn("GlobalHttpApi.oxpActivities")(
+      function* (ctx: { query: typeof GlobalOxpActivityListQuery.Type }) {
+        const before =
+          ctx.query.beforeLastSeenAt !== undefined && ctx.query.beforeID
+            ? {
+                lastSeenAt: ctx.query.beforeLastSeenAt,
+                id: ctx.query.beforeID,
+              }
+            : undefined
+        const rows = yield* oxpInspection.list({
+          limit: ctx.query.limit,
+          includeArchived: ctx.query.includeArchived === "true",
+          ...(before ? { before } : {}),
+        })
+        return rows.map(projectOxpActivity)
+      },
+    )
+
+    const oxpActivityGet = Effect.fn("GlobalHttpApi.oxpActivityGet")(
+      function* (ctx: {
+        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+      }) {
+        const row = yield* oxpInspection.get(ctx.params.activityID)
+        return row ? projectOxpActivity(row) : null
+      },
+    )
+
+    const oxpInvocations = Effect.fn("GlobalHttpApi.oxpInvocations")(
+      function* (ctx: {
+        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+        query: typeof GlobalOxpInvocationQuery.Type
+      }) {
+        const before =
+          ctx.query.beforeStartedAt !== undefined && ctx.query.beforeID
+            ? {
+                startedAt: ctx.query.beforeStartedAt,
+                id: ctx.query.beforeID,
+              }
+            : undefined
+        const page = yield* oxpInspection.invocations({
+          activityID: ctx.params.activityID,
+          limit: ctx.query.limit,
+          ...(before ? { before } : {}),
+        })
+        const links = new Map<string, OxpActivityInspection.InvocationLink[]>()
+        for (const link of page.links) {
+          const rows = links.get(link.invocation_id)
+          if (rows) rows.push(link)
+          else links.set(link.invocation_id, [link])
+        }
+        return {
+          items: page.items.map((row) =>
+            projectOxpInvocation(row, links.get(row.id) ?? []),
+          ),
+          more: page.more,
+          ...(page.before ? { before: page.before } : {}),
+        }
+      },
+    )
+
+    const oxpResource = Effect.fn("GlobalHttpApi.oxpResource")(
+      function* (ctx: { query: typeof GlobalOxpResourceQuery.Type }) {
+        return yield* oxpInspection.resource({
+          kind: ctx.query.kind,
+          ref: ctx.query.ref,
+          limit: ctx.query.limit,
+        })
+      },
+    )
+
+    const oxpActivityUpdate = Effect.fn("GlobalHttpApi.oxpActivityUpdate")(
+      function* (ctx: {
+        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+        payload: typeof GlobalOxpActivityPatch.Type
+      }) {
+        let changed = false
+        if (ctx.payload.title !== undefined || ctx.payload.clearTitle === true) {
+          const title =
+            ctx.payload.clearTitle === true || !ctx.payload.title?.trim()
+              ? undefined
+              : ctx.payload.title.trim()
+          changed =
+            (yield* oxpActivity.rename(ctx.params.activityID, title)) || changed
+        }
+        if (ctx.payload.archived !== undefined) {
+          changed =
+            (yield* oxpActivity.archive(
+              ctx.params.activityID,
+              ctx.payload.archived,
+            )) || changed
+        }
+        return changed
+      },
+    )
+
+    const oxpActivityDelete = Effect.fn("GlobalHttpApi.oxpActivityDelete")(
+      function* (ctx: {
+        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+      }) {
+        return {
+          deleted: yield* oxpActivity.deleteHistory(ctx.params.activityID),
+        }
+      },
+    )
 
     const projectList = Effect.fn("GlobalHttpApi.projects")(function* () {
       const projects = yield* Project.Service
@@ -658,7 +842,10 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       const method = yield* installation.method()
       if (method === "unknown") {
         return HttpServerResponse.jsonUnsafe(
-          { success: false as const, error: "Unknown installation method" },
+          {
+            success: false as const,
+            error: `This OpenFork executable is externally managed. Install the matching OpenFork release from ${PRODUCT_RELEASES_URL}.`,
+          },
           { status: 400 },
         )
       }
@@ -688,7 +875,14 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handleRaw("event", event)
       .handle("eventInterest", eventInterest)
       .handle("sessionRoots", sessionRoots)
+      .handle("sessionGet", sessionGet)
       .handle("sessionTelemetry", sessionTelemetry)
+      .handle("oxpActivities", oxpActivities)
+      .handle("oxpActivityGet", oxpActivityGet)
+      .handle("oxpInvocations", oxpInvocations)
+      .handle("oxpResource", oxpResource)
+      .handle("oxpActivityUpdate", oxpActivityUpdate)
+      .handle("oxpActivityDelete", oxpActivityDelete)
       .handle("projects", projectList)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)

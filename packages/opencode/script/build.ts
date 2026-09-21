@@ -16,6 +16,7 @@ process.chdir(dir)
 const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
+import { PRODUCT_REPOSITORY } from "@opencode-ai/core/brand"
 import pkg from "../package.json"
 
 const singleFlag = process.argv.includes("--single")
@@ -259,7 +260,8 @@ if (Script.release) {
       await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
     }
   }
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${process.env.GH_REPO}`
+  const repository = process.env.GH_REPO ?? PRODUCT_REPOSITORY
+  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${repository}`
 }
 
 export { binaries }

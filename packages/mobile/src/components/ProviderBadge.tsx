@@ -5,7 +5,7 @@ const LABELS: Record<string, string> = {
   "claude-api": "Anthropic",
   claude: "Claude",
   openai: "OpenAI",
-  opencode: "OpenCode",
+  opencode: "OpenCode Zen",
   "opencode-go": "OpenCode Go",
   openrouter: "OpenRouter",
   xai: "xAI",

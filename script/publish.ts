@@ -4,6 +4,12 @@ import { Script } from "@opencode-ai/script"
 import { $ } from "bun"
 import { fileURLToPath } from "url"
 
+if (process.env.OPENFORK_ENABLE_STABLE_PUBLISH !== "1") {
+  throw new Error(
+    "OpenFork stable publishing is not configured. Use dev-pre-release.yml, or deliberately enable the audited stable pipeline with OPENFORK_ENABLE_STABLE_PUBLISH=1.",
+  )
+}
+
 console.log("=== publishing ===\n")
 
 const dir = fileURLToPath(new URL("..", import.meta.url))
@@ -57,12 +63,6 @@ if (Script.release && !Script.preview) {
   await $`git tag -d ${tag}`.nothrow()
   await $`git tag ${tag}`
   await $`git push origin refs/tags/${tag} --force-with-lease --no-verify`
-  await new Promise((resolve) => setTimeout(resolve, 5_000))
-  await $`git fetch origin`
-  await $`git checkout -B dev origin/dev`
-  await prepareReleaseFiles()
-  await $`git commit -am "sync release versions for ${tag}"`
-  await $`git push origin HEAD:dev --no-verify`
 }
 
 if (Script.release) {
