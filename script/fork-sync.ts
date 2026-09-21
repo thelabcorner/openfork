@@ -440,7 +440,11 @@ export function checkSnapshot(snap: PkgSnapshot, merged: PkgJson): string[] {
 }
 
 function snapshotPath(tag: string): string {
-  return join(REPO_ROOT, ".opencode", "cache", `fork-sync-${tag}.json`)
+  return join(REPO_ROOT, ".openfork", "cache", `fork-sync-${tag}.json`)
+}
+
+function snapshotDirectories(): string[] {
+  return [join(REPO_ROOT, ".openfork", "cache"), join(REPO_ROOT, ".opencode", "cache")]
 }
 
 function readJsonFile(path: string): any {
@@ -485,7 +489,7 @@ function cmdPreflight(tag: string): number {
     }
   }
   writeFileSync(snapshotPath(tag), JSON.stringify({ tag, snaps }, null, 2))
-  console.log(`preflight: ${tag} verified, tree clean, snapshot of ${snaps.length} manifests -> .opencode/cache/fork-sync-${tag}.json`)
+  console.log(`preflight: ${tag} verified, tree clean, snapshot of ${snaps.length} manifests -> .openfork/cache/fork-sync-${tag}.json`)
   console.log(git("diff", "--stat", `main...${tag}`, "--", "packages/app", "packages/desktop", "packages/opencode", "packages/core",
     "packages/schema", "packages/protocol", "packages/server", "packages/session-ui", "packages/ui").out || "(no KEEP-path changes)")
   console.log(`next: git merge ${tag}`)
@@ -494,19 +498,21 @@ function cmdPreflight(tag: string): number {
 
 function loadSnapshots(): PkgSnapshot[] {
   let best: PkgSnapshot[] = []
-  let cacheDir: string[] = []
-  try {
-    cacheDir = readdirSync(join(REPO_ROOT, ".opencode", "cache"))
-  } catch {
-    return best
-  }
-  for (const entry of cacheDir) {
-    if (!entry.startsWith("fork-sync-") || !entry.endsWith(".json")) continue
+  for (const dir of snapshotDirectories()) {
+    let cacheDir: string[] = []
     try {
-      const data = readJsonFile(join(REPO_ROOT, ".opencode", "cache", entry))
-      if (Array.isArray(data.snaps) && data.snaps.length >= best.length) best = data.snaps
+      cacheDir = readdirSync(dir)
     } catch {
-      /* ignore malformed snapshots */
+      continue
+    }
+    for (const entry of cacheDir) {
+      if (!entry.startsWith("fork-sync-") || !entry.endsWith(".json")) continue
+      try {
+        const data = readJsonFile(join(dir, entry))
+        if (Array.isArray(data.snaps) && data.snaps.length >= best.length) best = data.snaps
+      } catch {
+        /* ignore malformed snapshots */
+      }
     }
   }
   return best
@@ -787,17 +793,141 @@ function cmdVerify(tag?: string): number {
         const missing: string[] = []
         if (!fileContains("packages/opencode/src/agent/agent.ts", 'name: "yolo"')) missing.push("native yolo agent")
         if (!fileContains("packages/opencode/src/tool/shell.ts", "catastrophicDeleteReason")) missing.push("catastrophic shell guard")
-        if (!fileContains("packages/opencode/script/install-jetbrains-acp.ts", "OpenCode (OpenFork)")) missing.push("JetBrains installer")
+        if (!fileContains("packages/opencode/script/install-jetbrains-acp.ts", 'AGENT_NAME = "OpenFork"')) missing.push("JetBrains installer")
         if (!fileContains("packages/opencode/src/tool/registry.ts", "CheckpointTool")) missing.push("checkpoint tool")
         return missing.length > 0 ? `JetBrains ACP integration missing: ${missing.join(", ")}` : undefined
       },
     },
     {
       name: "updater stays fork-pinned",
-      run: () =>
-        fileContains("packages/desktop/src/main/constants.ts", "UPDATER_ENABLED = false")
-          ? undefined
-          : "UPDATER_ENABLED = false missing from desktop constants",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/desktop/src/main/constants.ts", "UPDATER_ENABLED = false")) missing.push("disabled gate")
+        if (!fileContains("packages/desktop/electron-builder.config.ts", 'owner: "thelabcorner"')) missing.push("OpenFork owner")
+        if (!fileContains("packages/desktop/electron-builder.config.ts", 'repo: "openfork"')) missing.push("OpenFork repo")
+        return missing.length > 0 ? `Desktop updater fork pin missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
+      name: "OpenFork distribution boundary",
+      run: () => {
+        const failures: string[] = []
+        const read = (path: string) => {
+          try {
+            return readFileSync(join(REPO_ROOT, path), "utf8")
+          } catch {
+            failures.push(`unreadable ${path}`)
+            return ""
+          }
+        }
+        const installation = read("packages/opencode/src/installation/index.ts")
+        for (const forbidden of [
+          "https://opencode.ai/install",
+          "api.github.com/repos/anomalyco/opencode/releases",
+          "registry.npmjs.org/opencode-ai",
+          "anomalyco/tap/opencode",
+          "ScoopInstaller/Main/master/bucket/opencode.json",
+          "community.chocolatey.org/api/v2/Packages",
+        ]) {
+          if (installation.includes(forbidden)) failures.push(`CLI updater contains upstream distribution marker: ${forbidden}`)
+        }
+        if (!installation.includes("PRODUCT_REPOSITORY_API_URL")) failures.push("CLI updater missing fork-owned release API")
+        if (!installation.includes('export type Method = "curl" | "unknown"'))
+          failures.push("CLI updater regained an unowned package-manager method")
+
+        const wsl = read("packages/desktop/src/main/wsl/runtime.ts")
+        if (!wsl.includes("github.com/thelabcorner/openfork/releases/download"))
+          failures.push("WSL installer is not pinned to OpenFork releases")
+        if (wsl.includes("opencode.ai/install")) failures.push("WSL installer regained upstream install script")
+
+        const releaseScript = read("script/release")
+        if (!releaseScript.includes("dev-pre-release.yml")) failures.push("release entry point missing OpenFork workflow")
+        if (releaseScript.includes("publish.yml")) failures.push("release entry point regained upstream publish workflow")
+
+        const versioning = read("packages/script/src/index.ts")
+        if (versioning.includes("registry.npmjs.org/opencode-ai/latest"))
+          failures.push("release versioning regained upstream npm source")
+        if (!versioning.includes('REPOSITORY = process.env.GH_REPO ?? "thelabcorner/openfork"'))
+          failures.push("release versioning missing OpenFork repository default")
+
+        const build = read("packages/opencode/script/build.ts")
+        if (!build.includes('PRODUCT_REPOSITORY } from "@opencode-ai/core/brand"'))
+          failures.push("CLI release upload missing canonical OpenFork repository owner")
+        if (build.includes("--repo ${process.env.GH_REPO}"))
+          failures.push("CLI release upload can resolve to an undefined repository")
+
+        const stablePublish = read("script/publish.ts")
+        if (!stablePublish.includes('OPENFORK_ENABLE_STABLE_PUBLISH !== "1"'))
+          failures.push("stable publish pipeline is not fail-closed")
+        if (stablePublish.includes("origin/dev")) failures.push("stable publish pipeline regained upstream dev-branch mutation")
+
+        for (const path of [
+          "packages/opencode/script/publish.ts",
+          "packages/plugin/script/publish.ts",
+          "packages/sdk/js/script/publish.ts",
+          "packages/ui/script/publish.ts",
+        ]) {
+          const source = read(path)
+          if (source.includes("npm publish") && !source.includes("publishUpstreamNpmNamespace"))
+            failures.push(`${path} can publish an upstream npm namespace without an explicit fork gate`)
+        }
+
+        return failures.length > 0 ? `Distribution boundary broken: ${failures.join("; ")}` : undefined
+      },
+    },
+    {
+      name: "OpenFork product branding boundary",
+      run: () => {
+        const failures: string[] = []
+        const read = (path: string) => {
+          try {
+            return readFileSync(join(REPO_ROOT, path), "utf8")
+          } catch {
+            failures.push(`unreadable ${path}`)
+            return ""
+          }
+        }
+
+        const metainfo = read("packages/desktop/scripts/copy-metainfo.ts")
+        if (metainfo.includes("raw.githubusercontent.com/anomalyco/opencode"))
+          failures.push("Linux metainfo regained an upstream OpenCode promotional asset")
+
+        const appHelpers = read("packages/app/src/pages/layout/helpers.ts")
+        if (appHelpers.includes("https://opencode.ai/favicon.svg"))
+          failures.push("project avatars regained the upstream OpenCode product favicon")
+
+        const githubCommand = read("packages/opencode/src/cli/cmd/github.ts")
+        if (!githubCommand.includes("does not currently publish a first-party GitHub Action/GitHub App installer"))
+          failures.push("GitHub installer is no longer explicitly fail-closed")
+        const githubHandler = read("packages/opencode/src/cli/cmd/github.handler.ts")
+        if (githubHandler.includes("anomalyco/opencode/github@"))
+          failures.push("GitHub installer/runtime regained the upstream OpenCode Action")
+        if (githubHandler.includes("github.com/apps/opencode-agent"))
+          failures.push("GitHub installer regained the upstream OpenCode GitHub App")
+        for (const stale of ["[opencode session]", "Sending message to opencode", "opencode infrastructure"]) {
+          if (githubHandler.includes(stale)) failures.push(`GitHub runtime regained stale product copy: ${stale}`)
+        }
+
+        const v1Config = read("packages/core/src/v1/config/config.ts")
+        if (v1Config.includes("https://opencode.ai/docs/commands") || v1Config.includes("https://opencode.ai/docs/agents"))
+          failures.push("V1 config schema regained upstream OpenCode product documentation links")
+
+        const providerCli = read("packages/opencode/src/cli/cmd/providers.ts")
+        if (providerCli.includes("https://opencode.ai/docs/providers"))
+          failures.push("provider CLI regained upstream OpenCode product documentation links")
+
+        const protocolApi = read("packages/protocol/src/api.ts")
+        if (!protocolApi.includes('title: "OpenFork HttpApi"') || protocolApi.includes('title: "opencode HttpApi"'))
+          failures.push("local Protocol API metadata is not branded OpenFork")
+
+        const legacySdk = read("packages/sdk/js/src/gen/types.gen.ts")
+        if (legacySdk.includes("Automatically update to the latest version"))
+          failures.push("frozen V1 SDK regained stale upstream autoupdate documentation")
+        if (legacySdk.includes("https://opencode.ai/docs/commands") || legacySdk.includes("https://opencode.ai/docs/agent"))
+          failures.push("frozen V1 SDK regained upstream OpenCode product documentation links")
+
+        return failures.length > 0 ? `Branding boundary broken: ${failures.join("; ")}` : undefined
+      },
     },
     {
       name: "core memory export resolvable",
@@ -833,12 +963,12 @@ function cmdVerify(tag?: string): number {
       },
     },
     {
-      name: "websearch union (fork engines + upstream)",
+      name: "websearch adopted engines",
       run: () => {
         if (!fileContains("packages/opencode/src/tool/websearch.ts", "SearxngWebSearch"))
-          return "fork SearxngWebSearch engine missing from websearch.ts (union dropped fork engines)"
+          return "fork SearxngWebSearch engine missing from websearch.ts"
         if (!fileContains("packages/opencode/src/tool/websearch.ts", "McpWebSearch"))
-          return "upstream McpWebSearch engine missing from websearch.ts (union dropped upstream engines)"
+          return "explicitly adopted McpWebSearch engine missing from websearch.ts"
         return undefined
       },
     },
@@ -860,7 +990,7 @@ function cmdVerify(tag?: string): number {
         }
       }
     } catch {
-      failures.push(`no preflight snapshot at .opencode/cache/fork-sync-${tag}.json — run fork:sync preflight next time`)
+      failures.push(`no preflight snapshot at .openfork/cache/fork-sync-${tag}.json — run fork:sync preflight next time`)
     }
   }
 

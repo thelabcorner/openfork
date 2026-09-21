@@ -1,5 +1,11 @@
 # OpenCode V2 Effect Plugin API
 
+> **OpenFork compatibility note:** this document describes plugin infrastructure
+> inherited and forked inside OpenFork. It is **not** a promise that plugins written
+> for upstream OpenCode will work in OpenFork. OpenFork owns this local plugin
+> surface and may diverge. Cross-product plugin support exists only when explicitly
+> tested and documented.
+
 The Effect plugin API grants plugins two in-process capabilities:
 
 - `hook` installs behavior at an OpenCode extension point.

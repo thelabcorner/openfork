@@ -21,6 +21,7 @@ ts-dist
 refs
 Session.vim
 /opencode.json
+/openfork.json
 a.out
 target
 .scripts
@@ -45,10 +46,13 @@ logs/
 tsconfig.tsbuildinfo
 
 # Agent swarm databases (local-only, never commit)
+.openfork/swarms/*.chunkdb*
 .opencode/swarms/*.chunkdb*
 # Unified file indexes now live in Global.data/file-index/ (SQLite + JSON).
-# Legacy repo-local Brotli copy and any future .opencode file-index artifacts
-# must stay untracked — they are derived caches, not source.
+# Repo-local file-index artifacts are derived caches, not source. `.opencode`
+# entries are retained only to ignore leftovers from pre-OpenFork layouts.
+.openfork/file-index*
+.openfork/*.br
 .opencode/file-index*
 .opencode/*.br
 
@@ -66,7 +70,13 @@ workbuddy-usage-forensics.tar.br
 *.tar.br
 .opencode.json
 
+# Legacy repo-local OpenCode namespace. Canonical fork-owned source lives in
+# `.openfork/`; any remaining `.opencode/` content is migration residue only.
+.opencode/
+
 # Local analysis, replay, benchmark, and hot-reload artifacts
+.openfork/cache/
+.openfork/hot-reload-status.json
 .opencode/cache/
 .opencode/hot-reload-status.json
 .tmp-chunkdb-bench/
@@ -77,5 +87,6 @@ packages/opencode/.tmp-spad-*
 # Root-level OneOff SPAD reasoning-analysis scratch scripts (write to the
 # operator's Downloads dir; local forensics only, never source).
 .tmp-spad-*
+packages/opencode/.openfork-runtime-locks/
 packages/opencode/.opencode-runtime-locks/
 packages/browser-visual/.interop-*/

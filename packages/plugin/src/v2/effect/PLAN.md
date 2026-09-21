@@ -1,5 +1,10 @@
 # V2 Plugin System Implementation Plan
 
+> **OpenFork note:** this is a local OpenFork plugin architecture plan derived from
+> upstream work. It does not establish compatibility with upstream OpenCode plugins.
+> OpenFork and OpenCode are separate plugin surfaces unless a specific integration is
+> explicitly tested and supported.
+
 ## Status
 
 This document describes the agreed target design for the V2 plugin system. It is an implementation plan, not documentation for the current API.

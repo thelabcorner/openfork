@@ -123,9 +123,9 @@ export function targetFiles(locale: Locale) {
 }
 
 export function glossaryFile(locale: Locale) {
-  if (locale === "zh") return ".opencode/glossary/zh-cn.md"
-  if (locale === "zht") return ".opencode/glossary/zh-tw.md"
-  return `.opencode/glossary/${locale}.md`
+  if (locale === "zh") return ".openfork/glossary/zh-cn.md"
+  if (locale === "zht") return ".openfork/glossary/zh-tw.md"
+  return `.openfork/glossary/${locale}.md`
 }
 
 export function findDrift(source: Dictionary, target: Dictionary, locale?: Locale) {
@@ -160,17 +160,17 @@ export function findDrift(source: Dictionary, target: Dictionary, locale?: Local
 
 export function sessionIDFromEvents(output: string) {
   const match = output.match(/"sessionID"\s*:\s*"([^"]+)"/)
-  if (!match?.[1]) throw new Error("OpenCode did not report a session ID.")
+  if (!match?.[1]) throw new Error("OpenFork did not report a session ID.")
   return match[1]
 }
 
 export function sessionModels(value: unknown) {
   if (!isRecord(value) || !Array.isArray(value.messages))
-    throw new Error("OpenCode returned an invalid session export.")
+    throw new Error("OpenFork returned an invalid session export.")
   return value.messages.flatMap((message) => {
     if (!isRecord(message) || !isRecord(message.info) || message.info.role !== "assistant") return []
     if (typeof message.info.providerID !== "string" || typeof message.info.modelID !== "string") {
-      throw new Error("OpenCode session export omitted the assistant model.")
+      throw new Error("OpenFork session export omitted the assistant model.")
     }
     return [
       {
@@ -253,10 +253,10 @@ Usage: bun run translate:app -- <locale|all> [options]
 Synchronizes product app translations with the English app, UI, and desktop dictionaries.
 
 Options:
-  -c, --concurrency <count>  Maximum parallel OpenCode runs for 'all' (default: 4)
-      --model <provider/id>  OpenCode model (default: opencode/gpt-5.5)
+  -c, --concurrency <count>  Maximum parallel OpenFork runs for 'all' (default: 4)
+      --model <provider/id>  OpenFork model (default: opencode/gpt-5.5)
       --variant <name>       Model variant (default: xhigh)
-      --dry-run              Report drift without running OpenCode
+      --dry-run              Report drift without running OpenFork
       --check                Exit nonzero when translation drift exists
   -h, --help                 Show this help message
 

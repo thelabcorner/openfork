@@ -1,5 +1,8 @@
 #!/usr/bin/env bun
 
+const REPOSITORY = process.env.GH_REPO ?? "thelabcorner/openfork"
+const NPM_PACKAGE = process.env.OPENFORK_NPM_PACKAGE?.trim()
+
 async function sendToPostHog(event: string, properties: Record<string, any>) {
   const key = process.env["POSTHOG_KEY"]
 
@@ -73,7 +76,7 @@ async function fetchReleases(): Promise<Release[]> {
   const per = 100
 
   while (true) {
-    const url = `https://api.github.com/repos/anomalyco/opencode/releases?page=${page}&per_page=${per}`
+    const url = `https://api.github.com/repos/${REPOSITORY}/releases?page=${page}&per_page=${per}`
 
     const response = await fetch(url)
     if (!response.ok) {
@@ -188,16 +191,19 @@ async function save(githubTotal: number, npmDownloads: number) {
   )
 }
 
-console.log("Fetching GitHub releases for anomalyco/opencode...\n")
+console.log(`Fetching GitHub releases for ${REPOSITORY}...\n`)
 
 const releases = await fetchReleases()
 console.log(`\nFetched ${releases.length} releases total\n`)
 
 const { total: githubTotal } = calculate(releases)
 
-console.log("Fetching npm all-time downloads for opencode-ai...\n")
-const npmDownloads = await fetchNpmDownloads("opencode-ai")
-console.log(`Fetched npm all-time downloads: ${npmDownloads.toLocaleString()}\n`)
+const npmDownloads = NPM_PACKAGE ? await fetchNpmDownloads(NPM_PACKAGE) : 0
+if (NPM_PACKAGE) {
+  console.log(`Fetched npm all-time downloads for ${NPM_PACKAGE}: ${npmDownloads.toLocaleString()}\n`)
+} else {
+  console.log("Skipping npm download stats: OPENFORK_NPM_PACKAGE is not configured.\n")
+}
 
 await save(githubTotal, npmDownloads)
 

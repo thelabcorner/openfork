@@ -30,21 +30,25 @@ const CHANNEL = await (async () => {
   return await $`git branch --show-current`.text().then((x) => x.trim())
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
+const REPOSITORY = process.env.GH_REPO ?? "thelabcorner/openfork"
 
 const VERSION = await (async () => {
   if (env.OPENCODE_VERSION) return env.OPENCODE_VERSION
   if (IS_PREVIEW) return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
-  const version = await fetch("https://registry.npmjs.org/opencode-ai/latest")
+  const version = await fetch(`https://api.github.com/repos/${REPOSITORY}/releases/latest`, {
+    headers: { "User-Agent": "openfork-release-script" },
+  })
     .then((res) => {
       if (!res.ok) throw new Error(res.statusText)
       return res.json()
     })
-    .then((data: any) => data.version)
-  const [major, minor, patch] = version.split(".").map((x: string) => Number(x) || 0)
+    .then((data: any) => String(data.tag_name ?? "").replace(/^v/, ""))
+  const parsed = semver.parse(version)
+  if (!parsed) throw new Error(`Latest OpenFork release tag is not semver: ${version || "<empty>"}`)
   const t = env.OPENCODE_BUMP?.toLowerCase()
-  if (t === "major") return `${major + 1}.0.0`
-  if (t === "minor") return `${major}.${minor + 1}.0`
-  return `${major}.${minor}.${patch + 1}`
+  if (t === "major") return `${parsed.major + 1}.0.0`
+  if (t === "minor") return `${parsed.major}.${parsed.minor + 1}.0`
+  return `${parsed.major}.${parsed.minor}.${parsed.patch + 1}`
 })()
 
 const bot = ["actions-user", "opencode", "opencode-agent[bot]"]
@@ -75,5 +79,8 @@ export const Script = {
   get team() {
     return team
   },
+  get publishUpstreamNpmNamespace() {
+    return process.env.OPENFORK_PUBLISH_UPSTREAM_NPM_NAMESPACE === "1"
+  },
 }
-console.log(`opencode script`, JSON.stringify(Script, null, 2))
+console.log(`openfork script`, JSON.stringify(Script, null, 2))

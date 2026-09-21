@@ -6,6 +6,11 @@ import { fileURLToPath } from "url"
 const dir = fileURLToPath(new URL("..", import.meta.url))
 process.chdir(dir)
 
+if (!Script.publishUpstreamNpmNamespace) {
+  console.log("Skipping plugin npm publication: OpenFork does not publish the upstream @opencode-ai namespace.")
+  process.exit(0)
+}
+
 async function published(name: string, version: string) {
   return (await $`npm view ${name}@${version} version`.nothrow()).exitCode === 0
 }

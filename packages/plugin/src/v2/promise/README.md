@@ -1,5 +1,11 @@
 # OpenCode V2 Promise Plugin API
 
+> **OpenFork compatibility note:** this document describes plugin infrastructure
+> inherited and forked inside OpenFork. It is **not** a promise that plugins written
+> for upstream OpenCode will work in OpenFork. OpenFork owns this local plugin
+> surface and may diverge. Cross-product plugin support exists only when explicitly
+> tested and documented.
+
 The Promise plugin API is the async/await equivalent of `@opencode-ai/plugin/v2/effect`. It grants plugins the same two in-process capabilities:
 
 - `hook` installs behavior at an OpenCode extension point.
