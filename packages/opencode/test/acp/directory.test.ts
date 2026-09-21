@@ -169,6 +169,45 @@ describe("ACP directory snapshot", () => {
     }).pipe(Effect.provide(fakeLayer([]))),
   )
 
+  it.effect("keeps System One models out of conversational options and defaults", () =>
+    Effect.sync(() => {
+      const providerID = ProviderV2.ID.make("opencode")
+      const languageID = ModelV2.ID.make("gpt-5")
+      const semanticID = ModelV2.ID.make("jev-1.13")
+      const language = model(providerID, languageID, { high: { reasoningEffort: "high" } })
+      const semantic = {
+        ...model(providerID, semanticID, { semantic: {} }),
+        primitive: "system-one" as const,
+      }
+      const providers = {
+        [providerID]: {
+          id: providerID,
+          name: "OpenCode",
+          source: "api" as const,
+          env: [],
+          options: {},
+          models: {
+            [languageID]: language,
+            [semanticID]: semantic,
+          },
+        },
+      }
+
+      const result = Directory.build({
+        directory: "alpha",
+        providers,
+        modes: [{ id: "build", name: "Build" }],
+        defaultModeID: "build",
+        commands: [],
+        defaultModel: { providerID, modelID: semanticID },
+      })
+
+      expect(result.modelOptions.map((item) => item.modelID)).toEqual([languageID])
+      expect(result.variantsByModel[Directory.modelKey({ providerID, modelID: semanticID })]).toBeUndefined()
+      expect(result.defaultModel).toBeUndefined()
+    }),
+  )
+
   it.effect("falls back when the default mode is not available", () =>
     Effect.sync(() => {
       expect(

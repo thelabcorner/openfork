@@ -3,6 +3,7 @@ import { homedir, tmpdir } from "os"
 import { join, resolve, sep } from "path"
 import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { WorkBuddyEntitlementGovernor } from "./workbuddy-governor"
+import { Global } from "@opencode-ai/core/global"
 
 // Very similar to workbuddy-accounts.ts — verdent's multi-account vault/registry/router.
 // Reverse-engineered from Verdent 2.12.3 ASAR (dist/index.mjs):
@@ -56,9 +57,9 @@ export type StoredVerdentCredential = Omit<VerdentCredential, "path"> & {
 }
 
 function verdentVaultRoot(): string {
-  // Keep verdent vault inside opencode's home to avoid colliding with
+  // Keep the Verdent vault inside OpenFork-owned data to avoid colliding with
   // Verdent desktop's single `~/.verdent/agent/auth.json`.
-  return join(homedir(), ".opencode", "verdent")
+  return join(Global.Path.data, "verdent")
 }
 
 function decodeJwtPayloadText(token: string): string | undefined {

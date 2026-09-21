@@ -105,13 +105,15 @@ it.instance(
   },
 )
 
-it.instance("plan agent denies edits except .opencode/plans/*", () =>
+it.instance("plan agent allows canonical OpenFork plans and the legacy migration path", () =>
   Effect.gen(function* () {
     const plan = yield* load((svc) => svc.get("plan"))
     expect(plan).toBeDefined()
     // Wildcard is denied
     expect(evalPerm(plan, "edit")).toBe("deny")
-    // But specific path is allowed
+    // Canonical OpenFork plans are writable; the legacy path stays readable/editable
+    // only so existing plan sessions can complete during migration.
+    expect(Permission.evaluate("edit", ".openfork/plans/foo.md", plan!.permission).action).toBe("allow")
     expect(Permission.evaluate("edit", ".opencode/plans/foo.md", plan!.permission).action).toBe("allow")
   }),
 )
@@ -634,7 +636,7 @@ it.instance(
   () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
-      const skillDir = path.join(test.directory, ".opencode", "skill", "perm-skill")
+      const skillDir = path.join(test.directory, ".openfork", "skill", "perm-skill")
       yield* Effect.promise(() =>
         Bun.write(
           path.join(skillDir, "SKILL.md"),

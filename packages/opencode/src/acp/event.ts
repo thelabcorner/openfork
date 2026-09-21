@@ -12,6 +12,7 @@ import { Effect } from "effect"
 import { ACPSession } from "./session"
 import { ACPPermission } from "./permission"
 import { partsToContentChunks, type ReplayPart } from "./content"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import {
   duplicateRunningToolUpdate,
   errorToolUpdate,
@@ -121,6 +122,7 @@ export class Subscription {
 
   private async replayContentPart(message: SessionMessageResponse, part: Part) {
     if (part.type !== "text" && part.type !== "file" && part.type !== "reasoning") return
+    if (message.info.role === "user" && !SessionTurnProvenance.isSemanticUserInfo(message.info)) return
 
     const sessionUpdate =
       part.type === "reasoning"

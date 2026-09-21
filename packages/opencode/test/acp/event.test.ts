@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test"
 import type { AgentSideConnection } from "@agentclientprotocol/sdk"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import type { Event, Message, OpencodeClient, Part, SessionMessageResponse, ToolPart } from "@opencode-ai/sdk/v2"
 import { Effect, ManagedRuntime } from "effect"
 import { ACPEvent } from "@/acp/event"
@@ -204,6 +206,34 @@ function assistantMessage(sessionID: string, messageID: string, partID: string, 
   } satisfies SessionMessageResponse
 }
 
+function userTextMessage(
+  sessionID: string,
+  messageID: string,
+  text: string,
+  provenance?: ReturnType<typeof SessionTurnProvenance.user> | ReturnType<typeof SessionTurnProvenance.host>,
+) {
+  return {
+    info: {
+      id: messageID,
+      sessionID,
+      role: "user",
+      ...(provenance ? { provenance } : {}),
+      time: { created: Date.now() },
+      agent: "build",
+      model: { providerID: "provider", modelID: "model" },
+    },
+    parts: [
+      {
+        id: `${messageID}_text`,
+        sessionID,
+        messageID,
+        type: "text",
+        text,
+      },
+    ],
+  } satisfies SessionMessageResponse
+}
+
 function assistantToolMessage(part: ToolPart) {
   return {
     info: {
@@ -319,6 +349,42 @@ async function createKnownSession(
 }
 
 describe("acp event routing", () => {
+  it("does not replay host-owned provider-user turns as ACP user messages", async () => {
+    const harness = createHarness()
+    await Effect.runPromise(harness.session.create({ id: "ses_provenance", cwd: "/workspace" }))
+
+    await harness.subscription.replayMessage(
+      userTextMessage(
+        "ses_provenance",
+        "msg_host",
+        "continue the next worker cycle",
+        SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+          sourceMessageID: SessionV1.MessageID.make("msg_user_root"),
+        }),
+      ),
+    )
+    await harness.subscription.replayMessage(
+      userTextMessage(
+        "ses_provenance",
+        "msg_user",
+        "actual user request",
+        SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      ),
+    )
+
+    expect(
+      harness.updates
+        .map((item) => item.update)
+        .filter((item) => item.sessionUpdate === "user_message_chunk"),
+    ).toEqual([
+      {
+        sessionUpdate: "user_message_chunk",
+        messageId: "msg_user",
+        content: { type: "text", text: "actual user request" },
+      },
+    ])
+  })
+
   it("routes message.part.delta by sessionID without cross-session pollution", async () => {
     const harness = createHarness()
     await createKnownSession(harness.session, "ses_a", { messageId: "msg_a", partId: "part_a", partType: "text" })

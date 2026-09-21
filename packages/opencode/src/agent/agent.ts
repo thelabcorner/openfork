@@ -17,6 +17,7 @@ import { DEFAULT_PROMPT as PROMPT_TITLE } from "@opencode-ai/core/session/title-
 import { Permission } from "@/permission"
 import { mergeDeep } from "remeda"
 import { Global } from "@opencode-ai/core/global"
+import { LEGACY_PROJECT_CONFIG_DIRNAME, PROJECT_CONFIG_DIRNAME } from "@opencode-ai/core/storage-identity"
 import path from "path"
 import { Plugin } from "@/plugin"
 import { Skill } from "../skill"
@@ -46,6 +47,7 @@ export const Info = Schema.Struct({
     Schema.Struct({
       modelID: ModelV2.ID,
       providerID: ProviderV2.ID,
+      accountID: Schema.optional(Schema.String),
     }),
   ),
   variant: Schema.optional(Schema.String),
@@ -68,14 +70,14 @@ export interface Interface {
   readonly defaultAgent: () => Effect.Effect<string>
   readonly generate: (input: {
     description: string
-    model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
   }) => Effect.Effect<
     {
       identifier: string
       whenToUse: string
       systemPrompt: string
     },
-    Provider.DefaultModelError
+    Provider.DefaultModelError | Provider.UnsupportedModelPrimitiveError
   >
 }
 
@@ -170,7 +172,8 @@ const layer = Layer.effect(
                 },
                 edit: {
                   "*": "deny",
-                  [path.join(".opencode", "plans", "*.md")]: "allow",
+                  [path.join(PROJECT_CONFIG_DIRNAME, "plans", "*.md")]: "allow",
+                  [path.join(LEGACY_PROJECT_CONFIG_DIRNAME, "plans", "*.md")]: "allow",
                   [path.relative(ctx.worktree, path.join(Global.Path.data, path.join("plans", "*.md")))]: "allow",
                 },
               }),
@@ -382,11 +385,11 @@ const layer = Layer.effect(
       }),
       generate: Effect.fn("Agent.generate")(function* (input: {
         description: string
-        model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+        model?: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
       }) {
         const cfg = yield* config.get()
         const model = input.model ?? (yield* provider.defaultModel())
-        const resolved = yield* provider.getModel(model.providerID, model.modelID)
+        const resolved = yield* provider.getModel(model.providerID, model.modelID, input.model?.accountID)
         const language = yield* provider.getLanguage(resolved)
         const tracer = cfg.experimental?.openTelemetry
           ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))

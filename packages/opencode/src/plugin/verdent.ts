@@ -1429,7 +1429,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       return sendJson(res, 401, {
         error: {
           message:
-            "No Verdent desktop session found. Open the Verdent desktop app and sign in, then import that account into OpenCode.",
+            "No Verdent desktop session found. Open the Verdent desktop app and sign in, then import that account into OpenFork.",
           type: "authentication_error",
         },
       })
@@ -2763,7 +2763,7 @@ export async function VerdentPlugin(_input: PluginInput): Promise<Hooks> {
           async authorize() {
             return {
               url: "",
-              instructions: "Import the currently signed-in Verdent desktop account into OpenCode.",
+              instructions: "Import the currently signed-in Verdent desktop account into OpenFork.",
               method: "auto" as const,
               async callback() {
                 try {

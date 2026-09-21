@@ -24,6 +24,12 @@ import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MODEL_SONNET } from "@/claude/models"
+import {
+  resetZenPoolForTest,
+  setTestZenFetch,
+  setTestZenVaultCredentials,
+  zenLimitSnapshot,
+} from "@/plugin/zen"
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -52,6 +58,8 @@ const remove = (k: string) =>
   })
 
 afterEach(async () => {
+  setTestZenFetch(undefined)
+  resetZenPoolForTest()
   for (const [key, value] of originalEnv) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
@@ -87,6 +95,122 @@ const languageBaseURL = (language: unknown) => (language as { config: { baseURL:
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
+
+it.instance(
+  "discovers upstream-advertised free Jev during provider catalog assembly when models.dev lags Zen",
+  Effect.gen(function* () {
+    let discoveryCalls = 0
+    setTestZenVaultCredentials([{ apiKey: "jev-account-key", label: "Jev Account", isDefault: true }])
+    const accountID = zenLimitSnapshot()[0]!.accountId
+    setTestZenFetch(async (input) => {
+      discoveryCalls++
+      expect(String(input)).toBe("https://opencode.ai/zen/v1/models")
+      return new Response(
+        JSON.stringify({
+          object: "list",
+          data: [
+            { id: "gpt-5.6-sol", object: "model", owned_by: "opencode" },
+            { id: "jev-1.13-free", object: "model", owned_by: "opencode" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    })
+
+    const svc = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode")
+    const modelID = ModelV2.ID.make("jev-1.13-free")
+    const model = yield* svc.getModel(providerID, modelID)
+
+    expect(model.id).toBe(modelID)
+    expect(model.primitive).toBe("system-one")
+    expect(model.api).toEqual({
+      id: "jev-1.13-free",
+      url: "https://opencode.ai/zen/v1",
+      npm: "@ai-sdk/openai-compatible",
+    })
+    expect(model.cost).toEqual({ input: 0, output: 0, cache: { read: 0, write: 0 } })
+    expect(yield* svc.getModel(providerID, modelID)).toBe(model)
+    const accountModel = yield* svc.getModel(providerID, modelID, accountID)
+    const accountModelID = ModelV2.ID.make(`${modelID}@${accountID}`)
+    expect(accountModel.id).toBe(accountModelID)
+    expect(accountModel.name).toBe("Jev 1.13 Free (Jev Account)")
+    expect(accountModel.primitive).toBe("system-one")
+    expect(accountModel.api.id).toBe(accountModelID)
+    expect(discoveryCalls).toBe(1)
+    expect((yield* svc.getProvider(providerID)).models[modelID]).toBe(model)
+    expect((yield* svc.getProvider(providerID)).models[accountModelID]).toBe(accountModel)
+  }),
+  {
+    config: {
+      provider: {
+        opencode: {
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+  15_000,
+)
+
+it.instance(
+  "fails closed when Zen does not advertise the free Jev compatibility model",
+  Effect.gen(function* () {
+    setTestZenFetch(async () =>
+      new Response(JSON.stringify({ object: "list", data: [{ id: "gpt-5.6-sol", object: "model" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    )
+
+    const svc = yield* Provider.Service
+    const error = yield* svc
+      .getModel(ProviderV2.ID.make("opencode"), ModelV2.ID.make("jev-1.13-free"))
+      .pipe(Effect.flip)
+
+    expect(error).toBeInstanceOf(Provider.ModelNotFoundError)
+  }),
+  {
+    config: {
+      provider: {
+        opencode: {
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+  15_000,
+)
+
+it.instance(
+  "does not probe Zen discovery when the provider catalog already contains free Jev",
+  Effect.gen(function* () {
+    let discoveryCalls = 0
+    setTestZenFetch(async () => {
+      discoveryCalls++
+      return new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 })
+    })
+
+    const svc = yield* Provider.Service
+    const model = yield* svc.getModel(ProviderV2.ID.make("opencode"), ModelV2.ID.make("jev-1.13-free"))
+
+    expect(Provider.modelPrimitive(model)).toBe("system-one")
+    expect(discoveryCalls).toBe(0)
+  }),
+  {
+    config: {
+      provider: {
+        opencode: {
+          options: { apiKey: "test-key" },
+          models: {
+            "jev-1.13-free": { name: "Jev 1.13 Free", primitive: "system-one" },
+          },
+        },
+      },
+    },
+  },
+  15_000,
+)
 
 const alphaProviderConfig = {
   provider: {
@@ -153,6 +277,115 @@ it.instance("claude subscription getLanguage does not InitError", () =>
     expect(language).toBeDefined()
     expect(language.specificationVersion).toBe("v3")
   }),
+)
+
+it.instance(
+  "system-one models never enter language-model resolution or language auto-selection",
+  Effect.gen(function* () {
+    const svc = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("semantic-test")
+    const semanticID = ModelV2.ID.make("jev-test")
+    const languageID = ModelV2.ID.make("chat-test")
+    const semantic = yield* svc.getModel(providerID, semanticID)
+
+    expect(Provider.modelPrimitive(semantic)).toBe("system-one")
+    const error = yield* svc.getLanguage(semantic).pipe(Effect.flip)
+    expect(error).toBeInstanceOf(Provider.UnsupportedModelPrimitiveError)
+    expect(error.message).toContain("cannot be used as a language model")
+
+    expect(yield* svc.closest(providerID, ["jev"])).toBeUndefined()
+    expect(yield* svc.closest(providerID, ["chat"])).toEqual({ providerID, modelID: languageID })
+  }),
+  {
+    config: {
+      provider: {
+        "semantic-test": {
+          name: "Semantic Test",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://example.invalid/v1",
+          options: { apiKey: "test-key" },
+          models: {
+            "jev-test": { name: "Jev Test", primitive: "system-one" },
+            "chat-test": { name: "Chat Test", primitive: "language" },
+          },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "system-one models cannot be configured as the housekeeping small model",
+  Effect.gen(function* () {
+    const svc = yield* Provider.Service
+    expect(yield* svc.getSmallModel(ProviderV2.ID.make("semantic-test"))).toBeUndefined()
+  }),
+  {
+    config: {
+      small_model: "semantic-test/jev-test",
+      provider: {
+        "semantic-test": {
+          name: "Semantic Test",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://example.invalid/v1",
+          options: { apiKey: "test-key" },
+          models: {
+            "jev-test": { name: "Jev Test", primitive: "system-one" },
+          },
+        },
+      },
+    },
+  },
+)
+
+test("default model projection excludes System One-only providers", () => {
+  expect(
+    Provider.defaultModelIDs({
+      semantic: {
+        models: {
+          jev: { id: "jev-1.13", primitive: "system-one" },
+        },
+      },
+      mixed: {
+        models: {
+          jev: { id: "jev-1.13", primitive: "system-one" },
+          chat: { id: "gpt-5.6", primitive: "language" },
+        },
+      },
+    }),
+  ).toEqual({ mixed: "gpt-5.6" })
+})
+
+it.instance(
+  "explicit System One config rows stay out of language-model selection",
+  Effect.gen(function* () {
+    const svc = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode-go")
+    const modelID = ModelV2.ID.make("jev-1.13")
+    const model = yield* svc.getModel(providerID, modelID)
+
+    expect(Provider.modelPrimitive(model)).toBe("system-one")
+    expect(model.api.url).toBe("https://opencode.ai/zen/go/v1")
+    const error = yield* svc.getLanguage(model).pipe(Effect.flip)
+    expect(error).toBeInstanceOf(Provider.UnsupportedModelPrimitiveError)
+    expect(error.message).toContain("cannot be used as a language model")
+    expect(yield* svc.closest(providerID, ["jev"])).toBeUndefined()
+  }),
+  {
+    config: {
+      provider: {
+        "opencode-go": {
+          name: "OpenCode Go",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://opencode.ai/zen/go/v1",
+          options: { apiKey: "go-test-key" },
+          models: {
+            "jev-1.13": { name: "Jev 1.13", primitive: "system-one" },
+          },
+        },
+      },
+    },
+  },
 )
 
 it.instance(
@@ -399,6 +632,60 @@ it.instance(
     expect(String(model.modelID)).toBe("claude-sonnet-4-20250514")
   }),
   { config: { model: "anthropic/claude-sonnet-4-20250514" } },
+)
+
+it.instance(
+  "defaultModel skips a configured non-language primitive and selects a conversational model",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.defaultModel()
+    expect(String(model.providerID)).toBe("semantic-test")
+    expect(String(model.modelID)).toBe("chat-test")
+  }),
+  {
+    config: {
+      model: "semantic-test/jev-test",
+      provider: {
+        "semantic-test": {
+          name: "Semantic Test",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://example.invalid/v1",
+          options: { apiKey: "test-key" },
+          models: {
+            "jev-test": { name: "Jev Test", primitive: "system-one" },
+            "chat-test": { name: "Chat Test", primitive: "language" },
+          },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "defaultModel skips embedding-shaped plugin models that lack primitive metadata",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.defaultModel()
+    expect(String(model.providerID)).toBe("local-test")
+    expect(String(model.modelID)).toBe("chat-test")
+  }),
+  {
+    config: {
+      model: "local-test/text-embedding-nomic-embed-text-v1.5",
+      provider: {
+        "local-test": {
+          name: "Local Test",
+          npm: "@ai-sdk/openai-compatible",
+          api: "http://127.0.0.1:1234/v1",
+          options: { apiKey: "test-key" },
+          models: {
+            "text-embedding-nomic-embed-text-v1.5": {
+              name: "Nomic Embed Text v1.5",
+            },
+            "chat-test": { name: "Chat Test" },
+          },
+        },
+      },
+    },
+  },
 )
 
 it.instance(
@@ -1397,9 +1684,9 @@ it.instance(
   Effect.gen(function* () {
     const providers = yield* list
     expect(providers[ProviderV2.ID.make("nvidia")].options.headers).toEqual({
-      "HTTP-Referer": "https://opencode.ai/",
-      "X-Title": "opencode",
-      "X-BILLING-INVOKE-ORIGIN": "OpenCode",
+      "HTTP-Referer": "https://github.com/thelabcorner/openfork",
+      "X-Title": "OpenFork",
+      "X-BILLING-INVOKE-ORIGIN": "OpenFork",
     })
   }),
   { config: { provider: { nvidia: { options: { apiKey: "test-api-key" } } } } },
@@ -1410,9 +1697,9 @@ it.instance(
   Effect.gen(function* () {
     const providers = yield* list
     expect(providers[ProviderV2.ID.make("nvidia")].options.headers).toEqual({
-      "HTTP-Referer": "https://opencode.ai/",
-      "X-Title": "opencode",
-      "X-BILLING-INVOKE-ORIGIN": "OpenCode",
+      "HTTP-Referer": "https://github.com/thelabcorner/openfork",
+      "X-Title": "OpenFork",
+      "X-BILLING-INVOKE-ORIGIN": "OpenFork",
     })
   }),
   { config: { provider: { nvidia: { options: { apiKey: "test-api-key", baseURL: "http://localhost:8000/v1" } } } } },

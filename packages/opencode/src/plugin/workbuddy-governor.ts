@@ -134,7 +134,7 @@ export type EntitlementState =
   | "ACCOUNT_FORBIDDEN"
   | "UPSTREAM_DEGRADED"
 
-export type AdmissionKind = "window" | "quota" | "cooldown" | "queue" | "cancel" | "duplicate" | "forbidden"
+export type AdmissionKind = "window" | "quota" | "cooldown" | "queue" | "cancel" | "duplicate" | "forbidden" | "auth"
 
 export class AdmissionError extends Error {
   constructor(
@@ -216,7 +216,14 @@ export type RunGenerationOpts = {
 }
 
 export type GenerationLease = { release: () => void }
-export type RunGenerationResult = { res: Response; committed: boolean; lease: GenerationLease }
+export type GenerationRouteFailure = Extract<AdmissionKind, "window" | "quota" | "forbidden" | "auth">
+export type RunGenerationResult = {
+  res: Response
+  committed: boolean
+  lease: GenerationLease
+  /** Durable route-level failure learned from this physical generation only. */
+  routeFailure: GenerationRouteFailure | null
+}
 
 // --- config (provisional baselines; tune from live evidence) -----------------
 // The observed Tencent limit is a FREQUENCY limit, so the launch-rate budget is
@@ -396,6 +403,22 @@ export class WorkBuddyEntitlementGovernor {
   /** Epoch ms until which the account is quarantined as auth_forbidden. */
   private forbiddenUntil = 0
   private readonly forbiddenCooldownMs: number
+  /**
+   * Monotonic in-process revision for durable auth/account blocks. A physical
+   * generation captures this before admission; an older in-flight success must
+   * not clear a newer 11140/AUTH_INVALID verdict learned by a concurrent
+   * generation. This is intentionally not persisted: no in-flight generation
+   * survives a process restart.
+   */
+  private learnedBlockRevision = 0
+  /**
+   * Advances only when the authoritative credential is deliberately replaced
+   * outside a running generation (desktop heal/import or explicit enrollment).
+   * A response from a generation that began under an older credential revision
+   * may be returned to its caller, but must not poison the replacement with a
+   * stale AUTH_INVALID / auth_forbidden verdict.
+   */
+  private credentialRevision = 0
 
   /**
    * Pushed opportunistically by the quota adapter after a package-balance
@@ -522,9 +545,52 @@ export class WorkBuddyEntitlementGovernor {
   }
 
   private setState(state: EntitlementState, resetAt?: number) {
+    if (state === "ACCOUNT_FORBIDDEN" || state === "AUTH_INVALID") this.learnedBlockRevision++
     this.state = state
     this.resetAt = resetAt
     this.persist()
+    if (state === "ACCOUNT_FORBIDDEN" || state === "QUOTA_EXHAUSTED" || state === "AUTH_INVALID") {
+      this.rejectPendingLearnedBlock(state)
+    }
+  }
+
+  /**
+   * A durable account-level verdict learned by an active generation must also
+   * stop generations already queued behind it. Otherwise release() would pump
+   * those stale admissions after the first 11140/quota/auth failure was learned.
+   * Their callers can then re-enter AccountRouter and select another account.
+   *
+   * This does not make AUTH_INVALID a permanent admission rejection: a later
+   * *new* request may still select a lone invalid account and run the existing
+   * refresh-and-heal path. Only work that was queued before the definitive
+   * verdict is invalidated here.
+   */
+  private rejectPendingLearnedBlock(state: "ACCOUNT_FORBIDDEN" | "QUOTA_EXHAUSTED" | "AUTH_INVALID") {
+    if (!this.pending.length) return
+    const pending = this.pending.splice(0)
+    if (this.launchTimer) {
+      clearTimeout(this.launchTimer)
+      this.launchTimer = undefined
+    }
+    const now = Date.now()
+    for (const item of pending) {
+      if (item.onAbort) item.signal?.removeEventListener("abort", item.onAbort)
+      if (state === "ACCOUNT_FORBIDDEN") {
+        const retryAfter = Math.max(1, Math.ceil((this.forbiddenUntil - now) / 1000))
+        item.reject(
+          new AdmissionError(
+            403,
+            retryAfter,
+            `WorkBuddy has restricted this account (auth_forbidden); next probe in ${retryAfter}s`,
+            "forbidden",
+          ),
+        )
+      } else if (state === "QUOTA_EXHAUSTED") {
+        item.reject(new AdmissionError(402, 0, "entitlement credits exhausted for this account", "quota"))
+      } else {
+        item.reject(new AdmissionError(401, 0, "saved WorkBuddy credential was rejected after refresh", "auth"))
+      }
+    }
   }
 
   private modelKey(model: string): string {
@@ -797,6 +863,7 @@ export class WorkBuddyEntitlementGovernor {
   async runGeneration(opts: RunGenerationOpts): Promise<RunGenerationResult> {
     const session = opts.session ?? "default"
     const model = opts.model ?? "unknown"
+    const learnedBlockRevisionAtStart = this.learnedBlockRevision
     if (this.generationKeys.has(opts.genKey)) {
       throw new AdmissionError(409, 0, `duplicate logical generation: ${opts.genKey}`, "duplicate")
     }
@@ -833,6 +900,12 @@ export class WorkBuddyEntitlementGovernor {
       let refreshedThisGeneration = false
       let first: AttemptOutcome | null = null
       let res: Response | null = null
+      // Revision associated with `res`, captured immediately before the
+      // corresponding physical transport launches. Capturing this at logical
+      // generation entry is too early: a queued request may legitimately start
+      // using a newly replaced credential after waiting for governor admission.
+      let responseCredentialRevision = this.credentialRevision
+      let routeFailure: GenerationRouteFailure | null = null
       for (let i = 0; i < 2; i++) {
         if (opts.signal?.aborted) throw new AdmissionError(499, 0, "generation canceled", "cancel")
         const plan = planGeneration({ credExpired: opts.isExpired(), first, refreshedThisGeneration })
@@ -855,29 +928,43 @@ export class WorkBuddyEntitlementGovernor {
               status: res?.status ?? first.status,
               ...(secondCode !== undefined ? { code: secondCode } : {}),
             }
-            if (refreshed.rejected && !isValidationError(secondRaw) && !isAccountForbidden(secondRaw)) this.setState("AUTH_INVALID")
+            const authInvalid =
+              responseCredentialRevision === this.credentialRevision &&
+              refreshed.rejected &&
+              !isValidationError(secondRaw) &&
+              !isAccountForbidden(secondRaw)
+            if (authInvalid) this.setState("AUTH_INVALID")
             this.failed++
-            return { res: res!, committed: false, lease: { release: releaseLease } }
+            return { res: res!, committed: false, lease: { release: releaseLease }, routeFailure: authInvalid ? "auth" : null }
           }
         }
+        responseCredentialRevision = this.credentialRevision
         res = await opts.transport()
         this.attempts++
         const outcome = { status: res.status, ok: res.ok }
-        await this.observe(model, outcome, res)
+        routeFailure = await this.observe(model, outcome, res, responseCredentialRevision === this.credentialRevision)
         if (outcome.ok) {
           this.committed++
           if (refreshedThisGeneration) this.authRecoveries++
-          // A real generation is the only thing that can refute a chat-level
-          // account restriction or a dead-token verdict.
-          if (this.state === "AUTH_INVALID" || this.state === "ACCOUNT_FORBIDDEN") this.clearLearnedBlocks()
+          // A real generation can refute an auth/account block only when that
+          // block was already the one in force when this generation began.
+          // A concurrent request may have learned a NEW 11140/AUTH_INVALID
+          // while this transport was in flight; an older success is stale
+          // evidence and must not erase that newer verdict.
+          if (
+            (this.state === "AUTH_INVALID" || this.state === "ACCOUNT_FORBIDDEN") &&
+            learnedBlockRevisionAtStart === this.learnedBlockRevision
+          ) {
+            this.clearLearnedBlocks()
+          }
           this.relievePressure()
           // The lease remains active until the caller drains or cancels the body.
           if (res.body) {
             handedOff = true
-            return { res, committed: true, lease: { release: releaseLease } }
+            return { res, committed: true, lease: { release: releaseLease }, routeFailure: null }
           }
           releaseLease()
-          return { res, committed: true, lease: { release: () => undefined } }
+          return { res, committed: true, lease: { release: () => undefined }, routeFailure: null }
         }
         if (res.status === 401 || res.status === 403) {
           if (refreshedThisGeneration) {
@@ -887,10 +974,13 @@ export class WorkBuddyEntitlementGovernor {
             // thinking-echo validation rejection never poisons state.
             if (!isAccountForbidden(raw)) {
               this.lastAuthFailure = { at: Date.now(), status: res.status, ...(code !== undefined ? { code } : {}) }
-              if (!isValidationError(raw)) this.setState("AUTH_INVALID")
+              if (responseCredentialRevision === this.credentialRevision && !isValidationError(raw)) {
+                this.setState("AUTH_INVALID")
+                routeFailure = "auth"
+              }
             }
             this.failed++
-            return { res: res!, committed: false, lease: { release: releaseLease } }
+            return { res: res!, committed: false, lease: { release: releaseLease }, routeFailure }
           }
           // Fail fast on rejections a refresh cannot fix: an auth_forbidden
           // account needs the Tencent restriction lifted (verified live: a
@@ -899,15 +989,15 @@ export class WorkBuddyEntitlementGovernor {
           const firstRaw = await safeBody(res)
           if (isAccountForbidden(firstRaw) || isValidationError(firstRaw)) {
             this.failed++
-            return { res: res!, committed: false, lease: { release: releaseLease } }
+            return { res: res!, committed: false, lease: { release: releaseLease }, routeFailure }
           }
           first = outcome
           continue
         }
         this.failed++
-        return { res: res!, committed: false, lease: { release: releaseLease } }
+        return { res: res!, committed: false, lease: { release: releaseLease }, routeFailure }
       }
-      return { res: res!, committed: false, lease: { release: releaseLease } }
+      return { res: res!, committed: false, lease: { release: releaseLease }, routeFailure }
     } catch (error) {
       releaseLease()
       throw error
@@ -918,7 +1008,12 @@ export class WorkBuddyEntitlementGovernor {
     }
   }
 
-  private async observe(model: string, outcome: AttemptOutcome, res: Response) {
+  private async observe(
+    model: string,
+    outcome: AttemptOutcome,
+    res: Response,
+    credentialCurrent: boolean,
+  ): Promise<GenerationRouteFailure | null> {
     const retryAfter = res.headers.get("retry-after")
     if (outcome.status === 429) {
       const raw = await safeBody(res)
@@ -929,7 +1024,7 @@ export class WorkBuddyEntitlementGovernor {
       if (isBalanceExhausted(raw)) {
         this.limitedEpoch = this.limitedEpoch ?? "unknown-enrollment"
         this.setState("QUOTA_EXHAUSTED")
-        return
+        return "quota"
       }
       const resetAt = parseResetAt(raw, retryAfter)
       const isHardFrequency = code === 6000 || code === 6004 || /usage exceeds frequency limit|frequency window limit/i.test(raw)
@@ -945,6 +1040,7 @@ export class WorkBuddyEntitlementGovernor {
         runtime.serverCode = code ?? 6000
         absorbLearnedLimit(runtime, runtime.observed)
         this.persist()
+        return "window"
       } else if (isHardFrequency && code !== 14003) {
         // Fallback: server said frequency limit without parsable reset — treat as hard but infer 24h
         const runtime = this.runtimeFor(model)
@@ -954,6 +1050,7 @@ export class WorkBuddyEntitlementGovernor {
         runtime.serverCode = code ?? 6000
         absorbLearnedLimit(runtime, runtime.observed)
         this.persist()
+        return "window"
       } else {
         // Frequency pressure without a known reset: short backoff + adaptive easing.
         const backoff = Math.min(TRANSIENT_CAP_MS, 2000 * Math.pow(2, this.authRecoveries)) + Math.floor(Math.random() * 1000)
@@ -965,6 +1062,7 @@ export class WorkBuddyEntitlementGovernor {
       // Persist only the non-secret enrollment epoch, never a bearer token.
       this.limitedEpoch = this.limitedEpoch ?? "unknown-enrollment"
       this.setState("QUOTA_EXHAUSTED")
+      return "quota"
     } else if (outcome.status >= 500) {
       const backoff = Math.min(TRANSIENT_CAP_MS, 2000 * Math.pow(2, this.authRecoveries)) + Math.floor(Math.random() * 1000)
       this.cooldownUntil = Date.now() + backoff
@@ -973,11 +1071,16 @@ export class WorkBuddyEntitlementGovernor {
     } else if (outcome.status === 401 || outcome.status === 403) {
       const raw = await safeBody(res)
       const code = parseErrorCode(raw)
+      // This response belongs to a credential that was explicitly replaced
+      // while the transport was in flight. Surface the response to that
+      // caller, but do not let stale auth/account evidence poison the new
+      // credential's authoritative governor state.
+      if (!credentialCurrent) return null
       // auth_forbidden (11140/11142) is account-scoped per the official
       // taxonomy and cannot be cleared by refreshing — quarantine it.
       if (isAccountForbidden(raw)) {
         this.markAccountForbidden(code)
-        return
+        return "forbidden"
       }
       // Otherwise record the diagnostic only. The AUTH_INVALID verdict is
       // deliberately deferred to runGeneration's terminal branches, which
@@ -987,6 +1090,7 @@ export class WorkBuddyEntitlementGovernor {
       // never poison it at all.
       this.lastAuthFailure = { at: Date.now(), status: outcome.status, ...(code !== undefined ? { code } : {}) }
     }
+    return null
   }
 
   /** Called by the quota adapter after a fresh package-balance read. */
@@ -1042,6 +1146,16 @@ export class WorkBuddyEntitlementGovernor {
     this.forbiddenUntil = 0
     if (this.state === "AUTH_INVALID" || this.state === "ACCOUNT_FORBIDDEN") this.setState("READY")
     this.lastAuthFailure = null
+  }
+
+  /**
+   * Declare that the account's authoritative credential was deliberately
+   * replaced outside the generation retry loop. This is the credential-race
+   * fence for desktop heal/import and explicit enrollment.
+   */
+  recordCredentialReplacement() {
+    this.credentialRevision++
+    this.clearLearnedBlocks()
   }
 
   /**

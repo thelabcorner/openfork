@@ -1,3 +1,4 @@
+import { AgentCatalog } from "@/agent/catalog"
 import { Agent } from "@/agent/agent"
 import { Command } from "@/command"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -67,9 +68,12 @@ export const build = (input: {
   readonly commands: readonly Command.Info[]
   readonly defaultModel?: DefaultModel
 }): Snapshot => {
+  const languageModels = (provider: Provider.Info) =>
+    Object.values(provider.models).filter(Provider.isLanguageModel)
+
   const modelOptions = Provider.sort(
     Object.values(input.providers).flatMap((provider) =>
-      Object.values(provider.models).map((model) => ({
+      languageModels(provider).map((model) => ({
         id: model.id,
         providerID: provider.id,
         providerName: provider.name,
@@ -84,13 +88,21 @@ export const build = (input: {
     modelName: model.modelName,
   }))
 
+  const defaultModel = (() => {
+    if (!input.defaultModel) return undefined
+    const provider = input.providers[input.defaultModel.providerID]
+    const model = provider?.models[input.defaultModel.modelID]
+    if (!model || !Provider.isLanguageModel(model)) return undefined
+    return input.defaultModel
+  })()
+
   return {
     directory: input.directory,
     providers: input.providers,
     modelOptions,
     variantsByModel: Object.fromEntries(
       Object.values(input.providers).flatMap((provider) =>
-        Object.values(provider.models).flatMap((model) =>
+        languageModels(provider).flatMap((model) =>
           model.variants ? [[modelKey({ providerID: provider.id, modelID: model.id }), model.variants]] : [],
         ),
       ),
@@ -100,7 +112,7 @@ export const build = (input: {
       ? input.defaultModeID
       : (input.modes[0]?.id ?? input.defaultModeID),
     availableCommands: input.commands,
-    ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+    ...(defaultModel ? { defaultModel } : {}),
   }
 }
 
@@ -117,21 +129,25 @@ export const loaderLayer = Layer.effect(
         const ctx = yield* store.load({ directory })
         return yield* Effect.gen(function* () {
           const providers = yield* provider.list()
-          const [agents, defaultAgent, commands, defaultModel] = yield* Effect.all(
-            [agent.list(), agent.defaultInfo(), command.list(), provider.defaultModel().pipe(Effect.option)],
+          const [agentSnapshot, commands, defaultModel] = yield* Effect.all(
+            [
+              AgentCatalog.loadWith(agent),
+              command.list(),
+              provider.defaultModel().pipe(Effect.option),
+            ],
             { concurrency: "unbounded" },
           )
           return build({
             directory,
             providers,
-            modes: agents
-              .filter((item) => item.mode !== "subagent" && item.hidden !== true)
+            modes: agentSnapshot.agents
+              .filter((item) => item.mode !== "subagent")
               .map((item) => ({
-                id: item.name,
-                name: item.name,
+                id: item.id,
+                name: item.id,
                 ...(item.description ? { description: item.description } : {}),
               })),
-            defaultModeID: defaultAgent.name,
+            defaultModeID: agentSnapshot.defaultAgentID,
             commands: commands.toSorted((a, b) => a.name.localeCompare(b.name)),
             ...(defaultModel._tag === "Some" ? { defaultModel: defaultModel.value } : {}),
           })

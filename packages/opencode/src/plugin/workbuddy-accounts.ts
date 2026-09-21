@@ -10,7 +10,13 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs"
-import { WorkBuddyEntitlementGovernor, type EntitlementState } from "./workbuddy-governor"
+import {
+  AdmissionError,
+  WorkBuddyEntitlementGovernor,
+  type EntitlementState,
+  type RefreshResult,
+  type RunGenerationResult,
+} from "./workbuddy-governor"
 import { workBuddyClientHeaders, workBuddyUserAgent } from "./workbuddy-identity"
 
 /** Credential shape written by WorkBuddy/CodeBuddy desktop or OAuth enrollment. */
@@ -506,11 +512,16 @@ export class AccountRegistry {
     if (!credential.uid) throw new Error("Current WorkBuddy desktop credential has no Tencent UID")
     const saved = this.vault.importCredential(credential, source)
     const account = this.accountFrom(saved, "desktop-import", Date.now())
+    // accountFrom intentionally preserves the object captured by live
+    // transports. If this identity was already vault-backed, update that same
+    // object rather than leaving memory on the stale pre-import token.
+    Object.assign(account.credential, saved)
+    account.authPath = saved.path
     this.accountsById.set(account.id, account)
     // An explicit user import is a deliberate re-authorization: previously
     // learned account blocks (dead token, auth_forbidden quarantine) must not
     // survive it.
-    account.governor.clearLearnedBlocks()
+    account.governor.recordCredentialReplacement()
     return account
   }
 
@@ -540,7 +551,7 @@ export class AccountRegistry {
       Object.assign(account.credential, saved)
       account.authPath = saved.path
       account.source = "vault"
-      account.governor.clearLearnedBlocks()
+      account.governor.recordCredentialReplacement()
       this.accountsById.set(account.id, account)
       return true
     }
@@ -563,7 +574,7 @@ export class AccountRegistry {
     // Explicit re-enrollment is a deliberate re-authorization: previously
     // learned account blocks (dead token, auth_forbidden quarantine) must not
     // survive it.
-    account.governor.clearLearnedBlocks()
+    account.governor.recordCredentialReplacement()
     this.accountsById.set(account.id, account)
     return account
   }
@@ -619,12 +630,46 @@ export type AccountSelection = {
   reason: "explicit" | "affinity" | "automatic"
 }
 
+export type AccountRouteGenerationOptions = {
+  priority: number
+  requestId: string
+  requestedModel: string
+  session: string
+  explicitAccountId?: string
+  signal?: AbortSignal
+  isExpired: (account: WorkBuddyAccount) => boolean
+  refresh: (account: WorkBuddyAccount) => Promise<RefreshResult>
+  transport: (account: WorkBuddyAccount) => Promise<Response>
+}
+
+export type AccountRouteGenerationResult =
+  | {
+      kind: "response"
+      selection: AccountSelection
+      generation: RunGenerationResult
+      refreshAttempted: boolean
+      attemptedAccountIds: string[]
+    }
+  | {
+      kind: "admission"
+      selection: AccountSelection
+      error: AdmissionError
+      refreshAttempted: boolean
+      attemptedAccountIds: string[]
+    }
+  | {
+      kind: "unavailable"
+      attemptedAccountIds: string[]
+    }
+
 /**
  * Session-level account router.
  *
- * Automatic routing binds once and never moves a session. An explicit account
- * choice (an account-qualified model id, or `X-WorkBuddy-Account`) rebinds it —
- * that is a deliberate user action, not account hopping.
+ * Automatic routing keeps session affinity while the selected account remains
+ * eligible. A durable account/model failure may break that affinity and rotate
+ * to another eligible account. An explicit account choice (an account-qualified
+ * model id, or `X-WorkBuddy-Account`) rebinds it — that is deliberate user
+ * intent and is never silently substituted.
  */
 export class AccountRouter {
   private readonly registry: AccountRegistry
@@ -639,11 +684,35 @@ export class AccountRouter {
     return account
   }
 
-  unbind(session: string) { this.bindings.delete(session) }
+  /**
+   * Remove affinity, optionally only when it still points at the account the
+   * caller observed. The compare-and-delete form matters when two logical
+   * generations fail/rotate concurrently: an older failure must not erase a
+   * newer successful binding.
+   */
+  unbind(session: string, expectedAccountId?: string): boolean {
+    if (expectedAccountId !== undefined && this.bindings.get(session) !== expectedAccountId) return false
+    return this.bindings.delete(session)
+  }
   binding(session: string): string | undefined { return this.bindings.get(session) }
 
-  select(session: string, requestedModel: string, explicitAccountId?: string): AccountSelection | undefined {
+  select(
+    session: string,
+    requestedModel: string,
+    explicitAccountId?: string,
+    excludedAccountIds?: ReadonlySet<string>,
+  ): AccountSelection | undefined {
     const accounts = this.registry.all()
+    return this.selectFrom(accounts, session, requestedModel, explicitAccountId, excludedAccountIds)
+  }
+
+  private selectFrom(
+    accounts: WorkBuddyAccount[],
+    session: string,
+    requestedModel: string,
+    explicitAccountId?: string,
+    excludedAccountIds?: ReadonlySet<string>,
+  ): AccountSelection | undefined {
 
     // Explicit user intent is checked FIRST and rebinds the session.
     //
@@ -663,36 +732,41 @@ export class AccountRouter {
     // Only fall back to affinity when the user did not name an account.
     const existing = this.bindings.get(session)
     if (existing) {
-      const account = accounts.find((item) => item.id === existing)
-      if (!account) return undefined
-      // Auto-rotate on 429: if the bound account is blocked for this model
-      // (would hit a window/cooldown/quota admission failure), break affinity
-      // so the session can pool-rotate to an eligible account instead of
-      // staying stuck on the failing one.
-      const now = Date.now()
-      const metrics = account.governor.metrics()
-      // A known-zero package balance blocks EVERY model on this account, not
-      // just paid ones: Tencent's server runs its own balance check before
-      // every generation regardless of a model's published rate, so a
-      // 0-credit account 402s even on a nominally free promotional model.
-      // AUTH_INVALID and ACCOUNT_FORBIDDEN break affinity the same way: a
-      // session pinned to a dead token or to a Tencent-restricted account
-      // would otherwise fail every turn while healthy accounts sit in the
-      // pool unused.
-      const blocked = metrics.state === "QUOTA_EXHAUSTED" ||
-                      metrics.state === "AUTH_INVALID" ||
-                      metrics.state === "ACCOUNT_FORBIDDEN" ||
-                      !account.governor.canAdmitModel(requestedModel, now) ||
-                      !!(metrics.cooldownUntil && now < metrics.cooldownUntil) ||
-                      !account.governor.hasKnownCredits()
-      if (blocked) {
-        this.unbind(session)
+      if (excludedAccountIds?.has(existing)) {
+        this.unbind(session, existing)
       } else {
-        return { account, bound: true, reason: "affinity" }
+        const account = accounts.find((item) => item.id === existing)
+        if (!account) return undefined
+        // Auto-rotate on 429: if the bound account is blocked for this model
+        // (would hit a window/cooldown/quota admission failure), break affinity
+        // so the session can pool-rotate to an eligible account instead of
+        // staying stuck on the failing one.
+        const now = Date.now()
+        const metrics = account.governor.metrics()
+        // A known-zero package balance blocks EVERY model on this account, not
+        // just paid ones: Tencent's server runs its own balance check before
+        // every generation regardless of a model's published rate, so a
+        // 0-credit account 402s even on a nominally free promotional model.
+        // AUTH_INVALID and ACCOUNT_FORBIDDEN break affinity the same way: a
+        // session pinned to a dead token or to a Tencent-restricted account
+        // would otherwise fail every turn while healthy accounts sit in the
+        // pool unused.
+        const blocked = metrics.state === "QUOTA_EXHAUSTED" ||
+                        metrics.state === "AUTH_INVALID" ||
+                        metrics.state === "ACCOUNT_FORBIDDEN" ||
+                        !account.governor.canAdmitModel(requestedModel, now) ||
+                        !!(metrics.cooldownUntil && now < metrics.cooldownUntil) ||
+                        !account.governor.hasKnownCredits()
+        if (blocked) {
+          this.unbind(session, account.id)
+        } else {
+          return { account, bound: true, reason: "affinity" }
+        }
       }
     }
 
     const eligible = accounts.filter((account) => {
+      if (excludedAccountIds?.has(account.id)) return false
       const state = account.governor.metrics().state as EntitlementState
       // ACCOUNT_FORBIDDEN is excluded outright rather than kept as a
       // fallback: a generation would be rejected at admission anyway, and
@@ -725,16 +799,147 @@ export class AccountRouter {
     // the only option.
     const funded = authFallback.filter((account) => account.governor.hasKnownCredits())
     const pool = funded.length > 0 ? funded : authFallback
-    pool.sort((a, b) => {
-      const am = a.governor.metrics()
-      const bm = b.governor.metrics()
-      const aLoad = am.active + am.queued + (am.state === "READY" ? 0 : 1000)
-      const bLoad = bm.active + bm.queued + (bm.state === "READY" ? 0 : 1000)
-      return aLoad - bLoad || a.id.localeCompare(b.id)
-    })
-    const account = pool[0]
+    // One linear pass is enough; sorting the entire pool only to consume its
+    // first element adds O(n log n) work and repeatedly calls metrics().
+    let account = pool[0]!
+    let metrics = account.governor.metrics()
+    let load = metrics.active + metrics.queued + (metrics.state === "READY" ? 0 : 1000)
+    for (let i = 1; i < pool.length; i++) {
+      const candidate = pool[i]!
+      metrics = candidate.governor.metrics()
+      const candidateLoad = metrics.active + metrics.queued + (metrics.state === "READY" ? 0 : 1000)
+      if (candidateLoad < load || (candidateLoad === load && candidate.id.localeCompare(account.id) < 0)) {
+        account = candidate
+        load = candidateLoad
+      }
+    }
     this.bindings.set(session, account.id)
     return { account, bound: true, reason: "automatic" }
+  }
+
+  /**
+   * Execute one logical WorkBuddy generation across the account pool.
+   *
+   * The governor remains the authoritative owner of per-account admission,
+   * refresh/retry, and failure learning. This router owns the *cross-account*
+   * retry boundary because it alone knows explicit-vs-automatic intent,
+   * session affinity, model eligibility, and the remaining candidate pool.
+   * Each account can be selected at most once for this logical request.
+   */
+  async runGeneration(options: AccountRouteGenerationOptions): Promise<AccountRouteGenerationResult> {
+    // Discovery reads the vault and desktop auth files. One logical request
+    // takes one snapshot, then retries against these same governor-backed
+    // account objects so failover is event-driven rather than I/O-driven.
+    const accounts = this.registry.all()
+    const attempted = new Set<string>()
+    let selection = this.selectFrom(accounts, options.session, options.requestedModel, options.explicitAccountId, attempted)
+    if (!selection) return { kind: "unavailable", attemptedAccountIds: [] }
+
+    for (;;) {
+      const account = selection.account
+      let refreshAttempted = false
+
+      if (options.signal?.aborted) {
+        return {
+          kind: "admission",
+          selection,
+          error: new AdmissionError(499, 0, "generation canceled before account attempt", "cancel"),
+          refreshAttempted,
+          attemptedAccountIds: [...attempted],
+        }
+      }
+
+      attempted.add(account.id)
+      try {
+        const generation = await account.governor.runGeneration({
+          priority: options.priority,
+          genKey: `${account.id}:${options.requestId}`,
+          model: options.requestedModel,
+          session: options.session,
+          isExpired: () => options.isExpired(account),
+          refresh: () => {
+            refreshAttempted = true
+            return options.refresh(account)
+          },
+          transport: () => options.transport(account),
+          signal: options.signal,
+          enrollmentEpoch: account.credential.enrollmentEpoch,
+        })
+
+        // The governor reports what THIS physical generation learned. Do not
+        // reconstruct causality from its ambient state: an account that began
+        // the attempt AUTH_INVALID can still produce a request-scoped 4xx that
+        // must not be silently replayed on another account.
+        const accountScopedFailure = !generation.res.ok && generation.routeFailure !== null
+
+        if (selection.reason === "explicit" || !accountScopedFailure) {
+          return {
+            kind: "response",
+            selection,
+            generation,
+            refreshAttempted,
+            attemptedAccountIds: [...attempted],
+          }
+        }
+
+        // The failing governor has already learned the durable account/model
+        // state. Break only the affinity we observed, then pick a genuinely
+        // eligible account that has not been tried by this logical request.
+        this.unbind(options.session, account.id)
+
+        if (options.signal?.aborted) {
+          generation.lease.release()
+          await generation.res.body?.cancel().catch(() => undefined)
+          return {
+            kind: "admission",
+            selection,
+            error: new AdmissionError(499, 0, "generation canceled after account failure", "cancel"),
+            refreshAttempted,
+            attemptedAccountIds: [...attempted],
+          }
+        }
+
+        const next = this.selectFrom(accounts, options.session, options.requestedModel, undefined, attempted)
+        if (!next) {
+          generation.lease.release()
+          await generation.res.body?.cancel().catch(() => undefined)
+          return {
+            kind: "unavailable",
+            attemptedAccountIds: [...attempted],
+          }
+        }
+
+        // We are intentionally discarding this terminal account-scoped
+        // response. Release/cancel it before issuing the next physical attempt.
+        generation.lease.release()
+        await generation.res.body?.cancel().catch(() => undefined)
+        selection = next
+      } catch (error) {
+        if (!(error instanceof AdmissionError)) throw error
+
+        const accountScopedAdmission =
+          error.kind === "forbidden" || error.kind === "quota" || error.kind === "window" || error.kind === "auth"
+        if (selection.reason === "explicit" || !accountScopedAdmission || options.signal?.aborted) {
+          return {
+            kind: "admission",
+            selection,
+            error,
+            refreshAttempted,
+            attemptedAccountIds: [...attempted],
+          }
+        }
+
+        this.unbind(options.session, account.id)
+        const next = this.selectFrom(accounts, options.session, options.requestedModel, undefined, attempted)
+        if (!next) {
+          return {
+            kind: "unavailable",
+            attemptedAccountIds: [...attempted],
+          }
+        }
+        selection = next
+      }
+    }
   }
 
   bindingsSnapshot() { return [...this.bindings.entries()].map(([session, account]) => ({ session, account })) }

@@ -28,13 +28,22 @@ import { isRecord } from "@/util/record"
 import { optional } from "@opencode-ai/core/schema"
 import { ProviderTransform } from "./transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { PRODUCT_NAME, PRODUCT_REPOSITORY_URL, PRODUCT_SLUG } from "@opencode-ai/core/brand"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { trackNvidiaRequest } from "@/quota/providers/nvidia-usage"
 import { ProviderError } from "./error"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
-import { zenProviderFetch, syncZenAccountPool, zenQuotaAccounts } from "@/plugin/zen"
+import {
+  discoverZenSystemOneModel,
+  zenAccountModelAliases,
+  zenGoProviderFetch,
+  zenProviderFetch,
+  syncZenAccountPool,
+  zenQuotaAccounts,
+  ZEN_PUBLIC_API_KEY,
+} from "@/plugin/zen"
 import {
   MODEL_IDS,
   MODEL_METADATA,
@@ -54,24 +63,27 @@ import {
 import { GensparkCatalog } from "@/genspark/catalog"
 import { Integration } from "@opencode-ai/core/integration"
 import { EventV2 } from "@opencode-ai/core/event"
+import { providerModelID } from "@opencode-ai/schema/model-select/account-identity"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
-async function readLegacyGensparkKeyFromConfig(): Promise<string | undefined> {
+async function readGensparkKeyFromFallbackConfig(): Promise<string | undefined> {
   if (process.env.BUN_TEST || process.env.NODE_ENV === "test" || !!process.env.OPENCODE_TEST_HOME || !!process.env.VITEST) return undefined
   const { join } = await import("node:path")
   let dir = process.cwd()
   for (let i = 0; i < 6; i++) {
-    try {
-      const raw = await readFileNode(join(dir, ".opencode.json"), "utf8")
-      const parsed = JSON.parse(raw) as { provider?: Record<string, { options?: { apiKey?: unknown } }> }
-      const candidates = [
-        parsed.provider?.["genspark"]?.options?.apiKey,
-        parsed.provider?.["genspark-llm-proxy"]?.options?.apiKey,
-        parsed.provider?.["genspark-gemini-proxy"]?.options?.apiKey,
-      ]
-      for (const c of candidates) if (typeof c === "string" && c.trim()) return c.trim()
-    } catch {}
+    for (const file of ["openfork.json", ".opencode.json"]) {
+      try {
+        const raw = await readFileNode(join(dir, file), "utf8")
+        const parsed = JSON.parse(raw) as { provider?: Record<string, { options?: { apiKey?: unknown } }> }
+        const candidates = [
+          parsed.provider?.["genspark"]?.options?.apiKey,
+          parsed.provider?.["genspark-llm-proxy"]?.options?.apiKey,
+          parsed.provider?.["genspark-gemini-proxy"]?.options?.apiKey,
+        ]
+        for (const c of candidates) if (typeof c === "string" && c.trim()) return c.trim()
+      } catch {}
+    }
     const parent = (await import("node:path")).join(dir, "..")
     if (parent === dir) break
     dir = parent
@@ -264,7 +276,62 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
 
       return {
         autoload: Object.keys(input.models).length > 0,
-        options: { ...(ok ? {} : { apiKey: "public" }), fetch: zenProviderFetch },
+        options: { ...(ok ? {} : { apiKey: ZEN_PUBLIC_API_KEY }), fetch: zenProviderFetch },
+        async discoverModels() {
+          // Compatibility fallback only. Once the normal catalog contains the
+          // row, keep provider assembly deterministic and avoid a redundant
+          // hosted /models request.
+          if (input.models["jev-1.13-free"]) return {}
+          const discovered = await discoverZenSystemOneModel("jev-1.13-free")
+          if (!discovered) return {}
+          const id = ModelV2.ID.make(discovered.id)
+          const base = {
+            id,
+            providerID: input.id,
+            name: discovered.name,
+            family: "jev",
+            primitive: "system-one",
+            api: {
+              id,
+              url: discovered.baseURL,
+              npm: "@ai-sdk/openai-compatible",
+            },
+            status: "active",
+            headers: {},
+            options: {},
+            cost: {
+              input: discovered.cost.input,
+              output: discovered.cost.output,
+              cache: { read: 0, write: 0 },
+            },
+            // System One is a semantic inference primitive rather than a
+            // language context window. These fields are structurally required
+            // by the shared provider model shape but are not used by inference.
+            limit: { context: 0, output: 0 },
+            capabilities: {
+              temperature: false,
+              reasoning: false,
+              attachment: false,
+              toolcall: false,
+              input: { text: true, audio: false, image: false, video: false, pdf: false },
+              output: { text: false, audio: false, image: false, video: false, pdf: false },
+              interleaved: false,
+            },
+            release_date: "",
+            variants: {},
+          } satisfies Model
+          const models: Record<string, Model> = { [id]: base }
+          for (const alias of zenAccountModelAliases(base.id, base.name)) {
+            const aliasID = ModelV2.ID.make(alias.id)
+            models[aliasID] = {
+              ...base,
+              id: aliasID,
+              name: alias.name,
+              api: { ...base.api, id: aliasID },
+            }
+          }
+          return models
+        },
       }
     }),
     "opencode-go": Effect.fnUntraced(function* (input: Info) {
@@ -279,7 +346,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
 
       return {
         autoload: ok,
-        options: { fetch: zenProviderFetch },
+        options: { fetch: zenGoProviderFetch },
       }
     }),
     openai: () =>
@@ -463,7 +530,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           }
 
           // Region resolution precedence (highest to lowest):
-          // 1. options.region from opencode.json provider config
+          // 1. options.region from openfork.json provider config
           // 2. defaultRegion from AWS_REGION environment variable
           // 3. Default "us-east-1" (baked into defaultRegion)
           const region = options?.region ?? defaultRegion
@@ -546,9 +613,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://opencode.ai/",
-            "X-Title": "opencode",
-            "X-Source": "opencode",
+            "HTTP-Referer": PRODUCT_REPOSITORY_URL,
+            "X-Title": PRODUCT_NAME,
+            "X-Source": PRODUCT_SLUG,
           },
         },
       }),
@@ -557,8 +624,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://opencode.ai/",
-            "X-Title": "opencode",
+            "HTTP-Referer": PRODUCT_REPOSITORY_URL,
+            "X-Title": PRODUCT_NAME,
           },
         },
       }),
@@ -567,9 +634,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: provider.source === "config",
         options: {
           headers: {
-            "HTTP-Referer": "https://opencode.ai/",
-            "X-Title": "opencode",
-            "X-BILLING-INVOKE-ORIGIN": "OpenCode",
+            "HTTP-Referer": PRODUCT_REPOSITORY_URL,
+            "X-Title": PRODUCT_NAME,
+            "X-BILLING-INVOKE-ORIGIN": PRODUCT_NAME,
           },
         },
       }),
@@ -578,8 +645,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "http-referer": "https://opencode.ai/",
-            "x-title": "opencode",
+            "http-referer": PRODUCT_REPOSITORY_URL,
+            "x-title": PRODUCT_NAME,
           },
         },
       }),
@@ -683,8 +750,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://opencode.ai/",
-            "X-Title": "opencode",
+            "HTTP-Referer": PRODUCT_REPOSITORY_URL,
+            "X-Title": PRODUCT_NAME,
           },
         },
       }),
@@ -964,7 +1031,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "X-Cerebras-3rd-Party-Integration": "opencode",
+            "X-Cerebras-3rd-Party-Integration": PRODUCT_SLUG,
           },
         },
       }),
@@ -973,8 +1040,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         autoload: false,
         options: {
           headers: {
-            "HTTP-Referer": "https://opencode.ai/",
-            "X-Title": "opencode",
+            "HTTP-Referer": PRODUCT_REPOSITORY_URL,
+            "X-Title": PRODUCT_NAME,
           },
         },
       }),
@@ -1156,10 +1223,10 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         }),
       )
       if (!apiKey) {
-        const legacy = yield* Effect.promise(() => readLegacyGensparkKeyFromConfig()).pipe(
+        const fallbackConfig = yield* Effect.promise(() => readGensparkKeyFromFallbackConfig()).pipe(
           Effect.catch(() => Effect.succeed(undefined)),
         )
-        if (legacy) apiKey = legacy
+        if (fallbackConfig) apiKey = fallbackConfig
       }
       if (!apiKey) {
         const fallback = GENSPARK_MODEL_METADATA
@@ -1186,7 +1253,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         return { autoload: true, options: { ...GENSPARK_PROXY_OPTION } }
       }
       // The legacy fallback for the no-key case is handled by the quota
-      // adapter (which reads .opencode.json directly) and by the user
+      // adapter (which reads openfork.json first and legacy .opencode.json as a fallback) and by the user
       // migrating the key to Auth/env.
       const catalog = yield* dep.gensparkCatalog(apiKey)
       // Replacement, not merge: the live endpoint is authoritative. The static
@@ -1298,6 +1365,7 @@ export const Model = Schema.Struct({
   api: ProviderApiInfo,
   name: Schema.String,
   family: optional(Schema.String),
+  primitive: optional(ModelV2.Primitive),
   capabilities: ProviderCapabilities,
   cost: ProviderCost,
   limit: ProviderLimit,
@@ -1308,6 +1376,16 @@ export const Model = Schema.Struct({
   variants: optional(Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Any))),
 }).annotate({ identifier: "Model" })
 export type Model = Types.DeepMutable<Schema.Schema.Type<typeof Model>>
+
+export function modelPrimitive(model: Pick<Model, "primitive">): ModelV2.Primitive {
+  return model.primitive ?? "language"
+}
+
+export function isLanguageModel(
+  model: Pick<Model, "id" | "providerID" | "name" | "family" | "primitive">,
+) {
+  return ModelV2.isLanguageModel(model.providerID, model)
+}
 
 export const Info = Schema.Struct({
   id: ProviderV2.ID,
@@ -1351,8 +1429,23 @@ export function toPublicInfo(provider: Info): Info {
   )
 }
 
-export function defaultModelIDs<T extends { models: Record<string, { id: string }> }>(providers: Record<string, T>) {
-  return mapValues(providers, (item) => sort(Object.values(item.models))[0].id)
+export function defaultModelIDs<
+  T extends {
+    models: Record<
+      string,
+      { id: string; primitive?: ModelV2.Primitive; name?: string; family?: string }
+    >
+  },
+>(providers: Record<string, T>) {
+  return Object.fromEntries(
+    Object.entries(providers).flatMap(([providerID, provider]) => {
+      const model = sort(
+        Object.values(provider.models).filter((item) => ModelV2.isLanguageModel(providerID, item)),
+      )[0]
+      if (!model) return []
+      return [[providerID, model.id] as const]
+    }),
+  )
 }
 
 export class ModelNotFoundError extends Schema.TaggedErrorClass<ModelNotFoundError>()("ProviderModelNotFoundError", {
@@ -1406,14 +1499,39 @@ export class NoModelsError extends Schema.TaggedErrorClass<NoModelsError>()("Pro
   }
 }
 
+export class UnsupportedModelPrimitiveError extends Schema.TaggedErrorClass<UnsupportedModelPrimitiveError>()(
+  "ProviderUnsupportedModelPrimitiveError",
+  {
+    providerID: ProviderV2.ID,
+    modelID: ModelV2.ID,
+    primitive: ModelV2.Primitive,
+    required: ModelV2.Primitive,
+  },
+) {
+  override get message() {
+    return `Model ${this.providerID}/${this.modelID} uses the ${this.primitive} primitive and cannot be used as a ${this.required} model`
+  }
+}
+
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
-export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError
+export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError | UnsupportedModelPrimitiveError
 
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
-  readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
-  readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
+  /**
+   * Resolve an account-neutral model selection. accountID remains first-class
+   * above this provider boundary; legacy account-qualified catalog ids are
+   * materialized only here.
+   */
+  readonly getModel: (
+    providerID: ProviderV2.ID,
+    modelID: ModelV2.ID,
+    accountID?: string,
+  ) => Effect.Effect<Model, ModelNotFoundError>
+  readonly getLanguage: (
+    model: Model,
+  ) => Effect.Effect<LanguageModelV3, ModelNotFoundError | UnsupportedModelPrimitiveError>
   readonly closest: (
     providerID: ProviderV2.ID,
     query: string[],
@@ -1485,6 +1603,7 @@ function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model
     providerID: ProviderV2.ID.make(provider.id),
     name: model.name,
     family: model.family,
+    primitive: ModelsDev.modelPrimitive(provider.id, model),
     api: {
       id: model.id,
       url: model.provider?.api ?? provider.api ?? "",
@@ -1620,8 +1739,39 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
+        const decisionModels = yield* modelsDevSvc.getDecisionModels()
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
         const database = mapValues(catalog, toPublicInfo)
+        const typeSafeProviderID = ProviderV2.ID.make("typesafe")
+        const typeSafePrefix = "typesafe/"
+        const typeSafeMetadata = Object.values(decisionModels).filter(
+          (model) => model.type === "decision" && model.id.startsWith(typeSafePrefix),
+        )
+        if (typeSafeMetadata.length > 0 && !database[typeSafeProviderID]) {
+          const typeSafeBaseURL = (yield* env.get("TYPESAFE_BASE_URL"))?.trim() || "https://api.typesafe.ai/v1"
+          const directProvider = {
+            id: "typesafe",
+            name: "TypeSafe",
+            env: ["TYPESAFE_API_KEY"],
+            api: typeSafeBaseURL,
+            npm: "@ai-sdk/openai-compatible",
+            models: {},
+          } satisfies ModelsDev.Provider
+          database[typeSafeProviderID] = {
+            id: typeSafeProviderID,
+            source: "custom",
+            name: directProvider.name,
+            env: directProvider.env,
+            options: {},
+            models: Object.fromEntries(
+              typeSafeMetadata.map((metadata) => {
+                const directModelID = metadata.id.slice(typeSafePrefix.length)
+                const model = fromModelsDevModel(directProvider, { ...metadata, id: directModelID })
+                return [model.id, model]
+              }),
+            ),
+          }
+        }
         // Keep the API-key Anthropic transport under its own provider ID so it
         // cannot collide with either the first-party CLI runtime (`claude`) or
         // the external plugin (`claude-code`).
@@ -1866,6 +2016,7 @@ const layer = Layer.effect(
               status: model.status ?? existingModel?.status ?? "active",
               name,
               providerID: ProviderV2.ID.make(providerID),
+              primitive: model.primitive ?? existingModel?.primitive ?? ModelsDev.modelPrimitive(providerID, { id: apiID }),
               capabilities: {
                 temperature: model.temperature ?? existingModel?.capabilities.temperature ?? false,
                 reasoning: model.reasoning ?? existingModel?.capabilities.reasoning ?? false,
@@ -2237,31 +2388,45 @@ const layer = Layer.effect(
       InstanceState.use(state, (s) => s.providers[providerID]),
     )
 
-    const getModel = Effect.fn("Provider.getModel")(function* (providerID: ProviderV2.ID, modelID: ModelV2.ID) {
+    const getModel = Effect.fn("Provider.getModel")(function* (
+      providerID: ProviderV2.ID,
+      modelID: ModelV2.ID,
+      accountID?: string,
+    ) {
       const s = yield* InstanceState.get(state)
       const provider = s.providers[providerID]
+      const runtimeModelID = ModelV2.ID.make(providerModelID(modelID, providerID, accountID))
       if (!provider) {
         const catalogProvider = s.catalog[providerID]
         const suggestions = catalogProvider
-          ? modelSuggestions(catalogProvider, modelID, runtimeFlags.enableExperimentalModels)
+          ? modelSuggestions(catalogProvider, runtimeModelID, runtimeFlags.enableExperimentalModels)
           : fuzzysort
               .go(providerID, Object.keys({ ...s.catalog, ...s.providers }), { limit: 3, threshold: -10000 })
               .map((m) => m.target)
-        return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
+        return yield* new ModelNotFoundError({ providerID, modelID: runtimeModelID, suggestions })
       }
 
-      const info = provider.models[modelID]
+      const info = provider.models[runtimeModelID]
       if (!info) {
-        const current = modelSuggestions(provider, modelID, runtimeFlags.enableExperimentalModels)
+        const current = modelSuggestions(provider, runtimeModelID, runtimeFlags.enableExperimentalModels)
         const suggestions = current.length
           ? current
-          : modelSuggestions(s.catalog[providerID], modelID, runtimeFlags.enableExperimentalModels)
-        return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
+          : modelSuggestions(s.catalog[providerID], runtimeModelID, runtimeFlags.enableExperimentalModels)
+        return yield* new ModelNotFoundError({ providerID, modelID: runtimeModelID, suggestions })
       }
       return info
     })
 
     const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
+      const primitive = modelPrimitive(model)
+      if (primitive !== "language") {
+        return yield* new UnsupportedModelPrimitiveError({
+          providerID: model.providerID,
+          modelID: model.id,
+          primitive,
+          required: "language",
+        })
+      }
       const s = yield* InstanceState.get(state)
       const envs = yield* env.all()
       const key = `${model.providerID}/${model.id}`
@@ -2297,8 +2462,9 @@ const layer = Layer.effect(
       const provider = s.providers[providerID]
       if (!provider) return undefined
       for (const item of query) {
-        for (const modelID of Object.keys(provider.models)) {
-          if (modelID.includes(item)) return { providerID, modelID }
+        for (const model of Object.values(provider.models)) {
+          if (!isLanguageModel(model)) continue
+          if (model.id.includes(item)) return { providerID, modelID: model.id }
         }
       }
       return undefined
@@ -2309,9 +2475,10 @@ const layer = Layer.effect(
 
       if (cfg.small_model) {
         const parsed = parseModel(cfg.small_model)
-        return yield* getModel(parsed.providerID, parsed.modelID).pipe(
+        const configured = yield* getModel(parsed.providerID, parsed.modelID).pipe(
           Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)),
         )
+        return configured && isLanguageModel(configured) ? configured : undefined
       }
 
       const s = yield* InstanceState.get(state)
@@ -2324,11 +2491,12 @@ const layer = Layer.effect(
         { model: undefined },
       )
       if (experimental.model) {
-        return {
+        const candidate = {
           ...experimental.model,
           id: ModelV2.ID.make(experimental.model.id),
           providerID: ProviderV2.ID.make(experimental.model.providerID),
         }
+        if (isLanguageModel(candidate)) return candidate
       }
 
       // TODO: Remove these provider-specific assumptions once model syncing reliably reports available deployments.
@@ -2342,7 +2510,7 @@ const layer = Layer.effect(
           ? ["gpt-mini", ...smallModelFamilyPriority]
           : smallModelFamilyPriority
       const models = sortBy(
-        Object.values(provider.models),
+        Object.values(provider.models).filter(isLanguageModel),
         [(model) => model.release_date, "desc"],
         [(model) => model.id, "desc"],
       )
@@ -2380,9 +2548,19 @@ const layer = Layer.effect(
 
     const defaultModel = Effect.fn("Provider.defaultModel")(function* () {
       const cfg = yield* config.get()
-      if (cfg.model) return parseModel(cfg.model)
-
       const s = yield* InstanceState.get(state)
+      if (cfg.model) {
+        const configured = parseModel(cfg.model)
+        const model =
+          s.providers[configured.providerID]?.models[configured.modelID]
+        // Preserve explicit configuration when the current provider snapshot
+        // cannot resolve it yet. Only self-heal away from a configured model
+        // when we can positively prove it is a non-language primitive.
+        if (!model || isLanguageModel(model)) {
+          return configured
+        }
+      }
+
       const recent = yield* fs.readJson(path.join(Global.Path.state, "model.json")).pipe(
         Effect.map((x): { providerID: ProviderV2.ID; modelID: ModelV2.ID }[] => {
           if (!isRecord(x) || !Array.isArray(x.recent)) return []
@@ -2398,14 +2576,18 @@ const layer = Layer.effect(
       for (const entry of recent) {
         const provider = s.providers[entry.providerID]
         if (!provider) continue
-        if (!provider.models[entry.modelID]) continue
+        const model = provider.models[entry.modelID]
+        if (!model || !isLanguageModel(model)) continue
         return { providerID: entry.providerID, modelID: entry.modelID }
       }
 
       const configured = Object.keys(cfg.provider ?? {})
-      const provider = Object.values(s.providers).find((p) => configured.length === 0 || configured.includes(p.id))
+      const candidates = Object.values(s.providers).filter((p) => configured.length === 0 || configured.includes(p.id))
+      const provider =
+        candidates.find((p) => Object.values(p.models).some(isLanguageModel)) ??
+        candidates[0]
       if (!provider) return yield* new NoProvidersError()
-      const [model] = sort(Object.values(provider.models))
+      const [model] = sort(Object.values(provider.models).filter(isLanguageModel))
       if (!model) return yield* new NoModelsError({ providerID: provider.id })
       return {
         providerID: provider.id,

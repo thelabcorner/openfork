@@ -43,6 +43,7 @@ import { UsageService } from "./usage"
 import { ACPProfile } from "./profile"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Provider } from "@/provider/provider"
 import type { Command } from "@/command"
 
@@ -95,7 +96,7 @@ export function make(input: {
     const started = performance.now()
     const authMethod: AuthMethod = {
       description: "Run `opencode auth login` in the terminal",
-      name: "Login with opencode",
+      name: "Login with OpenFork",
       id: AuthMethodID,
     }
 
@@ -104,7 +105,7 @@ export function make(input: {
         "terminal-auth": {
           command: "opencode",
           args: ["auth", "login"],
-          label: "OpenCode Login",
+          label: "OpenFork Login",
         },
       }
     }
@@ -130,7 +131,7 @@ export function make(input: {
       },
       authMethods: [authMethod],
       agentInfo: {
-        name: "OpenCode",
+        name: "OpenFork",
         version: InstallationVersion,
       },
     }
@@ -697,6 +698,7 @@ type SdkResponse<T> = {
 type MessageInfo = {
   readonly role?: Message["role"]
   readonly model?: Extract<Message, { role: "user" }>["model"]
+  readonly provenance?: Extract<Message, { role: "user" }>["provenance"]
   readonly providerID?: Extract<Message, { role: "assistant" }>["providerID"]
   readonly modelID?: Extract<Message, { role: "assistant" }>["modelID"]
   readonly variant?: Extract<Message, { role: "assistant" }>["variant"]
@@ -787,18 +789,25 @@ function defaultModelFromConfig(
   providers: Record<ProviderV2.ID, Provider.Info>,
 ): Directory.DefaultModel | undefined {
   const configured = configuredModel ? Provider.parseModel(configuredModel) : undefined
-  if (configured && providers[configured.providerID]?.models[configured.modelID]) return configured
+  const configuredInfo = configured ? providers[configured.providerID]?.models[configured.modelID] : undefined
+  if (configured && configuredInfo && Provider.isLanguageModel(configuredInfo)) return configured
 
   // First-session ACP startup must not scan historical sessions just to infer
   // a default. Configured model, opencode provider, then sorted best model keep
   // the protocol response deterministic without extra session/message reads.
   const opencodeProvider = providers[ProviderV2.ID.make("opencode")]
-  const opencodeModel = opencodeProvider ? Provider.sort(Object.values(opencodeProvider.models))[0] : undefined
+  const opencodeModel = opencodeProvider
+    ? Provider.sort(Object.values(opencodeProvider.models).filter(Provider.isLanguageModel))[0]
+    : undefined
   if (opencodeProvider && opencodeModel) return { providerID: opencodeProvider.id, modelID: opencodeModel.id }
 
-  const best = Provider.sort(Object.values(providers).flatMap((provider) => Object.values(provider.models)))[0]
+  const best = Provider.sort(
+    Object.values(providers).flatMap((provider) =>
+      Object.values(provider.models).filter(Provider.isLanguageModel),
+    ),
+  )[0]
   if (best) return { providerID: best.providerID, modelID: best.id }
-  if (configured) return configured
+  if (configured && !configuredInfo) return configured
 }
 
 function selectDefaultModel(snapshot: Directory.Snapshot) {
@@ -874,7 +883,7 @@ const promptResponse = Effect.fn("ACP.promptResponse")(function* (
 
 function promptErrorMessage(error: AssistantError) {
   if ("message" in error.data && typeof error.data.message === "string") return error.data.message
-  return "OpenCode prompt failed"
+  return "OpenFork prompt failed"
 }
 
 function sendUsageUpdate(
@@ -901,7 +910,12 @@ function selectVariant(snapshot: Directory.Snapshot, model: Directory.DefaultMod
 
 function configOptions(snapshot: Directory.Snapshot, session: ConfigState) {
   return buildConfigOptions({
-    providers: Object.values(snapshot.providers),
+    providers: Object.values(snapshot.providers).map((provider) => ({
+      ...provider,
+      models: Object.fromEntries(
+        Object.entries(provider.models).filter(([, model]) => Provider.isLanguageModel(model)),
+      ),
+    })),
     currentModel: session.model,
     currentVariant: session.variant,
     modes: snapshot.availableModes,
@@ -914,6 +928,14 @@ function parseSelectedModel(snapshot: Directory.Snapshot, modelId: string) {
   const provider = snapshot.providers[ProviderV2.ID.make(selected.model.providerID)]
   const model = provider?.models[ModelV2.ID.make(selected.model.modelID)]
   if (!model) {
+    return Effect.fail(
+      new ACPError.InvalidModelError({
+        providerId: selected.model.providerID,
+        modelId,
+      }),
+    )
+  }
+  if (!Provider.isLanguageModel(model)) {
     return Effect.fail(
       new ACPError.InvalidModelError({
         providerId: selected.model.providerID,
@@ -1038,7 +1060,8 @@ function stableStringify(value: unknown): string {
 
 function restoreFromMessages(messages: readonly MessageInfo[]) {
   const user = messages.findLast(
-    (message) => message.role === "user" && message.model?.providerID && message.model.modelID,
+    (message) =>
+      SessionTurnProvenance.isWorkerPromptInfo(message) && message.model?.providerID && message.model.modelID,
   )
   if (user?.model?.providerID && user.model.modelID) {
     return {
@@ -1069,7 +1092,7 @@ function fromUnknownError(error: unknown, service?: string): Error {
   if (isAuthRequired(error)) {
     return new ACPError.AuthRequiredError({ providerId: findProviderID(error) })
   }
-  return new ACPError.ServiceFailureError({ safeMessage: "OpenCode service failure", service })
+  return new ACPError.ServiceFailureError({ safeMessage: "OpenFork service failure", service })
 }
 
 function isACPError(error: unknown): error is Error {

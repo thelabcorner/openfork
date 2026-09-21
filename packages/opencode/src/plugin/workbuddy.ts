@@ -2,7 +2,7 @@ import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Model } from "@opencode-ai/sdk/v2"
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http"
 import { createHash, randomBytes } from "crypto"
-import { AdmissionError, type RefreshResult, type RunGenerationOpts } from "./workbuddy-governor"
+import { AdmissionError, type RefreshResult } from "./workbuddy-governor"
 import { workBuddyClientHeaders, workBuddyUserAgent } from "./workbuddy-identity"
 import {
   isAccountForbidden,
@@ -22,6 +22,7 @@ import {
   pollWorkBuddyOAuth,
   startWorkBuddyOAuth,
   type Credential,
+  type AccountRouteGenerationResult,
   type WorkBuddyAccount,
   type WorkBuddyOAuthRealm,
 } from "./workbuddy-accounts"
@@ -1399,30 +1400,6 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     (req.headers["x-request-id"] as string | undefined) ??
     randomBytes(12).toString("hex")
   const explicitAccount = decoded.accountId ?? (req.headers["x-workbuddy-account"] as string | undefined)
-  const selection = accountRouter.select(session, requestedModel, explicitAccount)
-  if (!selection) {
-    const accounts = accountRegistry.all()
-    // An all-forbidden pool is a distinct, actionable diagnosis: the session
-    // endpoint answers 200 for a restricted account, so the default account
-    // message would send the user to sign in again for something
-    // re-authentication cannot clear.
-    const allForbidden = accounts.length > 0 && accounts.every((account) => account.governor.isAccountForbidden())
-    const status = accounts.length === 0 ? 401 : allForbidden ? 403 : 429
-    const message =
-      accounts.length === 0
-        ? "No signed-in WorkBuddy desktop session found. Sign in to the WorkBuddy desktop app, then retry."
-        : allForbidden
-          ? "Every signed-in WorkBuddy account is currently restricted by WorkBuddy (auth_forbidden, code 11140). This is a Tencent-side account restriction — re-authenticating does not clear it. Add or switch to another WorkBuddy account, or contact WorkBuddy support."
-          : `No eligible WorkBuddy account currently supports ${requestedModel}; choose an account or wait for its entitlement window.`
-    return sendJson(res, status, {
-      error: {
-        message,
-        type: accounts.length === 0 ? "authentication_error" : allForbidden ? "account_forbidden" : "account_unavailable",
-      },
-    })
-  }
-  const account = selection.account
-  const cred = account.credential
 
   const messages = Array.isArray(payload?.messages) ? [...payload.messages] : []
   // Backend contract (code 11128): the first message must be a system prompt.
@@ -1450,62 +1427,87 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     req.removeListener("aborted", abortOnClientClose)
     res.removeListener("close", abortOnClientClose)
   }
-  const transport: RunGenerationOpts["transport"] = () =>
-    fetch(`${backendFor(cred)}/v2/chat/completions`, {
-      method: "POST",
-      headers: upstreamHeaders(cred, upstreamConversationHeaders(account.id, session)),
-      body: JSON.stringify(body),
-      signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-    })
-
-  let result
   let _govStart2 = WB_PROFILE ? performance.now() : 0
-  // Tracks whether the governor attempted a token refresh for this
-  // generation, so a terminal 401 can say so instead of implying the user
-  // never signed in.
-  let refreshAttempted = false
+  let routed: AccountRouteGenerationResult
   try {
-    // The ACCOUNT governor owns admission, the generation-commit point, and the
-    // single auth-recovery retry. handleCompletions never re-issues a generation.
-    result = await account.governor.runGeneration({
+    routed = await accountRouter.runGeneration({
       priority: priorityFor(payload, messages),
-      genKey: `${account.id}:${requestId}`,
-      model: requestedModel,
+      requestId,
+      requestedModel,
       session,
-      isExpired: () => isExpired(cred),
-      refresh: () => {
-        refreshAttempted = true
-        return singleflightRefresh(account).then(toRefreshResult)
-      },
-      transport,
+      explicitAccountId: explicitAccount,
       signal: cancellation.signal,
-      enrollmentEpoch: cred.enrollmentEpoch,
+      isExpired: (account) => isExpired(account.credential),
+      refresh: (account) => singleflightRefresh(account).then(toRefreshResult),
+      transport: (account) => {
+        const cred = account.credential
+        return fetch(`${backendFor(cred)}/v2/chat/completions`, {
+          method: "POST",
+          headers: upstreamHeaders(cred, upstreamConversationHeaders(account.id, session)),
+          body: JSON.stringify(body),
+          signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+        })
+      },
     })
-    if (WB_PROFILE) wbMark("handleCompletions:governor", _govStart2)
-  } catch (e) {
-    if (e instanceof AdmissionError) {
-      cleanupCancellation()
-      const headers: Record<string, string> = e.retryAfter > 0 ? { "Retry-After": String(e.retryAfter) } : {}
-      const type = e.kind === "quota"
-        ? "quota_exhausted"
-        : e.kind === "queue"
-          ? "unavailable_error"
-          : e.kind === "cancel"
-            ? "canceled"
-            : e.kind === "duplicate"
-              ? "duplicate_request"
-              : e.kind === "forbidden"
-                ? "account_forbidden"
-                : "rate_limit_error"
-      const status = e.kind === "quota" ? 402 : e.kind === "queue" ? 503 : e.kind === "cancel" ? 499 : e.kind === "duplicate" ? 409 : e.kind === "forbidden" ? 403 : 429
-      if (res.writableEnded || res.destroyed) return
-      return sendJson(res, status, { error: { message: e.message, type } }, headers)
-    }
+  } catch {
     cleanupCancellation()
     return sendJson(res, 502, {
       error: { message: "Could not reach the WorkBuddy backend.", type: "upstream_error" },
     })
   }
+  if (WB_PROFILE) wbMark("handleCompletions:governor", _govStart2)
+
+  if (routed.kind === "unavailable") {
+    cleanupCancellation()
+    if (res.writableEnded || res.destroyed) return
+    const accounts = accountRegistry.all()
+    const modelAccounts = accounts.filter((account) => !account.catalog || account.catalog.ids.has(requestedModel))
+    const allForbidden = modelAccounts.length > 0 && modelAccounts.every((account) => account.governor.isAccountForbidden())
+    const attempted = routed.attemptedAccountIds.length
+    const status = accounts.length === 0 ? 401 : allForbidden ? 403 : 429
+    const message =
+      accounts.length === 0
+        ? "No signed-in WorkBuddy desktop session found. Sign in to the WorkBuddy desktop app, then retry."
+        : allForbidden
+          ? attempted > 0
+            ? `Every WorkBuddy account eligible for ${requestedModel} is currently restricted by WorkBuddy (auth_forbidden, code 11140). The logical request tried ${attempted} account${attempted === 1 ? "" : "s"} and no healthy eligible account remains.`
+            : `Every WorkBuddy account eligible for ${requestedModel} is currently restricted by WorkBuddy (auth_forbidden, code 11140); no healthy eligible account remains.`
+          : attempted > 0
+            ? `No healthy eligible WorkBuddy account remains for ${requestedModel} after ${attempted} bounded account attempt${attempted === 1 ? "" : "s"}.`
+            : `No eligible WorkBuddy account currently supports ${requestedModel}; choose an account or wait for its entitlement window.`
+    return sendJson(res, status, {
+      error: {
+        message,
+        type: accounts.length === 0 ? "authentication_error" : allForbidden ? "account_forbidden" : "account_unavailable",
+      },
+    })
+  }
+
+  if (routed.kind === "admission") {
+    const e = routed.error
+    cleanupCancellation()
+    const headers: Record<string, string> = e.retryAfter > 0 ? { "Retry-After": String(e.retryAfter) } : {}
+    const type = e.kind === "quota"
+      ? "quota_exhausted"
+      : e.kind === "auth"
+        ? "authentication_error"
+      : e.kind === "queue"
+        ? "unavailable_error"
+        : e.kind === "cancel"
+          ? "canceled"
+          : e.kind === "duplicate"
+            ? "duplicate_request"
+            : e.kind === "forbidden"
+              ? "account_forbidden"
+              : "rate_limit_error"
+    const status = e.kind === "quota" ? 402 : e.kind === "auth" ? 401 : e.kind === "queue" ? 503 : e.kind === "cancel" ? 499 : e.kind === "duplicate" ? 409 : e.kind === "forbidden" ? 403 : 429
+    if (res.writableEnded || res.destroyed) return
+    return sendJson(res, status, { error: { message: e.message, type } }, headers)
+  }
+
+  const account = routed.selection.account
+  const result = routed.generation
+  const refreshAttempted = routed.refreshAttempted
 
   const upstream = result.res
   if (!upstream.ok || !upstream.body) {
@@ -1920,15 +1922,12 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
       // duplicate transport attempt from being mistaken for a new request.
       output.headers["x-opencode-session"] = input.sessionID
       if (input.message?.id) {
-        // Multiple distinct generations can be derived from the same user
-        // message in the same turn (title generation is forked in parallel
-        // with the main streamText — see SessionPrompt.prompt.ts:1425-1431).
-        // Both pass `user: firstInfo` on a fresh session, which makes their
-        // `info.id` identical; without this namespace the workbuddy
-        // governor's top-level duplicate guard would reject the second
-        // in-flight request and the session would never start. Prefixing
-        // by the agent purpose keeps the same user message id under a
-        // distinct genKey per generation.
+        // Multiple distinct generations can share one Session affinity. Title
+        // generation now uses its own host-owned V1 special-agent anchor rather
+        // than borrowing the worker's user message, so request identity is no
+        // longer coupled to human-turn identity. Keep the purpose namespace for
+        // backward compatibility with older title anchors and to make helper vs
+        // main-generation intent explicit to the Workbuddy governor.
         const purpose = input.agent === "title" ? "title" : "main"
         output.headers["x-opencode-request"] = `${purpose}:${input.message.id}`
       }
