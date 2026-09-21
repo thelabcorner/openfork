@@ -407,9 +407,14 @@ export class SpadSupervisor {
 
   get recoveryAttempts(): number { return this.attempts }
 
-  /** Drain bounded gray-zone evidence for asynchronous LLM calibration. */
-  takeAuditCases(): SpadAuditCase[] {
+  /**
+   * Dequeue only the gray-zone evidence the caller can actually execute.
+   * Evidence beyond the current budget remains owned by the supervisor instead
+   * of being drained and silently discarded by a downstream slice.
+   */
+  takeAuditCases(limit = this.pendingAudits.length): SpadAuditCase[] {
     if (this.pendingAudits.length === 0) return []
-    return this.pendingAudits.splice(0, this.pendingAudits.length)
+    const count = Math.max(0, Math.min(this.pendingAudits.length, Math.floor(limit)))
+    return count === 0 ? [] : this.pendingAudits.splice(0, count)
   }
 }

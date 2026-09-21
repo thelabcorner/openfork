@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { APICallError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderTransform } from "@/provider/transform"
@@ -112,6 +113,36 @@ function basePart(messageID: string, id: string) {
 }
 
 describe("session.message-v2.toModelMessage", () => {
+  test("host-owned V1 synthetic turns still lower to provider role user", async () => {
+    const messageID = "m-host-continuation"
+    const info = userInfo(messageID)
+    info.provenance = SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+      sourceMessageID: MessageID.make("msg_human_root"),
+      ref: "reservation-1",
+    })
+    const input: SessionV1.WithParts[] = [
+      {
+        info,
+        parts: [
+          {
+            ...basePart(messageID, "p-host-continuation"),
+            type: "text",
+            text: "Continue the next concrete worker cycle.",
+            synthetic: true,
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(SessionTurnProvenance.semanticKind(input[0]!)).toBe("synthetic")
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "Continue the next concrete worker cycle." }],
+      },
+    ])
+  })
+
   test("filters out messages with no parts", async () => {
     const input: SessionV1.WithParts[] = [
       {
@@ -1619,6 +1650,245 @@ describe("session.message-v2.latest", () => {
       },
     ] as SessionV1.Part[],
   }
+
+  const stateMessage = (
+    id: string,
+    source: typeof SessionTurnProvenance.Source.GoalSpecification | typeof SessionTurnProvenance.Source.GoalProgress,
+    text: string,
+    created: number,
+  ): SessionV1.WithParts => {
+    const info = { ...userInfo(id), time: { created } }
+    info.provenance = SessionTurnProvenance.host(source, { ref: `goal-state:test:${id}` })
+    return {
+      info,
+      parts: [
+        {
+          ...basePart(id, `state-${id}`),
+          type: "text",
+          text,
+          synthetic: true,
+        },
+      ] as SessionV1.Part[],
+    }
+  }
+
+  test("treats newer state projections as transparent to the active V1 turn", () => {
+    const human = { ...userInfo("msg_human_turn"), time: { created: 100 } }
+    human.provenance = SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)
+    const state = stateMessage(
+      "msg_state_newer",
+      SessionTurnProvenance.Source.GoalProgress,
+      "current progress",
+      200,
+    )
+
+    const latest = MessageV2.latest([{ info: human, parts: [] }, state])
+    expect(latest.user?.id).toBe(human.id)
+    expect(SessionTurnProvenance.isStateProjectionTurn(state)).toBe(true)
+  })
+
+  test("keeps historical state-shaped rows structurally transparent without reviving live STATE", () => {
+    const human = { ...userInfo("msg_human_before_historical_state"), time: { created: 100 } }
+    human.provenance = SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)
+    const historicalState = stateMessage(
+      "msg_historical_state",
+      SessionTurnProvenance.Source.GoalProgress,
+      "old imported progress",
+      200,
+    )
+    if (historicalState.info.role !== "user") throw new Error("expected state projection to use user role")
+    historicalState.info.provenance = {
+      ...historicalState.info.provenance!,
+      lifetime: "historical",
+    }
+
+    const latest = MessageV2.latest([{ info: human, parts: [] }, historicalState])
+    expect(latest.user?.id).toBe(human.id)
+    expect(SessionTurnProvenance.hasStateSemanticsTurn(historicalState)).toBe(true)
+    expect(SessionTurnProvenance.isStateProjectionTurn(historicalState)).toBe(false)
+  })
+
+  test("collapses V1 state by source and materializes it immediately before the active turn", () => {
+    const oldSpec = stateMessage(
+      "msg_spec_old",
+      SessionTurnProvenance.Source.GoalSpecification,
+      "old spec",
+      10,
+    )
+    const progress = stateMessage(
+      "msg_progress",
+      SessionTurnProvenance.Source.GoalProgress,
+      "current progress",
+      20,
+    )
+    const human: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_human_latest"),
+        time: { created: 30 },
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      },
+      parts: [{ ...basePart("msg_human_latest", "human"), type: "text", text: "human steer" }] as SessionV1.Part[],
+    }
+    // Simulate the V1 runner publishing refreshed state after the human row was
+    // already persisted. Physical chronology must not become instruction order.
+    const newSpec = stateMessage(
+      "msg_spec_new",
+      SessionTurnProvenance.Source.GoalSpecification,
+      "new spec",
+      40,
+    )
+
+    const projected = MessageV2.projectStateForModel([oldSpec, progress, human, newSpec])
+    expect(projected.map((message) => message.info.id)).toEqual([
+      newSpec.info.id,
+      progress.info.id,
+      human.info.id,
+    ])
+    expect(projected.some((message) => message.info.id === oldSpec.info.id)).toBe(false)
+  })
+
+  test("historical state-shaped rows are transparent to the V1 provider projection", () => {
+    const historical = stateMessage(
+      "msg_progress_historical_provider",
+      SessionTurnProvenance.Source.GoalProgress,
+      "stale imported progress",
+      10,
+    )
+    if (historical.info.role !== "user") throw new Error("expected state projection to use user role")
+    historical.info.provenance = {
+      ...historical.info.provenance!,
+      lifetime: "historical",
+    }
+    const human: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_human_after_historical_state"),
+        time: { created: 20 },
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      },
+      parts: [],
+    }
+
+    expect(MessageV2.projectStateForModel([historical, human]).map((message) => message.info.id)).toEqual([
+      human.info.id,
+    ])
+  })
+
+  test("historical user rows cannot become the active V1 turn even with a newer timestamp", () => {
+    const live: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_live_active"),
+        time: { created: 10 },
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      },
+      parts: [],
+    }
+    const historical: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_historical_future"),
+        time: { created: 10_000 },
+        provenance: {
+          ...SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+          lifetime: "historical",
+        },
+      },
+      parts: [],
+    }
+
+    expect(MessageV2.latest([live, historical]).user?.id).toBe(live.info.id)
+    expect(MessageV2.projectStateForModel([live, historical]).map((message) => message.info.id)).toEqual([
+      live.info.id,
+      historical.info.id,
+    ])
+  })
+
+  test("historical compaction cannot become the live STATE reset boundary", () => {
+    const compactionID = MessageID.make("msg_historical_compaction")
+    const compaction: SessionV1.WithParts = {
+      info: {
+        ...userInfo(compactionID),
+        time: { created: 100 },
+        provenance: {
+          ...SessionTurnProvenance.host(SessionTurnProvenance.Source.Compaction, {
+            sourceMessageID: MessageID.make("msg_old_root"),
+          }),
+          lifetime: "historical",
+        },
+      },
+      parts: [{ ...basePart(compactionID, "historical-compaction"), type: "compaction", auto: true }] as SessionV1.Part[],
+    }
+    const summary: SessionV1.WithParts = {
+      info: {
+        ...assistantInfo("msg_historical_compaction_summary", compactionID),
+        time: { created: 101 },
+        summary: true,
+        finish: "stop",
+      } as SessionV1.Assistant,
+      parts: [],
+    }
+
+    expect(MessageV2.latestCompletedCompaction([compaction, summary])).toBeUndefined()
+  })
+
+  test("drops pre-compaction state and keeps only state published after the completed reset boundary", () => {
+    const oldSpec = stateMessage(
+      "msg_spec_before_compaction",
+      SessionTurnProvenance.Source.GoalSpecification,
+      "old spec",
+      10,
+    )
+    const compactionID = MessageID.make("msg_state_compaction")
+    const compaction: SessionV1.WithParts = {
+      info: {
+        ...userInfo(compactionID),
+        time: { created: 20 },
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.Compaction, {
+          sourceMessageID: MessageID.make("msg_worker_root"),
+        }),
+      },
+      parts: [{ ...basePart(compactionID, "state-compaction"), type: "compaction", auto: true }] as SessionV1.Part[],
+    }
+    const summary: SessionV1.WithParts = {
+      info: {
+        ...assistantInfo("msg_state_summary", compactionID),
+        time: { created: 21 },
+        summary: true,
+        finish: "stop",
+      } as SessionV1.Assistant,
+      parts: [],
+    }
+    const newProgress = stateMessage(
+      "msg_progress_after_compaction",
+      SessionTurnProvenance.Source.GoalProgress,
+      "new progress",
+      30,
+    )
+    const continuation: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_continue_after_compaction"),
+        time: { created: 40 },
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.CompactionContinue, {
+          sourceMessageID: MessageID.make("msg_worker_root"),
+        }),
+      },
+      parts: [
+        {
+          ...basePart("msg_continue_after_compaction", "continue-after-compaction"),
+          type: "text",
+          text: "continue",
+          synthetic: true,
+        },
+      ] as SessionV1.Part[],
+    }
+
+    const projected = MessageV2.projectStateForModel([oldSpec, compaction, summary, newProgress, continuation])
+    expect(projected.some((message) => message.info.id === oldSpec.info.id)).toBe(false)
+    expect(projected.map((message) => message.info.id)).toEqual([
+      compaction.info.id,
+      summary.info.id,
+      newProgress.info.id,
+      continuation.info.id,
+    ])
+  })
 
   test("selects latest messages by creation time when IDs are nonmonotonic", () => {
     const oldUser = { ...userInfo("msg_z_user"), time: { created: 100 } }

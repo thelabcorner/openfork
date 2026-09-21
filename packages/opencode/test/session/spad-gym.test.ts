@@ -180,7 +180,7 @@ describe("SPAD gym — precision-first production profile", () => {
       exactLoop("A long paragraph-scale motif should be interrupted only after several verified copies. This sentence adds enough lexical diversity to avoid a trivial short period. ", 12),
     ]
     for (const text of positives) {
-      const action = runText({ name: "positive", text })
+      const action = runText({ name: "positive", class: "prose", text })
       expect(action?.type).toBe("recover")
       expect(action?.detection.lane).toBe("raw")
       expect(action?.detection.exactVerifiedSpan).toBeGreaterThan(action?.detection.period ?? Number.POSITIVE_INFINITY)
@@ -314,7 +314,7 @@ describe("SPAD gym — precision-first production profile", () => {
 
   test("canonical drift is detected but cannot mutate output by default", () => {
     const text = canonicalOnlyDrift()
-    const action = runText({ name: "canonical", text })
+    const action = runText({ name: "canonical", class: "prose", text })
     expect(action?.type).toBe("observe")
     expect(action?.detection.lane).toBe("canonical")
   })
@@ -336,6 +336,20 @@ describe("SPAD gym — precision-first production profile", () => {
     expect(queued[0]?.intentIndependent.candidateTail.length).toBeLessThanOrEqual(1200)
     expect(queued[0]?.intentIndependent.features.period).toBeGreaterThan(0)
     expect(sup.takeAuditCases()).toEqual([])
+  })
+
+  test("audit dequeue never drains evidence beyond the caller's execution budget", () => {
+    const sup = new SpadSupervisor()
+    const pending = [
+      { detection: { source: "canonical-period" } },
+      { detection: { source: "information-recurrence" } },
+      { detection: { source: "generation-state-cycle" } },
+    ]
+    ;(sup as unknown as { pendingAudits: unknown[] }).pendingAudits = pending
+
+    expect(sup.takeAuditCases(2).map((item) => item.detection.source)).toEqual(["canonical-period", "information-recurrence"])
+    expect(sup.takeAuditCases(2).map((item) => item.detection.source)).toEqual(["generation-state-cycle"])
+    expect(sup.takeAuditCases(2)).toEqual([])
   })
 
   test("reasoning cannot acquire destructive authority through a caller flag", () => {
@@ -374,7 +388,7 @@ describe("SPAD gym — precision-first production profile", () => {
         text += `${i + 1}. The ${noun} ${verb} item-${(rand() % 97) + 1} with status-${rand() % 13} and attempt-${rand() % 5}.\n`
         if (rand() % 9 === 0) text += `   - key insight: ${noun} remains consistent while value ${rand() % 10000} changes.\n`
       }
-      const action = runText({ name: `fuzz-${c}`, text }, DEFAULT_SPAD_CONFIG, [1 + (rand() % 211)])
+      const action = runText({ name: `fuzz-${c}`, class: "prose", text }, DEFAULT_SPAD_CONFIG, [1 + (rand() % 211)])
       expect(isIntervention(action), `case=${c} lane=${action?.detection.lane}`).toBe(false)
     }
   })

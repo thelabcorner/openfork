@@ -1,13 +1,13 @@
 import fs from "fs"
-import os from "os"
 import path from "path"
+import { Global } from "@opencode-ai/core/global"
 
 const MAGIC = 0x44415053 // 'SPAD' LE
 const VERSION = 1
 const MAX_MOTIFS = 32
 const MAX_MOTIF_LEN = 4096
 
-const STORE_PATH = path.join(os.homedir(), ".local", "share", "opencode", "spad-patterns.bin")
+const STORE_PATH = path.join(Global.Path.data, "spad-patterns.bin")
 
 function hashMotif(motif: Uint16Array): number {
   let h = 0 >>> 0

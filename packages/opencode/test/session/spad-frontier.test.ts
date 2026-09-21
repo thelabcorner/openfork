@@ -283,17 +283,17 @@ describe("SPAD frontier — unseen fixtures", () => {
   test("toolResourceKey distinguishes SQLite queries instead of collapsing on action=query", () => {
     const a = toolResourceKey("sqlite", {
       action: "query",
-      db: "C:/tmp/opencode.db",
+      db: "C:/tmp/openfork.db",
       sql: "SELECT COUNT(*) FROM part",
     })
     const b = toolResourceKey("sqlite", {
       action: "query",
-      db: "C:/tmp/opencode.db",
+      db: "C:/tmp/openfork.db",
       sql: "SELECT COUNT(*) FROM session",
     })
     const same = toolResourceKey("sqlite", {
       action: "query",
-      db: "C:/tmp/opencode.db",
+      db: "C:/tmp/openfork.db",
       sql: "  select   count(*)   from part  ",
     })
     expect(a).not.toBe(b)

@@ -4,7 +4,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionGroupMemberTable, SessionGroupTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { eq } from "drizzle-orm"
 import { Effect, Layer } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -14,13 +15,29 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Session } from "@/session/session"
 import { SessionGroup } from "@/session/group"
 import { Goal } from "@opencode-ai/core/goal"
+import { SessionGroup as SessionGroupModel } from "@opencode-ai/schema/session-group"
+import { SwarmID } from "@opencode-ai/schema/swarm-id"
+import { Agent } from "@opencode-ai/schema/agent"
+import { Model } from "@opencode-ai/schema/model"
+import { Provider } from "@opencode-ai/schema/provider"
+import type { Swarm } from "@opencode-ai/schema/swarm"
 import { testEffect } from "../lib/effect"
+
+const managedProfile = {
+  agent: Agent.ID.make("build"),
+  model: {
+    providerID: Provider.ID.make("test"),
+    id: Model.ID.make("test-model"),
+  },
+  permissionBoundary: [],
+} satisfies Swarm.MemberExecutionProfile
 
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
       Session.node,
       SessionGroup.node,
+      SwarmV2.node,
       Goal.node,
       Database.node,
       EventV2Bridge.node,
@@ -74,7 +91,7 @@ it.instance("enforces subagent and plugin membership ownership", () =>
     const groups = yield* SessionGroup.Service
     const session = yield* sessions.create({ title: "Locked session" })
     const subagents = yield* groups.create({ name: "Subagents", kind: "subagent", anchorSessionId: session.id })
-    const plugin = yield* groups.create({ name: "Swarm", kind: "plugin", ownerPlugin: "openswarm" })
+    const plugin = yield* groups.create({ name: "Plugin workspace", kind: "plugin", ownerPlugin: "example-plugin" })
 
     yield* groups.addSession({
       groupId: subagents.id,
@@ -90,13 +107,13 @@ it.instance("enforces subagent and plugin membership ownership", () =>
       sessionId: session.id,
       locked: true,
       origin: "plugin",
-      originPlugin: "openswarm",
+      originPlugin: "example-plugin",
     })
     const foreign = yield* groups
       .removeSession({ groupId: plugin.id, sessionId: session.id, ownerPlugin: "foreign" })
       .pipe(Effect.flip)
     expect(foreign._tag).toBe("SessionGroupOwnerMismatchError")
-    yield* groups.removeSession({ groupId: plugin.id, sessionId: session.id, ownerPlugin: "openswarm" })
+    yield* groups.removeSession({ groupId: plugin.id, sessionId: session.id, ownerPlugin: "example-plugin" })
     expect((yield* groups.list()).some((group) => group.id === plugin.id)).toBe(false)
 
     yield* sessions.remove(session.id)
@@ -135,6 +152,253 @@ it.instance("never exposes membership-empty groups", () =>
   }),
 )
 
+it.instance("rejects generic mutation of virtual Swarm group identities before touching persisted group rows", () =>
+  Effect.gen(function* () {
+    const groups = yield* SessionGroup.Service
+    const virtualID = SessionGroupModel.groupIDForSwarm(SwarmID.make("swr_virtual_mutation_guard"))
+
+    const operations: ReadonlyArray<Effect.Effect<void, unknown>> = [
+      groups.rename({ id: virtualID, name: "Nope" }),
+      groups.reorder({ id: virtualID, position: 1 }),
+      groups.addSession({ groupId: virtualID, sessionId: "ses_missing" }),
+      groups.removeSession({ groupId: virtualID, sessionId: "ses_missing" }),
+      groups.setPolicy({
+        id: virtualID,
+        policy: { autoAddDescendants: false, lockAdded: false, autoDeleteWhenEmpty: false },
+      }),
+      groups.reorderMembers({ id: virtualID, sessionIds: [] }),
+      groups.remove(virtualID),
+    ]
+
+    for (const operation of operations) {
+      const error = yield* operation.pipe(Effect.flip)
+      expect((error as { _tag?: string })._tag).toBe("SessionGroupManagedProjectionError")
+      if ((error as { _tag?: string })._tag === "SessionGroupManagedProjectionError") {
+        expect((error as { code?: string }).code).toBe("session_group.managed_projection")
+        expect((error as { groupID?: string }).groupID).toBe(virtualID)
+      }
+    }
+  }),
+)
+
+it.instance("projects Swarm membership as a read-only virtual SessionGroup without materializing group state", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const swarms = yield* SwarmV2.Service
+    const database = yield* Database.Service
+    const coordinator = yield* sessions.create({ title: "Native coordinator" })
+    const worker = yield* sessions.create({ title: "Native worker" })
+    const coordinatorRow = yield* database.db
+      .select({ id: SessionTable.id, projectID: SessionTable.project_id, directory: SessionTable.directory })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, coordinator.id))
+      .get()
+      .pipe(Effect.orDie)
+    if (!coordinatorRow) throw new Error("coordinator Session row missing")
+
+    const swarm = yield* swarms.create({
+      projectID: coordinatorRow.projectID,
+      directory: coordinatorRow.directory,
+      name: "Native Swarm",
+      now: 1_000,
+    })
+    const coordinatorMember = yield* swarms.addMember({
+      swarmID: swarm.id,
+      name: "coordinator",
+      kind: "coordinator",
+      role: "Lead",
+      sessionID: coordinatorRow.id,
+      workspacePolicy: { mode: "shared-read" },
+      now: 1_010,
+    })
+    const workerRow = yield* database.db
+      .select({ id: SessionTable.id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, worker.id))
+      .get()
+      .pipe(Effect.orDie)
+    if (!workerRow) throw new Error("worker Session row missing")
+    const workerMember = yield* swarms.addMember({
+      swarmID: swarm.id,
+      name: "worker",
+      kind: "managed_worker",
+      role: "Implementer",
+      desiredProfile: managedProfile,
+      sessionID: workerRow.id,
+      workspacePolicy: { mode: "shared-read" },
+      now: 1_020,
+    })
+    yield* swarms.update({
+      id: swarm.id,
+      expectedRevision: 0,
+      coordinatorMemberID: coordinatorMember.id,
+      now: 1_030,
+    })
+
+    const virtualID = SessionGroupModel.groupIDForSwarm(swarm.id)
+    const detail = yield* groups.getWithSessions(virtualID)
+    expect(detail.group).toMatchObject({
+      id: virtualID,
+      kind: "swarm",
+      name: "Native Swarm",
+      ownerRef: swarm.id,
+      anchorSessionID: coordinator.id,
+      position: 1_000,
+    })
+    expect(detail.group.ownerPlugin).toBeUndefined()
+    expect(detail.sessions).toHaveLength(2)
+    expect(detail.sessions[0]).toMatchObject({
+      id: coordinator.id,
+      locked: true,
+      origin: "swarm",
+      originRef: coordinatorMember.id,
+      position: 0,
+    })
+    expect(detail.sessions[1]).toMatchObject({
+      id: worker.id,
+      locked: true,
+      origin: "swarm",
+      originRef: workerMember.id,
+      position: 1,
+    })
+
+    expect((yield* groups.list()).find((item) => item.id === virtualID)).toMatchObject({ kind: "swarm" })
+    expect((yield* groups.membershipsFor(worker.id)).map((item) => item.group.id)).toContain(virtualID)
+    expect(yield* database.db.select().from(SessionGroupTable).all().pipe(Effect.orDie)).toEqual([])
+    expect(yield* database.db.select().from(SessionGroupMemberTable).all().pipe(Effect.orDie)).toEqual([])
+    expect(
+      yield* database.db
+        .select({ groupID: SessionTable.group_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, worker.id))
+        .get()
+        .pipe(Effect.orDie),
+    ).toEqual({ groupID: null })
+
+    yield* swarms.setMemberLifecycle({
+      swarmID: swarm.id,
+      memberID: coordinatorMember.id,
+      expectedLifecycle: "active",
+      lifecycle: "stopped",
+      now: 1_040,
+    })
+    const withoutCoordinator = yield* groups.getWithSessions(virtualID)
+    expect(withoutCoordinator.group.id).toBe(virtualID)
+    expect(withoutCoordinator.group.anchorSessionID).toBeUndefined()
+    expect(withoutCoordinator.sessions.map((item) => item.id)).toEqual([worker.id])
+    expect((yield* groups.list()).some((item) => item.id === virtualID)).toBe(true)
+  }),
+)
+
+it.instance("allows one Session in multiple virtual Swarm groups and hides zero-bound Swarms without deleting them", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const swarms = yield* SwarmV2.Service
+    const database = yield* Database.Service
+    const session = yield* sessions.create({ title: "Shared coordinator" })
+    const row = yield* database.db
+      .select({ id: SessionTable.id, projectID: SessionTable.project_id, directory: SessionTable.directory })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, session.id))
+      .get()
+      .pipe(Effect.orDie)
+    if (!row) throw new Error("Session row missing")
+
+    const a = yield* swarms.create({ projectID: row.projectID, directory: row.directory, name: "A", now: 2_000 })
+    const b = yield* swarms.create({ projectID: row.projectID, directory: row.directory, name: "B", now: 2_100 })
+    const empty = yield* swarms.create({ projectID: row.projectID, directory: row.directory, name: "Empty", now: 2_200 })
+    const memberA = yield* swarms.addMember({
+      swarmID: a.id,
+      name: "shared-a",
+      kind: "coordinator",
+      role: "Lead",
+      sessionID: row.id,
+      workspacePolicy: { mode: "shared-read" },
+    })
+    yield* swarms.addMember({
+      swarmID: b.id,
+      name: "shared-b",
+      kind: "coordinator",
+      role: "Lead",
+      sessionID: row.id,
+      workspacePolicy: { mode: "shared-read" },
+    })
+
+    const memberships = yield* groups.membershipsFor(session.id)
+    expect(memberships.map((item) => item.group.id)).toEqual([
+      SessionGroupModel.groupIDForSwarm(a.id),
+      SessionGroupModel.groupIDForSwarm(b.id),
+    ])
+    expect((yield* groups.list()).some((item) => item.id === SessionGroupModel.groupIDForSwarm(empty.id))).toBe(false)
+
+    yield* swarms.setMemberLifecycle({
+      swarmID: a.id,
+      memberID: memberA.id,
+      expectedLifecycle: "active",
+      lifecycle: "stopped",
+      now: 2_300,
+    })
+    expect((yield* groups.list()).some((item) => item.id === SessionGroupModel.groupIDForSwarm(a.id))).toBe(false)
+    expect((yield* swarms.get(a.id)).swarm.id).toBe(a.id)
+  }),
+)
+
+it.instance("refreshes a Swarm coordinator rebind immediately without changing the virtual group identity", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const swarms = yield* SwarmV2.Service
+    const database = yield* Database.Service
+    const first = yield* sessions.create({ title: "Coordinator one" })
+    const second = yield* sessions.create({ title: "Coordinator two" })
+    const rows = yield* database.db
+      .select({ id: SessionTable.id, projectID: SessionTable.project_id, directory: SessionTable.directory })
+      .from(SessionTable)
+      .where(eq(SessionTable.project_id, first.projectID))
+      .all()
+      .pipe(Effect.orDie)
+    const firstRow = rows.find((row) => row.id === first.id)
+    const secondRow = rows.find((row) => row.id === second.id)
+    if (!firstRow || !secondRow) throw new Error("coordinator Session rows missing")
+
+    const swarm = yield* swarms.create({
+      projectID: firstRow.projectID,
+      directory: firstRow.directory,
+      name: "Rebind",
+      now: 3_000,
+    })
+    const member = yield* swarms.addMember({
+      swarmID: swarm.id,
+      name: "coordinator",
+      kind: "coordinator",
+      role: "Lead",
+      sessionID: firstRow.id,
+      workspacePolicy: { mode: "shared-read" },
+      now: 3_010,
+    })
+    yield* swarms.update({ id: swarm.id, expectedRevision: 0, coordinatorMemberID: member.id, now: 3_020 })
+
+    const virtualID = SessionGroupModel.groupIDForSwarm(swarm.id)
+    expect((yield* groups.getWithSessions(virtualID)).group.anchorSessionID).toBe(first.id)
+    yield* groups.listWithSessions()
+
+    yield* swarms.rebindMember({
+      swarmID: swarm.id,
+      memberID: member.id,
+      expectedBindingGeneration: 1,
+      sessionID: secondRow.id,
+      now: 3_030,
+    })
+
+    const rebound = yield* groups.getWithSessions(virtualID)
+    expect(rebound.group.id).toBe(virtualID)
+    expect(rebound.group.anchorSessionID).toBe(second.id)
+    expect(rebound.sessions.map((item) => item.id)).toEqual([second.id])
+  }),
+)
+
 it.instance("keeps plugin groups distinct by stable owner ref and can re-anchor one in place", () =>
   Effect.gen(function* () {
     const sessions = yield* Session.Service
@@ -143,17 +407,17 @@ it.instance("keeps plugin groups distinct by stable owner ref and can re-anchor 
     const secondCoordinator = yield* sessions.create({ title: "Coordinator B" })
 
     const first = yield* groups.resolveOrCreate({
-      name: "Swarm A",
+      name: "Plugin collection A",
       kind: "plugin",
-      ownerPlugin: "openswarm",
-      ownerRef: "swarm-a",
+      ownerPlugin: "example-plugin",
+      ownerRef: "collection-a",
       anchorSessionId: firstCoordinator.id,
     })
     const second = yield* groups.resolveOrCreate({
-      name: "Swarm B",
+      name: "Plugin collection B",
       kind: "plugin",
-      ownerPlugin: "openswarm",
-      ownerRef: "swarm-b",
+      ownerPlugin: "example-plugin",
+      ownerRef: "collection-b",
       anchorSessionId: firstCoordinator.id,
     })
     expect(first.id).not.toBe(second.id)
@@ -162,26 +426,26 @@ it.instance("keeps plugin groups distinct by stable owner ref and can re-anchor 
       groupId: first.id,
       sessionId: firstCoordinator.id,
       origin: "plugin",
-      originPlugin: "openswarm",
+      originPlugin: "example-plugin",
     })
     yield* groups.addSession({
       groupId: second.id,
       sessionId: firstCoordinator.id,
       origin: "plugin",
-      originPlugin: "openswarm",
+      originPlugin: "example-plugin",
     })
 
     const rebound = yield* groups.resolveOrCreate({
-      name: "Swarm A renamed",
+      name: "Plugin collection A renamed",
       kind: "plugin",
-      ownerPlugin: "openswarm",
-      ownerRef: "swarm-a",
+      ownerPlugin: "example-plugin",
+      ownerRef: "collection-a",
       anchorSessionId: secondCoordinator.id,
     })
     expect(rebound.id).toBe(first.id)
     expect(rebound.anchorSessionID).toBe(secondCoordinator.id)
-    expect(rebound.name).toBe("Swarm A renamed")
-    expect(rebound.ownerRef).toBe("swarm-a")
+    expect(rebound.name).toBe("Plugin collection A renamed")
+    expect(rebound.ownerRef).toBe("collection-a")
   }),
 )
 

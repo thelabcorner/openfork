@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, test } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError } from "ai"
@@ -88,6 +89,15 @@ function createModel(opts: {
 
 const wide = () => ProviderTest.fake({ model: createModel({ context: 100_000, output: 32_000 }) })
 
+test("V1 compaction tool projection preserves beginning and terminal failure context", () => {
+  const input = "BEGIN\n" + "x".repeat(10_000) + "\nTERMINAL-FAILURE"
+  const projected = SessionCompaction.compactToolOutput(input)
+  expect(projected).toContain("BEGIN")
+  expect(projected).toContain("TERMINAL-FAILURE")
+  expect(projected).toContain("showing beginning + end")
+  expect(Buffer.byteLength(projected, "utf-8")).toBeLessThanOrEqual(2_000)
+})
+
 function createUserMessage(sessionID: SessionID, text: string) {
   return Effect.gen(function* () {
     const ssn = yield* SessionNs.Service
@@ -105,6 +115,33 @@ function createUserMessage(sessionID: SessionID, text: string) {
       sessionID,
       type: "text",
       text,
+    })
+    return msg
+  })
+}
+
+function createGoalStateMessage(sessionID: SessionID, source: string, text: string, historical = false) {
+  return Effect.gen(function* () {
+    const ssn = yield* SessionNs.Service
+    const msg = yield* ssn.updateMessage({
+      id: MessageID.ascending(),
+      role: "user",
+      provenance: {
+        ...SessionTurnProvenance.host(source, { ref: `goal-state:test:${source}:${text}` }),
+        ...(historical ? { lifetime: "historical" as const } : {}),
+      },
+      sessionID,
+      agent: "build",
+      model: ref,
+      time: { created: Date.now() },
+    })
+    yield* ssn.updatePart({
+      id: PartID.ascending(),
+      messageID: msg.id,
+      sessionID,
+      type: "text",
+      text,
+      synthetic: true,
     })
     return msg
   })
@@ -202,6 +239,9 @@ function fake(
     get message() {
       return msg
     },
+    get hasNonProviderToolCalls() {
+      return false
+    },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
@@ -279,7 +319,20 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
 }
 
 function createSummaryCompaction(sessionID: SessionID) {
-  return SessionCompaction.use.create({ sessionID, agent: "build", model: ref, auto: false })
+  return SessionNs.Service.use((ssn) =>
+    Effect.gen(function* () {
+      const messages = yield* ssn.messages({ sessionID })
+      const source = messages.findLast(SessionTurnProvenance.isWorkerPromptTurn)
+      if (!source || source.info.role !== "user") throw new Error("test compaction requires a worker prompt source")
+      yield* SessionCompaction.use.create({
+        sessionID,
+        agent: "build",
+        model: ref,
+        sourceMessageID: source.info.id,
+        auto: false,
+      })
+    }),
+  )
 }
 
 function readCompactionPart(sessionID: SessionID) {
@@ -572,20 +625,22 @@ describe("session.compaction.create", () => {
         const ssn = yield* SessionNs.Service
 
         const info = yield* ssn.create({})
+        const source = yield* createUserMessage(info.id, "compact me")
 
         yield* compact.create({
           sessionID: info.id,
           agent: "build",
           model: ref,
+          sourceMessageID: source.id,
           auto: true,
           overflow: true,
         })
 
         const msgs = yield* ssn.messages({ sessionID: info.id })
-        expect(msgs).toHaveLength(1)
-        expect(msgs[0].info.role).toBe("user")
-        expect(msgs[0].parts).toHaveLength(1)
-        expect(msgs[0].parts[0]).toMatchObject({
+        expect(msgs).toHaveLength(2)
+        expect(msgs[1].info.role).toBe("user")
+        expect(msgs[1].parts).toHaveLength(1)
+        expect(msgs[1].parts[0]).toMatchObject({
           type: "compaction",
           auto: true,
           overflow: true,
@@ -601,17 +656,19 @@ describe("session.compaction.create", () => {
         const compact = yield* SessionCompaction.Service
         const ssn = yield* SessionNs.Service
         const info = yield* ssn.create({})
+        const source = yield* createUserMessage(info.id, "compact me")
 
         yield* compact.create({
           sessionID: info.id,
           agent: "build",
           model: ref,
+          sourceMessageID: source.id,
           auto: false,
           continueAfter: true,
         })
 
         const msgs = yield* ssn.messages({ sessionID: info.id })
-        expect(msgs[0]?.parts[0]).toMatchObject({
+        expect(msgs[1]?.parts[0]).toMatchObject({
           type: "compaction",
           auto: false,
           continueAfter: true,
@@ -627,11 +684,13 @@ describe("session.compaction.create", () => {
         const compact = yield* SessionCompaction.Service
         const ssn = yield* SessionNs.Service
         const info = yield* ssn.create({})
+        const source = yield* createUserMessage(info.id, "compact me")
 
         yield* compact.create({
           sessionID: info.id,
           agent: "build",
           model: ref,
+          sourceMessageID: source.id,
           auto: true,
           overflow: true,
         })
@@ -1497,6 +1556,63 @@ describe("session.compaction.process", () => {
         withCompaction({
           llm: stub.llmLayer,
           config: cfg({ tail_turns: 2, preserve_recent_tokens: 10_000 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "excludes replaceable Goal state projections from V1 summary input",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(
+        reply("summary", (input) => {
+          captured = JSON.stringify(input.messages)
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "historical user context")
+        yield* createGoalStateMessage(
+          session.id,
+          SessionTurnProvenance.Source.GoalSpecification,
+          "STALE-V1-GOAL-SPEC",
+        )
+        yield* createGoalStateMessage(
+          session.id,
+          SessionTurnProvenance.Source.GoalProgress,
+          "STALE-V1-GOAL-PROGRESS",
+        )
+        yield* createGoalStateMessage(
+          session.id,
+          SessionTurnProvenance.Source.GoalProgress,
+          "IMPORTED-STALE-V1-GOAL-PROGRESS",
+          true,
+        )
+        yield* createUserMessage(session.id, "retain this recent turn")
+        yield* createCompactionMarker(session.id)
+
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+        yield* SessionCompaction.use.process({
+          parentID: parent!,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(captured).toContain("historical user context")
+        expect(captured).not.toContain("STALE-V1-GOAL-SPEC")
+        expect(captured).not.toContain("STALE-V1-GOAL-PROGRESS")
+        expect(captured).not.toContain("IMPORTED-STALE-V1-GOAL-PROGRESS")
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          config: cfg({ tail_turns: 1, preserve_recent_tokens: 10_000 }),
         }),
       )
     },

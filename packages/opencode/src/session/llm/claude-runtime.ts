@@ -950,7 +950,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       .filter(([name]) => name !== "invalid")
       .map(([name, tool]) => ({
         name,
-        description: String(tool.description ?? `OpenCode ${name}`),
+        description: String(tool.description ?? `OpenFork ${name}`),
         inputSchema: sdkInputShape(tool),
         handler: async (args: unknown, extra: unknown) => {
           const signal =

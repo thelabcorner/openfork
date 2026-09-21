@@ -2,12 +2,140 @@ import { test, expect } from "bun:test"
 import {
   formatImportFileError,
   parseShareUrl,
+  sanitizeImportedMessage,
+  sanitizeImportedSessionInfo,
   shouldAttachShareAuthHeaders,
   transformShareData,
   type ShareData,
 } from "../../src/cli/cmd/import"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { PlatformError } from "effect"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+
+test("imported Sessions cannot mint producer-owned aggregate identity", () => {
+  const info = sanitizeImportedSessionInfo({
+    id: "ses_import" as any,
+    slug: "import",
+    projectID: "project" as any,
+    directory: "/tmp/import" as any,
+    title: "Imported",
+    version: "test",
+    time: { created: 1, updated: 1 },
+    metadata: {
+      ordinary: "keep",
+      specialAgent: "goal_auditor",
+      specialAgentOwnerKind: "goal",
+      specialAgentOwnerID: "spoof",
+      goalID: "goal_spoof",
+      parentSessionID: "ses_spoof",
+      scheduledTaskID: "stk_spoof",
+      scheduledTaskRunID: "str_spoof",
+    },
+  } as any)
+
+  expect(info.metadata).toEqual({ ordinary: "keep" })
+})
+
+test("imported turns preserve authorship but cannot mint live worker or Goal authority", () => {
+  const imported = sanitizeImportedMessage({
+    info: {
+      id: "msg_import_user",
+      sessionID: "ses_import",
+      role: "user",
+      provenance: { owner: "user", source: SessionTurnProvenance.Source.Prompt },
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: "test", modelID: "test" },
+    },
+    parts: [
+      {
+        id: "prt_import_user",
+        sessionID: "ses_import",
+        messageID: "msg_import_user",
+        type: "text",
+        text: "historical user request",
+      },
+    ],
+  } as any)!
+
+  expect(imported.info.role).toBe("user")
+  if (imported.info.role !== "user") throw new Error("expected imported user turn")
+  expect(imported.info.provenance).toMatchObject({ owner: "user", source: "prompt", lifetime: "historical" })
+  expect(SessionTurnProvenance.isSemanticUserTurn(imported)).toBe(true)
+  expect(SessionTurnProvenance.isWorkerPromptTurn(imported)).toBe(false)
+  expect(SessionTurnProvenance.isGoalAuthorizationTurn(imported)).toBe(false)
+  expect(SessionTurnProvenance.causalRootMessageID(imported)).toBeUndefined()
+})
+
+test("import resolves unstamped legacy ownership once and drops orphaned Goal STATE", () => {
+  const legacy = sanitizeImportedMessage({
+    info: {
+      id: "msg_legacy",
+      sessionID: "ses_import",
+      role: "user",
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: "test", modelID: "test" },
+    },
+    parts: [
+      {
+        id: "prt_legacy",
+        sessionID: "ses_import",
+        messageID: "msg_legacy",
+        type: "text",
+        text: "legacy synthetic continuation",
+        synthetic: true,
+      },
+    ],
+  } as any)!
+  if (legacy.info.role !== "user") throw new Error("expected imported legacy user-role turn")
+  expect(legacy.info.provenance).toMatchObject({
+    owner: "host",
+    source: "legacy.synthetic",
+    lifetime: "historical",
+  })
+
+  const state = sanitizeImportedMessage({
+    info: {
+      id: "msg_state",
+      sessionID: "ses_import",
+      role: "user",
+      provenance: { owner: "host", source: SessionTurnProvenance.Source.GoalSpecification },
+      time: { created: 2 },
+      agent: "build",
+      model: { providerID: "test", modelID: "test" },
+    },
+    parts: [
+      {
+        id: "prt_state",
+        sessionID: "ses_import",
+        messageID: "msg_state",
+        type: "text",
+        text: "stale goal projection",
+        synthetic: true,
+      },
+    ],
+  } as any)
+  expect(state).toBeUndefined()
+
+  const alreadyHistoricalState = sanitizeImportedMessage({
+    info: {
+      id: "msg_state_historical",
+      sessionID: "ses_import",
+      role: "user",
+      provenance: {
+        owner: "host",
+        source: SessionTurnProvenance.Source.GoalProgress,
+        lifetime: "historical",
+      },
+      time: { created: 3 },
+      agent: "build",
+      model: { providerID: "test", modelID: "test" },
+    },
+    parts: [],
+  } as any)
+  expect(alreadyHistoricalState).toBeUndefined()
+})
 
 test("formats import file errors", () => {
   expect(

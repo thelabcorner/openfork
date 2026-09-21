@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Effect, Option } from "effect"
 import { Session as SessionNs } from "@/session/session"
@@ -87,15 +88,17 @@ const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?
 const addAssistant = Effect.fn("Test.addAssistant")(function* (
   sessionID: SessionID,
   parentID: MessageID,
-  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"] },
+  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"]; completed?: boolean },
 ) {
   const session = yield* SessionNs.Service
   const id = MessageID.ascending()
+  const created = Date.now()
+  const completed = opts?.completed ?? opts?.finish !== undefined
   yield* session.updateMessage({
     id,
     sessionID,
     role: "assistant",
-    time: { created: Date.now() },
+    time: { created, ...(completed ? { completed: created } : {}) },
     parentID,
     modelID: ModelV2.ID.make("test"),
     providerID: ProviderV2.ID.make("test"),
@@ -809,6 +812,131 @@ describe("MessageV2.filterCompacted", () => {
       if (!tailPart || tailPart.type !== "compaction") throw new Error("Expected forked compaction part")
       expect(tailPart.tail_start_id).toBeDefined()
       expect(childFiltered.some((m) => m.info.id === tailPart.tail_start_id)).toBe(true)
+
+      yield* session.remove(forked.id)
+      yield* session.remove(created.id)
+    }),
+  )
+
+  it.instance("fork excludes finish-only assistant messages until durable completion", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* session.create({})
+      const user = yield* addUser(created.id, "work")
+      const assistant = yield* addAssistant(created.id, user, { finish: "end_turn", completed: false })
+
+      const source = yield* session.messages({ sessionID: created.id })
+      expect(source.map((message) => message.info.id)).toEqual([user, assistant])
+
+      const forked = yield* session.fork({ sessionID: created.id })
+      const child = yield* session.messages({ sessionID: forked.id })
+      expect(child).toHaveLength(1)
+      expect(child[0]?.info.role).toBe("user")
+
+      yield* session.remove(forked.id)
+      yield* session.remove(created.id)
+    }),
+  )
+
+  it.instance("fork remaps host causal provenance and never leaves cross-session lineage", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* session.create({})
+      const root = yield* addUser(created.id, "original request")
+      const rootMessage = yield* MessageV2.get({ sessionID: created.id, messageID: root })
+      if (rootMessage.info.role !== "user") throw new Error("Expected worker root")
+      yield* session.updateMessage({
+        ...rootMessage.info,
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      })
+      yield* addAssistant(created.id, root, { finish: "end_turn" })
+
+      const continuation = yield* session.updateMessage({
+        ...rootMessage.info,
+        id: MessageID.ascending(),
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+          sourceMessageID: root,
+          ref: "reservation-fork-lineage",
+        }),
+        time: { created: rootMessage.info.time.created + 2 },
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: continuation.id,
+        type: "text",
+        text: "continue",
+        synthetic: true,
+      })
+      yield* addAssistant(created.id, continuation.id, { finish: "end_turn" })
+
+      // Imported/historical STATE-shaped history is non-authoritative but must
+      // remain durable history in a fork. Its semantic kind stays structurally
+      // transparent; only the live replaceable projection below is aggregate-local.
+      const historicalState = yield* session.updateMessage({
+        ...rootMessage.info,
+        id: MessageID.ascending(),
+        provenance: {
+          ...SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+            ref: `goal-state:v1:progress:historical:${"a".repeat(64)}`,
+          }),
+          lifetime: "historical",
+        },
+        time: { created: rootMessage.info.time.created + 3 },
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: historicalState.id,
+        type: "text",
+        text: "historical imported Goal state",
+        synthetic: true,
+      })
+
+      // Source-session STATE is physically newest but is neither a fork turn
+      // boundary nor historical content to clone into the new aggregate.
+      const state = yield* session.updateMessage({
+        ...rootMessage.info,
+        id: MessageID.ascending(),
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+          ref: `goal-state:v1:progress:gol_fork:${"b".repeat(64)}`,
+        }),
+        time: { created: rootMessage.info.time.created + 4 },
+      })
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        sessionID: created.id,
+        messageID: state.id,
+        type: "text",
+        text: "source-only Goal state",
+        synthetic: true,
+      })
+
+      const forked = yield* session.fork({ sessionID: created.id })
+      const child = yield* session.messages({ sessionID: forked.id })
+      const childRoot = child.find(SessionTurnProvenance.isWorkerPromptTurn)
+      const childContinuation = child.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalContinuation,
+      )
+      expect(childRoot).toBeDefined()
+      expect(childContinuation).toBeDefined()
+      expect(SessionTurnProvenance.causalRootMessageID(childContinuation)).toBe(childRoot!.info.id)
+      expect(SessionTurnProvenance.causalRootMessageID(childContinuation)).not.toBe(root)
+      const childContinuationAssistant = child.find(
+        (message) => message.info.role === "assistant" && message.info.parentID === childContinuation!.info.id,
+      )
+      expect(childContinuationAssistant).toBeDefined()
+      expect(child.some(SessionTurnProvenance.isStateProjectionTurn)).toBe(false)
+      const childHistoricalState = child.find(
+        (message) =>
+          SessionTurnProvenance.hasStateSemanticsTurn(message) &&
+          SessionTurnProvenance.resolve(message)?.lifetime === "historical",
+      )
+      expect(childHistoricalState).toBeDefined()
+      expect(SessionTurnProvenance.isStateProjectionTurn(childHistoricalState!)).toBe(false)
 
       yield* session.remove(forked.id)
       yield* session.remove(created.id)

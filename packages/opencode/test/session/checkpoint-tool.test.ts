@@ -1,12 +1,14 @@
 import { afterEach, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { SessionCheckpointTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 import { Effect, Fiber, Layer, Cause, Exit } from "effect"
 import path from "path"
 import { TurnCheckpoint } from "../../src/session/checkpoint"
 import { Snapshot } from "../../src/snapshot"
+import { Git } from "../../src/git"
 import { Truncate } from "@/tool/truncate"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import * as Tool from "../../src/tool/tool"
@@ -21,7 +23,17 @@ import { seedSessionRow } from "./checkpoint-seed"
 
 const it = testEffect(
   Layer.mergeAll(
-    LayerNode.compile(LayerNode.group([TurnCheckpoint.node, Snapshot.node, Database.node, Truncate.node, AgentSvc.node])),
+    LayerNode.compile(
+      LayerNode.group([
+        TurnCheckpoint.node,
+        Snapshot.node,
+        Database.node,
+        Checkpoint.readNode,
+        Git.node,
+        Truncate.node,
+        AgentSvc.node,
+      ]),
+    ),
     testInstanceStoreLayer,
   ),
 )
@@ -134,6 +146,38 @@ it.instance(
       const cap = yield* tool.execute({ mode: "diff", ordinal: 2 }, mockCtx(sessionID))
       expect(cap.output).toContain("capturing")
       expect(cap.output).toContain("still in progress")
+    }),
+  { git: true },
+  120_000,
+)
+
+it.instance(
+  "diff maxBytes is a strict UTF-8 cap and preserves Unicode boundaries",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const dir = tmp.directory
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_tool_utf8_budget"
+      yield* seedSessionRow(sessionID)
+      const content = Array.from(
+        { length: 500 },
+        (_, i) => `line-${i}-🙂-你好-日本語-é-&<>-🚀`,
+      ).join("\n")
+      yield* runTurn(svc, sessionID, "msg_utf8_budget", dir, [["unicode-heavy.txt", content]])
+
+      const tool = yield* getTool
+      const maxBytes = 2_000
+      const result = yield* tool.execute({ mode: "diff", ordinal: 1, maxBytes }, mockCtx(sessionID))
+      const encoded = new TextEncoder().encode(result.output)
+
+      expect(encoded.byteLength).toBeLessThanOrEqual(maxBytes)
+      expect(new TextDecoder().decode(encoded)).toBe(result.output)
+      expect(result.metadata.truncated).toBe(true)
+      expect(result.output).toContain("<diff ")
+      expect(result.output).toContain("</diff>")
+      expect(result.output).toContain("<truncated")
+      expect(result.output).toContain("unicode-heavy.txt")
     }),
   { git: true },
   120_000,

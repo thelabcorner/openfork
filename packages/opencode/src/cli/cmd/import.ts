@@ -1,9 +1,11 @@
 import type { Session as SDKSession, Message, Part } from "@opencode-ai/sdk/v2"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Session } from "@/session/session"
 import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { partSearchText } from "@opencode-ai/core/session/search-text"
 import { InstanceRef } from "@/effect/instance-ref"
@@ -48,6 +50,41 @@ export function formatImportFileError(file: string, error: FSUtil.Error) {
 
   const detail = error.cause instanceof Error ? error.cause.message : error.message
   return `Invalid JSON in ${file}: ${detail}`
+}
+
+/**
+ * Imported files/shares are data, not trusted Session producers. Preserve the
+ * caller-owned compatibility bag while stripping host-owned aggregate identity
+ * before the row crosses the durable Session boundary.
+ */
+export function sanitizeImportedSessionInfo(info: Session.Info): Session.Info {
+  return {
+    ...info,
+    metadata: SessionMetadataOwnership.forPublicCreate(info.metadata),
+  }
+}
+
+/**
+ * Imports preserve historical authorship/presentation but never mint current
+ * execution authority. Explicit rows keep their source/correlation for replay;
+ * unstamped V1 rows are resolved once at this boundary and stamped so no later
+ * consumer has to revive part-shape inference. Goal STATE is a materialized
+ * projection of a Goal aggregate that import does not restore, so orphaned
+ * state snapshots are omitted rather than fossilized as active conversation.
+ */
+export function sanitizeImportedMessage(input: SessionV1.WithParts): SessionV1.WithParts | undefined {
+  if (input.info.role !== "user") return input
+  if (SessionTurnProvenance.hasStateSemanticsTurn(input)) return undefined
+  const resolved = SessionTurnProvenance.resolve(input)
+  if (!resolved) return input
+  const { confidence: _, ...provenance } = resolved
+  return {
+    ...input,
+    info: {
+      ...input.info,
+      provenance: { ...provenance, lifetime: "historical" },
+    },
+  }
 }
 
 /**
@@ -177,12 +214,12 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
     return
   }
 
-  const info = Schema.decodeUnknownSync(Session.Info)({
+  const info = sanitizeImportedSessionInfo(Schema.decodeUnknownSync(Session.Info)({
     ...exportData.info,
     projectID: ctx.project.id,
     directory: ctx.directory,
     path: path.relative(path.resolve(ctx.worktree), ctx.directory).replaceAll("\\", "/"),
-  }) as Session.Info
+  }) as Session.Info)
   const row = Session.toRow(info)
   yield* db
     .insert(SessionTable)
@@ -195,7 +232,12 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
     .pipe(Effect.orDie)
 
   for (const msg of exportData.messages) {
-    const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info
+    const decoded = sanitizeImportedMessage({
+      info: decodeMessageInfo(msg.info) as SessionV1.Info,
+      parts: msg.parts.map((part) => decodePart(part) as SessionV1.Part),
+    })
+    if (!decoded) continue
+    const msgInfo = decoded.info
     const { id, sessionID: _, ...msgData } = msgInfo
     yield* db
       .insert(MessageTable)
@@ -209,8 +251,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
       .run()
       .pipe(Effect.orDie)
 
-    for (const part of msg.parts) {
-      const partInfo = decodePart(part) as SessionV1.Part
+    for (const partInfo of decoded.parts) {
       const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
       yield* db
         .insert(PartTable)

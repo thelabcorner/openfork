@@ -50,6 +50,44 @@ Keep new integration code on one of these seams. Avoid importing session service
 
 Both runtimes converge on the same `LLMEvent` stream consumed by the session processor. The gate is per-request: a single session can route some calls through native and fall back for others.
 
+### Privileged-message capability is provider route ∩ runtime encoder
+
+Runtime selection must never silently change whether one semantic request is
+valid or what authority the model receives. Mid-conversation System support is a
+concrete example: the provider/model API may support a later privileged message
+while one encoder cannot express it, or an encoder may be able to serialize a
+raw System role for a model the provider does not support.
+
+Use `system-capability.ts` for the pure effective-capability intersection:
+
+```text
+exact provider/API-route + model semantics
+              ∩
+selected runtime adapter encoder capability
+              =
+effective System projection capability
+```
+
+Rules:
+
+- unknown or unaudited combinations fail closed to `head-only`;
+- a Claude-looking model id behind Bedrock, Vertex, OpenRouter, or another proxy
+  does not inherit direct Anthropic Messages semantics;
+- encoder ability cannot create provider capability (for example an SDK that can
+  serialize a later System role for an unsupported model);
+- provider capability cannot compensate for an encoder that has not been proven
+  to preserve it;
+- turn-scoped lifetime is independent of ordinary chronological System support
+  and remains disabled until the selected adapter implements the provider's exact
+  lifetime encoding;
+- the semantic/System-surface layer chooses the authority-preserving projection;
+  runtime adapters encode that decision. A wrapped-user fallback is not
+  authority-equivalent System semantics.
+
+Keep the capability helper pure and O(1): no provider calls, no catalog scans,
+no session history reads, no timers, and no runtime materialization solely to
+answer capability.
+
 ```txt
                              ╭───────────────────╮
 ╭───────────────────────────▶│ session processor │

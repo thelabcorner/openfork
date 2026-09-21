@@ -5,6 +5,8 @@ import { iife } from "@/util/iife"
 import { setTimeout as sleep } from "node:timers/promises"
 import { CopilotModels } from "./models"
 import { MessageV2 } from "@/session/message-v2"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 const CLIENT_ID = "Ov23li8tweQw6odWQebz"
 const API_VERSION = "2026-06-01"
@@ -370,6 +372,21 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
         output.headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
       }
 
+      // Modern OpenFork requests carry authoritative turn ownership on the V1
+      // anchor supplied to chat hooks. Prefer that over reverse-inference from
+      // the serialized provider body: host continuations, scheduled roots,
+      // STATE projections, and special-agent requests are all wire-role=user
+      // but are agent-initiated for Copilot accounting/routing purposes.
+      const turn = SessionTurnProvenance.resolveInfo(incoming.message)
+      if (turn?.confidence === "explicit" && turn.owner === "host") {
+        output.headers["x-initiator"] = "agent"
+        return
+      }
+      if (turn?.confidence === "explicit" && turn.owner === "user") {
+        output.headers["x-initiator"] = "user"
+        return
+      }
+
       const parts = await sdk.session
         .message({
           path: {
@@ -383,15 +400,13 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
         })
         .catch(() => undefined)
 
-      if (
-        parts?.data.parts?.some(
-          (part) =>
-            part.type === "compaction" ||
-            // Auto-compaction resumes via a synthetic user text part. Treat only
-            // that marked followup as agent-initiated so manual prompts stay user-initiated.
-            (part.type === "text" && part.synthetic && part.metadata?.compaction_continue === true),
-        )
-      ) {
+      const legacy = parts?.data.parts
+        ? SessionTurnProvenance.resolve({
+            info: incoming.message as SessionV1.User,
+            parts: parts.data.parts as SessionV1.Part[],
+          })
+        : undefined
+      if (legacy?.owner === "host") {
         output.headers["x-initiator"] = "agent"
         return
       }
@@ -407,7 +422,10 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
           throwOnError: true,
         })
         .catch(() => undefined)
-      if (!session || !session.data.parentID) return
+      if (!session || !session.data.parentID) {
+        if (legacy?.owner === "user") output.headers["x-initiator"] = "user"
+        return
+      }
       // mark subagent sessions as agent initiated matching standard that other copilot tools have
       output.headers["x-initiator"] = "agent"
     },

@@ -125,10 +125,18 @@ export class SpadDetector {
       }
     }
     if (d.lane === "canonical") {
-      if (!this.canonical) return undefined
+      const canonical = this.canonical
+      if (!canonical) return undefined
       const maxWindow = 4096
       const start = Math.max(d.laneRunStart, d.laneRunEnd - maxWindow)
-      return { ...result, canonicalDuplicate4GramRatio: (this.verifier ??= new ShingleVerifier()).duplicate4GramRatio((i) => this.canonical.get(i), start, d.laneRunEnd) }
+      return {
+        ...result,
+        canonicalDuplicate4GramRatio: (this.verifier ??= new ShingleVerifier()).duplicate4GramRatio(
+          (i) => canonical.get(i),
+          start,
+          d.laneRunEnd,
+        ),
+      }
     }
     return result
   }

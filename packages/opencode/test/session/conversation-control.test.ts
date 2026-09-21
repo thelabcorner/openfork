@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Deferred, Effect, Exit, Layer } from "effect"
@@ -221,6 +222,90 @@ describe("conversation control", () => {
       // Should have warning and still include the message
       expect(compiled.warnings.length).toBeGreaterThan(0)
       expect(compiled.effective.length).toBe(1)
+    }),
+  )
+
+  it.instance("refuses context overlays on authoritative replaceable state", () =>
+    Effect.gen(function* () {
+      const sessionSvc = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(sessionSvc.create({ title: "state-overlay-test" }), (info) =>
+        sessionSvc.remove(info.id).pipe(Effect.ignore),
+      )
+      const id = MessageID.make("msg_goal_state_overlay")
+      yield* sessionSvc.updateMessage({
+        id,
+        sessionID: created.id,
+        role: "user",
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+          ref: `goal-state:v1:progress:gol_overlay:${"a".repeat(64)}`,
+        }),
+        time: { created: 3500 },
+        agent: "test",
+        model: { providerID: "test", modelID: "test" },
+      } as SessionV1.User)
+      yield* sessionSvc.updatePart({
+        id: "prt_goal_state_overlay" as any,
+        sessionID: created.id,
+        messageID: id,
+        type: "text",
+        text: "AUTHORITATIVE-CURRENT-STATE",
+        synthetic: true,
+      } as any)
+
+      const msg = (yield* sessionSvc.messages({ sessionID: created.id }))[0]!
+      expect(EffectiveContextCompiler.canExcludeMessage(msg)).toMatchObject({ allowed: false })
+      expect(EffectiveContextCompiler.canEditMessage(msg)).toMatchObject({ allowed: false })
+      expect(EffectiveContextCompiler.canApplyContextOperation(msg, "message.pin")).toMatchObject({ allowed: false })
+      expect(EffectiveContextCompiler.groupTurns([msg])).toHaveLength(0)
+
+      // Simulate a historical invalid overlay already present in durable state.
+      // Compiler and ledger must both ignore it so stale STATE cannot be hidden,
+      // edited, pinned, or counted as excluded.
+      yield* SessionContextState.applyOps({
+        sessionID: created.id,
+        operations: [{ type: "message.exclude", messageID: id } as any],
+      })
+      const compiled = EffectiveContextCompiler.compile({
+        messages: [msg],
+        state: new Map([
+          [
+            id,
+            {
+              excluded: true,
+              pinned: true,
+              overrideData: { text: "MUTATED-STALE-STATE" },
+            },
+          ],
+        ]) as any,
+      })
+      expect(compiled.effective).toHaveLength(1)
+      expect(compiled.excluded).toHaveLength(0)
+      expect(compiled.warnings).toHaveLength(1)
+      expect(JSON.stringify(compiled.effective)).toContain("AUTHORITATIVE-CURRENT-STATE")
+      expect(JSON.stringify(compiled.effective)).not.toContain("MUTATED-STALE-STATE")
+
+      if (msg.info.role !== "user") throw new Error("expected Goal state to use the V1 user-role projection")
+      const historical = {
+        ...msg,
+        info: {
+          ...msg.info,
+          provenance: { ...msg.info.provenance!, lifetime: "historical" as const },
+        },
+      } as SessionV1.WithParts
+      expect(SessionTurnProvenance.isStateProjectionTurn(historical)).toBe(false)
+      expect(SessionTurnProvenance.hasStateSemanticsTurn(historical)).toBe(true)
+      expect(EffectiveContextCompiler.canExcludeMessage(historical)).toMatchObject({ allowed: false })
+      expect(EffectiveContextCompiler.canEditMessage(historical)).toMatchObject({ allowed: false })
+      const historicalCompiled = EffectiveContextCompiler.compile({
+        messages: [historical],
+        state: new Map([[id, { excluded: true, pinned: true, overrideData: { text: "MUTATED-HISTORY" } }]]) as any,
+      })
+      expect(historicalCompiled.effective).toEqual([historical])
+      expect(JSON.stringify(historicalCompiled.effective)).not.toContain("MUTATED-HISTORY")
+
+      const ledger = yield* SessionLedger.build({ sessionID: created.id, messages: [msg] })
+      expect(ledger.entries[0]).toMatchObject({ excluded: false, pinned: false, edited: false, type: "synthetic" })
+      expect(ledger.totals).toMatchObject({ excludedCount: 0, pinnedCount: 0, editedCount: 0 })
     }),
   )
 

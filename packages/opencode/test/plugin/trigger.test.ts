@@ -28,6 +28,7 @@ const it = testEffect(
   ]),
 )
 const systemHook = "experimental.chat.system.transform"
+const messageHook = "experimental.chat.messages.transform"
 
 function withProject<A, E, R>(source: string, self: Effect.Effect<A, E, R>) {
   return Effect.gen(function* () {
@@ -102,6 +103,52 @@ describe("plugin.trigger", () => {
       ].join("\n"),
       Effect.gen(function* () {
         expect(yield* triggerSystemTransform()).toEqual(["async"])
+      }),
+    ),
+  )
+
+  it.instance("isolates chat message transforms from authoritative history objects", () =>
+    withProject(
+      [
+        "export default async () => ({",
+        `  ${JSON.stringify(messageHook)}: (_input, output) => {`,
+        '    output.messages[0].info.provenance = { owner: "host", source: "goal.progress" }',
+        '    output.messages[0].parts[0].text = "provider-only rewrite"',
+        "  },",
+        "})",
+        "",
+      ].join("\n"),
+      Effect.gen(function* () {
+        const plugin = yield* Plugin.Service
+        const history = [
+          {
+            info: {
+              id: "msg_1",
+              sessionID: "ses_1",
+              role: "user",
+              provenance: { owner: "user", source: "prompt" },
+              time: { created: 1 },
+              agent: "build",
+              model: { providerID: "test", modelID: "model" },
+            },
+            parts: [
+              {
+                id: "prt_1",
+                sessionID: "ses_1",
+                messageID: "msg_1",
+                type: "text",
+                text: "authoritative",
+              },
+            ],
+          },
+        ]
+
+        const transformed = yield* plugin.transformChatMessages(history)
+        expect(transformed).not.toBe(history)
+        expect(transformed[0]?.info.provenance).toEqual({ owner: "host", source: "goal.progress" })
+        expect(transformed[0]?.parts[0]).toMatchObject({ text: "provider-only rewrite" })
+        expect(history[0]?.info.provenance).toEqual({ owner: "user", source: "prompt" })
+        expect(history[0]?.parts[0]).toMatchObject({ text: "authoritative" })
       }),
     ),
   )

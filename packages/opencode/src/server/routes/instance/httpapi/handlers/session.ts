@@ -557,24 +557,43 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       if (ctx.payload.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
         return yield* new HttpApiError.BadRequest({})
       }
-      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            const error = Cause.squash(cause)
-            yield* Effect.logError("prompt_async failed", {
-              sessionID: ctx.params.sessionID,
-              error: error instanceof Error ? error.message : String(error),
-              stack: error instanceof Error ? error.stack : undefined,
-              cause: Cause.pretty(cause),
-            })
-            yield* events.publish(Session.Event.Error, {
-              sessionID: ctx.params.sessionID,
-              error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
-            })
-          }),
-        ),
-        Effect.forkIn(scope, { startImmediately: true }),
-      )
+      // Admission must be durable before the 204 acknowledgement. Execution is
+      // a separate best-effort wake: if another process/instance already owns
+      // this Session, the pending SessionInput row is the wake signal and that
+      // owner's release-if-drained transaction will continue it. A busy wake is
+      // therefore successful coalescing, not a user-visible Session error.
+      yield* promptSvc
+        .prompt({ ...ctx.payload, sessionID: ctx.params.sessionID, noReply: true })
+        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      if (ctx.payload.noReply !== true) {
+        yield* promptSvc.loop({ sessionID: ctx.params.sessionID }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const error = Cause.squash(cause)
+              if (
+                error instanceof Session.BusyError ||
+                (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
+              ) {
+                yield* Effect.logInfo("prompt_async wake coalesced with existing Session owner", {
+                  sessionID: ctx.params.sessionID,
+                })
+                return
+              }
+              yield* Effect.logError("prompt_async failed", {
+                sessionID: ctx.params.sessionID,
+                error: error instanceof Error ? error.message : String(error),
+                stack: error instanceof Error ? error.stack : undefined,
+                cause: Cause.pretty(cause),
+              })
+              yield* events.publish(Session.Event.Error, {
+                sessionID: ctx.params.sessionID,
+                error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
+              })
+            }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+        )
+      }
       return HttpApiSchema.NoContent.make()
     })
 

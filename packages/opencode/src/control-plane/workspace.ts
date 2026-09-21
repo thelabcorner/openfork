@@ -659,7 +659,10 @@ const layer = Layer.effect(
           .orderBy(asc(EventTable.seq))
           .all()
           .pipe(Effect.orDie)
-        const compaction = yield* loadCompaction(db, input.sessionID)
+        // Session Warp exposes transport/domain failures to its caller; local
+        // persistence failures remain infrastructure defects, matching the
+        // surrounding workspace/event reads that already fail closed via orDie.
+        const compaction = yield* loadCompaction(db, input.sessionID).pipe(Effect.orDie)
         if (hasCompactedSequences(compaction?.bitmap) || storedRows.some((row) => row.type === SemanticCompactionFeature)) {
           // A semantically-pruned log contains durable sequence fillers that did
           // not exist in older peers. Probe BEFORE sending the first replay batch

@@ -2260,6 +2260,7 @@ const layer = Layer.effect(
       if (origin === "user") yield* goalAutomation.cancel(input.sessionID)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input, provenance)
+      if (origin === "user") yield* goals.reactivateBlockedForSession(input.sessionID)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -2312,9 +2313,9 @@ const layer = Layer.effect(
           if (input.noReply === true) return message
           const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
           if (session.pausedAt !== undefined) return message
-          // Do not cancel Goal automation again on an idempotent retry. The
-          // first durable admission already represented the user intervention;
-          // retry only repairs the execution wakeup if the process died after it.
+          // Do not cancel/reactivate Goal state again on an idempotent retry.
+          // The existing message is not a new human intervention and therefore
+          // must not acquire fresh authority over newer Goal lifecycle state.
           return yield* loop({ sessionID: input.sessionID })
         }
       }

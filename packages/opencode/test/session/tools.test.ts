@@ -16,6 +16,7 @@ import { ToolInterrupt } from "@/tool/interrupt"
 import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { Snapshot } from "@/snapshot"
 import { isCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
 import { Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
@@ -78,6 +79,7 @@ const fakePlugin = Plugin.Service.of({
   init: () => Effect.void,
   list: () => Effect.succeed([]),
   trigger: (_name, _input, output) => Effect.succeed(output),
+  transformChatMessages: (messages) => Effect.succeed(messages),
 } satisfies Plugin.Interface)
 
 const fakePermission = Permission.Service.of({
@@ -89,6 +91,13 @@ const fakePermission = Permission.Service.of({
 const fakeTruncate = Truncate.Service.of({
   cleanup: () => Effect.void,
   write: () => Effect.succeed("output.txt"),
+  writer: () =>
+    Effect.succeed({
+      outputPath: "output.br",
+      write: () => Effect.void,
+      close: Effect.void,
+      healthy: () => true,
+    }),
   output: (text: string) => Effect.succeed({ content: text, truncated: false }),
   limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
 } satisfies Truncate.Interface)
@@ -99,12 +108,37 @@ const fakeInterrupt = ToolInterrupt.Service.of({
   release: () => Effect.void,
 } satisfies ToolInterrupt.Interface)
 
+const fakeSnapshot = Snapshot.Service.of({
+  init: () => Effect.void,
+  cleanup: () => Effect.void,
+  track: () => Effect.succeed(undefined),
+  invalidate: () => Effect.void,
+  withMutation: (effect) => effect,
+  diagnostics: () =>
+    Effect.succeed({
+      revision: 0,
+      captures: 0,
+      cacheHits: 0,
+      invalidations: 0,
+      completedReuse: false,
+      watcherOwnedRoot: false,
+    }),
+  patch: () => Effect.die("unused"),
+  restore: () => Effect.die("unused"),
+  revert: () => Effect.die("unused"),
+  diff: () => Effect.die("unused"),
+  diffSummary: () => Effect.die("unused"),
+  diffFullBounded: () => Effect.die("unused"),
+  diffFull: () => Effect.die("unused"),
+} as Snapshot.Interface)
+
 const layer = Layer.mergeAll(
   Layer.succeed(Plugin.Service, fakePlugin),
   Layer.succeed(Permission.Service, fakePermission),
   Layer.succeed(MCP.Service, fakeMcp()),
   Layer.succeed(Truncate.Service, fakeTruncate),
   Layer.succeed(ToolInterrupt.Service, fakeInterrupt),
+  Layer.succeed(Snapshot.Service, fakeSnapshot),
   RuntimeFlags.layer(),
   Layer.succeed(
     ToolRegistry.Service,
@@ -173,6 +207,7 @@ function findLayer(defs: Tool.Def[]) {
     Layer.succeed(MCP.Service, fakeMcp()),
     Layer.succeed(Truncate.Service, fakeTruncate),
     Layer.succeed(ToolInterrupt.Service, fakeInterrupt),
+    Layer.succeed(Snapshot.Service, fakeSnapshot),
     RuntimeFlags.layer(),
     Layer.succeed(
       ToolRegistry.Service,
@@ -225,7 +260,7 @@ canonicalFindIt.effect("marks SessionTools output only when builtin find remains
         updateToolCall: () => Effect.die("unused"),
         completeToolCall: () => Effect.die("unused"),
       },
-      bypassAgentCheck: false,
+      authorizedAgentNames: new Set(),
       messages: [],
       promptOps: {} as never,
     })
@@ -259,7 +294,7 @@ shadowedFindIt.effect("does not mark SessionTools output when a custom find shad
         updateToolCall: () => Effect.die("unused"),
         completeToolCall: () => Effect.die("unused"),
       },
-      bypassAgentCheck: false,
+      authorizedAgentNames: new Set(),
       messages: [],
       promptOps: {} as never,
     })
@@ -281,6 +316,8 @@ it.effect("pre-seeds an explicitly mentioned lazy tool schema for direct broker 
     expect(context).toContain("Tool: @sqlite")
     expect(context).toContain('"action"')
     expect(context).toContain('"tool":"sqlite"')
+    expect(context).toContain("Contract: broker-v1:")
+    expect(context).toContain('"contract":"broker-v1:')
     expect(context).not.toContain("@missing")
     expect(context).not.toContain("Tool: @refactor")
   }),
@@ -372,7 +409,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
       model,
       session: { id: sessionID, permission: [] } as unknown as Session.Info,
       processor,
-      bypassAgentCheck: false,
+      authorizedAgentNames: new Set(),
       messages: [],
       promptOps: {} as never,
     })
@@ -442,7 +479,7 @@ it.effect("coalesces rapid tool progress metadata updates", () =>
       model,
       session: { id: sessionID, permission: [] } as unknown as Session.Info,
       processor,
-      bypassAgentCheck: false,
+      authorizedAgentNames: new Set(),
       messages: [],
       promptOps: {} as never,
     })

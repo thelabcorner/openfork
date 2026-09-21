@@ -70,7 +70,9 @@ export interface SpadConfig {
   readonly autoRecoverToolLoop: boolean
   readonly expansionMinLines: number
   readonly expansionMinCycles: number
+  readonly expansionWindowSize: number
   readonly expansionMinStreamChars: number
+  readonly expansionSeenHashCap: number
   readonly lowLexicalDistinctLetters: number
   readonly lowLexicalMinCoverage: number
   readonly autoRecoverThrash: boolean

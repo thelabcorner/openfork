@@ -2,10 +2,12 @@ import { describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
-import { MessageID, PartID, type SessionID } from "../../src/session/schema"
+import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideInstance, tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -139,6 +141,85 @@ describe("session.created event", () => {
   )
 })
 
+describe("trusted managed root creation", () => {
+  it.instance("is exact-retry idempotent and preserves provider account identity", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const id = SessionID.make("ses_swarm_managed_root_retry")
+      const model = {
+        providerID: ProviderV2.ID.make("workbuddy"),
+        id: ModelV2.ID.make("deepseek-v4.1-flash"),
+        accountID: "wb-managed-account",
+        variant: "max",
+      }
+      const input = { id, title: "managed researcher", agent: "build", model }
+
+      const first = yield* session.createManagedRoot(input)
+      const retried = yield* session.createManagedRoot(input)
+
+      expect(retried.id).toBe(first.id)
+      expect(retried.parentID).toBeUndefined()
+      expect(retried.model).toEqual(model)
+      expect(retried.directory).toBe(first.directory)
+      yield* session.remove(id)
+    }),
+  )
+
+  it.instance("rejects incompatible adoption of an existing deterministic identity", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const id = SessionID.make("ses_swarm_managed_root_conflict")
+      const base = {
+        id,
+        title: "managed researcher",
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make("workbuddy"),
+          id: ModelV2.ID.make("deepseek-v4.1-flash"),
+          accountID: "wb-account-a",
+        },
+      }
+      yield* session.createManagedRoot(base)
+
+      const conflict = yield* session
+        .createManagedRoot({
+          ...base,
+          model: { ...base.model, accountID: "wb-account-b" },
+        })
+        .pipe(Effect.flip)
+
+      expect(conflict._tag).toBe("Session.ManagedRootConflictError")
+      expect(conflict.reason).toContain("provider account mismatch")
+      yield* session.remove(id)
+    }),
+  )
+
+  it.instance("converges concurrent exact retries onto one durable root", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const id = SessionID.make("ses_swarm_managed_root_concurrent")
+      const input = {
+        id,
+        title: "managed researcher",
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make("test"),
+          id: ModelV2.ID.make("test-model"),
+        },
+      }
+
+      const created = yield* Effect.all(
+        Array.from({ length: 8 }, () => session.createManagedRoot(input)),
+        { concurrency: "unbounded" },
+      )
+
+      expect(new Set(created.map((item) => item.id))).toEqual(new Set([id]))
+      expect((yield* session.get(id)).parentID).toBeUndefined()
+      yield* session.remove(id)
+    }),
+  )
+})
+
 describe("step-finish token propagation via event", () => {
   it.instance(
     "non-zero tokens propagate through PartUpdated event",
@@ -222,8 +303,8 @@ describe("Session", () => {
       const first = yield* provideInstance(root)(session.create({ title: "chat-root-a" }))
       const second = yield* provideInstance(root)(session.create({ title: "chat-root-b" }))
 
-      expect(first.projectID).toBe(CHAT_PROJECT_ID)
-      expect(second.projectID).toBe(CHAT_PROJECT_ID)
+      expect(String(first.projectID)).toBe(CHAT_PROJECT_ID)
+      expect(String(second.projectID)).toBe(CHAT_PROJECT_ID)
       expect(first.directory).not.toBe(root)
       expect(second.directory).not.toBe(root)
       expect(first.directory).not.toBe(second.directory)

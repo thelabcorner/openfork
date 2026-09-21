@@ -1,6 +1,7 @@
 import { afterEach, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { SessionCheckpointTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { Hash } from "@opencode-ai/core/util/hash"
@@ -110,19 +111,105 @@ it.instance(
       const rediff = yield* snapshot.diffFull(row.before_snapshot!, row.after_snapshot!)
       expect(rediff.length).toBe(2)
 
-      // Retained refs pin both trees against GC pruning (t3 §45).
+      // Retained refs are checkpoint-owner scoped. Equal trees in other
+      // checkpoints must not share a releasable ref.
       const ctx = yield* InstanceState.context
       const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
-      for (const tree of [row.before_snapshot!, row.after_snapshot!]) {
+      for (const [slot, tree] of [
+        ["before", row.before_snapshot!],
+        ["after", row.after_snapshot!],
+      ] as const) {
         const proc = Bun.spawnSync([
           "git",
           `--git-dir=${gitdir}`,
           "show-ref",
           "--verify",
-          `refs/opencode/retained/${tree}`,
+          `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(row.id, slot, tree)}`,
         ])
         expect(proc.exitCode).toBe(0)
       }
+    }),
+  { git: true },
+)
+
+it.instance(
+  "retention reconciliation prunes orphan/stale refs while preserving durable and in-flight owners",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const svc = yield* TurnCheckpoint.Service
+      const snapshot = yield* Snapshot.Service
+      const sessionID = "ses_checkpoint_retention_reconcile"
+      yield* seedSession(sessionID)
+      expect(yield* snapshot.track()).toBeTruthy()
+
+      const first = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_ready" })
+      yield* Fiber.join(first!.beforeFiber)
+      yield* Effect.promise(() => Bun.write(path.join(tmp.directory, "retained.txt"), "ready"))
+      yield* svc.finish(first)
+      const ready = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const row = (yield* getRows(sessionID))[0]
+          return row?.status === "ready" ? row : undefined
+        }),
+        "retention fixture never finalized",
+        30_000,
+      )
+      yield* svc.quiesce(sessionID as any)
+
+      const ctx = yield* InstanceState.context
+      const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      const commit = Bun.spawnSync([
+        "git",
+        "-c",
+        "user.name=opencode",
+        "-c",
+        "user.email=opencode@localhost",
+        `--git-dir=${gitdir}`,
+        "commit-tree",
+        ready.after_snapshot!,
+        "-m",
+        "retention-reconcile-fixture",
+      ])
+      expect(commit.exitCode).toBe(0)
+      const commitID = commit.stdout.toString().trim()
+      const validAfterRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(
+        ready.id,
+        "after",
+        ready.after_snapshot!,
+      )}`
+      const staleAfterRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(ready.id, "after", "stale-tree")}`
+      const orphanRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(
+        "checkpoint-does-not-exist",
+        "after",
+        "orphan-tree",
+      )}`
+      for (const ref of [staleAfterRef, orphanRef]) {
+        expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "update-ref", ref, commitID]).exitCode).toBe(0)
+      }
+
+      const second = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_capturing" })
+      yield* Fiber.join(second!.beforeFiber)
+      const speculativeRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(
+        second!.checkpointID,
+        "after",
+        "speculative-tree",
+      )}`
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "update-ref", speculativeRef, commitID]).exitCode).toBe(0)
+
+      const firstSweep = yield* svc.reconcileRetention()
+      expect(firstSweep.released).toBeGreaterThanOrEqual(2)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", validAfterRef]).exitCode).toBe(0)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", staleAfterRef]).exitCode).not.toBe(0)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", orphanRef]).exitCode).not.toBe(0)
+      // New retention is pinned before finalize CAS, so capturing rows are
+      // conservatively transparent to maintenance.
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", speculativeRef]).exitCode).toBe(0)
+
+      yield* svc.fail(second, { code: "fixture", message: "settle capturing row" })
+      const secondSweep = yield* svc.reconcileRetention()
+      expect(secondSweep.released).toBeGreaterThanOrEqual(1)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", speculativeRef]).exitCode).not.toBe(0)
     }),
   { git: true },
 )
@@ -179,6 +266,155 @@ it.instance(
       expect(third!.ordinal).toBe(first!.ordinal + 1)
       rows = yield* getRows("ses_checkpoint_test_3")
       expect(rows).toHaveLength(2)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "concurrent begin calls share one authoritative handle for the same logical worker root",
+  () =>
+    Effect.gen(function* () {
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_checkpoint_concurrent_begin"
+      yield* seedSession(sessionID)
+
+      const turns = yield* Effect.all(
+        Array.from({ length: 16 }, () =>
+          svc.begin({ sessionID: sessionID as any, userMessageID: "msg_same_root" }),
+        ),
+        { concurrency: "unbounded" },
+      )
+      const first = turns[0]
+      expect(first).toBeDefined()
+      for (const turn of turns) {
+        expect(turn).toBe(first)
+        expect(turn?.checkpointID).toBe(first?.checkpointID)
+        expect(turn?.ordinal).toBe(first?.ordinal)
+      }
+      expect(yield* getRows(sessionID)).toHaveLength(1)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reopens a finalized checkpoint for the same canonical worker root and preserves the original rollback baseline",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const dir = tmp.directory
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_checkpoint_reopen_ready"
+      yield* seedSession(sessionID)
+
+      yield* Effect.promise(() => Bun.write(path.join(dir, "base.txt"), "before"))
+      const first = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_root" })
+      expect(first).toBeDefined()
+      const originalBefore = yield* Fiber.join(first!.beforeFiber)
+      expect(originalBefore).toBeTruthy()
+      if (!originalBefore) throw new Error("expected initial checkpoint snapshot")
+      yield* Effect.promise(() => Bun.write(path.join(dir, "cycle-1.txt"), "one"))
+      yield* svc.finish(first)
+
+      const firstReady = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const rows = yield* getRows(sessionID)
+          return rows[0]?.status === "ready" ? rows[0] : undefined
+        }),
+        "first logical cycle never finalized",
+        30_000,
+      )
+      expect(firstReady.before_snapshot).toBe(originalBefore)
+      const originalAfter = firstReady.after_snapshot
+      expect(originalAfter).toBeTruthy()
+      if (!originalAfter) throw new Error("expected finalized checkpoint snapshot")
+
+      const second = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_root" })
+      expect(second).toBeDefined()
+      expect(second!.checkpointID).toBe(first!.checkpointID)
+      expect(second!.ordinal).toBe(first!.ordinal)
+      expect(yield* Fiber.join(second!.beforeFiber)).toBe(originalBefore)
+      const reopened = (yield* getRows(sessionID))[0]!
+      expect(reopened.status).toBe("capturing")
+      // A crash/interruption before replacement finalize must not erase the
+      // last known recoverable post-state. Capturing status keeps it inactive.
+      expect(reopened.after_snapshot).toBe(originalAfter)
+
+      yield* Effect.promise(() => Bun.write(path.join(dir, "cycle-2.txt"), "two"))
+      yield* svc.finish(second)
+      const final = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const rows = yield* getRows(sessionID)
+          return rows[0]?.status === "ready" ? rows[0] : undefined
+        }),
+        "reopened logical checkpoint never finalized",
+        30_000,
+      )
+
+      expect((yield* getRows(sessionID))).toHaveLength(1)
+      expect(final.before_snapshot).toBe(originalBefore)
+      expect(final.diff!.map((item) => item.path as string).sort()).toEqual(["cycle-1.txt", "cycle-2.txt"])
+
+      yield* svc.quiesce(sessionID as any)
+      const ctx = yield* InstanceState.context
+      const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      const oldAfterRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(
+        final.id,
+        "after",
+        originalAfter!,
+      )}`
+      const currentAfterRef = `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(
+        final.id,
+        "after",
+        final.after_snapshot!,
+      )}`
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", oldAfterRef]).exitCode).not.toBe(0)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", currentAfterRef]).exitCode).toBe(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reopens an aborted checkpoint when the same worker root is resumed after preemption",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const dir = tmp.directory
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_checkpoint_reopen_aborted"
+      yield* seedSession(sessionID)
+
+      const first = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_root" })
+      const originalBefore = yield* Fiber.join(first!.beforeFiber)
+      if (!originalBefore) throw new Error("expected aborted checkpoint snapshot")
+      yield* Effect.promise(() => Bun.write(path.join(dir, "interrupted.txt"), "partial"))
+      yield* svc.finishAborted(sessionID as any)
+
+      const aborted = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const rows = yield* getRows(sessionID)
+          return rows[0]?.status === "aborted" ? rows[0] : undefined
+        }),
+        "aborted logical checkpoint never finalized",
+        30_000,
+      )
+      expect(aborted.before_snapshot).toBe(originalBefore)
+
+      const resumed = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_root" })
+      expect(resumed!.checkpointID).toBe(first!.checkpointID)
+      expect(yield* Fiber.join(resumed!.beforeFiber)).toBe(originalBefore)
+      yield* Effect.promise(() => Bun.write(path.join(dir, "resumed.txt"), "complete"))
+      yield* svc.finish(resumed)
+
+      const final = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const rows = yield* getRows(sessionID)
+          return rows[0]?.status === "ready" ? rows[0] : undefined
+        }),
+        "resumed logical checkpoint never finalized",
+        30_000,
+      )
+      expect((yield* getRows(sessionID))).toHaveLength(1)
+      expect(final.diff!.map((item) => item.path as string).sort()).toEqual(["interrupted.txt", "resumed.txt"])
     }),
   { git: true },
 )

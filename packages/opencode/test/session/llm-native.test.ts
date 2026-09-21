@@ -565,6 +565,7 @@ describe("session.llm-native.request", () => {
       } satisfies Tool
       const llmClient = {
         prepare: () => Effect.die("unused"),
+        compile: () => Effect.die("unused"),
         stream: () =>
           Stream.fromIterable([
             LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
@@ -617,6 +618,7 @@ describe("session.llm-native.request", () => {
       } satisfies Tool
       const llmClient = {
         prepare: () => Effect.die("unused"),
+        compile: () => Effect.die("unused"),
         stream: () =>
           Stream.fromIterable([
             LLMEvent.toolCall({ id: "call-glob", name: "glob", input: { pattern: "**/*.ts", path: "src" } }),

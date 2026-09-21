@@ -1,8 +1,12 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
@@ -42,11 +46,16 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionHistory } from "@opencode-ai/core/session/history"
+import { SessionTurnProvenance as CurrentTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
+import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
+import { SpadAuditor } from "@opencode-ai/core/spad-auditor"
 import { Skill } from "../../src/skill"
 import { SystemPrompt } from "../../src/session/system"
 import { Shell } from "@opencode-ai/core/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "@/tool/registry"
+import { ToolInterrupt } from "@/tool/interrupt"
 import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -57,7 +66,14 @@ import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { LocationServiceMap, buildLocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { Goal } from "@opencode-ai/core/goal"
+import { GoalContext } from "@opencode-ai/core/goal/context"
+import { GoalProjection } from "@opencode-ai/core/goal/projection"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { Model } from "@opencode-ai/llm"
+import * as OpenAICompatibleChat from "@opencode-ai/llm/protocols/openai-compatible-chat"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -118,6 +134,8 @@ function makeMcp(instructions: MCP.ServerInstructions[] = []) {
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
       tools: () => Effect.succeed({}),
+      exactTools: () => Effect.succeed([]),
+      invokeTool: () => Effect.die("unexpected MCP tool invocation in prompt-effect tests"),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -167,10 +185,34 @@ const blockingProcessor = Layer.succeed(
 
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
+let goalAuditorBaseURL = "http://127.0.0.1:1/v1"
+const goalAuditorModel = () =>
+  Model.make({
+    id: "test-model",
+    provider: "test",
+    route: OpenAICompatibleChat.route.with({
+      endpoint: { baseURL: goalAuditorBaseURL },
+      limits: { context: 100_000, output: 10_000 },
+    }),
+  })
+const goalAuditorModels = SessionRunnerModel.layerWith(
+  () => Effect.succeed(goalAuditorModel()),
+  () => Effect.succeed(goalAuditorModel()),
+)
+const testLocationServiceMap = buildLocationServiceMap([[SessionRunnerModel.node, goalAuditorModels]])
+const locationServiceMapNode = LayerNode.make({
+  service: LocationServiceMap.Service,
+  layer: locationServiceMapLayer,
+  deps: [],
+})
+
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,
+  Goal.node,
+  GoalContext.node,
+  GoalAutomation.node,
   Session.node,
   SessionProjector.node,
   MessageV2.node,
@@ -194,6 +236,7 @@ const promptRoot = LayerNode.group([
   Question.node,
   Todo.node,
   ToolRegistry.node,
+  ToolInterrupt.node,
   Skill.node,
   Git.node,
   Ripgrep.node,
@@ -240,7 +283,19 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
   return makePrompt(input)
 }
 
+function makeGoalHttp() {
+  const root = LayerNode.group([promptRoot, testLLMServerNode])
+  return LayerNode.compile(root, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [locationServiceMapNode, testLocationServiceMap],
+  ] as const)
+}
+
 const it = testEffect(makeHttp())
+const goalIt = testEffect(makeGoalHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -304,6 +359,36 @@ function providerCfg(url: string) {
   }
 }
 
+// Mirrors the SPAD gym's canonical-only drift fixture. It deterministically
+// queues exactly one gray-zone `canonical-period` audit case without entering
+// the destructive raw-repetition recovery lane.
+function canonicalSpadAuditDrift(lines = 36) {
+  let x = 0xc4110a1 >>> 0
+  const random = () => {
+    x ^= x << 13
+    x ^= x >>> 17
+    x ^= x << 5
+    return x >>> 0
+  }
+  const base = "The controller should re anchor to the user request and continue differently."
+  return Array.from({ length: lines }, () => {
+    let out = ""
+    for (const ch of base) {
+      if (ch === " ") {
+        const spaces = [" ", "  ", "\t", "\n", " \t "]
+        out += spaces[random() % spaces.length]!
+        continue
+      }
+      if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z")) {
+        out += (random() & 1) === 0 ? ch.toLowerCase() : ch.toUpperCase()
+        continue
+      }
+      out += ch
+    }
+    return out
+  }).join("\n")
+}
+
 const writeText = Effect.fn("test.writeText")(function* (file: string, text: string) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(file, text)
@@ -356,6 +441,28 @@ const deferredAsPromise = <A>(deferred: Deferred.Deferred<A>): PromiseLike<A> =>
     return deferredAsPromise(deferred) as PromiseLike<never>
   },
 })
+
+function providerSystemText(body: Record<string, unknown>) {
+  const messages = body.messages
+  if (!Array.isArray(messages)) return ""
+  return messages
+    .filter((message): message is { role: string; content?: unknown } => !!message && typeof message === "object" && "role" in message)
+    .filter((message) => message.role === "system")
+    .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")))
+    .join("\n")
+}
+
+function providerRoleTexts(body: Record<string, unknown>, role: string) {
+  const messages = body.messages
+  if (!Array.isArray(messages)) return [] as string[]
+  return messages
+    .filter(
+      (message): message is { role: string; content?: unknown } =>
+        !!message && typeof message === "object" && "role" in message,
+    )
+    .filter((message) => message.role === role)
+    .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")))
+}
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -479,6 +586,330 @@ noLLMServer.instance(
   { config: cfg },
 )
 
+noLLMServer.instance(
+  "scheduled-task root Sessions remain user-drivable while trusted host admission stays fenced",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Scheduled run",
+        metadata: { scheduledTaskID: "stk_prompt_test", scheduledTaskRunID: "str_prompt_test" },
+      })
+
+      const hostExit = yield* prompt
+        .hostPrompt({
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "generic host takeover" }],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(hostExit)).toBe(true)
+      if (Exit.isFailure(hostExit)) {
+        expect(Cause.squash(hostExit.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          kind: "scheduled_task",
+        })
+      }
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(0)
+
+      const admitted = yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "scheduled work" }],
+        },
+        { source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "str_prompt_test" },
+      )
+      expect(admitted.info.role).toBe("user")
+      if (admitted.info.role !== "user") throw new Error("Expected scheduled host admission to produce a user-role turn")
+      expect(admitted.info.provenance).toEqual({
+        owner: "host",
+        source: SessionTurnProvenance.Source.ScheduledTaskRun,
+        ref: "str_prompt_test",
+      })
+
+      const user = yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "follow up on that scheduled work" }],
+      })
+      expect(user.info.role).toBe("user")
+      if (user.info.role !== "user") throw new Error("Expected direct scheduled-session prompt to produce a user-role turn")
+      expect(user.info.provenance).toEqual({
+        owner: "user",
+        source: SessionTurnProvenance.Source.Prompt,
+      })
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(2)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "malformed scheduled-task origin stays fail-closed for user prompting",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Malformed Scheduled run",
+        // New task-owned Scheduled Sessions validly carry scheduledTaskID
+        // without a run id. The corrupt case is a protected run correlation
+        // with no owning task aggregate.
+        metadata: { scheduledTaskRunID: "str_missing_task" },
+      })
+
+      const exit = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "must not downgrade producer ownership" }],
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          kind: "scheduled_task",
+        })
+      }
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(0)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "derived host admission cannot resurrect a stale worker root",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Derived host causality" })
+
+      const first = yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first objective" }],
+      })
+      const second = yield* prompt.prompt({
+        sessionID: chat.id,
+        noReply: true,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "newer objective" }],
+      })
+
+      const stale = yield* prompt
+        .hostPrompt(
+          {
+            sessionID: chat.id,
+            noReply: true,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "late background result" }],
+          },
+          {
+            source: SessionTurnProvenance.Source.TaskSummary,
+            sourceMessageID: first.info.id,
+            ref: "ses_background_child",
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(stale)).toBe(true)
+      if (Exit.isFailure(stale)) {
+        expect(String(Cause.squash(stale.cause))).toContain("stale worker root")
+      }
+
+      const current = yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "current background result" }],
+        },
+        {
+          source: SessionTurnProvenance.Source.TaskSummary,
+          sourceMessageID: second.info.id,
+          ref: "ses_background_child",
+        },
+      )
+      if (current.info.role !== "user") throw new Error("expected host prompt to lower through the V1 user role")
+      expect(current.info.provenance).toEqual({
+        owner: "host",
+        source: SessionTurnProvenance.Source.TaskSummary,
+        sourceMessageID: second.info.id,
+        ref: "ses_background_child",
+      })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "trusted Goal action admission is a retry-idempotent worker root without Goal-creation authority",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const chat = yield* sessions.create({ title: "Goal action admission" })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Retry reactivation",
+          objective: "Repair blocked Goal state on idempotent user-action admission",
+          criteria: ["The blocked Goal is reactivated"],
+          continuationPolicy: { mode: "auto_continue" },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      yield* goals
+        .transition({
+          id: active.goal.id,
+          expectedRevision: active.goal.revision,
+          action: "block",
+          blocker: "Waiting for the trusted user action",
+        })
+        .pipe(Effect.orDie)
+      const messageID = MessageID.make("msg_goal_action_start_goal_test_7")
+      const input = {
+        sessionID: chat.id,
+        messageID,
+        noReply: true,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text" as const, text: "Begin the focused Goal." }],
+      }
+
+      const first = yield* prompt.userActionPrompt(input, { source: SessionTurnProvenance.Source.GoalStart })
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("active")
+      const reblocked = yield* goals
+        .transition({
+          id: created.goal.id,
+          expectedRevision: (yield* goals.get(created.goal.id)).goal.revision,
+          action: "block",
+          blocker: "A newer blocker established after the original user action",
+        })
+        .pipe(Effect.orDie)
+      expect(reblocked.goal.status).toBe("blocked")
+      const second = yield* prompt.userActionPrompt(input, { source: SessionTurnProvenance.Source.GoalStart })
+      expect(first.info.id).toBe(messageID)
+      expect(second.info.id).toBe(messageID)
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
+        status: "blocked",
+        blocker: "A newer blocker established after the original user action",
+      })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const actions = messages.filter((message) => message.info.id === messageID)
+      expect(actions).toHaveLength(1)
+      expect(actions[0]?.parts).toHaveLength(1)
+      expect(actions[0]?.parts[0]).toMatchObject({ type: "text", text: "Begin the focused Goal." })
+      expect(actions[0] && SessionTurnProvenance.isWorkerPromptTurn(actions[0])).toBe(true)
+      expect(actions[0] && SessionTurnProvenance.isGoalAuthorizationTurn(actions[0])).toBe(false)
+      const action = actions[0]
+      if (!action || action.info.role !== "user") throw new Error("expected Goal action to be a user-owned V1 turn")
+      expect(action.info.provenance).toEqual({ owner: "user", source: SessionTurnProvenance.Source.GoalStart })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "rejects direct worker-loop execution on a host-owned Goal Auditor child",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "Parent" })
+      const child = yield* sessions.create({
+        parentID: parent.id,
+        title: "Goal Auditor child",
+        metadata: { specialAgent: "goal_auditor", goalID: "goal_test" },
+      })
+
+      const exit = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          sessionID: child.id,
+          parentID: parent.id,
+          kind: "goal_auditor",
+        })
+      }
+    }),
+  { config: cfg },
+)
+
+for (const kind of ["prompt_revisor", "goal_revisor", "session_title", "spad_auditor"] as const) {
+  noLLMServer.instance(
+    `rejects host worker-loop execution on a ${kind} special-agent child`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const parent = yield* sessions.create({ title: "Parent" })
+        const child = yield* sessions.create({
+          parentID: parent.id,
+          title: kind,
+          metadata: { specialAgent: kind },
+        })
+
+        const exit = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(Cause.squash(exit.cause)).toMatchObject({
+            _tag: "SessionPrompt.HostOwnedSessionError",
+            sessionID: child.id,
+            parentID: parent.id,
+            kind,
+          })
+        }
+      }),
+    { config: cfg },
+  )
+}
+
+noLLMServer.instance(
+  "fails closed when a future or malformed special-agent kind reaches worker admission",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "Parent" })
+      const child = yield* sessions.create({
+        parentID: parent.id,
+        title: "Future special agent",
+        metadata: { specialAgent: "future_special_agent" },
+      })
+
+      const exit = yield* prompt.loop({ sessionID: child.id }).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          sessionID: child.id,
+          parentID: parent.id,
+          kind: "special_agent",
+        })
+      }
+    }),
+  { config: cfg },
+)
+
 // Loop semantics
 
 noLLMServer.instance(
@@ -495,6 +926,966 @@ noLLMServer.instance(
       if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
     }),
   { config: cfg },
+)
+
+goalIt.instance(
+  "Goal Mode: a genuine V1 user prompt reactivates a focused blocked Goal at admission even without a reply",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const chat = yield* sessions.create({ title: "Blocked Goal user reactivation" })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Reactivate from user prompt",
+          objective: "Continue when the user provides new input",
+          criteria: ["the blocked Goal becomes active on admission"],
+          continuationPolicy: { mode: "auto_continue" },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      const blocked = yield* goals
+        .transition({
+          id: active.goal.id,
+          expectedRevision: active.goal.revision,
+          action: "block",
+          blocker: "Waiting for new user input",
+        })
+        .pipe(Effect.orDie)
+      expect(blocked.goal.status).toBe("blocked")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "continue comprehensively" }],
+      })
+
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({ status: "active", blocker: undefined })
+    }),
+  { config: cfg },
+)
+
+goalIt.instance(
+  "Goal Mode: a completed worker turn runs the auditor, and the auditor's continuation re-drives the session until the auditor completes the Goal",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal loop",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Goal loop proof",
+          objective: "Prove worker -> auditor -> worker until complete",
+          criteria: ["the auditor re-drives the session"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const CONTINUATION = "AUDITOR-CONTINUATION-MARKER: take the next concrete step"
+
+      const toolNames = (body: Record<string, unknown>) => {
+        const tools = body.tools
+        if (!Array.isArray(tools)) return [] as string[]
+        return tools.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return []
+          const record = entry as { name?: unknown; function?: { name?: unknown } }
+          if (typeof record.name === "string") return [record.name]
+          if (typeof record.function?.name === "string") return [record.function.name]
+          return []
+        })
+      }
+      const isAuditorRequest = (hit: { body: Record<string, unknown> }) => toolNames(hit.body).includes("audit_verdict")
+
+      // Auditor turn 1: another bounded worker cycle, with an explicit handoff.
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .tool("audit_verdict", {
+            decision: "continue",
+            rationale: "The acceptance criterion is not yet verified.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "pending", evidence: "not verified yet" }],
+            continuationPrompt: CONTINUATION,
+          })
+          .item(),
+      )
+      // Auditor turn 2: the Goal is complete.
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The worker transcript verifies the acceptance criterion.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "verified by transcript" }],
+          })
+          .item(),
+      )
+      // Worker cycle 1 deliberately reports `stop` while emitting a host tool.
+      // The loop must execute the tool and send its result back to the worker
+      // before Goal auditing begins.
+      yield* llm.pushMatch(
+        (hit) => !isAuditorRequest(hit),
+        reply().tool("read", { filePath: fileURLToPath(import.meta.url) }).stop().item(),
+      )
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("worker step 1 complete").stop().item())
+      // Worker cycle 2 is the auditor-authorized continuation.
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("worker step 2 complete").stop().item())
+
+      const run = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "start the goal" }],
+        })
+        .pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
+      expect((run as { _tag?: string })._tag).not.toBe("None")
+
+      const hits = yield* llm.hits
+      const auditorHits = hits.filter(isAuditorRequest)
+      const workerHits = hits.filter((hit) => !isAuditorRequest(hit))
+
+      // 1) Completing the worker turn auto-ran the independent auditor.
+      expect(auditorHits.length).toBeGreaterThanOrEqual(2)
+      // A provider `stop` that also contains a host tool is not a terminal Goal
+      // cycle. The tool result must return to the worker before the first audit.
+      expect(hits.findIndex(isAuditorRequest)).toBeGreaterThanOrEqual(2)
+      // 2) The auditor's continuation re-drove the worker session.
+      expect(workerHits.length).toBeGreaterThanOrEqual(3)
+      expect(JSON.stringify(workerHits.at(-1)!.body)).toContain(CONTINUATION)
+      const firstWorkerUsers = providerRoleTexts(workerHits[0]!.body, "user")
+      const firstSpec = firstWorkerUsers.findIndex((text) => text.includes('<goal_spec state="current"'))
+      const firstProgress = firstWorkerUsers.findIndex((text) => text.includes('<goal_progress state="current"'))
+      const firstHuman = firstWorkerUsers.findIndex((text) => text.includes("start the goal"))
+      expect(firstSpec).toBeGreaterThanOrEqual(0)
+      expect(firstProgress).toBeGreaterThan(firstSpec)
+      expect(firstHuman).toBeGreaterThan(firstProgress)
+
+      // V1 persists a real user steer before the runner can reach its next safe
+      // state-reconciliation boundary. The provider materialized view must still
+      // keep current Goal state immediately before the active continuation, so
+      // state cannot become a newer instruction merely because it was appended.
+      const continuedUsers = providerRoleTexts(workerHits.at(-1)!.body, "user")
+      const continuedSpec = continuedUsers.findIndex((text) => text.includes('<goal_spec state="current"'))
+      const continuedProgress = continuedUsers.findIndex((text) => text.includes('<goal_progress state="current"'))
+      const continuedTurn = continuedUsers.findIndex((text) => text.includes(CONTINUATION))
+      expect(continuedSpec).toBeGreaterThanOrEqual(0)
+      expect(continuedProgress).toBeGreaterThan(continuedSpec)
+      expect(continuedTurn).toBeGreaterThan(continuedProgress)
+      // The continuation is a durable host-authored turn boundary, not worker
+      // system context. This is the role/cache isolation invariant: changing
+      // auditor text may append to the transcript but must never mutate the
+      // worker's privileged system prefix.
+      expect(providerSystemText(workerHits.at(-1)!.body)).not.toContain(CONTINUATION)
+      // Privileged auditor identity/reminder/protocol instructions belong only
+      // to the host-owned auditor child. They must never leak into a worker
+      // provider request, even when the worker receives an auditor-authored
+      // continuation assessment as a synthetic host turn.
+      for (const hit of workerHits) {
+        const system = providerSystemText(hit.body)
+        expect(system).toContain("<goal_mechanism>")
+        expect(system).not.toContain("[GOAL AUDITOR")
+        expect(system).not.toContain("Goal loop proof")
+        expect(system).not.toContain("Prove worker -> auditor -> worker until complete")
+        expect(system).not.toContain('<goal_spec state="current"')
+        expect(system).not.toContain('<goal_progress state="current"')
+      }
+      const transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const stateTurns = transcript.filter(SessionTurnProvenance.isStateProjectionTurn)
+      const specTurns = stateTurns.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalSpecification,
+      )
+      const progressTurns = stateTurns.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalProgress,
+      )
+      expect(specTurns).toHaveLength(1)
+      expect(progressTurns.length).toBeGreaterThanOrEqual(2)
+      for (const stateTurn of stateTurns) {
+        expect(stateTurn.info.role).toBe("user")
+        expect(stateTurn.parts).toHaveLength(1)
+        expect(stateTurn.parts[0]).toMatchObject({ type: "text", synthetic: true })
+      }
+      const finalProgress = progressTurns.toSorted((left, right) =>
+        left.info.time.created !== right.info.time.created
+          ? right.info.time.created - left.info.time.created
+          : right.info.id.localeCompare(left.info.id),
+      )[0]!
+      expect(finalProgress.parts[0]?.type === "text" ? finalProgress.parts[0].text : "").toContain(
+        "<status>completed</status>",
+      )
+      const continuationTurns = transcript.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalContinuation &&
+          typeof message.info.provenance.ref === "string" &&
+          message.info.provenance.ref.length > 0 &&
+          message.parts.some(
+            (part) =>
+              part.type === "text" &&
+              part.synthetic === true &&
+              part.text.includes(CONTINUATION),
+          ),
+      )
+      expect(continuationTurns).toHaveLength(1)
+      const continuationTurn = continuationTurns[0]!
+      expect(continuationTurn.info.role).toBe("user")
+      if (continuationTurn.info.role !== "user") throw new Error("Expected Goal continuation user-role turn")
+      expect(continuationTurn.info.provenance?.owner).toBe("host")
+      expect(continuationTurn.info.provenance?.source).toBe(SessionTurnProvenance.Source.GoalContinuation)
+      if (continuationTurn.info.provenance?.owner !== "host") throw new Error("Expected host-owned Goal continuation")
+      expect(typeof continuationTurn.info.provenance.ref).toBe("string")
+      const continuationPart = continuationTurn.parts.find(
+        (part) => part.type === "text" && part.synthetic === true && part.text.includes(CONTINUATION),
+      )
+      expect(continuationPart?.type).toBe("text")
+      const userAuthoredTurns = transcript.filter(
+        (message) => SessionTurnProvenance.isSemanticUserTurn(message),
+      )
+      expect(userAuthoredTurns).toHaveLength(1)
+      expect(continuationTurn.info.provenance.sourceMessageID).toBe(userAuthoredTurns[0]!.info.id)
+      expect(
+        transcript.some(
+          (message) => message.info.role === "assistant" && message.info.parentID === continuationTurn.info.id,
+        ),
+      ).toBe(true)
+      // 3) The final auditor verdict settled the Goal.
+      const focused = yield* goals.focused(chat.id)
+      expect(focused?.detail.goal.status).toBe("completed")
+      expect(focused?.detail.goal.auditorRuns).toBe(2)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a recovered reservation repairs a message-only continuation publication without duplicating the turn",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal continuation crash recovery",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Repair partial continuation publication",
+          objective: "Recover exactly one complete continuation after a crash between message and part publication",
+          criteria: ["the continuation is complete and not duplicated"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      // Emulate the GoalProjection-specific crash boundary as well: the exact
+      // deterministic goal.spec message committed, but its synthetic text part
+      // did not. The same runner recovery that repairs the continuation below
+      // must complete this row in place rather than append another spec state.
+      const spec = GoalProjection.sections(active).find((section) => section.kind === "spec")!
+      const partialSpecMessageID = MessageID.make(
+        GoalProjection.publicationMessageID({ sessionID: chat.id as never, section: spec }),
+      )
+      yield* sessions.updateMessage({
+        ...seeded.user,
+        id: partialSpecMessageID,
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalSpecification, { ref: spec.ref }),
+        time: { created: Date.now() },
+      })
+
+      const criterionID = active.criteria[0]!.id
+      const reservationDecision = yield* automation.afterTurn({
+        sessionID: chat.id,
+        origin: "user",
+        sourceMessageID: seeded.user.id,
+        audit: {
+          ok: true,
+          verdict: {
+            decision: "continue",
+            rationale: "One more worker cycle is required.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "pending", evidence: "recovery has not run yet" }],
+            continuationPrompt: "RECOVERED-CONTINUATION-MARKER: finish the recovery proof.",
+          },
+        },
+      })
+      const reservation = reservationDecision.reservation
+      expect(reservation?.sourceMessageID).toBe(seeded.user.id)
+      if (!reservation) throw new Error("Expected a Goal continuation reservation")
+
+      // Emulate the exact crash boundary: the reservation was claimed and its
+      // MessageUpdated event committed, but PartUpdated never happened. Startup
+      // recovery requeues the claim; the next loop must fill the missing part on
+      // the same deterministic message id rather than append a second turn.
+      const claimed = yield* automation.claim(chat.id)
+      expect(claimed?.id).toBe(reservation.id)
+      const continuationMessageID = MessageID.make(`msg_goal_continuation_${reservation.id}`)
+      yield* sessions.updateMessage({
+        ...seeded.user,
+        id: continuationMessageID,
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+          sourceMessageID: seeded.user.id,
+          ref: reservation.id,
+        }),
+        time: { created: reservation.createdAt },
+      })
+      yield* automation.release({ sessionID: chat.id, reservationID: reservation.id })
+
+      const toolNames = (body: Record<string, unknown>) => {
+        const tools = body.tools
+        if (!Array.isArray(tools)) return [] as string[]
+        return tools.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return []
+          const record = entry as { name?: unknown; function?: { name?: unknown } }
+          if (typeof record.name === "string") return [record.name]
+          if (typeof record.function?.name === "string") return [record.function.name]
+          return []
+        })
+      }
+      const isAuditorRequest = (hit: { body: Record<string, unknown> }) => toolNames(hit.body).includes("audit_verdict")
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The recovered continuation completed successfully.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "recovered worker cycle completed" }],
+          })
+          .item(),
+      )
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("recovery proof complete").stop().item())
+
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)))
+
+      const transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const repairedSpec = transcript.filter(
+        (message) =>
+          message.info.id === partialSpecMessageID &&
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalSpecification,
+      )
+      expect(repairedSpec).toHaveLength(1)
+      expect(repairedSpec[0]!.parts).toEqual([
+        expect.objectContaining({ type: "text", synthetic: true, text: spec.text }),
+      ])
+      const correlated = transcript.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalContinuation &&
+          message.info.provenance.ref === reservation.id,
+      )
+      expect(correlated).toHaveLength(1)
+      expect(correlated[0]!.info.id).toBe(continuationMessageID)
+      expect(
+        correlated[0]!.parts.filter(
+          (part) => part.type === "text" && part.synthetic === true && part.text === reservation.prompt,
+        ),
+      ).toHaveLength(1)
+      expect(
+        transcript.some(
+          (message) => message.info.role === "assistant" && message.info.parentID === continuationMessageID,
+        ),
+      ).toBe(true)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a completed compaction resets effective state and reprojects unchanged Goal snapshots without another provider turn",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal projection compaction reset",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const goal = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Reproject after compaction",
+          objective: "Keep current Goal state live without fossilizing old snapshots",
+          criteria: ["state is reprojected after reset"],
+        })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: goal.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      yield* llm.push(reply().text("baseline worker result").stop().item())
+      const baseline = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "establish the baseline Goal context" }],
+      })
+      if (baseline.info.role !== "assistant") throw new Error("expected baseline assistant")
+
+      let transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const root = transcript.find(SessionTurnProvenance.isWorkerPromptTurn)
+      if (!root || root.info.role !== "user") throw new Error("expected worker root")
+      const before = transcript.filter(SessionTurnProvenance.isStateProjectionTurn)
+      expect(before).toHaveLength(2)
+      const beforeIDs = new Set(before.map((message) => message.info.id))
+      const hitsBeforeReset = (yield* llm.hits).length
+
+      const compactionID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        ...root.info,
+        id: compactionID,
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.Compaction, root.info),
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: compactionID,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      })
+      const summaryID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        ...baseline.info,
+        id: summaryID,
+        parentID: compactionID,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        error: undefined,
+        time: { created: Date.now() + 1 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summaryID,
+        sessionID: chat.id,
+        type: "text",
+        text: "historical summary intentionally excludes Goal state",
+      })
+
+      // No prompt/continuation is pending. The loop should use its normal
+      // effective-history load to reproject state at the new reset boundary and
+      // then quiesce on the already-finished compaction summary.
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)))
+      expect((yield* llm.hits).length).toBe(hitsBeforeReset)
+
+      transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const after = transcript.filter(SessionTurnProvenance.isStateProjectionTurn)
+      const republished = after.filter((message) => !beforeIDs.has(message.info.id))
+      expect(republished).toHaveLength(2)
+      expect(
+        republished
+          .flatMap((message) =>
+            message.info.role === "user" && message.info.provenance?.owner === "host"
+              ? [message.info.provenance.source]
+              : [],
+          )
+          .sort(),
+      ).toEqual(
+        [SessionTurnProvenance.Source.GoalProgress, SessionTurnProvenance.Source.GoalSpecification].sort(),
+      )
+
+      // A second reconciliation in the same reset epoch is a no-op.
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)))
+      const finalTranscript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      expect(finalTranscript.filter(SessionTurnProvenance.isStateProjectionTurn)).toHaveLength(after.length)
+      expect((yield* llm.hits).length).toBe(hitsBeforeReset)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: an orphaned verifying Goal can run the auditor directly without another worker turn",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Direct Goal audit",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      // Seed a normal completed worker exchange before the Goal exists. The
+      // direct audit must inspect this transcript; it must not ask the worker
+      // model for a synthetic/no-op turn merely to wake the auditor.
+      yield* llm.push(reply().text("baseline worker result").stop().item())
+      const baseline = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "produce the baseline result" }],
+      })
+      if (baseline.info.role !== "assistant") throw new Error("expected baseline assistant")
+      // Reproduce a long-running campaign transcript where the latest bounded
+      // history page contains only assistant/tool activity. Auditor model
+      // provenance must still find the most recent user turn across pages.
+      for (let index = 0; index < 12; index++) {
+        yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          parentID: baseline.info.parentID,
+          role: "assistant",
+          sessionID: chat.id,
+          mode: "build",
+          agent: "build",
+          variant: baseline.info.variant,
+          path: baseline.info.path,
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: baseline.info.modelID,
+          providerID: baseline.info.providerID,
+          time: { created: Date.now() + index + 1, completed: Date.now() + index + 1 },
+          finish: "stop",
+        })
+      }
+
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Recover verifier",
+          objective: "Audit the existing worker result without another worker turn",
+          criteria: ["the existing worker result is independently verified"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      const verifying = yield* goals
+        .transition({ id: active.goal.id, expectedRevision: active.goal.revision, action: "request_verification" })
+        .pipe(Effect.orDie)
+
+      const criterionID = verifying.criteria[0]!.id
+      yield* llm.pushMatch(
+        (hit) => {
+          const tools = hit.body.tools
+          return Array.isArray(tools) && JSON.stringify(tools).includes("audit_verdict")
+        },
+        reply()
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The existing transcript is sufficient evidence.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "verified from the existing worker transcript" }],
+          })
+          .item(),
+      )
+
+      const before = (yield* llm.hits).length
+      yield* prompt.auditGoal(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
+      const hits = (yield* llm.hits).slice(before)
+
+      expect(hits).toHaveLength(1)
+      expect(JSON.stringify(hits[0]!.body.tools)).toContain("audit_verdict")
+      expect((yield* goals.focused(chat.id))?.detail.goal.status).toBe("completed")
+      expect((yield* goals.focused(chat.id))?.detail.goal.auditorRuns).toBe(1)
+      expect(yield* (yield* GoalAutomation.Service).runtime(chat.id)).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a user verification request preempts an in-flight worker generation before AUDITING begins",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal audit preemption",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Preempt worker for verification",
+          objective: "Stop active worker generation when the user requests independent verification",
+          criteria: ["the independent auditor verifies the interrupted worker transcript"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const auditorGate = yield* Deferred.make<void>()
+      const toolNames = (body: Record<string, unknown>) => {
+        const tools = body.tools
+        if (!Array.isArray(tools)) return [] as string[]
+        return tools.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return []
+          const record = entry as { name?: unknown; function?: { name?: unknown } }
+          if (typeof record.name === "string") return [record.name]
+          if (typeof record.function?.name === "string") return [record.function.name]
+          return []
+        })
+      }
+      const isAuditorRequest = (hit: { body: Record<string, unknown> }) => toolNames(hit.body).includes("audit_verdict")
+
+      // The worker emits visible text and then leaves the provider stream open.
+      // Verification must interrupt this exact run instead of waiting for a
+      // natural assistant completion.
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("partial worker output").hang().item())
+      // Keep the real auditor provider turn open after admission so the test can
+      // observe the authoritative intermediate state: parent idle + live auditor
+      // lease. Releasing the gate then commits the terminal verdict.
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .wait(deferredAsPromise(auditorGate))
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The interrupted worker transcript is sufficient for this regression proof.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "auditor inspected the finalized interrupted turn" }],
+          })
+          .item(),
+      )
+
+      const worker = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "begin worker generation and keep going" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const verify = yield* prompt.requestGoalAudit(chat.id).pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const runtime = yield* automation.runtime(chat.id)
+          const parentStatus = yield* status.get(chat.id)
+          return runtime?.phase === "auditing" && parentStatus.type === "idle" ? runtime : undefined
+        }),
+        "timed out waiting for worker preemption and live auditor lease",
+        "10 seconds",
+      )
+
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      const running = yield* automation.runtime(chat.id)
+      expect(running?.phase).toBe("auditing")
+      if (running?.phase !== "auditing") throw new Error("expected live auditor lease")
+      expect(yield* goals.auditorSessionFor({ parentSessionID: chat.id, goalID: active.goal.id })).toBe(
+        running.auditorSessionID,
+      )
+
+      const interrupted = (yield* sessions.messages({ sessionID: chat.id })).findLast(
+        (message) => message.info.role === "assistant",
+      )
+      expect(interrupted?.info.role).toBe("assistant")
+      if (interrupted?.info.role === "assistant") {
+        expect(interrupted.info.time.completed).toBeDefined()
+        expect(interrupted.info.error?.name).toBe("MessageAbortedError")
+      }
+
+      yield* Deferred.succeed(auditorGate, void 0)
+      const verifyExit = yield* Fiber.await(verify)
+      expect(Exit.isSuccess(verifyExit)).toBe(true)
+      const workerExit = yield* Fiber.await(worker)
+      expect(Exit.isSuccess(workerExit)).toBe(true)
+
+      const focused = yield* goals.focused(chat.id)
+      expect(focused?.detail.goal.status).toBe("completed")
+      expect(focused?.detail.goal.auditorRuns).toBe(1)
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a user verification request aborts an in-flight worker tool before the auditor starts",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const registry = yield* ToolRegistry.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const { read } = yield* registry.named()
+      const { ready: toolReady, aborted: toolAborted, restore } = yield* hangUntilAborted(read)
+      yield* restore
+
+      const chat = yield* sessions.create({
+        title: "Goal tool preemption",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Preempt worker tool for verification",
+          objective: "Stop an active worker tool when the user requests independent verification",
+          criteria: ["the independent auditor sees a finalized interrupted tool state"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const auditorGate = yield* Deferred.make<void>()
+      const toolNames = (body: Record<string, unknown>) => {
+        const tools = body.tools
+        if (!Array.isArray(tools)) return [] as string[]
+        return tools.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return []
+          const record = entry as { name?: unknown; function?: { name?: unknown } }
+          if (typeof record.name === "string") return [record.name]
+          if (typeof record.function?.name === "string") return [record.function.name]
+          return []
+        })
+      }
+      const isAuditorRequest = (hit: { body: Record<string, unknown> }) => toolNames(hit.body).includes("audit_verdict")
+
+      // The provider delegates to a host-executed tool. The overridden read tool
+      // blocks until its AbortSignal fires, proving that verification preemption
+      // reaches the currently executing tool rather than merely cancelling the
+      // provider stream around it.
+      yield* llm.pushMatch(
+        (hit) => !isAuditorRequest(hit),
+        reply().tool("read", { filePath: fileURLToPath(import.meta.url) }).item(),
+      )
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .wait(deferredAsPromise(auditorGate))
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The interrupted tool state is finalized and visible in the worker transcript.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "the read tool was durably marked interrupted before audit" }],
+          })
+          .item(),
+      )
+
+      const worker = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "read the requested file and continue working" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(toolReady), "timed out waiting for worker tool to start", "10 seconds")
+      yield* waitForBusy(chat.id)
+
+      const verify = yield* prompt.requestGoalAudit(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(toolAborted), "timed out waiting for worker tool abort", "10 seconds")
+      yield* llm.wait(2)
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const runtime = yield* automation.runtime(chat.id)
+          const parentStatus = yield* status.get(chat.id)
+          return runtime?.phase === "auditing" && parentStatus.type === "idle" ? runtime : undefined
+        }),
+        "timed out waiting for finalized tool state and live auditor lease",
+        "10 seconds",
+      )
+
+      const parentMessages = yield* sessions.messages({ sessionID: chat.id })
+      const interruptedTool = parentMessages
+        .flatMap((message) => message.parts)
+        .find(
+          (part) =>
+            part.type === "tool" &&
+            part.tool === "read" &&
+            part.state.status === "error" &&
+            part.state.metadata?.interrupted === true,
+        )
+      expect(interruptedTool?.type).toBe("tool")
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      const running = yield* automation.runtime(chat.id)
+      expect(running?.phase).toBe("auditing")
+
+      yield* Deferred.succeed(auditorGate, void 0)
+      expect(Exit.isSuccess(yield* Fiber.await(verify))).toBe(true)
+      expect(Exit.isSuccess(yield* Fiber.await(worker))).toBe(true)
+      expect((yield* goals.focused(chat.id))?.detail.goal).toMatchObject({ status: "completed", auditorRuns: 1 })
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: manual verification preempts an in-flight auditor-authorized continuation without resurrecting it",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal continuation preemption",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Preempt automatic continuation",
+          objective: "Manual verification supersedes an already-running automatic Goal continuation",
+          criteria: ["the stale automatic continuation cannot resurrect after user verification"],
+          continuationPolicy: { mode: "auto_continue" },
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const toolNames = (body: Record<string, unknown>) => {
+        const tools = body.tools
+        if (!Array.isArray(tools)) return [] as string[]
+        return tools.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return []
+          const record = entry as { name?: unknown; function?: { name?: unknown } }
+          if (typeof record.name === "string") return [record.name]
+          if (typeof record.function?.name === "string") return [record.function.name]
+          return []
+        })
+      }
+      const isAuditorRequest = (hit: { body: Record<string, unknown> }) => toolNames(hit.body).includes("audit_verdict")
+
+      // Initial user worker cycle completes normally.
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("initial worker cycle complete").stop().item())
+      // First auditor authorizes an autonomous continuation.
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .tool("audit_verdict", {
+            decision: "continue",
+            rationale: "One more worker cycle is required.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "pending", evidence: "more work remains" }],
+            continuationPrompt: "Run the automatic continuation until the next concrete checkpoint.",
+          })
+          .item(),
+      )
+      // The auditor-authorized continuation starts, then hangs in generation.
+      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("partial automatic continuation").hang().item())
+      // The user-requested replacement audit completes the Goal.
+      yield* llm.pushMatch(
+        isAuditorRequest,
+        reply()
+          .tool("audit_verdict", {
+            decision: "complete",
+            rationale: "The finalized transcript now satisfies the regression criterion.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "passed", evidence: "stale continuation was interrupted and did not resume" }],
+          })
+          .item(),
+      )
+
+      const original = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "start the automatic Goal" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // Three requests prove the second worker cycle is the claimed automatic
+      // continuation: worker 1, auditor 1, worker 2 (hung).
+      yield* llm.wait(3)
+      yield* waitForBusy(chat.id, "10 seconds")
+      const before = yield* llm.hits
+      expect(before.filter(isAuditorRequest)).toHaveLength(1)
+      expect(before.filter((hit) => !isAuditorRequest(hit))).toHaveLength(2)
+
+      yield* prompt.requestGoalAudit(chat.id).pipe(Effect.timeout("15 seconds"))
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect((yield* goals.focused(chat.id))?.detail.goal).toMatchObject({ status: "completed", auditorRuns: 2 })
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+
+      const originalExit = yield* Fiber.await(original)
+      expect(Exit.isSuccess(originalExit)).toBe(true)
+      const hits = yield* llm.hits
+      expect(hits.filter(isAuditorRequest)).toHaveLength(2)
+      expect(hits.filter((hit) => !isAuditorRequest(hit))).toHaveLength(2)
+      for (const hit of hits.filter((entry) => !isAuditorRequest(entry))) {
+        expect(providerSystemText(hit.body)).not.toContain("[GOAL AUDITOR")
+      }
+    }),
+  { config: cfg },
+  30_000,
 )
 
 noLLMServer.instance(
@@ -857,6 +2248,87 @@ it.instance("SPAD recovery truncates a repetitive tail and continues with a hidd
     if (repetitive?.type === "text") expect(repetitive.text.length).toBeLessThan(motif.length * 12)
     expect(yield* llm.hits).toHaveLength(2)
   }),
+)
+
+it.instance("SPAD auditor persists host-owned synthetic provenance and a settled verdict", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      small_model: "test/test-model",
+      experimental: { spad_recovery: false, spad_auditor: true },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "SPAD auditor provenance",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const drift = canonicalSpadAuditDrift()
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Compare the approaches and keep useful changes." }],
+    })
+    yield* llm.toolMatch(
+      (hit) => JSON.stringify(hit.body).includes(SpadAuditor.VERDICT_TOOL),
+      SpadAuditor.VERDICT_TOOL,
+      { decision: "uncertain", confidence: 0.55, reason: "insufficient_evidence" },
+    )
+    yield* llm.text(drift)
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.info.role).toBe("assistant")
+
+    const transcriptID = SpecialAgentSession.sessionIDFor({
+      ownerKind: SpecialAgentSession.OWNER_SESSION,
+      ownerID: session.id,
+      agent: "spad_auditor",
+    })
+    const { readDb } = yield* Database.Service
+    const history = yield* pollWithTimeout(
+      Effect.gen(function* () {
+        const current = yield* SessionHistory.load(readDb, transcriptID)
+        const prompts = current.filter(
+          (message) =>
+            message.type === "synthetic" &&
+            message.provenance?.owner === "host" &&
+            message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
+        )
+        const tools = current.flatMap((message) =>
+          message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+        )
+        const settled = tools.some(
+          (tool) => tool.name === SpadAuditor.VERDICT_TOOL && tool.state.status === "completed",
+        )
+        const dangling = tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")
+        return prompts.length === 1 && settled && !dangling ? current : undefined
+      }),
+      "SPAD auditor child transcript did not settle",
+      "10 seconds",
+    )
+
+    const prompts = history.filter(
+      (message) =>
+        message.type === "synthetic" &&
+        message.provenance?.owner === "host" &&
+        message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
+    )
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0] && CurrentTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+    expect(prompts[0] && CurrentTurnProvenance.isGoalAuthorizationTurn(prompts[0])).toBe(false)
+    const tools = history.flatMap((message) =>
+      message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+    )
+    expect(tools.map((tool) => ({ name: tool.name, status: tool.state.status }))).toContainEqual({
+      name: SpadAuditor.VERDICT_TOOL,
+      status: "completed",
+    })
+    expect(tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")).toBe(false)
+  }),
+  20_000,
 )
 
 it.instance("SPAD disabled preserves repetitive output and avoids recovery", () =>
@@ -1301,9 +2773,10 @@ it.instance("loop continues when finish is unknown", () =>
       expect(result.info.finish).toBe("stop")
     }
 
-    // Continuation context (#43892): the N+1 generation must be TOLD why it
-    // is running (previous response ended "unknown"), instead of appearing
-    // as a blank/phantom user turn. Request-only — gen 1 has no notice.
+    // Continuation context (#43892): the N+1 generation must be told why it is
+    // running (previous response ended "unknown"), instead of appearing as a
+    // blank/phantom user turn. The continuation is now a durable host-owned
+    // synthetic turn, matching the V2 semantic-message model.
     const hits = yield* llm.hits
     const firstBody = JSON.stringify(hits[0]?.body)
     expect(firstBody).not.toContain("AUTOMATIC CONTINUATION")
@@ -1311,9 +2784,25 @@ it.instance("loop continues when finish is unknown", () =>
       ?.messages ?? []) as Array<{ role: string; content: unknown }>
     const lastUserTurn = secondMessages.findLast((m) => m.role === "user")
     expect(JSON.stringify(lastUserTurn?.content)).toContain("AUTOMATIC CONTINUATION")
-    // The persisted session must NOT contain it (request-only injection).
     const finalMsgs = yield* sessions.messages({ sessionID: session.id })
-    expect(JSON.stringify(finalMsgs)).not.toContain("AUTOMATIC CONTINUATION")
+    const continuations = finalMsgs.filter(
+      (message) =>
+        message.info.role === "user" &&
+        message.info.provenance?.owner === "host" &&
+        message.info.provenance.source === SessionTurnProvenance.Source.UnknownFinishContinuation,
+    )
+    expect(continuations).toHaveLength(1)
+    const continuation = continuations[0]!
+    expect(SessionTurnProvenance.semanticKind(continuation)).toBe("synthetic")
+    expect(continuation.parts.some((part) => part.type === "text" && part.text.includes("AUTOMATIC CONTINUATION"))).toBe(
+      true,
+    )
+    if (continuation.info.role !== "user") throw new Error("expected synthetic provider-user turn")
+    expect(continuation.info.provenance?.owner).toBe("host")
+    if (continuation.info.provenance?.owner !== "host") throw new Error("expected host provenance")
+    const source = finalMsgs.find(SessionTurnProvenance.isWorkerPromptTurn)
+    expect(source).toBeDefined()
+    expect(continuation.info.provenance.sourceMessageID).toBe(source?.info.id)
   }),
 )
 
@@ -1578,8 +3067,12 @@ it.instance(
       const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
       yield* llm.wait(1)
       expect((yield* status.get(chat.id)).type).toBe("busy")
+      const cancelStarted = Date.now()
       yield* prompt.cancel(chat.id)
+      console.log("busy-idle cancel ms", Date.now() - cancelStarted)
+      const awaitStarted = Date.now()
       yield* Fiber.await(fiber)
+      console.log("busy-idle await ms", Date.now() - awaitStarted)
       expect((yield* status.get(chat.id)).type).toBe("idle")
     }),
   3_000,
@@ -1724,55 +3217,8 @@ raceNoLLMServer.instance(
   3_000,
 )
 
-noLLMServer.instance(
-  "cancel finalizes subtask tool state",
-  () =>
-    Effect.gen(function* () {
-      const ready = yield* Deferred.make<void>()
-      const aborted = yield* Deferred.make<void>()
-      const registry = yield* ToolRegistry.Service
-      const { task } = yield* registry.named()
-      const original = task.execute
-      task.execute = (_args, ctx) =>
-        Effect.callback<never>((_resume) => {
-          ctx.abort.addEventListener("abort", () => succeedVoid(aborted), { once: true })
-          if (ctx.abort.aborted) succeedVoid(aborted)
-          succeedVoid(ready)
-          return Effect.sync(() => succeedVoid(aborted))
-        })
-      yield* Effect.addFinalizer(() => Effect.sync(() => void (task.execute = original)))
-
-      const { prompt, chat } = yield* boot()
-      const msg = yield* user(chat.id, "hello")
-      yield* addSubtask(chat.id, msg.id)
-
-      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-      yield* awaitWithTimeout(Deferred.await(ready), "timed out waiting for task tool to start", "10 seconds")
-      yield* prompt.cancel(chat.id)
-
-      const exit = yield* Fiber.await(fiber)
-      expect(Exit.isSuccess(exit)).toBe(true)
-      yield* awaitWithTimeout(Deferred.await(aborted), "timed out waiting for task tool abort", "10 seconds")
-
-      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-      const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
-      expect(taskMsg?.info.role).toBe("assistant")
-      if (!taskMsg || taskMsg.info.role !== "assistant") return
-
-      const tool = toolPart(taskMsg.parts)
-      expect(tool?.type).toBe("tool")
-      if (!tool) return
-
-      expect(tool.state.status).not.toBe("running")
-      expect(taskMsg.info.time.completed).toBeDefined()
-      expect(taskMsg.info.finish).toBeDefined()
-    }),
-  { config: cfg },
-  30_000,
-)
-
 it.instance(
-  "cancel propagates from slash command subtask to child session",
+  "cancel propagates from slash command subtask and finalizes parent tool state",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -1802,6 +3248,15 @@ it.instance(
 
       expect((yield* status.get(chat.id)).type).toBe("idle")
       expect((yield* status.get(childID)).type).toBe("idle")
+
+      const settled = yield* MessageV2.filterCompactedEffect(chat.id)
+      const settledTask = settled.find((item) => item.info.role === "assistant" && item.info.id === taskMsg?.info.id)
+      expect(settledTask?.info.role).toBe("assistant")
+      if (!settledTask || settledTask.info.role !== "assistant") return
+      const settledTool = toolPart(settledTask.parts)
+      expect(settledTool?.state.status).not.toBe("running")
+      expect(settledTask.info.time.completed).toBeDefined()
+      expect(settledTask.info.finish).toBeDefined()
     }),
   10_000,
 )
@@ -1875,6 +3330,7 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     const gate = yield* Deferred.make<void>()
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
     const chat = yield* sessions.create({ title: "Pinned" })
 
     yield* llm.hold("first", deferredAsPromise(gate))
@@ -1911,6 +3367,9 @@ it.instance("prompt submitted during an active run is included in the next LLM i
         ),
       "timed out waiting for second prompt to save",
     )
+    const pending = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
+    expect(pending?.admissionClass).toBe("user")
+    expect(pending?.promotedSeq).toBeUndefined()
 
     yield* Deferred.succeed(gate, void 0)
 
@@ -1918,6 +3377,8 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     expect(Exit.isSuccess(ea)).toBe(true)
     expect(Exit.isSuccess(eb)).toBe(true)
     expect(yield* llm.calls).toBe(2)
+    const promoted = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
+    expect(promoted?.promotedSeq).toBeDefined()
 
     const msgs = yield* sessions.messages({ sessionID: chat.id })
     const assistants = msgs.filter((msg) => msg.info.role === "assistant")
@@ -1933,6 +3394,84 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
   }),
+  15_000,
+)
+
+it.instance(
+  "human prompt steers an active scheduled-task root at the next safe provider cycle",
+  () =>
+    Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const gate = yield* Deferred.make<void>()
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({
+      title: "Active Scheduled run",
+      metadata: { scheduledTaskID: "stk_active_steer", scheduledTaskRunID: "str_active_steer" },
+    })
+
+    yield* llm.hold("scheduled-first", deferredAsPromise(gate))
+    yield* llm.text("human-second")
+
+    const scheduled = yield* prompt
+      .hostPrompt(
+        {
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "scheduled objective" }],
+        },
+        { source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "str_active_steer" },
+      )
+      .pipe(Effect.forkChild)
+
+    yield* llm.wait(1)
+    yield* waitForBusy(chat.id)
+
+    const humanID = MessageID.ascending()
+    const human = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        messageID: humanID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "human takes focus" }],
+      })
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      SessionInput.findEntry(db, SessionMessage.ID.make(humanID)).pipe(
+        Effect.map((entry) => (entry?.admissionClass === "user" ? entry : undefined)),
+      ),
+      "timed out waiting for Scheduled human focus frontier",
+    )
+    expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeUndefined()
+    expect(yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(chat.id))).toBe(
+      (yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.admittedSeq,
+    )
+
+    yield* Deferred.succeed(gate, void 0)
+
+    const [scheduledExit, humanExit] = yield* Effect.all([Fiber.await(scheduled), Fiber.await(human)])
+    expect(Exit.isSuccess(scheduledExit)).toBe(true)
+    expect(Exit.isSuccess(humanExit)).toBe(true)
+    expect(yield* llm.calls).toBe(2)
+    expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeDefined()
+
+    const messages = yield* llm.inputs
+    expect(messages).toHaveLength(2)
+    const second = messages.at(-1)?.messages
+    if (!Array.isArray(second)) throw new Error("expected second LLM input")
+    expect(second.at(-1)).toEqual({ role: "user", content: "human takes focus" })
+
+    const transcript = yield* sessions.messages({ sessionID: chat.id })
+    const final = transcript.filter((message) => message.info.role === "assistant").at(-1)
+    if (!final || final.info.role !== "assistant") throw new Error("expected final Scheduled assistant")
+    expect(final.info.parentID).toBe(humanID)
+    expect(final.parts.some((part) => part.type === "text" && part.text === "human-second")).toBe(true)
+    }),
+  15_000,
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>
@@ -1957,8 +3496,12 @@ it.instance("assertNotBusy fails with BusyError when loop running", () =>
       expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "SessionBusyError", sessionID: chat.id })
     }
 
+    const cancelStarted = Date.now()
     yield* prompt.cancel(chat.id)
+    console.log("assert-busy cancel ms", Date.now() - cancelStarted)
+    const awaitStarted = Date.now()
     yield* Fiber.await(fiber)
+    console.log("assert-busy await ms", Date.now() - awaitStarted)
   }),
 )
 
@@ -1974,6 +3517,209 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
 )
 
 // Shell semantics
+
+if (process.platform === "win32") {
+  it.instance(
+    "shell executes configured cmd through the tested Node shell adapter",
+    () =>
+      Effect.gen(function* () {
+        const cmd = process.env.COMSPEC || Bun.which("cmd.exe")
+        if (!cmd) return
+        yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          shell: cmd,
+        }))
+        const { prompt, chat } = yield* boot()
+        const result = yield* prompt.shell({
+          sessionID: chat.id,
+          agent: "build",
+          command: "echo configured-cmd",
+        })
+        const tool = completedTool(result.parts)
+        expect(tool?.state.output).toContain("configured-cmd")
+      }),
+    30_000,
+  )
+
+  it.instance(
+    "shell rejects multiline cmd before durable turn admission",
+    () =>
+      Effect.gen(function* () {
+        const cmd = process.env.COMSPEC || Bun.which("cmd.exe")
+        if (!cmd) return
+        yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          shell: cmd,
+        }))
+        const { prompt, sessions, chat } = yield* boot()
+        const before = yield* sessions.messages({ sessionID: chat.id })
+        const exit = yield* prompt
+          .shell({
+            sessionID: chat.id,
+            agent: "build",
+            command: "echo one\necho two",
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(String(Cause.squash(exit.cause))).toContain("multiline cmd.exe program")
+        }
+        expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(before.length)
+      }),
+    30_000,
+  )
+
+  it.instance(
+    "shell rejects lossy inherited cmd expansion before process execution",
+    () =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const key = "OPENFORK_CMD_ENV_LIMIT_SESSION"
+          const previous = process.env[key]
+          process.env[key] = "x".repeat(Shell.CMD_INHERITED_ENV_LIMIT + 1)
+          return { key, previous }
+        }),
+        ({ key }) =>
+          Effect.gen(function* () {
+            const cmd = process.env.COMSPEC || Bun.which("cmd.exe")
+            if (!cmd) return
+            yield* useServerConfig((url) => ({
+              ...providerCfg(url),
+              shell: cmd,
+            }))
+            const { prompt, sessions, chat } = yield* boot()
+            const exit = yield* prompt
+              .shell({
+                sessionID: chat.id,
+                agent: "build",
+                command: `if "%${key}%"=="" (echo SILENT-WRONG-BRANCH) else (echo expected)`,
+              })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit)) {
+              expect(String(Cause.squash(exit.cause))).toContain("Cannot execute this cmd.exe script faithfully")
+            }
+          }),
+        ({ key, previous }) =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env[key]
+            else process.env[key] = previous
+          }),
+      ),
+    30_000,
+  )
+
+  it.instance(
+    "shell transports large Git Bash source without the old MSYS argv ceiling",
+    () =>
+      withSh(() =>
+        Effect.gen(function* () {
+          if (!(yield* hasBash)) return
+          yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            shell: "bash",
+          }))
+          const { prompt, sessions, chat } = yield* boot()
+          const before = yield* sessions.messages({ sessionID: chat.id })
+          const size = 100_000
+          const source = "X=" + "x".repeat(size) + "; printf '%s' \"\${#X}\""
+
+          const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: source })
+          const tool = completedTool(result.parts)
+          expect(tool?.state.output.trim()).toBe(String(size))
+          const after = yield* sessions.messages({ sessionID: chat.id })
+          expect(after).toHaveLength(before.length + 2)
+        }),
+      ),
+    30_000,
+  )
+
+  it.instance(
+    "shell transports Git Bash source beyond the old MSYS argv boundary",
+    () =>
+      withSh(() =>
+        Effect.gen(function* () {
+          if (!(yield* hasBash)) return
+          yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            shell: "bash",
+          }))
+          const { prompt, chat } = yield* boot()
+          const source = "printf '%s' '" + "x".repeat(10_000) + "' | wc -c"
+          const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: source })
+          const tool = completedTool(result.parts)
+          if (!tool) return
+          expect(tool.state.output.trim()).toBe("10000")
+        }),
+      ),
+    30_000,
+  )
+
+
+  it.instance(
+    "shell transports oversized Windows PowerShell source beyond the native argv boundary",
+    () =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          const key = Shell.POWERSHELL_SCRIPT_SOURCE_ENV_PREFIX + "9999"
+          const previous = process.env[key]
+          process.env[key] = "stale-transport-value"
+          return { key, previous }
+        }),
+        () =>
+          Effect.gen(function* () {
+            const pwsh = Bun.which("pwsh") || Bun.which("powershell")
+            if (!pwsh) return
+            yield* useServerConfig((url) => ({
+              ...providerCfg(url),
+              shell: pwsh,
+            }))
+            const { prompt, sessions, chat } = yield* boot()
+            const before = yield* sessions.messages({ sessionID: chat.id })
+            const source = [
+              `#${"x".repeat(Shell.POWERSHELL_INLINE_SCRIPT_LIMIT + 5_000)}`,
+              "Write-Output 'large-powershell-ok'",
+              `Write-Output ([bool](Get-ChildItem Env:${Shell.POWERSHELL_SCRIPT_SOURCE_ENV_PREFIX}* -ErrorAction SilentlyContinue))`,
+            ].join("\n")
+            const result = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: source })
+            const tool = completedTool(result.parts)
+            expect(tool?.state.output.trim().replaceAll("\r\n", "\n")).toBe("large-powershell-ok\nFalse")
+            const after = yield* sessions.messages({ sessionID: chat.id })
+            expect(after).toHaveLength(before.length + 2)
+          }),
+        ({ key, previous }) =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env[key]
+            else process.env[key] = previous
+          }),
+      ),
+    30_000,
+  )
+
+  it.instance(
+    "shell rejects NUL source before durable turn admission",
+    () =>
+      Effect.gen(function* () {
+        const pwsh = Bun.which("pwsh") || Bun.which("powershell")
+        if (!pwsh) return
+        yield* useServerConfig((url) => ({
+          ...providerCfg(url),
+          shell: pwsh,
+        }))
+        const { prompt, sessions, chat } = yield* boot()
+        const before = yield* sessions.messages({ sessionID: chat.id })
+        const exit = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: "Write-Output before\0after" })
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("NUL byte")
+        const after = yield* sessions.messages({ sessionID: chat.id })
+        expect(after).toHaveLength(before.length)
+      }),
+    30_000,
+  )
+}
 
 it.instance("shell rejects with BusyError when loop running", () =>
   Effect.gen(function* () {
@@ -2250,8 +3996,8 @@ it.instance(
   10_000,
 )
 
-unix(
-  "command ! expansion uses configured shell over env shell",
+it.instance(
+  "command ! expansion uses configured shell over env shell across platforms",
   () =>
     withSh(() =>
       Effect.gen(function* () {
@@ -2261,7 +4007,7 @@ unix(
           shell: "bash",
           command: {
             probe: {
-              template: "Probe: !`[[ 1 -eq 1 ]] && printf configured`",
+              template: "Probe: !`[[ 1 -eq 1 ]] && printf '%s' 'configured|$HOME|$(printf nested)|\\tail\\'`",
             },
           },
         }))
@@ -2277,11 +4023,81 @@ unix(
 
         expect(result.info.role).toBe("assistant")
         const inputs = yield* llm.inputs
-        expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("configured")
+        const messages = JSON.stringify(inputs.at(-1)?.messages)
+        expect(messages).toContain("configured|$HOME|$(printf nested)|\\\\tail\\\\")
       }),
     ),
   30_000,
 )
+
+if (process.platform === "win32") {
+  it.instance(
+    "command ! expansion transports large Git Bash source before provider execution",
+    () =>
+      withSh(() =>
+        Effect.gen(function* () {
+          if (!(yield* hasBash)) return
+          const size = 100_000
+          const source = "X=" + "x".repeat(size) + "; printf '%s' \"\${#X}\""
+          const { llm } = yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            shell: "bash",
+            command: {
+              probe: {
+                template: `Probe: !\`${source}\``,
+              },
+            },
+          }))
+
+          const { prompt, chat } = yield* boot()
+          yield* llm.text("done")
+          const result = yield* prompt.command({
+            sessionID: chat.id,
+            command: "probe",
+            arguments: "",
+          })
+
+          expect(result.info.role).toBe("assistant")
+          const inputs = yield* llm.inputs
+          const messages = JSON.stringify(inputs.at(-1)?.messages)
+          expect(messages).toContain(`Probe: ${size}`)
+          expect(messages).not.toContain("x".repeat(1_000))
+        }),
+      ),
+    30_000,
+  )
+
+  it.instance(
+    "command ! expansion transports Git Bash source beyond the old MSYS argv boundary",
+    () =>
+      withSh(() =>
+        Effect.gen(function* () {
+          if (!(yield* hasBash)) return
+          const source = "printf '%s' '" + "x".repeat(10_000) + "' | wc -c"
+          const { llm } = yield* useServerConfig((url) => ({
+            ...providerCfg(url),
+            shell: "bash",
+            command: {
+              probe: {
+                template: "Probe: !`" + source + "`",
+              },
+            },
+          }))
+
+          const { prompt, chat } = yield* boot()
+          yield* llm.text("done")
+          yield* prompt.command({
+            sessionID: chat.id,
+            command: "probe",
+            arguments: "",
+          })
+          const inputs = yield* llm.inputs
+          expect(JSON.stringify(inputs.at(-1)?.messages)).toContain("10000")
+        }),
+      ),
+    30_000,
+  )
+}
 
 unixNoLLMServer(
   "cancel interrupts shell and resolves cleanly",
