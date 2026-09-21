@@ -623,6 +623,115 @@ describe("tool.read subtools", () => {
     }),
   )
 
+  it.live("normalizes default-polluted single-path payloads", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const file = path.join(dir, "polluted.txt")
+      yield* put(file, "payload survived")
+      const result = yield* exec(dir, {
+        filePath: file,
+        file_path: file,
+        filePaths: [],
+        reads: [],
+        offset: 1,
+        limit: 40,
+        action: "read",
+        pattern: "",
+        symbol: "",
+      })
+      expect(result.output).toContain("payload survived")
+    }),
+  )
+
+  it.live("normalizes default-polluted filePaths payloads", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const a = path.join(dir, "a.txt")
+      const b = path.join(dir, "b.txt")
+      yield* put(a, "alpha")
+      yield* put(b, "beta")
+      const result = yield* exec(dir, {
+        filePath: "",
+        file_path: "",
+        filePaths: [a, b],
+        reads: [],
+        offset: 1,
+        limit: 100,
+        action: "read",
+        pattern: "",
+        symbol: "",
+      })
+      expect(result.output).toContain("alpha")
+      expect(result.output).toContain("beta")
+    }),
+  )
+
+  it.live("prefers a real filePaths batch when single-path aliases echo its first target", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const a = path.join(dir, "a.txt")
+      const b = path.join(dir, "b.txt")
+      yield* put(a, "alpha")
+      yield* put(b, "beta")
+      const result = yield* exec(dir, {
+        filePath: a,
+        file_path: a,
+        filePaths: [a, b],
+        reads: [],
+        offset: 1,
+        limit: 100,
+        action: "read",
+        pattern: "",
+        symbol: "",
+      })
+      expect(result.output).toContain("alpha")
+      expect(result.output).toContain("beta")
+    }),
+  )
+
+  it.live("normalizes zero top-level defaults around reads payloads", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const file = path.join(dir, "window.txt")
+      yield* put(file, "one\ntwo\nthree")
+      const result = yield* exec(dir, {
+        filePath: "",
+        file_path: "",
+        filePaths: [],
+        reads: [{ filePath: file, offset: 2, limit: 1 }],
+        offset: 0,
+        limit: 0,
+        action: "read",
+        pattern: "",
+        symbol: "",
+      })
+      expect(result.output).toContain("2: two")
+      expect(result.output).not.toContain("3: three")
+    }),
+  )
+
+  it.live("accepts duplicated top-level windows when reads already carries the same window", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const file = path.join(dir, "window.txt")
+      yield* put(file, "one\ntwo\nthree")
+      const result = yield* exec(dir, {
+        filePath: "",
+        file_path: "",
+        filePaths: [],
+        reads: [{ filePath: file, offset: 1, limit: 2 }],
+        offset: 1,
+        limit: 2,
+        action: "read",
+        pattern: "",
+        symbol: "",
+      })
+      expect(result.output).toContain("1: one")
+      expect(result.output).toContain("2: two")
+      expect(result.output).not.toContain("3: three")
+    }),
+  )
+
   it.live("coerces stringified filePaths JSON", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
@@ -680,8 +789,11 @@ describe("tool.read subtools", () => {
       const file = path.join(dir, "a.txt")
       yield* put(file, "a")
 
-      const mixed = yield* fail(dir, { filePath: file, filePaths: [file] })
+      const mixed = yield* fail(dir, { filePath: file, filePaths: [path.join(dir, "different.txt")] })
       expect(mixed.message).toContain("exactly one read pathway")
+
+      const aliases = yield* fail(dir, { filePath: file, file_path: path.join(dir, "other.txt") })
+      expect(aliases.message).toContain("filePath and file_path disagree")
 
       const window = yield* fail(dir, { reads: [{ filePath: file }], limit: 10 })
       expect(window.message).toContain("Top-level offset/limit cannot be combined with reads[]")

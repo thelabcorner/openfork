@@ -9,13 +9,14 @@ import { Truncate } from "@/tool/truncate"
 import { Agent } from "../../src/agent/agent"
 import { testEffect } from "../lib/effect"
 import { SymbolsTool } from "../../src/tool/symbols"
+import { Symbols } from "@/symbols/service"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
 import type * as Tool from "../../src/tool/tool"
 import path from "path"
 
 const toolLayer = LayerNode.compile(
-  LayerNode.group([CrossSpawnSpawner.node, FSUtil.node, Ripgrep.node, Truncate.node, Agent.node]),
+  LayerNode.group([CrossSpawnSpawner.node, FSUtil.node, Ripgrep.node, Symbols.node, Truncate.node, Agent.node]),
 )
 
 const rooted = testEffect(Layer.mergeAll(toolLayer, testInstanceStoreLayer))

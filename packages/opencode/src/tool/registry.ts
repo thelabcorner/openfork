@@ -23,14 +23,19 @@ import { BackgroundTool } from "./background"
 import { MemoryTool } from "./memory"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
+import { Git } from "@/git"
+import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { CheckpointTool } from "./checkpoint"
 import { GoalTool } from "./goal"
+import { ScheduledTaskTool } from "./scheduled-task"
+import { SwarmTool } from "./swarm"
 import { SessionTool } from "./session"
 import { TurnCheckpoint } from "@/session/checkpoint"
 import { Snapshot } from "@/snapshot"
 import { TypecheckTool } from "./typecheck"
 import { ProjectTool } from "./project"
 import { SymbolsTool } from "./symbols"
+import { Symbols } from "@/symbols/service"
 import { TestTool } from "./test"
 import { RefactorTool } from "./refactor"
 import { SympyTool } from "./sympy"
@@ -48,7 +53,10 @@ import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
 import { PatchTool } from "./patch"
 import { BrowserTool } from "./browser"
+import { OfxpTool } from "./ofxp"
 import { BrokerClient } from "@/browser/broker-client"
+import { OfxpRuntime } from "@/ofxp/runtime"
+import { ExternalToolCoverage } from "@/exchange/tool-coverage"
 import { Effect, Layer, Context, Ref } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -77,6 +85,9 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { McpCatalog } from "@/mcp/catalog"
 import { Memory } from "@opencode-ai/core/memory"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
+import { ScheduledTaskAgent } from "@opencode-ai/core/scheduled-task/agent"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
 
 export function webSearchEnabled(
   providerID: ProviderV2.ID,
@@ -95,13 +106,11 @@ export function webSearchEnabled(
   )
 }
 
-type TaskDef = Tool.InferDef<typeof TaskTool>
 type ReadDef = Tool.InferDef<typeof ReadTool>
 
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
-  task: TaskDef
   read: ReadDef
 }
 
@@ -123,6 +132,8 @@ const snapshotReadOnlyTools = new Set([
   "task",
   "session",
   "goal",
+  "scheduled_task",
+  "ofxp",
   TOOL_ACCESS_ID,
 ])
 
@@ -161,6 +172,8 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
       return args.mode === "restore"
     case "background":
       return !["list", "status", "read", "wait"].includes(String(args.action))
+    case "swarm":
+      return args.action === "recover.members"
     default:
       return true
   }
@@ -182,7 +195,7 @@ function providerPolicy(toolID: string, ruleset: PermissionV1.Ruleset): Permissi
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
-  readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly named: () => Effect.Effect<{ read: ReadDef }>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
@@ -204,7 +217,6 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const plugin = yield* Plugin.Service
     const agents = yield* Agent.Service
-    const agent = yield* Agent.Service
     const truncate = yield* Truncate.Service
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
@@ -243,6 +255,8 @@ const layer = Layer.effect(
     const gittool = yield* GitTool
     const checkpointtool = yield* CheckpointTool
     const goaltool = yield* GoalTool
+    const scheduledtasktool = yield* ScheduledTaskTool
+    const swarmtool = yield* SwarmTool
     const sessiontool = yield* SessionTool
     const typechecktool = yield* TypecheckTool
     const projecttool = yield* ProjectTool
@@ -252,6 +266,7 @@ const layer = Layer.effect(
     const sympytool = yield* SympyTool
     const patchTool = yield* PatchTool
     const browsertool = yield* BrowserTool
+    const ofxptool = yield* OfxpTool
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
 
@@ -261,7 +276,6 @@ const layer = Layer.effect(
         const plugins = yield* plugin.list()
         const custom = (
           yield* buildCustomTools(dirs, plugins, {
-            agent,
             truncate,
             directory: ctx.directory,
             worktree: ctx.worktree,
@@ -291,6 +305,8 @@ const layer = Layer.effect(
           git: Tool.init(gittool),
           checkpoint: Tool.init(checkpointtool),
           goal: Tool.init(goaltool),
+          scheduledTask: Tool.init(scheduledtasktool),
+          swarm: Tool.init(swarmtool),
           session: Tool.init(sessiontool),
           typecheck: Tool.init(typechecktool),
           project: Tool.init(projecttool),
@@ -304,6 +320,7 @@ const layer = Layer.effect(
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
           browser: Tool.init(browsertool),
+          ofxp: Tool.init(ofxptool),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -313,6 +330,15 @@ const layer = Layer.effect(
 
         const lazy = [...Object.values(tool), ...custom].filter(isLazyTool)
         const toolAccessDef = createToolAccessTool(lazy, plugin)
+
+        // OFXP parity is an architectural invariant, not a hand-maintained
+        // checklist. Every provider-visible builtin must have an explicit
+        // remote semantic equivalent (which may intentionally be supervision,
+        // delegation, an alias, or an intrinsic broker behavior).
+        ExternalToolCoverage.assertNativeCovered([
+          ...Object.values(tool).map((item) => item.id),
+          toolAccessDef.id,
+        ])
 
         return yield* Ref.make<State>({
           custom,
@@ -336,6 +362,8 @@ const layer = Layer.effect(
             tool.git,
             tool.checkpoint,
             tool.goal,
+            tool.scheduledTask,
+            tool.swarm,
             tool.session,
             tool.typecheck,
             tool.project,
@@ -347,11 +375,11 @@ const layer = Layer.effect(
             tool.patchTool,
             tool.patch,
             tool.browser,
+            tool.ofxp,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
-          task: tool.task,
           read: tool.read,
         })
       }),
@@ -486,7 +514,7 @@ const layer = Layer.effect(
 
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* readState()
-      return { task: s.task, read: s.read }
+      return { read: s.read }
     })
 
     return Service.of({ ids, all, named, tools, refreshCustom })
@@ -534,12 +562,19 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     MCP.node,
     Database.node,
+    Checkpoint.readNode,
     Snapshot.node,
     TurnCheckpoint.node,
+    Git.node,
     GoalAgent.node,
+    ScheduledTaskAgent.node,
+    SwarmV2.node,
+    SwarmMemberSessionWake.node,
     Ripgrep.node,
+    Symbols.node,
     RipgrepBinary.node,
     BrokerClient.node,
+    OfxpRuntime.node,
     Memory.node,
     locationServiceMapNode,
   ],

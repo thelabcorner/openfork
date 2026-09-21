@@ -107,6 +107,71 @@ describe("Tool.define", () => {
     }),
   )
 
+  it.effect("producer truncated=false cannot bypass the final provider-facing bound", () =>
+    Effect.gen(function* () {
+      const info = yield* Tool.define(
+        "bounded-false",
+        Effect.succeed({
+          description: "test tool",
+          parameters: params,
+          execute() {
+            return Effect.succeed({
+              title: "test",
+              output: "HEAD-" + "x".repeat(Truncate.MAX_BYTES * 2) + "-TAIL",
+              metadata: { truncated: false },
+            })
+          },
+        }),
+      )
+      const tool = yield* info.init()
+      const result = yield* tool.execute({ input: "x" }, makeCtx())
+      const metadata = result.metadata as typeof result.metadata & Truncate.ProjectionMetadata
+
+      expect(metadata.truncated).toBe(true)
+      expect(metadata.producerTruncated).toBe(false)
+      expect(metadata.providerTruncated).toBe(true)
+      expect(result.output).toContain("HEAD-")
+      expect(result.output).toContain("-TAIL")
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(Truncate.MAX_BYTES)
+      expect(typeof metadata.outputPath).toBe("string")
+      expect(metadata.providerOutputPath).toBe(metadata.outputPath)
+      expect(metadata.outputProjection?.segments).toHaveLength(2)
+      expect(metadata.outputProjection?.segments[0]?.startByte).toBe(0)
+      expect(metadata.outputProjection?.segments[1]?.endByte).toBe(metadata.outputProjection?.originalBytes)
+    }),
+  )
+
+  it.effect("producer truncated=true remains distinct from provider truncation and keeps producer spill authority", () =>
+    Effect.gen(function* () {
+      const producerPath = "/producer/full-output"
+      const info = yield* Tool.define(
+        "bounded-true",
+        Effect.succeed({
+          description: "test tool",
+          parameters: params,
+          execute() {
+            return Effect.succeed({
+              title: "test",
+              output: "HEAD-" + "y".repeat(Truncate.MAX_BYTES * 2) + "-TAIL",
+              metadata: { truncated: true, outputPath: producerPath },
+            })
+          },
+        }),
+      )
+      const tool = yield* info.init()
+      const result = yield* tool.execute({ input: "x" }, makeCtx())
+      const metadata = result.metadata as typeof result.metadata & Truncate.ProjectionMetadata
+
+      expect(metadata.truncated).toBe(true)
+      expect(metadata.producerTruncated).toBe(true)
+      expect(metadata.providerTruncated).toBe(true)
+      expect(metadata.outputPath).toBe(producerPath)
+      expect(typeof metadata.providerOutputPath).toBe("string")
+      expect(metadata.providerOutputPath).not.toBe(producerPath)
+      expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(Truncate.MAX_BYTES)
+    }),
+  )
+
   // Regression for #28438: the wrap is the canonical "untyped → typed" boundary.
   // When the LLM emits a tool call with a payload that fails the parameter
   // schema, the wrap must surface a typed `Tool.InvalidArgumentsError` whose

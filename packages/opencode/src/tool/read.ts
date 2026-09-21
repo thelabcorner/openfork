@@ -1,4 +1,4 @@
-import { Effect, Option, Schema, Scope, Stream } from "effect"
+import { Effect, Option, Schema, Scope } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as path from "path"
 import * as Tool from "./tool"
@@ -10,7 +10,6 @@ import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
-import z from "node:zlib"
 import { getOutline, makeOutlineCache } from "./symbols/outline"
 import {
   coerceFilePaths,
@@ -20,18 +19,17 @@ import {
   statPath,
   type GlobSearch,
 } from "./read/path"
-import { AROUND_MAX, compilePattern, GREP_MAX, renderGrep, renderHeal, renderOutline, aroundWindow } from "./read/inspect"
+import { AROUND_MAX, renderGrep, renderHeal, renderOutline, aroundWindow } from "./read/inspect"
 import { globalReadCache } from "./edit/prior-read"
+import { ReadFilesystem } from "@/read/filesystem"
 
-const DEFAULT_READ_LIMIT = 2000
-const MAX_LINE_LENGTH = 2000
-const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
-const MAX_BYTES = 50 * 1024
+const DEFAULT_READ_LIMIT = ReadFilesystem.DEFAULT_READ_LIMIT
+const MAX_BYTES = ReadFilesystem.MAX_BYTES
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
-const SAMPLE_BYTES = 4096
+const SAMPLE_BYTES = ReadFilesystem.SAMPLE_BYTES
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 const MAX_BULK_FILES = 8
-const DEFAULT_TAIL = 80
+const DEFAULT_TAIL = ReadFilesystem.DEFAULT_TAIL
 const HINT =
   'Tip: action="outline" for a symbol TOC, pattern="name" to search this file, symbol="name" to jump to a definition.'
 
@@ -46,8 +44,6 @@ const BatchRead = Schema.Struct({
     description: "Maximum lines for this target (default 2000).",
   }),
 })
-
-class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 
 // Prior-read grounding (D47): every successful file-content read records
 // mtime+size so edit/patch can refuse targets that moved under the model.
@@ -102,6 +98,22 @@ export const Parameters = Schema.Struct({
   }),
 })
 
+const hasText = (value: string | undefined) => typeof value === "string" && value.trim().length > 0
+
+const resolveSinglePathInput = (params: Schema.Schema.Type<typeof Parameters>) => {
+  const primary = hasText(params.filePath) ? params.filePath : undefined
+  const alias = hasText(params.file_path) ? params.file_path : undefined
+  if (primary && alias && primary !== alias) {
+    throw new Error("filePath and file_path disagree. Provide only one path value, or make the aliases identical.")
+  }
+  return primary ?? alias
+}
+
+const hasFilePathsInput = (value: Schema.Schema.Type<typeof Parameters>["filePaths"]) =>
+  typeof value === "string" ? hasText(value) : (value?.some(hasText) ?? false)
+
+const hasTopLevelWindow = (value: number | undefined) => typeof value === "number" && value > 0
+
 type Display =
   | {
       type: "directory"
@@ -133,15 +145,7 @@ type Metadata = {
   healed?: boolean
 }
 
-type LineResult = {
-  raw: string[]
-  count: number
-  cut: boolean
-  more: boolean
-  offset: number
-  clamped?: boolean
-  requestedOffset?: number
-}
+type LineResult = ReadFilesystem.LineResult
 
 export const ReadTool = Tool.define<
   typeof Parameters,
@@ -185,243 +189,25 @@ export const ReadTool = Tool.define<
       )
     })
 
-    const list = Effect.fn("ReadTool.list")(function* (filepath: string) {
-      const items = yield* fs.readDirectoryEntries(filepath)
-      return yield* Effect.forEach(
-        items,
-        Effect.fnUntraced(function* (item) {
-          if (item.type === "directory") return item.name + "/"
-          if (item.type !== "symlink") return item.name
-
-          const target = yield* fs.stat(path.join(filepath, item.name)).pipe(Effect.catch(() => Effect.void))
-          if (target?.type === "Directory") return item.name + "/"
-          return item.name
-        }),
-        { concurrency: 16 },
-      ).pipe(Effect.map((items: string[]) => items.sort((a, b) => a.localeCompare(b))))
-    })
+    const list = (filepath: string) => ReadFilesystem.list(fs, filepath)
 
     const warm = Effect.fn("ReadTool.warm")(function* (filepath: string) {
       yield* lsp.touchFile(filepath).pipe(Effect.ignoreCause, Effect.forkIn(scope))
     })
 
-    const readSample = Effect.fn("ReadTool.readSample")(function* (
-      filepath: string,
-      fileSize: number,
-      sampleSize: number,
-    ) {
-      if (fileSize === 0) return new Uint8Array()
-
-      return yield* Effect.scoped(
-        Effect.gen(function* () {
-          const file = yield* fs.open(filepath, { flag: "r" })
-          return Option.getOrElse(yield* file.readAlloc(Math.min(sampleSize, fileSize)), () => new Uint8Array())
-        }),
-      )
-    })
-
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
-      const start = opts.offset - 1
-      const raw: string[] = []
-      const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
-
-      const decoder = new TextDecoder("utf-8")
-      yield* fs.stream(filepath).pipe(
-        Stream.map((bytes) => decoder.decode(bytes, { stream: true })),
-        Stream.splitLines,
-        Stream.runForEach((text) =>
-          Effect.gen(function* () {
-            if (flags.done) return yield* new ReadStop()
-            flags.count += 1
-            if (flags.count <= start) return
-
-            if (raw.length >= opts.limit) {
-              flags.more = true
-              return
-            }
-
-            const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-            if (flags.bytes + size <= MAX_BYTES) {
-              raw.push(line)
-              flags.bytes += size
-              return
-            }
-
-            flags.cut = true
-            flags.more = true
-            flags.done = true
-            return yield* new ReadStop()
-          }),
-        ),
-        Effect.catchTag("ReadStop", () => Effect.void),
-      )
-
-      return { raw, count: flags.count, cut: flags.cut, more: flags.more, offset: opts.offset }
-    })
-
-    const brotliLines = Effect.fn("ReadTool.brotliLines")(function* (
-      filepath: string,
-      opts: { limit: number; offset: number },
-    ) {
-      const compressed = yield* fs.readFile(filepath)
-      let text: string
-      try {
-        text = z.brotliDecompressSync(Buffer.from(compressed)).toString("utf8")
-      } catch (error) {
-        return yield* Effect.fail(
-          new Error(`Unable to decompress Brotli file ${filepath}: ${error instanceof Error ? error.message : String(error)}`),
-        )
-      }
-
-      try {
-        text = JSON.stringify(JSON.parse(text), null, 2)
-      } catch {
-      }
-
-      const all = text.split(/\r?\n/)
-      const start = Math.max(0, opts.offset - 1)
-      const raw = all.slice(start, start + opts.limit).map((line) =>
-        line.length > MAX_LINE_LENGTH ? line.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : line,
-      )
-      return {
-        raw,
-        count: all.length,
-        cut: false,
-        more: start + raw.length < all.length,
-        offset: opts.offset,
-      }
-    })
-
-    const readLines = Effect.fn("ReadTool.readLines")(function* (
-      filepath: string,
-      opts: { limit: number; offset: number },
-    ) {
-      return path.extname(filepath).toLowerCase() === ".br" ? yield* brotliLines(filepath, opts) : yield* lines(filepath, opts)
-    })
-
-    const clampRead = Effect.fn("ReadTool.clampRead")(function* (
-      filepath: string,
-      opts: { limit: number; offset: number },
-    ) {
-      const file = yield* readLines(filepath, opts)
-      if (file.raw.length > 0 || (file.count === 0 && opts.offset <= 1)) {
-        return { ...file, clamped: false } satisfies LineResult
-      }
-      if (file.count === 0) {
-        return { ...file, clamped: true, requestedOffset: opts.offset } satisfies LineResult
-      }
-      const offset = Math.max(1, file.count - Math.min(opts.limit, file.count) + 1)
-      const next = yield* readLines(filepath, { limit: opts.limit, offset })
-      return { ...next, clamped: true, requestedOffset: opts.offset } satisfies LineResult
-    })
+    const readSample = (filepath: string, fileSize: number, sampleSize: number) =>
+      ReadFilesystem.readSample(fs, filepath, fileSize, sampleSize)
+    const clampRead = (filepath: string, opts: { limit: number; offset: number }) =>
+      ReadFilesystem.clampRead(fs, filepath, opts)
 
     const grepFile = Effect.fn("ReadTool.grepFile")(function* (filepath: string, pattern: string) {
-      if (path.extname(filepath).toLowerCase() === ".br") {
-        const file = yield* brotliLines(filepath, { offset: 1, limit: Number.MAX_SAFE_INTEGER })
-        const re = compilePattern(pattern)
-        const hits: Array<{ line: number; text: string }> = []
-        for (let i = 0; i < file.raw.length; i++) {
-          if (!re.test(file.raw[i])) continue
-          hits.push({ line: i + 1, text: file.raw[i] })
-          if (hits.length >= GREP_MAX) break
-        }
-        return { hits, truncated: hits.length >= GREP_MAX, count: file.count }
-      }
-
-      const result = yield* ripgrep
-        .grep({
-          cwd: path.dirname(filepath),
-          pattern,
-          file: path.basename(filepath),
-          limit: GREP_MAX,
-        })
-        .pipe(
-          Effect.catchTag("Ripgrep.InvalidPatternError", () =>
-            ripgrep.grep({
-              cwd: path.dirname(filepath),
-              pattern: pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-              file: path.basename(filepath),
-              limit: GREP_MAX,
-            }),
-          ),
-        )
-      return {
-        hits: result.map((item) => ({ line: item.line, text: item.text.trimEnd() })),
-        truncated: result.length >= GREP_MAX,
-        count: result.length,
-      }
+      return yield* ReadFilesystem.grep(fs, ripgrep, filepath, pattern)
     })
+    const tailFile = (filepath: string, limit: number) => ReadFilesystem.tail(fs, filepath, limit)
+    const isBinaryFile = ReadFilesystem.isBinary
 
-    const tailFile = Effect.fn("ReadTool.tailFile")(function* (filepath: string, limit: number) {
-      const ring: string[] = []
-      let count = 0
-      const decoder = new TextDecoder("utf-8")
-      yield* fs.stream(filepath).pipe(
-        Stream.map((bytes) => decoder.decode(bytes, { stream: true })),
-        Stream.splitLines,
-        Stream.runForEach((text) =>
-          Effect.sync(() => {
-            count += 1
-            const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            if (ring.length === limit) ring.shift()
-            ring.push(line)
-          }),
-        ),
-      )
-      const offset = count === 0 ? 1 : Math.max(1, count - ring.length + 1)
-      return { raw: ring, count, cut: false, more: false, offset, clamped: false } satisfies LineResult
-    })
-
-    const isBinaryFile = (filepath: string, bytes: Uint8Array) => {
-      const ext = path.extname(filepath).toLowerCase()
-      switch (ext) {
-        case ".zip":
-        case ".tar":
-        case ".gz":
-        case ".exe":
-        case ".dll":
-        case ".so":
-        case ".class":
-        case ".jar":
-        case ".war":
-        case ".7z":
-        case ".doc":
-        case ".docx":
-        case ".xls":
-        case ".xlsx":
-        case ".ppt":
-        case ".pptx":
-        case ".odt":
-        case ".ods":
-        case ".odp":
-        case ".bin":
-        case ".dat":
-        case ".obj":
-        case ".o":
-        case ".a":
-        case ".lib":
-        case ".wasm":
-        case ".pyc":
-        case ".pyo":
-          return true
-      }
-
-      if (bytes.length === 0) return false
-
-      let nonPrintableCount = 0
-      for (let i = 0; i < bytes.length; i++) {
-        if (bytes[i] === 0) return true
-        if (bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32)) {
-          nonPrintableCount++
-        }
-      }
-
-      return nonPrintableCount / bytes.length > 0.3
-    }
-
-    const normalizeInput = (params: Schema.Schema.Type<typeof Parameters>, directory: string) => {
-      let filepath = params.filePath ?? params.file_path
+    const normalizeInput = (input: string | undefined, directory: string) => {
+      let filepath = input
       if (filepath && !path.isAbsolute(filepath) && !isPosixAbsoluteOnWindows(filepath)) {
         filepath = path.resolve(directory, filepath)
       }
@@ -465,23 +251,44 @@ export const ReadTool = Tool.define<
       const instance = yield* InstanceState.context
       const action = resolveAction(params)
 
-      const hasSinglePath = params.filePath !== undefined || params.file_path !== undefined
-      const hasFilePaths = params.filePaths != null
-      const hasReads = params.reads != null
-      if (Number(hasSinglePath) + Number(hasFilePaths) + Number(hasReads) > 1) {
+      const singlePathInput = resolveSinglePathInput(params)
+      const hasSinglePath = singlePathInput !== undefined
+      let filePathsInput: string[] = []
+      if (hasFilePathsInput(params.filePaths)) {
+        try {
+          filePathsInput = coerceFilePaths(params.filePaths!).filter(hasText)
+        } catch (error) {
+          throw error instanceof Error ? error : new Error(String(error))
+        }
+      }
+      const readsInput = Array.isArray(params.reads) ? params.reads.filter((item) => hasText(item.filePath)) : []
+      const hasFilePaths = filePathsInput.length > 0
+      const hasReads = readsInput.length > 0
+      const singlePathIsBatchEcho =
+        hasSinglePath && hasFilePaths && filePathsInput.some((filePath) => filePath === singlePathInput)
+      const hasIndependentSinglePath = hasSinglePath && !singlePathIsBatchEcho
+      if (Number(hasIndependentSinglePath) + Number(hasFilePaths) + Number(hasReads) > 1) {
         throw new Error(
           "Choose exactly one read pathway: filePath/file_path for one target, filePaths[] for 2-8 targets sharing one offset/limit, or reads[] for 2-8 targets with per-target windows.",
         )
       }
-      if (hasReads && (params.offset !== undefined || params.limit !== undefined)) {
+      const hasWindowDefaults = hasTopLevelWindow(params.offset) || hasTopLevelWindow(params.limit)
+      const topLevelWindowDuplicatesReads =
+        hasReads &&
+        readsInput.every(
+          (item) =>
+            (!hasTopLevelWindow(params.offset) || item.offset === params.offset) &&
+            (!hasTopLevelWindow(params.limit) || item.limit === params.limit),
+        )
+      if (hasReads && hasWindowDefaults && !topLevelWindowDuplicatesReads) {
         throw new Error(
           "Top-level offset/limit cannot be combined with reads[]. Put offset/limit on each reads[] item instead.",
         )
       }
       if (
         (hasFilePaths || hasReads) &&
-        (params.pattern !== undefined ||
-          params.symbol !== undefined ||
+        (hasText(params.pattern) ||
+          hasText(params.symbol) ||
           (params.action !== undefined && params.action !== "read"))
       ) {
         throw new Error(
@@ -491,16 +298,10 @@ export const ReadTool = Tool.define<
 
       if (hasFilePaths || hasReads) {
         let requests: Array<{ filePath: string; offset?: number; limit?: number }>
-        if (params.reads != null) {
-          requests = params.reads.map((item) => ({ filePath: item.filePath, offset: item.offset, limit: item.limit }))
+        if (hasReads) {
+          requests = readsInput.map((item) => ({ filePath: item.filePath, offset: item.offset, limit: item.limit }))
         } else {
-          let paths: string[]
-          try {
-            paths = coerceFilePaths(params.filePaths!)
-          } catch (error) {
-            throw error instanceof Error ? error : new Error(String(error))
-          }
-          requests = paths.map((filePath) => ({ filePath, offset: params.offset, limit: params.limit }))
+          requests = filePathsInput.map((filePath) => ({ filePath, offset: params.offset, limit: params.limit }))
         }
         if (requests.length === 0) {
           throw new Error("Provide at least one target in filePaths[] or reads[].")
@@ -575,7 +376,7 @@ export const ReadTool = Tool.define<
         }
       }
 
-      const filepathIn = normalizeInput(params, instance.directory)
+      const filepathIn = normalizeInput(singlePathInput, instance.directory)
       if (!filepathIn) {
         throw new Error("Provide filePath or filePaths[] to read.")
       }

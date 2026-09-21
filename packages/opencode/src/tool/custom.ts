@@ -5,14 +5,12 @@ import path from "path"
 import type { JSONSchema7, JSONSchema7Definition } from "@ai-sdk/provider"
 import type { Hooks, ToolContext as PluginToolContext, ToolDefinition } from "@opencode-ai/plugin"
 import type * as Tool from "./tool"
-import { Agent } from "@/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { EffectBridge } from "@/effect/bridge"
 import { Glob } from "@opencode-ai/core/util/glob"
 import { loadToolModule } from "./import"
 
 export type CustomToolDeps = {
-  agent: Agent.Interface
   truncate: Truncate.Interface
   directory: string
   worktree: string
@@ -61,17 +59,12 @@ export function fromPlugin(id: string, def: ToolDefinition, deps: CustomToolDeps
         const output = typeof result === "string" ? result : result.output
         const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
         const attachments = typeof result === "string" ? undefined : result.attachments
-        const info = yield* deps.agent.get(toolCtx.agent)
-        const out = yield* deps.truncate.output(output, {}, info)
+        const out = yield* deps.truncate.output(output)
         return {
           title: typeof result === "string" ? "" : (result.title ?? ""),
-          output: out.truncated ? out.content : output,
+          output: out.content,
           attachments,
-          metadata: {
-            ...metadata,
-            truncated: out.truncated,
-            ...(out.truncated && { outputPath: out.outputPath }),
-          },
+          metadata: Truncate.mergeMetadata(metadata, out),
         }
       }).pipe(
         Effect.withSpan("Tool.execute", {

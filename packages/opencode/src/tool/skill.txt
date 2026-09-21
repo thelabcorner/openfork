@@ -3,7 +3,7 @@ Load a specialized skill when the task matches a skill, including skills that ar
 Use this tool to inject the skill's instructions and resources into the current conversation.
 
 Where skills come from:
-- Registered project/user skills (agent-skills/, skills/, .skills/, .opencode/skill, Claude/Codex folders, config paths).
+- Registered project/user skills (agent-skills/, skills/, .skills/, .openfork/skill, Claude/Codex folders, config paths).
 - Anywhere on disk: Downloads, another repo, a USB path, etc. Pass filePath or a path-like name.
 
 Load:

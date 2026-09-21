@@ -1,8 +1,9 @@
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { ToolRegistry } from "@/tool/registry"
 import { TOOL_ACCESS_ID } from "../../src/tool/access"
+import { BUILTIN_LAZY_TOOL_IDS } from "../../src/tool/exposure"
 import { ToolJsonSchema } from "../../src/tool/json-schema"
 import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -16,7 +17,7 @@ afterEach(async () => {
 const it = testEffect(LayerNode.compile(LayerNode.group([ToolRegistry.node])))
 
 const agent = { name: "build", mode: "primary" as const, permission: [], options: {} }
-const lazyIDs = ["sqlite", "sympy", "refactor"]
+const lazyIDs = [...BUILTIN_LAZY_TOOL_IDS]
 
 const ctx: Tool.Context = {
   sessionID: SessionID.make("ses_lazy_tools"),
@@ -86,6 +87,8 @@ describe("optional tool access", () => {
       const result = yield* broker.execute({ action: "describe", tool: "sqlite" }, ctx)
       expect(result.output).toContain('"tool": "sqlite"')
       expect(result.output).toContain('"parameters"')
+      expect(result.output).toContain('"contract": "broker-v1:')
+      expect(result.output).toContain('contract set to the exact value above')
 
       const after = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
       expect(after.map((tool) => tool.id)).toEqual(tools.map((tool) => tool.id))
@@ -97,8 +100,14 @@ describe("optional tool access", () => {
       const registry = yield* ToolRegistry.Service
       const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
       const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)!
+      const described = JSON.parse((yield* broker.execute({ action: "describe", tool: "sqlite" }, ctx)).output)
       const result = yield* broker.execute(
-        { action: "call", tool: "sqlite", args: { action: "run", db: "lazy.db", sql: "CREATE TABLE t (x INTEGER)" } },
+        {
+          action: "call",
+          tool: "sqlite",
+          contract: described.contract,
+          args: { action: "run", db: "lazy.db", sql: "CREATE TABLE t (x INTEGER)" },
+        },
         ctx,
       )
       expect(result.metadata.delegatedTool).toBe("sqlite")
@@ -114,10 +123,12 @@ describe("optional tool access", () => {
       const registry = yield* ToolRegistry.Service
       const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
       const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)!
+      const described = JSON.parse((yield* broker.execute({ action: "describe", tool: "sqlite" }, ctx)).output)
       const result = yield* broker.execute(
         {
           action: "call",
           tool: "sqlite",
+          contract: described.contract,
           args: JSON.stringify({ action: "run", db: "lazy-string.db", sql: "CREATE TABLE t (x INTEGER)" }),
         },
         ctx,
@@ -125,6 +136,26 @@ describe("optional tool access", () => {
       expect(result.metadata.delegatedTool).toBe("sqlite")
       expect(result.metadata.brokerAction).toBe("call")
       expect(result.output).toContain("schema changed")
+    }),
+  )
+
+  it.instance("refuses speculative calls that did not load the current hidden descriptor", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
+      const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)!
+      const exit = yield* Effect.exit(
+        broker.execute(
+          { action: "call", tool: "sqlite", args: { action: "query", db: "missing.db", sql: "SELECT 1" } },
+          ctx,
+        ),
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = Cause.pretty(exit.cause)
+        expect(message).toContain("descriptor contract")
+        expect(message).toContain('action="describe"')
+      }
     }),
   )
 })

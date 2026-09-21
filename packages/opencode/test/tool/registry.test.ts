@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Exit, Layer, Result, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry, toolMayMutateWorkspace } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -22,6 +22,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import type { Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import { OxpToolCoverage } from "@/oxp/tool-coverage"
+import { ExternalToolCoverage } from "@/exchange/tool-coverage"
+import { EXECUTABLE_CAPABILITY_IDS } from "@/ofxp/capability"
 
 const configLayer = TestConfig.layer({
   directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
@@ -36,6 +39,7 @@ const brokenPluginLayer = Layer.succeed(
     init: () => Effect.void,
     trigger: ((_name: unknown, _input: unknown, output: unknown) =>
       Effect.succeed(output)) as Plugin.Interface["trigger"],
+    transformChatMessages: (messages) => Effect.succeed(messages),
     list: () =>
       Effect.succeed([
         {
@@ -107,6 +111,51 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  it.instance("keeps every registered builtin explicitly dispositioned onto OXP", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      const missing = ids.filter((id) => !OxpToolCoverage.BY_NATIVE.has(id))
+      expect(missing).toEqual([])
+      for (const optional of ["execute", "lsp", "plan_exit"]) {
+        expect(OxpToolCoverage.BY_NATIVE.has(optional)).toBe(true)
+      }
+    }),
+  )
+
+  it.instance("keeps every registered builtin explicitly dispositioned onto OFXP", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      const missing = ids.filter((id) => !ExternalToolCoverage.BY_NATIVE.get(id)?.ofxp)
+      expect(missing).toEqual([])
+      for (const optional of ["execute", "lsp", "plan_exit"]) {
+        expect(ExternalToolCoverage.BY_NATIVE.get(optional)?.ofxp).toBeDefined()
+      }
+    }),
+  )
+
+  it.instance("distinguishes OFXP semantic mappings from actually executable capability coverage", () =>
+    Effect.sync(() => {
+      const report = ExternalToolCoverage.ofxpExecutionReport(EXECUTABLE_CAPABILITY_IDS)
+      expect(report.unmappedExecutable).toEqual([])
+      expect(report.executableSurfaces).toEqual(["archive", "browser", "edit", "find", "git", "json", "lsp", "memory", "patch", "process", "project", "read", "skill", "sqlite", "symbols", "sympy", "test", "typecheck", "web", "write"])
+      expect(report.pendingSurfaces).not.toContain("archive")
+      expect(report.pendingSurfaces).not.toContain("json")
+      expect(report.pendingSurfaces).not.toContain("sqlite")
+      expect(report.pendingSurfaces).not.toContain("memory")
+      expect(report.pendingSurfaces).not.toContain("git")
+      expect(report.pendingSurfaces).not.toContain("process")
+      expect(report.pendingSurfaces).not.toContain("browser")
+      expect(report.pendingSurfaces).not.toContain("edit")
+      expect(report.pendingSurfaces).not.toContain("patch")
+      expect(report.pendingSurfaces).not.toContain("sympy")
+      expect(report.pendingSurfaces).not.toContain("typecheck")
+      expect(report.pendingSurfaces).not.toContain("test")
+      expect(report.nativePending).not.toContain("credential")
+    }),
+  )
+
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
@@ -122,6 +171,50 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
 
       expect(ids).toContain("checkpoint")
+    }),
+  )
+
+  it.instance("exposes scheduled_task directly to providers for conversational creation", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      expect(ids).toContain("scheduled_task")
+      expect(tools.map((tool) => tool.id)).toContain("scheduled_task")
+    }),
+  )
+
+  it.instance("keeps scheduled_task manifest-stable while enforcing explicit permission denial at execution", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        permission: Permission.fromConfig({ scheduled_task: "deny" }),
+      })
+      const scheduled = tools.find((tool) => tool.id === "scheduled_task")
+      if (!scheduled) throw new Error("scheduled_task missing from provider-visible manifest")
+
+      const ctx = {
+        sessionID: SessionID.descending(),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+
+      const denied = yield* Effect.exit(scheduled.execute({}, ctx))
+      expect(Exit.isFailure(denied)).toBe(true)
+      if (Exit.isFailure(denied)) expect(Cause.pretty(denied.cause)).toContain("scheduled_task")
     }),
   )
 
@@ -161,9 +254,16 @@ describe("tool.registry", () => {
       const description = JSON.parse(described.output)
       expect(description.operation).toBe("navigate")
       expect(description.args.required).toContain("url")
+      expect(description.contract).toMatch(/^broker-v1:[0-9a-f]{24}$/)
       expect(description.invoke).toBeUndefined()
-      expect(description.usage).toContain('args set to a JSON object')
+      expect(description.usage).toContain('contract set to the exact value above')
       expect(described.output).not.toContain("<args matching schema>")
+
+      const speculative = yield* Effect.exit(
+        browser.execute({ action: "call", operation: "navigate", args: { url: "https://example.com" } }, ctx),
+      )
+      expect(Exit.isFailure(speculative)).toBe(true)
+      if (Exit.isFailure(speculative)) expect(Cause.pretty(speculative.cause)).toContain("descriptor contract")
     }),
   )
 
@@ -339,7 +439,7 @@ describe("tool.registry", () => {
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
-      for (const id of ["checkpoint", "project", "symbols", "test", "git", "goal", "session"]) {
+      for (const id of ["checkpoint", "project", "symbols", "test", "git", "goal", "scheduled_task", "session"]) {
         expect(ids).toContain(id)
       }
       // Question remains intentionally gated until ACP elicitation is bridged.

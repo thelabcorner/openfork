@@ -35,7 +35,8 @@ import { BrowserProfilerStopTool } from "./browser/profiler-stop"
 import { BrowserReactInspectTool } from "./browser/react-inspect"
 import { BrowserOpenDevtoolsTool } from "./browser/open-devtools"
 import { BrowserExtensionsListTool } from "./browser/extensions-list"
-import { normalizeBrokerArgs, withObjectBrokerArgsSchema } from "./broker-args"
+import { normalizeBrokerArgs, withContractedBrokerArgsSchema } from "./broker-args"
+import { BrokerContract } from "./broker-contract"
 
 const OPERATIONS = [
   "status",
@@ -75,18 +76,19 @@ type Operation = (typeof OPERATIONS)[number]
 export const Parameters = Schema.Struct({
   action: Schema.Literals(["list", "describe", "call"]).annotate({
     description:
-      "list browser operations, describe one operation's exact schema, or call an operation. Use describe only when the operation arguments are not already known.",
+      "list browser operations, describe one operation's exact schema/contract, or call it. Every call requires the current contract returned by describe.",
   }),
   operation: Schema.optional(Schema.Literals(OPERATIONS)).annotate({
     description: "Browser operation for describe/call.",
   }),
+  contract: BrokerContract.Parameter,
   args: Schema.optional(Schema.Unknown).annotate({
     description:
-      "Arguments for action=call. Pass a JSON object matching the selected operation schema. Omit only for operations with no required arguments; never pass describe output or placeholder text as args.",
+      "Arguments for action=call. Pass a JSON object matching the selected operation schema. A current descriptor contract is required before every call. Omit args only for operations with no required arguments; never pass describe output or placeholder text as args.",
   }),
 })
 
-const ProviderParameters = withObjectBrokerArgsSchema(ToolJsonSchema.fromSchema(Parameters))
+const ProviderParameters = withContractedBrokerArgsSchema(ToolJsonSchema.fromSchema(Parameters))
 
 type Metadata = {
   browserAction: "list" | "describe" | "call"
@@ -96,7 +98,19 @@ type Metadata = {
 }
 
 const OPERATION_GROUPS: ReadonlyArray<readonly [string, readonly Operation[]]> = [
-  ["read", ["status", "snapshot", "screenshot", "query", "profiler_start", "profiler_stop", "react_inspect", "extensions_list"]],
+  [
+    "read",
+    [
+      "status",
+      "snapshot",
+      "screenshot",
+      "query",
+      "profiler_start",
+      "profiler_stop",
+      "react_inspect",
+      "extensions_list",
+    ],
+  ],
   ["visual", ["visual_capture", "visual_diff", "visual_record", "visual_history", "visual_artifact"]],
   ["navigate", ["open", "claim", "navigate", "close"]],
   ["interact", ["resize", "set_appearance", "click", "type", "press", "scroll", "wait_for", "highlight", "annotate"]],
@@ -193,7 +207,7 @@ export const BrowserTool = Tool.define<
 
     return {
       description:
-        "One compact gateway for Desktop browser control. Operations include deterministic SnapEye visual verification through visual_capture, visual_diff, and visual_record in addition to status/open/navigation/snapshot/screenshot/interactions/evaluation/recording/profiling. Use action=list for grouped discovery, action=describe for one operation's exact argument schema, and action=call to execute it. Legacy result text may say browser_open/browser_snapshot/etc.; treat those names as the corresponding operation through this tool.",
+        "One compact gateway for Desktop browser control. This is a strict two-phase broker: before action=call, action=describe MUST load the selected operation's exact instructions/schema and its returned contract MUST be echoed on the call. Use action=list only when the operation name is unknown. Operations include deterministic SnapEye visual verification through visual_capture, visual_diff, and visual_record plus status/open/navigation/snapshot/screenshot/interactions/evaluation/recording/profiling. Legacy result text may say browser_open/browser_snapshot/etc.; treat those names as the corresponding operation through this tool.",
       parameters: Parameters,
       jsonSchema: ProviderParameters,
       execute: (params, ctx) =>
@@ -202,7 +216,7 @@ export const BrowserTool = Tool.define<
             const output = [
               "Browser operations:",
               ...OPERATION_GROUPS.map(([group, operations]) => `- ${group}: ${operations.join(", ")}`),
-              "Use action=describe with one operation when you need its exact args schema; otherwise call it directly.",
+              "Before calling an operation, use action=describe for its exact instructions, args schema, and current contract.",
             ].join("\n")
             return {
               title: "Browser operations",
@@ -215,14 +229,23 @@ export const BrowserTool = Tool.define<
           const target = catalog[operation] as Tool.Def
 
           if (params.action === "describe") {
+            const description = modelDescription(target.description)
+            const args = ToolJsonSchema.fromTool(target)
+            const descriptor = BrokerContract.describe({
+              broker: "browser",
+              target: operation,
+              targetField: "operation",
+              description,
+              schema: args,
+            })
             return {
               title: `Describe browser ${operation}`,
               output: JSON.stringify(
                 {
+                  ...descriptor,
                   operation,
-                  description: modelDescription(target.description),
-                  args: ToolJsonSchema.fromTool(target),
-                  usage: `Call browser again with action="call", operation="${operation}", and args set to a JSON object whose fields satisfy the args schema above. Do not pass the schema itself or placeholder text as args.`,
+                  args,
+                  usage: `Call browser again with action="call", operation="${operation}", contract set to the exact value above, and args set to a JSON object whose fields satisfy inputSchema/args.`,
                 },
                 null,
                 2,
@@ -231,6 +254,16 @@ export const BrowserTool = Tool.define<
             }
           }
 
+          const description = modelDescription(target.description)
+          const argsSchema = ToolJsonSchema.fromTool(target)
+          BrokerContract.assertCurrent({
+            broker: "browser",
+            target: operation,
+            description,
+            schema: argsSchema,
+            contract: params.contract,
+            discovery: `Call browser with action="describe" and operation="${operation}"`,
+          })
           const args = normalizeBrokerArgs(params.args, { broker: "browser", allowOmitted: true })
           yield* plugin.trigger(
             "tool.execute.before",

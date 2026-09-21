@@ -4,6 +4,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { FileSearch } from "@/search/filesystem"
 import DESCRIPTION from "./grep.txt"
 import * as Tool from "./tool"
 
@@ -57,28 +58,14 @@ export const GrepTool = Tool.define(
             kind: requestedInfo?.type === "Directory" ? "directory" : "file",
           })
 
-          const search = FSUtil.resolve(requested)
-          const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          const cwd = info?.type === "Directory" ? search : path.dirname(search)
-          const limit = 100
-          const result = yield* ripgrep.grep({
-            cwd,
-            pattern: params.pattern,
-            file: requestedInfo?.type === "File" ? path.basename(search) : undefined,
-            include: params.include,
-            limit: limit + 1,
-          })
-          if (result.length === 0) return empty
+          const result = yield* FileSearch.grep(
+            { fs, ripgrep },
+            { path: requested, pattern: params.pattern, include: params.include, signal: ctx.abort },
+          )
+          if (result.rows.length === 0) return empty
 
-          const truncated = result.length > limit
-          const rows = result.slice(0, limit).map((item) => ({
-            path: path.resolve(
-              requestedInfo?.type === "Directory" ? requested : path.dirname(requested),
-              item.entry.path,
-            ),
-            line: item.line,
-            text: item.text,
-          }))
+          const truncated = result.truncated
+          const rows = result.rows
 
           if (rows.length === 0) return empty
 

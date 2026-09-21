@@ -36,11 +36,18 @@ type Metadata = {
   [key: string]: unknown
 }
 
+const hasText = (value: string | undefined) => typeof value === "string" && value.trim().length > 0
+
 function resolveAction(params: Params): Action {
-  const hasGlob = typeof params.glob === "string" && params.glob.length > 0
-  const hasGrep = typeof params.grep === "string" && params.grep.length > 0
-  if (hasGlob === hasGrep) throw new Error("find requires exactly one non-empty field: glob or grep")
-  if (hasGlob && params.include !== undefined) throw new Error("include is only valid with find grep")
+  const hasGlob = hasText(params.glob)
+  const hasGrep = hasText(params.grep)
+  const hasInclude = hasText(params.include)
+  if (hasGlob && hasGrep) {
+    if (hasInclude) return "grep"
+    throw new Error("find requires exactly one non-empty field: glob or grep")
+  }
+  if (!hasGlob && !hasGrep) throw new Error("find requires exactly one non-empty field: glob or grep")
+  if (hasGlob && hasInclude) throw new Error("include is only valid with find grep")
   return hasGlob ? "glob" : "grep"
 }
 
@@ -66,11 +73,11 @@ export const FindTool = Tool.define<
           const target = (action === "glob" ? glob : grep) as Tool.Def
           const args: Record<string, unknown> =
             action === "glob"
-              ? { pattern: params.glob, ...(params.path !== undefined ? { path: params.path } : {}) }
+              ? { pattern: params.glob, ...(hasText(params.path) ? { path: params.path } : {}) }
               : {
                   pattern: params.grep,
-                  ...(params.path !== undefined ? { path: params.path } : {}),
-                  ...(params.include !== undefined ? { include: params.include } : {}),
+                  ...(hasText(params.path) ? { path: params.path } : {}),
+                  ...(hasText(params.include) ? { include: params.include } : {}),
                 }
 
           yield* plugin.trigger(

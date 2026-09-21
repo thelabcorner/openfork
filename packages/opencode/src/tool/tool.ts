@@ -6,7 +6,8 @@ import type { MessageV2 } from "../session/message-v2"
 import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
-import { Agent } from "@/agent/agent"
+import { ToolExposure } from "./exposure"
+import type { Agent } from "@/agent/agent"
 
 interface Metadata {
   [key: string]: any
@@ -107,11 +108,14 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
   id: string,
   init: Init<Parameters, Result>,
   truncate: Truncate.Interface,
-  agents: Agent.Interface,
 ) {
   return () =>
     Effect.gen(function* () {
       const toolInfo = typeof init === "function" ? { ...(yield* init()) } : { ...init }
+      // Builtin lazy exposure is fork-owned policy, not a per-adapter guess.
+      // Explicit custom/tool-local exposure remains valid; the shared policy
+      // guarantees known builtin lazy tools cannot accidentally become eager.
+      toolInfo.exposure ??= ToolExposure.lazyExposure(id)
       // Compile the parser closure once per tool init; `decodeUnknownEffect`
       // allocates a new closure per call, so hoisting avoids re-closing it for
       // every LLM tool invocation.
@@ -135,19 +139,14 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             ),
           )
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
-          if (result.metadata.truncated !== undefined) {
-            return result
-          }
-          const agent = yield* agents.get(ctx.agent)
-          const truncated = yield* truncate.output(result.output, {}, agent)
+          // Producer/domain truncation (for example grep hit caps or SQLite row
+          // paging) is not authority to bypass the harness's final model-facing
+          // output bound. Every tool result crosses this boundary exactly once.
+          const projected = yield* truncate.output(result.output)
           return {
             ...result,
-            output: truncated.content,
-            metadata: {
-              ...result.metadata,
-              truncated: truncated.truncated,
-              ...(truncated.truncated && { outputPath: truncated.outputPath }),
-            },
+            output: projected.content,
+            metadata: Truncate.mergeMetadata(result.metadata, projected),
           }
         }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
       }
@@ -163,13 +162,12 @@ export function define<
 >(
   id: ID,
   init: Effect.Effect<Init<Parameters, Result>, never, R>,
-): Effect.Effect<Info<Parameters, Result>, never, R | Truncate.Service | Agent.Service> & { id: ID } {
+): Effect.Effect<Info<Parameters, Result>, never, R | Truncate.Service> & { id: ID } {
   return Object.assign(
     Effect.gen(function* () {
       const resolved = yield* init
       const truncate = yield* Truncate.Service
-      const agents = yield* Agent.Service
-      return { id, init: wrap(id, resolved, truncate, agents) }
+      return { id, init: wrap(id, resolved, truncate) }
     }),
     { id },
   )

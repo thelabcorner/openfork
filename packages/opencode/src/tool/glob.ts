@@ -4,6 +4,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { FileSearch } from "@/search/filesystem"
 import DESCRIPTION from "./glob.txt"
 import * as Tool from "./tool"
 
@@ -37,33 +38,26 @@ export const GlobTool = Tool.define(
 
           let search = params.path ?? ins.directory
           search = path.isAbsolute(search) ? search : path.resolve(ins.directory, search)
-          const info = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (info?.type === "File") {
-            throw new Error(`glob path must be a directory: ${search}`)
-          }
           yield* assertExternalDirectoryEffect(ctx, search, {
             bypass: false,
             kind: "directory",
           })
 
-          const limit = 100
-          const files = yield* ripgrep.find({
-            cwd: search,
-            pattern: params.pattern,
-            limit: limit + 1,
-            hidden: true,
-          })
-          const truncated = files.length > limit
-          const final = files.slice(0, limit)
+          const result = yield* FileSearch.glob(
+            { fs, ripgrep },
+            { path: search, pattern: params.pattern, signal: ctx.abort },
+          )
+          const final = result.rows
+          const truncated = result.truncated
 
           const output = []
           if (final.length === 0) output.push("No files found")
           if (final.length > 0) {
-            output.push(...final.map((file) => path.resolve(search, file.path)))
+            output.push(...final)
             if (truncated) {
               output.push("")
               output.push(
-                `(Results are truncated: showing first ${limit} results. Consider using a more specific path or pattern.)`,
+                `(Results are truncated: showing first ${FileSearch.DEFAULT_LIMIT} results. Consider using a more specific path or pattern.)`,
               )
             }
           }

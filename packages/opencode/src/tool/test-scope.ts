@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import path from "path"
+import stripAnsi from "strip-ansi"
 
 // Shared machinery for the `test` tool: harness detection, per-harness command
 // construction, and reporter parsing (JSON for vitest/jest, TAP for node:test,
@@ -8,6 +9,31 @@ import path from "path"
 
 export const Harness = Schema.Literals(["bun", "vitest", "jest", "node", "mocha", "ava", "playwright", "none"])
 export type Harness = Schema.Schema.Type<typeof Harness>
+
+export const Parameters = Schema.Struct({
+  action: Schema.optional(Schema.Literals(["run", "list"])).annotate({
+    description:
+      "What to do (default run). run = execute tests; list = enumerate test files (and names when the harness supports it cheaply).",
+  }),
+  path: Schema.optional(Schema.String).annotate({
+    description: "Filter: file or directory to run/list (relative). Default: harness default scope.",
+  }),
+  testNamePattern: Schema.optional(Schema.String).annotate({
+    description:
+      "Filter: test-name pattern (regex or substring per harness; mapped per harness: -t for bun/jest/vitest, --test-name-pattern for node:test, --grep for mocha, -g for playwright, --match for ava).",
+  }),
+  runtime: Schema.optional(Schema.Literals(["auto", "bun", "node"])).annotate({
+    description: "Runtime (default auto: prefer the repo's runtime). Explicit value forces the runner.",
+  }),
+  timeoutMs: Schema.optional(Schema.Int).annotate({
+    description: "Hard timeout for the run (default 120000; max 600000). On expiry the child is killed.",
+  }),
+  full: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Request fuller runner output. Adapters may still apply their own bounded-output policy.",
+  }),
+})
+export type Input = Schema.Schema.Type<typeof Parameters>
 
 export type TestCase = {
   /** "describe > test" style full name */
@@ -214,6 +240,59 @@ async function readPackageJson(dir: string): Promise<PackageJson | undefined> {
 
 export type Runtime = "auto" | "bun" | "node"
 
+// Per-harness default globs for cheap test discovery. Config include/testMatch
+// overrides are probed first. This belongs with harness detection/command
+// construction so native tools and OXP share one discovery contract.
+const DEFAULT_GLOBS: Record<string, string[]> = {
+  bun: ["**/*.{test,spec}.{ts,tsx,js,mjs,cjs}", "**/test/**/*.{ts,tsx,js,mjs,cjs}"],
+  vitest: ["**/*.{test,spec}.?(c|m)[jt]s?(x)"],
+  jest: ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)"],
+  node: ["**/*.test.{js,mjs,cjs}", "**/test-*.{js,mjs,cjs}", "**/test.{js,mjs,cjs}", "**/test/**/*.{js,mjs,cjs}"],
+  mocha: ["**/*.test.{js,cjs,mjs}", "**/test/**/*.{js,cjs,mjs}"],
+  ava: ["**/*.test.{js,mjs,cjs}", "**/test/**/*.{js,mjs,cjs}"],
+  playwright: ["**/*.@(spec|test).?(c|m)[jt]s?(x)"],
+}
+
+function arrayLiterals(text: string, key: string): string[] | undefined {
+  const re = new RegExp(`${key}\\s*:\\s*\\[([^\\]]*)\\]`)
+  const match = re.exec(text)
+  if (!match) return undefined
+  const items = [...match[1]!.matchAll(/["'`]([^"'`]+)["'`]/g)].map((m) => m[1]!)
+  return items.length > 0 ? items : undefined
+}
+
+export async function testGlobsFor(harness: string, dir: string): Promise<string[]> {
+  const fs = await import("node:fs/promises")
+  if (harness === "vitest") {
+    for (const name of ["vitest.config.mjs", "vitest.config.js", "vitest.config.mts", "vitest.config.ts"]) {
+      const text = await fs.readFile(path.join(dir, name), "utf8").catch(() => undefined)
+      if (text !== undefined) {
+        const include = arrayLiterals(text, "include")
+        if (include) return include
+      }
+    }
+  }
+  if (harness === "jest") {
+    const json = await fs.readFile(path.join(dir, "jest.config.json"), "utf8").catch(() => undefined)
+    if (json !== undefined) {
+      try {
+        const testMatch = (JSON.parse(json) as { testMatch?: string[] }).testMatch
+        if (testMatch?.length) return testMatch
+      } catch {
+        // fall through to regex probe
+      }
+    }
+    for (const name of ["jest.config.mjs", "jest.config.js", "jest.config.ts"]) {
+      const text = await fs.readFile(path.join(dir, name), "utf8").catch(() => undefined)
+      if (text !== undefined) {
+        const testMatch = arrayLiterals(text, "testMatch")
+        if (testMatch) return testMatch
+      }
+    }
+  }
+  return DEFAULT_GLOBS[harness] ?? DEFAULT_GLOBS.node!
+}
+
 export type RunCommand = {
   /** executable (bun, node, or the resolved JS bin for a node-based harness) */
   bin: string
@@ -318,12 +397,12 @@ export async function buildCommand(input: {
     if (harness === "jest") args.push("--json")
     else if (harness === "vitest") {
       args.push("--reporter=json")
-      outputFile = path.join(dir, `.opencode-test-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.json`)
+      outputFile = path.join(dir, `.openfork-test-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.json`)
       args.push(`--outputFile=${outputFile}`)
     } else if (harness === "mocha") args.push("--reporter", "json")
     else if (harness === "playwright") {
       args.push("--reporter=json")
-      outputFile = path.join(dir, `.opencode-test-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.json`)
+      outputFile = path.join(dir, `.openfork-test-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.json`)
       args.push(`--outputFile=${outputFile}`)
     }
     // ava outputs TAP by default; nothing to add.
@@ -587,14 +666,14 @@ function fileLineFromLocation(value: string): { file?: string; line?: number } {
 
 // --- bun text output ---
 
-const BUN_PASS = /^\(pass\) (.+?)(?: \[[\d.]+ms\])?$/
+const BUN_PASS = /^(?:\(pass\)|✓|✔)\s+(.+?)(?: \[[\d.]+ms\])?$/
 const BUN_SKIP = /^\(skip\) (.+?)$/
-const BUN_FAIL = /^\(fail\) (.+?)(?: \[[\d.]+ms\])?$/
-const BUN_RAN = /^Ran (\d+) tests across (\d+) file.* \[([\d.]+)ms\]$/
+const BUN_FAIL = /^(?:\(fail\)|✗|✘)\s+(.+?)(?: \[[\d.]+ms\])?$/
+const BUN_RAN = /^Ran (\d+) tests? across (\d+) files?\.?(?: \[([\d.]+)ms\])?$/
 const BUN_SUMMARY = /^ *(\d+) (pass|skip|fail)$/
 
 function parseBunText(raw: string): TestSummary | undefined {
-  const lines = raw.split(/\r?\n/)
+  const lines = stripAnsi(raw).split(/\r?\n/)
   if (!lines.some((l) => BUN_PASS.test(l) || BUN_FAIL.test(l))) return undefined
   const tests: TestCase[] = []
   let currentFile: string | undefined
@@ -703,7 +782,7 @@ const GENERIC_PASS = /(?:^|\s)(?:PASS|✓|✔|ok \d+)(?:\s|$|:)/i
 const GENERIC_FAIL = /(?:^|\s)(?:FAIL|✗|✘|not ok \d+)(?:\s|$|:)/i
 
 export function parseGeneric(raw: string, harness: Harness, exitCode: number): TestSummary {
-  const lines = raw.split(/\r?\n/)
+  const lines = stripAnsi(raw).split(/\r?\n/)
   let passed = 0
   let failed = 0
   for (const line of lines) {

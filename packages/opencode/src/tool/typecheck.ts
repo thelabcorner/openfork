@@ -1,6 +1,5 @@
 import { Effect, Schema } from "effect"
 import path from "path"
-import fs from "node:fs/promises"
 import * as Tool from "./tool"
 import { AppProcess } from "@opencode-ai/core/process"
 import { GitRuntime } from "@opencode-ai/core/git-runtime"
@@ -9,17 +8,6 @@ import { InstanceState } from "@/effect/instance-state"
 import { TypecheckScope } from "./typecheck-scope"
 import DESCRIPTION from "./typecheck.txt"
 
-const SKIP_DIRS = new Set([
-  "node_modules",
-  "dist",
-  "build",
-  ".next",
-  ".turbo",
-  "coverage",
-  ".git",
-  "__pycache__",
-  ".opencode",
-])
 
 const GIT_ARGS = [
   "--no-optional-locks",
@@ -69,32 +57,6 @@ function escapeXml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
-// Local-import selection for bottomUp: regex is fine here — it only selects
-// which files to compile, never parses for correctness.
-function localImports(text: string): string[] {
-  const out: string[] = []
-  const re = /(?:from\s+|import\s*\()\s*["']([^"']+)["']/g
-  let match: RegExpExecArray | null
-  while ((match = re.exec(text)) !== null) out.push(match[1]!)
-  return out
-}
-
-async function walkTsFiles(dir: string, max: number, includeTests: boolean): Promise<string[]> {
-  const out: string[] = []
-  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as import("node:fs").Dirent[])
-  for (const entry of entries.toSorted((a, b) => a.name.localeCompare(b.name))) {
-    if (out.length >= max) break
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) continue
-      out.push(...(await walkTsFiles(path.join(dir, entry.name), max - out.length, includeTests)))
-      continue
-    }
-    if (!TypecheckScope.isTsFile(entry.name)) continue
-    if (!includeTests && (entry.name.endsWith(".test.ts") || entry.name.endsWith(".spec.ts") || entry.name.includes(".test."))) continue
-    out.push(path.join(dir, entry.name))
-  }
-  return out
-}
 
 export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess.Service>(
   "typecheck",
@@ -127,77 +89,6 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
       return "changed"
     })
 
-    const computeScope = Effect.fn("TypecheckTool.scope")(function* (
-      mode: string,
-      params: Schema.Schema.Type<typeof Parameters>,
-      worktree: string,
-      directory: string,
-    ) {
-      const maxFiles = params.maxFiles ?? 60
-
-      if (mode === "file") {
-        if (!params.filePath) throw new Error("file mode requires filePath")
-        const file = path.isAbsolute(params.filePath) ? params.filePath : path.join(directory, params.filePath)
-        return [file]
-      }
-      if (mode === "files") {
-        if (!params.files?.length) throw new Error("files mode requires files[]")
-        return params.files.map((f) => (path.isAbsolute(f) ? f : path.join(directory, f)))
-      }
-      if (mode === "folder") {
-        if (!params.folder) throw new Error("folder mode requires folder")
-        const dir = path.isAbsolute(params.folder) ? params.folder : path.join(directory, params.folder)
-        const files = yield* Effect.promise(() => walkTsFiles(dir, maxFiles, params.includeTests ?? false))
-        if (files.length === 0) throw new Error(`No TypeScript files found under ${dir}`)
-        return files
-      }
-      if (mode === "changed") {
-        const staged = yield* runGit(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], worktree)
-        const unstaged = yield* runGit(["diff", "--name-only", "--diff-filter=ACMR"], worktree)
-        let list = [...staged, ...unstaged]
-        if (params.includeUntracked) {
-          list = [...list, ...(yield* runGit(["ls-files", "--others", "--exclude-standard"], worktree))]
-        }
-        const files = list
-          .filter((f) => TypecheckScope.isTsFile(f))
-          .map((f) => path.join(worktree, f))
-        if (files.length === 0) throw new Error("No changed TypeScript files detected (use includeUntracked for new files)")
-        return files
-      }
-      if (mode === "bottomUp") {
-        const seeds = params.files?.length
-          ? params.files.map((f) => (path.isAbsolute(f) ? f : path.join(directory, f)))
-          : params.filePath
-            ? [path.isAbsolute(params.filePath) ? params.filePath : path.join(directory, params.filePath)]
-            : []
-        if (seeds.length === 0) throw new Error("bottomUp requires filePath or files[] as seeds")
-        const depth = params.depth ?? 2
-        const seen = new Set<string>()
-        const ordered: string[] = []
-        const visit = async (file: string, d: number): Promise<void> => {
-          if (seen.has(file) || d > depth) return
-          seen.add(file)
-          const text = await fs.readFile(file, "utf8").catch(() => "")
-          const imports = localImports(text)
-          for (const spec of imports) {
-            if (!spec.startsWith(".")) continue
-            const resolved = path.resolve(path.dirname(file), spec)
-            for (const candidate of [resolved, `${resolved}.ts`, `${resolved}.tsx`, `${resolved}.d.ts`, path.join(resolved, "index.ts")]) {
-              if (seen.has(candidate)) continue
-              if (await fs.stat(candidate).then((s) => s.isFile()).catch(() => false)) {
-                await visit(candidate, d + 1)
-              }
-            }
-          }
-          ordered.push(file)
-        }
-        yield* Effect.promise(async () => {
-          for (const seed of seeds.slice(0, maxFiles)) await visit(seed, 0)
-        })
-        return ordered.filter((f) => TypecheckScope.isTsFile(f)).slice(0, maxFiles)
-      }
-      throw new Error(`Unsupported mode: ${mode}`)
-    })
 
     return {
       description: DESCRIPTION,
@@ -241,8 +132,24 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
             metadata: { mode, full: mode === "full" },
           })
 
-          const scope = yield* computeScope(mode, params, instance.worktree, instance.directory)
-          if (scope.length === 0) throw new Error("No files selected to typecheck")
+          const scope =
+            mode === "full"
+              ? []
+              : yield* TypecheckScope.computeScope({
+                  mode: mode as TypecheckScope.ScopeMode,
+                  worktree: instance.worktree,
+                  directory: instance.directory,
+                  filePath: params.filePath,
+                  files: params.files,
+                  folder: params.folder,
+                  maxFiles: params.maxFiles,
+                  depth: params.depth,
+                  includeTests: params.includeTests,
+                  includeUntracked: params.includeUntracked,
+                  includeImporters: params.includeImporters,
+                  runGit,
+                })
+          if (mode !== "full" && scope.length === 0) throw new Error("No files selected to typecheck")
 
           // Worktree-bound guard: every file must live inside the worktree.
           for (const file of scope) {
@@ -267,14 +174,17 @@ export const TypecheckTool = Tool.define<typeof Parameters, Metadata, AppProcess
             })
           } else {
             const firstDir = path.dirname(scope[0]!)
-            tsconfigDir = params.tsconfig
-              ? (path.isAbsolute(params.tsconfig) ? path.dirname(params.tsconfig) : path.dirname(path.join(instance.directory, params.tsconfig)))
-              : (yield* Effect.promise(() => TypecheckScope.findNearestTsconfig(firstDir, instance.worktree))) ?? (yield* Effect.promise(() => TypecheckScope.findNearestTsconfig(instance.directory, instance.worktree)))
-            if (!tsconfigDir) throw new Error(`No tsconfig found for ${scope[0]} — cannot run a scoped typecheck.`)
+            const tsconfigPath = params.tsconfig
+              ? (path.isAbsolute(params.tsconfig) ? params.tsconfig : path.join(instance.directory, params.tsconfig))
+              : (yield* Effect.promise(() => TypecheckScope.findNearestTsconfigFile(firstDir, instance.worktree))) ??
+                (yield* Effect.promise(() => TypecheckScope.findNearestTsconfigFile(instance.directory, instance.worktree)))
+            if (!tsconfigPath) throw new Error(`No tsconfig found for ${scope[0]} — cannot run a scoped typecheck.`)
+            tsconfigDir = path.dirname(tsconfigPath)
             outcome = yield* TypecheckScope.runScopedTypecheck({
               app,
               worktree: instance.worktree,
               tsconfigDir,
+              tsconfigPath,
               files: scope,
               maxErrors,
               timeoutMs,

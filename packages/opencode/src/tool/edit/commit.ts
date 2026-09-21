@@ -55,7 +55,11 @@ let tempCounter = 0
  * within a filesystem, so a reader never observes a partially written file and
  * a crash mid-write cannot truncate the original.
  */
-export const atomicWrite = Effect.fn("EditCommit.atomicWrite")(function* (afs: FSUtil.Interface, filePath: string, bytes: string) {
+export const atomicWrite = Effect.fn("EditCommit.atomicWrite")(function* (
+  afs: FSUtil.Interface,
+  filePath: string,
+  bytes: string | Uint8Array,
+) {
   const temp = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${tempCounter++}.tmp`)
   yield* afs.writeWithDirs(temp, bytes)
   yield* afs.rename(temp, filePath).pipe(

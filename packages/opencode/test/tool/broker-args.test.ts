@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test"
-import { normalizeBrokerArgs, withObjectBrokerArgsSchema } from "../../src/tool/broker-args"
+import { normalizeBrokerArgs, withContractedBrokerArgsSchema } from "../../src/tool/broker-args"
 
 describe("broker argument normalization", () => {
   test("forces provider-facing args to advertise an object without changing the runtime decoder", () => {
-    const schema = withObjectBrokerArgsSchema({
+    const schema = withContractedBrokerArgsSchema({
       type: "object",
-      properties: { args: { description: "dynamic args" } },
+      properties: {
+        contract: { type: "string" },
+        args: { description: "dynamic args" },
+      },
     })
     expect(schema.properties?.args).toEqual({ description: "dynamic args", type: "object" })
   })

@@ -4,10 +4,19 @@ export function isBrokerArgs(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-/** Keep the runtime decoder permissive enough to repair JSON-stringified args,
- * while making the provider-facing contract unambiguously object-shaped. */
-export function withObjectBrokerArgsSchema(schema: JSONSchema7): JSONSchema7 {
+/**
+ * Project a compressed broker schema to providers.
+ *
+ * `args` intentionally stays opaque in the permanent manifest, but opaque args
+ * are only safe when the broker also exposes the descriptor-contract handshake.
+ * Enforce that invariant here so a future compressed broker cannot accidentally
+ * reuse this helper and reintroduce speculative nested calls.
+ */
+export function withContractedBrokerArgsSchema(schema: JSONSchema7): JSONSchema7 {
   const properties = schema.properties ?? {}
+  if (!("contract" in properties)) {
+    throw new Error("Compressed broker schemas must expose a descriptor contract before hiding delegated args")
+  }
   const current = properties.args
   const args = current && typeof current === "object" && !Array.isArray(current) ? current : {}
   return {

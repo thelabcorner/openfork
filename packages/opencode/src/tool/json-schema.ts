@@ -69,6 +69,24 @@ export function fromTool(tool: Tool.Def): JSONSchema7 {
   return tool.jsonSchema ?? fromSchema(tool.parameters as Schema.Top)
 }
 
+/**
+ * Normalize an already-materialized JSON Schema for OpenCode's AI SDK/provider
+ * tool path. Canonical/Core tools can legitimately use a top-level local $ref
+ * (for example an Effect Schema identifier); several OpenAI-compatible
+ * providers require the function parameters object itself to expose
+ * `type: "object"` at the root. Reuse the same bounded dereference/normalization
+ * pipeline as native OpenCode tools instead of teaching each special agent a
+ * provider-specific workaround.
+ */
+export function fromJsonSchema(schema: JSONSchema7): JSONSchema7 {
+  assertJsonSchemaDepth(schema)
+  const normalized = normalize(schema)
+  const inlined = dropDefinitionsIfResolved(inlineLocalReferences(normalized))
+  assertJsonSchemaDepth(inlined)
+  if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
+  return inlined
+}
+
 function normalize(value: unknown, options: { stripNull?: boolean } = {}): unknown {
   if (Array.isArray(value)) return value.map((item) => normalize(item))
   if (!isRecord(value)) return value
@@ -116,6 +134,15 @@ function normalize(value: unknown, options: { stripNull?: boolean } = {}): unkno
     if (withoutNull.length === 1 && isRecord(withoutNull[0])) {
       const { anyOf: _, ...rest } = schema
       return normalize({ ...withoutNull[0], ...rest })
+    }
+
+    // OpenAI-compatible function APIs require the parameters schema itself to
+    // advertise `type: "object"`. Effect Schema encodes discriminated object
+    // unions as a root `anyOf` of object branches, which is semantically
+    // object-only but otherwise has no root type. Keep the union constraints
+    // intact and make that implied root type explicit.
+    if (schema.type === undefined && withoutNull.every((item) => isRecord(item) && item.type === "object")) {
+      return { type: "object", ...schema }
     }
   }
 

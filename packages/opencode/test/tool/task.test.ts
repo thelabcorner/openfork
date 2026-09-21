@@ -1,5 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -16,7 +17,8 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
-import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskTool } from "../../src/tool/task"
+import type { SessionPromptOps } from "../../src/session/prompt-contract"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -72,6 +74,7 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   const user = yield* session.updateMessage({
     id: MessageID.ascending(),
     role: "user",
+    provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
     sessionID: chat.id,
     agent: "build",
     model: ref,
@@ -96,12 +99,72 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
   return { chat, assistant }
 })
 
+const seedDelegated = Effect.fn("TaskToolTest.seedDelegated")(function* (input: {
+  allowed: boolean
+  model?: { providerID: string; modelID: string; variant?: string }
+  source?: "turn" | "session"
+}) {
+  const sessions = yield* Session.Service
+  const localMcp = {
+    strictSubagentModelPolicy: true,
+    nestedSubagentsAllowed: input.allowed,
+    ...(input.model
+      ? {
+          ...(input.source === "session"
+            ? { modelSelection: { ...input.model, variant: input.model.variant ?? "default", source: "user_explicit" } }
+            : { subagentModelPolicy: input.model }),
+        }
+      : {}),
+  }
+  const chat = yield* sessions.create({
+    title: "Delegated",
+    ...(input.source === "session" ? { metadata: { localMcp } } : {}),
+  })
+  const user = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+    sessionID: chat.id,
+    agent: "build",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  const marker =
+    input.source === "session"
+      ? undefined
+      : yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: user.id,
+          sessionID: chat.id,
+          type: "text",
+          text: "delegated task",
+          metadata: { localMcp },
+        })
+  const assistant: SessionV1.Assistant = {
+    id: MessageID.ascending(),
+    role: "assistant",
+    parentID: user.id,
+    sessionID: chat.id,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    variant: "xhigh",
+    time: { created: Date.now() },
+  }
+  yield* sessions.updateMessage(assistant)
+  return { chat, user, assistant, marker }
+})
+
 function stubOps(opts?: {
   onPrompt?: (input: SessionPrompt.PromptInput) => void
   text?: string
   error?: NonNullable<SessionV1.Assistant["error"]>
   toolError?: string
-}): TaskPromptOps {
+}): SessionPromptOps {
   return {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
@@ -243,6 +306,424 @@ describe("tool.task", () => {
         },
       },
     },
+  )
+
+  it.instance("pins localMCP delegated tasks to the user-authorized turn model", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const pinned = { providerID: "user-provider", modelID: "user-model", variant: "high" }
+      const { chat, assistant } = yield* seedDelegated({ allowed: true, model: pinned, source: "turn" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      const result = yield* def.execute(
+        {
+          description: "inspect strict model",
+          prompt: "verify the delegated model",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="completed"')
+      expect(seen?.model).toEqual({
+        providerID: ProviderV2.ID.make("user-provider"),
+        modelID: ModelV2.ID.make("user-model"),
+      })
+      expect(seen?.variant).toBe("high")
+      const child = (yield* sessions.children(chat.id))[0]
+      expect(child?.model).toEqual({
+        providerID: ProviderV2.ID.make("user-provider"),
+        id: ModelV2.ID.make("user-model"),
+        variant: "high",
+      })
+      expect(child?.metadata?.localMcp).toMatchObject({
+        delegatedSubagent: true,
+        strictSubagentModelPolicy: true,
+        nestedSubagentsAllowed: true,
+        modelSelection: {
+          providerID: "user-provider",
+          modelID: "user-model",
+          variant: "high",
+          source: "inherited_user_policy",
+        },
+      })
+    }),
+  )
+
+  it.instance("inherits strict delegated authority through a causal host continuation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const pinned = { providerID: "user-provider", modelID: "user-model", variant: "high" }
+      const { chat, user, assistant } = yield* seedDelegated({ allowed: true, model: pinned, source: "turn" })
+      const continuation = yield* sessions.updateMessage({
+        ...user,
+        id: MessageID.ascending(),
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.GoalContinuation, user, {
+          ref: "reservation-task-policy",
+        }),
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Continue delegated work",
+        synthetic: true,
+      })
+      const automaticAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: continuation.id,
+        time: { created: Date.now() },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      const result = yield* def.execute(
+        { description: "causal delegated task", prompt: "continue under the pinned model", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: automaticAssistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="completed"')
+      expect(seen?.model).toEqual({
+        providerID: ProviderV2.ID.make("user-provider"),
+        modelID: ModelV2.ID.make("user-model"),
+      })
+      expect(seen?.variant).toBe("high")
+    }),
+  )
+
+  it.instance("does not let host continuation metadata widen delegated authority", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const pinned = { providerID: "user-provider", modelID: "user-model" }
+      const { chat, user, assistant } = yield* seedDelegated({ allowed: false, model: pinned, source: "turn" })
+      const continuation = yield* sessions.updateMessage({
+        ...user,
+        id: MessageID.ascending(),
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.GoalContinuation, user, {
+          ref: "reservation-task-policy-deny",
+        }),
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "Synthetic continuation with conflicting metadata",
+        synthetic: true,
+        metadata: {
+          localMcp: {
+            strictSubagentModelPolicy: true,
+            nestedSubagentsAllowed: true,
+            subagentModelPolicy: { providerID: "attacker-provider", modelID: "attacker-model" },
+          },
+        },
+      })
+      const automaticAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: continuation.id,
+        time: { created: Date.now() },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const exit = yield* def
+        .execute(
+          { description: "attempt widened authority", prompt: "spawn anyway", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: automaticAssistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected causal-root delegation refusal")
+      expect((Cause.squash(exit.cause) as Error).message).toMatch(/nested subagent spawning is not authorized/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("refuses delegated authority from a provider-user state projection", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, user, assistant } = yield* seedDelegated({
+        allowed: true,
+        model: { providerID: "user-provider", modelID: "user-model" },
+        source: "turn",
+      })
+      const state = yield* sessions.updateMessage({
+        ...user,
+        id: MessageID.ascending(),
+        provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalProgress, {
+          ref: `goal-state:v1:progress:gol_task_authority:${"c".repeat(64)}`,
+        }),
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: state.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "replaceable host state",
+        synthetic: true,
+        metadata: {
+          localMcp: {
+            strictSubagentModelPolicy: true,
+            nestedSubagentsAllowed: true,
+            subagentModelPolicy: { providerID: "attacker-provider", modelID: "attacker-model" },
+          },
+        },
+      })
+      const stateAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: state.id,
+        time: { created: Date.now() },
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const exit = yield* def
+        .execute(
+          { description: "state authority attack", prompt: "spawn from state", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: stateAssistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected state authority refusal")
+      expect((Cause.squash(exit.cause) as Error).message).toMatch(/not a provenance-qualified worker prompt/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("fails closed when a localMCP delegated task has no user-authorized model", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seedDelegated({ allowed: true, source: "turn" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "missing strict model",
+            prompt: "try to choose one",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected strict model failure")
+      const failure = Cause.squash(exit.cause)
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as Error).message).toMatch(/requires a user-authorized model|may not choose/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("producer-enforces localMCP nested-subagent denial even when task is invoked directly", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seedDelegated({
+        allowed: false,
+        model: { providerID: "user-provider", modelID: "user-model" },
+        source: "turn",
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "denied nested task",
+            prompt: "try to spawn",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected nested delegation refusal")
+      const failure = Cause.squash(exit.cause)
+      expect((failure as Error).message).toMatch(/nested subagent spawning is not authorized/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("inherits strict localMCP model policy recursively and refuses model-changing task resumes", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const firstPolicy = { providerID: "user-provider", modelID: "recursive-model", variant: "high" }
+      const { chat, assistant, marker } = yield* seedDelegated({ allowed: true, model: firstPolicy, source: "turn" })
+      if (!marker) throw new Error("expected delegated marker")
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let prompts = 0
+      const promptOps = stubOps({ onPrompt: () => prompts++ })
+
+      yield* def.execute(
+        {
+          description: "recursive worker",
+          prompt: "first turn",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      const child = (yield* sessions.children(chat.id))[0]
+      expect(child).toBeDefined()
+      expect(prompts).toBe(1)
+
+      // The child itself can recursively delegate from its durable session
+      // metadata without relying on a parent-model fallback.
+      expect(child?.metadata?.localMcp).toMatchObject({
+        strictSubagentModelPolicy: true,
+        modelSelection: { providerID: "user-provider", modelID: "recursive-model", variant: "high" },
+      })
+
+      yield* sessions.updatePart({
+        ...marker,
+        metadata: {
+          localMcp: {
+            strictSubagentModelPolicy: true,
+            nestedSubagentsAllowed: true,
+            subagentModelPolicy: { providerID: "user-provider", modelID: "different-model", variant: "high" },
+          },
+        },
+      })
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "recursive worker",
+            prompt: "resume with a different policy",
+            subagent_type: "general",
+            task_id: child!.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected model-binding mismatch")
+      expect((Cause.squash(exit.cause) as Error).message).toMatch(/not bound to the current user-authorized subagent model/i)
+      expect(prompts).toBe(1)
+    }),
+  )
+
+  it.instance("uses strict model policy stored on a delegated parent session for recursive task spawning", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seedDelegated({
+        allowed: true,
+        model: { providerID: "user-provider", modelID: "session-policy-model", variant: "high" },
+        source: "session",
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      yield* def.execute(
+        {
+          description: "recursive session policy",
+          prompt: "inherit the durable policy",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(seen?.model).toEqual({
+        providerID: ProviderV2.ID.make("user-provider"),
+        modelID: ModelV2.ID.make("session-policy-model"),
+      })
+      expect(seen?.variant).toBe("high")
+    }),
   )
 
   it.instance("execute resumes an existing task session from task_id", () =>
@@ -413,9 +894,10 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const ready = yield* Deferred.make<void>()
+      const cancelled = yield* Deferred.make<SessionID>()
 
-      const promptOps: TaskPromptOps = {
-        cancel: () => Effect.void,
+      const promptOps: SessionPromptOps = {
+        cancel: (sessionID) => Deferred.succeed(cancelled, sessionID).pipe(Effect.asVoid),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: () => Deferred.succeed(ready, undefined).pipe(Effect.andThen(Effect.never)),
       }
@@ -460,10 +942,11 @@ describe("tool.task", () => {
       if (!(failure instanceof Error)) throw new Error("expected Error defect")
       expect(failure.message).toContain(`Task cancelled (task_id: ${childID}`)
       expect(failure.message).toContain(`task_id "${childID}"`)
+      expect(yield* Deferred.await(cancelled)).toBe(childID)
     }),
   )
 
-  it.instance("execute asks by default and skips checks when bypassed", () =>
+  it.instance("execute skips task permission only for the explicitly authorized agent name", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -494,9 +977,10 @@ describe("tool.task", () => {
         )
 
       yield* exec()
-      yield* exec({ bypassAgentCheck: true })
+      yield* exec({ authorizedAgentNames: new Set(["general"]) })
+      yield* exec({ authorizedAgentNames: new Set(["other-agent"]) })
 
-      expect(calls).toHaveLength(1)
+      expect(calls).toHaveLength(2)
       expect(calls[0]).toEqual({
         permission: "task",
         patterns: ["general"],
@@ -506,6 +990,7 @@ describe("tool.task", () => {
           subagent_type: "general",
         },
       })
+      expect(calls[1]).toEqual(calls[0])
     }),
   )
 
@@ -517,7 +1002,7 @@ describe("tool.task", () => {
       const ready = defer<SessionPrompt.PromptInput>()
       const cancelled = defer<SessionID>()
       const abort = new AbortController()
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         cancel: (sessionID) =>
           Effect.sync(() => {
             cancelled.resolve(sessionID)
@@ -716,7 +1201,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let resolved = ""
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         resolvePromptParts: (template) =>
           Effect.sync(() => {
@@ -813,10 +1298,19 @@ describe("tool.task", () => {
         const sessions = yield* Session.Service
         const { chat, assistant } = yield* seed()
         const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+        const nestedUser = yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+          sessionID: child.id,
+          agent: "general",
+          model: ref,
+          time: { created: Date.now() },
+        })
         const nestedAssistant = yield* sessions.updateMessage({
           ...assistant,
           id: MessageID.ascending(),
-          parentID: MessageID.ascending(),
+          parentID: nestedUser.id,
           sessionID: child.id,
         })
         const tool = yield* TaskTool
@@ -834,7 +1328,7 @@ describe("tool.task", () => {
             agent: "general",
             abort: new AbortController().signal,
             extra: { promptOps: stubOps() },
-            messages: [],
+            messages: [{ info: nestedUser, parts: [] }],
             metadata: () => Effect.void,
             ask: () => Effect.void,
           },
@@ -953,7 +1447,7 @@ describe("tool.task", () => {
       const done = yield* Deferred.make<void>()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
       let runs = 0
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         cancel: () => Effect.void,
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
@@ -1032,7 +1526,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+            } satisfies SessionPromptOps,
           },
           messages: [],
           metadata: () => Effect.void,
@@ -1057,7 +1551,7 @@ describe("tool.task", () => {
       const finish = yield* Deferred.make<void>()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
       let childRuns = 0
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -1171,7 +1665,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let childRuns = 0
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
@@ -1229,7 +1723,7 @@ describe("tool.task", () => {
       const seen: string[] = []
       let continuationRuns = 0
 
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
@@ -1312,7 +1806,7 @@ describe("tool.task", () => {
       const releaseFailure = yield* Deferred.make<void>()
       const continuationRan = yield* Deferred.make<void>()
       let childRuns = 0
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
@@ -1385,12 +1879,14 @@ describe("tool.task", () => {
       const second = defer<void>()
       const updated = defer<SessionPrompt.PromptInput>()
       const injected = defer<SessionPrompt.PromptInput>()
+      const injectedProvenance = defer<SessionPrompt.HostPromptProvenance | undefined>()
       let prompts = 0
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
-        prompt: (input) => {
+        prompt: (input, provenance) => {
           if (input.sessionID === chat.id) {
             injected.resolve(input)
+            injectedProvenance.resolve(provenance)
             return Effect.succeed(reply(input, "done"))
           }
           prompts++
@@ -1447,6 +1943,11 @@ describe("tool.task", () => {
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
       if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+      expect(yield* Effect.promise(() => injectedProvenance.promise)).toEqual({
+        source: SessionTurnProvenance.Source.TaskSummary,
+        sourceMessageID: assistant.parentID,
+        ref: started.metadata.sessionId,
+      })
     }),
   )
 
@@ -1457,7 +1958,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -1509,7 +2010,7 @@ describe("tool.task", () => {
       const tool = yield* TaskTool
       const def = yield* tool.init()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
-      const promptOps: TaskPromptOps = {
+      const promptOps: SessionPromptOps = {
         ...stubOps(),
         prompt: (input) =>
           input.sessionID === chat.id
@@ -1600,7 +2101,7 @@ describe("tool.task", () => {
               ...stubOps({ text: "background done" }),
               prompt: (input) =>
                 input.sessionID === chat.id ? Effect.never : Effect.succeed(reply(input, "background done")),
-            } satisfies TaskPromptOps,
+            } satisfies SessionPromptOps,
           },
           messages: [],
           metadata: () => Effect.void,
@@ -1638,7 +2139,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+            } satisfies SessionPromptOps,
           },
           messages: [],
           metadata: () => Effect.void,
@@ -1677,7 +2178,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+            } satisfies SessionPromptOps,
           },
           messages: [],
           metadata: () => Effect.void,
@@ -1716,7 +2217,7 @@ describe("tool.task", () => {
             promptOps: {
               ...stubOps(),
               prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+            } satisfies SessionPromptOps,
           },
           messages: [],
           metadata: () => Effect.void,

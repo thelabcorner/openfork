@@ -61,7 +61,7 @@ export const Parameters = Schema.Struct({
   }),
 })
 
-type Metadata = {
+export type Metadata = {
   action: "list" | "extract" | "read" | "create"
   format: string
   count: number
@@ -79,7 +79,7 @@ function meta(
   return { action, format, count, truncated, preview }
 }
 
-type DisplayEntry = {
+export type DisplayEntry = {
   name: string
   dir: boolean
   unsafe: boolean
@@ -89,18 +89,18 @@ type DisplayEntry = {
   linkTo?: string
 }
 
-function isSystemFormat(format: ArchiveFormat.ArchiveFormat): boolean {
+export function isSystemFormat(format: ArchiveFormat.ArchiveFormat): boolean {
   if (format.kind === "7z" || format.kind === "rar") return true
   return format.kind === "compressed" && ArchiveFormat.SYSTEM_COMPRESSIONS.has(format.compression)
 }
 
-function formatLabel(format: ArchiveFormat.ArchiveFormat): string {
+export function formatLabel(format: ArchiveFormat.ArchiveFormat): string {
   const base = ArchiveFormat.formatName(format)
   if (format.kind === "compressed" && format.container === "tar") return `${base} (tar)`
   return base
 }
 
-async function detectArchive(filepath: string): Promise<ArchiveFormat.ArchiveFormat> {
+export async function detectArchive(filepath: string): Promise<ArchiveFormat.ArchiveFormat> {
   const handle = await fs.open(filepath, "r")
   try {
     const buf = Buffer.alloc(4096)
@@ -126,7 +126,7 @@ function checkAbort(signal: AbortSignal) {
 }
 
 // All pure-format listings share one shape so list/extract/read dispatch stays small.
-async function resolveEntries(
+export async function resolveEntries(
   filepath: string,
   format: ArchiveFormat.ArchiveFormat,
 ): Promise<{ format: ArchiveFormat.ArchiveFormat; entries: DisplayEntry[] }> {
@@ -185,7 +185,7 @@ function toDisplay(e: TarFile.TarEntry): DisplayEntry {
   }
 }
 
-function stripCompressionExt(filepath: string): string {
+export function stripCompressionExt(filepath: string): string {
   const base = path.basename(filepath)
   const lower = base.toLowerCase()
   for (const ext of COMPRESSION_EXTS) {
@@ -198,19 +198,19 @@ function entryMatches(pattern: string, name: string): boolean {
   return name === pattern || name.startsWith(pattern + "/") || Glob.match(pattern, name)
 }
 
-function filterEntries(entries: DisplayEntry[], patterns: readonly string[]): DisplayEntry[] {
+export function filterEntries(entries: DisplayEntry[], patterns: readonly string[]): DisplayEntry[] {
   if (!patterns.length) return entries
   return entries.filter((e) => patterns.some((pattern) => entryMatches(pattern, e.name)))
 }
 
-function sortEntries(entries: DisplayEntry[]): DisplayEntry[] {
+export function sortEntries(entries: DisplayEntry[]): DisplayEntry[] {
   return entries.toSorted((a, b) => {
     if (a.dir !== b.dir) return a.dir ? -1 : 1
     return a.name.localeCompare(b.name)
   })
 }
 
-function renderList(
+export function renderList(
   filepath: string,
   format: ArchiveFormat.ArchiveFormat,
   entries: DisplayEntry[],
@@ -251,13 +251,21 @@ function renderList(
   return lines.join("\n")
 }
 
-async function extractPure(
+export async function extractPure(
   filepath: string,
   format: ArchiveFormat.ArchiveFormat,
   dest: string,
   selection: DisplayEntry[],
   overwrite: boolean,
   signal: AbortSignal,
+  hooks?: {
+    /**
+     * Called immediately before each externally visible filesystem mutation.
+     * Native tools omit this; authority-aware adapters use it to revalidate
+     * their principal at the actual mutation boundary.
+     */
+    beforeMutation?: (target: string, kind: "file" | "directory") => Promise<void>
+  },
 ): Promise<{
   extracted: number
   dirs: number
@@ -297,6 +305,7 @@ async function extractPure(
           continue
         }
         if (entry.dir) {
+          await hooks?.beforeMutation?.(path.join(dest, entry.name), "directory")
           await mkdirSafe(dest, entry.name)
           result.dirs++
           continue
@@ -324,6 +333,7 @@ async function extractPure(
           }
         }
         const data = await ZipFile.readZipEntry(reader, zipEntry)
+        await hooks?.beforeMutation?.(target, "file")
         await writeOut(target, data, zipEntry.date)
         result.extracted++
         result.totalBytes += data.length
@@ -351,6 +361,7 @@ async function extractPure(
         throw new Error(`Decompressed size ${ArchiveFormat.humanSize(data.length)} exceeds the in-process limit`)
       const target = dest
       if (!(await exists(target)) || overwrite) {
+        await hooks?.beforeMutation?.(target, "file")
         await writeOut(target, data, new Date())
         result.extracted++
         result.totalBytes += data.length
@@ -370,6 +381,7 @@ async function extractPure(
       continue
     }
     if (entry.dir) {
+      await hooks?.beforeMutation?.(path.join(dest, entry.name), "directory")
       await mkdirSafe(dest, entry.name)
       result.dirs++
       continue
@@ -383,6 +395,7 @@ async function extractPure(
         const data = TarFile.entryData(tarBytes, src)
         const target = await safeJoin(dest, entry.name)
         if (!(await exists(target)) || overwrite) {
+          await hooks?.beforeMutation?.(target, "file")
           await writeOut(target, data, new Date(entry.date ? entry.date.getTime() : Date.now()))
           result.extracted++
           result.totalBytes += data.length
@@ -418,6 +431,7 @@ async function extractPure(
       }
     }
     const data = TarFile.entryData(tarBytes, tarEntry)
+    await hooks?.beforeMutation?.(target, "file")
     await writeOut(target, data, new Date(tarEntry.mtime * 1000))
     result.extracted++
     result.totalBytes += data.length
@@ -434,7 +448,7 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-async function isDirectory(p: string): Promise<boolean> {
+export async function isDirectory(p: string): Promise<boolean> {
   const stat = await fs.stat(p).catch(() => undefined)
   return stat?.isDirectory() ?? false
 }
@@ -468,13 +482,13 @@ async function safeJoin(dest: string, name: string): Promise<string> {
   return target
 }
 
-async function writeOut(target: string, data: Uint8Array, date: Date) {
+export async function writeOut(target: string, data: Uint8Array, date: Date) {
   await fs.mkdir(path.dirname(target), { recursive: true })
   await fs.writeFile(target, data)
   await fs.utimes(target, date, date).catch(() => undefined)
 }
 
-function renderExtract(filepath: string, dest: string, result: Awaited<ReturnType<typeof extractPure>>): string {
+export function renderExtract(filepath: string, dest: string, result: Awaited<ReturnType<typeof extractPure>>): string {
   const lines = [
     `Extracted ${result.extracted} files and ${result.dirs} directories (${ArchiveFormat.humanSize(result.totalBytes)}) to ${dest}`,
   ]
@@ -497,7 +511,7 @@ function renderExtract(filepath: string, dest: string, result: Awaited<ReturnTyp
   return lines.join("\n")
 }
 
-async function readEntryData(
+export async function readEntryData(
   filepath: string,
   format: ArchiveFormat.ArchiveFormat,
   pattern: string,
@@ -605,7 +619,7 @@ function missingEntry(pattern: string, names: string[]): never {
   throw new Error(`Entry not found: ${pattern}${hint}`)
 }
 
-function renderRead(
+export function renderRead(
   filepath: string,
   name: string,
   data: Uint8Array,
@@ -709,7 +723,7 @@ async function walkDir(dir: string, prefix: string, collected: SourceEntry[], ac
   }
 }
 
-async function createPure(dest: string, format: ArchiveFormat.ArchiveFormat, sources: string[]): Promise<string> {
+export async function createPure(dest: string, format: ArchiveFormat.ArchiveFormat, sources: string[]): Promise<string> {
   const files = await collectSources(sources)
   const fileCount = files.filter((f) => !f.dir).length
 
@@ -855,7 +869,12 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
             }
             if (isSystemFormat(format)) {
               const data = yield* Effect.promise(() =>
-                ArchiveSystem.systemRead(format, normalized, format.kind === "compressed" ? "" : entry!, ctx.abort),
+                ArchiveSystem.systemRead(
+                  format,
+                  normalized,
+                  format.kind === "compressed" && format.container === "single" ? "" : entry!,
+                  ctx.abort,
+                ),
               )
               const rendered = renderRead(
                 normalized,

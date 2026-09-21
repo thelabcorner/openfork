@@ -5,6 +5,19 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { ChildProcess } from "effect/unstable/process"
 import { withHeavyProcessSlot } from "./heavy-process-concurrency"
 
+const SKIP_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+  "coverage",
+  ".git",
+  ".openfork",
+  "__pycache__",
+  ".opencode",
+])
+
 // Shared scoped-typecheck machinery used by the `typecheck` tool and by the
 // opt-in `runTypecheck` on edit/write. Scoped modes are fast because they run
 // the repo's own compiler against a temporary tsconfig whose `include` is
@@ -38,6 +51,174 @@ export type ScopeSummary = {
   tsconfig?: string
   reason?: string
 }
+
+export type ScopeMode = "file" | "files" | "folder" | "changed" | "bottomUp"
+
+export type ScopeSelectionInput = {
+  mode: ScopeMode
+  worktree: string
+  directory: string
+  filePath?: string
+  files?: readonly string[]
+  folder?: string
+  maxFiles?: number
+  depth?: number
+  includeTests?: boolean
+  includeUntracked?: boolean
+  includeImporters?: boolean
+  runGit?: (args: string[], cwd: string) => Effect.Effect<string[], unknown>
+  validatePath?: (file: string) => Promise<void>
+}
+
+function localImports(text: string): string[] {
+  const out: string[] = []
+  const re = /(?:from\s+|import\s*\()\s*["']([^"']+)["']/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(text)) !== null) out.push(match[1]!)
+  return out
+}
+
+async function walkTsFiles(dir: string, max: number, includeTests: boolean): Promise<string[]> {
+  const out: string[] = []
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as import("node:fs").Dirent[])
+  for (const entry of entries.toSorted((a, b) => a.name.localeCompare(b.name))) {
+    if (out.length >= max) break
+    if (entry.isSymbolicLink()) continue
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue
+      out.push(...(await walkTsFiles(path.join(dir, entry.name), max - out.length, includeTests)))
+      continue
+    }
+    if (!isTsFile(entry.name)) continue
+    if (
+      !includeTests &&
+      (entry.name.endsWith(".test.ts") || entry.name.endsWith(".spec.ts") || entry.name.includes(".test."))
+    ) {
+      continue
+    }
+    out.push(path.join(dir, entry.name))
+  }
+  return out
+}
+
+function assertWithin(worktree: string, file: string) {
+  const rel = path.relative(worktree, file)
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error("Refusing to typecheck path outside the selected worktree")
+  }
+}
+
+export const computeScope = Effect.fn("TypecheckScope.computeScope")(function* (input: ScopeSelectionInput) {
+  const maxFiles = Math.min(Math.max(input.maxFiles ?? 60, 1), 500)
+  const resolveInput = (value: string) => (path.isAbsolute(value) ? value : path.join(input.directory, value))
+  let selected: string[]
+
+  if (input.mode === "file") {
+    if (!input.filePath) throw new Error("file mode requires filePath")
+    selected = [resolveInput(input.filePath)]
+  } else if (input.mode === "files") {
+    if (!input.files?.length) throw new Error("files mode requires files[]")
+    selected = input.files.map(resolveInput)
+  } else if (input.mode === "folder") {
+    if (!input.folder) throw new Error("folder mode requires folder")
+    const directory = resolveInput(input.folder)
+    selected = yield* Effect.promise(() => walkTsFiles(directory, maxFiles, input.includeTests ?? false))
+    if (selected.length === 0) throw new Error("No TypeScript files found under the selected folder")
+  } else if (input.mode === "changed") {
+    if (!input.runGit) throw new Error("changed mode requires a Git file-list provider")
+    const staged = yield* input.runGit(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], input.worktree)
+    const unstaged = yield* input.runGit(["diff", "--name-only", "--diff-filter=ACMR"], input.worktree)
+    let list = [...staged, ...unstaged]
+    if (input.includeUntracked) {
+      list = [...list, ...(yield* input.runGit(["ls-files", "--others", "--exclude-standard"], input.worktree))]
+    }
+    selected = [...new Set(list)]
+      .filter((file) => isTsFile(file))
+      .map((file) => path.join(input.worktree, file))
+      .slice(0, maxFiles)
+    if (selected.length === 0) {
+      throw new Error("No changed TypeScript files detected (use includeUntracked for new files)")
+    }
+  } else {
+    const seeds = input.files?.length
+      ? input.files.map(resolveInput)
+      : input.filePath
+        ? [resolveInput(input.filePath)]
+        : []
+    if (seeds.length === 0) throw new Error("bottomUp requires filePath or files[] as seeds")
+    const depth = Math.min(Math.max(input.depth ?? 2, 0), 5)
+    const seen = new Set<string>()
+    const ordered: string[] = []
+    const visit = async (file: string, currentDepth: number): Promise<void> => {
+      if (seen.has(file) || currentDepth > depth || seen.size >= maxFiles) return
+      assertWithin(input.worktree, file)
+      await input.validatePath?.(file)
+      seen.add(file)
+      const text = await fs.readFile(file, "utf8").catch(() => "")
+      for (const specifier of localImports(text)) {
+        if (!specifier.startsWith(".")) continue
+        const resolved = path.resolve(path.dirname(file), specifier)
+        for (const candidate of [
+          resolved,
+          resolved + ".ts",
+          resolved + ".tsx",
+          resolved + ".mts",
+          resolved + ".cts",
+          resolved + ".d.ts",
+          path.join(resolved, "index.ts"),
+          path.join(resolved, "index.tsx"),
+        ]) {
+          if (seen.has(candidate)) continue
+          if (
+            await fs
+              .lstat(candidate)
+              .then((stat) => stat.isFile() && !stat.isSymbolicLink())
+              .catch(() => false)
+          ) {
+            await visit(candidate, currentDepth + 1)
+            break
+          }
+        }
+      }
+      ordered.push(file)
+    }
+    yield* Effect.tryPromise({
+      try: async () => {
+        for (const seed of seeds.slice(0, maxFiles)) await visit(seed, 0)
+      },
+      catch: (error) => error as Error,
+    })
+    selected = ordered.filter(isTsFile).slice(0, maxFiles)
+
+    if (input.includeImporters && selected.length < maxFiles) {
+      const all = yield* Effect.promise(() => walkTsFiles(input.worktree, maxFiles * 4, true))
+      const selectedSet = new Set(selected.map((file) => path.resolve(file)))
+      for (const candidate of all) {
+        if (selected.length >= maxFiles || selectedSet.has(path.resolve(candidate))) continue
+        const text = yield* Effect.promise(() => fs.readFile(candidate, "utf8").catch(() => ""))
+        const base = path.dirname(candidate)
+        const importsSelected = localImports(text).some((specifier) => {
+          if (!specifier.startsWith(".")) return false
+          const resolved = path.resolve(base, specifier)
+          return [...selectedSet].some(
+            (target) =>
+              target === resolved ||
+              target === resolved + ".ts" ||
+              target === resolved + ".tsx" ||
+              target === path.join(resolved, "index.ts") ||
+              target === path.join(resolved, "index.tsx"),
+          )
+        })
+        if (!importsSelected) continue
+        selected.push(candidate)
+        selectedSet.add(path.resolve(candidate))
+      }
+    }
+  }
+
+  for (const file of selected) assertWithin(input.worktree, file)
+  return [...new Set(selected.map((file) => path.resolve(file)))].slice(0, maxFiles)
+})
 
 const CATEGORY: Record<number, string> = {
   2307: "import-resolution",
@@ -188,12 +369,30 @@ export async function findNearestTsconfig(fromDir: string, stopAt: string): Prom
   }
 }
 
+export async function findNearestTsconfigFile(fromDir: string, stopAt: string): Promise<string | undefined> {
+  let dir = path.resolve(fromDir)
+  const root = path.resolve(stopAt)
+  while (true) {
+    const entries = await fs.readdir(dir).catch(() => [] as string[])
+    const candidates = entries
+      .filter((name) => TSCONFIG_NAME.test(name))
+      .toSorted((left, right) => {
+        if (left === "tsconfig.json") return -1
+        if (right === "tsconfig.json") return 1
+        return left.localeCompare(right)
+      })
+    if (candidates[0]) return path.join(dir, candidates[0])
+    if (dir === root || dir === path.dirname(dir)) return undefined
+    dir = path.dirname(dir)
+  }
+}
+
 // Resolve the compiler binary by walking up from the tsconfig directory toward
 // the worktree root, preferring the nearest node_modules. tsgo (the native
 // preview compiler) is primary; plain tsc.js is the fallback. Falls back to
 // the host package's own node_modules (cwd) so the tool works even when the
 // project under check has no local TypeScript install (e.g. tests).
-async function resolveCompiler(tsconfigDir: string, worktree: string): Promise<{ bin: "tsgo" | "tsc"; path: string }> {
+export async function resolveCompiler(tsconfigDir: string, worktree: string): Promise<{ bin: "tsgo" | "tsc"; path: string }> {
   const walk = async (start: string, stop: string): Promise<{ bin: "tsgo" | "tsc"; path: string } | undefined> => {
     let dir = path.resolve(start)
     const root = path.resolve(stop)
@@ -228,7 +427,25 @@ async function resolveCompiler(tsconfigDir: string, worktree: string): Promise<{
   )
 }
 
-const TEMP_TSCONFIG_PREFIX = ".opencode-typecheck-"
+const TEMP_TSCONFIG_PREFIX = ".openfork-typecheck-"
+
+export function scopedConfigText(input: {
+  baseTsconfig: string
+  tempDir: string
+  files: readonly string[]
+}) {
+  let extendsPath = path.relative(input.tempDir, input.baseTsconfig).split(path.sep).join("/")
+  if (!extendsPath.startsWith(".")) extendsPath = "./" + extendsPath
+  return JSON.stringify(
+    {
+      extends: extendsPath,
+      include: input.files.map((file) => path.relative(input.tempDir, file).split(path.sep).join("/")),
+      compilerOptions: { noEmit: true },
+    },
+    null,
+    2,
+  )
+}
 
 // Write a temp tsconfig that extends the project's tsconfig but narrows the
 // `include` to the target files. Runs the compiler with it and always removes
@@ -239,6 +456,7 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
   app: AppProcess.Interface
   worktree: string
   tsconfigDir: string
+  tsconfigPath?: string
   files: string[]
   maxErrors?: number
   timeoutMs?: number
@@ -248,16 +466,15 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
     const app = input.app
     const tempName = `${TEMP_TSCONFIG_PREFIX}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.json`
     const tempPath = path.join(input.tsconfigDir, tempName)
-    const relative = input.files.map((file) => path.relative(input.tsconfigDir, file).split(path.sep).join("/"))
-
-    const scoped = {
-      extends: "./tsconfig.json",
-      include: relative,
-      compilerOptions: { noEmit: true },
-    }
+    const baseTsconfig = input.tsconfigPath ?? path.join(input.tsconfigDir, "tsconfig.json")
+    const scoped = scopedConfigText({
+      baseTsconfig,
+      tempDir: input.tsconfigDir,
+      files: input.files,
+    })
 
     yield* Effect.acquireRelease(
-      Effect.promise(() => fs.writeFile(tempPath, JSON.stringify(scoped, null, 2), "utf8")),
+      Effect.promise(() => fs.writeFile(tempPath, scoped, "utf8")),
       Effect.fnUntraced(function* () {
         yield* Effect.promise(() => fs.rm(tempPath, { force: true })).pipe(Effect.catch(() => Effect.void))
       }),
@@ -310,6 +527,21 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
   return yield* Effect.scoped(body)
 })
 
+export async function findTypecheckScriptDir(cwd: string, worktree: string): Promise<string> {
+  let dir = path.resolve(cwd)
+  const root = path.resolve(worktree)
+  while (true) {
+    const pkg = path.join(dir, "package.json")
+    const parsed = await fs
+      .readFile(pkg, "utf8")
+      .then((text) => JSON.parse(text) as { scripts?: Record<string, string> })
+      .catch(() => undefined)
+    if (parsed?.scripts?.typecheck) return dir
+    if (dir === root || dir === path.dirname(dir)) return root
+    dir = path.dirname(dir)
+  }
+}
+
 // `full` mode shells the package's own `typecheck` script (bun run typecheck)
 // from the nearest package dir that defines one, walking up to the worktree.
 export const runFullTypecheck = Effect.fn("TypecheckScope.runFull")(function* (input: {
@@ -321,20 +553,7 @@ export const runFullTypecheck = Effect.fn("TypecheckScope.runFull")(function* (i
   signal?: AbortSignal
 }) {
   const app = input.app
-  const scriptDir = yield* Effect.promise(async () => {
-    let dir = path.resolve(input.cwd)
-    const root = path.resolve(input.worktree)
-    while (true) {
-      const pkg = path.join(dir, "package.json")
-      const parsed = await fs
-        .readFile(pkg, "utf8")
-        .then((text) => JSON.parse(text) as { scripts?: Record<string, string> })
-        .catch(() => undefined)
-      if (parsed?.scripts?.typecheck) return dir
-      if (dir === root || dir === path.dirname(dir)) return input.worktree
-      dir = path.dirname(dir)
-    }
-  })
+  const scriptDir = yield* Effect.promise(() => findTypecheckScriptDir(input.cwd, input.worktree))
   const command = ChildProcess.make("bun", ["run", "typecheck"], {
     cwd: scriptDir,
     stdin: "ignore",

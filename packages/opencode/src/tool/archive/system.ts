@@ -14,6 +14,12 @@ export type ListedEntry = {
 
 export type Backend = { kind: "7z" | "tar" | "unrar"; tool: string }
 
+export type RunResult = {
+  code: number
+  stdout: Uint8Array
+  stderr: string
+}
+
 export async function findTool(name: string): Promise<string | undefined> {
   const onPath = Bun.which(name)
   if (onPath) return onPath
@@ -68,32 +74,31 @@ function missingBackend(format: ArchiveFormat): never {
 
 export async function systemList(format: ArchiveFormat, archive: string, signal?: AbortSignal): Promise<ListedEntry[]> {
   const backend = await resolveBackend(format)
-  if (backend.kind === "7z") {
-    const { code, stdout, stderr } = await run(backend.tool, ["l", "-slt", archive], signal)
-    if (code !== 0)
+  const args = listArgs(backend, archive)
+  const attempt = async () => {
+    const { code, stdout, stderr } = await run(backend.tool, args, signal)
+    if (code !== 0) {
+      const label = backend.kind === "7z" ? "7z" : backend.kind === "tar" ? "tar" : "unrar"
       throw new Error(
-        `7z could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
+        `${label} could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
       )
-    return parse7zListing(stdout)
+    }
+    return {
+      entries: parseList(backend, stdout),
+      outputBytes: stdout.length,
+    }
   }
-  if (backend.kind === "tar") {
-    const { code, stdout, stderr } = await run(backend.tool, ["-tvf", archive], signal)
-    if (code !== 0)
-      throw new Error(
-        `tar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
-      )
-    return parseTarListing(stdout)
-  }
-  const { code, stdout, stderr } = await run(backend.tool, ["lb", archive], signal)
-  if (code !== 0)
-    throw new Error(
-      `unrar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
-    )
-  return new TextDecoder()
-    .decode(stdout)
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => ({ name: line.trim(), dir: line.trim().endsWith("/"), size: 0 }))
+
+  const first = await attempt()
+  if (first.entries.length > 0 || first.outputBytes > 0) return first.entries
+
+  // On Windows under high process concurrency, system archive tools can
+  // occasionally report a successful exit before any piped listing bytes are
+  // observed by the parent. A genuinely empty archive is indistinguishable
+  // from that transient on the first attempt, so retry exactly once. Empty
+  // archives remain valid after the second successful empty listing.
+  const second = await attempt()
+  return second.entries
 }
 
 export async function systemExtract(
@@ -103,17 +108,14 @@ export async function systemExtract(
   signal?: AbortSignal,
 ): Promise<string> {
   const backend = await resolveBackend(format)
-  let args: string[]
-  if (backend.kind === "7z") args = ["x", archive, `-o${dest}`, "-y"]
-  else if (backend.kind === "tar") args = ["-xf", archive, "-C", dest]
-  else args = ["x", "-y", archive, dest + path.sep]
+  const args = extractArgs(backend, archive, dest)
   const { code, stdout, stderr } = await run(backend.tool, args, signal)
   if (code !== 0) {
     throw new Error(
       `Extraction failed (${path.basename(backend.tool)}): ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`,
     )
   }
-  return backend.kind === "7z" ? summarize7z(stdout) : `Extracted with ${path.basename(backend.tool)}.`
+  return summarizeExtract(backend, stdout)
 }
 
 export async function systemRead(
@@ -123,15 +125,15 @@ export async function systemRead(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   const backend = await resolveBackend(format)
+  const args = readArgs(backend, archive, entry)
   if (backend.kind === "7z") {
-    const args = entry ? ["e", archive, entry, "-so"] : ["e", archive, "-so"]
     const { code, stdout, stderr } = await run(backend.tool, args, signal)
     if (code !== 0 || stdout.length === 0) {
       throw new Error(`Could not read "${entry}" from the archive: ${stderr.trim() || "entry not found"}`)
     }
     return stdout
   }
-  const { code, stdout, stderr } = await run(backend.tool, ["-xOf", archive, entry], signal)
+  const { code, stdout, stderr } = await run(backend.tool, args, signal)
   if (code !== 0) {
     throw new Error(`Could not read "${entry}" from the archive: ${stderr.trim() || "entry not found"}`)
   }
@@ -139,18 +141,57 @@ export async function systemRead(
 }
 
 export async function systemCreate(dest: string, sources: string[], signal?: AbortSignal): Promise<string> {
-  const sevenZip = (await findTool("7z")) ?? (await findTool("7za")) ?? (await findTool("7zr"))
+  const sevenZip = await resolveCreateTool()
   if (!sevenZip) {
     throw new Error(
       "Creating 7-Zip archives requires the '7z' command. Install 7-Zip or use the bash tool: 7z a <dest> <sources>",
     )
   }
-  const { code, stdout, stderr } = await run(sevenZip, ["a", "-y", dest, ...sources], signal)
+  const { code, stdout, stderr } = await run(sevenZip, createArgs(dest, sources), signal)
   if (code !== 0)
     throw new Error(
       `7z could not create the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`,
     )
   return `Created ${path.basename(dest)} with 7-Zip.`
+}
+
+export function listArgs(backend: Backend, archive: string): string[] {
+  if (backend.kind === "7z") return ["l", "-slt", archive]
+  if (backend.kind === "tar") return ["-tvf", archive]
+  return ["lb", archive]
+}
+
+export function readArgs(backend: Backend, archive: string, entry: string): string[] {
+  if (backend.kind === "7z") return entry ? ["e", archive, entry, "-so"] : ["e", archive, "-so"]
+  return ["-xOf", archive, entry]
+}
+
+export function extractArgs(backend: Backend, archive: string, dest: string): string[] {
+  if (backend.kind === "7z") return ["x", archive, `-o${dest}`, "-y"]
+  if (backend.kind === "tar") return ["-xf", archive, "-C", dest]
+  return ["x", "-y", archive, dest + path.sep]
+}
+
+export function createArgs(dest: string, sources: string[]): string[] {
+  return ["a", "-y", dest, ...sources]
+}
+
+export async function resolveCreateTool(): Promise<string | undefined> {
+  return (await findTool("7z")) ?? (await findTool("7za")) ?? (await findTool("7zr"))
+}
+
+export function parseList(backend: Backend, stdout: Uint8Array): ListedEntry[] {
+  if (backend.kind === "7z") return parse7zListing(stdout)
+  if (backend.kind === "tar") return parseTarListing(stdout)
+  return new TextDecoder()
+    .decode(stdout)
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => ({ name: line.trim(), dir: line.trim().endsWith("/"), size: 0 }))
+}
+
+export function summarizeExtract(backend: Backend, stdout: Uint8Array): string {
+  return backend.kind === "7z" ? summarize7z(stdout) : `Extracted with ${path.basename(backend.tool)}.`
 }
 
 async function run(

@@ -11,7 +11,9 @@ import { ProjectInventory } from "@opencode-ai/core/project-inventory"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { AppProcess } from "@opencode-ai/core/process"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { ProjectInspection } from "@/project/inspection"
 import { ChildProcess } from "effect/unstable/process"
 import { which } from "@opencode-ai/core/util/which"
 import DESCRIPTION from "./project.txt"
@@ -272,7 +274,15 @@ const GIT_SAFE_ENV = {
   LC_ALL: "C",
 }
 
-const GIT_ARGS = ["--no-pager", "--no-optional-locks", "-c", "color.ui=false", "-c", "core.quotepath=false"] as const
+const GIT_ARGS = [
+  "--no-pager",
+  "--no-optional-locks",
+  "-c",
+  "color.ui=false",
+  "-c",
+  "core.quotepath=false",
+  ...GitRuntime.args([]),
+] as const
 
 // Probe runtimes/versions for the toolchain action. Order matters for the
 // reported list; each entry is (label, [binary, ...candidates], versionFlag).
@@ -1106,13 +1116,22 @@ export const ProjectTool = Tool.define<
           // recent: N most recently modified files (project-wide, gitignored)
           if (action === "recent") {
             const limit = Math.min(Math.max(params.recent ?? MAX_RECENT_DEFAULT, 1), MAX_RECENT)
-            const rootMtimes = yield* readSizes(base, rootPaths, ctx.abort)
-            const { rows, grouped, now } = yield* listRecent(rootPaths, rootMtimes.mtimes, limit)
+            const rows = yield* ProjectInspection.recent(base, rootPaths, limit, ctx.abort)
+            const grouped = new Map<string, Array<{ path: string; mtime: number }>>()
+            for (const row of rows) {
+              const dir = row.path.includes("/") ? row.path.slice(0, row.path.lastIndexOf("/")) : "."
+              const bucket = grouped.get(dir) ?? []
+              bucket.push(row)
+              grouped.set(dir, bucket)
+            }
+            const now = Date.now()
             const lines = [`<recent count="${rows.length}" total="${rootPaths.length}">`]
             for (const [dir, bucket] of grouped) {
               lines.push(`  <dir path="${escapeXml(dir)}">`)
               for (const row of bucket) {
-                lines.push(`    <file path="${escapeXml(row.rel)}" modified="${relativeTime(now - row.mtime)}" />`)
+                lines.push(
+                  `    <file path="${escapeXml(row.path)}" modified="${ProjectInspection.relativeTime(now - row.mtime)}" />`,
+                )
               }
               lines.push("  </dir>")
             }
@@ -1164,74 +1183,27 @@ export const ProjectTool = Tool.define<
             }
           }
 
-          // scope-relative view for the tree + stats
-          const prefix = scopeRel === "." ? "" : `${scopeRel.split(path.sep).join("/")}/`
-          const scopedPaths = prefix
-            ? rootPaths.filter((p) => p.startsWith(prefix)).map((p) => p.slice(prefix.length))
-            : rootPaths
-
-          const { sizes: sizeMap } = yield* readSizes(normalized, scopedPaths, ctx.abort)
-
-          // Manifest reads: walk up from the scope to the worktree root so a
-          // scoped snapshot still sees the repo's manifests (nearest wins).
-          const manifestEntries = yield* Effect.forEach(
-            [...MANIFEST_NAMES],
-            Effect.fnUntraced(function* (name: string) {
-              let dir = normalized
-              while (true) {
-                const r = yield* Effect.promise(() => manifestText(dir, name))
-                if (r) return [name, r] as const
-                if (dir === base) break
-                const parent = path.dirname(dir)
-                if (parent === dir) break
-                dir = parent
-              }
-              return [name, undefined] as const
-            }),
-            { concurrency: 4 },
-          )
-          const manifests = new Map(manifestEntries)
-          const notes: string[] = []
-          for (const [name, r] of manifests) {
-            if (r && "tooLarge" in r) {
-              notes.push(`${name} skipped: too large (${Math.round(r.tooLarge / 1024)} KB)`)
-            }
-          }
-
-          const { stack, lockfile, versionPins } = yield* detectStack(
-            normalized,
-            new Set(scopedPaths),
-            fileSet,
-            manifests,
-          )
-
-          const pkgManifest = manifests.get("package.json")
-          const scripts = annotateScripts(pkgManifest && "text" in pkgManifest ? pkgManifest.text : undefined)
-
-          // entry/config/CI presence (root-relative probes)
-          const entryPoints = [...new Set([...(stack?.entryPoints ?? []), ...probeEntryPoints(fileSet)])].slice(0, 10)
-          const configs: Presence[] = []
-          for (const [name, kind] of CONFIG_PROBES) {
-            if (fileSet.has(name)) configs.push({ path: name, kind })
-          }
-          const rootEntries = yield* Effect.tryPromise(() => fs.readdir(base, { withFileTypes: true })).pipe(
-            Effect.catch(() => Effect.succeed([] as import("node:fs").Dirent[])),
-          )
-          for (const entry of rootEntries) {
-            if (!entry.isFile()) continue
-            if (CONFIG_PATTERNS.some((re) => re.test(entry.name))) configs.push({ path: entry.name, kind: "config" })
-            else if (entry.name.startsWith(".env")) configs.push({ path: entry.name, kind: "env" })
-          }
-          const ci: Presence[] = []
-          for (const [name, kind] of CI_PROBES) {
-            if (fileSet.has(name)) ci.push({ path: name, kind })
-          }
-          const workflowsDir = path.join(base, ".github", "workflows")
-          const workflowFiles = yield* Effect.tryPromise(() => fs.readdir(workflowsDir)).pipe(
-            Effect.catch(() => Effect.succeed([] as string[])),
-          )
-          const workflowCount = workflowFiles.filter((f) => /\.ya?ml$/.test(f)).length
-          if (workflowCount > 0) ci.unshift({ path: `.github/workflows (${workflowCount} workflows)`, kind: "github" })
+          const inspection = yield* ProjectInspection.inspect(ripgrep, {
+            root: base,
+            scope: normalized,
+            signal: ctx.abort,
+            // A path-scoped request is expected to describe the caller's current
+            // view immediately. The project inventory is watcher-maintained and
+            // can legitimately lag a just-created subtree by its debounce window,
+            // so scoped inspection re-queries ripgrep instead of treating that
+            // eventually-consistent snapshot as authoritative query input.
+            files: params.path ? undefined : rootPaths,
+          }).pipe(Effect.orDie)
+          const scopedPaths = inspection.files
+          const sizeMap = inspection.sizes
+          const stack = inspection.stack
+          const lockfile = inspection.lockfile
+          const versionPins = inspection.versionPins
+          const notes = inspection.notes
+          const scripts = inspection.scripts
+          const entryPoints = inspection.entryPoints
+          const configs = inspection.configs
+          const ci = inspection.ci
 
           const statsInfo = yield* computeStats(normalized, scopedPaths, sizeMap, ctx.abort)
 
@@ -1301,7 +1273,7 @@ export const ProjectTool = Tool.define<
             return lines.join("\n")
           }
 
-          const scriptsXml = (list: Array<{ name: string; category: string; cmd: string }>) => {
+          const scriptsXml = (list: readonly { name: string; category: string; cmd: string }[]) => {
             const lines = [`<scripts total="${list.length}">`]
             for (const s of list)
               lines.push(
@@ -1311,7 +1283,7 @@ export const ProjectTool = Tool.define<
             return lines.join("\n")
           }
 
-          const summaryScripts = (list: Array<{ name: string; category: string; cmd: string }>) => {
+          const summaryScripts = (list: readonly { name: string; category: string; cmd: string }[]) => {
             const seen = new Set<string>()
             const onePerCategory = list.filter((s) => {
               if (seen.has(s.category)) return false
@@ -1329,7 +1301,7 @@ export const ProjectTool = Tool.define<
 
           const treeRender =
             tier === "structure" || tier === "full"
-              ? renderTree(buildTree(scopedPaths, sizeMap).root, depth, maxEntries)
+              ? ProjectInspection.tree(scopedPaths, sizeMap, depth, maxEntries)
               : undefined
 
           let output: string

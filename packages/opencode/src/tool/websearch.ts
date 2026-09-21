@@ -150,11 +150,11 @@ function parallelAuthHeaders() {
   return { ...headers, Authorization: `Bearer ${process.env.PARALLEL_API_KEY}` }
 }
 
-function callProvider(
+export function callProvider(
   http: HttpClient.HttpClient,
   provider: WebSearchProvider,
   params: Schema.Schema.Type<typeof Parameters>,
-  ctx: Tool.Context,
+  context: { readonly sessionID: string; readonly modelName?: string },
 ) {
   if (provider === "parallel") {
     return McpWebSearch.call(
@@ -165,8 +165,8 @@ function callProvider(
       {
         objective: params.query!,
         search_queries: [params.query!],
-        session_id: ctx.sessionID,
-        model_name: webSearchModelName(ctx.extra),
+        session_id: context.sessionID,
+        model_name: context.modelName,
       },
       "25 seconds",
       parallelAuthHeaders(),
@@ -213,7 +213,7 @@ function callProvider(
   )
 }
 
-function providersOutput(flags: Record<string, boolean>): string {
+export function providersOutput(flags: Record<string, boolean>): string {
   const keyless = WEBSEARCH_PROVIDERS.filter((p) => KEYLESS_PROVIDERS.has(p)).length
   const lines = [
     `websearch providers (${WEBSEARCH_PROVIDERS.length}, ${keyless} keyless-ready):`,
@@ -231,6 +231,18 @@ function providersOutput(flags: Record<string, boolean>): string {
   lines.push("Enable a key-based provider by setting its env var (e.g. BRAVE_API_KEY=...).")
   lines.push('Pin a provider with provider: "brave", or set OPENCODE_WEBSEARCH_PROVIDER=brave.')
   return lines.join("\n")
+}
+
+export function flagMap(flags: RuntimeFlags.Info): Record<WebSearchProvider, boolean> {
+  return {
+    exa: flags.enableExa,
+    parallel: flags.enableParallel,
+    firecrawl: flags.enableFirecrawl,
+    duckduckgo: flags.enableDuckDuckGo,
+    brave: flags.enableBrave,
+    tavily: flags.enableTavily,
+    searxng: flags.enableSearxng,
+  }
 }
 
 type WebSearchMeta = { action: "search" | "providers"; provider: WebSearchProvider | undefined }
@@ -252,19 +264,11 @@ export const WebSearchTool = Tool.define<
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          const flagMap = {
-            exa: flags.enableExa,
-            parallel: flags.enableParallel,
-            firecrawl: flags.enableFirecrawl,
-            duckduckgo: flags.enableDuckDuckGo,
-            brave: flags.enableBrave,
-            tavily: flags.enableTavily,
-            searxng: flags.enableSearxng,
-          }
+          const flagsByProvider = flagMap(flags)
 
           // ── Introspection: no query, no network, no permission ask ──
           if (params.action === "providers") {
-            const output = providersOutput(flagMap)
+            const output = providersOutput(flagsByProvider)
             return {
               title: "websearch providers",
               output,
@@ -276,7 +280,7 @@ export const WebSearchTool = Tool.define<
             return yield* Effect.fail(new Error("query is required for action 'search'"))
           }
 
-          const provider = selectWebSearchProvider(ctx.sessionID, flagMap, params.provider)
+          const provider = selectWebSearchProvider(ctx.sessionID, flagsByProvider, params.provider)
           const title = webSearchProviderLabel(provider)
           yield* ctx.metadata({ title: `${title} "${params.query}"`, metadata: { provider } })
 
@@ -294,7 +298,10 @@ export const WebSearchTool = Tool.define<
             },
           })
 
-          const result = yield* callProvider(http, provider, params, ctx)
+          const result = yield* callProvider(http, provider, params, {
+            sessionID: ctx.sessionID,
+            modelName: webSearchModelName(ctx.extra),
+          })
 
           return {
             output: result ?? "No search results found. Please try a different query.",

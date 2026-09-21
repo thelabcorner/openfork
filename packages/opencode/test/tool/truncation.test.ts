@@ -3,12 +3,13 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Effect, FileSystem } from "effect"
+import { Effect, FileSystem, Layer } from "effect"
 import { Truncate } from "@/tool/truncate"
 import { Config } from "@/config/config"
 import { Identifier } from "../../src/id/id"
 import { Process } from "@/util/process"
 import path from "path"
+import { brotliDecompressSync } from "node:zlib"
 import { testEffect } from "../lib/effect"
 import { writeFileStringScoped } from "../lib/filesystem"
 import { TestConfig } from "../fixture/config"
@@ -23,6 +24,18 @@ const configuredLayer = (cfg: ConfigV1.Info) =>
     [Config.node, TestConfig.layer({ get: () => Effect.succeed(cfg) })],
   ])
 const configuredIt = (cfg: ConfigV1.Info) => testEffect(configuredLayer(cfg))
+const failingFs = Layer.effect(
+  FSUtil.Service,
+  Effect.gen(function* () {
+    const fs = yield* FSUtil.Service
+    return FSUtil.Service.of({
+      ...fs,
+      ensureDir: () =>
+        Effect.fail(new FSUtil.FileSystemError({ method: "ensureDir", cause: new Error("retention unavailable") })),
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(LayerNode.group([FSUtil.node, filesystem]))))
+const failingWriterIt = testEffect(LayerNode.compile(Truncate.node, [[FSUtil.node, failingFs]]))
 
 describe("Truncate", () => {
   describe("output", () => {
@@ -34,7 +47,8 @@ describe("Truncate", () => {
         const result = yield* svc.output(content)
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("truncated...")
+        expect(result.content).toContain("output truncated")
+        expect(result.content).toContain("brotli compressed")
         if (result.truncated) expect(result.outputPath).toBeDefined()
       }),
     )
@@ -57,7 +71,10 @@ describe("Truncate", () => {
         const result = yield* svc.output(lines, { maxLines: 10 })
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("...90 lines truncated...")
+        expect(result.content).toContain("line0")
+        expect(result.content).toContain("line99")
+        expect(result.content).toContain("output truncated")
+        expect(result.content.split("\n").length).toBeLessThanOrEqual(10)
       }),
     )
 
@@ -68,20 +85,32 @@ describe("Truncate", () => {
         const result = yield* svc.output(content, { maxBytes: 100 })
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("truncated...")
+        expect(Buffer.byteLength(result.content, "utf-8")).toBeLessThanOrEqual(100)
+        if (result.truncated) expect(result.originalBytes).toBe(1000)
       }),
     )
 
-    it.live("truncates from head by default", () =>
+    it.live("retains both head and tail by default", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
         const lines = Array.from({ length: 10 }, (_, i) => `line${i}`).join("\n")
-        const result = yield* svc.output(lines, { maxLines: 3 })
+        const result = yield* svc.output(lines, { maxLines: 5, maxBytes: 10_000 })
 
         expect(result.truncated).toBe(true)
         expect(result.content).toContain("line0")
-        expect(result.content).toContain("line1")
-        expect(result.content).toContain("line2")
+        expect(result.content).toContain("line9")
+        if (result.truncated) expect(result.strategy).toBe("balanced")
+      }),
+    )
+
+    it.live("truncates from head when direction is head", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const lines = Array.from({ length: 10 }, (_, i) => `line${i}`).join("\n")
+        const result = yield* svc.output(lines, { maxLines: 5, maxBytes: 10_000, direction: "head" })
+
+        expect(result.truncated).toBe(true)
+        expect(result.content).toContain("line0")
         expect(result.content).not.toContain("line9")
       }),
     )
@@ -90,11 +119,9 @@ describe("Truncate", () => {
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
         const lines = Array.from({ length: 10 }, (_, i) => `line${i}`).join("\n")
-        const result = yield* svc.output(lines, { maxLines: 3, direction: "tail" })
+        const result = yield* svc.output(lines, { maxLines: 5, maxBytes: 10_000, direction: "tail" })
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("line7")
-        expect(result.content).toContain("line8")
         expect(result.content).toContain("line9")
         expect(result.content).not.toContain("line0")
       }),
@@ -103,6 +130,63 @@ describe("Truncate", () => {
     test("uses default MAX_LINES and MAX_BYTES", () => {
       expect(Truncate.MAX_LINES).toBe(2000)
       expect(Truncate.MAX_BYTES).toBe(50 * 1024)
+    })
+
+    it.live("metadata composition keeps producer and provider loss independent", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const projected = yield* svc.output("HEAD-" + "x".repeat(10_000) + "-TAIL", { maxBytes: 512 })
+        expect(projected.truncated).toBe(true)
+        if (!projected.truncated) throw new Error("expected provider projection")
+
+        const producerPath = "/producer/full-output"
+        const metadata = Truncate.mergeMetadata(
+          { truncated: true, outputPath: producerPath, rows: 100 },
+          projected,
+        )
+        expect(metadata.truncated).toBe(true)
+        expect(metadata.producerTruncated).toBe(true)
+        expect(metadata.providerTruncated).toBe(true)
+        expect(metadata.outputPath).toBe(producerPath)
+        expect(metadata.providerOutputPath).toBe(projected.outputPath)
+        expect(metadata.outputProjection?.originalBytes).toBe(projected.originalBytes)
+        expect(metadata.outputProjection?.segments).toEqual(projected.segments)
+      }),
+    )
+
+    test("metadata composition reports a clean provider projection without inventing a spill", () => {
+      const projected = { content: "ok", truncated: false } as const
+      const metadata = Truncate.mergeMetadata({ truncated: false, rows: 1 }, projected)
+      expect(metadata).toMatchObject({
+        rows: 1,
+        truncated: false,
+        producerTruncated: false,
+        providerTruncated: false,
+      })
+      expect("providerOutputPath" in metadata).toBe(false)
+      expect("outputProjection" in metadata).toBe(false)
+    })
+
+    test("metadata composition represents lossy provider projection when retention is unavailable", () => {
+      const projected: Truncate.Result = {
+        content: "HEAD\n[retention unavailable]\nTAIL",
+        truncated: true,
+        originalLines: 100,
+        originalBytes: 10_000,
+        retainedBytes: 8,
+        omittedBytes: 9_992,
+        strategy: "balanced",
+        segments: [
+          { startByte: 0, endByte: 4 },
+          { startByte: 9_996, endByte: 10_000 },
+        ],
+      }
+      const metadata = Truncate.mergeMetadata({ rows: 1 }, projected)
+      expect(metadata.truncated).toBe(true)
+      expect(metadata.providerTruncated).toBe(true)
+      expect("outputPath" in metadata).toBe(false)
+      expect("providerOutputPath" in metadata).toBe(false)
+      expect(metadata.outputProjection?.omittedBytes).toBe(9_992)
     })
 
     it.live("limits() falls back to MAX_LINES/MAX_BYTES when Config is not provided", () =>
@@ -132,7 +216,9 @@ describe("Truncate", () => {
           const content = Array.from({ length: 100 }, (_, i) => `line${i}`).join("\n")
           const result = yield* (yield* Truncate.Service).output(content)
           expect(result.truncated).toBe(true)
-          expect(result.content).toContain("...90 lines truncated...")
+          expect(result.content).toContain("line0")
+          expect(result.content).toContain("line99")
+          expect(result.content.split("\n").length).toBeLessThanOrEqual(10)
         }),
       )
 
@@ -143,7 +229,7 @@ describe("Truncate", () => {
           const content = "a".repeat(1000)
           const result = yield* (yield* Truncate.Service).output(content)
           expect(result.truncated).toBe(true)
-          expect(result.content).toContain("bytes truncated...")
+          expect(Buffer.byteLength(result.content, "utf-8")).toBeLessThanOrEqual(100)
         }),
       )
 
@@ -160,16 +246,17 @@ describe("Truncate", () => {
       )
     })
 
-    it.live("large single-line file truncates with byte message", () =>
+    it.live("large single-line file preserves useful beginning and end within byte budget", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
-        const fsys = yield* FSUtil.Service
-        const content = yield* fsys.readFileString(path.join(FIXTURES_DIR, "models-api.json"))
-        const result = yield* svc.output(content)
+        const content = "HEAD-" + "☃".repeat(40_000) + "-TAIL"
+        const result = yield* svc.output(content, { maxLines: 3, maxBytes: 1024 })
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("bytes truncated...")
-        expect(Buffer.byteLength(content, "utf-8")).toBeGreaterThan(Truncate.MAX_BYTES)
+        expect(result.content).toContain("HEAD-")
+        expect(result.content).toContain("-TAIL")
+        expect(result.content).not.toContain("�")
+        expect(Buffer.byteLength(result.content, "utf-8")).toBeLessThanOrEqual(1024)
       }),
     )
 
@@ -180,15 +267,18 @@ describe("Truncate", () => {
         const result = yield* svc.output(lines, { maxLines: 10 })
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("The tool call succeeded but the output was truncated")
-        expect(result.content).toContain("Grep")
+        expect(result.content).toContain("output truncated")
+        expect(result.content).toContain("archive({action:")
         if (!result.truncated) throw new Error("expected truncated")
         expect(result.outputPath).toBeDefined()
-        expect(result.outputPath).toContain("tool_")
+        const outputPath = result.outputPath
+        if (!outputPath) throw new Error("expected retained output path")
+        expect(outputPath).toContain("tool_")
+        expect(outputPath.endsWith(".br")).toBe(true)
 
         const fsys = yield* FSUtil.Service
-        const written = yield* fsys.readFileString(result.outputPath!)
-        expect(written).toBe(lines)
+        const written = yield* fsys.readFile(outputPath)
+        expect(brotliDecompressSync(written as unknown as Buffer).toString("utf-8")).toBe(lines)
       }),
     )
 
@@ -200,7 +290,7 @@ describe("Truncate", () => {
         const result = yield* svc.output(lines, { maxLines: 10 }, agent as any)
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("Grep")
+        expect(result.content).toContain("archive inspection")
         expect(result.content).toContain("Task tool")
       }),
     )
@@ -213,7 +303,7 @@ describe("Truncate", () => {
         const result = yield* svc.output(lines, { maxLines: 10 }, agent as any)
 
         expect(result.truncated).toBe(true)
-        expect(result.content).toContain("Grep")
+        expect(result.content).toContain("archive({action:")
         expect(result.content).not.toContain("Task tool")
       }),
     )
@@ -227,6 +317,18 @@ describe("Truncate", () => {
         expect(result.truncated).toBe(false)
         if (result.truncated) throw new Error("expected not truncated")
         expect("outputPath" in result).toBe(false)
+      }),
+    )
+
+    failingWriterIt.live("streaming retention initialization failure degrades to a disabled writer", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const writer = yield* svc.writer("initial output")
+        expect(writer.healthy()).toBe(false)
+        expect(writer.outputPath).toBeUndefined()
+        yield* writer.write("later output")
+        yield* writer.close
+        expect(writer.healthy()).toBe(false)
       }),
     )
 

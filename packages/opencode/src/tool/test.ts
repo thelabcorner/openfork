@@ -1,4 +1,4 @@
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 import path from "path"
 import fs from "node:fs/promises"
 import { ChildProcess } from "effect/unstable/process"
@@ -14,29 +14,7 @@ import { ToolID } from "./schema"
 import { TestScope } from "./test-scope"
 import DESCRIPTION from "./test.txt"
 
-export const Parameters = Schema.Struct({
-  action: Schema.optional(Schema.Literals(["run", "list"])).annotate({
-    description:
-      "What to do (default run). run = execute tests; list = enumerate test files (and names when the harness supports it cheaply).",
-  }),
-  path: Schema.optional(Schema.String).annotate({
-    description: "Filter: file or directory to run/list (relative). Default: harness default scope.",
-  }),
-  testNamePattern: Schema.optional(Schema.String).annotate({
-    description:
-      "Filter: test-name pattern (regex or substring per harness; mapped per harness: -t for bun/jest/vitest, --test-name-pattern for node:test, --grep for mocha, -g for playwright, --match for ava).",
-  }),
-  runtime: Schema.optional(Schema.Literals(["auto", "bun", "node"])).annotate({
-    description: "Runtime (default auto: prefer the repo's runtime). Explicit value forces the runner.",
-  }),
-  timeoutMs: Schema.optional(Schema.Int).annotate({
-    description: "Hard timeout for the run (default 120000; max 600000). On expiry the child is killed.",
-  }),
-  full: Schema.optional(Schema.Boolean).annotate({
-    description:
-      "Always spill the full output to a file and report the path (default: spill only on truncation/failure).",
-  }),
-})
+export const Parameters = TestScope.Parameters
 
 type Metadata = {
   action: string
@@ -98,61 +76,6 @@ function tailRing(raw: string, maxLines: number, maxBytes: number): string {
   return out.join("\n")
 }
 
-// Per-harness default globs for `list` (design §6.7). Config include/testMatch
-// overrides are probed first (see testGlobsFor).
-const DEFAULT_GLOBS: Record<string, string[]> = {
-  bun: ["**/*.{test,spec}.{ts,tsx,js,mjs,cjs}", "**/test/**/*.{ts,tsx,js,mjs,cjs}"],
-  vitest: ["**/*.{test,spec}.?(c|m)[jt]s?(x)"],
-  jest: ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)"],
-  node: ["**/*.test.{js,mjs,cjs}", "**/test-*.{js,mjs,cjs}", "**/test.{js,mjs,cjs}", "**/test/**/*.{js,mjs,cjs}"],
-  mocha: ["**/*.test.{js,cjs,mjs}", "**/test/**/*.{js,cjs,mjs}"],
-  ava: ["**/*.test.{js,mjs,cjs}", "**/test/**/*.{js,mjs,cjs}"],
-  playwright: ["**/*.@(spec|test).?(c|m)[jt]s?(x)"],
-}
-
-// Best-effort: extract string-literal array items like `include: ["a", "b"]`
-// or `testMatch: ["x", "y"]` from a config file's text.
-function arrayLiterals(text: string, key: string): string[] | undefined {
-  const re = new RegExp(`${key}\\s*:\\s*\\[([^\\]]*)\\]`)
-  const match = re.exec(text)
-  if (!match) return undefined
-  const items = [...match[1]!.matchAll(/["'`]([^"'`]+)["'`]/g)].map((m) => m[1]!)
-  return items.length > 0 ? items : undefined
-}
-
-// Resolve test-file globs for a harness, honoring config include/testMatch
-// when parseable (design §6.7). Falls back to defaults.
-async function testGlobsFor(harness: string, dir: string): Promise<string[]> {
-  const fs = await import("node:fs/promises")
-  if (harness === "vitest") {
-    for (const name of ["vitest.config.mjs", "vitest.config.js", "vitest.config.mts", "vitest.config.ts"]) {
-      const text = await fs.readFile(path.join(dir, name), "utf8").catch(() => undefined)
-      if (text !== undefined) {
-        const include = arrayLiterals(text, "include")
-        if (include) return include
-      }
-    }
-  }
-  if (harness === "jest") {
-    const json = await fs.readFile(path.join(dir, "jest.config.json"), "utf8").catch(() => undefined)
-    if (json !== undefined) {
-      try {
-        const testMatch = (JSON.parse(json) as { testMatch?: string[] }).testMatch
-        if (testMatch?.length) return testMatch
-      } catch {
-        // fall through to regex probe
-      }
-    }
-    for (const name of ["jest.config.mjs", "jest.config.js", "jest.config.ts"]) {
-      const text = await fs.readFile(path.join(dir, name), "utf8").catch(() => undefined)
-      if (text !== undefined) {
-        const testMatch = arrayLiterals(text, "testMatch")
-        if (testMatch) return testMatch
-      }
-    }
-  }
-  return DEFAULT_GLOBS[harness] ?? DEFAULT_GLOBS.node!
-}
 
 export const TestTool = Tool.define<
   typeof Parameters,
@@ -199,7 +122,7 @@ export const TestTool = Tool.define<
     }
 
     const runAction = Effect.fn("TestTool.runAction")(function* (
-      params: Schema.Schema.Type<typeof Parameters>,
+      params: TestScope.Input,
       ctx: Tool.Context<Metadata>,
       instance: { directory: string; worktree: string },
     ) {
@@ -409,7 +332,7 @@ export const TestTool = Tool.define<
     })
 
     const listAction = Effect.fn("TestTool.listAction")(function* (
-      params: Schema.Schema.Type<typeof Parameters>,
+      params: TestScope.Input,
       ctx: Tool.Context<Metadata>,
       instance: { directory: string; worktree: string },
     ) {
@@ -441,7 +364,7 @@ export const TestTool = Tool.define<
         metadata: { harness, runtime: params.runtime ?? "auto", path: params.path, command: commandText },
       })
 
-      const globs = yield* Effect.promise(() => testGlobsFor(harness, directory))
+      const globs = yield* Effect.promise(() => TestScope.testGlobsFor(harness, directory))
       const found = new Set<string>()
       let truncated = false
       for (const glob of globs) {
@@ -497,7 +420,7 @@ export const TestTool = Tool.define<
       exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
+      execute: (params: TestScope.Input, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
           const action = params.action ?? "run"

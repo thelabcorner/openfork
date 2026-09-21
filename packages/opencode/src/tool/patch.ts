@@ -454,20 +454,69 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       // Journal for rollback: every write is either committed or unwound, so
       // a mid-loop failure can no longer leave a half-applied refactor.
       const journal: Restorable[] = []
+      const pendingJournal = new Map<string, Restorable[]>()
+      const latestCommitted = new Map<string, Restorable>()
+      const addJournal = (entry: Restorable) => {
+        journal.push(entry)
+        const queue = pendingJournal.get(entry.filePath)
+        if (queue) queue.push(entry)
+        else pendingJournal.set(entry.filePath, [entry])
+      }
+      const markCommitted = (filePath: string, expectedExists: boolean, expectedContent?: Uint8Array) =>
+        Effect.sync(() => {
+          const queue = pendingJournal.get(filePath)
+          const entry = queue?.find((candidate) => !candidate.committed)
+          if (!entry) throw new Error("Patch rollback journal missing mutation for " + filePath)
+          entry.committed = true
+          entry.expectedExists = expectedExists
+          entry.expectedContent = expectedExists ? expectedContent : undefined
+          latestCommitted.set(filePath, entry)
+        })
+      const refreshCommittedContent = (filePath: string) =>
+        afs.readFile(filePath).pipe(
+          Effect.flatMap((content) =>
+            Effect.sync(() => {
+              const entry = latestCommitted.get(filePath)
+              if (!entry) throw new Error("Patch rollback journal missing committed mutation for " + filePath)
+              entry.expectedExists = true
+              entry.expectedContent = content
+            }),
+          ),
+        )
+      const encoded = (content: string) => new TextEncoder().encode(content)
       for (const change of actionable) {
         if (change.type === "move") {
           const destPrior = yield* Bom.readFile(afs, change.movePath!).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          journal.push({
+          addJournal({
             filePath: change.movePath!,
             existedBefore: destPrior !== undefined,
             contentBefore: destPrior?.text ?? "",
             bom: destPrior?.bom ?? change.bom,
+            committed: false,
           })
-          journal.push({ filePath: change.filePath, existedBefore: true, contentBefore: change.oldContent, bom: change.bom })
+          addJournal({
+            filePath: change.filePath,
+            existedBefore: true,
+            contentBefore: change.oldContent,
+            bom: change.bom,
+            committed: false,
+          })
         } else if (change.type === "add") {
-          journal.push({ filePath: change.filePath, existedBefore: false, contentBefore: "", bom: change.bom })
+          addJournal({
+            filePath: change.filePath,
+            existedBefore: false,
+            contentBefore: "",
+            bom: change.bom,
+            committed: false,
+          })
         } else {
-          journal.push({ filePath: change.filePath, existedBefore: true, contentBefore: change.oldContent, bom: change.bom })
+          addJournal({
+            filePath: change.filePath,
+            existedBefore: true,
+            contentBefore: change.oldContent,
+            bom: change.bom,
+            committed: false,
+          })
         }
       }
       const applyAll = Effect.gen(function* () {
@@ -481,18 +530,27 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
           const edited = change.type === "delete" ? undefined : (change.movePath ?? change.filePath)
           switch (change.type) {
             case "add":
-            case "update":
-              yield* afs.writeWithDirs(change.movePath ?? change.filePath, Bom.join(change.newContent, change.bom))
-              updates.push({ file: change.movePath ?? change.filePath, event: change.type === "add" ? "add" : "change" })
+            case "update": {
+              const target = change.movePath ?? change.filePath
+              const content = Bom.join(change.newContent, change.bom)
+              yield* afs.writeWithDirs(target, content)
+              yield* markCommitted(target, true, encoded(content))
+              updates.push({ file: target, event: change.type === "add" ? "add" : "change" })
               break
-            case "move":
-              yield* afs.writeWithDirs(change.movePath!, Bom.join(change.newContent, change.bom))
+            }
+            case "move": {
+              const content = Bom.join(change.newContent, change.bom)
+              yield* afs.writeWithDirs(change.movePath!, content)
+              yield* markCommitted(change.movePath!, true, encoded(content))
               yield* afs.remove(change.filePath)
+              yield* markCommitted(change.filePath, false)
               updates.push({ file: change.filePath, event: "unlink" })
               updates.push({ file: change.movePath!, event: "add" })
               break
+            }
             case "delete":
               yield* afs.remove(change.filePath)
+              yield* markCommitted(change.filePath, false)
               updates.push({ file: change.filePath, event: "unlink" })
               break
           }
@@ -500,6 +558,10 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
             if (yield* format.file(edited)) {
               yield* Bom.syncFile(afs, edited, change.bom)
             }
+            // Formatter/BOM normalization is part of our mutation. Refresh the
+            // compare-before-restore image so a later failure can distinguish
+            // our final bytes from a subsequent external writer.
+            yield* refreshCommittedContent(edited)
             yield* events.publish(FileSystem.Event.Edited, { file: edited })
           }
         }

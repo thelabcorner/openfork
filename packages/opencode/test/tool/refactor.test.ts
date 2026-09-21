@@ -217,4 +217,25 @@ describe("tool.refactor", () => {
       expect(result.metadata.status).toBe("noop")
     }),
   )
+
+  it.instance("rejects path-shaped preview ids before plan-cache lookup", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const registry = yield* ToolRegistry.Service
+      const tool = yield* toolByID(registry, RefactorTool.id)
+      if (!tool) throw new Error("refactor tool not found")
+
+      const exit = yield* tool
+        .execute(
+          {
+            mode: "preview",
+            previewId: "../../../../outside",
+          },
+          asks().ctx,
+        )
+        .pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, "outside.json")).exists())).toBe(false)
+    }),
+  )
 })

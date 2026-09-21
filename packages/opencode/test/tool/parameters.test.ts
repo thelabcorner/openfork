@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Result, Schema } from "effect"
 import { ToolJsonSchema } from "../../src/tool/json-schema"
+import { Goal } from "@opencode-ai/schema/goal"
 
 // Each tool exports its parameters schema at module scope so this test can
 // import them without running the tool's Effect-based init. The JSON Schema
@@ -61,6 +62,21 @@ describe("tool parameters", () => {
           questions: { items: { properties: { options: { items: { properties: { label: { type: "string" } } } } } } },
         },
       })
+    })
+
+    test("inlines a named root schema before handing canonical special-agent tools to providers", () => {
+      const document = Schema.toJsonSchemaDocument(Goal.AuditorVerdict)
+      const schema = ToolJsonSchema.fromJsonSchema({
+        ...document.schema,
+        $defs: document.definitions,
+      })
+      expect(schema.type).toBe("object")
+      expect(schema).not.toHaveProperty("$ref")
+      expect(schema).not.toHaveProperty("$defs")
+      expect(schema.anyOf).toHaveLength(3)
+      for (const branch of schema.anyOf ?? []) {
+        expect(branch).toMatchObject({ type: "object", properties: { decision: { type: "string" } } })
+      }
     })
 
     test("preserves required nullable fields", () => {

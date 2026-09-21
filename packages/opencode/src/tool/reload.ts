@@ -41,7 +41,6 @@ import { Tool } from "./tool"
 import { ToolRegistry } from "./registry"
 import { fromPlugin, isPluginTool, type CustomToolDeps } from "./custom"
 import { loadToolModule } from "./import"
-import { Agent } from "@/agent/agent"
 import { Truncate } from "./truncate"
 import { Clock, Context, Effect, Layer, Option, Queue, Ref, Scope } from "effect"
 
@@ -90,13 +89,12 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const events = yield* EventV2Bridge.Service
     const plugin = yield* Plugin.Service
-    const agent = yield* Agent.Service
     const truncate = yield* Truncate.Service
     const scope = yield* Scope.Scope
 
     const state = yield* InstanceState.make<ReloadState>(
       Effect.fn("ToolReload.state")(function* (ctx) {
-        const deps: CustomToolDeps = { agent, truncate, directory: ctx.directory, worktree: ctx.worktree }
+        const deps: CustomToolDeps = { truncate, directory: ctx.directory, worktree: ctx.worktree }
         const gate = yield* Ref.make(false)
         const pending = yield* Ref.make(false)
         const backoffUntil = yield* Ref.make(0)
@@ -432,7 +430,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Config.node, Plugin.node, EventV2Bridge.node, ToolRegistry.node, Agent.node, Truncate.node],
+  deps: [Config.node, Plugin.node, EventV2Bridge.node, ToolRegistry.node, Truncate.node],
 })
 
 // ---- pure helpers ----

@@ -12,7 +12,7 @@ Modes:
 
 PLAN-FIRST SAFETY (dry-run by default):
 - Every write-capable mode first produces a plan (previewId) and saves it to
-  .opencode/cache/refactor-preview/<id>.json (TTL 6h). No files change.
+  .openfork/cache/refactor-preview/<id>.json (TTL 6h). No files change.
 - Applying requires the saved plan id + confirm:"REFACTOR"; args alone are
   never enough to write.
 - Before applying, every touched file is re-fingerprinted — if any changed
