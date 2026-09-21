@@ -35,6 +35,13 @@ const truncate = Layer.succeed(
   Truncate.Service.of({
     cleanup: () => Effect.void,
     write: () => Effect.succeed("unused"),
+    writer: () =>
+      Effect.succeed({
+        outputPath: "unused.br",
+        write: () => Effect.void,
+        close: Effect.void,
+        healthy: () => true,
+      }),
     output: (text) => Effect.succeed({ content: text, truncated: false as const }),
     limits: () => Effect.succeed({ maxLines: 2_000, maxBytes: 50 * 1024 }),
   }),
@@ -89,6 +96,49 @@ describe("tool.goal", () => {
           userMessageID: "msg_goal_confirm",
           userText: "Yes, do it.",
           previousAssistantText: "This is multi-step work. Should I create a Goal and start it for you?",
+        },
+      ])
+    }),
+  )
+
+  it.effect("exposes Goal update and passes the explicit current human update directive", () =>
+    Effect.gen(function* () {
+      captured.length = 0
+      const info = yield* GoalTool
+      const tool = yield* info.init()
+      const ctx: Tool.Context = {
+        sessionID: SessionID.make("ses_goal_v1"),
+        messageID: MessageID.make("msg_goal_v1_assistant_update"),
+        callID: "call_goal_update",
+        agent: "build",
+        abort: AbortSignal.any([]),
+        messages: [
+          {
+            info: { id: MessageID.make("msg_goal_update"), role: "user" },
+            parts: [
+              {
+                type: "text",
+                text: "Update the goal and add stress-test corpuses plus 1:1 bitmap parity.",
+              },
+            ],
+          },
+        ] as any,
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      yield* tool.execute(
+        {
+          action: "update",
+          criteria: ["Stress-test corpuses cover difficult cases", "Rendered output maintains 1:1 bitmap parity"],
+        },
+        ctx,
+      )
+
+      expect(captured).toEqual([
+        {
+          userMessageID: "msg_goal_update",
+          userText: "Update the goal and add stress-test corpuses plus 1:1 bitmap parity.",
         },
       ])
     }),

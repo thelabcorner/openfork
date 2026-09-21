@@ -33,6 +33,7 @@ export const Input = Schema.Struct({
     "claim_step",
     "release_step",
     "verify",
+    "update",
     "create",
   ]),
   expectedRevision: Schema.optionalKey(Schema.Number),
@@ -92,6 +93,7 @@ const layer = Layer.effect(
       if (input.action === "create") {
         const authorization = GoalCreationPolicy.authorize(turn)
         if (!authorization.allowed) return yield* new GoalSchema.ValidationError({ reason: authorization.reason })
+        const authorizingTurn = authorization.source
         const session = yield* sessions.get(sessionID)
         if (!session) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${sessionID}` })
         if (session.parentID !== undefined) {
@@ -105,14 +107,21 @@ const layer = Layer.effect(
         if (criteria.length === 0) {
           return yield* new GoalSchema.ValidationError({ reason: "create requires at least one acceptance criterion" })
         }
-        if (input.continuationMode === "unattended" && !GoalCreationPolicy.explicitlyRequestsUnattended(turn!.userText)) {
+        const unattendedAuthorized =
+          GoalCreationPolicy.explicitlyRequestsUnattended(turn!.userText) ||
+          GoalCreationPolicy.explicitlyRequestsUnattended(authorizingTurn.userText)
+        if (input.continuationMode === "unattended" && !unattendedAuthorized) {
           return yield* new GoalSchema.ValidationError({
             reason: "unattended Goal creation requires the user to explicitly request unattended Goal mode",
           })
         }
 
         const existing = yield* goals.focused(sessionID)
-        const shouldStart = GoalCreationPolicy.explicitlyRequestsDraft(turn!.userText) ? false : (input.start ?? true)
+        const shouldStart =
+          GoalCreationPolicy.explicitlyRequestsDraft(turn!.userText) ||
+          GoalCreationPolicy.explicitlyRequestsDraft(authorizingTurn.userText)
+            ? false
+            : (input.start ?? true)
         if (existing) {
           if (existing.detail.goal.objective !== objective) {
             return yield* new GoalSchema.ValidationError({
@@ -151,7 +160,7 @@ const layer = Layer.effect(
           criteria,
           steps: input.steps,
           continuationPolicy: { mode: input.continuationMode ?? "auto_continue" },
-          sourceMessageID: turn!.userMessageID,
+          sourceMessageID: authorizingTurn.userMessageID,
           actor: "agent",
         })
         yield* goals.focus({ goalID: detail.goal.id, sessionID, role: "owner", actor: "agent" })
@@ -171,6 +180,39 @@ const layer = Layer.effect(
       let evidence: GoalModel.Evidence | undefined
 
       if (input.action === "status") return { action: input.action, goal: detail }
+
+      if (input.action === "update") {
+        const authorization = GoalCreationPolicy.authorizeUpdate(turn)
+        if (!authorization.allowed) return yield* new GoalSchema.ValidationError({ reason: authorization.reason })
+        if (input.start !== undefined || input.continuationMode !== undefined) {
+          return yield* new GoalSchema.ValidationError({
+            reason: "Goal update does not change start state or automation policy; use only user-directed specification fields",
+          })
+        }
+        if (
+          input.title === undefined &&
+          input.objective === undefined &&
+          input.constraints === undefined &&
+          input.criteria === undefined &&
+          input.steps === undefined
+        ) {
+          return yield* new GoalSchema.ValidationError({
+            reason: "update requires title, objective, constraints, criteria, and/or steps",
+          })
+        }
+        detail = yield* goals.amend({
+          id: detail.goal.id,
+          expectedRevision: expected(input, detail.goal.revision),
+          title: input.title,
+          objective: input.objective,
+          appendConstraints: input.constraints,
+          appendCriteria: input.criteria,
+          appendSteps: input.steps,
+          sourceMessageID: authorization.source.userMessageID,
+          actor: "agent",
+        })
+        return { action: input.action, goal: detail }
+      }
 
       if (input.action === "block") {
         if (!input.blocker?.trim()) return yield* new GoalSchema.ValidationError({ reason: "block requires blocker" })

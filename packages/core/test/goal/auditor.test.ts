@@ -8,6 +8,7 @@ import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { GoalV2 } from "@opencode-ai/core/goal"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { GoalAuditor } from "@opencode-ai/core/goal/auditor"
 import { GoalAuditorSessionTable } from "@opencode-ai/core/goal/sql"
 import { Location } from "@opencode-ai/core/location"
@@ -20,6 +21,7 @@ import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { MaintenanceUsageTable } from "@opencode-ai/core/usage/sql"
 import { Config } from "@opencode-ai/core/config"
 import { and, eq } from "drizzle-orm"
@@ -49,13 +51,18 @@ const grepCalls: string[] = []
 const globCalls: string[] = []
 let configEntries: Config.Entry[] = []
 let resolvedRefs: ModelV2.Ref[] = []
+let unavailableRefs = new Set<string>()
+let modelOverrides = new Map<string, typeof workerModel>()
 let currentCriteria: ReadonlyArray<{ id: string }> = []
 let readClockAdvanceMs = 0
+let resolveClockAdvanceMs = 0
+let defectReadPaths = new Set<string>()
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
+    compile: () => Effect.die("unused"),
     stream: ((request: LLMRequest) => {
       generateRequests.push(request)
       const next = generateResponses.shift()
@@ -76,6 +83,7 @@ const filesystem = Layer.succeed(
     read: ({ path }) =>
       Effect.gen(function* () {
         readCalls.push(path)
+        if (defectReadPaths.has(path)) return yield* Effect.die(new Error(`NotFound: FileSystem.stat (${path})`))
         if (readClockAdvanceMs > 0) yield* TestClock.adjust(readClockAdvanceMs)
         return { content: new TextEncoder().encode("export const shipped = true\n"), mime: "text/plain" }
       }),
@@ -110,16 +118,21 @@ const config = Layer.succeed(
 
 const models = SessionRunnerModel.layerWith(
   () => Effect.succeed(workerModel),
-  (ref) => {
+  (ref) => Effect.gen(function* () {
     resolvedRefs.push(ref)
-    return Effect.succeed(
-      ref.providerID === auditorRef.providerID && ref.id === auditorRef.id ? auditorModel : workerModel,
-    )
-  },
+    if (resolveClockAdvanceMs > 0) yield* TestClock.adjust(resolveClockAdvanceMs)
+    const key = `${ref.providerID}/${ref.id}`
+    if (unavailableRefs.has(key)) {
+      return yield* new SessionRunnerModel.ModelUnavailableError({ providerID: ref.providerID, modelID: ref.id })
+    }
+    const overridden = modelOverrides.get(key)
+    if (overridden) return overridden
+    return ref.providerID === auditorRef.providerID && ref.id === auditorRef.id ? auditorModel : workerModel
+  }),
 )
 
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, GoalV2.node, GoalAuditor.node]), [
+  AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, GoalV2.node, GoalAutomation.node, GoalAuditor.node]), [
     [LayerNodePlatform.llmClient, llmClient],
     [FileSystem.node, filesystem],
     [Config.node, config],
@@ -178,8 +191,12 @@ const setup = Effect.gen(function* () {
   globCalls.length = 0
   configEntries = []
   resolvedRefs = []
+  unavailableRefs = new Set()
+  modelOverrides = new Map()
   currentCriteria = []
   readClockAdvanceMs = 0
+  resolveClockAdvanceMs = 0
+  defectReadPaths = new Set()
 
   const { db } = yield* Database.Service
   yield* db
@@ -228,6 +245,49 @@ const focusedGoal = (options: { maxAttempts?: number; configuredModel?: boolean 
   })
 
 describe("GoalAuditor", () => {
+  it.effect("never exposes AUDITING when the auditor model cannot resolve", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      unavailableRefs.add(`${workerRef.providerID}/${workerRef.id}`)
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+
+      expect(result.ok).toBe(false)
+      expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
+    }),
+  )
+
+  it.effect("falls back from a stale inherited account-qualified worker model to its canonical catalog model", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      const staleRef: ModelV2.Ref = {
+        providerID: ProviderV2.ID.make("opencode-go"),
+        id: ModelV2.ID.make("deepseek-v4.1-flash@zen-stale-account"),
+        variant: ModelV2.VariantID.make("max"),
+      }
+      const canonicalRef: ModelV2.Ref = {
+        providerID: ProviderV2.ID.make("opencode-go"),
+        id: ModelV2.ID.make("deepseek-v4.1-flash"),
+        variant: ModelV2.VariantID.make("max"),
+      }
+      unavailableRefs.add(`${staleRef.providerID}/${staleRef.id}`)
+      modelOverrides.set(
+        `${canonicalRef.providerID}/${canonicalRef.id}`,
+        Model.make({ id: canonicalRef.id, provider: canonicalRef.providerID, route: OpenAIChat.route }),
+      )
+      generateResponses = [verdict("canonical-fallback", "continue")]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: staleRef })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.model).toEqual(canonicalRef)
+      expect(resolvedRefs).toEqual([staleRef, canonicalRef])
+    }),
+  )
+
   it.effect("performs read-only reconnaissance before committing audit_verdict", () =>
     Effect.gen(function* () {
       yield* setup
@@ -256,6 +316,9 @@ describe("GoalAuditor", () => {
 
       expect(result).toMatchObject({ ok: true, model: auditorRef, rounds: 2 })
       if (!result.ok) return
+      // The live lease belongs only to evaluate(); terminal success must have
+      // finalized it before the caller receives the verdict.
+      expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
       expect(result.tokens).toBeGreaterThan(0)
       expect(result.tools).toEqual(["read", "grep", "glob", "audit_verdict"])
       expect(readCalls).toEqual(["src/feature.ts"])
@@ -296,6 +359,15 @@ describe("GoalAuditor", () => {
 
       const history = yield* SessionHistory.load(readDb, result.auditorSessionID)
       expect(history.some((message) => message.type === "system" && message.text.includes("[GOAL AUDIT CYCLE]"))).toBe(true)
+      const prompts = history.filter(
+        (message) =>
+          message.type === "synthetic" &&
+          message.provenance?.owner === "host" &&
+          message.provenance.source === SessionTurnProvenance.Source.GoalAuditor,
+      )
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0]?.type === "synthetic" ? prompts[0].text : "").toContain("Worker says it shipped.")
+      expect(prompts[0] && SessionTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
       const assistants = history.filter((message) => message.type === "assistant")
       expect(assistants).toHaveLength(2)
       expect(
@@ -324,6 +396,27 @@ describe("GoalAuditor", () => {
     }),
   )
 
+  it.effect("survives a missing-path filesystem defect and lets the auditor recover", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      defectReadPaths.add("docs")
+      generateResponses = [
+        response({ id: "missing-read", name: "read", input: { path: "docs" } }),
+        verdict("after-missing-read", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.rounds).toBe(2)
+      expect(readCalls).toEqual(["docs"])
+      expect(result.tools).toEqual(["read", "audit_verdict"])
+      expect(JSON.stringify(generateRequests[1]!.messages)).toContain("Unable to read docs")
+    }),
+  )
+
   it.effect("reuses exactly one host-owned auditor Session for the same parent and Goal", () =>
     Effect.gen(function* () {
       yield* setup
@@ -343,6 +436,7 @@ describe("GoalAuditor", () => {
       expect(
         yield* goals.auditorSessionFor({ parentSessionID: sessionID, goalID: active.goal.id }),
       ).toBe(first.auditorSessionID)
+      expect((yield* goals.focused(sessionID))?.auditorSessionID).toBe(first.auditorSessionID)
       expect(yield* goals.isAuditorSession(first.auditorSessionID)).toBe(true)
       expect(yield* goals.focused(first.auditorSessionID)).toBeUndefined()
 
@@ -388,6 +482,38 @@ describe("GoalAuditor", () => {
         (message) => message.type === "system" && message.text.includes("[GOAL AUDITOR REMINDER"),
       )
       expect(reminders).toHaveLength(1)
+    }),
+  )
+
+  it.effect("hard-stops the whole auditor after one five-minute execution budget", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      readClockAdvanceMs = GoalAuditor.AUDITOR_EXECUTION_TIMEOUT_MS + 1
+      generateResponses = [
+        response({ id: "slow-read", name: "read", input: { path: "src/feature.ts" } }),
+        verdict("after-time-limit", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toContain("5-minute execution budget")
+      expect(generateRequests).toHaveLength(1)
+      expect(yield* (yield* GoalAutomation.Service).runtime(sessionID)).toBeUndefined()
+    }),
+  )
+
+  it.effect("does not charge model resolution time against the five-minute auditor execution budget", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      resolveClockAdvanceMs = GoalAuditor.AUDITOR_EXECUTION_TIMEOUT_MS + 1
+      generateResponses = [verdict("after-slow-resolution", "complete", true)]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      expect(generateRequests).toHaveLength(1)
     }),
   )
 

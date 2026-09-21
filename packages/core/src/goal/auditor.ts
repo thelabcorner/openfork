@@ -8,14 +8,16 @@ import {
   Message,
   type Model as LLMModel,
   Tool,
+  type ToolDefinition,
   ToolFailure,
   type ToolResultValue,
   ToolRuntime,
   toDefinitions,
 } from "@opencode-ai/llm"
-import { Clock, Context, DateTime, Effect, Layer, Schema } from "effect"
+import { Clock, Context, DateTime, Duration, Effect, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Goal as GoalModel } from "@opencode-ai/schema/goal"
+import { splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
 import { Config } from "../config"
 import { makeLocationNode } from "../effect/app-node"
 import { llmClient } from "../effect/app-node-platform"
@@ -28,8 +30,10 @@ import {
   collectUntilTerminalTool,
   generateAdaptive,
   boundedMaxTokens,
+  modelOutputLimit,
   retryMaxTokens,
   runTerminalCompletionWithTranscript,
+  SPECIAL_AGENT_TIME_WINDOW_MS,
   type TerminalAttempt,
   terminalCompletionAccepted,
   withSpecialAgentTimeout,
@@ -39,14 +43,18 @@ import { SessionRunnerModel } from "../session/runner/model"
 import { SessionSchema } from "../session/schema"
 import { SessionEvent } from "../session/event"
 import { SessionMessage } from "../session/message"
-import { createLLMEventPublisher } from "../session/runner/publish-llm-event"
 import { Token } from "../util/token"
 import { EventV2 } from "../event"
 import { UsageRecord } from "../usage/record"
+import { SpecialAgentSession } from "../special-agent-session"
 import { Goal } from "./index"
+import { GoalAutomation } from "./automation"
 import { DEFAULT_PROMPT, PROTOCOL_PROMPT } from "./auditor-prompt"
 
 export { DEFAULT_PROMPT, PROTOCOL_PROMPT }
+
+/** One auditor execution budget, including provider generation and all tool rounds. */
+export const AUDITOR_EXECUTION_TIMEOUT_MS = SPECIAL_AGENT_TIME_WINDOW_MS
 
 export type Success = {
   readonly ok: true
@@ -73,6 +81,48 @@ export type Failure = {
 
 export type Result = Success | Failure
 
+/**
+ * Opaque model resolved by the runtime that actually executes the Goal audit.
+ * Core owns the audit protocol, tools, transcript and verdict semantics; the
+ * host owns provider/model resolution and transport. This mirrors Prompt
+ * Revisor's runtime seam and prevents OpenCode's production Provider catalog
+ * from being re-resolved through Core's standalone Catalog.
+ */
+export interface ResolvedModel {
+  readonly ref: ModelV2.Ref
+  readonly value: unknown
+  readonly capability: ToolChoiceCapabilityIdentity
+  readonly outputLimit?: number
+}
+
+export class RuntimeUnavailableError extends Schema.TaggedErrorClass<RuntimeUnavailableError>()(
+  "GoalAuditor.RuntimeUnavailableError",
+  { message: Schema.String },
+) {}
+
+export interface RuntimeGenerateInput {
+  readonly model: ResolvedModel
+  readonly sessionID: SessionSchema.ID
+  readonly system: string
+  readonly messages: readonly Message[]
+  readonly tools: readonly ToolDefinition[]
+  readonly toolChoice: "auto" | "required" | "none"
+  readonly generation: {
+    readonly maxTokens?: number
+    readonly temperature?: number
+  }
+  readonly publish: (event: LLMEvent) => Effect.Effect<void>
+}
+
+export interface Runtime {
+  readonly resolveModel: (input: {
+    readonly configured?: ModelV2.Ref
+    readonly workerModel?: ModelV2.Ref
+    readonly session?: SessionSchema.Info
+  }) => Effect.Effect<ResolvedModel, RuntimeUnavailableError>
+  readonly generate: (input: RuntimeGenerateInput) => Effect.Effect<LLMResponse, RuntimeUnavailableError>
+}
+
 /** One physical provider request made by the Goal auditor. Kept provider-neutral
  * so the host can price it with the same model catalog used for normal turns. */
 export type UsageSample = {
@@ -93,7 +143,20 @@ export interface Interface {
     readonly session?: SessionSchema.Info
     readonly workerModel?: ModelV2.Ref
     readonly latestWork?: string
+    /** Claimed continuation whose worker cycle is now being audited. */
+    readonly reservationID?: string
   }) => Effect.Effect<Result>
+  /** Production/runtime override using the host application's canonical provider stack. */
+  readonly evaluateWithRuntime: (
+    input: {
+      readonly sessionID: SessionSchema.ID
+      readonly session?: SessionSchema.Info
+      readonly workerModel?: ModelV2.Ref
+      readonly latestWork?: string
+      readonly reservationID?: string
+    },
+    runtime: Runtime,
+  ) => Effect.Effect<Result>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/GoalAuditor") {}
@@ -335,12 +398,14 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const goals = yield* Goal.Service
+    const automation = yield* GoalAutomation.Service
     const models = yield* SessionRunnerModel.Service
     const llm = yield* LLMClient.Service
     const files = yield* FileSystem.Service
     const config = yield* Config.Service
     const events = yield* EventV2.Service
     const usageRecord = yield* UsageRecord.Service
+    const specialAgents = yield* SpecialAgentSession.Service
 
     const readonlyTools = {
       read: Tool.make({
@@ -353,7 +418,14 @@ const layer = Layer.effect(
             if (sensitivePath(path)) return yield* toolFailure("Sensitive files are not available to the Goal auditor")
             const result = yield* files
               .read({ path })
-              .pipe(Effect.mapError(() => toolFailure(`Unable to read ${path}`)))
+              .pipe(
+                Effect.mapError(() => toolFailure(`Unable to read ${path}`)),
+                // FileSystem.read intentionally exposes a `never` error channel
+                // and turns missing paths/directories/escape attempts into
+                // defects. Reconnaissance mistakes are model-correctable tool
+                // failures, not reasons to kill the independent auditor.
+                Effect.catchDefect(() => Effect.fail(toolFailure(`Unable to read ${path}`))),
+              )
             if (result.content.includes(0))
               return yield* toolFailure("Binary files are not available to the Goal auditor")
             return lineSlice(new TextDecoder().decode(result.content))
@@ -376,6 +448,7 @@ const layer = Layer.effect(
                 : matches.map((match) => `${match.entry.path}:${match.line}: ${match.text.trimEnd()}`).join("\n"),
             ),
             Effect.mapError(() => toolFailure("Search failed")),
+            Effect.catchDefect(() => Effect.fail(toolFailure("Search failed"))),
           ),
       }),
       glob: Tool.make({
@@ -388,6 +461,7 @@ const layer = Layer.effect(
               entries.length === 0 ? "No files found" : entries.map((entry) => entry.path).join("\n"),
             ),
             Effect.mapError(() => toolFailure("Glob failed")),
+            Effect.catchDefect(() => Effect.fail(toolFailure("Glob failed"))),
           ),
       }),
       [AUDIT_VERDICT]: Tool.make({
@@ -399,7 +473,7 @@ const layer = Layer.effect(
       }),
     } as const
 
-    const resolveModel = Effect.fn("GoalAuditor.resolveModel")(function* (
+    const resolveCoreModel = Effect.fn("GoalAuditor.resolveCoreModel")(function* (
       configured: ModelV2.Ref | undefined,
       input: {
         session?: SessionSchema.Info
@@ -407,41 +481,125 @@ const layer = Layer.effect(
       },
     ) {
       if (configured) return yield* models.resolveRef(configured)
-      if (input.workerModel) return yield* models.resolveRef(input.workerModel)
+      if (input.workerModel) {
+        const inherited = input.workerModel
+        return yield* models.resolveRef(inherited).pipe(
+          Effect.catchTag("SessionRunnerModel.ModelUnavailableError", (error) => {
+            const parts = splitModelIDForProvider(inherited.id, inherited.providerID)
+            if (parts.baseModelID === inherited.id) return Effect.fail(error)
+            // V1 provider catalogs persist account-qualified model ids. The
+            // account suffix is routing metadata and may legitimately change
+            // when credentials are re-enrolled. An inherited auditor model may
+            // therefore fall back to the canonical model row while preserving
+            // the worker's variant. Explicit auditor-model selections above
+            // remain exact and never silently switch accounts/models.
+            return models.resolveRef({
+              ...inherited,
+              id: ModelV2.ID.make(parts.baseModelID),
+            })
+          }),
+        )
+      }
       if (input.session) return yield* models.resolve(input.session)
       return yield* Effect.die("Goal auditor has no model source")
     })
 
+    const coreRuntime: Runtime = {
+      resolveModel: Effect.fn("GoalAuditor.coreRuntime.resolveModel")(function* (input) {
+        const requested = input.configured ?? input.workerModel ?? input.session?.model
+        const model = yield* resolveCoreModel(input.configured, input).pipe(
+          Effect.mapError(
+            (error) =>
+              new RuntimeUnavailableError({
+                message: error instanceof Error ? error.message : String(error),
+              }),
+          ),
+        )
+        return {
+          ref: {
+            providerID: ProviderV2.ID.make(model.provider),
+            id: ModelV2.ID.make(model.id),
+            ...(requested?.variant === undefined ? {} : { variant: requested.variant }),
+          },
+          value: model,
+          capability: {
+            providerID: String(model.provider),
+            modelID: String(model.id),
+            apiURL: model.route.endpoint.baseURL,
+            routeID: model.route.id,
+            routeProtocol: String(model.route.protocol),
+          },
+          outputLimit: modelOutputLimit(model),
+        } satisfies ResolvedModel
+      }),
+      generate: Effect.fn("GoalAuditor.coreRuntime.generate")(function* (request) {
+        const model = request.model.value as LLMModel
+        const llmRequest = LLM.request({
+          model,
+          system: request.system,
+          messages: request.messages,
+          tools: request.tools,
+          toolChoice: request.toolChoice,
+          generation: request.generation,
+        })
+        const response = yield* collectUntilTerminalTool(
+          llm.stream(llmRequest).pipe(Stream.tap((event) => request.publish(event))),
+          AUDIT_VERDICT,
+        ).pipe(
+          Effect.mapError(
+            (error) =>
+              new RuntimeUnavailableError({
+                message: error instanceof Error ? error.message : String(error),
+              }),
+          ),
+        )
+        if (!response) return yield* new RuntimeUnavailableError({ message: "Goal audit ended without a terminal response" })
+        return response
+      }),
+    }
+
     const runAudit = Effect.fn("GoalAuditor.run")(function* (input: {
       detail: Goal.Detail
       evidence: ReadonlyArray<GoalModel.Evidence>
-      model: LLMModel
-      modelRef: ModelV2.Ref
+      model: ResolvedModel
+      runtime: Runtime
       auditorSessionID: SessionSchema.ID
       system: string
       latestWork?: string
     }) {
-      const messages: Message[] = [Message.user(render(input.detail, input.evidence, input.latestWork))]
+      const requestText = render(input.detail, input.evidence, input.latestWork)
+      yield* specialAgents.publishPrompt({
+        sessionID: input.auditorSessionID,
+        agent: "goal_auditor",
+        text: requestText,
+      })
+      const messages: Message[] = [Message.user(requestText)]
       const usedTools: string[] = []
       const usageSamples: UsageSample[] = []
       let tokens = 0
       let reminderDeadline = (yield* Clock.currentTimeNanos) + AUDITOR_REMINDER_INTERVAL_NANOS
       let activeReminder: Message | undefined
-      const capability: ToolChoiceCapabilityIdentity = {
-        providerID: String(input.model.provider),
-        modelID: String(input.model.id),
-        apiURL: input.model.route.endpoint.baseURL,
-        routeID: input.model.route.id,
-        routeProtocol: String(input.model.route.protocol),
-      }
+      const capability = input.model.capability
 
       type ProviderTurn = {
         readonly response: LLMResponse
-        readonly publisher: ReturnType<typeof createLLMEventPublisher>
+        readonly publisher: ReturnType<SpecialAgentSession.Interface["publisher"]>
         readonly sample: UsageSample
         settled: boolean
       }
       const pendingTurns = new Set<ProviderTurn>()
+
+      const turnTokens = (turn: ProviderTurn) => {
+        const cachedRead = Math.max(0, turn.sample.cacheReadInputTokens)
+        const cachedWrite = Math.max(0, turn.sample.cacheWriteInputTokens)
+        const reasoning = Math.max(0, turn.sample.reasoningTokens)
+        return {
+          input: Math.max(0, turn.sample.inputTokens - cachedRead - cachedWrite),
+          output: Math.max(0, turn.sample.outputTokens - reasoning),
+          reasoning,
+          cache: { read: cachedRead, write: cachedWrite },
+        }
+      }
 
       const publishSystem = Effect.fn("GoalAuditor.publishSystem")(function* (text: string) {
         yield* events.publish(SessionEvent.ContextUpdated, {
@@ -457,29 +615,13 @@ const layer = Layer.effect(
         results: ReadonlyArray<{ readonly id: string; readonly name: string; readonly result: ToolResultValue }> = [],
       ) {
         if (turn.settled) return
-        for (const result of results) {
-          yield* turn.publisher.publish(
-            LLMEvent.toolResult({ id: result.id, name: result.name, result: result.result }),
-          )
-        }
-        yield* turn.publisher.flush()
-        const assistantMessageID = yield* turn.publisher.startAssistant()
-        const cachedRead = Math.max(0, turn.sample.cacheReadInputTokens)
-        const cachedWrite = Math.max(0, turn.sample.cacheWriteInputTokens)
-        const reasoning = Math.max(0, turn.sample.reasoningTokens)
-        const tokenSummary = turn.publisher.stepSettlement()?.tokens ?? {
-          input: Math.max(0, turn.sample.inputTokens - cachedRead - cachedWrite),
-          output: Math.max(0, turn.sample.outputTokens - reasoning),
-          reasoning,
-          cache: { read: cachedRead, write: cachedWrite },
-        }
-        yield* events.publish(SessionEvent.Step.Ended, {
+        yield* specialAgents.settleTurn({
           sessionID: input.auditorSessionID,
-          timestamp: yield* DateTime.now,
-          assistantMessageID,
-          finish: turn.publisher.stepSettlement()?.finish ?? turn.response.finishReason,
+          publisher: turn.publisher,
+          response: turn.response,
+          toolResults: results,
+          tokens: turnTokens(turn),
           cost: 0,
-          tokens: tokenSummary,
         })
         turn.settled = true
         pendingTurns.delete(turn)
@@ -489,21 +631,36 @@ const layer = Layer.effect(
         if (pendingTurns.size === 0) return
         const pending = Array.from(pendingTurns)
         for (const turn of pending) {
-          const results = turn.response.toolCalls
-            .filter((call) => call.providerExecuted !== true)
-            .map((call) => ({
-              id: call.id,
-              name: call.name,
-              result: {
-                type: "error" as const,
-                value: `Goal auditor protocol correction. ${AUDITOR_PROTOCOL_IDENTITY}`,
-              },
-            }))
-          yield* settleTurn(turn, results)
+          yield* specialAgents.rejectTurn({
+            sessionID: input.auditorSessionID,
+            publisher: turn.publisher,
+            response: turn.response,
+            tokens: turnTokens(turn),
+            cost: 0,
+            reason: `Goal auditor protocol correction. ${AUDITOR_PROTOCOL_IDENTITY}`,
+          })
+          turn.settled = true
+          pendingTurns.delete(turn)
         }
         yield* publishSystem(`[GOAL AUDITOR PROTOCOL CORRECTION] ${AUDITOR_PROTOCOL_IDENTITY}`)
       })
 
+      const rejectPendingTurns = Effect.fn("GoalAuditor.rejectPendingTurns")(function* (reason: string) {
+        for (const turn of Array.from(pendingTurns)) {
+          yield* specialAgents.rejectTurn({
+            sessionID: input.auditorSessionID,
+            publisher: turn.publisher,
+            response: turn.response,
+            tokens: turnTokens(turn),
+            cost: 0,
+            reason,
+          })
+          turn.settled = true
+          pendingTurns.delete(turn)
+        }
+      })
+
+      return yield* Effect.gen(function* () {
       const prepareMessages = Effect.fn("GoalAuditor.prepareMessages")(function* (current: ReadonlyArray<Message>) {
         const now = yield* Clock.currentTimeNanos
         if (now >= reminderDeadline) {
@@ -511,7 +668,7 @@ const layer = Layer.effect(
           activeReminder = Message.system(AUDITOR_REMINDER)
           yield* publishSystem(AUDITOR_REMINDER)
         }
-        return activeReminder ? [...current, activeReminder] : current
+        return [...current, ...(activeReminder ? [activeReminder] : [])]
       })
 
       yield* publishSystem(
@@ -532,23 +689,11 @@ const layer = Layer.effect(
           ? { [AUDIT_VERDICT]: readonlyTools[AUDIT_VERDICT] }
           : readonlyTools
         const requestMessages = yield* prepareMessages(inputGenerate.messages)
-        const baseRequest = LLM.request({
-          model: input.model,
-          system: input.system,
-          messages: requestMessages,
-          tools: toDefinitions(availableTools),
-          toolChoice: "required",
-          generation: {
-            // A verdict truncated at the output limit is a budget problem, not a
-            // protocol violation: give the retry more room.
-            maxTokens: boundedMaxTokens(
-              input.model,
-              retryMaxTokens(AUDIT_MAX_TOKENS, inputGenerate.attempt, AUDIT_MAX_TOKENS_CEILING),
-            ),
-            temperature: 0.1,
-          },
-        })
-        let publisher: ReturnType<typeof createLLMEventPublisher> | undefined
+        const tools = toDefinitions(availableTools)
+        const requestedMaxTokens = retryMaxTokens(AUDIT_MAX_TOKENS, inputGenerate.attempt, AUDIT_MAX_TOKENS_CEILING)
+        const maxTokens =
+          input.model.outputLimit === undefined ? requestedMaxTokens : Math.min(requestedMaxTokens, input.model.outputLimit)
+        let publisher: ReturnType<SpecialAgentSession.Interface["publisher"]> | undefined
         let startedAt = Date.now()
         const generated = yield* generateAdaptive({
           identity: capability,
@@ -556,20 +701,27 @@ const layer = Layer.effect(
           generate: (toolChoice) =>
             Effect.gen(function* () {
               startedAt = Date.now()
-              const current = createLLMEventPublisher(events, {
+              const current = specialAgents.publisher({
                 sessionID: input.auditorSessionID,
-                agent: AUDITOR_AGENT,
-                model: input.modelRef,
+                agent: "goal_auditor",
+                model: input.model.ref,
               })
               publisher = current
               current.setRequestSentAt(yield* DateTime.now)
-              const response = yield* collectUntilTerminalTool(
-                llm
-                  .stream(LLM.updateRequest(baseRequest, { toolChoice }))
-                  .pipe(Stream.tap((event) => current.publish(event))),
-                AUDIT_VERDICT,
-              )
-              if (!response) return yield* Effect.fail(new Error("Goal audit ended without a terminal response"))
+              const response = yield* specialAgents.guardProviderTurn({
+                publisher: current,
+                label: "Goal auditor",
+                effect: input.runtime.generate({
+                  model: input.model,
+                  sessionID: input.auditorSessionID,
+                  system: input.system,
+                  messages: requestMessages,
+                  tools,
+                  toolChoice,
+                  generation: { maxTokens, temperature: 0.1 },
+                  publish: (event) => current.publish(event),
+                }),
+              })
               if (current.hasAssistantStarted()) yield* current.streamed()
               return response
             }),
@@ -578,7 +730,10 @@ const layer = Layer.effect(
         if (!settledPublisher) return yield* Effect.die("Goal auditor provider turn completed without a publisher")
         const completedAt = Date.now()
         const reported = generated.response.usage
-        const fallback = reported === undefined ? safetyUsageEstimate(baseRequest, generated.response) : undefined
+        const fallback =
+          reported === undefined
+            ? safetyUsageEstimate({ system: input.system, messages: requestMessages, tools }, generated.response)
+            : undefined
         const sample: UsageSample = {
           estimated: reported === undefined,
           inputTokens: reported?.inputTokens ?? fallback?.inputTokens ?? 0,
@@ -594,9 +749,9 @@ const layer = Layer.effect(
         tokens += sample.totalTokens
         yield* usageRecord.recordMaintenance({
           agent: AUDITOR_AGENT,
-          providerID: String(input.model.provider),
-          modelID: String(input.model.id),
-          variant: input.modelRef.variant,
+          providerID: String(input.model.ref.providerID),
+          modelID: String(input.model.ref.id),
+          variant: input.model.ref.variant,
           sessionID: input.auditorSessionID,
           projectID: input.detail.goal.projectID,
           costEstimated: sample.estimated,
@@ -769,21 +924,34 @@ const layer = Layer.effect(
         tools: usedTools,
         usage: usageSamples,
       }
+      }).pipe(
+        Effect.ensuring(
+          rejectPendingTurns("Goal auditor operation ended before the provider turn was interpreted."),
+        ),
+      )
     })
-    const evaluate = Effect.fn("GoalAuditor.evaluate")(function* (input: {
+    const evaluateWith = Effect.fn("GoalAuditor.evaluateWithRuntime")(function* (
+      input: {
       sessionID: SessionSchema.ID
       session?: SessionSchema.Info
       workerModel?: ModelV2.Ref
       latestWork?: string
-    }) {
+      reservationID?: string
+      },
+      runtime: Runtime,
+    ) {
       const focused = yield* goals.focused(input.sessionID)
       if (!focused) return { ok: false, error: "no focused Goal" } satisfies Failure
-      if (focused.detail.goal.continuationPolicy.mode === "manual")
-        return { ok: false, error: "Goal automation is manual" } satisfies Failure
 
       const configured = focused.detail.goal.auditorPolicy.model
       const requested = configured ?? input.workerModel ?? input.session?.model
-      const modelExit = yield* resolveModel(configured, input).pipe(Effect.exit)
+      const modelExit = yield* runtime
+        .resolveModel({
+          ...(configured ? { configured } : {}),
+          ...(input.workerModel ? { workerModel: input.workerModel } : {}),
+          ...(input.session ? { session: input.session } : {}),
+        })
+        .pipe(Effect.exit)
       if (modelExit._tag === "Failure")
         return {
           ok: false,
@@ -791,11 +959,7 @@ const layer = Layer.effect(
           ...(requested ? { model: requested } : {}),
         } satisfies Failure
       const model = modelExit.value
-      const ref = {
-        id: ModelV2.ID.make(model.id),
-        providerID: ProviderV2.ID.make(model.provider),
-        ...(requested?.variant === undefined ? {} : { variant: requested.variant }),
-      } satisfies ModelV2.Ref
+      const ref = model.ref
       const auditorSession = yield* goals
         .auditorSession({
           parentSessionID: input.sessionID,
@@ -816,65 +980,110 @@ const layer = Layer.effect(
       const policy = Config.latest(entries, "auditor_prompt")?.trim() || DEFAULT_PROMPT
       const system = `${policy}\n\n${PROTOCOL_PROMPT}`
       const attempts = Math.max(1, Math.min(8, Math.floor(focused.detail.goal.auditorPolicy.maxAttempts ?? 2)))
-      let lastError = "Goal auditor failed"
-      let consumedTokens = 0
-      let rounds = 0
-      let usedTools: ReadonlyArray<string> = []
-      let usage: ReadonlyArray<UsageSample> = []
-
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        const attemptResult = yield* runAudit({
-          detail: focused.detail,
-          evidence,
-          model,
-          modelRef: ref,
+      // This is the authoritative execution boundary for the UI's AUDITING
+      // state. Model resolution and child provisioning have already succeeded,
+      // and from this point until finalization this Effect is the live auditor.
+      const running = yield* automation.beginAudit({
+        sessionID: input.sessionID,
+        auditorSessionID,
+        ...(input.reservationID ? { reservationID: input.reservationID } : {}),
+      })
+      if (!running || running.phase !== "auditing") {
+        return {
+          ok: false,
+          error: "Goal auditor could not acquire its live execution lease",
+          model: ref,
           auditorSessionID,
-          system,
-          latestWork: input.latestWork,
-        })
-        consumedTokens += attemptResult.tokens
-        rounds += attemptResult.rounds
-        usedTools = [...usedTools, ...attemptResult.tools]
-        usage = [...usage, ...attemptResult.usage]
-        if (attemptResult.ok) {
-          return {
-            ok: true,
-            verdict: attemptResult.verdict,
-            goalRevision: focused.detail.goal.revision,
-            model: ref,
-            tokens: consumedTokens,
-            rounds,
-            tools: usedTools,
-            usage,
-            auditorSessionID,
-          } satisfies Success
-        }
-        lastError = attemptResult.error
+        } satisfies Failure
       }
 
-      return {
-        ok: false,
-        error: `${lastError} (after ${attempts} auditor attempt${attempts === 1 ? "" : "s"})`,
-        model: ref,
-        tokens: consumedTokens,
-        rounds,
-        tools: usedTools,
-        usage,
-        auditorSessionID,
-      } satisfies Failure
+      const execute: Effect.Effect<Result> = Effect.gen(function* () {
+        let lastError = "Goal auditor failed"
+        let consumedTokens = 0
+        let rounds = 0
+        let usedTools: ReadonlyArray<string> = []
+        let usage: ReadonlyArray<UsageSample> = []
+
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          const attemptResult = yield* runAudit({
+            detail: focused.detail,
+            evidence,
+            model,
+            runtime,
+            auditorSessionID,
+            system,
+            latestWork: input.latestWork,
+          })
+          consumedTokens += attemptResult.tokens
+          rounds += attemptResult.rounds
+          usedTools = [...usedTools, ...attemptResult.tools]
+          usage = [...usage, ...attemptResult.usage]
+          if (attemptResult.ok) {
+            return {
+              ok: true,
+              verdict: attemptResult.verdict,
+              goalRevision: focused.detail.goal.revision,
+              model: ref,
+              tokens: consumedTokens,
+              rounds,
+              tools: usedTools,
+              usage,
+              auditorSessionID,
+            } satisfies Success
+          }
+          lastError = attemptResult.error
+        }
+
+        return {
+          ok: false,
+          error: `${lastError} (after ${attempts} auditor attempt${attempts === 1 ? "" : "s"})`,
+          model: ref,
+          tokens: consumedTokens,
+          rounds,
+          tools: usedTools,
+          usage,
+          auditorSessionID,
+        } satisfies Failure
+      }).pipe(Effect.ensuring(automation.endAudit(input.sessionID)))
+
+      // The auditor budget is execution time, not Goal lifetime and not model
+      // discovery/provisioning time. Start the single absolute wall-clock timer
+      // only after the real auditor child owns the live lease; it then covers
+      // every provider generation, read/grep/glob round, protocol repair, and
+      // retry until a verdict or timeout. Interruption propagates through the
+      // Effect scope and the ensuring above always clears the AUDITING lease.
+      return yield* withSpecialAgentTimeout(
+        execute,
+        () =>
+          Effect.succeed({
+            ok: false,
+            error: `Goal auditor exceeded its ${Math.floor(AUDITOR_EXECUTION_TIMEOUT_MS / 60_000)}-minute execution budget`,
+            model: ref,
+            auditorSessionID,
+          } satisfies Failure),
+        Duration.millis(AUDITOR_EXECUTION_TIMEOUT_MS),
+      )
     })
 
-    const timedEvaluate: Interface["evaluate"] = (input) =>
-      withSpecialAgentTimeout(evaluate(input), () =>
-        Effect.succeed({ ok: false, error: "Goal auditor timed out after 5 minutes" } satisfies Failure),
-      )
+    const evaluate: Interface["evaluate"] = (input) => evaluateWith(input, coreRuntime)
+    const evaluateWithRuntime: Interface["evaluateWithRuntime"] = (input, runtime) => evaluateWith(input, runtime)
 
-    return Service.of({ evaluate: timedEvaluate })
+    return Service.of({ evaluate, evaluateWithRuntime })
   }),
 )
 
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Goal.node, SessionRunnerModel.node, FileSystem.node, Config.node, EventV2.node, UsageRecord.node, llmClient],
+  deps: [
+    Goal.node,
+    GoalAutomation.node,
+    SessionRunnerModel.node,
+    FileSystem.node,
+    Config.node,
+    EventV2.node,
+    UsageRecord.node,
+    SpecialAgentSession.node,
+    llmClient,
+  ],
 })

@@ -11,6 +11,7 @@ import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { SessionTable } from "../session/sql"
 import { SessionSchema } from "../session/schema"
 import { SessionHostChild } from "../session/host-child"
+import { SessionMetadataOwnership } from "../session/metadata-ownership"
 import { SessionV1 } from "../v1/session"
 import { SpecialAgentSession } from "../special-agent-session"
 import { GoalSchema } from "./schema"
@@ -37,6 +38,17 @@ export const Event = GoalModel.Event
 
 export { GoalSchema, GoalStateMachine }
 
+export interface Focused {
+  readonly focus: Focus
+  readonly detail: Detail
+  /**
+   * Durable relation owned by GoalAuditorSessionTable for this exact
+   * parent-Session/Goal pair. This is navigation/inspection identity, not live
+   * automation state.
+   */
+  readonly auditorSessionID?: SessionSchema.ID
+}
+
 export interface CreateInput {
   readonly projectID: typeof ProjectTable.$inferSelect.id
   readonly workspaceID?: typeof WorkspaceTable.$inferSelect.id
@@ -62,6 +74,17 @@ export interface PrepareForSessionInput {
   readonly auditorPolicy?: GoalModel.AuditorPolicy
   readonly start?: boolean
   readonly actor?: GoalModel.AuditActor
+  /**
+   * Require this call to create a new Goal instead of reusing an existing
+   * compatible focus. Automatic producers use this when each operation owns a
+   * distinct auditable Goal.
+   */
+  readonly requireFresh?: boolean
+  /**
+   * Optional optimistic focus fence evaluated inside the prepare transaction.
+   * null means the Session must still have no focused Goal.
+   */
+  readonly expectedCurrentGoalID?: ID | null
 }
 
 export interface UpdateInput {
@@ -74,6 +97,26 @@ export interface UpdateInput {
   readonly steps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
   readonly continuationPolicy?: GoalModel.ContinuationPolicy
   readonly auditorPolicy?: GoalModel.AuditorPolicy
+  readonly actor?: GoalModel.AuditActor
+}
+
+/**
+ * Append-preserving specification mutation for an in-flight Goal.
+ *
+ * Criteria and steps are additive by design so a user can strengthen an active
+ * Goal without replacing durable child IDs (and therefore without orphaning
+ * progress, assignments, or evidence). Scalar title/objective fields may be
+ * replaced. Exact semantic duplicates are ignored, making retries idempotent.
+ */
+export interface AmendInput {
+  readonly id: ID
+  readonly expectedRevision: number
+  readonly title?: string
+  readonly objective?: string
+  readonly appendConstraints?: ReadonlyArray<string>
+  readonly appendCriteria?: ReadonlyArray<string>
+  readonly appendSteps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
+  readonly sourceMessageID?: string
   readonly actor?: GoalModel.AuditActor
 }
 
@@ -131,6 +174,12 @@ export interface FocusInput {
   readonly sessionID: typeof SessionTable.$inferSelect.id
   readonly role?: GoalModel.FocusRole
   readonly actor?: GoalModel.AuditActor
+  /**
+   * Optional optimistic focus fence. Omitted preserves normal interactive
+   * replacement semantics. null means no Goal may be focused; an ID means that
+   * exact Goal must still be focused.
+   */
+  readonly expectedCurrentGoalID?: ID | null
 }
 
 export type Error = GoalSchema.Error
@@ -139,7 +188,7 @@ export interface Interface {
   readonly create: (input: CreateInput) => Effect.Effect<Detail, GoalSchema.ValidationError>
   readonly prepareForSession: (
     input: PrepareForSessionInput,
-  ) => Effect.Effect<{ focus: Focus; detail: Detail }, GoalSchema.NotFoundError | GoalSchema.ValidationError>
+  ) => Effect.Effect<Focused, GoalSchema.NotFoundError | GoalSchema.ValidationError>
   readonly get: (id: ID) => Effect.Effect<Detail, GoalSchema.NotFoundError>
   readonly list: (input: {
     projectID: typeof ProjectTable.$inferSelect.id
@@ -147,6 +196,9 @@ export interface Interface {
   }) => Effect.Effect<ReadonlyArray<Info>>
   readonly update: (
     input: UpdateInput,
+  ) => Effect.Effect<Detail, GoalSchema.NotFoundError | GoalSchema.StaleRevisionError | GoalSchema.ValidationError>
+  readonly amend: (
+    input: AmendInput,
   ) => Effect.Effect<Detail, GoalSchema.NotFoundError | GoalSchema.StaleRevisionError | GoalSchema.ValidationError>
   readonly transition: (
     input: TransitionInput,
@@ -164,9 +216,18 @@ export interface Interface {
     sessionID: typeof SessionTable.$inferSelect.id
     actor?: GoalModel.AuditActor
   }) => Effect.Effect<void>
+  /**
+   * Remove only the exact expected focus. Automatic coordinators use this so a
+   * concurrent human focus can never be cleared by a stale pre-read.
+   */
+  readonly unfocusExpected: (input: {
+    sessionID: typeof SessionTable.$inferSelect.id
+    goalID: ID
+    actor?: GoalModel.AuditActor
+  }) => Effect.Effect<boolean>
   readonly focused: (
     sessionID: typeof SessionTable.$inferSelect.id,
-  ) => Effect.Effect<{ focus: Focus; detail: Detail } | undefined>
+  ) => Effect.Effect<Focused | undefined>
   readonly focuses: (goalID: ID) => Effect.Effect<ReadonlyArray<Focus>>
   readonly auditorSession: (input: {
     parentSessionID: SessionSchema.ID
@@ -371,6 +432,7 @@ const layer = Layer.effect(
             })
             return yield* detailTx(tx, id).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
           }),
+          { behavior: "immediate" },
         ).pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Created, { goalID: id, info: detail.goal })
       return detail
@@ -422,6 +484,19 @@ const layer = Layer.effect(
               .where(eq(GoalFocusTable.session_id, input.sessionID))
               .get()
               .pipe(Effect.orDie)
+            if (input.expectedCurrentGoalID !== undefined) {
+              const actual = existingFocus?.goal_id ?? null
+              if (actual !== input.expectedCurrentGoalID) {
+                return yield* new GoalSchema.ValidationError({
+                  reason: `Session Goal focus changed; expected ${input.expectedCurrentGoalID ?? "<none>"}, found ${actual ?? "<none>"}`,
+                })
+              }
+            }
+            if (input.requireFresh && existingFocus) {
+              return yield* new GoalSchema.ValidationError({
+                reason: "this operation requires a fresh Goal but the Session already has a focused Goal",
+              })
+            }
             if (existingFocus) {
               const existing = yield* detailTx(tx, existingFocus.goal_id)
               if (GoalStateMachine.isTerminal(existing.goal.status) || existing.goal.objective !== objective.value) {
@@ -537,6 +612,7 @@ const layer = Layer.effect(
               detail: yield* detailTx(tx, id),
             }
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
 
@@ -674,10 +750,156 @@ const layer = Layer.effect(
           })
           return yield* detailTx(tx, input.id)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.id, info: detail.goal })
       return detail
+    })
+
+    const amend = Effect.fn("Goal.amend")(function* (input: AmendInput) {
+      if (
+        input.title === undefined &&
+        input.objective === undefined &&
+        input.appendConstraints === undefined &&
+        input.appendCriteria === undefined &&
+        input.appendSteps === undefined
+      ) {
+        return yield* new GoalSchema.ValidationError({ reason: "no Goal fields were supplied to amend" })
+      }
+      const title = input.title === undefined ? undefined : requiredText(input.title, "title")
+      if (title && !title.ok) return yield* new GoalSchema.ValidationError({ reason: title.reason })
+      const objective = input.objective === undefined ? undefined : requiredText(input.objective, "objective")
+      if (objective && !objective.ok) return yield* new GoalSchema.ValidationError({ reason: objective.reason })
+      const constraints = input.appendConstraints === undefined ? undefined : normalizeStrings(input.appendConstraints)
+      if (constraints && !constraints.ok) return yield* new GoalSchema.ValidationError({ reason: constraints.reason })
+      const criteria = input.appendCriteria === undefined ? undefined : normalizeStrings(input.appendCriteria)
+      if (criteria && !criteria.ok) return yield* new GoalSchema.ValidationError({ reason: criteria.reason })
+      const steps = input.appendSteps === undefined ? undefined : normalizeSteps(input.appendSteps)
+      if (steps && !steps.ok) return yield* new GoalSchema.ValidationError({ reason: steps.reason })
+      const now = Date.now()
+
+      const result = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const current = yield* requireRow(tx, input.id)
+              yield* requireRevision(input.id, current.revision, input.expectedRevision)
+              if (GoalStateMachine.isTerminal(current.status) || current.status === "verifying") {
+                return yield* new GoalSchema.ValidationError({
+                  reason: `specification cannot change while Goal is ${current.status}`,
+                })
+              }
+
+              const detail = yield* detailTx(tx, input.id)
+              const titleChanged = title?.ok === true && title.value !== detail.goal.title
+              const objectiveChanged = objective?.ok === true && objective.value !== detail.goal.objective
+
+              const constraintKeys = new Set(detail.goal.constraints.map(specIdentity))
+              const appendConstraints = (constraints?.ok ? constraints.value : []).filter((value) => {
+                const key = specIdentity(value)
+                if (constraintKeys.has(key)) return false
+                constraintKeys.add(key)
+                return true
+              })
+
+              const criterionKeys = new Set(detail.criteria.map((item) => specIdentity(item.description)))
+              const appendCriteria = (criteria?.ok ? criteria.value : []).filter((value) => {
+                const key = specIdentity(value)
+                if (criterionKeys.has(key)) return false
+                criterionKeys.add(key)
+                return true
+              })
+
+              const stepKeys = new Set(detail.steps.map((item) => stepIdentity(item)))
+              const appendSteps = (steps?.ok ? steps.value : []).filter((value) => {
+                const key = stepIdentity(value)
+                if (stepKeys.has(key)) return false
+                stepKeys.add(key)
+                return true
+              })
+
+              const changed =
+                titleChanged ||
+                objectiveChanged ||
+                appendConstraints.length > 0 ||
+                appendCriteria.length > 0 ||
+                appendSteps.length > 0
+              if (!changed) return { detail, changed: false as const }
+
+              const updated = yield* tx
+                .update(GoalTable)
+                .set({
+                  ...(titleChanged ? { title: title!.value } : {}),
+                  ...(objectiveChanged ? { objective: objective!.value } : {}),
+                  ...(appendConstraints.length > 0
+                    ? { constraints: [...detail.goal.constraints, ...appendConstraints] }
+                    : {}),
+                  revision: sql`${GoalTable.revision} + 1`,
+                  time_updated: now,
+                })
+                .where(and(eq(GoalTable.id, input.id), eq(GoalTable.revision, input.expectedRevision)))
+                .returning({ revision: GoalTable.revision })
+                .get()
+                .pipe(Effect.orDie)
+              if (!updated) return yield* staleAfterCas(tx, input.id, input.expectedRevision)
+
+              if (appendCriteria.length > 0) {
+                const startPosition = Math.max(-1, ...detail.criteria.map((item) => item.position)) + 1
+                yield* tx
+                  .insert(GoalCriterionTable)
+                  .values(
+                    appendCriteria.map((description, index) => ({
+                      id: GoalModel.CriterionID.create(),
+                      goal_id: input.id,
+                      position: startPosition + index,
+                      description,
+                    })),
+                  )
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+              if (appendSteps.length > 0) {
+                const startPosition = Math.max(-1, ...detail.steps.map((item) => item.position)) + 1
+                yield* tx
+                  .insert(GoalStepTable)
+                  .values(
+                    appendSteps.map((step, index) => ({
+                      id: GoalModel.StepID.create(),
+                      goal_id: input.id,
+                      position: startPosition + index,
+                      title: step.title,
+                      description: step.description,
+                    })),
+                  )
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+
+              yield* appendAudit(tx, {
+                goalID: input.id,
+                type: "specification_updated",
+                actor: input.actor ?? "user",
+                payload: {
+                  revision: updated.revision,
+                  mode: "amend",
+                  ...(input.sourceMessageID ? { sourceMessageID: input.sourceMessageID } : {}),
+                  ...(titleChanged ? { titleChanged: true } : {}),
+                  ...(objectiveChanged ? { objectiveChanged: true } : {}),
+                  addedConstraints: appendConstraints.length,
+                  addedCriteria: appendCriteria.length,
+                  addedSteps: appendSteps.length,
+                },
+                now,
+              })
+              return { detail: yield* detailTx(tx, input.id), changed: true as const }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+
+      if (result.changed) yield* events.publish(Event.Updated, { goalID: input.id, info: result.detail.goal })
+      return result.detail
     })
 
     const transition = Effect.fn("Goal.transition")(function* (input: TransitionInput) {
@@ -770,6 +992,7 @@ const layer = Layer.effect(
           })
           return yield* detailTx(tx, input.id)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.id, info: detail.goal })
@@ -813,6 +1036,7 @@ const layer = Layer.effect(
             })
             return yield* detailTx(tx, input.goalID)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.goalID, info: detail.goal })
@@ -884,6 +1108,7 @@ const layer = Layer.effect(
             })
             return yield* detailTx(tx, input.goalID)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.goalID, info: detail.goal })
@@ -955,6 +1180,7 @@ const layer = Layer.effect(
             })
             return yield* detailTx(tx, input.goalID)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.goalID, info: detail.goal })
@@ -1004,6 +1230,7 @@ const layer = Layer.effect(
             })
             return yield* detailTx(tx, input.goalID)
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Updated, { goalID: input.goalID, info: detail.goal })
@@ -1086,6 +1313,7 @@ const layer = Layer.effect(
               time_created: now,
             })
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       const current = yield* detailTx(db, input.goalID).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
@@ -1127,9 +1355,9 @@ const layer = Layer.effect(
             .pipe(Effect.orDie)
           if (!session) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${input.sessionID}` })
           const role = input.role ?? "owner"
-          if (session.parentID && session.metadata?.specialAgent === "goal_auditor") {
+          if (SessionMetadataOwnership.isSpecialAgent(session.metadata ?? undefined)) {
             return yield* new GoalSchema.ValidationError({
-              reason: "Goal auditor Sessions cannot own or focus Goals",
+              reason: "Special-agent Sessions cannot own or focus Goals",
             })
           }
           if (session.parentID && role !== "worker") {
@@ -1148,6 +1376,14 @@ const layer = Layer.effect(
             .where(eq(GoalFocusTable.session_id, input.sessionID))
             .get()
             .pipe(Effect.orDie)
+          if (input.expectedCurrentGoalID !== undefined) {
+            const actual = existing?.goal_id ?? null
+            if (actual !== input.expectedCurrentGoalID) {
+              return yield* new GoalSchema.ValidationError({
+                reason: `Session Goal focus changed; expected ${input.expectedCurrentGoalID ?? "<none>"}, found ${actual ?? "<none>"}`,
+              })
+            }
+          }
           if (existing?.goal_id === input.goalID && existing.role === role) {
             return { focus: hydrateFocus(existing), previousGoalID: undefined as ID | undefined, changed: false }
           }
@@ -1183,6 +1419,7 @@ const layer = Layer.effect(
             changed: true,
           }
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       if (result.changed) {
@@ -1219,21 +1456,77 @@ const layer = Layer.effect(
           })
           return existing.goal_id
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
       if (previous) yield* events.publish(Event.Unfocused, { goalID: previous, sessionID: input.sessionID })
     })
 
+    const unfocusExpected = Effect.fn("Goal.unfocusExpected")(function* (input: {
+      sessionID: typeof SessionTable.$inferSelect.id
+      goalID: ID
+      actor?: GoalModel.AuditActor
+    }) {
+      const now = Date.now()
+      const changed = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const existing = yield* tx
+                .select()
+                .from(GoalFocusTable)
+                .where(eq(GoalFocusTable.session_id, input.sessionID))
+                .get()
+                .pipe(Effect.orDie)
+              if (!existing || existing.goal_id !== input.goalID) return false
+              yield* tx
+                .delete(GoalFocusTable)
+                .where(and(eq(GoalFocusTable.session_id, input.sessionID), eq(GoalFocusTable.goal_id, input.goalID)))
+                .run()
+                .pipe(Effect.orDie)
+              yield* appendAudit(tx, {
+                goalID: input.goalID,
+                type: "unfocused",
+                actor: input.actor ?? "user",
+                payload: { sessionID: input.sessionID },
+                now,
+              })
+              return true
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+      if (changed) yield* events.publish(Event.Unfocused, { goalID: input.goalID, sessionID: input.sessionID })
+      return changed
+    })
+
     const focused = Effect.fn("Goal.focused")(function* (sessionID: typeof SessionTable.$inferSelect.id) {
       const row = yield* readDb
-        .select()
+        .select({
+          session_id: GoalFocusTable.session_id,
+          goal_id: GoalFocusTable.goal_id,
+          role: GoalFocusTable.role,
+          focused_at: GoalFocusTable.focused_at,
+          auditorSessionID: GoalAuditorSessionTable.auditor_session_id,
+        })
         .from(GoalFocusTable)
+        .leftJoin(
+          GoalAuditorSessionTable,
+          and(
+            eq(GoalAuditorSessionTable.parent_session_id, GoalFocusTable.session_id),
+            eq(GoalAuditorSessionTable.goal_id, GoalFocusTable.goal_id),
+          ),
+        )
         .where(eq(GoalFocusTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
       if (!row) return undefined
       const detail = yield* detailTx(readDb, row.goal_id).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
-      return { focus: hydrateFocus(row), detail }
+      return {
+        focus: hydrateFocus(row),
+        detail,
+        ...(row.auditorSessionID ? { auditorSessionID: row.auditorSessionID } : {}),
+      } satisfies Focused
     })
 
     // Goal inheritance is owned by the Goal domain, not Session creation or the
@@ -1245,7 +1538,7 @@ const layer = Layer.effect(
     const unsubscribeSessionCreated = yield* events.listenType(SessionV1.Event.Created, (event) => {
       const info = event.data.info
       const parentID = info.parentID
-      if (!parentID || info.metadata?.specialAgent) return Effect.void
+      if (!parentID || SessionMetadataOwnership.isSpecialAgent(info.metadata)) return Effect.void
       return Effect.gen(function* () {
         const inherited = yield* focused(parentID)
         if (!inherited || GoalStateMachine.isTerminal(inherited.detail.goal.status)) return
@@ -1414,29 +1707,41 @@ const layer = Layer.effect(
       model?: import("../model").ModelV2.Ref
     }) {
       yield* requireRow(db, input.goalID)
-      yield* db
+      const detail = yield* db
         .transaction((tx) =>
-          appendAudit(tx, {
-            goalID: input.goalID,
-            type: "audited",
-            actor: "auditor",
-            payload: {
-              decision: input.verdict.decision,
-              rationale: input.verdict.rationale,
-              progressMade: input.verdict.progressMade,
-              ...(input.verdict.confidence === undefined ? {} : { confidence: input.verdict.confidence }),
-              ...(input.verdict.decision === "blocked" ? { blocker: input.verdict.blocker } : {}),
-              ...(input.verdict.decision === "continue" || input.verdict.decision === "blocked"
-                ? { continuationPrompt: input.verdict.continuationPrompt }
-                : {}),
-              ...(input.model
-                ? { model: { providerID: input.model.providerID, id: input.model.id, variant: input.model.variant } }
-                : {}),
-            },
-            now: Date.now(),
+          Effect.gen(function* () {
+            const now = Date.now()
+            yield* tx
+              .update(GoalTable)
+              .set({ auditor_runs: sql`${GoalTable.auditor_runs} + 1`, time_updated: now })
+              .where(eq(GoalTable.id, input.goalID))
+              .run()
+              .pipe(Effect.orDie)
+            yield* appendAudit(tx, {
+              goalID: input.goalID,
+              type: "audited",
+              actor: "auditor",
+              payload: {
+                decision: input.verdict.decision,
+                rationale: input.verdict.rationale,
+                progressMade: input.verdict.progressMade,
+                ...(input.verdict.confidence === undefined ? {} : { confidence: input.verdict.confidence }),
+                ...(input.verdict.decision === "blocked" ? { blocker: input.verdict.blocker } : {}),
+                ...(input.verdict.decision === "continue" || input.verdict.decision === "blocked"
+                  ? { continuationPrompt: input.verdict.continuationPrompt }
+                  : {}),
+                ...(input.model
+                  ? { model: { providerID: input.model.providerID, id: input.model.id, variant: input.model.variant } }
+                  : {}),
+              },
+              now,
+            })
+            return yield* detailTx(tx, input.goalID).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
+      yield* events.publish(Event.Updated, { goalID: input.goalID, info: detail.goal })
     })
 
     const reconcileAuditorVerdict = Effect.fn("Goal.reconcileAuditorVerdict")(function* (input: {
@@ -1464,6 +1769,16 @@ const layer = Layer.effect(
                 reason: `auditor findings cannot be reconciled while Goal is ${current.status}`,
               })
             }
+
+            // This is a lifetime Goal metric, not automation cursor state and
+            // not semantic Goal progress. Keep it atomic with the durable
+            // `audited` event without bumping `revision`.
+            yield* tx
+              .update(GoalTable)
+              .set({ auditor_runs: sql`${GoalTable.auditor_runs} + 1`, time_updated: now })
+              .where(eq(GoalTable.id, input.goalID))
+              .run()
+              .pipe(Effect.orDie)
 
             const criteriaRows = yield* tx
               .select()
@@ -1640,9 +1955,13 @@ const layer = Layer.effect(
             }
             return { detail: yield* detailTx(tx, input.goalID), changed, completed }
           }),
+          { behavior: "immediate" },
         )
         .pipe(Effect.catchTag("SqlError", Effect.die))
-      if (result.changed) yield* events.publish(Event.Updated, { goalID: input.goalID, info: result.detail.goal })
+      // A successful reconciliation always commits one auditor run, even when
+      // criteria/status/revision are otherwise unchanged. Publish the compact
+      // Goal.Info update so clients observe the counter without history scans.
+      yield* events.publish(Event.Updated, { goalID: input.goalID, info: result.detail.goal })
       return result
     })
 
@@ -1652,6 +1971,7 @@ const layer = Layer.effect(
       get,
       list,
       update,
+      amend,
       transition,
       updateCriterion,
       updateStep,
@@ -1661,6 +1981,7 @@ const layer = Layer.effect(
       evidence,
       focus,
       unfocus,
+      unfocusExpected,
       focused,
       focuses,
       auditorSession,
@@ -1735,6 +2056,7 @@ function hydrateInfo(row: typeof GoalTable.$inferSelect): Info {
     constraints: row.constraints,
     status: row.status,
     revision: row.revision,
+    auditorRuns: row.auditor_runs,
     continuationPolicy: row.continuation_policy,
     auditorPolicy: row.auditor_policy,
     blocker: row.blocker ?? undefined,
@@ -1829,6 +2151,14 @@ function normalizeSteps(
     result.push({ title, description: value.description?.trim() ?? "" })
   }
   return { ok: true, value: result }
+}
+
+function specIdentity(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase()
+}
+
+function stepIdentity(value: { readonly title: string; readonly description?: string }) {
+  return `${specIdentity(value.title)}\u0000${specIdentity(value.description ?? "")}`
 }
 
 function normalizeAuditorPolicy(value: GoalModel.AuditorPolicy): Normalized<GoalModel.AuditorPolicy> {

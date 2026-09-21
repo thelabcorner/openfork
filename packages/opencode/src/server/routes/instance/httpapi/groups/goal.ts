@@ -23,6 +23,7 @@ export const GoalPaths = {
   focuses: `${root}/:goalID/focus`,
   sessionFocus: `/session/:sessionID/goal`,
   sessionPrepare: `/session/:sessionID/goal/prepare`,
+  sessionDispatch: `/session/:sessionID/goal/dispatch`,
 } as const
 
 export const ListQuery = Schema.Struct({
@@ -60,6 +61,8 @@ export const UpdatePayload = Schema.Struct({
 
 export const TransitionPayload = Schema.Struct({
   expectedRevision: Schema.Number,
+  /** Session context owns the Tier-3 runtime when the user requests an immediate independent audit. */
+  sessionID: Schema.optionalKey(SessionSchema.ID),
   action: Schema.Literals([
     "start",
     "pause",
@@ -113,6 +116,12 @@ export const PreparePayload = Schema.Struct({
   continuationPolicy: Schema.optionalKey(Goal.ContinuationPolicy),
   auditorPolicy: Schema.optionalKey(Goal.AuditorPolicy),
   start: Schema.optionalKey(Schema.Boolean),
+})
+
+export const DispatchPayload = Schema.Struct({
+  goalID: Goal.ID,
+  revision: Schema.Number,
+  action: Schema.Literals(["start", "update"]),
 })
 
 const errors = [HttpApiError.BadRequest, ApiNotFoundError, ConflictError] as const
@@ -183,7 +192,7 @@ export const GoalApi = HttpApi.make("goal")
         }).annotateMerge(OpenApi.annotations({ identifier: "goal.focuses", summary: "List Goal Session focus bindings" })),
         HttpApiEndpoint.get("focused", GoalPaths.sessionFocus, {
           params: { sessionID: SessionSchema.ID },
-          success: described(Schema.NullOr(Schema.Struct({ focus: Goal.Focus, detail: Goal.Detail })), "Focused Goal"),
+          success: described(Schema.NullOr(Goal.FocusedGoal), "Focused Goal"),
           error: errors,
         }).annotateMerge(OpenApi.annotations({ identifier: "goal.focused", summary: "Get focused Goal for Session" })),
         HttpApiEndpoint.put("focus", GoalPaths.sessionFocus, {
@@ -200,12 +209,23 @@ export const GoalApi = HttpApi.make("goal")
         HttpApiEndpoint.post("prepare", GoalPaths.sessionPrepare, {
           params: { sessionID: SessionSchema.ID },
           payload: PreparePayload,
-          success: described(Schema.Struct({ focus: Goal.Focus, detail: Goal.Detail }), "Prepared focused Goal"),
+          success: described(Goal.FocusedGoal, "Prepared focused Goal"),
           error: errors,
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "goal.prepare",
             summary: "Create, focus, and optionally start a Goal for a Session",
+          }),
+        ),
+        HttpApiEndpoint.post("dispatch", GoalPaths.sessionDispatch, {
+          params: { sessionID: SessionSchema.ID },
+          payload: DispatchPayload,
+          success: described(HttpApiSchema.NoContent, "Dispatched focused Goal action"),
+          error: errors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "goal.dispatch",
+            summary: "Dispatch a user-authorized focused Goal action to the worker",
           }),
         ),
       )
@@ -215,5 +235,5 @@ export const GoalApi = HttpApi.make("goal")
       .middleware(Authorization),
   )
   .annotateMerge(
-    OpenApi.annotations({ title: "opencode Goal HttpApi", version: "0.0.1", description: "Native Goal Mode API." }),
+    OpenApi.annotations({ title: "OpenFork Goal HttpApi", version: "0.0.1", description: "Native Goal Mode API." }),
   )
