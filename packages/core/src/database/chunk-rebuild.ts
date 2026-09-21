@@ -32,7 +32,8 @@ import { copyFileSync, existsSync, renameSync, statSync, unlinkSync } from "node
 import { createRequire } from "node:module"
 import { Duration, Effect } from "effect"
 import { Flag } from "../flag/flag"
-import { compressText, decodeValueBytes } from "./json-codec"
+import { compressText, SMALL_TEXT_THRESHOLD } from "./json-codec"
+import { verifyStoredEventValue } from "./event-value-integrity"
 
 const require = createRequire(import.meta.url)
 
@@ -244,7 +245,8 @@ export function rebuildDatabase(filename: string): Effect.Effect<RebuildResult, 
             PRIMARY KEY (aggregate_id, value_id), UNIQUE (aggregate_id, sha256),
             FOREIGN KEY (aggregate_id) REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE)`)
           db.run(`CREATE TABLE IF NOT EXISTS ocdb_meta (key TEXT PRIMARY KEY, value TEXT)`)
-          db.run(`CREATE INDEX IF NOT EXISTS idx_event_seal_candidates ON event (aggregate_id, seq) WHERE typeof(data) = 'text' AND length(data) >= 4096`)
+          db.run(`CREATE INDEX IF NOT EXISTS idx_event_seal_candidates_v2 ON event (aggregate_id, seq) WHERE typeof(data) = 'text' AND length(data) >= ${SMALL_TEXT_THRESHOLD}`)
+          db.run(`DROP INDEX IF EXISTS idx_event_seal_candidates`)
           let collapsedEvent = 0
           let collapsedProjection = 0
           let deduped = 0
@@ -336,13 +338,18 @@ export function rebuildDatabase(filename: string): Effect.Effect<RebuildResult, 
           // Every $cdbRef in the collapsed tables must resolve to an event_value row
           // and its bytes must decode (frame CRC or raw JSON) — otherwise abort-hard (Q1).
           const checkTables = [
-            { table: "event", column: "data", where: COLLAPSE_SET.eventWhere },
-            ...COLLAPSE_SET.projections.map((p) => ({ table: p.table, column: p.column, where: "1=1" })),
+            { table: "event", column: "data", aggregate: "aggregate_id", where: COLLAPSE_SET.eventWhere },
+            ...COLLAPSE_SET.projections.map((p) => ({
+              table: p.table,
+              column: p.column,
+              aggregate: p.aggCol,
+              where: "1=1",
+            })),
           ]
           for (const t of checkTables) {
             const refs = db.queryAll(
-              `SELECT ${t.column} AS v FROM ${t.table} WHERE ${t.where} AND ${t.column} LIKE '{"${CDB_REF}"%'`,
-            ) as Array<{ v: string }>
+              `SELECT ${t.column} AS v, ${t.aggregate} AS aggregate_id FROM ${t.table} WHERE ${t.where} AND ${t.column} LIKE '{"${CDB_REF}"%'`,
+            ) as Array<{ v: string; aggregate_id: string }>
             for (const r of refs) {
               let parsed: unknown
               try {
@@ -352,32 +359,70 @@ export function rebuildDatabase(filename: string): Effect.Effect<RebuildResult, 
               }
               const valueId = (parsed as Record<string, string>)[CDB_REF]
               if (!valueId) throw new Error(`missing $cdbRef in ${t.table}.${t.column}`)
-              // Resolve via event_value — value_id is globally unique (aggregate_id:seq:hash), so no aggregate filter.
-              const row = db.prepareAll("SELECT bytes, sha256 FROM event_value WHERE value_id = ?", [valueId]) as Array<{
+              // Resolve by the durable composite identity. value_id naming is
+              // an implementation detail; verification must not rely on it
+              // being globally unique across aggregates.
+              const row = db.prepareAll(
+                "SELECT value_id, sha256, raw_len, bytes FROM event_value WHERE aggregate_id = ? AND value_id = ?",
+                [r.aggregate_id, valueId],
+              ) as Array<{
+                value_id: string
                 bytes: Uint8Array | Buffer
                 sha256: string
+                raw_len: number
               }>
               if (row.length === 0) throw new Error(`dangling $cdbRef ${valueId} in ${t.table}.${t.column} — abort-hard (Q1)`)
-              const bytes = row[0].bytes instanceof Uint8Array ? row[0].bytes : new Uint8Array(row[0].bytes as unknown as ArrayBuffer)
-              // Throws on CRC mismatch / corrupt frame — abort-hard.
-              try {
-                const decoded = decodeValueBytes(bytes)
-                JSON.parse(decoded)
-              } catch (e) {
-                throw new Error(`corrupt event_value bytes for ${valueId} in ${t.table}.${t.column}: ${e instanceof Error ? e.message : String(e)}`)
+              const value = row[0]
+              if (
+                !verifyStoredEventValue(
+                  {
+                    valueID: value.value_id,
+                    sha256: value.sha256,
+                    rawLen: value.raw_len,
+                    bytes: value.bytes,
+                  },
+                  (baseValueID) =>
+                    (
+                      db.prepareAll(
+                        "SELECT bytes FROM event_value WHERE aggregate_id = ? AND value_id = ? LIMIT 1",
+                        [r.aggregate_id, baseValueID],
+                      )[0] as { bytes: Uint8Array } | undefined
+                    )?.bytes,
+                )
+              ) {
+                throw new Error(`corrupt event_value bytes for ${valueId} in ${t.table}.${t.column}`)
               }
             }
           }
 
           // Byte-exact rehydration sample on event_value itself (same as #9)
-          const sample = db.queryAll(`SELECT bytes FROM event_value LIMIT ${VERIFY_SAMPLE}`) as Array<{
+          const sample = db.queryAll(
+            `SELECT aggregate_id, value_id, sha256, raw_len, bytes FROM event_value LIMIT ${VERIFY_SAMPLE}`,
+          ) as Array<{
+            aggregate_id: string
+            value_id: string
+            sha256: string
+            raw_len: number
             bytes: Uint8Array | Buffer
           }>
           for (const row of sample) {
-            const bytes = row.bytes instanceof Uint8Array ? row.bytes : new Uint8Array(row.bytes as unknown as ArrayBuffer)
-            try {
-              JSON.parse(decodeValueBytes(bytes))
-            } catch {
+            if (
+              !verifyStoredEventValue(
+                {
+                  valueID: row.value_id,
+                  sha256: row.sha256,
+                  rawLen: row.raw_len,
+                  bytes: row.bytes,
+                },
+                (baseValueID) =>
+                  (
+                    db.prepareAll(
+                      "SELECT bytes FROM event_value WHERE aggregate_id = ? AND value_id = ? LIMIT 1",
+                      [row.aggregate_id, baseValueID],
+                    )[0] as { bytes: Uint8Array } | undefined
+                  )?.bytes,
+              )
+            ) {
               throw new Error("event_value bytes failed decode sample")
             }
           }

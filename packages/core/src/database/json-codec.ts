@@ -36,7 +36,7 @@ const HEADER = 14
 const VERSION_V2 = 2 // legacy frames in production DBs: CRC over raw (decompressed) bytes
 const VERSION = 3 // current write version: CRC over COMPRESSED bytes (~7-14x cheaper)
 const VERSION_V4 = 4 // segmented frame for jumbo rows (>JUMBO_THRESHOLD): independently-compressed segments
-const VERSION_V5 = 5 // delta_ref frame (epoch-4 #10): sparse correction against a base value in event_value
+const VERSION_V5 = 5 // delta_ref frame (#10; storage epoch 5 fences reference-capable DBs)
 const CODEC_ZSTD = 1
 const CODEC_BROTLI = 2
 const CODEC_DEFLATE = 3
@@ -49,6 +49,8 @@ const JUMBO_THRESHOLD = 4 * 1024 * 1024
 const SEGMENT_SIZE = 1024 * 1024
 /** Rows under this many UTF-16 code units stay TEXT forever (settled-size threshold). */
 export const THRESHOLD = 4096
+/** Measured physical frontier for independently-framed small JSON values. */
+export const SMALL_TEXT_THRESHOLD = 512
 /** Refuse-to-frame guard; real max row is ~32.8MB, ~4x headroom. */
 const RAWLEN_PRE_CAP = 128 * 1024 * 1024
 /** SQLite values are capped at 1GB; refuse to frame anything beyond 2^31-1. */
@@ -60,7 +62,7 @@ const decoder = new TextDecoder()
 export class OCDBFrameError extends Error {
   readonly reason: string
   constructor(reason: string) {
-    super(`OpenCode ChunkDB frame error: ${reason}`)
+    super(`OpenFork ChunkDB frame error: ${reason}`)
     this.name = "OCDBFrameError"
     this.reason = reason
   }
@@ -115,18 +117,24 @@ function compressWith(
 
 type CodecChoice = { readonly codec: 1 | 2 | 3; readonly level: number }
 
-const ZSTD_RATIO_LEVELS = [1, 9, 15, 19] as const
 const SMALL_RATIO_CANDIDATES: readonly CodecChoice[] = [
   { codec: CODEC_BROTLI, level: 11 },
-  { codec: CODEC_BROTLI, level: 9 },
+]
+const LARGE_RATIO_CANDIDATES: readonly CodecChoice[] = [
   { codec: CODEC_ZSTD, level: 19 },
+  { codec: CODEC_ZSTD, level: 9 },
+]
+// Jumbo v4 frames are already split into 1 MiB segments and are rare enough
+// that byte-minimization remains worthwhile per segment. Current corpus work
+// found a real segment where zstd-15 beat both zstd-19 and zstd-9 by 83 bytes,
+// so keep the full historical frontier here rather than imposing the ordinary
+// value fast path on jumbo storage.
+const JUMBO_RATIO_CANDIDATES: readonly CodecChoice[] = [
+  { codec: CODEC_ZSTD, level: 19 },
+  { codec: CODEC_ZSTD, level: 15 },
   { codec: CODEC_ZSTD, level: 9 },
   { codec: CODEC_ZSTD, level: 1 },
 ]
-const LARGE_RATIO_CANDIDATES: readonly CodecChoice[] = ZSTD_RATIO_LEVELS.map((level) => ({
-  codec: CODEC_ZSTD,
-  level,
-}))
 const BROTLI_RATIO_MAX_RAW = 64 * 1024
 
 function compressBest(raw: Uint8Array, candidates: readonly CodecChoice[]): { payload: Uint8Array; codec: number } {
@@ -136,6 +144,20 @@ function compressBest(raw: Uint8Array, candidates: readonly CodecChoice[]): { pa
     if (best === undefined || compressed.payload.byteLength < best.payload.byteLength) best = compressed
   }
   return best ?? compressWith(raw, CODEC_ZSTD, 1)
+}
+
+function frameCompressed(raw: Uint8Array, payload: Uint8Array, codec: number): Uint8Array {
+  const output = new Uint8Array(HEADER + payload.byteLength)
+  output.set(MAGIC)
+  output[4] = VERSION
+  output[5] = codec
+  const view = new DataView(output.buffer, output.byteOffset, output.byteLength)
+  view.setUint32(6, raw.byteLength, true)
+  // v3: CRC covers the COMPRESSED bytes (far smaller than raw), so the
+  // integrity check is cheap and can fail before decompression.
+  view.setUint32(10, crc32(payload), true)
+  output.set(payload, HEADER)
+  return output
 }
 
 function decompressWith(payload: Uint8Array, codec: number): Uint8Array {
@@ -157,24 +179,18 @@ function assertCodec(codec: number): void {
  * nothing; otherwise a frame v2 Uint8Array.
  */
 /**
- * Adaptive codec selection for the SEALER path. Picks the throughput-optimal
- * codec for a given raw UTF-8 byte length, measured on the epoch-3 bench
- * (packages/core/test/bench-chunkdb.ts, median-3 over a realistic 50% 8KiB /
- * 30% 32KiB / 20% 128KiB mix):
+ * Ratio-first codec hint used by delta_ref, whose correction stream is encoded
+ * exactly once. Ordinary compressText() uses the measured candidate frontier
+ * above and keeps the smallest result. The <=64 KiB frontier is deliberately a
+ * single Brotli-11 candidate; on current post-semantic-prune corpus samples it
+ * won every comparison, so recomputing Brotli-9/Zstd candidates was pure CPU.
+ * The >64 KiB frontier retains Zstd-19 + Zstd-9 because Zstd-9 still wins rare
+ * values by a few bytes.
  *
- * - Small payloads (<16KiB): brotli-q1 — 622 MB/s compress / 568 MB/s decode
- *   vs zstd-1's 221 / 508, at a ratio within ~3% (85.2x vs 87.8x on the mix).
- *   The absolute bytes saved at these sizes are negligible, so CPU is the
- *   priority.
- * - Large payloads (>=16KiB): zstd-1 — strictly dominates brotli-1 on ratio
- *   AND throughput at scale (e.g. 1MiB: 720 vs 558 MB/s compress, 14.6 vs 7.6
- *   ratio). zstd's ratio scales with input size, so the large-case win grows.
- *
- * This replaces the per-payload J-score (which compressed with BOTH zstd-1 and
- * zstd-3 to pick a winner): the bench shows zstd-1 beats zstd-3 on ratio AND
- * speed on the realistic mix (87.82x vs 87.68x), so the J-score never picked
- * anything but zstd-1 — it only doubled the compress cost (40 MB/s adaptive vs
- * 221 MB/s explicit). One compress per payload is the pareto frontier.
+ * This policy intentionally replaced the older throughput-first
+ * Brotli-q1/Zstd-1 routing on 2026-09-06. Current audit measurements show that
+ * the extra ratio is expensive, so callers must not describe this as the
+ * throughput-optimal path; see the ChunkDB architecture/performance ledger.
  */
 export function chooseCodec(rawLen: number): { codec: 1 | 2 | 3; level: number } {
   if (rawLen <= BROTLI_RATIO_MAX_RAW) return { codec: CODEC_BROTLI, level: 11 }
@@ -231,18 +247,27 @@ export function compressText(json: string, options?: { codec?: 1 | 2 | 3; level?
   // Header + payload must beat raw bytes by at least 24 to be worth framing.
   if (payload.byteLength + HEADER + 24 >= raw.byteLength) return json
 
-  const output = new Uint8Array(HEADER + payload.byteLength)
-  output.set(MAGIC)
-  output[4] = VERSION
-  output[5] = codec
-  const view = new DataView(output.buffer, output.byteOffset, output.byteLength)
-  view.setUint32(6, raw.byteLength, true)
-  // v3: CRC covers the COMPRESSED bytes (far smaller than raw), so the
-  // integrity check is ~7-14x cheaper and the reader can verify it BEFORE
-  // decompressing. Fail-closed on corrupt frames either way.
-  view.setUint32(10, crc32(payload), true)
-  output.set(payload, HEADER)
-  return output
+  return frameCompressed(raw, payload, codec)
+}
+
+/**
+ * Evidence-owned small-value representation policy.
+ *
+ * The stratified post-semantic-prune corpus found 512 code units to be the
+ * physical SQLite frontier: lowering to 256 compressed more source bytes but
+ * produced a larger whole database once frame/journal cardinality was counted.
+ * Brotli-5 retained essentially all of the ratio available from q9 at about half
+ * the codec CPU. Values remain independently decodable v3 frames; >=4KiB stays
+ * owned by the normal sealer.
+ */
+export function compressSmallText(json: string): string | Uint8Array {
+  if (json.length < SMALL_TEXT_THRESHOLD || json.length >= THRESHOLD) return json
+  const raw = encoder.encode(json)
+  if (raw.byteLength > MAX_RAW) return json
+  if (!isCompressible(raw)) return json
+  const { payload, codec } = compressWith(raw, CODEC_BROTLI, 5)
+  if (payload.byteLength + HEADER + 24 >= raw.byteLength) return json
+  return frameCompressed(raw, payload, codec)
 }
 
 /**
@@ -298,7 +323,7 @@ function compressSegmentedAdaptive(raw: Uint8Array): Uint8Array {
   let offset = 0
   while (offset < raw.byteLength) {
     const end = Math.min(offset + SEGMENT_SIZE, raw.byteLength)
-    const { payload } = compressBest(raw.subarray(offset, end), LARGE_RATIO_CANDIDATES)
+    const { payload } = compressBest(raw.subarray(offset, end), JUMBO_RATIO_CANDIDATES)
     segments.push(payload)
     segLens.push(payload.byteLength)
     offset = end
@@ -682,6 +707,28 @@ function isFrame(value: Uint8Array): boolean {
     value[2] === MAGIC[2] &&
     value[3] === MAGIC[3]
   )
+}
+
+/**
+ * Return the exact decoded byte length of a stored event_value representation
+ * without decompressing it. This is the allocation/admission authority used by
+ * the decompression worker pool.
+ *
+ * Raw JSON BLOBs decode to themselves. Every OCDB frame version stores its
+ * reconstructed raw length at offset 6, so the pool can reserve output memory
+ * before dispatch instead of discovering a 32 MiB completion after several
+ * workers have already been admitted.
+ */
+export function decodedValueByteLength(bytes: Uint8Array): number {
+  if (!isFrame(bytes)) return bytes.byteLength
+  if (bytes.byteLength < 10) throw new OCDBFrameError("truncated frame header — " + restoreHint)
+  const version = bytes[4]
+  if (version < 1 || version > VERSION_V5) {
+    throw new OCDBFrameError("unsupported version " + version + " — " + restoreHint)
+  }
+  const rawLen = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(6, true)
+  if (rawLen > RAWLEN_PRE_CAP) throw new OCDBFrameError("rawLen " + rawLen + " exceeds pre-cap — " + restoreHint)
+  return rawLen
 }
 
 function parseDriverValue(value: unknown): unknown {

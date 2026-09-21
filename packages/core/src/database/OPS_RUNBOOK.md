@@ -12,7 +12,7 @@ storage-frontier-v3 / read-frontier-v3). All behavior is **flag-gated** and
 | `OPENCODE_SEAL_ENABLED` | off | Master switch. Without it the sealer is a no-op and DBs stay plain TEXT. |
 | `OPENCODE_SEAL_DEDUP` | off | Epoch-2: externalize payloads into `event_value` + `{"$cdbRef":...}` refs (implies epoch-1 framing). |
 | `OPENCODE_SEAL_WORKERS` | off | Epoch-3: offload `compressText` to a 2–4 worker-thread pool (codec-frontier-v3). |
-| `OPENCODE_SEAL_DELTA` | off | Epoch-4 (#10): store record-structured values as a v5 delta_ref sparse-correction frame against a base value when smaller (codec-frontier-v3). Read path decodes v5 whenever present; write path opt-in. |
+| `OPENCODE_SEAL_DELTA` | legacy only | New v5 emission is retired; setting this flag only produces a warning. Historical v5 reader/integrity/dependency-GC support remains mandatory, and reference-capable DBs stay fenced at storage epoch 5. |
 | `OPENCODE_SEAL_BACKFILL` | on (1) | Epoch-3 (#6): allow BACKFILL mode (back-to-back passes at 50k cap) when a backlog exists. Set to `0` to force maintenance-only. |
 | `OPENCODE_SEAL_COMPACT` | off | Epoch-3 (#9): one-shot shrink of an EXISTING DB (`auto_vacuum=0` → `incremental_vacuum` no-op); `VACUUM INTO` + atomic swap. |
 | `OPENCODE_SEAL_REBUILD` | off | Epoch-3 (#8): one-shot collapse of 5 projection stores into `event_value` `$cdbRef` (same table, no second scan). |
@@ -23,9 +23,12 @@ storage-frontier-v3 / read-frontier-v3). All behavior is **flag-gated** and
 
 ## Epoch gate (schema layer)
 
-`PRAGMA user_version` enforces the epoch gate (chunkdb.ts). Frame version
-(v1/v2/v3/v4/v5) is **orthogonal** to `user_version` — a v3/v4/v5 frame is readable
-by any binary using this codec module regardless of the epoch gate. See
+`PRAGMA user_version` enforces the storage-capability gate (chunkdb.ts). Frame
+version (v1/v2/v3/v4/v5) is a distinct codec concept, but a new durable frame
+producer can still require a newer storage fence when older binaries would
+otherwise accept the database. Storage epoch 4 fences sparse durable sequences;
+storage epoch 5 fences every dedup/reference-capable database so pre-v5
+reference readers fail at open instead of failing lazily on a delta value. See
 `FORMAT.md` for frame-version semantics.
 
 ## First-seal timing
@@ -34,6 +37,12 @@ Acceptance math (coordinator-verified): 1.37M events = 1 probe (5k) + 28
 backfill passes (50k) ≈ 21–25 min + ~7s interleave — well under 2h. A typical
 large DB (~45h of event history) first-seals in hours under BACKFILL mode.
 Maintenance mode (no backlog) settles to 10-min spaced passes at 5k cap.
+
+The measured independent small-row lane is part of the ordinary sealer:
+512..4095-character cold event TEXT is framed inline as Brotli-5 v3; >=4 KiB
+retains the ordinary large-value/externalization policy. Maintenance waits for a
+100 ms cross-process `PRAGMA data_version` quiet window before writer slices,
+then abandons/retries rather than queueing behind foreground activity.
 
 ## Space reclaim
 
@@ -74,5 +83,9 @@ integrity: `empty | ok | corrupt (frame errors OR dangling) | inconsistent
   bounded reclaim — complete.
 - **Read lane (read-frontier-v3):** v4 segment streaming decode (#5) + OPCL read (#8) — complete.
 - **Storage lane (storage-frontier-v3):** rebuild collapse (#8) + compact (#9) — complete.
-- **Sparse-ref (codec-frontier-v3):** delta_ref v5 (#10) — complete, flag-gated `OPENCODE_SEAL_DELTA`.
-- **Verification (#11):** 34/34 database tests pass, p99 468µs, 3.83× file, 966 rows/s — all green.
+- **Sparse-ref compatibility:** historical delta_ref v5 decode/integrity/GC is
+  complete; new emission is retired.
+- **Verification:** the current closeout surface passes 96/96 database tests and
+  58/58 EventV2 tests. Historical synthetic throughput/ratio numbers are retained
+  only as regression-shape evidence; current-population sizing lives in the
+  ChunkDB architecture/performance audit ledger.

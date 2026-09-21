@@ -386,6 +386,60 @@ describe("DatabaseMigration", () => {
     )
   })
 
+  test("repairs only the known stale checksums from the checksum rollout", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(
+          sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL, checksum TEXT)`,
+        )
+        yield* db.run(sql`
+          INSERT INTO migration (id, time_completed, checksum) VALUES
+            ('20260919235500_oxp_parent_activity', 1, '357ae708c1e188cd672b39bbac599ab1a6c2d6851bd8774015518cdf080c479c'),
+            ('20260920034100_schema_convergence', 1, 'b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c')
+        `)
+
+        const canonical: DatabaseMigration.Migration[] = [
+          {
+            id: "20260919235500_oxp_parent_activity",
+            checksum: "e010f3f0a9b9e5b457e5e38cc91dcb08e3555d02b9fc5753434abdc5461d13ef",
+            up: () => Effect.die("completed migration must not replay"),
+          },
+          {
+            id: "20260920034100_schema_convergence",
+            checksum: "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
+            up: () => Effect.die("completed migration must not replay"),
+          },
+        ]
+
+        yield* DatabaseMigration.applyOnly(db, canonical)
+        expect(yield* db.all(sql`SELECT id, checksum FROM migration ORDER BY id`)).toEqual([
+          {
+            id: "20260919235500_oxp_parent_activity",
+            checksum: "e010f3f0a9b9e5b457e5e38cc91dcb08e3555d02b9fc5753434abdc5461d13ef",
+          },
+          {
+            id: "20260920034100_schema_convergence",
+            checksum: "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
+          },
+        ])
+
+        yield* db.run(sql`
+          UPDATE migration
+          SET checksum = '357ae708c1e188cd672b39bbac599ab1a6c2d6851bd8774015518cdf080c479c'
+          WHERE id = '20260919235500_oxp_parent_activity'
+        `)
+        const mutated: DatabaseMigration.Migration = {
+          ...canonical[0]!,
+          checksum: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        }
+        const exit = yield* Effect.exit(DatabaseMigration.applyOnly(db, [mutated]))
+        if (exit._tag === "Success") throw new Error("expected unknown checksum mutation to fail")
+        expect(String(exit.cause)).toContain("Migration checksum mismatch for 20260919235500_oxp_parent_activity")
+      }),
+    )
+  })
+
   test("serializes concurrent embedded initialization for one database path", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "embedded.sqlite")

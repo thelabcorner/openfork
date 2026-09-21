@@ -11,6 +11,7 @@ import {
 } from "./json-codec"
 import { decompressValueAsync } from "./decompress-pool"
 import { Flag } from "../flag/flag"
+import { EVENT_PAYLOAD_REF, isEventPayloadRef, resolveEventPayloadRef } from "../event-payload"
 
 /** Compact semantic classes stored in `event_semantic.kind`. */
 export const SemanticKind = {
@@ -157,6 +158,7 @@ export const decodeSemanticStorage = Effect.fn("ChunkDB.semantic.decodeStorage")
     const parsed = JSON.parse(stored) as unknown
     const ref = cdbRef(parsed)
     if (ref) return (yield* resolveValue(db, aggregateID, ref)).value
+    if (isEventPayloadRef(parsed)) return yield* resolveEventPayloadRef(db, parsed)
     return parsed
   }
   if (stored instanceof Uint8Array) return (yield* Effect.promise(() => decodeFrame(stored))).value
@@ -166,7 +168,11 @@ export const decodeSemanticStorage = Effect.fn("ChunkDB.semantic.decodeStorage")
 export function semanticRef(stored: unknown): string | undefined {
   if (typeof stored !== "string" || stored.length > 512) return undefined
   try {
-    return cdbRef(JSON.parse(stored))
+    const parsed = JSON.parse(stored)
+    const ref = cdbRef(parsed)
+    if (ref) return `cdb:${ref}`
+    if (isEventPayloadRef(parsed)) return `payload:${parsed[EVENT_PAYLOAD_REF].id}`
+    return undefined
   } catch {
     return undefined
   }

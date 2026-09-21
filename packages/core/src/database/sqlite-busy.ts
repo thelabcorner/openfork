@@ -42,9 +42,11 @@ export function isSqliteBusy(error: unknown): boolean {
 export function retrySqliteBusy<A, E, R>(
   attempt: () => Effect.Effect<A, E, R>,
   delayMs = 35,
+  beforeAttempt?: () => Effect.Effect<void>,
 ): Effect.Effect<A, E, R> {
   return Effect.gen(function* () {
     for (;;) {
+      if (beforeAttempt) yield* beforeAttempt()
       const outcome = yield* attempt().pipe(
         Effect.map((value) => ({ kind: "ok" as const, value })),
         Effect.catch((error) => Effect.succeed({ kind: "error" as const, error })),

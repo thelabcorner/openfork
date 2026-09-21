@@ -10,6 +10,32 @@ type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
 const lock = Semaphore.makeUnsafe(1)
 
+// The initial checksum rollout (5489cd7531) committed two registry fingerprints
+// that did not match the exact tracked migration source bytes. Databases opened
+// by that build correctly persisted those generated values, so treat only these
+// exact stale -> canonical pairs as journal metadata repairs. The canonical hash
+// is part of the match on purpose: any later source mutation still fails closed.
+const checksumCorrections = new Map<string, ReadonlyMap<string, string>>([
+  [
+    "20260919235500_oxp_parent_activity",
+    new Map([
+      [
+        "357ae708c1e188cd672b39bbac599ab1a6c2d6851bd8774015518cdf080c479c",
+        "e010f3f0a9b9e5b457e5e38cc91dcb08e3555d02b9fc5753434abdc5461d13ef",
+      ],
+    ]),
+  ],
+  [
+    "20260920034100_schema_convergence",
+    new Map([
+      [
+        "b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c",
+        "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
+      ],
+    ]),
+  ],
+])
+
 export type Migration = {
   id: string
   /**
@@ -128,6 +154,13 @@ export function applyOnly(db: Database, input: Migration[]) {
       const migration = byID.get(row.id)
       if (!migration?.checksum) continue
       if (row.checksum && row.checksum !== migration.checksum) {
+        const corrected = checksumCorrections.get(row.id)?.get(row.checksum)
+        if (corrected === migration.checksum) {
+          yield* db.run(
+            sql`UPDATE ${sql.identifier("migration")} SET checksum = ${migration.checksum} WHERE id = ${row.id} AND checksum = ${row.checksum}`,
+          )
+          continue
+        }
         return yield* Effect.die(
           new Error(
             `Migration checksum mismatch for ${row.id}: database=${row.checksum} source=${migration.checksum}`,

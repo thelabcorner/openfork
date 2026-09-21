@@ -46,7 +46,7 @@ const seedLayer = () =>
       yield* db.run("PRAGMA journal_mode = WAL")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, filename: ":memory:" }
+      return { db, readDb: db, filename: ":memory:" }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename: ":memory:", createTimePragmas: { page_size: 8192, auto_vacuum: 2 } })))
 
@@ -58,7 +58,7 @@ function runWithDb(body: (db: DatabaseShape) => Effect.Effect<void, unknown, unk
   return Effect.runPromise(provided)
 }
 
-describe("ChunkDB epoch-4 v5 delta_ref frame", () => {
+describe("ChunkDB v5 delta_ref frame", () => {
   test("round-trips byte-exact (encode -> parse -> decode -> apply)", () => {
     const baseObj = makeBase()
     const newObj = makeNew()
@@ -163,6 +163,84 @@ describe("ChunkDB epoch-4 v5 delta_ref frame", () => {
         deepStrictEqual(resolved, newObj)
       }),
     )
+  })
+
+  test("rehydrateEvents batches v5 base lookup for a replay page", async () => {
+    const previousEnabled = process.env.OPENCODE_SEAL_ENABLED
+    const previousDedup = process.env.OPENCODE_SEAL_DEDUP
+    process.env.OPENCODE_SEAL_ENABLED = "1"
+    process.env.OPENCODE_SEAL_DEDUP = "1"
+    try {
+      await runWithDb((db) =>
+        Effect.gen(function* () {
+          const aggID = "agg_delta_batch"
+          const baseObj = makeBase()
+          const baseText = JSON.stringify(baseObj)
+          const baseRaw = encoder.encode(baseText)
+          const baseFrame = compressText(baseText)
+          const baseStored = typeof baseFrame === "string" ? encoder.encode(baseFrame) : baseFrame
+          const baseValueID = `${aggID}:base`
+          yield* db
+            .insert(EventValueTable)
+            .values({
+              aggregate_id: aggID,
+              value_id: baseValueID,
+              sha256: createHash("sha256").update(baseRaw).digest("hex"),
+              raw_len: baseRaw.length,
+              bytes: baseStored,
+              refs: 0,
+              time_promoted: Date.now(),
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          const children = ["B", "C", "D"].map((suffix, index) => {
+            const value = { type: "summary", text: "A".repeat(5000) + suffix }
+            const raw = encoder.encode(JSON.stringify(value))
+            return {
+              value,
+              raw,
+              valueID: `${aggID}:child:${index}`,
+              bytes: compressDeltaRef(raw, baseRaw, baseValueID, 1, 1),
+            }
+          })
+          for (const child of children) {
+            yield* db
+              .insert(EventValueTable)
+              .values({
+                aggregate_id: aggID,
+                value_id: child.valueID,
+                sha256: createHash("sha256").update(child.raw).digest("hex"),
+                raw_len: child.raw.length,
+                bytes: child.bytes,
+                refs: 1,
+                time_promoted: Date.now(),
+              })
+              .run()
+              .pipe(Effect.orDie)
+          }
+
+          let selects = 0
+          const reader = {
+            select: (...args: unknown[]) => {
+              selects += 1
+              return (db.select as (...inner: unknown[]) => unknown)(...args)
+            },
+          } as DatabaseShape
+          const refs = children.map((child) => ({ data: { $cdbRef: child.valueID } }))
+          const hydrated = yield* EventV2.rehydrateEvents(reader, aggID, refs as never)
+          expect(selects).toBe(2)
+          for (let index = 0; index < children.length; index++) {
+            deepStrictEqual(hydrated[index]?.data, children[index]?.value)
+          }
+        }),
+      )
+    } finally {
+      if (previousEnabled === undefined) delete process.env.OPENCODE_SEAL_ENABLED
+      else process.env.OPENCODE_SEAL_ENABLED = previousEnabled
+      if (previousDedup === undefined) delete process.env.OPENCODE_SEAL_DEDUP
+      else process.env.OPENCODE_SEAL_DEDUP = previousDedup
+    }
   })
 
   test("resolveCdbRef fail-closed on missing delta_ref base", async () => {

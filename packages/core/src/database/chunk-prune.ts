@@ -6,6 +6,7 @@ import { CHUNKDB_COOLING_MS, CHUNKDB_HOT_TAIL_EVENTS } from "./chunkdb"
 import { CHECKPOINT_TYPE, recordCompactedSequences } from "./chunk-compaction"
 import { isV5Frame, parseV5Header } from "./json-codec"
 import { retrySqliteBusy } from "./sqlite-busy"
+import type { SqliteMaintenanceQuietGate } from "./sqlite-maintenance"
 import {
   decodeSemanticStorage,
   semanticIdentity,
@@ -14,6 +15,7 @@ import {
   type SemanticIdentity,
   type SemanticKind as SemanticKindValue,
 } from "./chunk-semantic"
+import { decrementEventPayloadRefs } from "../event-payload"
 
 /**
  * Semantic compaction sits ahead of ChunkDB's lossless codec layer.
@@ -54,13 +56,12 @@ const DEPENDENCY_BACKFILL_ROWID_SPAN = 2_048
 const PROOF_LOOKUP_CHUNK = 256
 const TRANSFORMED_IDENTITY_CACHE_ENTRIES = 8_192
 // Sparse compaction writes only tiny metadata plus one aggregate bitmap BLOB.
-// Separate-process contention benchmark, 8,192 deletions, median-of-3:
-//   64 rows  -> ~2.126 s maintenance
-//   128 rows -> ~1.135 s
-//   256 rows -> ~0.573 s, foreground writer p99 ~2.3 ms
-//   512 rows -> ~0.488 s but foreground p99 ~15-16 ms
-// 256 is the Pareto point: ~3.7x the 64-row throughput while avoiding the
-// 512-row tail-latency cliff. Exact slices retry on SQLITE_BUSY.
+// The original 2026-09-07 benchmark selected 256 rows as the mutation-throughput
+// frontier. A 2026-09-18 apples-to-apples re-audit showed the old 2.3ms
+// foreground-p99 figure was harness-specific: the actual 256-row semantic path
+// also exhibits Windows SQLite's ~15ms busy-handler sleep under a saturated
+// competing writer. Foreground priority is therefore owned by the production
+// data_version quiet gate + busy_timeout=0, not by this row count alone.
 const WRITE_SLICE_ROWS = 256
 const WRITE_SLICE_PAUSE_MS = 2
 const WRITE_SLICE_BUSY_RETRY_MS = 35
@@ -294,6 +295,7 @@ const prepareWriteStage = Effect.fn("ChunkDB.semanticPrune.prepareWriteStage")(f
     id TEXT PRIMARY KEY,
     seq INTEGER NOT NULL,
     ref_id TEXT,
+    payload_id TEXT,
     raw_bytes INTEGER NOT NULL
   ) WITHOUT ROWID`).pipe(Effect.orDie)
 })
@@ -431,7 +433,10 @@ export const backfillSemanticIndex = Effect.fn("ChunkDB.semanticPrune.backfillIn
         typeof(e.data) = 'blob'
         OR (
           typeof(e.data) = 'text'
-          AND substr(e.data, 1, 12) = '{"$cdbRef":"'
+           AND (
+             substr(e.data, 1, 12) = '{"$cdbRef":"'
+             OR substr(e.data, 1, 17) = '{"$eventPayload":'
+           )
         )
       )
     ORDER BY e.rowid
@@ -868,14 +873,22 @@ const gcZeroRefValues = Effect.fn("ChunkDB.semanticPrune.gcZeroRefs")(function* 
 /** Run one bounded semantic-compaction/indexing pass. */
 export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(function* (
   db: DatabaseShape,
-  options?: { readonly limit?: number; readonly now?: number; readonly writeSliceRows?: number },
+  options?: {
+    readonly limit?: number
+    readonly now?: number
+    readonly writeSliceRows?: number
+    readonly quietGate?: SqliteMaintenanceQuietGate
+  },
 ) {
   const requested = options?.limit ?? DEFAULT_LIMIT
   const limit = Math.max(1, Math.min(MAX_LIMIT, requested))
   const writeSliceRows = Math.max(1, Math.min(512, options?.writeSliceRows ?? WRITE_SLICE_ROWS))
   const expectedHistoryEpoch = yield* historyEpoch(db)
+  if (options?.quietGate) yield* options.quietGate.wait()
   const checkpointMigration = yield* migrateLegacyCheckpoints(db)
+  if (options?.quietGate) yield* options.quietGate.wait()
   const dependency = yield* backfillDeltaDependencies(db, expectedHistoryEpoch)
+  if (options?.quietGate) yield* options.quietGate.wait()
   const backfill = yield* backfillSemanticIndex(db, expectedHistoryEpoch)
   if (!backfill.complete || !dependency.complete) {
     return {
@@ -987,7 +1000,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
           // payloads are never copied into the write transaction. Message/part
           // branches stay separate so SQLite can use their native PK/indexes.
           yield* tx.run(sql`
-            INSERT INTO ocdb_semantic_valid_v4 (id, seq, ref_id, raw_bytes)
+            INSERT INTO ocdb_semantic_valid_v4 (id, seq, ref_id, payload_id, raw_bytes)
             SELECT plan.id,
                    plan.seq,
                    CASE
@@ -996,7 +1009,14 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
                       AND substr(event.data, 1, 12) = '{"$cdbRef":"'
                      THEN json_extract(event.data, '$."$cdbRef"')
                      ELSE NULL
-                   END AS ref_id,
+                    END AS ref_id,
+                   CASE
+                     WHEN typeof(event.data) = 'text'
+                      AND length(event.data) <= 512
+                      AND substr(event.data, 1, 17) = '{"$eventPayload":'
+                     THEN json_extract(event.data, '$."$eventPayload".id')
+                     ELSE NULL
+                   END AS payload_id,
                    coalesce(
                      seal.raw_bytes,
                      CASE
@@ -1047,7 +1067,14 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
                       AND substr(event.data, 1, 12) = '{"$cdbRef":"'
                      THEN json_extract(event.data, '$."$cdbRef"')
                      ELSE NULL
-                   END AS ref_id,
+                    END AS ref_id,
+                   CASE
+                     WHEN typeof(event.data) = 'text'
+                      AND length(event.data) <= 512
+                      AND substr(event.data, 1, 17) = '{"$eventPayload":'
+                     THEN json_extract(event.data, '$."$eventPayload".id')
+                     ELSE NULL
+                   END AS payload_id,
                    coalesce(
                      seal.raw_bytes,
                      CASE
@@ -1122,6 +1149,14 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
               )
           `)
 
+          const stagedPayloadRefs = yield* tx.all<{ payloadID: string; count: number }>(sql`
+            SELECT payload_id AS payloadID, count(*) AS count
+            FROM ocdb_semantic_valid_v4
+            WHERE payload_id IS NOT NULL
+            GROUP BY payload_id
+          `)
+          yield* decrementEventPayloadRefs(tx, stagedPayloadRefs)
+
           const validSeqs = yield* tx.all<{ seq: number }>(sql`
             SELECT seq FROM ocdb_semantic_valid_v4 ORDER BY seq
           `)
@@ -1154,15 +1189,19 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
             }),
           ),
         WRITE_SLICE_BUSY_RETRY_MS,
+        options?.quietGate?.wait,
       )
       compatibilityRejected += slice.length - outcome.validCount
       compacted += outcome.validCount
       bitmapBytesStored += outcome.bitmapGrowth
       payloadBytesReclaimed += Math.max(0, outcome.rawBytes - outcome.bitmapGrowth)
-      if (start + writeSliceRows < safe.length) yield* Effect.sleep(Duration.millis(WRITE_SLICE_PAUSE_MS))
+      if (start + writeSliceRows < safe.length && !options?.quietGate) {
+        yield* Effect.sleep(Duration.millis(WRITE_SLICE_PAUSE_MS))
+      }
     }
   }
 
+  if (compacted > 0 && options?.quietGate) yield* options.quietGate.wait()
   const gc = compacted > 0 ? yield* gcZeroRefValues(db, aggregateID) : { values: 0, bytes: 0 }
 
   // Keep draining an aggregate while it makes progress; skip mismatch-only
@@ -1175,7 +1214,16 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
   // minutes-long backfill into a multi-day migration.
   let hasLaterAggregate = false
   if (compacted === 0) {
+    if (options?.quietGate) yield* options.quietGate.wait()
     yield* writeCursor(db, aggregateID, expectedHistoryEpoch)
+    hasLaterAggregate = (yield* nextAggregate(db, cutoff, aggregateID)) !== undefined
+  } else if (!hasMore) {
+    // A successful final page exhausts this aggregate just as surely as a
+    // mismatch-only page does. Probe past it before returning so the outer
+    // sealer keeps semantic drain mode active when another aggregate still has
+    // work. Without this branch, one successfully compacted session incorrectly
+    // reported global convergence and later sessions waited for the normal
+    // maintenance cadence.
     hasLaterAggregate = (yield* nextAggregate(db, cutoff, aggregateID)) !== undefined
   }
 

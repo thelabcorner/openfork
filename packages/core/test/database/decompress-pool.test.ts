@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { EventEmitter } from "node:events"
 import type { Worker } from "node:worker_threads"
-import { DecompressPool } from "../../src/database/decompress-pool"
+import {
+  DECOMPRESS_POOL_MIN_BYTES,
+  DecompressPool,
+  DecompressPoolCapacityError,
+  shouldUseDecompressPool,
+} from "../../src/database/decompress-pool"
 
 class FakeWorker extends EventEmitter {
   request?: { id: number; bytes: Uint8Array }
@@ -23,6 +28,12 @@ function fixture() {
 }
 
 describe("decompression pool settlement", () => {
+  test("owns one 64 KiB worker admission boundary for every caller", () => {
+    expect(DECOMPRESS_POOL_MIN_BYTES).toBe(64 * 1024)
+    expect(shouldUseDecompressPool(DECOMPRESS_POOL_MIN_BYTES - 1)).toBe(false)
+    expect(shouldUseDecompressPool(DECOMPRESS_POOL_MIN_BYTES)).toBe(true)
+  })
+
   test("parses at most one completed worker result per scheduler turn", async () => {
     const workers: FakeWorker[] = []
     const scheduled: Array<() => void> = []
@@ -119,18 +130,22 @@ describe("decompression pool settlement", () => {
     await pool.close()
   })
 
-  test("rejects admission when retained input bytes would exceed the pool budget", async () => {
+  test("reserves decoded output before dispatch so concurrent completions cannot overshoot the pool budget", async () => {
     const { pool, workers } = (() => {
       const workers: FakeWorker[] = []
       const pool = new DecompressPool(1, () => {
         const worker = new FakeWorker()
         workers.push(worker)
         return worker as unknown as Worker
-      }, 4)
+      }, 8)
       return { pool, workers }
     })()
     const first = pool.submit(new Uint8Array(3))
-    await expect(pool.submit(new Uint8Array(2))).rejects.toThrow("byte budget")
+    // Raw BLOBs decode to themselves, so a 3-byte input reserves 3 input + 3
+    // output bytes. A second 2-byte job would require 4 more bytes and must be
+    // rejected before either worker completes.
+    const second = pool.submit(new Uint8Array(2))
+    await expect(second).rejects.toBeInstanceOf(DecompressPoolCapacityError)
     workers[0]!.reply()
     await first
     await pool.close()

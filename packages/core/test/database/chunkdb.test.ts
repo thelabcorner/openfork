@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Database } from "bun:sqlite"
 import { drizzle } from "drizzle-orm/bun-sqlite"
 import { sqliteTable, text } from "drizzle-orm/sqlite-core"
-import { sql } from "drizzle-orm"
+import { and, eq, sql } from "drizzle-orm"
 import { createHash } from "node:crypto"
 import { deepStrictEqual } from "node:assert"
 import { Effect, Schema, Exit } from "effect"
@@ -397,6 +397,19 @@ describe("ChunkDB epoch-2 rehydration (read path)", () => {
         yield* EventV2.readAggregate(db, { aggregateID: aggID, limit: 100, manifest: chunkManifest })
         const afterSecond = rehydrateCacheStats(db)
         expect(afterSecond.hits).toBeGreaterThan(afterFirst.hits)
+
+        // A warm cache hit must not re-fetch the canonical BLOB. The validated
+        // value is immutable, so once cached it is sufficient to rehydrate the
+        // event even if the backing row becomes unavailable after the first
+        // read. A cold dangling ref is covered separately by fail-closed tests.
+        yield* db
+          .delete(EventValueTable)
+          .where(and(eq(EventValueTable.aggregate_id, aggID), eq(EventValueTable.value_id, valueID)))
+          .run()
+          .pipe(Effect.orDie)
+        const third = yield* EventV2.readAggregate(db, { aggregateID: aggID, limit: 100, manifest: chunkManifest })
+        expect(third.events).toHaveLength(1)
+        expect(third.events[0]?.data).toEqual(eventData)
       }),
     )
   })

@@ -10,7 +10,7 @@
 import { Duration, Effect } from "effect"
 import { renameSync, unlinkSync, existsSync, statSync, copyFileSync } from "node:fs"
 import { createRequire } from "node:module"
-import { decodeValueBytes } from "./json-codec"
+import { verifyStoredEventValue } from "./event-value-integrity"
 import { Flag } from "../flag/flag"
 
 const require = createRequire(import.meta.url)
@@ -33,7 +33,15 @@ type RawDb = {
   close: () => void
   run: (sql: string) => void
   exec: (sql: string) => void
-  queryAll: (sql: string) => Array<Record<string, unknown>>
+  queryAll: (sql: string, ...params: unknown[]) => Array<Record<string, unknown>>
+}
+
+type VerifyValueRow = {
+  aggregate_id: string
+  value_id: string
+  sha256: string
+  raw_len: number
+  bytes: Uint8Array | Buffer
 }
 
 function doGc() {
@@ -65,9 +73,9 @@ function openRaw(filename: string): RawDb {
       },
       run: (sql: string) => db.run(sql),
       exec: (sql: string) => db.run(sql),
-      queryAll: (sql: string) => {
+      queryAll: (sql: string, ...params: unknown[]) => {
         const stmt = db.query(sql)
-        return (stmt.all() ?? []) as Array<Record<string, unknown>>
+        return (stmt.all(...params) ?? []) as Array<Record<string, unknown>>
       },
     }
   } catch {}
@@ -89,9 +97,9 @@ function openRaw(filename: string): RawDb {
     },
     run: (sql: string) => db.exec(sql),
     exec: (sql: string) => db.exec(sql),
-    queryAll: (sql: string) => {
+      queryAll: (sql: string, ...params: unknown[]) => {
       const stmt = db.prepare(sql)
-      return (stmt.all() ?? []) as Array<Record<string, unknown>>
+        return (stmt.all(...params) ?? []) as Array<Record<string, unknown>>
     },
   }
 }
@@ -154,17 +162,32 @@ export function compactDatabase(filename: string): Effect.Effect<CompactResult, 
           if (!c) return false
           if (c.event !== pre.rows.event || c.event_value !== pre.rows.event_value || c.ocdb_seal !== pre.rows.ocdb_seal) return false
 
-          // Byte-exact rehydration sample
-          const sample = db.queryAll(`SELECT bytes FROM event_value LIMIT ${VERIFY_SAMPLE}`) as Array<{
-            bytes: Uint8Array | Buffer
-          }>
+          // Byte-exact canonical-value sample. This must understand every
+          // representation event_value can durably contain, including v5
+          // delta_ref values whose bytes depend on another canonical row.
+          const sample = db.queryAll(
+            `SELECT aggregate_id, value_id, sha256, raw_len, bytes FROM event_value LIMIT ${VERIFY_SAMPLE}`,
+          ) as VerifyValueRow[]
           for (const row of sample) {
-            const bytes = row.bytes instanceof Uint8Array ? row.bytes : new Uint8Array(row.bytes as unknown as ArrayBuffer)
-            try {
-              JSON.parse(decodeValueBytes(bytes))
-            } catch {
+            if (
+              !verifyStoredEventValue(
+                {
+                  valueID: row.value_id,
+                  sha256: row.sha256,
+                  rawLen: row.raw_len,
+                  bytes: row.bytes,
+                },
+                (baseValueID) =>
+                  (
+                    db.queryAll(
+                      "SELECT bytes FROM event_value WHERE aggregate_id = ? AND value_id = ? LIMIT 1",
+                      row.aggregate_id,
+                      baseValueID,
+                    )[0] as { bytes: Uint8Array } | undefined
+                  )?.bytes,
+              )
+            )
               return false
-            }
           }
           return true
         }),

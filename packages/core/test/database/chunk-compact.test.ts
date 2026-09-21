@@ -30,6 +30,7 @@ import { DatabaseMigration } from "../../src/database/migration"
 import { ensureChunkDB } from "../../src/database/chunkdb"
 import { runPassV2 } from "../../src/database/chunk-sealer"
 import { compactDatabase } from "../../src/database/chunk-compact"
+import { compressDeltaRef, isV5Frame } from "../../src/database/json-codec"
 import { rehydrateEvents } from "../../src/event"
 import { EventV2 } from "../../src/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -41,7 +42,6 @@ process.env.OPENCODE_SEAL_ENABLED = "1"
 process.env.OPENCODE_SEAL_DEDUP = "1"
 process.env.OPENCODE_SEAL_WORKERS = "0"
 process.env.OPENCODE_SEAL_COMPACT = "1"
-
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 
 // Layer WITH the ChunkDB feature (create-time pragmas for FRESH DBs only).
@@ -57,7 +57,7 @@ const crashLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(
@@ -78,7 +78,7 @@ const plainLayer = (filename: string) =>
       yield* db.run("PRAGMA cache_size = -64000")
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename })))
 
@@ -200,6 +200,29 @@ describe("ChunkDB compactDatabase (#9)", () => {
           const events = makeEvents()
           const result = yield* runPassV2(db).pipe(Effect.orDie)
           expect(result.promoted).toBeGreaterThan(0)
+          // Production v5 emission is retired, but compact must remain able to
+          // verify historical v5 databases. Convert one canonical child into a
+          // valid delta_ref fixture explicitly instead of relying on the sealer
+          // to manufacture a dominated representation.
+          const encoder = new TextEncoder()
+          const baseValueID = "agg_a:1"
+          const childValueID = "agg_a:4"
+          const baseEvent = events.find((event) => event.agg === "agg_a" && event.seq === 1)!
+          const childEvent = events.find((event) => event.agg === "agg_a" && event.seq === 4)!
+          const baseRaw = encoder.encode(JSON.stringify(baseEvent.data))
+          const childRaw = encoder.encode(JSON.stringify(childEvent.data))
+          const historicalV5 = compressDeltaRef(childRaw, baseRaw, baseValueID, 1, 1)
+          yield* db.run(sql`
+            UPDATE event_value
+            SET bytes = ${historicalV5}
+            WHERE aggregate_id = 'agg_a' AND value_id = ${childValueID}
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event_value_dependency (aggregate_id, value_id, base_value_id)
+            VALUES ('agg_a', ${childValueID}, ${baseValueID})
+          `).pipe(Effect.orDie)
+          const values = yield* db.all<{ bytes: Uint8Array }>(sql`SELECT bytes FROM event_value`).pipe(Effect.orDie)
+          expect(values.some((row) => isV5Frame(row.bytes))).toBe(true)
           const freelist = yield* db.all<{ freelist_count: number }>(`PRAGMA freelist_count`).pipe(Effect.orDie)
           const snap = yield* snapshot(db)
           yield* verifyByteExact(db, events)
