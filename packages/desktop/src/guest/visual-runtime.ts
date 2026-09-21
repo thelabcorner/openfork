@@ -35,7 +35,7 @@ const scope = globalThis as typeof globalThis & {
 }
 
 const bridge = scope[VISUAL_BRIDGE_KEY]
-if (!bridge || typeof bridge.rpc !== "function") throw new Error("OpenCode visual preload bridge is unavailable")
+if (!bridge || typeof bridge.rpc !== "function") throw new Error("OpenFork visual preload bridge is unavailable")
 
 if (!scope[VISUAL_RUNTIME_KEY]) {
   let active = false

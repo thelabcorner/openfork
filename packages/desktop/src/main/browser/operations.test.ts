@@ -20,11 +20,18 @@ const { BrowserOperations } = await import("./operations")
 
 const agentOwner = (sessionId: string): HostOwner => ({ kind: "agent", sessionId })
 const userOwner: HostOwner = { kind: "user" }
+const externalOwner = (principalId: string): HostOwner => ({ kind: "external", principalId })
 const context = (sessionId = "sess-1"): BrowserDispatchContext => ({
   requestId: `test-${sessionId || "internal"}`,
   sessionId,
   windowId: "win-1",
   messageId: "msg-test",
+  timeoutMs: 15_000,
+})
+const externalContext = (principalId = "oxp-parent-one"): BrowserDispatchContext => ({
+  requestId: `test-${principalId}`,
+  principal: { kind: "external", principalId },
+  windowId: "win-1",
   timeoutMs: 15_000,
 })
 
@@ -163,6 +170,27 @@ test("claim on another session's tab throws BrowserPermissionDenied (O5)", async
   await expect(operations.dispatch(undefined, { name: "claim", input: { tabId: "tab_other" } }, context())).rejects.toBeInstanceOf(
     BrowserPermissionDeniedError,
   )
+})
+
+test("external principal can claim a user tab but cannot claim another external principal's tab", async () => {
+  const harness = makeHarness([
+    makeRecord("tab_user", userOwner),
+    makeRecord("tab_other", externalOwner("oxp-parent-two")),
+  ])
+  const claimed = await harness.operations.dispatch(
+    undefined,
+    { name: "claim", input: { tabId: "tab_user" } },
+    externalContext(),
+  )
+  expect(claimed).toEqual({ claimed: { tabId: "tab_user", owner: externalOwner("oxp-parent-one") } })
+  expect(harness.records.get("tab_user")?.owner).toEqual(externalOwner("oxp-parent-one"))
+  await expect(
+    harness.operations.dispatch(
+      undefined,
+      { name: "claim", input: { tabId: "tab_other" } },
+      externalContext(),
+    ),
+  ).rejects.toBeInstanceOf(BrowserPermissionDeniedError)
 })
 
 test("setTabOwner flips the owner to ANY user-chosen value (D7)", async () => {

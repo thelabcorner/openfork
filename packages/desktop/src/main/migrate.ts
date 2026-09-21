@@ -19,13 +19,13 @@ function tauriDir(id: string) {
   }
 }
 // The Tauri app identifier changes between dev/beta/prod builds.
-const TAURI_APP_IDS: Record<string, string> = {
+const LEGACY_TAURI_APP_IDS: Record<string, string> = {
   dev: "ai.opencode.desktop.dev",
   beta: "ai.opencode.desktop.beta",
   prod: "ai.opencode.desktop",
 }
 function tauriAppId() {
-  return app.isPackaged ? TAURI_APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
+  return app.isPackaged ? LEGACY_TAURI_APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
 }
 // Migrate a single Tauri .dat file into the corresponding electron-store.
 // `opencode.settings.dat` is special: it maps to the `opencode.settings` store

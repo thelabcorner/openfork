@@ -67,7 +67,8 @@ export class WebviewVisualController {
     appearance: Appearance,
   ): Promise<{ visual: VisualResult }> {
     if (context.signal?.aborted) throw new BrowserControlInterruptedError("Visual operation was already aborted")
-    if (canDispatchTab(tab.owner, context.sessionId) !== "ok") throw new BrowserPermissionDeniedError()
+    const principal = context.principal ?? (context.sessionId ? { kind: "session" as const, sessionId: context.sessionId } : undefined)
+    if (!principal || canDispatchTab(tab.owner, principal) !== "ok") throw new BrowserPermissionDeniedError()
     if (this.active.has(tab.runtimeTabId)) {
       throw new BrowserOperationFailedError(`A visual operation is already active on tab ${tab.runtimeTabId}`)
     }

@@ -69,6 +69,7 @@ import {
   type AnnotateOutput,
   type AnnotationTarget,
   type BrowserDispatchContext,
+  type BrowserPrincipal,
   type BrowserOperation,
   type BrowserPointerEvent,
   type ClaimInput,
@@ -113,7 +114,7 @@ import {
   type WireBrowserState,
   type WireGuestTabState,
 } from "./contracts"
-import { canClaimTab, canDispatchTab, isCoords, isLocator, isRefTarget } from "./contracts"
+import { canClaimTab, canDispatchTab, isCoords, isLocator, isRefTarget, ownerForBrowserPrincipal } from "./contracts"
 export interface BrowserOperationsOptions {
   registry: GuestRegistry
   sessions: ControlSessionManager
@@ -149,8 +150,8 @@ interface PendingOpen {
   reject: (error: unknown) => void
   timer: ReturnType<typeof setTimeout>
   lifecycleGeneration: number
-  /** Broker-open path: attribute the created tab to this session (agent owner). */
-  sessionId?: string
+  /** Broker-open path: attribute the created tab to this controller principal. */
+  principal?: BrowserPrincipal
   /** Duplicate path: the new tab inherits this source tab's owner (D8). */
   inheritOwnerFrom?: string
 }
@@ -178,13 +179,13 @@ export class BrowserOperations {
     const pending = this.pendingOpens.get(runtimeTabId)
     if (!pending) return
     if (pending.lifecycleGeneration !== tab.lifecycleGeneration) return
-    if (pending.sessionId) {
-      tab.owner = { kind: "agent", sessionId: pending.sessionId }
+    if (pending.principal) {
+      tab.owner = ownerForBrowserPrincipal(pending.principal)
     } else if (pending.inheritOwnerFrom) {
       const source = this.deps.registry.get(pending.inheritOwnerFrom)
       if (source) tab.owner = source.owner
     }
-    if (pending.sessionId || pending.inheritOwnerFrom) this.deps.registry.activate(runtimeTabId)
+    if (pending.principal || pending.inheritOwnerFrom) this.deps.registry.activate(runtimeTabId)
   }
   /** Engine calls this after the configured guest has been published. */
   resolveOpen(runtimeTabId: string, tab: GuestRecord): void {
@@ -196,14 +197,16 @@ export class BrowserOperations {
     pending.resolve(tab)
   }
   async dispatch(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
-    const sessionId = context.sessionId
+    const principal = context.principal ?? (context.sessionId ? { kind: "session" as const, sessionId: context.sessionId } : undefined)
     switch (operation.name) {
       case "status":
         return (await this.status(tabId)) as unknown as Record<string, unknown>
       case "open":
-        return (await this.open(operation.input, sessionId)) as unknown as Record<string, unknown>
+        if (!principal) throw new BrowserPermissionDeniedError()
+        return (await this.open(operation.input, principal)) as unknown as Record<string, unknown>
       case "claim":
-        return (await this.claim(operation.input, sessionId)) as unknown as Record<string, unknown>
+        if (!principal) throw new BrowserPermissionDeniedError()
+        return (await this.claim(operation.input, principal)) as unknown as Record<string, unknown>
       case "set_tab_owner":
         return (await this.setTabOwner(operation.input)) as unknown as Record<string, unknown>
       case "navigate":
@@ -239,7 +242,8 @@ export class BrowserOperations {
       case "recording_stop":
         return (await this.recordingStop(tabId, operation.input)) as unknown as Record<string, unknown>
       case "close":
-        return (await this.close(tabId, operation.input, sessionId)) as unknown as Record<string, unknown>
+        if (!principal) throw new BrowserPermissionDeniedError()
+        return (await this.close(tabId, operation.input, principal)) as unknown as Record<string, unknown>
       case "highlight":
         return (await this.highlight(tabId, operation.input)) as unknown as Record<string, unknown>
       case "annotate":
@@ -337,16 +341,17 @@ export class BrowserOperations {
     }
   }
   // --- open / navigate / close ------------------------------------------------
-  private async open(input: OpenInput, sessionId: string): Promise<OpenOutput> {
-    // Named tab: claim-and-navigate (D6) or navigate the session's own tab.
+  private async open(input: OpenInput, principal: BrowserPrincipal): Promise<OpenOutput> {
+    const owner = ownerForBrowserPrincipal(principal)
+    // Named tab: claim-and-navigate (D6) or navigate the controller's own tab.
     if (input.tabId !== undefined) {
       const tab = this.resolveTab(input.tabId)
       // Broker is authoritative; the host double-checks (defense in depth).
-      const gate = canDispatchTab(tab.owner, sessionId)
+      const gate = canDispatchTab(tab.owner, principal)
       if (gate === "other-agent") throw new BrowserPermissionDeniedError()
       if (gate === "user-owned" && input.claim !== true) throw new BrowserPermissionDeniedError()
       if (input.claim === true && gate === "user-owned") {
-        this.deps.registry.setOwner(tab.runtimeTabId, { kind: "agent", sessionId })
+        this.deps.registry.setOwner(tab.runtimeTabId, owner)
       }
       const from = tab.url
       await this.withControl(tab, "navigate", async (send) => {
@@ -361,11 +366,11 @@ export class BrowserOperations {
           title: tab.title,
           readyState: "Success",
           viewport,
-          owner: { kind: "agent", sessionId },
+          owner,
         },
       }
     }
-    // Fresh tab: the created tab is owned by the requesting session (D2/D6).
+    // Fresh tab: the created tab is owned by the requesting controller (D2/D6).
     const runtimeTabId = randomUUID()
     const pending = new Promise<GuestRecord>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -376,7 +381,7 @@ export class BrowserOperations {
         reject(new BrowserTimeoutError("open", OPEN_ATTACH_TIMEOUT_MS))
       }, OPEN_ATTACH_TIMEOUT_MS)
       timer.unref?.()
-      this.pendingOpens.set(runtimeTabId, { resolve, reject, timer, sessionId, lifecycleGeneration: 0 })
+      this.pendingOpens.set(runtimeTabId, { resolve, reject, timer, principal, lifecycleGeneration: 0 })
     })
     const lifecycleGeneration = this.deps.onTabRequest({ tabId: runtimeTabId, url: input.url, activate: input.activate ?? true })
     const pendingEntry = this.pendingOpens.get(runtimeTabId)
@@ -390,20 +395,21 @@ export class BrowserOperations {
         title: attached.title,
         readyState: "Success",
         viewport,
-        owner: { kind: "agent", sessionId },
+        owner,
       },
     }
   }
-  /** Explicit claim (D6): flip a user tab to this session — first-come-wins. */
-  private async claim(input: ClaimInput, sessionId: string): Promise<ClaimOutput> {
+  /** Explicit claim (D6): flip a user tab to this controller — first-come-wins. */
+  private async claim(input: ClaimInput, principal: BrowserPrincipal): Promise<ClaimOutput> {
+    const owner = ownerForBrowserPrincipal(principal)
     const tab = this.resolveTab(input.tabId)
-    const gate = canClaimTab(tab.owner, sessionId)
+    const gate = canClaimTab(tab.owner, principal)
     if (gate === "denied") throw new BrowserPermissionDeniedError()
     if (gate === "ok") {
-      this.deps.registry.setOwner(tab.runtimeTabId, { kind: "agent", sessionId })
+      this.deps.registry.setOwner(tab.runtimeTabId, owner)
     }
     // Idempotent for the session's own tab.
-    return { claimed: { tabId: tab.runtimeTabId, owner: { kind: "agent", sessionId } } }
+    return { claimed: { tabId: tab.runtimeTabId, owner } }
   }
   /** Broker-minted control op (D7): set the tab's owner to ANY value the user
    * chose. An agent tool can never invoke this — only `assign` mints it. */
@@ -434,12 +440,12 @@ export class BrowserOperations {
       },
     }
   }
-  private async close(tabId: string | undefined, input: { tabId?: string }, sessionId: string): Promise<Record<string, unknown>> {
+  private async close(tabId: string | undefined, input: { tabId?: string }, principal: BrowserPrincipal): Promise<Record<string, unknown>> {
     const target = input.tabId ?? tabId
     const tab = target ? this.deps.registry.get(target) : this.deps.registry.activeTab
     if (!tab) throw new BrowserTabNotFoundError(target)
     // Broker is authoritative; the host double-checks ownership (own tab only).
-    if (canDispatchTab(tab.owner, sessionId) !== "ok") throw new BrowserPermissionDeniedError()
+    if (canDispatchTab(tab.owner, principal) !== "ok") throw new BrowserPermissionDeniedError()
     const wasActive = this.deps.registry.activeTab?.runtimeTabId === tab.runtimeTabId
     this.deps.onTabClose(tab.runtimeTabId)
     this.deps.registry.remove(tab.runtimeTabId)

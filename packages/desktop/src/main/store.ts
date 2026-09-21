@@ -20,7 +20,7 @@ const cache = new Map<string, CachedStore>()
 // We cannot instantiate the electron-store at module load time because
 // module import hoisting causes this to run before app.setPath("userData", ...)
 // in index.ts has executed, which would result in files being written to the default directory
-// (e.g. bad: %APPDATA%\@opencode-ai\desktop\opencode.settings vs good: %APPDATA%\ai.opencode.desktop.dev\opencode.settings).
+// (e.g. bad: package-manager-derived paths vs good: the canonical OpenFork userData root).
 //
 // conf 15 re-reads + JSON.parse's the whole file on every `.store` / `.get` /
 // `.set`. Cache the snapshot so IPC hydrate/write does not re-parse megabyte

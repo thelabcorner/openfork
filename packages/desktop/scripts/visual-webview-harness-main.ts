@@ -316,7 +316,7 @@ async function verifyUpstreamInterop(
       upstreamToOpenCode.visual.operation !== "diff" ||
       upstreamToOpenCode.visual.diff?.changed !== false
     ) {
-      throw new Error(`OpenCode could not consume upstream baseline: ${JSON.stringify(upstreamToOpenCode.visual)}`)
+      throw new Error(`OpenFork could not consume upstream baseline: ${JSON.stringify(upstreamToOpenCode.visual)}`)
     }
 
     const openCodeCapture = await controller.run(
@@ -327,7 +327,7 @@ async function verifyUpstreamInterop(
       "light",
     )
     if (openCodeCapture.visual.status !== "ok" || openCodeCapture.visual.operation !== "capture") {
-      throw new Error(`OpenCode interoperability capture failed: ${JSON.stringify(openCodeCapture.visual)}`)
+      throw new Error(`OpenFork interoperability capture failed: ${JSON.stringify(openCodeCapture.visual)}`)
     }
 
     const openCodeToUpstream = await runSnapEyeCliOperation({
@@ -339,7 +339,7 @@ async function verifyUpstreamInterop(
       runId: "upstream-diff-opencode",
     })
     if (openCodeToUpstream.status !== "ok" || openCodeToUpstream.operation !== "diff" || openCodeToUpstream.diff?.changed !== false) {
-      throw new Error(`Upstream SnapEye could not consume OpenCode baseline: ${JSON.stringify(openCodeToUpstream)}`)
+      throw new Error(`Upstream SnapEye could not consume OpenFork baseline: ${JSON.stringify(openCodeToUpstream)}`)
     }
 
     return {

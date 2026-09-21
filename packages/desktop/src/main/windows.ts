@@ -44,6 +44,9 @@ protocol.registerSchemesAsPrivileged([
   },
 ])
 let backgroundColor: string | undefined
+let appQuitting = false
+let closeToTray = false
+let initialWindowsHidden = false
 let relaunchHandler = () => {
   setAppQuitting()
   app.relaunch()
@@ -67,7 +70,22 @@ export function setRelaunchHandler(handler: () => void) {
   relaunchHandler = handler
 }
 export function setAppQuitting(quitting = true) {
+  appQuitting = quitting
   registry.setQuitting(quitting)
+}
+export function setCloseToTray(enabled: boolean) {
+  closeToTray = enabled
+}
+export function setInitialWindowsHidden(hidden: boolean) {
+  initialWindowsHidden = hidden
+}
+export function showMainWindows() {
+  const windows = BrowserWindow.getAllWindows().filter((win) => !win.isDestroyed())
+  const available = windows.length ? windows : restoreMainWindows()
+  const target = getLastFocusedWindow() ?? available[0]
+  for (const win of available) win.show()
+  target?.focus()
+  return target ?? null
 }
 export function setBackgroundColor(color: string) {
   backgroundColor = color
@@ -190,7 +208,7 @@ export function createMainWindow(id: string = randomUUID()) {
     height: state.height,
     show: false,
     autoHideMenuBar: true,
-    title: "OpenCode",
+    title: "OpenFork",
     icon: iconPath(),
     backgroundColor: backgroundColor ?? defaultBackgroundColor(),
     ...(process.platform === "darwin"
@@ -220,6 +238,11 @@ export function createMainWindow(id: string = randomUUID()) {
   allowRendererPermissions(win)
   wireWindowRecovery(win, id)
   wireNavigationPolicy(win)
+  win.on("close", (event) => {
+    if (appQuitting || !closeToTray) return
+    event.preventDefault()
+    win.hide()
+  })
   win.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
     const { requestHeaders } = details
     upsertKeyValue(requestHeaders, "Access-Control-Allow-Origin", ["*"])
@@ -244,8 +267,10 @@ export function createMainWindow(id: string = randomUUID()) {
   })
   win.once("ready-to-show", () => {
     autopsyMark("window-ready-to-show") // STARTUP-AUTOPSY
-    win.show()
-    autopsyMark("window-shown") // STARTUP-AUTOPSY (entry-chain window-visible endpoint)
+    if (!initialWindowsHidden) {
+      win.show()
+      autopsyMark("window-shown") // STARTUP-AUTOPSY (entry-chain window-visible endpoint)
+    }
   })
   return win
 }

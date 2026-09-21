@@ -169,7 +169,7 @@ export const SCREENSHOT_OVERLAY_INVARIANT = {
 
 export const TAB_GROUP_EXTENSION_LANE = {
   // SW creates group: chrome.tabs.group({tabIds}) then
-  title: (sessionId: string) => `opencode — ${sessionId.slice(0, 8)}`,
+  title: (sessionId: string) => `OpenFork — ${sessionId.slice(0, 8)}`,
   color: "blue" as const,
   collapseFallback: "no collapse (keep open for agent tab visibility)",
 } as const

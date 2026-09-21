@@ -1,6 +1,6 @@
-# OpenCode Desktop
+# OpenFork Desktop
 
-The OpenCode Desktop app, built with Electron.
+The OpenFork Desktop app, built with Electron.
 
 ## Development
 

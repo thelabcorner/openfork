@@ -33,6 +33,7 @@ export type RunWslOptions = {
 
 const DEFAULT_WSL_TIMEOUT_MS = 20_000
 const DEFAULT_WSL_INSTALL_TIMEOUT_MS = 15 * 60_000
+const OPENFORK_RELEASE_BASE = "https://github.com/thelabcorner/openfork/releases/download"
 
 export function wslArgs(args: string[], distro?: string | null, user?: string | null) {
   return [...(distro ? ["-d", distro] : []), ...(user ? ["--user", user] : []), "--", ...args]
@@ -270,11 +271,43 @@ export async function installWslDistro(name: string, opts?: RunWslOptions) {
   )
 }
 
+export function openForkWslInstallScript(version: string) {
+  return [
+    "set -euo pipefail",
+    `version=${shellEscape(version)}`,
+    'libc=""',
+    'if (ldd --version 2>&1 || true) | grep -qi musl; then libc="-musl"; fi',
+    'case "$(uname -m)" in',
+    '  x86_64|amd64)',
+    '    baseline=""',
+    '    grep -qw avx2 /proc/cpuinfo 2>/dev/null || baseline="-baseline"',
+    '    asset="opencode-linux-x64${baseline}${libc}.tar.gz" ;;',
+    '  aarch64|arm64) asset="opencode-linux-arm64${libc}.tar.gz" ;;',
+    '  *) echo "OpenFork does not publish a WSL binary for architecture: $(uname -m)" >&2; exit 2 ;;',
+    "esac",
+    'tmp="$(mktemp -d)"',
+    'target="$HOME/.openfork/bin/opencode"',
+    'mkdir -p "$(dirname "$target")"',
+    'staged="${target}.openfork-update-$$"',
+    'trap \'rm -rf "$tmp"; rm -f "$staged"\' EXIT',
+    `url="${OPENFORK_RELEASE_BASE}/v\${version}/\${asset}"`,
+    'curl -fL "$url" -o "$tmp/openfork.tar.gz" || { echo "Failed to download the matching OpenFork release: $url" >&2; exit 3; }',
+    'tar -xzf "$tmp/openfork.tar.gz" -C "$tmp"',
+    'test -x "$tmp/opencode" || { echo "OpenFork release archive did not contain the opencode compatibility executable" >&2; exit 4; }',
+    'install -m 0755 "$tmp/opencode" "$staged"',
+    'staged_version="$("$staged" --version)"',
+    'test "$staged_version" = "$version" || { echo "Downloaded OpenFork binary reported $staged_version; expected $version" >&2; exit 5; }',
+    'mv -f "$staged" "$target"',
+    'actual="$("$target" --version)"',
+    'test "$actual" = "$version" || { echo "OpenFork WSL binary reported $actual; expected $version" >&2; exit 6; }',
+  ].join("\n")
+}
+
 export async function installWslOpencode(version: string, distro: string, opts?: RunWslOptions) {
   return runInteractiveCommand(
     resolveSystem32Command("wsl.exe"),
     wslArgs(
-      ["bash", "-lc", `curl -fsSL https://opencode.ai/install | bash -s -- --version ${shellEscape(version)}`],
+      ["bash", "-lc", openForkWslInstallScript(version)],
       distro,
     ),
     withTimeout(opts, DEFAULT_WSL_INSTALL_TIMEOUT_MS),
@@ -317,7 +350,7 @@ export async function resolveWslOpencode(distro: string, opts?: RunWslOptions) {
   return firstLine(
     (
       await runWslSh(
-        'if [ -x "$HOME/.opencode/bin/opencode" ]; then printf "%s\\n" "$HOME/.opencode/bin/opencode"; fi',
+        'if [ -x "$HOME/.openfork/bin/opencode" ]; then printf "%s\\n" "$HOME/.openfork/bin/opencode"; elif [ -x "$HOME/.opencode/bin/opencode" ]; then printf "%s\\n" "$HOME/.opencode/bin/opencode"; fi',
         distro,
         opts,
       )

@@ -2,8 +2,7 @@ type Channel = "dev" | "beta" | "prod"
 const raw = import.meta.env.OPENCODE_CHANNEL
 export const CHANNEL: Channel = raw === "dev" || raw === "beta" || raw === "prod" ? raw : "dev"
 
-// OpenFork: auto-update stays off. The upstream publish feed points at
-// anomalyco/opencode, so enabling the updater in a packaged build would let
-// official OpenCode install over this fork. Re-enable only after retargeting
-// electron-builder's publish config to thelabcorner/openfork.
+// OpenFork: the feed is fork-owned, but auto-update remains disabled until
+// stable/beta/dev channel metadata and signed installer policy are explicitly
+// defined. Manual checks must never fall back to an upstream OpenCode feed.
 export const UPDATER_ENABLED = false

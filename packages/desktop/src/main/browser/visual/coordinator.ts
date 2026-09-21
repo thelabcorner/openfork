@@ -158,7 +158,7 @@ export class VisualObservationCoordinator {
 
   async begin(input: BeginVisualTransactionInput): Promise<VisualTransactionGrant> {
     const { context } = input
-    if (!context.directory || !context.sessionId || !context.requestId || !input.tabId) {
+    if (!context.directory || !context.principal || !context.requestId || !input.tabId) {
       throw new VisualCapabilityError(
         "VISUAL_CONTEXT_REQUIRED",
         "Visual operations require an agent-owned broker request with a trusted project directory and tab",
@@ -431,7 +431,7 @@ export class VisualObservationCoordinator {
   }
 
   private requireProjectContext(context: BrowserDispatchContext): string {
-    if (!context.directory || !context.sessionId || !context.requestId) {
+    if (!context.directory || !context.principal || !context.requestId) {
       throw new VisualCapabilityError(
         "VISUAL_CONTEXT_REQUIRED",
         "Visual artifact inspection requires a trusted project broker context",

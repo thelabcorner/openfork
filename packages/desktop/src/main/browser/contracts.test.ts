@@ -75,6 +75,18 @@ test("isBrokerRequest accepts claim / set_tab_owner envelopes with tabId", () =>
   expect(isBrokerRequest(setOwner)).toBe(true)
 })
 
+test("isBrokerRequest accepts a sessionless external browser principal", () => {
+  expect(
+    isBrokerRequest({
+      requestId: "req-external",
+      principal: { kind: "external", principalId: "oxp-parent-digest" },
+      windowId: "win-1",
+      timeoutMs: 5_000,
+      operation: { name: "status", input: {} },
+    }),
+  ).toBe(true)
+})
+
 test("toRendererGuestTabState carries lifecycle + owner + active + muted", () => {
   const record = {
     runtimeTabId: "tab_1",
@@ -123,6 +135,10 @@ test("canDispatchTab / canClaimTab ownership gates (O1-O6)", () => {
   expect(canClaimTab({ kind: "user" }, "sess-1")).toBe("ok")
   expect(canClaimTab({ kind: "agent", sessionId: "sess-1" }, "sess-1")).toBe("idempotent")
   expect(canClaimTab({ kind: "agent", sessionId: "sess-2" }, "sess-1")).toBe("denied")
+  const external = { kind: "external" as const, principalId: "oxp-one" }
+  expect(canDispatchTab({ kind: "external", principalId: "oxp-one" }, external)).toBe("ok")
+  expect(canDispatchTab({ kind: "external", principalId: "oxp-two" }, external)).toBe("other-agent")
+  expect(canClaimTab({ kind: "external", principalId: "oxp-one" }, external)).toBe("idempotent")
 })
 
 test("isBrokerRequest accepts a valid canonical envelope ({name} op, input nested in operation)", () => {

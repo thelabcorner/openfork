@@ -15,7 +15,7 @@
 
 // --- wire constants (must stay in sync with the protocol group) ---------------
 
-export const BROWSER_PROTOCOL_VERSION = 2
+export const BROWSER_PROTOCOL_VERSION = 3
 export const BROKER_REQUEST_PATH = "/v1/browser/request"
 export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
 
@@ -145,9 +145,40 @@ export interface HostGuestState {
   url: string | null
 }
 
-/** A tab's owner — exactly one of `user` or `agent(<sessionId>)`. Two agents
- * never share a tab; the user may always reassign via the context menu. */
-export type HostOwner = { kind: "user" } | { kind: "agent"; sessionId: string }
+export type BrowserPrincipal =
+  | { kind: "session"; sessionId: string }
+  | { kind: "external"; principalId: string }
+
+export type HostOwner =
+  | { kind: "user" }
+  | { kind: "agent"; sessionId: string }
+  | { kind: "external"; principalId: string }
+
+export const browserPrincipalFromRequest = (request: {
+  sessionId?: string
+  principal?: BrowserPrincipal
+}): BrowserPrincipal | undefined => {
+  if (request.principal) {
+    if (
+      request.sessionId !== undefined &&
+      (request.principal.kind !== "session" || request.principal.sessionId !== request.sessionId)
+    ) return undefined
+    return request.principal
+  }
+  return request.sessionId ? { kind: "session", sessionId: request.sessionId } : undefined
+}
+
+export const ownerForBrowserPrincipal = (principal: BrowserPrincipal): Exclude<HostOwner, { kind: "user" }> =>
+  principal.kind === "session"
+    ? { kind: "agent", sessionId: principal.sessionId }
+    : { kind: "external", principalId: principal.principalId }
+
+const sameBrowserPrincipal = (owner: HostOwner, principal: BrowserPrincipal) =>
+  (owner.kind === "agent" && principal.kind === "session" && owner.sessionId === principal.sessionId) ||
+  (owner.kind === "external" && principal.kind === "external" && owner.principalId === principal.principalId)
+
+const normalizeBrowserPrincipal = (principal: BrowserPrincipal | string): BrowserPrincipal =>
+  typeof principal === "string" ? { kind: "session", sessionId: principal } : principal
 
 export interface HostHello {
   protocolVersion: number
@@ -216,11 +247,12 @@ export type HostEvent =
 
 export interface BrokerRequest {
   requestId: string
-  sessionId: string
+  sessionId?: string
+  principal?: BrowserPrincipal
   windowId: string
   workspaceId?: string
   directory?: string
-  messageId: string
+  messageId?: string
   toolCallId?: string
   tabId?: string
   operation: BrowserOperation
@@ -238,11 +270,14 @@ export interface BrokerRequest {
  */
 export interface BrowserDispatchContext {
   requestId: string
-  sessionId: string
+  /** Canonical controller identity. Host-local UI dispatches intentionally omit it. */
+  principal?: BrowserPrincipal
+  /** Native compatibility projection for Session-originated requests. */
+  sessionId?: string
   windowId: string
   workspaceId?: string
   directory?: string
-  messageId: string
+  messageId?: string
   toolCallId?: string
   timeoutMs: number
   signal?: AbortSignal
@@ -1267,9 +1302,18 @@ export const isElementTarget = (value: unknown): value is ElementTarget =>
 export const isBrokerRequest = (value: unknown): value is BrokerRequest => {
   if (!isRecord(value)) return false
   if (typeof value.requestId !== "string" || value.requestId.length === 0) return false
-  if (typeof value.sessionId !== "string" || value.sessionId.length === 0) return false
+  const principal = browserPrincipalFromRequest({
+    sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
+    principal:
+      isRecord(value.principal) && value.principal.kind === "session" && typeof value.principal.sessionId === "string"
+        ? { kind: "session", sessionId: value.principal.sessionId }
+        : isRecord(value.principal) && value.principal.kind === "external" && typeof value.principal.principalId === "string"
+          ? { kind: "external", principalId: value.principal.principalId }
+          : undefined,
+  })
+  if (!principal) return false
   if (typeof value.windowId !== "string" || value.windowId.length === 0) return false
-  if (typeof value.messageId !== "string" || value.messageId.length === 0) return false
+  if (value.messageId !== undefined && (typeof value.messageId !== "string" || value.messageId.length === 0)) return false
   if (value.workspaceId !== undefined && typeof value.workspaceId !== "string") return false
   if (value.directory !== undefined && typeof value.directory !== "string") return false
   if (value.toolCallId !== undefined && typeof value.toolCallId !== "string") return false
@@ -1437,13 +1481,13 @@ export const rangeTargets = (tabIds: readonly string[], tabId: string, mode: "le
 
 /** Can this session dispatch to a tab with this owner? (O1/O2/O3 — mirror of the
  * core broker helper; desktop cannot import core, so it is mirrored here.) */
-export const canDispatchTab = (owner: HostOwner, sessionId: string): "ok" | "other-agent" | "user-owned" => {
+export const canDispatchTab = (owner: HostOwner, input: BrowserPrincipal | string): "ok" | "other-agent" | "user-owned" => {
   if (owner.kind === "user") return "user-owned"
-  return owner.sessionId === sessionId ? "ok" : "other-agent"
+  return sameBrowserPrincipal(owner, normalizeBrowserPrincipal(input)) ? "ok" : "other-agent"
 }
 
 /** Can this session claim a tab with this owner? (O4/O5/O6) */
-export const canClaimTab = (owner: HostOwner, sessionId: string): "ok" | "idempotent" | "denied" => {
+export const canClaimTab = (owner: HostOwner, input: BrowserPrincipal | string): "ok" | "idempotent" | "denied" => {
   if (owner.kind === "user") return "ok"
-  return owner.sessionId === sessionId ? "idempotent" : "denied"
+  return sameBrowserPrincipal(owner, normalizeBrowserPrincipal(input)) ? "idempotent" : "denied"
 }

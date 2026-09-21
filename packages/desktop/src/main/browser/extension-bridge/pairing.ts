@@ -87,9 +87,9 @@ export function getNativeHostDir(variant: BrowserVariant, home: string, plat: No
   if (plat === "win32") {
     // On Windows the canonical location is the registry; the JSON file still lives
     // at a fixed per-app location and the registry value points at it. We use
-    // %LOCALAPPDATA%/opencode/NativeMessagingHosts as that stable location.
+    // %LOCALAPPDATA%/openfork/NativeMessagingHosts as that stable location.
     const localAppData = process.env["LOCALAPPDATA"] ?? join(home, "AppData", "Local")
-    return join(localAppData, "opencode", "NativeMessagingHosts")
+    return join(localAppData, "openfork", "NativeMessagingHosts")
   }
   // Linux
   switch (variant) {
@@ -111,7 +111,7 @@ export function buildManifest(options: PairingOptions): NativeHostManifest {
   const resolved = resolve(options.hostBinaryPath)
   return {
     name: HOST_NAME,
-    description: "opencode desktop bridge",
+    description: "OpenFork desktop bridge",
     path: resolved,
     type: "stdio",
     allowed_origins: options.allowedOrigins,
@@ -208,7 +208,7 @@ export function getInstructions(options: Partial<Pick<PairingOptions, "homeDir" 
   const status = getStatus(options)
   return {
     steps: [
-      "Install the opencode companion extension from the Chrome Web Store.",
+      "Install the OpenFork companion extension from the Chrome Web Store.",
       "Open the Desktop app — it will write the native messaging host manifest automatically.",
       `Host manifest: ${HOST_NAME}.json (per-browser under NativeMessagingHosts).`,
       "Reload chrome://extensions after pairing so the native host handshake can be retried.",

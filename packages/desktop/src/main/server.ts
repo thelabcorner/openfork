@@ -7,15 +7,22 @@ import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
 import { waitForServerHealth } from "./server-health"
+import {
+  isSidecarMessage,
+  type OxpSidecarRequest,
+  type SidecarOxpState,
+} from "./sidecar-protocol"
 export type HealthCheck = { wait: Promise<void> }
-type SidecarMessage =
-  | { type: "ready" }
-  | { type: "stopped" }
-  | { type: "error"; error: { message: string; stack?: string } }
 export type SidecarListener = { stop: () => Promise<void> }
+export type OxpSidecarClient = {
+  request: (request: OxpSidecarRequest) => Promise<SidecarOxpState>
+  subscribe: (listener: (state: SidecarOxpState) => void) => () => void
+  onClosed: (listener: (code: number) => void) => () => void
+}
 const SIDECAR_SERVICE_NAME = "opencode server"
 const SIDECAR_START_STALL_TIMEOUT = 60_000
 const SIDECAR_STOP_TIMEOUT = 6_000
+const OXP_REQUEST_TIMEOUT = 15_000
 type SpawnLocalServerOptions = {
   userDataPath: string
   /**
@@ -95,7 +102,9 @@ export async function spawnLocalServer(
         fail(new Error(`Sidecar did not become ready within ${SIDECAR_START_STALL_TIMEOUT}ms: ${sidecar}`))
       }, SIDECAR_START_STALL_TIMEOUT)
     }
-    const onMessage = (message: SidecarMessage) => {
+    const onMessage = (value: unknown) => {
+      if (!isSidecarMessage(value)) return
+      const message = value
       if (message.type === "ready") {
         if (done) return
         done = true
@@ -144,6 +153,7 @@ export async function spawnLocalServer(
     (signal) => checkHealth(`http://${hostname}:${port}`, password, signal),
     exit.promise,
   )
+  const oxp = createOxpSidecarClient(child, exit.promise)
   let stopping: Promise<void> | undefined
   return {
     listener: {
@@ -161,6 +171,83 @@ export async function spawnLocalServer(
       },
     },
     health: { wait },
+    oxp,
+  }
+}
+
+function createOxpSidecarClient(
+  child: ReturnType<typeof utilityProcess.fork>,
+  exit: Promise<number>,
+): OxpSidecarClient {
+  let sequence = 0
+  let closed = false
+  const pending = new Map<
+    number,
+    { resolve: (state: SidecarOxpState) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+  >()
+
+  const listeners = new Set<(state: SidecarOxpState) => void>()
+  const closeListeners = new Set<(code: number) => void>()
+  const onMessage = (value: unknown) => {
+    if (!isSidecarMessage(value)) return
+    if (value.type === "oxp-state") {
+      for (const listener of listeners) listener(value.state)
+      return
+    }
+    if (value.type !== "oxp-response") return
+    const waiter = pending.get(value.id)
+    if (!waiter) return
+    pending.delete(value.id)
+    clearTimeout(waiter.timer)
+    if (value.ok === true) waiter.resolve(value.state)
+    else waiter.reject(Object.assign(new Error(value.error.message), value.error.code ? { code: value.error.code } : {}))
+  }
+  child.on("message", onMessage)
+
+  void exit.then((code) => {
+    closed = true
+    child.off("message", onMessage)
+    const error = new Error(`OpenFork sidecar exited with code ${code}`)
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    pending.clear()
+
+    listeners.clear()
+    for (const listener of closeListeners) listener(code)
+    closeListeners.clear()
+  })
+
+  return {
+    request(request) {
+      if (closed) return Promise.reject(new Error("OpenFork sidecar is not running"))
+      const id = ++sequence
+      return new Promise<SidecarOxpState>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          reject(new Error(`OXP sidecar request timed out after ${OXP_REQUEST_TIMEOUT}ms`))
+        }, OXP_REQUEST_TIMEOUT)
+        timer.unref?.()
+        pending.set(id, { resolve, reject, timer })
+        try {
+          child.postMessage({ type: "oxp-request", id, request })
+        } catch (error) {
+          clearTimeout(timer)
+          pending.delete(id)
+          reject(error instanceof Error ? error : new Error("Failed to send OXP request to the sidecar"))
+        }
+      })
+    },
+
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    onClosed(listener) {
+      closeListeners.add(listener)
+      return () => closeListeners.delete(listener)
+    },
   }
 }
 export async function checkHealth(url: string, password?: string | null, signal?: AbortSignal): Promise<boolean> {

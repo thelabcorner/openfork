@@ -13,6 +13,7 @@ import {
   wslServerIdsToStartOnInitialize,
 } from "./startup"
 import { createWslServersController, type WslServerConfig } from "./servers"
+import { openForkWslInstallScript } from "./runtime"
 
 let persistedServers: WslServerConfig[] = []
 let releaseOpencodeResolve: (() => void) | undefined
@@ -29,11 +30,11 @@ test("starts every configured WSL server on initialization", () => {
 test("rejects an update that did not install the desktop version", () => {
   expect(() => expectOpencodeVersion("1.16.2", "1.16.2")).not.toThrow()
   expect(() => expectOpencodeVersion("1.14.35", "1.16.2")).toThrow(
-    "OpenCode update finished but Debian still reports 1.14.35; expected 1.16.2",
+    "OpenFork update finished but Debian still reports 1.14.35; expected 1.16.2",
   )
 })
 
-test("restarts an existing distro server after updating OpenCode", () => {
+test("restarts an existing distro server after updating OpenFork", () => {
   expect(
     wslServerIdToRestart(
       [
@@ -46,6 +47,20 @@ test("restarts an existing distro server after updating OpenCode", () => {
     ),
   ).toBe("wsl:Debian")
   expect(wslServerIdToRestart([], "Debian")).toBeUndefined()
+})
+
+test("installs the matching OpenFork release into the OpenFork WSL executable path", () => {
+  const script = openForkWslInstallScript("1.18.30")
+  expect(script).toContain("https://github.com/thelabcorner/openfork/releases/download/v${version}/${asset}")
+  expect(script).toContain('asset="opencode-linux-x64${baseline}${libc}.tar.gz"')
+  expect(script).toContain('asset="opencode-linux-arm64${libc}.tar.gz"')
+  expect(script).toContain('baseline="-baseline"')
+  expect(script).toContain('libc="-musl"')
+  expect(script).toContain('target="$HOME/.openfork/bin/opencode"')
+  expect(script).toContain('install -m 0755 "$tmp/opencode" "$staged"')
+  expect(script).toContain('test "$staged_version" = "$version"')
+  expect(script).toContain('mv -f "$staged" "$target"')
+  expect(script).not.toContain("opencode.ai/install")
 })
 
 test("clears cached distro probes when removing a WSL server", () => {

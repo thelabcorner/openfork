@@ -2,6 +2,7 @@
 
 import type { Platform } from "../../../app/src/context/platform"
 import type { ServerConnection } from "../../../app/src/context/server"
+import { isOxpPlatform } from "../../../app/src/oxp/platform"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 import { createResource, createSignal, lazy, Show, Suspense } from "solid-js"
 import { render } from "solid-js/web"
@@ -173,6 +174,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
   const storage = createDesktopStorage(window.api)
 
   const wslServersApi = os === "windows" ? window.api.wslServers : undefined
+  const oxpApi = isOxpPlatform(window.api.oxp) ? window.api.oxp : undefined
 
   return {
     platform: "desktop",
@@ -285,7 +287,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
 
       const notification = new Notification(title, {
         body: description ?? "",
-        icon: "https://opencode.ai/favicon-96x96-v3.png",
+        icon: new URL("./favicon-96x96-v3.png", document.baseURI).href,
       })
       notification.onclick = () => {
         void window.api.showWindow()
@@ -311,6 +313,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     },
 
     wslServers: wslServersApi,
+    oxp: oxpApi,
 
     getDisplayBackend: async () => {
       return window.api.getDisplayBackend().catch(() => null)

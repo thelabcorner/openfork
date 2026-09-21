@@ -1,9 +1,11 @@
 import { $ } from "bun"
 import { buildLocalCliToResources } from "./utils"
+import { fetchTunnelClient } from "./fetch-tunnel-client"
 
 await $`bun run install-electron`
 
 await $`bun ./scripts/copy-icons.ts ${process.env.OPENCODE_CHANNEL ?? "dev"}`
+await fetchTunnelClient()
 
 // V1 and V2 are mutually exclusive runtime backends. Building both on every
 // launch made the default V1 dev path compile + smoke-test a Bun executable it

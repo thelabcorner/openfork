@@ -174,7 +174,16 @@ function manifest() {
 }
 function serverLogRoots() {
   const xdgData = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
-  return [...new Set([join(xdgData, "opencode", "log"), join(app.getPath("userData"), "opencode", "log")])]
+  return [
+    ...new Set([
+      join(xdgData, "openfork", "log"),
+      join(app.getPath("userData"), "openfork", "log"),
+      // Migration-only discovery so exported diagnostics can still include
+      // logs from a pre-OpenFork storage namespace.
+      join(xdgData, "opencode", "log"),
+      join(app.getPath("userData"), "opencode", "log"),
+    ]),
+  ]
 }
 type Entry = { name: string; path?: string; data?: Buffer }
 function collect(dir: string, prefix: string): Entry[] {

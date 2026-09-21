@@ -23,7 +23,7 @@ import {
   BrowserError,
   type BrowserError as BrowserErrorType,
 } from "../errors"
-import type { Appearance, BrowserDispatchContext, BrowserOperation, BrokerRequest, HostCapabilities, WireGuestTabState, SessionTabInfo, VisualCaptureInput, VisualDiffInput, VisualRecordInput } from "../contracts"
+import type { Appearance, BrowserDispatchContext, BrowserOperation, BrokerRequest, HostCapabilities, HostOwner, WireGuestTabState, SessionTabInfo, VisualCaptureInput, VisualDiffInput, VisualRecordInput } from "../contracts"
 import { BROWSER_PROTOCOL_VERSION, canDispatchTab } from "../contracts"
 import type { ExtensionHost } from "./extension-host"
 import type { VisualObservationCoordinator } from "../visual/coordinator"
@@ -41,7 +41,7 @@ export interface ExtensionTabRecord {
   windowId?: string
   active?: boolean
   muted?: boolean
-  owner?: { kind: "user" } | { kind: "agent"; sessionId: string }
+  owner?: HostOwner
   readyState?: WireGuestTabState["readyState"]
   controller?: WireGuestTabState["controller"]
 }
@@ -184,7 +184,7 @@ export class ExtensionBridge {
 
     // Create-path for `open` without tabId goes to the preferred creation lane
     if (operation.name === "open" && tabId === undefined) {
-      const createLane = this.isAvailable ? "extension" : "webview"
+      const createLane = context.principal?.kind === "external" ? "webview" : this.isAvailable ? "extension" : "webview"
       // If createLane is extension but extension unavailable for creation, let it fall through to webview
       if (createLane === "extension") {
         try {
@@ -215,6 +215,10 @@ export class ExtensionBridge {
 
   private async dispatchExtension(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
     if (context.signal?.aborted) throw new BrowserControlInterruptedError("Browser request was already aborted")
+    if (context.principal?.kind !== "session") {
+      throw new BrowserError("BrowserUnsupportedOperation", "The Chrome extension lane currently requires a native OpenFork Session browser principal", false)
+    }
+    const sessionId = context.principal.sessionId
     // Preserve the ORIGINAL broker identity and project provenance across the
     // Chrome lane. There is no second logical request here; native messaging is
     // merely another carrier for the same request.
@@ -224,7 +228,7 @@ export class ExtensionBridge {
       const visualInput = operation.input as VisualCaptureInput | VisualDiffInput | VisualRecordInput
       const extensionTab = tabId ? this.options.getExtensionTab?.(tabId) : this.getActiveExtensionTab()
       if (!extensionTab) throw new BrowserError("BrowserTabNotFound", "Chrome tab is not available for visual capture", true)
-      if (canDispatchTab(extensionTab.owner ?? { kind: "user" }, context.sessionId) !== "ok") throw new BrowserPermissionDeniedError()
+      if (canDispatchTab(extensionTab.owner ?? { kind: "user" }, context.principal) !== "ok") throw new BrowserPermissionDeniedError()
       const grant = await this.options.visual.begin({
         context,
         lane: "extension",
@@ -254,11 +258,12 @@ export class ExtensionBridge {
 
     const envelope: BrokerRequest = {
       requestId: context.requestId,
-      sessionId: context.sessionId,
+      sessionId,
+      principal: context.principal,
       windowId: context.windowId,
       ...(context.workspaceId !== undefined ? { workspaceId: context.workspaceId } : {}),
       ...(context.directory !== undefined ? { directory: context.directory } : {}),
-      messageId: context.messageId,
+      ...(context.messageId !== undefined ? { messageId: context.messageId } : {}),
       ...(context.toolCallId !== undefined ? { toolCallId: context.toolCallId } : {}),
       tabId,
       operation: extensionOperation,
@@ -284,7 +289,7 @@ export class ExtensionBridge {
         throw new BrowserError(tag, message, retryable, details as Record<string, unknown>)
       }
       const result = response.result as Record<string, unknown>
-      this.captureExtensionState(operation, result, context.sessionId)
+      this.captureExtensionState(operation, result, sessionId)
       return result
     } catch (error) {
       // Native host transport down → BrowserHostUnavailable so caller can retry via webview or fail fast
@@ -303,7 +308,7 @@ export class ExtensionBridge {
     // of serializing one complete desktop status traversal ahead of Chrome.
     const [webviewStatus] = await Promise.all([
       this.options.operations.dispatch(undefined, { name: "status", input: {} }, context).catch(() => null) as Promise<{ status?: unknown; tabs?: SessionTabInfo[] } | null>,
-      this.isAvailable
+      this.isAvailable && context.principal?.kind !== "external"
         ? this.dispatchExtension(undefined, { name: "status", input: {} }, context).catch((error) => {
             this.log("extension status refresh failed", { error: String(error) })
             return null

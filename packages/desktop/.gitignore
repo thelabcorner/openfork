@@ -26,5 +26,6 @@ out/
 electron.vite.config.*.mjs
 
 resources/opencode-cli*
+resources/tunnel
 resources/icons
 resources/*.metainfo.xml

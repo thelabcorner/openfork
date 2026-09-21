@@ -30,6 +30,7 @@ import {
 import {
   BROKER_REQUEST_PATH,
   BROWSER_PROTOCOL_VERSION,
+  browserPrincipalFromRequest,
   isBrokerRequest,
   type BrokerRequest,
   type BrokerResponse,
@@ -357,6 +358,11 @@ export class BrowserHost {
       return
     }
     const request = body as BrokerRequest
+    const principal = browserPrincipalFromRequest(request)
+    if (!principal) {
+      respondJson(res, 200, responseError(request.requestId, 0, new BrowserOperationFailedError("Invalid browser control principal")))
+      return
+    }
     if (request.windowId !== this.options.windowId) {
       respondJson(
         res,
@@ -396,11 +402,12 @@ export class BrowserHost {
     try {
       const context: BrowserDispatchContext = {
         requestId: request.requestId,
-        sessionId: request.sessionId,
+        principal,
+        ...(principal.kind === "session" ? { sessionId: principal.sessionId } : {}),
         windowId: request.windowId,
         ...(request.workspaceId !== undefined ? { workspaceId: request.workspaceId } : {}),
         ...(request.directory !== undefined ? { directory: request.directory } : {}),
-        messageId: request.messageId,
+        ...(request.messageId !== undefined ? { messageId: request.messageId } : {}),
         ...(request.toolCallId !== undefined ? { toolCallId: request.toolCallId } : {}),
         timeoutMs: request.timeoutMs,
         signal: controller.signal,
@@ -704,7 +711,10 @@ const isBrokerResponseLike = (value: unknown): value is BrokerResponse => {
 function getHostConfigPaths(): string[] {
   const candidates: string[] = []
   const xdg = process.env.XDG_STATE_HOME
-  if (xdg) candidates.push(join(xdg, "opencode", "browser-host.json"))
+  if (xdg) {
+    candidates.push(join(xdg, "openfork", "browser-host.json"))
+    candidates.push(join(xdg, "opencode", "browser-host.json"))
+  }
   const home = (() => {
     try {
       return homedir()
@@ -713,10 +723,12 @@ function getHostConfigPaths(): string[] {
     }
   })()
   if (home) {
-    candidates.push(join(home, ".local", "state", "opencode", "browser-host.json"))
-    candidates.push(join(home, "Library", "Application Support", "opencode", "browser-host.json"))
-    candidates.push(join(home, "AppData", "Roaming", "opencode", "browser-host.json"))
-    candidates.push(join(home, "AppData", "Local", "opencode", "browser-host.json"))
+    for (const app of ["openfork", "opencode"]) {
+      candidates.push(join(home, ".local", "state", app, "browser-host.json"))
+      candidates.push(join(home, "Library", "Application Support", app, "browser-host.json"))
+      candidates.push(join(home, "AppData", "Roaming", app, "browser-host.json"))
+      candidates.push(join(home, "AppData", "Local", app, "browser-host.json"))
+    }
   }
   try {
     candidates.push(join(process.cwd(), "browser-host.json"))

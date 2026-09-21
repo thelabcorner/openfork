@@ -4,9 +4,9 @@ import type { Configuration } from "electron-builder"
 const legacyDesktopEntry = "resources/linux/opencode-desktop.desktop"
 
 const channels = [
-  { channel: "dev", appId: "ai.opencode.desktop.dev" },
-  { channel: "beta", appId: "ai.opencode.desktop.beta" },
-  { channel: "prod", appId: "ai.opencode.desktop" },
+  { channel: "dev", appId: "ai.openfork.desktop.dev" },
+  { channel: "beta", appId: "ai.openfork.desktop.beta" },
+  { channel: "prod", appId: "ai.openfork.desktop" },
 ] as const
 
 for (const channel of channels) {
@@ -21,6 +21,7 @@ for (const channel of channels) {
     else process.env.OPENCODE_CHANNEL = previous
 
     expect(config.appId).toBe(channel.appId)
+    expect(config.artifactName).toBe("openfork-desktop-${os}-${arch}.${ext}")
     expect(config.extraMetadata?.desktopName).toBe(`${channel.appId}.desktop`)
     expect(config.linux?.executableName).toBe(channel.appId)
     expect(config.linux?.desktop?.entry?.StartupWMClass).toBe(channel.appId)
@@ -51,9 +52,9 @@ test("keeps a hidden prod launcher for old Linux pins", async () => {
   ).toBe(true)
 
   const desktop = await Bun.file(legacyDesktopEntry).text()
-  expect(desktop).toContain("Exec=/opt/OpenCode/ai.opencode.desktop %U")
-  expect(desktop).toContain("Icon=ai.opencode.desktop")
-  expect(desktop).toContain("StartupWMClass=ai.opencode.desktop")
+  expect(desktop).toContain("Exec=/opt/OpenFork/ai.openfork.desktop %U")
+  expect(desktop).toContain("Icon=ai.openfork.desktop")
+  expect(desktop).toContain("StartupWMClass=ai.openfork.desktop")
   expect(desktop).toContain("NoDisplay=true")
 })
 
@@ -90,11 +91,9 @@ for (const channel of ["beta", "prod"] as const) {
   })
 }
 
-// OpenFork: a publish feed would generate app-update.yml inside packaged builds;
-// while it points at anomalyco, electron-updater can install official OpenCode
-// over this fork. No channel may carry any publish target until it is retargeted.
+// Every channel must point update metadata at OpenFork, never upstream OpenCode.
 for (const channel of ["dev", "beta", "prod"] as const) {
-  test(`carries no upstream publish feed in ${channel} builds`, async () => {
+  test(`publishes update metadata only to OpenFork in ${channel} builds`, async () => {
     const previous = process.env.OPENCODE_CHANNEL
     process.env.OPENCODE_CHANNEL = channel
     const module = await import(`./electron-builder.config.ts?no-publish=${channel}`)
@@ -102,6 +101,8 @@ for (const channel of ["dev", "beta", "prod"] as const) {
     if (previous === undefined) delete process.env.OPENCODE_CHANNEL
     else process.env.OPENCODE_CHANNEL = previous
 
-    expect(config.publish).toBeUndefined()
+    expect(config.publish).toEqual([
+      expect.objectContaining({ provider: "github", owner: "thelabcorner", repo: "openfork" }),
+    ])
   })
 }

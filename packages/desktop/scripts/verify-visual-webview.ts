@@ -40,7 +40,7 @@ try {
     OPENCODE_VISUAL_RESULT_PATH: resultPath,
     ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
   }
-  // The OpenCode dev shell can intentionally carry ELECTRON_RUN_AS_NODE for
+  // The OpenFork dev shell can intentionally carry ELECTRON_RUN_AS_NODE for
   // helper processes. Passing it to the fidelity harness makes electron.exe
   // behave like plain Node and silently bypass the Electron main/preload path we
   // are trying to certify.

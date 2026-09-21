@@ -1,9 +1,15 @@
-import { join } from "node:path"
+import { createRequire } from "node:module"
+import { dirname, join } from "node:path"
 
 const env = { ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 
-const child = Bun.spawn(["electron-vite", "dev"], {
+const electronVite = (() => {
+  const manifest = createRequire(import.meta.url).resolve("electron-vite/package.json")
+  return join(dirname(manifest), "bin", "electron-vite.js")
+})()
+
+const child = Bun.spawn([process.execPath, electronVite, "dev"], {
   cwd: join(import.meta.dir, ".."),
   env,
   stdin: "inherit",

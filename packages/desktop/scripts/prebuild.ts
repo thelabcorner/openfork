@@ -2,12 +2,14 @@
 import { $ } from "bun"
 
 import { buildLocalCliToResources, downloadCliToResources, resolveChannel } from "./utils"
+import { fetchTunnelClient } from "./fetch-tunnel-client"
 
 const channel = resolveChannel()
 await $`bun ./scripts/copy-icons.ts ${channel}`
 await $`bun ./scripts/copy-metainfo.ts ${channel}`
 
 await $`cd ../opencode && bun script/build-node.ts`
+await fetchTunnelClient()
 // Dev builds normally pull a *pinned upstream* CLI npm package
 // (`@opencode-ai/cli-*@0.0.0-next-*`, see utils.ts). A dev pre-release of this
 // fork must ship the CLI built from the current source instead, so CI sets

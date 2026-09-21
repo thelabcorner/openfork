@@ -220,7 +220,7 @@ test("coalesces overlapping host hello registrations", async () => {
     requests++
     releases.push(() => {
       res.writeHead(200, { "content-type": "application/json" })
-      res.end(JSON.stringify({ data: { accepted: true, brokerProtocolVersion: 2, hostId: "test-host" } }))
+      res.end(JSON.stringify({ data: { accepted: true, brokerProtocolVersion: 3, hostId: "test-host" } }))
     })
   })
   await new Promise<void>((resolve, reject) => {
@@ -600,7 +600,7 @@ test("hello registration is session-agnostic (no sessionId/workspaceId/directory
     expect(registration["workspaceId"]).toBeUndefined()
     expect(registration["directory"]).toBeUndefined()
     expect(registration["windowId"]).toBe("test-window")
-    expect(registration["protocolVersion"]).toBe(2)
+    expect(registration["protocolVersion"]).toBe(3)
     expect(registration["callbackToken"]).toBe(h.callbackUrlToken)
   } finally {
     await h.stop()
@@ -621,6 +621,32 @@ test("forwards the requesting sessionId inside dispatch context", async () => {
     })
     expect(response.status).toBe(200)
     expect(seenSessionId).toBe("sess-custom")
+  } finally {
+    await forwarding.host.stop()
+  }
+})
+
+test("forwards an external principal without manufacturing a Session id", async () => {
+  let seen: BrowserDispatchContext | undefined
+  const forwarding = await makeHost(async (_tabId, _operation, context) => {
+    seen = context
+    return { status: { ok: true } }
+  })
+  try {
+    const response = await post(
+      forwarding.url,
+      "/v1/browser/request",
+      envelope({
+        sessionId: undefined,
+        messageId: undefined,
+        principal: { kind: "external", principalId: "oxp-parent-digest" },
+      }),
+      { authorization: `Bearer ${forwarding.host.callbackUrlToken}` },
+    )
+    expect(response.status).toBe(200)
+    expect(seen?.principal).toEqual({ kind: "external", principalId: "oxp-parent-digest" })
+    expect(seen?.sessionId).toBeUndefined()
+    expect(seen?.messageId).toBeUndefined()
   } finally {
     await forwarding.host.stop()
   }

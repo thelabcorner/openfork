@@ -5,9 +5,17 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
 import { app } from "electron"
+import { LEGACY_USER_DATA_NAMES, USER_DATA_NAMES } from "./user-data"
 const execFileAsync = promisify(execFile)
 const root = dirname(fileURLToPath(import.meta.url))
-const desktopStateNames = ["ai.opencode.desktop.dev", "ai.opencode.desktop.beta", "ai.opencode.desktop"]
+const desktopStateNames = [
+  USER_DATA_NAMES.dev,
+  USER_DATA_NAMES.beta,
+  USER_DATA_NAMES.prod,
+  LEGACY_USER_DATA_NAMES.dev,
+  LEGACY_USER_DATA_NAMES.beta,
+  LEGACY_USER_DATA_NAMES.prod,
+]
 type Logger = {
   log(message: string, meta?: Record<string, unknown>): void
   error(message: string, meta?: Record<string, unknown>): void

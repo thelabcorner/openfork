@@ -167,7 +167,7 @@ describe("integration reconciliation", () => {
   test("BrokerRequest shape is byte-identical across lanes (windowId required, operation discriminator)", () => {
     const req = { requestId: "r1", sessionId, windowId, messageId: "m1", timeoutMs: 15000, operation: { name: "snapshot", input: { tabId: "tab-1" } } }
     expect(isBrokerRequest(req)).toBe(true)
-    expect(BROWSER_PROTOCOL_VERSION).toBe(2)
+  expect(BROWSER_PROTOCOL_VERSION).toBe(3)
     expect(BROKER_REQUEST_PATH).toBe("/v1/browser/request")
     // windowId must be required — missing should fail
     const missing = { ...req, windowId: undefined as unknown as string }
@@ -368,7 +368,7 @@ describe("integration reconciliation", () => {
   })
 
   test("overlay invariants: tabGroups title + hide→capture→show sequence", () => {
-    expect(TAB_GROUP_EXTENSION_LANE.title("sess-int-12345678")).toBe("opencode — sess-int")
+    expect(TAB_GROUP_EXTENSION_LANE.title("sess-int-12345678")).toBe("OpenFork — sess-int")
     expect(TAB_GROUP_EXTENSION_LANE.color).toBe("blue")
     expect(SCREENSHOT_OVERLAY_INVARIANT.sequence).toEqual(["opencode:hide (barrier ack)", "Page.captureScreenshot (captureBeyondViewport)", "opencode:show"])
     expect(SCREENSHOT_OVERLAY_INVARIANT.ack).toContain("sendMessage")
