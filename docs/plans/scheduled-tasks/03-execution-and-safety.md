@@ -15,6 +15,7 @@ export interface Interface {
   readonly execute: (input: {
     readonly task: ScheduledTask.Info
     readonly runID: ScheduledTask.RunID
+     readonly attempt: number
     readonly fireFor: number
     readonly leaseID: string
   }) => Effect.Effect<ExecutionOutcome>  // never fails — encodes failure
@@ -95,6 +96,21 @@ task
 
 ## 3. Firing sequence
 
+### 3.0 SQLite writer ownership
+
+The scheduler shares a WAL database with a low-priority ChunkDB maintenance
+writer. Every scheduler transaction that reads durable state and may then mutate
+it begins with `BEGIN IMMEDIATE` (`{ behavior: "immediate" }` in the Effect
+Drizzle API). This reserves the single SQLite writer before the transaction
+establishes its read snapshot.
+
+This is correctness, not tuning. Under DEFERRED mode a maintenance commit between
+the scheduler's read and first write makes that read snapshot unwritable and
+SQLite returns `SQLITE_BUSY_SNAPSHOT` (517) immediately; a five-second
+`busy_timeout` cannot repair an obsolete snapshot. Read-only snapshot
+transactions remain DEFERRED, while ChunkDB maintenance retains its dedicated
+connection and short backoff so foreground domain work owns writer priority.
+
 ```text
  1. LEASE ACQUIRED (runner, Tier 0)
      |
@@ -109,11 +125,19 @@ task
  6.  >> TIER 3 BEGINS <<  InstanceStore.load({ directory })
      |
  7.  Resolve agent   model                 -> unavailable = failed/config
- 8.  Create session (title from task name   fire instant)
+ 8.  Resolve Session continuity policy:
+       new      -> create fresh task-owned root
+       reuse    -> reuse/create task-owned binding
+       auto     -> reuse only if durable User frontier is unchanged, else rotate
+       existing -> revalidate exact user-selected root
+     -> bind runID + attempt -> sessionID before any Goal/model work
      |
       -- if action.goal: Goal.prepareForSession({ ..., start: true })
      |
- 9.  SessionPrompt.hostPrompt({ sessionID, parts, agent, model })   heartbeat 30s
+ 9.  SessionPrompt.hostPrompt(
+       { sessionID, parts, agent, model },
+       { source: scheduled-task.run, ref: runID }
+     )                                                   heartbeat 30s
 10.  Await completion (or goal terminal state, or timeout)
      |
 11.  SETTLE — update run row, denormalize onto task, release lease,
@@ -126,6 +150,92 @@ run row is marked `abandoned` on the next startup sweep rather than remaining
 `running` forever. A perpetual `running` row would **permanently block the
 task** under the `skip` overrun policy — a silent death that is very hard to
 diagnose from the UI.
+
+### 3.1 Scheduled prompt semantics
+
+Creation authorization is consumed **before** this execution lifecycle begins.
+For conversational creation, the live human Prompt/Command worker root
+authorizes one durable task definition and the task stores
+`source=agent + sourceMessageID`. That human turn is not replayed later as the
+authority of each scheduled execution.
+
+`hostPrompt` is an admission/ownership boundary, not a request for privileged System authority.
+
+The scheduled action prompt is:
+
+```text
+owner         = host
+semantic kind = Synthetic / trusted host-admitted conversational input
+producer      = scheduled-task.run
+correlation   = provenance.ref = scheduled_task_run.id (logical run)
+lineage       = root (no sourceMessageID)
+authority     = conversational/user lane
+provider      = normally role=user
+```
+
+This preserves the distinction between “the human is not currently typing” and “the host may override the user's policy.” A scheduled run is user-authorized automation, but its task body must not become System simply because OpenFork injected it. Stable unattended-execution/safety doctrine remains host-privileged System policy and is projected separately according to the exact provider/model/runtime capability.
+
+The two provenance planes answer different questions:
+
+- task `source=agent + sourceMessageID`: **why does this durable schedule exist?**
+- run-turn `source=scheduled-task.run + ref=runID`: **why is this model-facing
+  execution turn occurring now?**
+
+The latter is host-owned Synthetic root-lineage input and does **not** gain
+durable-user/Goal-creation authority merely because provider lowering may encode
+it as `role=user`.
+
+ScheduledTask now uses the shared typed provenance registry at the trusted
+`hostPrompt` admission boundary. The executor chooses only the registered
+`scheduled-task.run` source plus the durable run correlation; SessionPrompt
+constructs `owner=host`. Public `PromptInput` cannot submit provenance. This
+is the same producer-owned rule used by Goal continuation and the planned Swarm
+admission surface: **the producer stamps provenance once; downstream consumers
+classify it, never infer it from role/text/session metadata.**
+
+That rule concerns **turn provenance/authority**. Session continuity requires
+aggregate identity and run identity to remain separate: task-owned Sessions may
+carry protected `scheduledTaskID`, while per-run correlation belongs to the run
+row and the `scheduled-task.run / ref=runID` turn. An explicitly pinned existing
+Session remains user-owned and receives no Scheduled aggregate identity. The
+binding/CAS/User-frontier contract is normative in
+`08-scheduler-workspace-session-continuity.md`.
+
+#### User-driving a scheduled run Session
+
+Scheduled execution creates a **root worker Session**, not a host-owned child
+Session. After the scheduler's trusted `hostPrompt` admission, the human may
+open that run Session and submit ordinary prompts through the canonical Session
+prompt API. Those follow-ups carry normal `owner=user / source=prompt`
+provenance and are governed by the same busy/queue/interrupt behavior as any
+other root chat.
+
+The inverse remains fenced: arbitrary `hostPrompt` callers may not take over a
+Scheduled root merely because its aggregate metadata identifies a task/run. Only
+the registered `scheduled-task.run` producer may perform trusted Scheduled
+admission. This is the same separation Swarm relies on conceptually: a worker
+root can be human-drivable without making producer admission forgeable.
+
+Do **not** collapse task identity, run identity, and conversation identity into
+one concept. They remain independently inspectable even when a policy reuses one
+conversation across runs: each logical firing still has its own durable run row
+and its own correlated host turn. `new` creates a root per run; `reuse`,
+`auto`, and `existing` intentionally permit Session reuse under the rules in
+08.
+
+Retries remain attempts of the same logical run, so they may create a new
+Session while retaining the same `provenance.ref = runID`. Attempt identity is
+an execution-safety fence, not a second causal origin: Session binding,
+permission-state transitions, and settlement are all conditional on the current
+`runID + attempt`. A stale attempt is unable to mutate a newer attempt's run
+state.
+
+Lease recovery follows the same ownership discipline. Candidate discovery and
+reclamation execute inside one `BEGIN IMMEDIATE` transaction; recovery
+revalidates the exact lease id, owner, and heartbeat it observed before clearing
+ownership, and only abandons a run whose `attempt` matches that recovered
+lease. A heartbeat or retry transition therefore cannot race a pre-transaction
+stale scan into abandoning newer work.
 
 ## 4. Goal composition
 

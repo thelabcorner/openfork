@@ -11,8 +11,20 @@
 
 ```text
 user intent (\"every weekday at 09:00, run /review\")
-        ↓
-         durable specification row             scheduled_task             (SQLite, global DB)
+        │
+        ├── editor / HTTP API ───────────────────────────────────────┐
+        │                                                           │
+        └── conversation                                            │
+              ↓                                                     │
+            scheduled_task tool                                     │
+              ↓ active human worker-root provenance + intent policy │
+            ScheduledTaskAgent                                      │
+              ↓ durable Session ownership (project + directory)     │
+              └─────────────────────────────────────────────────────┤
+                                                                    ↓
+                                            ScheduledTask.Service.create
+                                                                    ↓
+                                      durable specification row scheduled_task
         ↓
          recurrence engine computes next_run_at      pure function, no I/O
         ↓
@@ -44,7 +56,7 @@ Walking backwards from every thing the UI wants to show:
 | Task list (name, enabled, schedule summary) | `scheduled_task` rows | One indexed query, **Tier 0** |
 | \"Next run in 4m 12s\" | `next_run_at` **already materialized** on the row | Zero — it is a stored integer, not a recomputation |
 | \"Last run succeeded / failed\" | `last_run_status`   `last_run_at` denormalized onto the task row | Zero extra queries |
-| Link to the session a run created | `scheduled_task_run.session_id` scalar | No session hydration |
+| Link to the current execution attempt's session | `scheduled_task_run.session_id` scalar, attempt-fenced and written before Goal/model work | No session hydration |
 | Unread inbox badge count | `COUNT(*) WHERE acknowledged_at IS NULL AND status IN (...)` | One aggregate, indexed |
 | Run history for one opened task | `scheduled_task_run` paged by task | **Only on explicit open** |
 | The actual agent output | Navigate to the session | Normal session detail path |
@@ -62,6 +74,7 @@ The design succeeds or fails on keeping the boundary sharp.
 | Operation | Tier | Justification |
 |---|---|---|
 | List / get / create / update / delete / enable a task | **0** | It is durable global catalog state. `AGENTS.md` lists \"durable project catalog, global session indexes/status\" as Tier 0. A schedule is the same kind of fact. |
+| Conversational create | **0** | One durable Session lookup establishes project/directory ownership, then the same `ScheduledTask.Service.create` writer runs. The uncontended hot path has no extra idempotency preflight and no Instance/runtime materialization; only duplicate/replay recovery performs an indexed name lookup. |
 | List runs / acknowledge a run / inbox count | **0** | Durable history rows keyed by task. |
 | Timer arming, due scan, lease claim | **0** | Process-global bookkeeping over a global table. Must **never** touch `InstanceStore`. |
 | Validating that a task's target directory still exists | **1** | Durable location metadata. Requires an explicit directory, no runtime init. |
@@ -97,7 +110,8 @@ different **lifetime**, and a different **failure meaning**.
 
 ### 3.1 `scheduled_task` — user-owned specification
 
-Writer: the user (or a loop file). Lifetime: until deleted.
+Writer: the user through API/UI, the trusted conversational admission producer,
+or a loop file. Lifetime: until deleted.
 
 ```ts
 // packages/core/src/scheduled-task/sql.ts
@@ -158,9 +172,12 @@ queries
     last_run_id: text().$type<ScheduledTask.RunID>(),
     consecutive_failures: integer().notNull().default(0),
 
-    // -- source provenance (loop files, T7) -----------------------
-    source: text().$type<\"api\" | \"loop_file\">().notNull().default(\"api\"),
+    // -- creation provenance --------------------------------------
+    source: text().$type<\"api\" | \"agent\" | \"loop_file\">().notNull().default(\"api\"),
     source_path: text(),
+    // Scalar correlation only: pruning the conversation must not erase
+    // why this durable schedule exists.
+    source_message_id: text(),
 
     time_created: integer().notNull().$default(() => Date.now()),
     time_updated: integer().notNull().$default(() => Date.now()),
@@ -174,6 +191,30 @@ queries
   ],
 )
 ```
+
+#### Creation provenance and conversational idempotency
+
+Task-definition provenance and execution-turn provenance are separate planes.
+An agent-created task stores `source=agent` plus the exact durable
+`source_message_id` of the human worker root that authorized creation. The
+message id is deliberately a scalar, not a foreign key: deleting/pruning a
+conversation must not erase schedule attribution.
+
+Public HTTP creation does not accept either field. Only the trusted
+`ScheduledTaskAgent` producer may stamp agent origin. It first proves that the
+**active/latest worker root itself** is a provenance-qualified human
+Prompt/Command, then a domain-specific policy proves that this text explicitly
+requested scheduling or confirmed the immediately preceding scheduling
+proposal. A later host/scheduled/subagent worker root cannot borrow older human
+consent.
+
+Provider retries are convergent rather than duplicate-producing without taxing
+the uncontended create path. The agent goes directly through the canonical
+IMMEDIATE create transaction. Only if that create reports a duplicate/validation
+conflict does it perform an indexed `(project_id, name)` recovery read. The same
+`source_message_id + exact normalized task specification` returns the existing
+row with `created=false`; the same name with different authorization/spec fails
+closed instead of silently mutating user-owned automation.
 
 ### 3.2 `scheduled_task_lease` — runtime claim cursor
 
@@ -249,7 +290,9 @@ has a bug.
       .notNull(),
 
     status: text().$type<ScheduledTask.RunStatus>().notNull(),
-    //  queued | running | succeeded | failed | skipped | abandoned
+    //  queued | running | waiting | succeeded | failed | skipped | abandoned
+    //  `waiting` is the permission-pause state (03 § 5.1) and is an unread
+    //  inbox status.
 
     // Scalar references — intentionally NOT foreign keys.
     session_id: text(),
@@ -284,6 +327,67 @@ feature.
 )
 ```
 
+#### Session aggregate correlation
+
+`scheduled_task_run.session_id` is the authoritative run -> Session pointer for
+the current attempt and remains a scalar reference so Session pruning cannot erase
+run history. The inverse classification needed by process-global consumers does
+**not** justify another run-table index or history scan.
+
+The original one-run-per-Session implementation stamps
+`scheduledTaskID + scheduledTaskRunID` into V1 Session metadata. The next
+continuity tranche supersedes the run-owned aggregate assumption: task-owned
+Sessions keep task identity, while run identity remains on
+`scheduled_task_run.session_id` plus the scheduled turn's typed provenance.
+See `08-scheduler-workspace-session-continuity.md` for the normative migration.
+Producer-owned Scheduled keys remain registered with the shared
+`SessionMetadataOwnership` policy during that migration:
+
+- public/general Session creation cannot mint them;
+- generic metadata replacement retains the current producer-owned values while
+  preserving replacement semantics for ordinary caller metadata;
+- a fork/derived Session strips them because it is a new aggregate and must not
+  inherit the source Session's producer identity.
+
+This is aggregate provenance, not conversational authority. Individual scheduled
+prompt authority continues to come only from the typed turn-provenance contract
+described in 03 § 3.1.
+
+The resulting task/run Session is also **not a subagent-style opaque worker**.
+Producer-owned Scheduled metadata classifies task-owned aggregates; it does not
+make the root Session host-only. The compatibility/default `new` policy still
+creates one root per run, while `reuse` and `auto` may bind many runs to one
+task-owned root and `existing` may target an ordinary user-owned root. Every run
+remains independently auditable through its run row and typed
+`scheduled-task.run` turn provenance.
+
+Conversational authority is deliberately narrower than aggregate mutation
+authority. The ordinary V1 Session prompt/command/shell transport may drive a
+well-formed Scheduled run root, but public update/delete/fork/control/history
+mutation continues to treat the producer-owned aggregate as protected. A partial
+or malformed Scheduled metadata envelope fails closed rather than becoming an
+ordinary public Session.
+
+Human focus also reuses the shared Session input/execution plane rather than
+introducing a scheduler-specific interrupt protocol. If a human prompt arrives
+while an autonomous Scheduled provider cycle is already active, that in-flight
+cycle may reach its safe terminal boundary; the durable User input establishes
+the shared `SessionInput` user frontier and owns the **next** provider cycle ahead
+of host/automatic work. This is the same safe-cycle steering law used by the
+generalized Session/Swarm architecture, not an immediate blind cancellation of
+an already-running provider stream.
+
+Project navigation treats these roots as ordinary project Sessions even when the
+executor's physical directory differs from the canonical worktree. The
+bootstrap-free global root census can therefore be scoped by `projectID`; the
+canonical worktree cache is the bounded project-wide root index, while sandbox
+and detail stores remain physical-directory slices. Ordinary
+`session.created|updated|deleted` events mirror a foreign-directory root into
+that already-materialized project index (and, when present, its physical detail
+store) without consulting Scheduled Task state. A partial
+`(project_id,time_updated,id) WHERE parent_id IS NULL` index keeps that census
+ordered and bounded.
+
 **Note on the `retry` trigger vs the unique index.** A retry of the same logical
 instant must *not* insert a second row — it **updates** the existing row and
 increments `scheduled_task_lease.attempt`. This is deliberate: the inbox should
@@ -306,15 +410,15 @@ row.
 **Reuse the pattern, not the table.** T3 should literally re-read
 `goal/automation.ts` and mirror its `claim`/`release`/recovery structure.
 
-### 3.5 Multi-project fan-out (decision deferred to T0)
+### 3.5 Multi-project fan-out (T0 decision: one target in v1)
 
-Codex supports one task running across more than one project. That implies a
-join table (`scheduled_task_target`) and a fan-out of N runs per firing. This plan
-**models one target per task in v1** and notes the extension point: if fan-out
-lands later, `scheduled_task_run.fire_for` must become `(task_id, target_id,
-fire_for)` in the unique index. **Decide this in T0**, because retrofitting it
-changes the idempotency key — a migration that is painful after real run
-history exists.
+Codex supports one task running across more than one project. That would imply a
+join table (`scheduled_task_target`) and a fan-out of N runs per firing. T0
+resolved this explicitly: **v1 has one target per task**, so the idempotency key
+remains `(task_id, fire_for)`. If fan-out lands later,
+`scheduled_task_run.fire_for` must become `(task_id, target_id, fire_for)` in the
+unique index. That is an intentional future migration, not an unresolved v1
+design choice; see decision 4 in `06-risks-and-open-questions.md`.
 
 ## 4. The due cursor invariant
 
@@ -351,7 +455,8 @@ double-firing a database-level impossibility rather than a timing hope.
 
 ### Layer 1 — Compare-and-set acquisition
 
-Directly modeled on `GoalAutomation.claim`:
+Uses the same database-CAS doctrine originally demonstrated by
+`GoalAutomation.claim`, but not its process-owner recovery policy:
 
 ```ts
 const claimed = yield* db
@@ -382,19 +487,18 @@ fired this instant\" and exits without starting work.
 
 ### Layer 4 — Crash recovery by owner identity
 
-`goal/automation.ts` carries this exact comment, which should be adapted:
+`goal/automation.ts` historically carried this assumption:
 
 + \"A different process owner in this local SQLite database can only be a
 + crashed/restarted predecessor. Requeue those claims once at service
 + construction. Same-process duplicate service instances share the module owner id
 + and therefore never steal one another's live reservation.\"
 
-**Important divergence: do not copy that assumption blindly.** It is sound for Goal
-automation because a continuation that gets requeued costs little. For a
-scheduler it is **too aggressive** if two processes can legitimately run
-concurrently (desktop app   `opencode serve` on the same DB). Blind requeue at
-startup would let a starting process steal a **live** lease from a healthy peer
-and double-fire.
+**That assumption is not sound in the supported shared-realm multi-process
+topology, for Goal or ScheduledTask.** A second live OpenCode process can share
+the same SQLite database. Blind foreign-owner clearing can therefore steal live
+work. Goal worker continuation is planned to move beneath shared Session
+execution ownership; ScheduledTask already uses a separate heartbeat lease.
 
 **Therefore the recovery rule is heartbeat-based, not identity-based:**
 
@@ -402,15 +506,18 @@ and double-fire.
 reclaim a lease only when
     heartbeat_at < now - LEASE_TTL      (stale — owner is gone or wedged)
 OR
-    owner = PROCESS_OWNER_ID            (our own orphan from a prior life
-                                  of this exact process id)
+    owner = PROCESS_OWNER_ID            (explicit same-process teardown/startup
+                                         reconciliation where no run can be live)
 ```
 
-with `LEASE_TTL` comfortably larger than the heartbeat interval (suggest
-`heartbeat = 30s`, `TTL = 150s`). Reclaiming a stale lease increments `attempt`
-and is recorded as such. T0 must confirm whether concurrent processes sharing
-one DB is a supported topology; if it is **not**, say so explicitly and the
-simpler identity-based rule becomes legal.
+with `LEASE_TTL` comfortably larger than the heartbeat interval (current
+implementation: heartbeat 30s, TTL 150s). Reclaiming a stale ScheduledTask lease
+increments `attempt` and is recorded as such.
+
+The newer RuntimeOwner design can replace feature-local
+`scheduled-owner:<pid>:<uuid>` identity with one process-incarnation ID while
+leaving this per-run heartbeat/retry policy intact. Shared identity does not turn
+ScheduledTask into a Session-style non-expiring execution owner.
 
 ### Heartbeat cost
 
@@ -540,11 +647,21 @@ export const RootHttpApi = HttpApi.make(\"opencode-root\")
 
 **Not** `InstanceHttpApi`. See §2.1.
 
-The one endpoint that *is* runtime-heavy — `runNow` — still lives in this Tier 0
-group but is **asynchronous**: it validates, writes a `queued` run row, pokes
-the runner, and returns immediately. The HTTP request itself never blocks on
-Instance bootstrap or agent work. This keeps the group's middleware chain
-uniformly cheap while still offering OpenChamber's \"run now\" affordance.
+`runNow` also belongs to this Tier 0 group. The HTTP operation does exactly one
+kind of work: validate and durably enqueue a `queued` manual run. It neither
+materializes an Instance nor waits for agent work. The process-global runner is
+woken by the authoritative `scheduledTask.runUpdated` event and only the
+executor crosses the Tier 3 boundary. Classifying the route by the eventual
+consumer rather than the work performed by the route would violate the
+producer/ownership rule in both root and httpapi `AGENTS.md`.
+
+The enqueue is restart-safe even if the writer dies before publishing its
+process-local event: SQLite triggers advance a durable scheduler generation in
+the same transaction as runnable-state mutations. Every runner owns one clamped
+timer; when no recurrence cursor exists that timer performs a generation-only
+reconciliation read. An unchanged generation re-arms without a due scan. A
+changed generation performs the normal due scan. This is the cross-process
+liveness floor; EventV2 remains the zero-latency same-process fast path.
 
 ## 9. Negative invariants (the closeout contract)
 
@@ -554,7 +671,7 @@ Each becomes a test in T9.
 
 | # | Invariant | How it is proven |
 |---|---|---|
-| N1 | **Zero implicit instances.** List/get/create/update/delete/enable/ack and the entire idle timer loop create exactly **0** `InstanceStore.load` calls — including when directory/workspace query params are omitted. | Instrument `InstanceStore.load` with a counter; assert 0 across the full CRUD   60 minutes of simulated idle time. |
+| N1 | **Zero implicit instances.** List/get/create/update/delete/enable/ack/runNow and the entire idle timer loop create exactly **0** `InstanceStore.load` calls — including when directory/workspace query params are omitted. | Instrument `InstanceStore.load` with a counter; assert 0 across the full CRUD + manual enqueue + 60 minutes of simulated idle time. |
 | N2 | **One timer.** N tasks ⇒ 1 armed timer, not N. | Assert the scheduler's active timer count is ≤1 with 200 tasks loaded. |
 | N3 | **No double-fire.** Two concurrent runners over one DB, 100 simultaneously-due tasks ⇒ exactly 100 run rows. | Two service instances, distinct owner ids, shared SQLite file. |
 | N4 | **No per-row transport.** Rendering 50 task rows issues **one** list request and **zero** per-row requests or per-row subscriptions. | Network assertion in the client test. |
@@ -563,6 +680,7 @@ Each becomes a test in T9.
 | N7 | **Convergent teardown.** After disposal, zero armed timers, zero held leases owned by this process, zero leaked fibers. | Dispose and assert. |
 | N8 | **Bounded event rate.** Events per second stay under the configured ceiling under a pathological schedule set. | Count emissions over a simulated hour. |
 | N9 | **No recurrence evaluation in the hot loop.** The due scan performs 0 cron parses. | Spy on the recurrence module during a scan. |
+| N10 | **Lost process-local wake cannot strand durable work.** A peer may commit runnable work and die before EventV2 publication; another idle process must discover it within the reconciliation bound without polling the task table. | Commit a queued run without publishing EventV2; assert the DB trigger advances the generation and an idle runner executes it after one reconciliation interval. |
 
 ## 10. Phasing
 

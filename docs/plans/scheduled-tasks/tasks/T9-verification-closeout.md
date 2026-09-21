@@ -12,30 +12,42 @@ the way in.
 
 ## Deliverables
 
-1. **D1–D7** from 05 § 2 Tier D, all wired into CI. Start with **D7**
+1. **D1–D32** from 05 § 2 Tier D, all wired into CI. Start with **D7**
    (static import-graph assertion: only `executor.ts` may import
    `InstanceStore`). It is the cheapest to write and the most valuable
    over time.
-2. **C1–C8** from 05 § 2 Tier C. C1 and C2 **must** use two real
-   processes against one database file. Two fibers in one process do
-not
-   prove anything — in-process scheduling serializes them by accident.
-3. **Performance measurement** against the budget table in 05 § 5.
-Record
-   actual numbers, not assertions that it \"feels fast\".
-4. **Manual QA 1–4** from 05 § 4, performed once on a real machine and
-   written up.
+2. **C1–C11** from 05 § 2 Tier C. C1/C2 and the C9 storage leg use two real
+   processes against one database file. The C9 runner leg uses TestClock so
+   the 60-second liveness bound is deterministic rather than a wall-clock
+   sleep. Fiber-only tests remain insufficient for lease/SQLite visibility races.
+3. **Performance measurement** against the budget table in 05 § 5. Record
+   actual numbers, including the average cost of the idle generation probe, not
+   assertions that it "feels fast".
+4. **Manual QA 1–5** from 05 § 4, performed once on a real machine and
+   written up. Automated substitutes may increase confidence but do not convert
+   this release gate into an automated-only gate.
 5. **Closeout note** in `docs/handoff/` following the existing
    `CLOSEOUT-*` convention.
+6. **Conversational-admission proof:** `scheduled_task` is provider-visible,
+   but its Core creation path remains Tier 0, derives ownership from the
+   durable root Session, requires the active human worker root, rejects stale
+   consent/child Sessions/ambiguous wall-clock timezone, and is idempotent for
+   exact provider replay.
+7. **Session-convergence proof:** a Scheduled run root is directly human
+   promptable through the ordinary Session composer/prompt API; a
+   foreign-directory root belonging to a project appears through the
+   bootstrap-free project-scoped Session census, converges through ordinary
+   Session create/update/delete events, and opening Chats performs no Scheduled
+   list/inbox read.
 
 ## What the closeout note must contain
 
 - The measured numbers next to the predicted budget. If a budget was
   missed, say so plainly rather than silently re-baselining — that is
   the documented expectation for performance work in this repo.
-- How each of the nine T0 decisions **actually** resolved, including
-any
-  that changed during implementation.
+- How each T0/post-T0 decision **actually** resolved, including the
+  cross-process liveness decision added after the lost-wake proof. Record later
+  refinements rather than silently preserving superseded assumptions.
 - Which Medium/Low confidence claims in 06 were confirmed or
   falsified. The headless-session assumption (T5) and the
 shared-data-dir

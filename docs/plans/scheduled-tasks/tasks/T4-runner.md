@@ -7,40 +7,58 @@
 ## Scope
 
 One process-global singleton, installed at the hook T0 decision 1 identified.
-It owns **exactly one timer** and nothing else.
+While started it owns **exactly one timer**. That timer represents either the
+earliest recurrence wake (clamped to 60s) or the idle cross-process
+reconciliation floor.
 
 ```
-start     -> recoverStale() -> arm()
+start        -> grace -> single-flight recoverStale() -> wake()
 
-arm()     -> nextDueAt() -> if null, stay idle (0 timers armed is fine)
-           -> else schedule one timer for (nextDueAt - now), clamped to +0
+arm()        -> nextDueAt()
+              -> due cursor exists: arm one min(delta, 60s) timer
+              -> no cursor: read generation; arm one 60s idle timer
 
-wake()    -> due(now) -> for each, bounded-concurrency dispatch -> arm()
+timer expiry -> atomically consume its timer slot before callback
+              -> recurrence timer: wake()
+              -> idle timer: read generation
+                   unchanged -> re-arm idle only
+                   changed   -> wake()
 
-dispatch -> claim -> (lost? skip silently) -> recordRunStart -> heartbeat
-fiber
-            -> executor.execute() -> settleRun -> release -> arm()
+wake()       -> dispatch already active? set wakePending and return
+              -> planDue(now)
+              -> bounded single dispatch batch
+              -> batch drains:
+                   wakePending -> one fresh wake()
+                   otherwise   -> arm()
 
-mutation event -> arm()             (re-arm on any cursor change)
+dispatch     -> claim -> revalidate -> recordRunStart -> heartbeat
+              -> executor.execute() -> settleRun
 ```
 
 ## Hard rules
 
-- **One timer, not N.** No `setInterval` polling loop. An idle runner
-issues
-  zero queries (regression D3).
-- Dispatch concurrency is **bounded** (02 § dispatch cap). 100 simultaneous
-  due tasks must not start 100 sessions.
-- The heartbeat fiber is **scoped to the run fiber** so it cannot outlive
-it.
-- `settleRun` is unconditional — the executor cannot fail the effect (03 §
-  1), so there is no path that skips it.
-- Suspend/resume: on wake, **always** re-read the clock and re-query rather
-  than trusting the timer fired on time. Sleeping laptops make timers
-lie.
+- **One timer, not N.** No per-task timer and no `setInterval` fanout.
+- Truly idle cost is bounded to **one primary-key generation read per 60s**.
+  If the generation is unchanged, do not scan the task/run tables, evaluate
+  recurrence, or materialize an Instance.
+- Durable state owns correctness; EventV2 mutation notifications are only the
+  immediate same-process accelerator.
+- Dispatch concurrency is **globally bounded per runner**, not merely
+  per-batch. Dispatch batches never overlap; concurrent wakes coalesce into one
+  `wakePending` follow-up scan.
+- Timer ownership is epoch-guarded: an expired/superseded timer cannot erase a
+  newer timer, and the callback consumes its slot before re-arming.
+- The heartbeat fiber is scoped to the run fiber so it cannot outlive it.
+- `settleRun` is unconditional — the executor encodes failures as outcomes.
+- Suspend/resume: on wake, always re-read the clock and authoritative durable
+  state rather than trusting timer timing.
 
 ## Verification
 
-- C1, C2, C6, C7, C8 from 05 — **C1/C2 with two real processes**.
-- D3 (idle = 0 queries) and D4 (N tasks = 1 timer).
-- Kill -9 a runner mid-run; confirm reclaim and `abandoned` on restart.
+- C1, C2, C6, C7, C8 and C9 from 05. C1/C2/C9-storage use real processes.
+- D3: 60 simulated idle minutes produce zero dispatch work while preserving one
+  reconciliation timer.
+- D4/N2: 200 tasks and an empty task set both preserve the one-timer ceiling.
+- C6: an overlapping timer wake + manual poke still peaks at exactly the
+  configured dispatch concurrency.
+- Kill a runner mid-run; confirm reclaim and `abandoned` on restart.

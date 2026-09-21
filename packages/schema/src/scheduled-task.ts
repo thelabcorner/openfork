@@ -35,20 +35,47 @@ export const Weekday = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 
 })
 export type Weekday = typeof Weekday.Type
 
+const OnceSchedule = Schema.Struct({ kind: Schema.Literal("once"), at: Schema.Number })
+const DailySchedule = Schema.Struct({ kind: Schema.Literal("daily"), times: Schema.Array(TimeOfDay) })
+const WeeklySchedule = Schema.Struct({
+  kind: Schema.Literal("weekly"),
+  weekdays: Schema.Array(Weekday),
+  times: Schema.Array(TimeOfDay),
+})
+const CronSchedule = Schema.Struct({ kind: Schema.Literal("cron"), expression: Schema.String })
+
+export const RecurringSchedule = Schema.Union([DailySchedule, WeeklySchedule, CronSchedule]).annotate({
+  identifier: "ScheduledTask.RecurringSchedule",
+})
+export type RecurringSchedule = typeof RecurringSchedule.Type
+
 export const Schedule = Schema.Union([
   // Fires exactly once, then `next_run_at` becomes null and the task disables.
-  Schema.Struct({ kind: Schema.Literal("once"), at: Schema.Number }),
-  Schema.Struct({ kind: Schema.Literal("daily"), times: Schema.Array(TimeOfDay) }),
-  Schema.Struct({
-    kind: Schema.Literal("weekly"),
-    weekdays: Schema.Array(Weekday),
-    times: Schema.Array(TimeOfDay),
-  }),
+  OnceSchedule,
+  DailySchedule,
+  WeeklySchedule,
   // Standard 5-field cron (minute hour day-of-month month day-of-week).
   // A seconds field, `@reboot`, and L/W/# extensions are rejected at validation.
-  Schema.Struct({ kind: Schema.Literal("cron"), expression: Schema.String }),
+  CronSchedule,
 ]).annotate({ identifier: "ScheduledTask.Schedule" })
 export type Schedule = typeof Schedule.Type
+
+/**
+ * Input contract for create/update/preview boundaries. Durable task rows always
+ * store `Schedule`, never a moving relative duration or wrapper.
+ *
+ * Canonical Schedule variants remain accepted for local API compatibility.
+ */
+export const ScheduleInput = Schema.Union([
+  OnceSchedule,
+  DailySchedule,
+  WeeklySchedule,
+  CronSchedule,
+  Schema.Struct({ kind: Schema.Literal("relative"), delayMs: Schema.Number }),
+  Schema.Struct({ kind: Schema.Literal("timestamp"), at: Schema.Number }),
+  Schema.Struct({ kind: Schema.Literal("recurring"), schedule: RecurringSchedule }),
+]).annotate({ identifier: "ScheduledTask.ScheduleInput" })
+export type ScheduleInput = typeof ScheduleInput.Type
 
 // ---------------------------------------------------------------------------
 // Execution target (03-execution-and-safety.md § 2)

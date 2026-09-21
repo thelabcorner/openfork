@@ -1,10 +1,10 @@
 # Scheduled Tasks — Planning Index
 
-**Status:** WORKING DRAFT — architecture/research only, no runtime implementation yet  
+**Status:** IMPLEMENTED — T0–T9 spine + V2/new-layout client surface; T7 loop files and manual release QA remain deferred
 **Started:** 2026-09-17  
 **Contract:** repository-root `AGENTS.md`   `packages/opencode/src/server/routes/instance/httpapi/AGENTS.md`
 
-## What we are building
+## What is implemented
 
 A **scheduled task** is a user-owned, durable specification that causes OpenFork to
 start agent work at a future time without a human present at the moment of
@@ -32,15 +32,35 @@ and use default sandbox settings with `approval_policy = \"never\"` when org
 policy allows it. They explicitly warn that frequent worktree schedules
 **accumulate worktrees over time**.
 
+The implementation lives across `packages/core/src/scheduled-task/**`,
+`packages/opencode/src/scheduled-task/**`, the root HTTP API, generated SDK, and
+`packages/app` Scheduled surface. A provider-visible `scheduled_task` tool
+adds conversational **creation plus scoped lifecycle management** through the
+same Tier-0 owners (inspection, mutation, run history/inbox, acknowledgement,
+run-now, preview/agenda); it is not a second scheduler or lifecycle-management
+backend. Global pause and arbitrary Existing-Session binding remain outside this
+project-scoped model surface. The current automated closeout is recorded in
+`docs/handoff/CLOSEOUT-scheduled-tasks-2026-09-17.md`; this dossier remains the
+architectural source of truth and is updated when implementation falsifies an
+earlier planning assumption.
+
+OpenFork's generation axes are intentionally asymmetric here. Durable scheduling
+semantics and process-global projections live in shared Schema/Core; the mature
+**V1/fork runtime and local HTTP surface** own actual execution; the
+**V2/new-layout app** is the product presentation. The unified SDK's `v2`
+namespace is a generator/client detail and does not imply that Scheduled Tasks
+belong on the current Protocol/runtime. This follows `docs/map/v1-v2.md`,
+`docs/map/surfaces.md`, and the package `AGENTS.md` contracts.
+
 ## The one-sentence architectural thesis
 
 A scheduled task is **durable global domain state with a time-ordered due cursor**,
-not a timer that lives next to a UI list. The authoritative producer is a single
-process-global service that owns (a) the durable specification rows, (b) one
-timer armed to **one** earliest-due instant, and (c) a claim/lease protocol that
-makes the transition \"due → running\" exactly-once under crash, restart, and
-concurrent processes. Everything else — the sidebar badge, the inbox, the next-run
-countdown — is a projection of that state.
+not a timer that lives next to a UI list. Each process-global runner owns at most
+one timer: normally the earliest-due wake, or a cheap generation-reconciliation
+wake when no cursor exists. SQLite owns truth and cross-process liveness; the
+lease/idempotency protocol owns execution safety. Everything else — EventV2,
+the sidebar badge, the inbox, the next-run countdown — is an accelerator or
+projection of that durable state.
 
 ## Why this plan exists in this form
 
@@ -57,30 +77,33 @@ component is named.
 
 ## What the repo already has (and why it changes the design)
 
-This is **not** a greenfield feature. OpenFork already ships a durable,
-reservation-based autonomous continuation subsystem that solved the hard part of
-this problem once:
+This is **not** a greenfield feature. OpenFork already ships durable Goal
+continuation machinery that established several useful patterns, but later
+multi-process analysis proved that its process-owner recovery assumption is not
+itself reusable as a scheduler lease.
 
 | Existing asset | Path | Why it matters here |
 |---|---|---|
-| `GoalAutomationTable` | `packages/core/src/goal/sql.ts` | Durable **continuation cursor** with `reservation_id` / `reservation_owner` / `reservation_created_at` and a **unique index on `reservation_id`**. This is the exact lease shape a scheduler needs. |
-| `GoalAutomation` service | `packages/core/src/goal/automation.ts` | Implements `claim` / `release` / `cancel` / `pendingSessions`, a `PROCESS_OWNER_ID`, and — critically — **crash recovery at service construction** that requeues rows owned by a different (dead) process owner. |
+| `GoalAutomationTable` | `packages/core/src/goal/sql.ts` | Durable continuation correlation/cursor precedent. Its current `reservation_owner` is a historical single-owner mechanism and is **not** the target shared-process execution primitive. |
+| `GoalAutomation` service | `packages/core/src/goal/automation.ts` | Useful precedents: revalidate-before-spend, correlation IDs, stale-result rejection, and durable continuation state. Its startup rule that treats every foreign owner as a dead predecessor is being retired under the shared Session-execution architecture. |
 | Revalidate-before-claim | `automation.ts` `claim` | Re-reads policy/lifecycle/focus **immediately before** spending provider work, because the world may have changed since the reservation was written. A scheduler must do the same. |
-| Compare-and-set claim | `automation.ts` `claim` | The `UPDATE ... WHERE reservation_id = ? AND reservation_owner IS NULL ... RETURNING` pattern is the atomic primitive to copy verbatim. |
+| Compare-and-set claim | `automation.ts` `claim` | The general CAS pattern is reusable; the Goal-specific owner field/recovery policy is not. ScheduledTask correctly owns its own lease row, heartbeat, attempt, and stale-recovery semantics. |
 | Goal domain | `packages/core/src/goal/**`, `packages/schema/src/goal.ts` | OpenChamber's \"Run as goal\" checkbox has a **native equivalent already built here** (`ContinuationPolicy`, `AutomationMode` = `manual` / `auto_continue` / `unattended`, `prepareForSession`). |
 | Optimistic concurrency | `GoalTable.revision`   `StaleRevisionError` | Established repo pattern for \"user edited the spec while something else was acting on it\". |
 | Migration convention | `packages/core/src/database/migration/*.ts`   `migration.gen.ts` | Timestamped file exporting `{ id, up(tx) }`, registered in the generated barrel. |
 | Event convention | `packages/schema/src/goal.ts` (bottom) | Live non-durable protocol events next to durable tables, registered via `event-manifest.ts`. |
-| Host-origin prompting | `SessionPrompt.hostPrompt` in `packages/opencode/src/session/prompt.ts` | There is already a **non-user prompt origin** seam. A scheduled run is a host-origin prompt, not a synthetic user keystroke. |
+| Host-origin prompting | `SessionPrompt.hostPrompt` + shared `SessionTurnProvenance` policy | Scheduled execution stamps `owner=host`, `source=scheduled-task.run`, and `ref=runID` at the producer. It is a Synthetic worker root, not Goal authorization or privileged System merely because the host injected it; provider lowering may still encode it as role `user`. |
 | Pause gate | `runLoop` / `promptInternal` | A paused session must not start provider work. Scheduled wakeups must respect the same gate. |
+| PushV2 | `packages/core/src/push.ts` | One process-global notification owner. Scheduled Sessions suppress generic outcome pushes; durable run/task/lease truth decides `failure|always|never` after `RunSettled`. Push is best-effort attention; the Scheduled inbox is truth. |
 
-**Consequence:** the plan below deliberately *reuses the GoalAutomation lease
-semantics* and *composes with* the Goal subsystem rather than inventing a second,
-parallel autonomy mechanism. But it also refuses to **overload** `goal_automation`
-itself: that table is keyed `session_id PRIMARY KEY` and models \"this existing
-session should continue\". A schedule is \"**no session exists yet** and one should
-be created at time T\" — a different entity with a different key and a different
-lifetime. See `01-architecture.md` § \"Rejected alternatives\".
+**Consequence:** ScheduledTask reuses proven *techniques* from Goal (CAS,
+revalidation, durable correlation), not Goal's process-owner policy. The
+ScheduledTask lease remains a distinct domain lease because a schedule is
+\"**no session exists yet** and one should be created at time T\", with its own
+retry/expiry semantics. The newer shared `RuntimeOwner` architecture may
+eventually supply one process-incarnation identity to both domains without
+merging their lease rules. See the Swarm concurrency handoff protocol for that
+cross-domain identity boundary.
 
 ## Hard problems this plan must answer
 
@@ -118,6 +141,8 @@ default.
 | 04 | [`04-surface-and-ux.md`](./04-surface-and-ux.md) | API group shape, SDK regeneration obligations, the Scheduled inbox projection, and the loop-file (markdown) source. |
 | 05 | [`05-verification.md`](./05-verification.md) | Test strategy that makes **ownership mistakes fail**, not just the happy path pass. Includes the deterministic-clock harness and the concurrency proofs. |
 | 06 | [`06-risks-and-open-questions.md`](./06-risks-and-open-questions.md) | Decision log, confidence levels, and the questions that must not be silently answered by implementation accident. |
+| 07 | [`07-cross-process-liveness.md`](./07-cross-process-liveness.md) | Normative proof for lost-wake recovery, durable generation, timer ownership, dispatch coalescing, performance bounds, and future wake accelerators. |
+| 08 | [`08-scheduler-workspace-session-continuity.md`](./08-scheduler-workspace-session-continuity.md) | Next-tranche architecture for the premium calendar workspace, execution-model picker, Prompt Revisor integration, and New/Reuse/Auto/Existing Session continuity. |
 
 ## Taskfiles
 
@@ -132,12 +157,13 @@ not by convenience. Each states its **Do**, **Do not**, and **Done when**.
 | [T3](./tasks/T3-core-service.md) | `ScheduledTask` core service — CRUD, due cursor, lease | T1 T2 |
 | [T4](./tasks/T4-runner.md) | Process-global runner — single timer, claim, fire, settle | T3 |
 | [T5](./tasks/T5-execution-adapter.md) | Execution adapter — tier-3 boundary, session creation, prompt | T4 |
-| [T6](./tasks/T6-http-api.md) | HTTP API group split by ownership tier   SDK regeneration | T3 T5 |
+| [T6](./tasks/T6-http-api.md) | Tier-0 HTTP API + SDK regeneration; execution crosses Tier 3 only in the runner/executor | T3 T5 |
 | [T7](./tasks/T7-loop-files.md) | Markdown loop-file source (optional phase 2) | T3 |
 | [T8](./tasks/T8-client-surface.md) | Client store   Scheduled inbox UI | T6 |
 | [T9](./tasks/T9-verification-closeout.md) | Negative invariants, concurrency proofs, closeout | T4 T6 T8 |
+| [T10](./tasks/T10-scheduler-workspace-session-continuity.md) | First-class Scheduler workspace + model/Revisor/Session continuity | T3 T5 T6 T8 D15–D18 |
 
-## Non-goals for the planning phase
+## Non-goals / deferred scope
 
 - Do not open with a UI dialog or a `setInterval` in a component.
 - Do not ship a second autonomy mechanism that duplicates Goal continuation.
@@ -149,3 +175,9 @@ not by convenience. Each states its **Do**, **Do not**, and **Done when**.
 - Do not treat \"the server happened to be running\" as a durability strategy.
 - Do not encode catch-up, jitter, overrun, or permission behavior as invisible
   defaults. Every one of them is a named, persisted policy field.
+- Do not add Scheduled Tasks to `packages/tui` merely for parity. The current
+  map classifies TUI as retained upstream coupling, not an OpenFork product
+  surface.
+- Do not implement T7 with a second watcher or by keeping every project Location
+  graph alive. File-authoritative loops remain deferred until a process-global
+  filesystem invalidation owner exists.

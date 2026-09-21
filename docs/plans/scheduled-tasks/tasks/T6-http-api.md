@@ -1,40 +1,43 @@
-# T6 — HTTP API (split by ownership tier)   SDK regeneration
+# T6 — Tier-0 HTTP API + SDK regeneration
 
-**Depends on:** T3  
+**Depends on:** T3 T5
 **Blocks:** T8  
 **Read first:** `04-surface-and-ux.md` § 1; the httpapi `AGENTS.md`
 
 ## Scope
 
-Two groups, one noun — exactly as 04 § 1 specifies. The `scheduledTask`
-group is Tier 0 and must **not** carry `InstanceContextMiddleware`. Only
-`runNow` lives in the Tier 3 group.
+One `scheduledTask` group on `RootHttpApi`. Every HTTP operation is Tier 0,
+including `runNow`: manual fire at the transport boundary means **durably
+enqueue a queued run and return**. The process-global runner/executor performs
+the later Tier-3 work.
 
-Before writing any endpoint, complete the 7-point route review checklist
-from the httpapi `AGENTS.md` and paste the answers into the PR
- description. That checklist exists precisely for cases like this one.
+The group must not carry `InstanceContextMiddleware`, import
+`InstanceStore`, or depend on `ScheduledTaskRunner`. The runner is woken from
+authoritative domain events in-process and correctness does not depend on that
+ephemeral wake.
 
 ## Rules
 
-- Follow the established group pattern: yield services once while building
-  the handler layer, close over them in endpoint implementations.
-- Declare explicit `Schema.ErrorClass` error contracts per endpoint. Do
-not
+- Follow the established group pattern: yield services once while building the
+  handler layer, close over them in endpoint implementations.
+- Declare explicit `Schema.ErrorClass` error contracts per endpoint. Do not
   leak domain or storage errors through the handler boundary.
-- Keep the core service free of any HttpApi types.
+- Keep the core service free of HttpApi types.
 - `preview` is pure and touches no database.
+- `runNow` writes only durable Tier-0 state. Do not call the runner from the
+  handler; notification is an optimization, not the durability boundary.
 
 ## SDK
 
-**Regenerate the SDK and commit the result.** The generated client is
-not hand-edited. T6 is not complete until the generated types exist and
-the workspace typechecks — T8 depends on them existing, not on them
-being planned.
+**Regenerate the SDK and commit the result.** Generated client code is never
+hand-edited. T6 is not complete until generated types exist and the SDK
+typechecks.
 
 ## Verification
 
-- D1 and D2 from 05: instance-load probe reads **zero** for every
-endpoint
-  in the Tier 0 group, including when directory/workspace query
-  parameters are omitted.
-- OpenAPI output includes both groups with correct error schemas.
+- D1/D2: every endpoint, including `runNow`, answers with zero Instance loads
+  and without directory/workspace context.
+- Static ownership test: the scheduled-task HTTP handler imports neither
+  `InstanceHttpApi` nor `ScheduledTaskRunner`.
+- OpenAPI output exposes one `ScheduledTask` client surface and the
+  `/scheduled-task/{taskID}/run-now` operation.

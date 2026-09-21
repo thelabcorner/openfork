@@ -60,6 +60,22 @@ one cron string**, so the engine must compute `next` as `MIN` over the set.
 This is a real bug that appears in naive implementations; the structural
 representation prevents it by construction.
 
+Write and preview boundaries also accept a `ScheduleInput` convenience union
+with three explicit user-intent families:
+
+- `{ kind: "relative", delayMs }` — one run X time from the operation's
+  captured `now`;
+- `{ kind: "timestamp", at }` — one run at an absolute epoch-millisecond
+  instant;
+- `{ kind: "recurring", schedule }` — a structural daily/weekly/5-field-cron
+  recurrence.
+
+These are input semantics, not new durable schedule semantics. Relative input is
+resolved exactly once and persisted as `{ kind: "once", at }`; timestamp input
+is likewise canonicalized to `once`; recurring input is unwrapped to the
+existing recurrence union. A restart therefore cannot move a task forward by
+reinterpreting "90 minutes from now".
+
 ### 2.2 The engine contract
 
 `packages/core/src/scheduled-task/recurrence.ts` exposes **one pure function**:
@@ -104,7 +120,7 @@ exists)
 | 6-field cron (seconds) | Sub-minute agent runs are not a real workflow and they break the event-rate bound (01 §7.1). Reject at validation with a clear message. |
 | `@reboot` | Not a time. If startup tasks are wanted later, model them as a distinct trigger kind, not a fake cron. |
 | Non-standard `L` / `W` / `#` extensions | Only if the chosen library supports them **and** the summary renderer can explain them to a user. Silent partial support is worse than rejection. |
-| Intervals (\"every 90 minutes\") | Ambiguous anchor (from when? across restarts?). If added, it needs an explicit `anchor_at` column. Defer. |
+| Recurring intervals (\"every 90 minutes\") | Distinct from the supported one-shot \"in 90 minutes\" input. A recurring interval needs an explicit durable anchor (from when? across restarts?); model that anchor explicitly rather than persisting a moving relative duration. |
 
 ### 2.4 Library decision (T0 must resolve)
 

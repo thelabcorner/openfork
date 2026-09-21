@@ -11,15 +11,23 @@ in a conventional project directory, following OpenChamber's \"loop file\"
 idea. The value is that schedules become committable and reviewable
 artifacts rather than hidden local state.
 
-## Why this is optional and sequenced last
+## Why this remains deferred
 
 `AGENTS.md` treats filesystem watchers as expensive observers requiring
 a single shared owner. This feature needs file change notification.
 
-**Do not add a second watcher.** Subscribe to the existing one and
-filter. If that turns out not to be possible, **defer the feature** and
-say so — do not \"just add a small watcher for now\". That is exactly
-the kind of accretion the contract is written to prevent.
+The feasibility gate has now been resolved:
+
+- the canonical `Watcher.node` is **location-scoped**;
+- its native subscription is finalized with the location graph;
+- inactive projects can therefore change while no watcher exists;
+- keeping every location graph alive for schedules would pull Tier-2/3
+  workspace services into a Tier-0 scheduler concern;
+- adding a second process-global watcher is explicitly disallowed.
+
+So the current answer is **defer**. Do not implement loop files until a
+process-global/project-catalog-owned invalidation primitive exists that can
+observe inactive projects without materializing their location graphs.
 
 ## Reconciliation rules (non-negotiable)
 
@@ -38,5 +46,7 @@ and
 ## Verification
 
 - No new watcher instance (assert the count).
+- File-authoritative correctness must hold while the target project has no active
+  location graph.
 - Edit/remove/restore a loop file and confirm the tombstone semantics.
 - Re-reading an unchanged file produces **zero** writes.
