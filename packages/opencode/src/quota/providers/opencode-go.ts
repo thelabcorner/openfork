@@ -3,6 +3,7 @@ import type { Auth } from "@/auth"
 import type { ForkCredentials } from "@/fork/credentials"
 import { officialUsageCache, OFFICIAL_TTL_MS, type OfficialSnapshot, type OfficialUsageCache } from "@/fork/usage-cache"
 import { zenQuotaAccounts } from "@/plugin/zen"
+import { stableZenIdentity } from "@/plugin/zen-accounts"
 import { buildResult, toUsageWindow } from "../format"
 import { NEXT_REFRESH_NOW } from "./http"
 import type { Adapter } from "../registry"
@@ -43,19 +44,20 @@ export const opencodeGo = (
     Effect.gen(function* () {
       const directGo = yield* authKey(auth, ["opencode-go"])
       if (directGo) {
-        return snapshotToResult(yield* usageCache.get(`auth:${directGo.id}`, directGo.key))
+        return snapshotToResult(yield* usageCache.get(stableZenIdentity(directGo.key), directGo.key))
       }
-      const poolDefault = zenQuotaAccounts().find((account) => account.isDefault) ?? zenQuotaAccounts()[0]
+      const poolAccounts = zenQuotaAccounts()
+      const poolDefault = poolAccounts.find((account) => account.isDefault) ?? poolAccounts[0]
       if (poolDefault) {
         return snapshotToResult(yield* usageCache.get(poolDefault.accountId, poolDefault.apiKey))
       }
       const active = yield* credentials.active()
-      if (active) return snapshotToResult(yield* usageCache.get(active.id, active.key))
+      if (active) return snapshotToResult(yield* usageCache.get(stableZenIdentity(active.key), active.key))
       const resolved = yield* authKey(auth, ["opencode"])
       if (!resolved) {
         return buildResult({ providerId: "opencode-go", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }
-      return snapshotToResult(yield* usageCache.get(`auth:${resolved.id}`, resolved.key))
+      return snapshotToResult(yield* usageCache.get(stableZenIdentity(resolved.key), resolved.key))
     }),
 })
 

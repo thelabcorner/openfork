@@ -45,6 +45,47 @@ describe("OfficialUsageCache (L1 remote gate)", () => {
     expect(calls).toBe(1)
   })
 
+  test("cached readers preserve the original remote snapshot timestamp", async () => {
+    let now = 1_500_000
+    let calls = 0
+    const cache = createOfficialUsageCache({
+      now: () => now,
+      fetch: async () => {
+        calls++
+        return fakeResponse(OK_PAYLOAD)
+      },
+    })
+
+    const first = await Effect.runPromise(cache.get("cred_1", "sk-1"))
+    expect(first.fetchedAt).toBe(1_500_000)
+    expect(first.ageMs).toBe(0)
+
+    now += 90_000
+    const cached = await Effect.runPromise(cache.get("cred_1", "sk-1"))
+    expect(calls).toBe(1)
+    expect(cached.fetchedAt).toBe(first.fetchedAt)
+    expect(cached.ageMs).toBe(90_000)
+  })
+
+  test("aliases of the same physical key share one process-global gate bucket", async () => {
+    let calls = 0
+    const cache = createOfficialUsageCache({
+      fetch: async () => {
+        calls++
+        return fakeResponse(OK_PAYLOAD)
+      },
+    })
+
+    const first = await Effect.runPromise(cache.get("vault-uuid", "same-go-key"))
+    const second = await Effect.runPromise(cache.get("zen-stable-account", "same-go-key"))
+    const third = await Effect.runPromise(cache.get("auth:opencode-go", "same-go-key"))
+
+    expect(first.status).toBe("ok")
+    expect(second.snapshot).toEqual(first.snapshot)
+    expect(third.snapshot).toEqual(first.snapshot)
+    expect(calls).toBe(1)
+  })
+
   test("concurrent callers share one in-flight fetch (single-flight)", async () => {
     let now = 2_000_000
     let calls = 0

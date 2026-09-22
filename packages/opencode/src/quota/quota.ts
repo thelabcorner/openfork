@@ -6,9 +6,12 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { HttpClient } from "effect/unstable/http"
 import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
+import { forkUsageSnapshot } from "@/fork/usage"
+import { SessionUsage } from "@opencode-ai/core/session/usage"
 import * as VerdentFreeUsage from "@/usage/verdent-free"
 import * as ZenFreeUsage from "@/usage/zen-free"
-import type { ProviderResult, ProvidersResult } from "./schema"
+import type { ProviderResult, ProvidersResult, ResetAgendaResult } from "./schema"
+import { buildResetAgenda } from "./resets"
 import { createSingleFlight, resolveAdapter, type Adapter } from "./registry"
 import { deepseek } from "./providers/deepseek"
 import { genspark } from "./providers/genspark"
@@ -23,7 +26,18 @@ import { xai } from "./providers/xai"
 import { nvidia } from "./providers/nvidia"
 import { workbuddy } from "./providers/workbuddy"
 
-export { UsageWindow, ProviderUsage, ProviderResult, ProviderSummary, ProvidersResult } from "./schema"
+export {
+  UsageWindow,
+  ProviderUsage,
+  ProviderResult,
+  ProviderSummary,
+  ProvidersResult,
+  ResetSource,
+  ResetWindow,
+  ResetOccurrence,
+  ResetFailure,
+  ResetAgendaResult,
+} from "./schema"
 
 /**
  * Proactive provider-account quota reads, ported from OpenChamber's quota
@@ -44,6 +58,8 @@ export interface Interface {
   readonly providers: () => Effect.Effect<ProvidersResult>
   /** Fetches one provider's account quota; same-ID calls single-flight. */
   readonly get: (input: { readonly providerID: string }) => Effect.Effect<ProviderResult, QuotaProviderNotFoundError>
+  /** Bounded calendar projection of currently-known provider/account reset deadlines. */
+  readonly resets: (input: { readonly from: number; readonly to: number }) => Effect.Effect<ResetAgendaResult>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Quota") {}
@@ -51,12 +67,18 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Qu
 const layer: Layer.Layer<
   Service,
   never,
-  Auth.Service | ForkCredentials.Service | HttpClient.HttpClient | ZenFreeUsage.Service | VerdentFreeUsage.Service
+  | Auth.Service
+  | ForkCredentials.Service
+  | SessionUsage.Service
+  | HttpClient.HttpClient
+  | ZenFreeUsage.Service
+  | VerdentFreeUsage.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
     const auth = yield* Auth.Service
     const credentials = yield* ForkCredentials.Service
+    const sessionUsage = yield* SessionUsage.Service
     const http = yield* HttpClient.HttpClient
     const zenFreeUsage = yield* ZenFreeUsage.Service
     const verdentFreeUsage = yield* VerdentFreeUsage.Service
@@ -89,6 +111,7 @@ const layer: Layer.Layer<
           Effect.map(Effect.exit(adapter.configured()), (exit) => ({
             providerId: adapter.id,
             providerName: adapter.name,
+            aliases: [...adapter.aliases],
             configured: Exit.isSuccess(exit) ? exit.value : false,
           })),
         { concurrency: 4 },
@@ -104,12 +127,58 @@ const layer: Layer.Layer<
       return yield* singleFlight(adapter.id, adapter.fetch())
     })
 
-    return Service.of({ providers, get })
+    const resets = Effect.fn("Quota.resets")(function* (input: { readonly from: number; readonly to: number }) {
+      const configured = (yield* providers()).providers.filter((provider) => provider.configured)
+      const providerResults = yield* Effect.forEach(
+        configured.filter((provider) => provider.providerId !== "opencode-go"),
+        (provider) =>
+          Effect.map(Effect.exit(get({ providerID: provider.providerId })), (exit): ProviderResult =>
+            Exit.isSuccess(exit)
+              ? exit.value
+              : {
+                  providerId: provider.providerId,
+                  providerName: provider.providerName,
+                  ok: false,
+                  configured: true,
+                  error: "Usage data unavailable",
+                  planLabel: null,
+                  usage: null,
+                  fetchedAt: Date.now(),
+                },
+          ),
+        { concurrency: 4 },
+      )
+
+      const goConfigured = configured.some((provider) => provider.providerId === "opencode-go")
+      const goSnapshot = goConfigured
+        ? yield* forkUsageSnapshot({ credentials, usage: sessionUsage, auth }).pipe(Effect.option)
+        : undefined
+      const result = buildResetAgenda({
+        from: input.from,
+        to: input.to,
+        providerResults,
+        ...(goSnapshot && goSnapshot._tag === "Some" ? { goSnapshot: goSnapshot.value } : {}),
+      })
+      if (!goConfigured || (goSnapshot && goSnapshot._tag === "Some")) return result
+      return {
+        ...result,
+        failures: [
+          ...result.failures,
+          {
+            providerId: "opencode-go",
+            providerName: "OpenCode Go",
+            error: "Usage data unavailable",
+          },
+        ],
+      }
+    })
+
+    return Service.of({ providers, get, resets })
   }),
 )
 
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Auth.node, ForkCredentials.node, httpClient, ZenFreeUsage.node, VerdentFreeUsage.node],
+  deps: [Auth.node, ForkCredentials.node, SessionUsage.node, httpClient, ZenFreeUsage.node, VerdentFreeUsage.node],
 })

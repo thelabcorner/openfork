@@ -11,6 +11,26 @@ import { Schema } from "effect"
  * partial provider payloads stay representable.
  */
 
+/**
+ * Machine-readable resource represented by a quota window.
+ *
+ * A percent alone is insufficient for request-capacity math because providers
+ * meter fundamentally different things: literal requests, credits, money, or
+ * an opaque provider-defined entitlement. Display labels remain presentation
+ * only; Capacity consumes this structured resource.
+ */
+export const QuotaResource = Schema.Struct({
+  kind: Schema.Literals(["requests", "credits", "money", "relative", "provider-units"]),
+  unit: Schema.String,
+  used: Schema.NullOr(Schema.Finite),
+  remaining: Schema.NullOr(Schema.Finite),
+  limit: Schema.NullOr(Schema.Finite),
+  currency: Schema.optional(Schema.String),
+  /** Optional exact/published conversion for credit systems with a monetary pack rate. */
+  usdPerUnit: Schema.optional(Schema.Finite),
+})
+export type QuotaResource = Schema.Schema.Type<typeof QuotaResource>
+
 export const UsageWindow = Schema.Struct({
   usedPercent: Schema.NullOr(Schema.Finite),
   remainingPercent: Schema.NullOr(Schema.Finite),
@@ -18,6 +38,7 @@ export const UsageWindow = Schema.Struct({
   resetAt: Schema.NullOr(Schema.Finite),
   resetAfterSeconds: Schema.NullOr(Schema.Finite),
   valueLabel: Schema.NullOr(Schema.String),
+  resource: Schema.optional(QuotaResource),
 })
 export type UsageWindow = Schema.Schema.Type<typeof UsageWindow>
 
@@ -153,6 +174,58 @@ export const ProviderUsage = Schema.Struct({
 })
 export type ProviderUsage = Schema.Schema.Type<typeof ProviderUsage>
 
+export const ResetSource = Schema.Union([
+  Schema.Literal("provider"),
+  Schema.Literal("observed"),
+  Schema.Literal("inferred"),
+  Schema.Literal("local"),
+])
+export type ResetSource = Schema.Schema.Type<typeof ResetSource>
+
+export const ResetWindow = Schema.Struct({
+  key: Schema.String,
+  usedPercent: Schema.NullOr(Schema.Finite),
+  remainingPercent: Schema.NullOr(Schema.Finite),
+  valueLabel: Schema.NullOr(Schema.String),
+  source: ResetSource,
+})
+export type ResetWindow = Schema.Schema.Type<typeof ResetWindow>
+
+export const ResetOccurrence = Schema.Struct({
+  id: Schema.String,
+  providerId: Schema.String,
+  providerName: Schema.String,
+  resetAt: Schema.Finite,
+  observedAt: Schema.Finite,
+  scope: Schema.Union([
+    Schema.Literal("provider"),
+    Schema.Literal("account"),
+    Schema.Literal("model"),
+    Schema.Literal("account-model"),
+  ]),
+  accountId: Schema.optional(Schema.String),
+  accountLabel: Schema.optional(Schema.String),
+  model: Schema.optional(Schema.String),
+  windows: Schema.Array(ResetWindow),
+})
+export type ResetOccurrence = Schema.Schema.Type<typeof ResetOccurrence>
+
+export const ResetFailure = Schema.Struct({
+  providerId: Schema.String,
+  providerName: Schema.String,
+  error: Schema.String,
+})
+export type ResetFailure = Schema.Schema.Type<typeof ResetFailure>
+
+export const ResetAgendaResult = Schema.Struct({
+  from: Schema.Finite,
+  to: Schema.Finite,
+  generatedAt: Schema.Finite,
+  occurrences: Schema.Array(ResetOccurrence),
+  failures: Schema.Array(ResetFailure),
+})
+export type ResetAgendaResult = Schema.Schema.Type<typeof ResetAgendaResult>
+
 export const ProviderResult = Schema.Struct({
   providerId: Schema.String,
   providerName: Schema.String,
@@ -181,6 +254,7 @@ export type ProviderResult = Schema.Schema.Type<typeof ProviderResult>
 export const ProviderSummary = Schema.Struct({
   providerId: Schema.String,
   providerName: Schema.String,
+  aliases: Schema.Array(Schema.String),
   configured: Schema.Boolean,
 })
 export type ProviderSummary = Schema.Schema.Type<typeof ProviderSummary>

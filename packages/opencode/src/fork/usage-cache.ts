@@ -1,5 +1,6 @@
 export * as UsageCache from "./usage-cache"
 
+import { createHash } from "node:crypto"
 import { Effect } from "effect"
 
 /**
@@ -76,10 +77,21 @@ export function createOfficialUsageCache(options: {
     snapshot: OfficialUsage | undefined
     fetchedAt: number
     status: OfficialStatus
-    inFlight: Promise<OfficialUsage | undefined> | undefined
+    /** Settled or pending promise for the current gate window. */
+    inFlight: Promise<void> | undefined
     inFlightAt: number
+    /** Prevents a superseded slow flight from overwriting a newer window. */
+    flightVersion: number
   }
   const entries = new Map<string, Entry>()
+
+  // The remote gate is keyed by the physical bearer secret, not by a caller's
+  // storage alias. The same Go key can simultaneously exist as an auth.json
+  // provider credential, an env-backed Zen-pool account, and a vault UUID. If
+  // those aliases received independent buckets they could each hit the official
+  // endpoint inside one 5-minute window. Hashing the secret gives one opaque
+  // process-local identity without retaining another plaintext-key map.
+  const gateIdentity = (key: string) => createHash("sha256").update(key).digest("hex")
 
   const runFetch = (key: string): Promise<OfficialUsage | undefined> =>
     fetchImpl(GO_USAGE_URL, {
@@ -91,34 +103,54 @@ export function createOfficialUsageCache(options: {
       .then(decodeOfficialUsage)
       .catch(() => undefined)
 
-  const get = Effect.fn("OfficialUsageCache.get")(function* (credentialID: string, key: string) {
-    let entry = entries.get(credentialID)
+  const get = Effect.fn("OfficialUsageCache.get")(function* (_credentialID: string, key: string) {
+    const identity = gateIdentity(key)
+    let entry = entries.get(identity)
     if (!entry) {
-      entry = { snapshot: undefined, fetchedAt: 0, status: "error", inFlight: undefined, inFlightAt: 0 }
-      entries.set(credentialID, entry)
+      entry = {
+        snapshot: undefined,
+        fetchedAt: 0,
+        status: "error",
+        inFlight: undefined,
+        inFlightAt: 0,
+        flightVersion: 0,
+      }
+      entries.set(identity, entry)
     }
     const at = now()
-    // Single-flight: the in-flight promise is shared by every concurrent caller
-    // within the TTL window (set synchronously before any yield), so the gate
-    // holds <=1 remote fetch per credential per window even under bursts.
+    // Single-flight: every alias of this physical key shares the same in-flight
+    // promise inside the TTL window, so storage/provider/pool projections cannot
+    // multiply official usage reads.
     if (!entry.inFlight || at - entry.inFlightAt >= ttlMs) {
-      entry.inFlight = runFetch(key)
-      entry.inFlightAt = at
+      const startedAt = at
+      const version = ++entry.flightVersion
+      entry.inFlightAt = startedAt
+      entry.inFlight = runFetch(key).then((result) => {
+        // Production timeout is far shorter than the gate TTL, but keep the
+        // cache correct even under injected clocks/custom TTLs: an older slow
+        // request must never overwrite a newer gate window.
+        if (entry!.flightVersion !== version) return
+        if (result) {
+          entry!.snapshot = result
+          // Snapshot time is the remote fetch START, not the time a later cache
+          // reader happened to await the already-settled promise. Capacity uses
+          // this as its local-depletion lower bound.
+          entry!.fetchedAt = startedAt
+          entry!.status = "ok"
+        } else if (entry!.snapshot) {
+          entry!.status = "stale"
+        } else {
+          entry!.status = "error"
+        }
+      })
     }
-    const result = yield* Effect.promise(() => entry.inFlight!)
-    if (result) {
-      entry.snapshot = result
-      entry.fetchedAt = at
-      entry.status = "ok"
-    } else if (entry.snapshot) {
-      entry.status = "stale"
-    } else {
-      entry.status = "error"
-    }
+    const flight = entry.inFlight
+    yield* Effect.promise(() => flight!)
+    const servedAt = now()
     return {
       snapshot: entry.snapshot,
       fetchedAt: entry.fetchedAt,
-      ageMs: Math.max(0, at - entry.fetchedAt),
+      ageMs: Math.max(0, servedAt - entry.fetchedAt),
       status: entry.status,
     }
   })

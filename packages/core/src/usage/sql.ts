@@ -1,5 +1,6 @@
 import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import type { SessionSchema } from "../session/schema"
+import type { YieldStatisticState } from "./yield-statistics"
 
 /**
  * Durable, scalar-only record of one settled user-facing model generation.
@@ -17,6 +18,10 @@ export const UsageRecordTable = sqliteTable(
       .notNull(),
     provider_id: text().notNull(),
     model_id: text().notNull(),
+    /** Account-suffix-free model identity used by statistical projections. */
+    base_model_id: text(),
+    /** Physical/provider account that served the generation when known. */
+    account_id: text(),
     variant: text(),
     agent: text(),
     mode: text(),
@@ -36,6 +41,13 @@ export const UsageRecordTable = sqliteTable(
     index("usage_record_completed_idx").on(table.completed_at),
     index("usage_record_session_completed_idx").on(table.session_id, table.completed_at),
     index("usage_record_model_completed_idx").on(table.provider_id, table.model_id, table.completed_at),
+    index("usage_record_base_model_completed_idx").on(table.provider_id, table.base_model_id, table.completed_at),
+    index("usage_record_account_model_completed_idx").on(
+      table.provider_id,
+      table.base_model_id,
+      table.account_id,
+      table.completed_at,
+    ),
   ],
 )
 
@@ -45,6 +57,29 @@ export const UsageRecordTable = sqliteTable(
  * maintenance such as compaction remains canonical in the message table and is
  * classified by the Usage service instead of being duplicated here.
  */
+export const UsageYieldStatTable = sqliteTable(
+  "usage_yield_stat",
+  {
+    stat_key: text().primaryKey(),
+    provider_id: text().notNull(),
+    base_model_id: text().notNull(),
+    account_id: text(),
+    state: text({ mode: "json" }).$type<YieldStatisticState>().notNull(),
+    updated_at: integer().notNull(),
+  },
+  (table) => [
+    index("usage_yield_stat_model_idx").on(table.provider_id, table.base_model_id),
+    index("usage_yield_stat_account_idx").on(table.provider_id, table.base_model_id, table.account_id),
+  ],
+)
+
+export const UsageYieldMetaTable = sqliteTable("usage_yield_meta", {
+  id: text().$type<"global">().primaryKey(),
+  version: integer().notNull(),
+  rebuilt_at: integer().notNull(),
+  source_rows: integer().notNull(),
+})
+
 export const MaintenanceUsageTable = sqliteTable(
   "maintenance_usage",
   {

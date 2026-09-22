@@ -1,10 +1,7 @@
-// Pulls the per-model "observed request patterns" (avg input/cached/output
-// tokens per request) that OpenCode Go's own docs publish, straight from the
-// raw doc source, so the per-model usage estimate in the model selector stays
-// current as models are added/removed/repriced without us hand-maintaining a
-// copy of their table. Best-effort: on fetch failure or parse miss for a
-// given model, callers fall back to the flat generic profile in
-// model-usage-estimate.ts.
+// Pulls the per-model "observed request patterns" and pricing tables that
+// OpenCode Go publishes, straight from the raw doc source. These tables remain
+// useful for pricing/display and legacy consumers, but they are NOT the owner of
+// Go request-capacity prediction; server-side Capacity owns that projection.
 
 export type UsageProfile = { input: number; cached: number; output: number }
 export type UsagePricing = { input: number; output: number; cache: { read: number; write: number } }

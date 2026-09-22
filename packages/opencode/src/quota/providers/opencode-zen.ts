@@ -196,6 +196,17 @@ export function zenFreeProviderResult(estimate: ZenFreeLimitEstimate, fetchedAt:
           windowSeconds: ZEN_FREE_DAY_MS / 1000,
           resetAt: zenUtcDayEnd(fetchedAt),
           valueLabel: exact ? null : `${estimate.used} used, cap at least ${estimate.knownAtLeast}`,
+          ...(estimate.limit !== null
+            ? {
+                resource: {
+                  kind: "requests" as const,
+                  unit: "request",
+                  used: estimate.used,
+                  remaining: Math.max(0, estimate.limit - estimate.used),
+                  limit: estimate.limit,
+                },
+              }
+            : {}),
         }),
       },
     },

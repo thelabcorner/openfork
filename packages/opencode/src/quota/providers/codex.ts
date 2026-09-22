@@ -106,7 +106,22 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
   if (credits && typeof credits === "object") {
     const balance = typeof credits.balance === "number" ? credits.balance : null
     const unlimited = credits.unlimited === true
-    windows.credits = toUsageWindow({ usedPercent: null, valueLabel: unlimited ? "Unlimited" : (balance !== null ? `Credits: $${balance.toFixed(2)}` : undefined) })
+    windows.credits = toUsageWindow({
+      usedPercent: null,
+      valueLabel: unlimited ? "Unlimited" : (balance !== null ? `Credits: $${balance.toFixed(2)}` : undefined),
+      ...(balance !== null && !unlimited
+        ? {
+            resource: {
+              kind: "money" as const,
+              unit: "USD",
+              currency: "USD",
+              used: null,
+              remaining: Math.max(0, balance),
+              limit: null,
+            },
+          }
+        : {}),
+    })
   }
 
   // Spend control (optional monthly spend cap).
@@ -117,7 +132,22 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
       const spent = typeof individualLimit.spent === "number" ? individualLimit.spent : null
       const limit = typeof individualLimit.limit === "number" ? individualLimit.limit : null
       const percent = spent !== null && limit !== null && limit > 0 ? (spent / limit) * 100 : null
-      windows.credits_spend = toUsageWindow({ usedPercent: percent, valueLabel: spent !== null && limit !== null ? `$${spent.toFixed(2)} / $${limit.toFixed(2)} spent` : undefined })
+      windows.credits_spend = toUsageWindow({
+        usedPercent: percent,
+        valueLabel: spent !== null && limit !== null ? `$${spent.toFixed(2)} / $${limit.toFixed(2)} spent` : undefined,
+        ...(spent !== null && limit !== null
+          ? {
+              resource: {
+                kind: "money" as const,
+                unit: "USD",
+                currency: "USD",
+                used: Math.max(0, spent),
+                remaining: Math.max(0, limit - spent),
+                limit: Math.max(0, limit),
+              },
+            }
+          : {}),
+      })
     }
   }
 

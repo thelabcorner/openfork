@@ -64,7 +64,22 @@ export const openrouter = (http: HttpClient.HttpClient, auth: Auth.Interface): A
           providerName: NAME,
           ok: true,
           configured: true,
-          usage: { windows: { credits: toUsageWindow({ usedPercent: null, valueLabel: `$${formatMoney(remaining)} left · $${formatMoney(totalUsage)} spent` }) } },
+          usage: {
+            windows: {
+              credits: toUsageWindow({
+                usedPercent: null,
+                valueLabel: `$${formatMoney(remaining)} left · $${formatMoney(totalUsage)} spent`,
+                resource: {
+                  kind: "money",
+                  unit: "USD",
+                  currency: "USD",
+                  used: Math.max(0, totalUsage),
+                  remaining,
+                  limit: Math.max(0, totalCredits),
+                },
+              }),
+            },
+          },
         })
         cache.store(result, resolved.key)
         return withNext(result)

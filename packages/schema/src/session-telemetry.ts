@@ -58,6 +58,8 @@ export type Context = typeof Context.Type
 export const Info = Schema.Struct({
   sessionID: SessionID,
   phase: Phase,
+  /** Start of the current session drain / user-visible turn. Live-only. */
+  turnStartedAt: Schema.optional(Schema.Finite),
   phaseStartedAt: Schema.optional(Schema.Finite),
   updatedAt: Schema.Finite,
   model: Schema.optional(Model),

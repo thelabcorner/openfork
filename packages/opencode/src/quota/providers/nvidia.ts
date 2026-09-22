@@ -29,7 +29,18 @@ export const nvidia = (auth: Auth.Interface): Adapter => ({
     const usage = nvidiaUsage()
     const usedPercent = Math.min(100, (usage.requestCount / NVIDIA_LIMIT_PER_MINUTE) * 100)
     const windows: Record<string, ReturnType<typeof toUsageWindow>> = {}
-    windows["1m"] = toUsageWindow({ usedPercent, windowSeconds: 60, resetAt: usage.resetAt })
+    windows["1m"] = toUsageWindow({
+      usedPercent,
+      windowSeconds: 60,
+      resetAt: usage.resetAt,
+      resource: {
+        kind: "requests",
+        unit: "request",
+        used: usage.requestCount,
+        remaining: Math.max(0, NVIDIA_LIMIT_PER_MINUTE - usage.requestCount),
+        limit: NVIDIA_LIMIT_PER_MINUTE,
+      },
+    })
     const result = buildResult({
       providerId: "nvidia",
       providerName: NAME,

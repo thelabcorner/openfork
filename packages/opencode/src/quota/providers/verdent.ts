@@ -165,6 +165,17 @@ export function verdentFreeProviderResult(estimate: VerdentFreeEstimate, fetched
       windowSeconds: windowMs / 1000,
       resetAt,
       valueLabel: exact ? null : `${est.used} used, cap at least ${est.knownAtLeast}`,
+      ...(est.limit !== null
+        ? {
+            resource: {
+              kind: "requests" as const,
+              unit: "request",
+              used: est.used,
+              remaining: Math.max(0, est.limit - est.used),
+              limit: est.limit,
+            },
+          }
+        : {}),
     })
   }
 

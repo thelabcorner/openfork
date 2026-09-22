@@ -222,7 +222,18 @@ export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
           planLabel: plan ? plan.charAt(0).toUpperCase() + plan.slice(1) : undefined,
           usage: {
             windows: {
-              credits: toUsageWindow({ usedPercent: null, valueLabel: label }),
+              credits: toUsageWindow({
+                usedPercent: null,
+                valueLabel: label,
+                resource: {
+                  kind: "credits",
+                  unit: "credit",
+                  used: null,
+                  remaining: Math.max(0, credit),
+                  limit: null,
+                  usdPerUnit: 20 / 7500,
+                },
+              }),
             },
           },
         })

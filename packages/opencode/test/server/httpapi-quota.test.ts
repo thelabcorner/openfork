@@ -37,6 +37,15 @@ const quotaOwnershipLayer = HttpRouter.serve(
       HttpApiBuilder.group(QuotaApi, "quota", (handlers) =>
         handlers
           .handle("providers", () => Effect.succeed({ providers: [] }))
+          .handle("resets", (ctx) =>
+            Effect.succeed({
+              from: ctx.query.from,
+              to: ctx.query.to,
+              generatedAt: ctx.query.from,
+              occurrences: [],
+              failures: [],
+            }),
+          )
           .handle("get", () => Effect.die("quota.get is not exercised by the ownership probe")),
       ),
     ),
@@ -73,6 +82,14 @@ describe("QuotaHttpApi", () => {
       const response = yield* request("/quota/does-not-exist")
       expect(response.status).toBe(404)
     }))
+
+  it.effect("rejects reset agenda ranges larger than the calendar bound before provider work", () =>
+    Effect.gen(function* () {
+      const from = 1_700_000_000_000
+      const to = from + 33 * 24 * 60 * 60 * 1000
+      const response = yield* request(`/quota/resets?from=${from}&to=${to}`)
+      expect(response.status).toBe(400)
+    }))
 })
 
 describe("QuotaHttpApi ownership", () => {
@@ -83,6 +100,22 @@ describe("QuotaHttpApi ownership", () => {
       const response = yield* request("/quota/providers")
       expect(response.status).toBe(200)
       expect(yield* response.json).toEqual({ providers: [] })
+    }),
+  )
+
+  itProbe.live("serves quota reset agenda with no instance or workspace runtime", () =>
+    Effect.gen(function* () {
+      const from = 1_700_000_000_000
+      const to = from + 24 * 60 * 60 * 1000
+      const response = yield* request(`/quota/resets?from=${from}&to=${to}`)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        from,
+        to,
+        generatedAt: from,
+        occurrences: [],
+        failures: [],
+      })
     }),
   )
 })

@@ -1,4 +1,4 @@
-import type { ProviderResult, UsageWindow } from "./schema"
+import type { ProviderResult, QuotaResource, UsageWindow } from "./schema"
 
 /**
  * Pure normalization helpers for quota payloads, ported from OpenChamber
@@ -50,16 +50,30 @@ export const toUsageWindow = (input: {
   windowSeconds?: number | null
   resetAt?: number | null
   valueLabel?: string | null
+  resource?: QuotaResource
 }): UsageWindow => {
   const finite = finiteOrNull(input.usedPercent)
   const usedPercent = finite === null ? null : clampPercent(finite)
+  const remainingPercent = usedPercent === null ? null : clampPercent(100 - usedPercent)
+  const resource =
+    input.resource ??
+    (usedPercent === null
+      ? undefined
+      : {
+          kind: "relative" as const,
+          unit: "fraction",
+          used: usedPercent / 100,
+          remaining: remainingPercent! / 100,
+          limit: 1,
+        })
   return {
     usedPercent,
-    remainingPercent: usedPercent === null ? null : clampPercent(100 - usedPercent),
+    remainingPercent,
     windowSeconds: finiteOrNull(input.windowSeconds ?? null),
     resetAt: finiteOrNull(input.resetAt ?? null),
     resetAfterSeconds: calculateResetAfterSeconds(finiteOrNull(input.resetAt ?? null)),
     valueLabel: input.valueLabel ?? null,
+    ...(resource ? { resource } : {}),
   }
 }
 

@@ -68,14 +68,30 @@ export const deepseek = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
         if (totalBalance === null) {
           return buildResult({ providerId: "deepseek", providerName: NAME, ok: false, configured: true, error: "No quota data in response", nextRefreshAt: NEXT_REFRESH_NOW })
         }
-        const symbol = balanceInfo?.currency === "CNY" ? "¥" : "$"
+        const currency = balanceInfo?.currency === "CNY" ? "CNY" : "USD"
+        const symbol = currency === "CNY" ? "¥" : "$"
         const money = formatMoney(totalBalance)
         const result = buildResult({
           providerId: "deepseek",
           providerName: NAME,
           ok: true,
           configured: true,
-          usage: { windows: { credits_balance: toUsageWindow({ usedPercent: null, valueLabel: money === null ? null : `${symbol}${money}` }) } },
+          usage: {
+            windows: {
+              credits_balance: toUsageWindow({
+                usedPercent: null,
+                valueLabel: money === null ? null : `${symbol}${money}`,
+                resource: {
+                  kind: "money",
+                  unit: currency,
+                  currency,
+                  used: null,
+                  remaining: Math.max(0, totalBalance),
+                  limit: null,
+                },
+              }),
+            },
+          },
         })
         cache.store(result, resolved.key)
         return withNext(result)

@@ -4,13 +4,17 @@ import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionSchema } from "../session/schema"
+import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { MaintenanceUsageTable, UsageRecordTable } from "./sql"
+import { UsageYield } from "./yield"
 
 export interface RecordInput {
   readonly messageID: string
   readonly sessionID: string
   readonly providerID: string
   readonly modelID: string
+  /** Authoritative routed account when the provider/router exposes it. */
+  readonly accountID?: string
   readonly variant?: string
   readonly agent?: string
   readonly mode?: string
@@ -74,14 +78,19 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
+    const usageYield = yield* UsageYield.Service
 
     const record = Effect.fnUntraced(function* (input: RecordInput) {
       const sessionID = SessionSchema.ID.make(input.sessionID)
+      const modelIdentity = splitAccountModelID(input.modelID)
+      const accountID = input.accountID ?? modelIdentity.accountID
       const row: typeof UsageRecordTable.$inferInsert = {
         message_id: input.messageID,
         session_id: sessionID,
         provider_id: input.providerID,
         model_id: input.modelID,
+        base_model_id: modelIdentity.baseModelID,
+        account_id: accountID,
         variant: input.variant,
         agent: input.agent,
         mode: input.mode,
@@ -97,34 +106,38 @@ const layer = Layer.effect(
         output_tokens: input.tokens.output,
         reasoning_tokens: input.tokens.reasoning,
       }
-      yield* db
-        .insert(UsageRecordTable)
-        .values(row)
-        .onConflictDoUpdate({
-          target: UsageRecordTable.message_id,
-          set: {
-            session_id: sessionID,
-            provider_id: input.providerID,
-            model_id: input.modelID,
-            variant: input.variant,
-            agent: input.agent,
-            mode: input.mode,
-            created_at: input.createdAt,
-            request_sent_at: input.requestSentAt,
-            first_token_at: input.firstTokenAt,
-            streamed_at: input.streamedAt,
-            completed_at: input.completedAt,
-            cost_usd: input.cost,
-            input_tokens: input.tokens.input,
-            cache_read_tokens: input.tokens.cacheRead,
-            cache_write_tokens: input.tokens.cacheWrite,
-            output_tokens: input.tokens.output,
-            reasoning_tokens: input.tokens.reasoning,
-          },
-        })
-        .run()
+      const inserted = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const fresh = yield* tx
+                .insert(UsageRecordTable)
+                .values(row)
+                .onConflictDoNothing()
+                .returning({ messageID: UsageRecordTable.message_id })
+                .get()
+                .pipe(Effect.orDie)
+              if (!fresh) return false
+
+              yield* usageYield.observe(
+                {
+                  sessionID: input.sessionID,
+                  providerID: input.providerID,
+                  baseModelID: modelIdentity.baseModelID,
+                  accountID,
+                  agent: input.agent,
+                  mode: input.mode,
+                  completedAt: input.completedAt,
+                  tokens: input.tokens,
+                },
+                tx,
+              )
+              return true
+            }),
+          { behavior: "immediate" },
+        )
         .pipe(Effect.orDie)
-      historyRevision += 1
+      if (inserted) historyRevision += 1
     })
 
     const recordMaintenance = Effect.fnUntraced(function* (input: MaintenanceRecordInput) {
@@ -163,4 +176,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node] })
+export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node, UsageYield.node] })

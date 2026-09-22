@@ -75,9 +75,26 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
       const windows: Record<string, UsageWindow> = {}
       const usage = asObject(payload.usage)
       if (usage) {
+        const total = toNumber(usage.limit)
+        const used = toNumber(usage.used)
+        const remaining = toNumber(usage.remaining)
+        const normalizedUsed = used ?? (total !== null && remaining !== null ? Math.max(0, total - remaining) : null)
+        const normalizedRemaining =
+          remaining ?? (total !== null && normalizedUsed !== null ? Math.max(0, total - normalizedUsed) : null)
         windows.weekly = toUsageWindow({
-          usedPercent: computeUsedPercent(toNumber(usage.limit), toNumber(usage.used), toNumber(usage.remaining)),
+          usedPercent: computeUsedPercent(total, used, remaining),
           resetAt: toTimestamp(usage.resetTime),
+          ...((total !== null || normalizedUsed !== null || normalizedRemaining !== null)
+            ? {
+                resource: {
+                  kind: "provider-units" as const,
+                  unit: "kimi-quota-unit",
+                  used: normalizedUsed,
+                  remaining: normalizedRemaining,
+                  limit: total,
+                },
+              }
+            : {}),
         })
       }
       for (const limit of Array.isArray(payload.limits) ? payload.limits : []) {
@@ -88,10 +105,27 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
         const rawLabel = durationToLabel(window?.duration, window?.timeUnit)
         const windowSeconds = durationToSeconds(window?.duration, window?.timeUnit)
         const label = windowSeconds === 5 * 60 * 60 ? `Rate Limit (${rawLabel})` : rawLabel
+        const total = toNumber(detail?.limit)
+        const used = toNumber(detail?.used)
+        const remaining = toNumber(detail?.remaining)
+        const normalizedUsed = used ?? (total !== null && remaining !== null ? Math.max(0, total - remaining) : null)
+        const normalizedRemaining =
+          remaining ?? (total !== null && normalizedUsed !== null ? Math.max(0, total - normalizedUsed) : null)
         windows[label] = toUsageWindow({
-          usedPercent: computeUsedPercent(toNumber(detail?.limit), toNumber(detail?.used), toNumber(detail?.remaining)),
+          usedPercent: computeUsedPercent(total, used, remaining),
           windowSeconds,
           resetAt: toTimestamp(detail?.resetTime),
+          ...((total !== null || normalizedUsed !== null || normalizedRemaining !== null)
+            ? {
+                resource: {
+                  kind: "provider-units" as const,
+                  unit: "kimi-quota-unit",
+                  used: normalizedUsed,
+                  remaining: normalizedRemaining,
+                  limit: total,
+                },
+              }
+            : {}),
         })
       }
       const result = buildResult({

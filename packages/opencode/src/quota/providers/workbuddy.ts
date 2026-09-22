@@ -269,11 +269,20 @@ function windowFromBucket(bucket: PackageBucket, opts?: { fallbackWindowSeconds?
   if (bucket.total === null && bucket.remaining === null) {
     return opts?.emptyLabel ? toUsageWindow({ usedPercent: null, valueLabel: opts.emptyLabel }) : undefined
   }
+  const used = bucket.used ?? (bucket.total !== null && bucket.remaining !== null ? Math.max(0, bucket.total - bucket.remaining) : null)
+  const remaining = bucket.remaining ?? (bucket.total !== null && used !== null ? Math.max(0, bucket.total - used) : null)
   return toUsageWindow({
     usedPercent: usedPercentOf(bucket.total, bucket.used, bucket.remaining),
     windowSeconds: bucket.expiresAt ? null : opts?.fallbackWindowSeconds,
     resetAt: bucket.expiresAt,
     valueLabel: pointsLabel(bucket.total, bucket.remaining, bucket.used),
+    resource: {
+      kind: "credits",
+      unit: "workbuddy-credit",
+      used,
+      remaining,
+      limit: bucket.total,
+    },
   })
 }
 
