@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { PluginInput } from "@opencode-ai/plugin"
+import { ROUTED_ACCOUNT_HEADER } from "@/provider/routing-metadata"
 import {
   ZenGoPlugin,
   ZenPlugin,
@@ -55,6 +56,33 @@ async function modelsHook() {
   const hooks = await ZenPlugin({ serverUrl: new URL("http://127.0.0.1:1") } as PluginInput)
   return hooks.provider!.models!
 }
+
+describe("zen provider account roster", () => {
+  test("publishes the same stable ids and human labels for both opencode and opencode-go", async () => {
+    resetZenPoolForTest()
+    setTestZenVaultCredentials([
+      { apiKey: "roster-secret-a", label: "key1", isDefault: false },
+      { apiKey: "roster-secret-b", label: "Migrated Key", isDefault: true },
+    ])
+    try {
+      const input = { serverUrl: new URL("http://127.0.0.1:1") } as PluginInput
+      const zen = await ZenPlugin(input)
+      const go = await ZenGoPlugin(input)
+      const zenAccounts = await zen.provider!.accounts!({})
+      const goAccounts = await go.provider!.accounts!({})
+
+      expect(zenAccounts).toHaveLength(2)
+      expect(goAccounts).toEqual(zenAccounts)
+      expect(zenAccounts.map((account) => account.label)).toEqual(["key1", "Migrated Key"])
+      expect(zenAccounts.every((account) => /^zen-/.test(account.id))).toBe(true)
+      expect(new Set(zenAccounts.map((account) => account.id)).size).toBe(2)
+      expect(JSON.stringify(zenAccounts)).not.toContain("roster-secret")
+    } finally {
+      setTestZenVaultCredentials(undefined)
+      resetZenPoolForTest()
+    }
+  })
+})
 
 describe("zen models hook", () => {
   test("empty pool leaves the catalog unchanged", async () => {
@@ -250,9 +278,10 @@ describe("zen provider fetch wrapper", () => {
       stubFetch([new Response(JSON.stringify({ choices: [] }), { status: 200 })])
       const snapshot = zenLimitSnapshot()
       const target = snapshot[1]!.accountId
-      await runFetch(`model-x@${target}`)
+      const response = await runFetch(`model-x@${target}`)
       expect(lastCall().body.model).toBe("model-x")
       expect(lastCall().headers.get("Authorization")).toBe("Bearer wrap-key-b")
+      expect(response.headers.get(ROUTED_ACCOUNT_HEADER)).toBe(target)
     } finally {
       dispose()
     }

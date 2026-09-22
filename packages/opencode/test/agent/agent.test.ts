@@ -55,6 +55,7 @@ it.instance("returns default native agents when no config", () =>
     expect(names).toContain("explore")
     expect(names).toContain("compaction")
     expect(names).toContain("title")
+    expect(names).toContain("prompt-revisor")
     expect(names).toContain("summary")
   }),
 )
@@ -145,6 +146,20 @@ it.instance(
       },
     },
   },
+)
+
+it.instance("prompt revisor is a canonical hidden native agent", () =>
+  Effect.gen(function* () {
+    const revisor = yield* load((svc) => svc.get("prompt-revisor"))
+    expect(revisor).toBeDefined()
+    expect(revisor?.mode).toBe("primary")
+    expect(revisor?.native).toBe(true)
+    expect(revisor?.hidden).toBe(true)
+    expect(revisor?.steps).toBe(3)
+    expect(evalPerm(revisor, "edit")).toBe("deny")
+    expect(evalPerm(revisor, "read")).toBe("allow")
+    expect(evalPerm(revisor, "question")).toBe("allow")
+  }),
 )
 
 it.instance("explore agent denies edit and write", () =>
@@ -241,6 +256,29 @@ it.instance(
           description: "My custom agent",
           temperature: 0.5,
           top_p: 0.9,
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "configured Prompt Revisor model preserves first-class account identity",
+  () =>
+    Effect.gen(function* () {
+      const revisor = yield* load((svc) => svc.get("prompt-revisor"))
+      expect(revisor).toBeDefined()
+      expect(String(revisor?.model?.providerID)).toBe("opencode")
+      expect(String(revisor?.model?.modelID)).toBe("gpt-5-nano")
+      expect(revisor?.model?.accountID).toBe("zen-account-42")
+      expect(revisor?.variant).toBe("high")
+    }),
+  {
+    config: {
+      agent: {
+        "prompt-revisor": {
+          model: "opencode/gpt-5-nano@zen-account-42",
+          variant: "high",
         },
       },
     },

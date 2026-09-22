@@ -1,5 +1,11 @@
 import { describe, it, expect } from "bun:test"
-import { accountLabels, AccountRouter, stableAccountIdentity, type WorkBuddyAccount } from "../workbuddy-accounts"
+import {
+  accountLabels,
+  AccountRouter,
+  stableAccountIdentity,
+  workBuddyProviderAccounts,
+  type WorkBuddyAccount,
+} from "../workbuddy-accounts"
 import { WorkBuddyEntitlementGovernor, type EntitlementState } from "../workbuddy-governor"
 import type { AccountRegistry } from "../workbuddy-accounts"
 
@@ -44,6 +50,34 @@ function fakeRegistry(accounts: WorkBuddyAccount[]): AccountRegistry {
 }
 
 const MODEL = "hy4-preview"
+
+describe("workBuddyProviderAccounts", () => {
+  it("publishes stable ids, display labels, and exact human aliases from the same account source", () => {
+    const accounts = [
+      { id: "wb-account-0001", uid: "uid-a", nickname: "team" },
+      { id: "wb-account-0002", uid: "uid-b", nickname: "team" },
+      { id: "wb-account-0003", uid: "uid-c", nickname: "  " },
+    ]
+
+    expect(workBuddyProviderAccounts(accounts)).toEqual([
+      {
+        id: "wb-account-0001",
+        label: "team #0001",
+        aliases: ["team", "uid-a"],
+      },
+      {
+        id: "wb-account-0002",
+        label: "team #0002",
+        aliases: ["team", "uid-b"],
+      },
+      {
+        id: "wb-account-0003",
+        label: "uid-c",
+        aliases: ["uid-c"],
+      },
+    ])
+  })
+})
 
 describe("AccountRouter.select", () => {
   it("binds the session on the first automatic selection", () => {

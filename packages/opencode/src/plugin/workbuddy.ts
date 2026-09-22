@@ -19,6 +19,7 @@ import {
   AccountRouter,
   AccountVault,
   accountLabels,
+  workBuddyProviderAccounts,
   pollWorkBuddyOAuth,
   startWorkBuddyOAuth,
   type Credential,
@@ -1863,6 +1864,9 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
   return {
     provider: {
       id: PROVIDER_ID,
+      async accounts() {
+        return workBuddyProviderAccounts(accountRegistry.all())
+      },
       async models(provider) {
         const proxy = await ensureProxy().catch(() => undefined)
         if (!proxy) return provider.models

@@ -203,6 +203,30 @@ export function verdentAccountLabels(
   return labels
 }
 
+export function verdentProviderAccounts(
+  accounts: Array<
+    Pick<VerdentAccount, "id" | "uid" | "nickname" | "email"> & {
+      credential?: Pick<VerdentCredential, "email">
+    }
+  >,
+): Array<{ id: string; label: string; aliases: string[] }> {
+  const labels = verdentAccountLabels(accounts)
+  return accounts.map((account) => ({
+    id: account.id,
+    label: labels.get(account.id) ?? account.id,
+    aliases: [
+      ...new Set(
+        [
+          account.nickname.trim(),
+          account.email?.trim(),
+          account.credential?.email?.trim(),
+          account.uid.trim(),
+        ].filter((value): value is string => !!value),
+      ),
+    ],
+  }))
+}
+
 export class VerdentVault {
   readonly root: string
   readonly accountsDir: string

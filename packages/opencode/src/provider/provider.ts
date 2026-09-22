@@ -63,7 +63,11 @@ import {
 import { GensparkCatalog } from "@/genspark/catalog"
 import { Integration } from "@opencode-ai/core/integration"
 import { EventV2 } from "@opencode-ai/core/event"
-import { providerModelID } from "@opencode-ai/schema/model-select/account-identity"
+import { providerModelID, splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
+import {
+  resolveProviderAccountSelector,
+  type ProviderAccountIdentity,
+} from "./account-resolution"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
@@ -1513,12 +1517,50 @@ export class UnsupportedModelPrimitiveError extends Schema.TaggedErrorClass<Unsu
   }
 }
 
+export class AccountResolutionError extends Schema.TaggedErrorClass<AccountResolutionError>()(
+  "ProviderAccountResolutionError",
+  {
+    providerID: ProviderV2.ID,
+    selector: Schema.String,
+    reason: Schema.Literals(["unsupported", "not-found", "ambiguous", "unavailable"]),
+    matches: Schema.optional(Schema.Array(Schema.String)),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    if (this.reason === "unsupported") {
+      return `Provider ${this.providerID} does not expose first-class account selection`
+    }
+    if (this.reason === "ambiguous") {
+      return `Provider account selector "${this.selector}" is ambiguous for ${this.providerID}; use the stable account id`
+    }
+    if (this.reason === "unavailable") {
+      return `Provider account roster is unavailable for ${this.providerID}`
+    }
+    return `Provider account selector "${this.selector}" is unavailable for ${this.providerID}`
+  }
+}
+
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
-export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModelsError | UnsupportedModelPrimitiveError
+export type Error =
+  | ModelNotFoundError
+  | InitError
+  | NoProvidersError
+  | NoModelsError
+  | UnsupportedModelPrimitiveError
+  | AccountResolutionError
 
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
+  /**
+   * Resolve a stable provider account id from either that exact id or one
+   * unique human-facing label/alias published by the live provider.
+   */
+  readonly resolveAccountID: (
+    providerID: ProviderV2.ID,
+    selector: string,
+  ) => Effect.Effect<string, AccountResolutionError>
   /**
    * Resolve an account-neutral model selection. accountID remains first-class
    * above this provider boundary; legacy account-qualified catalog ids are
@@ -1547,6 +1589,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  accountLoaders: Record<string, () => Promise<readonly ProviderAccountIdentity[]>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1889,6 +1932,7 @@ const layer = Layer.effect(
         const varsLoaders: {
           [providerID: string]: CustomVarsLoader
         } = {}
+        const accountLoaders: Record<string, () => Promise<readonly ProviderAccountIdentity[]>> = {}
         const sdk = new Map<string, BundledSDK>()
         const discoveryLoaders: {
           [providerID: string]: CustomDiscoverModels
@@ -1930,11 +1974,21 @@ const layer = Layer.effect(
 
         for (const hook of plugins) {
           const p = hook.provider
-          const models = p?.models
-          if (!p || !models) continue
+          if (!p) continue
 
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
+          const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
+
+          if (p.accounts) {
+            // Keep the loader live rather than snapshotting labels at provider
+            // initialization. Account rename/enrollment changes must resolve
+            // immediately without waiting for a provider-catalog invalidation.
+            accountLoaders[providerID] = () => p.accounts!({ auth: pluginAuth })
+          }
+
+          const models = p.models
+          if (!models) continue
 
           const provider =
             database[providerID] ??
@@ -1947,7 +2001,6 @@ const layer = Layer.effect(
               models: {},
             } satisfies Info)
           database[providerID] ??= provider
-          const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
           provider.models = yield* Effect.promise(async () => {
             const next = await models(toPublicInfo(provider), { auth: pluginAuth })
@@ -2235,6 +2288,7 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          accountLoaders,
         }
       }),
     )
@@ -2387,6 +2441,48 @@ const layer = Layer.effect(
     const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderV2.ID) =>
       InstanceState.use(state, (s) => s.providers[providerID]),
     )
+
+    const resolveAccountID = Effect.fn("Provider.resolveAccountID")(function* (
+      providerID: ProviderV2.ID,
+      selector: string,
+    ) {
+      const requested = selector.trim()
+      const s = yield* InstanceState.get(state)
+      const load = s.accountLoaders[providerID]
+      if (!load) {
+        return yield* new AccountResolutionError({
+          providerID,
+          selector: requested,
+          reason: "unsupported",
+        })
+      }
+
+      const accounts = yield* Effect.tryPromise({
+        try: () => load(),
+        catch: (cause) =>
+          new AccountResolutionError({
+            providerID,
+            selector: requested,
+            reason: "unavailable",
+            cause,
+          }),
+      })
+      const resolved = resolveProviderAccountSelector(requested, accounts)
+      if (resolved.kind === "resolved") return resolved.accountID
+      if (resolved.kind === "ambiguous") {
+        return yield* new AccountResolutionError({
+          providerID,
+          selector: requested,
+          reason: "ambiguous",
+          matches: resolved.matches.map((account) => account.id),
+        })
+      }
+      return yield* new AccountResolutionError({
+        providerID,
+        selector: requested,
+        reason: "not-found",
+      })
+    })
 
     const getModel = Effect.fn("Provider.getModel")(function* (
       providerID: ProviderV2.ID,
@@ -2595,7 +2691,16 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    return Service.of({
+      list,
+      getProvider,
+      resolveAccountID,
+      getModel,
+      getLanguage,
+      closest,
+      getSmallModel,
+      defaultModel,
+    })
   }),
 )
 
@@ -2612,9 +2717,11 @@ export function sort<T extends { id: string }>(models: T[]) {
 
 export function parseModel(model: string) {
   const [providerID, ...rest] = model.split("/")
+  const split = splitModelIDForProvider(rest.join("/"), providerID)
   return {
     providerID: ProviderV2.ID.make(providerID),
-    modelID: ModelV2.ID.make(rest.join("/")),
+    modelID: ModelV2.ID.make(split.baseModelID),
+    ...(split.accountID ? { accountID: split.accountID } : {}),
   }
 }
 

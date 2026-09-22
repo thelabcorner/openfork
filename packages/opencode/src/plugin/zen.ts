@@ -6,6 +6,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { makeRuntime } from "@/effect/run-service"
 import { ForkCredentials } from "@/fork/credentials"
 import { errorMessage } from "@/util/error"
+import { withRoutedAccount } from "@/provider/routing-metadata"
 import { ZenAccountPool, stableZenIdentity, type ZenVaultCredential } from "./zen-accounts"
 
 /**
@@ -390,7 +391,7 @@ async function routedZenProviderFetch(
   if (route.accountID && !response.ok) {
     pool.observe(route.accountID, response.status, retryAfterMs(response))
   }
-  return response
+  return withRoutedAccount(response, route.accountID)
 }
 
 export function zenProviderFetch(url: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -527,6 +528,10 @@ export async function ZenPlugin(_input: PluginInput): Promise<Hooks> {
   return {
     provider: {
       id: PROVIDER_ID,
+      accounts: async () => {
+        await syncVault()
+        return pool.all().map((account) => ({ id: account.id, label: account.label }))
+      },
       models: async (provider) => mergeAccountModels(provider.models),
     },
     event: async ({ event }) => zenEventHook({ event: event as any }),
@@ -539,6 +544,10 @@ export async function ZenGoPlugin(_input: PluginInput): Promise<Hooks> {
   return {
     provider: {
       id: GO_PROVIDER_ID,
+      accounts: async () => {
+        await syncVault()
+        return pool.all().map((account) => ({ id: account.id, label: account.label }))
+      },
       models: async (provider) => mergeAccountModels(provider.models),
     },
   }

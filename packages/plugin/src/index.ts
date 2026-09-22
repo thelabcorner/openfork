@@ -232,9 +232,23 @@ export type ProviderHookContext = {
   auth?: Auth
 }
 
+export type ProviderAccount = {
+  /** Stable provider-owned routing identity. Never a display label. */
+  id: string
+  /** Human-facing account/key name. */
+  label: string
+  /** Optional additional exact human selectors (email, uid, legacy nickname, etc.). */
+  aliases?: readonly string[]
+}
+
 export type ProviderHook = {
   id: string
   models?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
+  /**
+   * Live multi-account identity roster. Consumers resolve labels/aliases to the
+   * stable id before persisting or routing a model selection.
+   */
+  accounts?: (ctx: ProviderHookContext) => Promise<readonly ProviderAccount[]>
 }
 
 /** @deprecated Use AuthOAuthResult instead. */

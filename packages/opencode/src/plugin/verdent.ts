@@ -7,7 +7,14 @@ import * as os from "os"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { requiredSystemBlocks } from "./verdent-system"
-import { VerdentRegistry, VerdentRouter, VerdentVault, verdentAccountLabels, uidFromToken } from "./verdent-accounts"
+import {
+  VerdentRegistry,
+  VerdentRouter,
+  VerdentVault,
+  verdentAccountLabels,
+  verdentProviderAccounts,
+  uidFromToken,
+} from "./verdent-accounts"
 import { AdmissionError, WorkBuddyEntitlementGovernor } from "./workbuddy-governor"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 
@@ -2715,6 +2722,9 @@ export async function VerdentPlugin(_input: PluginInput): Promise<Hooks> {
   return {
     provider: {
       id: PROVIDER_ID,
+      async accounts() {
+        return verdentProviderAccounts(verdentRegistry.all())
+      },
       async models(provider, context) {
         const proxy = await ensureProxy().catch(() => undefined)
         if (!proxy) return provider.models

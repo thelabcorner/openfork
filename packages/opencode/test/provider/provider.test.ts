@@ -120,6 +120,8 @@ it.instance(
     const svc = yield* Provider.Service
     const providerID = ProviderV2.ID.make("opencode")
     const modelID = ModelV2.ID.make("jev-1.13-free")
+    expect(yield* svc.resolveAccountID(providerID, "jev account")).toBe(accountID)
+    expect(yield* svc.resolveAccountID(providerID, accountID)).toBe(accountID)
     const model = yield* svc.getModel(providerID, modelID)
 
     expect(model.id).toBe(modelID)
@@ -140,6 +142,57 @@ it.instance(
     expect(discoveryCalls).toBe(1)
     expect((yield* svc.getProvider(providerID)).models[modelID]).toBe(model)
     expect((yield* svc.getProvider(providerID)).models[accountModelID]).toBe(accountModel)
+  }),
+  {
+    config: {
+      provider: {
+        opencode: {
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+  15_000,
+)
+
+it.instance(
+  "resolves account labels to one stable canonical routing id and keeps distinct accounts distinct",
+  Effect.gen(function* () {
+    setTestZenVaultCredentials([
+      { apiKey: "jev-account-key", label: "Jev Account", isDefault: true },
+      { apiKey: "alt-account-key", label: "Alt Account" },
+    ])
+    setTestZenFetch(async () =>
+      new Response(
+        JSON.stringify({
+          object: "list",
+          data: [
+            { id: "gpt-5.6-sol", object: "model", owned_by: "opencode" },
+            { id: "jev-1.13-free", object: "model", owned_by: "opencode" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    )
+
+    const svc = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode")
+    const modelID = ModelV2.ID.make("jev-1.13-free")
+
+    // A label/alias must canonicalize to the same stable id the delegated
+    // worker persists in its durable origin, including on a later read.
+    const canonical = yield* svc.resolveAccountID(providerID, "jev account")
+    expect(yield* svc.resolveAccountID(providerID, "  JEV ACCOUNT  ")).toBe(canonical)
+    expect(yield* svc.resolveAccountID(providerID, canonical)).toBe(canonical)
+
+    // Distinct accounts never collapse onto one routing id.
+    const other = yield* svc.resolveAccountID(providerID, "Alt Account")
+    expect(other).not.toBe(canonical)
+
+    // Alias and canonical selectors route to the exact same account model.
+    const byCanonical = yield* svc.getModel(providerID, modelID, canonical)
+    const aliasResolved = yield* svc.resolveAccountID(providerID, "JEV ACCOUNT")
+    expect((yield* svc.getModel(providerID, modelID, aliasResolved)).id).toBe(byCanonical.id)
   }),
   {
     config: {

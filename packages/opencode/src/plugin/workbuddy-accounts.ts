@@ -86,6 +86,17 @@ export function accountLabels(accounts: Array<Pick<WorkBuddyAccount, "id" | "uid
   return labels
 }
 
+export function workBuddyProviderAccounts(
+  accounts: Array<Pick<WorkBuddyAccount, "id" | "uid" | "nickname">>,
+): Array<{ id: string; label: string; aliases: string[] }> {
+  const labels = accountLabels(accounts)
+  return accounts.map((account) => ({
+    id: account.id,
+    label: labels.get(account.id) ?? account.id,
+    aliases: [...new Set([account.nickname.trim(), account.uid.trim()].filter(Boolean))],
+  }))
+}
+
 export type AccountRegistryOptions = {
   /** Test-only or embedding override for current desktop files. */
   authFiles?: string[]

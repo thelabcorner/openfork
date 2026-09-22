@@ -14,6 +14,7 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import { DEFAULT_PROMPT as PROMPT_TITLE } from "@opencode-ai/core/session/title-prompt"
+import { DEFAULT_PROMPT as PROMPT_REVISOR } from "@opencode-ai/core/prompt-revisor-prompt"
 import { Permission } from "@/permission"
 import { mergeDeep } from "remeda"
 import { Global } from "@opencode-ai/core/global"
@@ -258,6 +259,29 @@ const layer = Layer.effect(
               user,
             ),
             prompt: PROMPT_TITLE,
+          },
+          "prompt-revisor": {
+            name: "prompt-revisor",
+            description: "Read-only host-owned prompt and Goal revision agent.",
+            mode: "primary",
+            native: true,
+            hidden: true,
+            steps: 3,
+            prompt: PROMPT_REVISOR,
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                "*": "deny",
+                grep: "allow",
+                glob: "allow",
+                read: "allow",
+                question: "allow",
+                composer_context: "allow",
+                revised_prompt: "allow",
+              }),
+              user,
+            ),
+            options: {},
           },
           summary: {
             name: "summary",
