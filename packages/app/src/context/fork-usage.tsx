@@ -1,10 +1,29 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
-import { createResource, createSignal, onCleanup, onMount } from "solid-js"
+import { createMemo, createResource, createSignal, onCleanup, onMount } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
-import type { ForkServer, ForkWindowUsage } from "@/utils/fork-client"
+import type {
+  ForkCapacityEstimate,
+  ForkCapacityPredictiveRange,
+  ForkCapacityResult,
+  ForkServer,
+  ForkWindowUsage,
+} from "@/utils/fork-client"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 
 const HEARTBEAT_MS = 60_000
 const EVENT_DEBOUNCE_MS = 3_000
+const CAPACITY_TTL_MS = 2_000
+
+export type CapacityView = {
+  status: "ready" | "learning" | "unavailable" | "unlimited"
+  estimatedRequests?: number
+  remainingPercent?: number
+  personalized: boolean
+  predictiveRange?: ForkCapacityPredictiveRange
+  accountID?: string
+  accountLabel?: string
+  reason?: string
+}
 let forkClientRuntime: Promise<typeof import("@/utils/fork-client")> | undefined
 const loadForkClientRuntime = () => (forkClientRuntime ??= import("@/utils/fork-client"))
 
@@ -50,6 +69,102 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
       { initialValue: undefined },
     )
 
+    // Request-capacity is deliberately lazy: ordinary quota heartbeats should
+    // not fan out across provider quota sources until a capacity consumer exists.
+    // Once requested by the model picker, it stays fresh after settled turns and
+    // normal heartbeats. Provider adapters own their remote caches/single-flight;
+    // OpenCode Go additionally reuses its process-global >=5m official gate.
+    const [capacity, setCapacity] = createSignal<ForkCapacityResult>()
+    const [capacityLoadedAt, setCapacityLoadedAt] = createSignal(0)
+    let capacityPending: Promise<void> | undefined
+    const ensureCapacity = (force = false) => {
+      if (
+        !force &&
+        capacityLoadedAt() > 0 &&
+        Date.now() - capacityLoadedAt() < CAPACITY_TTL_MS
+      )
+        return Promise.resolve()
+      if (capacityPending) return capacityPending
+      capacityPending = loadForkClientRuntime()
+        .then(({ ForkClient }) => ForkClient.capacity(server()))
+        .then((value) => {
+          setCapacity(value)
+          setCapacityLoadedAt(Date.now())
+        })
+        .catch(() => {
+          // Older/degraded servers simply expose no capacity projection. Do not
+          // fall back to the structurally-wrong universal-dollar estimator.
+          setCapacity(undefined)
+          setCapacityLoadedAt(Date.now())
+        })
+        .finally(() => {
+          capacityPending = undefined
+        })
+      return capacityPending
+    }
+
+    const routedCapacity = createMemo(() => {
+      const map = new Map<string, ForkCapacityEstimate>()
+      for (const estimate of capacity()?.routed ?? []) map.set(estimate.modelID, estimate)
+      return map
+    })
+    const accountCapacity = createMemo(() => {
+      const map = new Map<string, Map<string, ForkCapacityEstimate>>()
+      for (const account of capacity()?.accounts ?? []) {
+        map.set(account.accountID, new Map(account.estimates.map((estimate) => [estimate.modelID, estimate])))
+      }
+      return map
+    })
+    const providerCapacity = createMemo(() => {
+      const map = new Map<string, NonNullable<ForkCapacityResult["providers"]>[number]>()
+      for (const provider of capacity()?.providers ?? []) {
+        for (const providerID of provider.modelProviderIDs) map.set(providerID, provider)
+      }
+      return map
+    })
+
+    const capacityFor = (providerID: string, modelID: string, accountID?: string): CapacityView | undefined => {
+      const id = splitModelIDForProvider(modelID, providerID).baseModelID
+
+      // Preserve the calibrated Go-specific evidence/range while older servers
+      // are still in the rolling-compatibility window.
+      if (providerID === "opencode-go") {
+        const estimate = accountID ? accountCapacity().get(accountID)?.get(id) : routedCapacity().get(id)
+        if (!estimate || estimate.projectionStatus === "incomplete-local-accounting") return undefined
+        return {
+          status: "ready" as const,
+          estimatedRequests: estimate.estimatedRequests,
+          remainingPercent: estimate.remainingPercent,
+          personalized: estimate.personalized,
+          predictiveRange: estimate.predictiveRange,
+          accountID: estimate.accountID,
+        }
+      }
+
+      const provider = providerCapacity().get(providerID)
+      if (!provider || provider.status !== "ok") return undefined
+
+      const account = accountID
+        ? provider.accounts.find((candidate) => candidate.accountID === accountID)
+        : undefined
+      const estimate = accountID
+        ? account?.estimates.find((candidate) => candidate.modelID === id) ?? account?.defaultEstimate
+        : provider.estimates.find((candidate) => candidate.modelID === id) ??
+          provider.defaultEstimates.find((candidate) => candidate.modelID === id) ??
+          provider.defaultEstimates.find((candidate) => candidate.modelID === undefined)
+
+      if (!estimate) return undefined
+      return {
+        status: estimate.status,
+        ...(estimate.estimatedRequests !== null ? { estimatedRequests: estimate.estimatedRequests } : {}),
+        ...(estimate.remainingPercent !== null ? { remainingPercent: estimate.remainingPercent } : {}),
+        personalized: estimate.personalized,
+        ...(estimate.accountID ? { accountID: estimate.accountID } : {}),
+        ...(estimate.accountLabel ? { accountLabel: estimate.accountLabel } : {}),
+        ...(estimate.reason ? { reason: estimate.reason } : {}),
+      }
+    }
+
     // SSE: refetch local usage shortly after a step finishes (session.status
     // flips to idle at step-finish). A normal reconnect is only transport
     // recovery; refresh both resources only when the server marks the reconnect
@@ -61,6 +176,7 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
       eventTimer = setTimeout(() => {
         eventTimer = undefined
         void refetchUsage()
+        if (capacityLoadedAt() > 0) void ensureCapacity(true)
       }, EVENT_DEBOUNCE_MS)
     }
     const unsub = serverSDK().event.listen((e) => {
@@ -71,6 +187,7 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
       ) {
         void refetchCredentials()
         void refetchUsage()
+        if (capacityLoadedAt() > 0) void ensureCapacity(true)
         return
       }
       if (event.type === "session.status") {
@@ -83,6 +200,7 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
     const tick = () => {
       if (document.hidden) return
       void refetchUsage()
+      if (capacityLoadedAt() > 0) void ensureCapacity(true)
     }
     const interval = window.setInterval(tick, heartbeatMs)
 
@@ -103,10 +221,14 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
     return {
       credentials,
       usage,
+      capacity,
+      ensureCapacity,
+      capacityFor,
       refreshUsage: () => void refetchUsage(),
       refreshAll: () => {
         void refetchCredentials()
         void refetchUsage()
+        if (capacityLoadedAt() > 0) void ensureCapacity(true)
       },
       // The actual account a bare opencode-go request routes to. New servers
       // report direct-provider-auth > pool precedence explicitly; old servers

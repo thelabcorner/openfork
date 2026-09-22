@@ -8,7 +8,7 @@ import type {
 import type { Agent, PermissionRequest, Project, Provider, ProviderListResponse } from "@opencode-ai/sdk/v2/client"
 import type { Project as CurrentProject } from "@opencode-ai/client/promise"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
-import { Model as ModelContract } from "@opencode-ai/schema/model"
+import { resolvePrimitive } from "@opencode-ai/schema/model-runtime"
 export { pathKey as directoryKey, type PathKey as DirectoryKey } from "@/utils/path-key"
 
 export const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
@@ -16,7 +16,7 @@ export const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 function primitiveOf(model: { id: string; providerID: string } & Record<string, unknown>) {
   const value = model.primitive
   const primitive = value === "language" || value === "system-one" ? value : undefined
-  return ModelContract.resolvePrimitive(model.providerID, { id: model.id, primitive })
+  return resolvePrimitive(model.providerID, { id: model.id, primitive })
 }
 
 export function normalizeAgentList(input: AgentListOutput["data"] | Agent[]): Agent[] {
@@ -77,7 +77,7 @@ export function normalizeProviderList(
                   id,
                   {
                     ...model,
-                    primitive: ModelContract.resolvePrimitive(provider.id, model),
+                    primitive: resolvePrimitive(provider.id, model),
                   },
                 ]),
             ),

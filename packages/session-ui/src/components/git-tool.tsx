@@ -7,7 +7,7 @@ import { DiffChanges } from "@opencode-ai/ui/diff-changes"
 import { resolveFileDiff } from "./session-diff"
 import { Markdown } from "./markdown"
 import { SmartToolOutput } from "./tool-output"
-import { ToolFileAccordion } from "./message-part"
+import { ToolFileAccordion } from "./tool-file-accordion"
 import { ToolBadge, ToolBoundedList, ToolEmpty, ToolPath, ToolRow, ToolScrollArea, ToolStats } from "./tool-parts"
 
 function unescapeXml(text: string) {

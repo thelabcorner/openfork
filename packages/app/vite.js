@@ -13,7 +13,7 @@ const channel = (() => {
 })()
 
 /**
- * @type {import("vite").PluginOption}
+ * @type {import("vite").PluginOption[]}
  */
 export default [
   {

@@ -1,0 +1,358 @@
+[data-slot="prompt-turn-lane"] {
+  --prompt-turn-ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --prompt-turn-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --prompt-turn-swap: 120ms;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+[data-slot="prompt-turn-group"] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 86px;
+  padding-right: 6px;
+  overflow: hidden;
+  flex: none;
+  box-sizing: border-box;
+  transition:
+    width 200ms var(--prompt-turn-ease-out),
+    padding-right 200ms var(--prompt-turn-ease-out),
+    opacity var(--prompt-turn-swap) ease;
+}
+
+[data-slot="prompt-turn-group"][data-live="false"] {
+  width: 0;
+  padding-right: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition-duration: 110ms, 110ms, 110ms;
+  transition-timing-function: var(--prompt-turn-ease-in), var(--prompt-turn-ease-in), ease;
+}
+
+[data-slot="prompt-turn-clock"] {
+  width: 48px;
+  flex: none;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: 0.1px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-muted);
+  white-space: nowrap;
+  user-select: none;
+  transition: color var(--prompt-turn-swap) ease;
+}
+
+[data-slot="prompt-turn-clock"][data-settled="true"] {
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="prompt-turn-baton"] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background-color: var(--v2-background-bg-button-neutral);
+  color: var(--v2-state-fg-danger);
+  box-shadow: var(--v2-elevation-button-neutral);
+  transition:
+    background-color var(--prompt-turn-swap) ease,
+    color var(--prompt-turn-swap) ease;
+}
+
+[data-slot="prompt-turn-baton"]:hover:not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+}
+
+[data-slot="prompt-turn-baton"]:active:not([aria-disabled="true"]) {
+  background-color: var(--v2-state-bg-danger);
+  box-shadow:
+    var(--v2-elevation-button-neutral),
+    inset 0 1px 2px 0 var(--v2-alpha-dark-8);
+}
+
+[data-slot="prompt-turn-baton"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+[data-slot="prompt-turn-baton"][data-quiet="true"] {
+  color: var(--v2-icon-icon-muted);
+}
+
+[data-slot="prompt-turn-arc"] {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+[data-slot="prompt-turn-track"] {
+  stroke: var(--v2-border-border-muted);
+}
+
+[data-slot="prompt-turn-runner"] {
+  stroke: var(--v2-border-border-strong);
+  stroke-dasharray: 24 76;
+  animation: prompt-turn-orbit 2200ms linear infinite;
+}
+
+[data-slot="prompt-turn-arc"][data-frozen="true"] [data-slot="prompt-turn-runner"] {
+  animation: none;
+  stroke-dasharray: none;
+  stroke-dashoffset: 0;
+  stroke: var(--v2-border-border-base);
+}
+
+[data-slot="prompt-turn-charge"] {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 3px;
+  height: 1px;
+  border-radius: 1px;
+  background: var(--v2-icon-icon-accent);
+  transform-origin: left center;
+  animation: prompt-turn-charge 1400ms linear forwards;
+}
+
+[data-slot="prompt-send-group"] {
+  position: relative;
+  display: flex;
+  flex: none;
+  isolation: isolate;
+}
+
+[data-slot="prompt-send-tab"] {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% - 4px);
+  translate: -50% 0;
+  z-index: 0;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 13px;
+  padding: 0 0 3px;
+  border: 0;
+  border-radius: 5px 5px 0 0;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  color: var(--v2-icon-icon-contrast);
+  background-image: linear-gradient(180deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  box-shadow: 0 -1px 1.5px 0 var(--v2-alpha-dark-14);
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity var(--prompt-turn-swap) ease,
+    transform var(--prompt-turn-swap) var(--prompt-turn-ease-out);
+}
+
+/* Auto-send is the stronger automation tier: keep the selected Rising Tab
+ * geometry, but make that persistent preference legible without opening the
+ * menu. The tooltip/ARIA label carries the full semantic explanation. */
+[data-slot="prompt-send-tab"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  width: 2px;
+  height: 2px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0;
+  transform: scale(0.5);
+  transition:
+    opacity var(--prompt-turn-swap) ease,
+    transform var(--prompt-turn-swap) var(--prompt-turn-ease-out);
+}
+
+[data-slot="prompt-send-tab"][data-auto-send="true"]::after {
+  opacity: 0.82;
+  transform: scale(1);
+}
+
+[data-slot="prompt-send-group"]:hover [data-slot="prompt-send-tab"],
+[data-slot="prompt-send-group"]:focus-within [data-slot="prompt-send-tab"],
+[data-slot="prompt-send-tab"][data-pinned="true"] {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+[data-slot="prompt-send-tab"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 1px;
+}
+
+[data-slot="prompt-send-tab"][data-armed="true"] {
+  background-image: linear-gradient(180deg, var(--v2-background-bg-accent) 0%, var(--v2-background-bg-accent) 100%);
+  color: var(--v2-text-text-contrast);
+}
+
+[data-slot="prompt-send-primary"] {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  cursor: default;
+  user-select: none;
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  color: var(--v2-icon-icon-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+  transition:
+    background-image var(--prompt-turn-swap) ease,
+    color var(--prompt-turn-swap) ease,
+    box-shadow var(--prompt-turn-swap) ease;
+}
+
+[data-slot="prompt-send-primary"]:hover:not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-contrast-hover) 0%, var(--v2-overlay-simple-overlay-contrast-hover) 100%),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-slot="prompt-send-primary"]:active:not([aria-disabled="true"]) {
+  background-image:
+    linear-gradient(90deg, var(--v2-overlay-simple-overlay-contrast-pressed) 0%, var(--v2-overlay-simple-overlay-contrast-pressed) 100%),
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+}
+
+[data-slot="prompt-send-primary"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: 2.5px;
+}
+
+/* Opaque by design: the rising tab tucks under the primary and must never show
+ * through a dimmed contrast surface. */
+[data-slot="prompt-send-primary"][aria-disabled="true"] {
+  background-image: linear-gradient(90deg, var(--v2-background-bg-layer-03) 0%, var(--v2-background-bg-layer-03) 100%);
+  color: var(--v2-icon-icon-muted);
+  box-shadow: 0 0 0 0.5px var(--v2-border-border-base);
+}
+
+[data-slot="prompt-send-primary"][data-busy="true"] {
+  cursor: progress;
+  background-image:
+    linear-gradient(180deg, var(--v2-alpha-light-20) 0%, var(--v2-alpha-light-0) 100%),
+    linear-gradient(90deg, var(--v2-background-bg-contrast) 0%, var(--v2-background-bg-contrast) 100%);
+  color: var(--v2-icon-icon-contrast);
+  box-shadow: var(--v2-elevation-button-contrast);
+}
+
+[data-slot="prompt-send-launch"][data-launching="true"] {
+  animation: prompt-send-launch 260ms var(--prompt-turn-ease-out);
+}
+
+[data-slot="prompt-send-revising"] {
+  animation: prompt-send-breathe 2200ms ease-in-out infinite;
+}
+
+[data-slot="prompt-send-staged"] {
+  position: absolute;
+  top: 3.5px;
+  right: 3.5px;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--v2-icon-icon-accent);
+}
+
+[data-slot="prompt-send-glyph-stack"],
+[data-slot="prompt-turn-glyph-stack"] {
+  display: grid;
+  place-items: center;
+}
+
+[data-slot="prompt-send-glyph-stack"] > span,
+[data-slot="prompt-turn-glyph-stack"] > span {
+  grid-area: 1 / 1;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transform: scale(0.82);
+  transition:
+    opacity var(--prompt-turn-swap) ease,
+    transform var(--prompt-turn-swap) var(--prompt-turn-ease-out);
+}
+
+[data-slot="prompt-send-glyph-stack"] > span[data-active="true"],
+[data-slot="prompt-turn-glyph-stack"] > span[data-active="true"] {
+  opacity: 1;
+  transform: scale(1);
+}
+
+@keyframes prompt-turn-orbit {
+  from { stroke-dashoffset: 100; }
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes prompt-turn-charge {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@keyframes prompt-send-launch {
+  0% { transform: translateY(0); opacity: 1; }
+  55% { transform: translateY(-9px); opacity: 0; }
+  56% { transform: translateY(5px); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes prompt-send-breathe {
+  0%, 100% { opacity: 0.58; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="prompt-turn-runner"] {
+    animation: none !important;
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+
+  [data-slot="prompt-turn-charge"] {
+    animation: none !important;
+    transform: scaleX(1);
+  }
+
+  [data-slot="prompt-send-launch"][data-launching="true"],
+  [data-slot="prompt-send-revising"] {
+    animation: none !important;
+  }
+
+  [data-slot="prompt-turn-group"],
+  [data-slot="prompt-send-tab"],
+  [data-slot="prompt-send-tab"]::after,
+  [data-slot="prompt-send-glyph-stack"] > span,
+  [data-slot="prompt-turn-glyph-stack"] > span {
+    transition-duration: 0ms !important;
+  }
+}

@@ -43,14 +43,24 @@ describe("prompt revision automation", () => {
 
   test("clears impossible persisted auto-send state when auto-revise is off", () => {
     expect(normalizePromptRevisionSettings({ autoBeforeSend: false, autoSendAfterRevision: true })).toBeUndefined()
+  })
+
+  test("drops legacy renderer-owned Prompt Revisor model and policy state", () => {
     expect(
       normalizePromptRevisionSettings({
         model: { providerID: "openai", modelID: "gpt-test" },
+        prompt: "legacy renderer policy",
         autoSendAfterRevision: true,
       }),
+    ).toBeUndefined()
+    expect(
+      normalizePromptRevisionSettings({
+        model: { providerID: "openai", modelID: "gpt-test" },
+        prompt: "legacy renderer policy",
+        autoBeforeSend: true,
+      }),
     ).toEqual({
-      model: { providerID: "openai", modelID: "gpt-test" },
-      autoBeforeSend: undefined,
+      autoBeforeSend: true,
       autoSendAfterRevision: undefined,
     })
   })

@@ -6,6 +6,7 @@ import {
   scheduledLocalDayKey,
   scheduledMonthGrid,
   scheduledRunAttentionRank,
+  scheduledTemporalClusters,
   shiftScheduledCalendarAnchor,
 } from "./scheduled-page-model"
 
@@ -32,6 +33,20 @@ describe("scheduled calendar model", () => {
     expect(store.match(/\.agenda\(/g) ?? []).toHaveLength(1)
     expect(store).toContain("agendaInflight")
     expect(store).toContain("agendaCache")
+  })
+
+  test("quota resets consume one bounded Tier-0 agenda and never recreate provider fanout in the calendar", () => {
+    const page = readFileSync(new URL("./scheduled-page.tsx", import.meta.url), "utf8")
+    const resets = readFileSync(new URL("./scheduled-quota-resets.ts", import.meta.url), "utf8")
+
+    expect(page.match(/quotaResets\.load\(/g) ?? []).toHaveLength(1)
+    expect(resets.match(/\.client\.quota\.resets\(/g) ?? []).toHaveLength(1)
+    expect(page).not.toContain("useLimits(")
+    expect(resets).not.toContain(".client.quota.get(")
+    expect(resets).not.toContain(".client.quota.providers(")
+    expect(resets).not.toContain("setInterval(")
+    expect(resets).toContain("MAX_CACHE_ENTRIES = 6")
+    expect(resets).toContain("if (state.key !== key) return")
   })
 
   test("T10.10: workspace open is catalog/history-free, 30d rendering is bounded, and countdowns share one ticker", () => {
@@ -90,6 +105,51 @@ describe("scheduled calendar model", () => {
     expect(cells.length % 7).toBe(0)
     expect(cells.filter((value) => value !== undefined)).toHaveLength(30)
     expect(scheduledLocalDayKey(cells.find((value) => value !== undefined)!)).toBe(scheduledLocalDayKey(anchor))
+  })
+
+  test("reset rail clustering preserves every authoritative event while preventing adjacent rail collisions", () => {
+    const base = new Date(2026, 8, 19, 9, 0).getTime()
+    const input = [
+      { id: "later", at: base + 17 * 60_000 },
+      { id: "first", at: base },
+      { id: "near", at: base + 8 * 60_000 },
+      { id: "separate", at: base + 40 * 60_000 },
+    ]
+    const clusters = scheduledTemporalClusters(input, (item) => item.at, 18 * 60_000)
+
+    expect(clusters).toHaveLength(2)
+    expect(clusters[0]?.items.map((item) => item.id)).toEqual(["first", "near", "later"])
+    expect(clusters[0]?.startAt).toBe(base)
+    expect(clusters[0]?.endAt).toBe(base + 17 * 60_000)
+    expect(clusters[1]?.items.map((item) => item.id)).toEqual(["separate"])
+    expect(input.map((item) => item.id)).toEqual(["later", "first", "near", "separate"])
+  })
+
+  test("temporal clustering is deterministic at the threshold and discards invalid presentation timestamps", () => {
+    const base = new Date(2026, 8, 19, 9, 0).getTime()
+    const input = [
+      { id: "invalid", at: Number.NaN },
+      { id: "a", at: base },
+      { id: "threshold", at: base + 18 * 60_000 },
+      { id: "outside", at: base + 36 * 60_000 + 1 },
+    ]
+
+    const clusters = scheduledTemporalClusters(input, (item) => item.at, 18 * 60_000)
+    expect(clusters.map((cluster) => cluster.items.map((item) => item.id))).toEqual([["a", "threshold"], ["outside"]])
+    expect(clusters.flatMap((cluster) => cluster.items).some((item) => item.id === "invalid")).toBe(false)
+  })
+
+  test("timed reset rendering reserves an independent system rail instead of z-indexing over task controls", () => {
+    const page = readFileSync(new URL("./scheduled-page.tsx", import.meta.url), "utf8")
+
+    expect(page).toContain("SYSTEM_EVENT_RAIL_WIDTH")
+    expect(page).toContain("scheduledTemporalClusters")
+    expect(page).toContain('data-calendar-layer="system-event-rail"')
+    expect(page).toContain('data-calendar-layer="quota-reset-guide"')
+    expect(page).toContain('data-calendar-layer="quota-reset-marker"')
+    expect(page).toContain('data-calendar-layer="scheduled-task"')
+    expect(page).toContain('right: props.showSystemEvents ? `${SYSTEM_EVENT_RAIL_WIDTH + 4}px` : "4px"')
+    expect(page).not.toContain("z-[15]")
   })
 
   test("activity ranking keeps waiting/failed unread work ahead of passive history", () => {

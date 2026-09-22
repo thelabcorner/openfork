@@ -23,6 +23,7 @@ type InstanceOfxpProjection = {
         protocolMax: number
         pairing: boolean
         endpointHints: ReadonlyArray<{ port: number }>
+        publicOrigin?: string
       }
 }
 
@@ -42,6 +43,7 @@ export type ConfiguredServerOfxpIdentity =
       protocolMax: number
       pairing: boolean
       compatible: boolean
+      publicOrigin?: string
     }
 
 function record(value: unknown): RecordValue | undefined {
@@ -51,6 +53,16 @@ function record(value: unknown): RecordValue | undefined {
 
 function integer(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value)
+}
+
+function validOrigin(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 256) return false
+  try {
+    const url = new URL(value)
+    return url.protocol === "http:" || url.protocol === "https:"
+  } catch {
+    return false
+  }
 }
 
 export function parseInstanceOfxpProjection(value: unknown): InstanceOfxpProjection | undefined {
@@ -84,6 +96,8 @@ export function parseInstanceOfxpProjection(value: unknown): InstanceOfxpProject
     return integer(port) && port > 0 && port <= 65_535 ? [{ port }] : []
   })
   if (endpointHints.length === 0) return
+  const publicOrigin = ofxp.publicOrigin
+  if (publicOrigin !== undefined && !validOrigin(publicOrigin)) return
   return {
     instanceID: root.instanceID,
     realmID: root.realmID,
@@ -96,6 +110,7 @@ export function parseInstanceOfxpProjection(value: unknown): InstanceOfxpProject
       protocolMax: ofxp.protocolMax,
       pairing: ofxp.pairing,
       endpointHints,
+      ...(publicOrigin === undefined ? {} : { publicOrigin }),
     },
   }
 }
@@ -239,10 +254,13 @@ export async function probeConfiguredServerOfxp(
       protocolMax: parsed.ofxp.protocolMax,
       pairing: parsed.ofxp.pairing,
       compatible,
+      ...(parsed.ofxp.publicOrigin === undefined ? {} : { publicOrigin: parsed.ofxp.publicOrigin }),
     }
     const host = serverSeedHost(connection)
     const endpoint = parsed.ofxp.endpointHints[0]
-    if (!compatible || !host || !endpoint) return { instanceID: parsed.instanceID, ofxp: identity }
+    const ingressHost = parsed.ofxp.publicOrigin ? httpHostname(parsed.ofxp.publicOrigin) : undefined
+    const viaIngress = !!host && !!ingressHost && host.toLowerCase() === ingressHost.toLowerCase()
+    if (!compatible || !host || !endpoint || viaIngress) return { instanceID: parsed.instanceID, ofxp: identity }
     return {
       instanceID: parsed.instanceID,
       ofxp: identity,

@@ -1,4 +1,5 @@
 import type {
+  OxpInvocationDetailInfo,
   OxpInvocationInfo,
   OxpInvocationPage,
   OxpParentActivitySummary,
@@ -7,6 +8,13 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useServerSDK } from "./server-sdk"
+
+type InvocationDetailState = {
+  data?: OxpInvocationDetailInfo
+  loaded: boolean
+  loading: boolean
+  error?: string
+}
 
 type DetailState = {
   items: OxpInvocationInfo[]
@@ -20,6 +28,7 @@ type DetailState = {
 
 const MAX_CACHED_ACTIVITY_DETAILS = 8
 const MAX_CACHED_INVOCATIONS_PER_ACTIVITY = 2_000
+const MAX_CACHED_INVOCATION_DETAILS = 128
 
 const emptyDetail = (): DetailState => ({
   items: [],
@@ -51,6 +60,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
     const [state, setState] = createStore({
       summaries: {} as Record<string, OxpParentActivitySummary>,
       details: {} as Record<string, DetailState>,
+      invocationDetails: {} as Record<string, InvocationDetailState>,
       loaded: false,
       loading: false,
       loadingMoreSummaries: false,
@@ -62,6 +72,8 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
     const sdk = createMemo(() => serverSDK().client.global)
     let disposed = false
     const detailRecency: string[] = []
+    const invocationDetailRecency: string[] = []
+    const invocationDetailRefreshes = new Map<string, Promise<void>>()
     const detailRefreshes = new Map<string, Promise<void>>()
     const detailDirty = new Set<string>()
     const summaryQueue = new Set<string>()
@@ -85,6 +97,22 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       }
     }
 
+    const touchInvocationDetail = (invocationID: string) => {
+      const existing = invocationDetailRecency.indexOf(invocationID)
+      if (existing >= 0) invocationDetailRecency.splice(existing, 1)
+      invocationDetailRecency.push(invocationID)
+      while (invocationDetailRecency.length > MAX_CACHED_INVOCATION_DETAILS) {
+        const evict = invocationDetailRecency.shift()
+        if (!evict || evict === invocationID) continue
+        setState("invocationDetails", (details) => {
+          if (!(evict in details)) return details
+          const next = { ...details }
+          delete next[evict]
+          return next
+        })
+      }
+    }
+
     const upsertSummary = (summary: OxpParentActivitySummary) =>
       setState("summaries", summary.id, summary)
 
@@ -101,6 +129,17 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
         delete next[activityID]
         return next
       })
+      const invocationIDs = state.details[activityID]?.items.map((item) => item.id) ?? []
+      for (const invocationID of invocationIDs) {
+        setState("invocationDetails", (details) => {
+          if (!(invocationID in details)) return details
+          const next = { ...details }
+          delete next[invocationID]
+          return next
+        })
+        const invocationRecency = invocationDetailRecency.indexOf(invocationID)
+        if (invocationRecency >= 0) invocationDetailRecency.splice(invocationRecency, 1)
+      }
       const recency = detailRecency.indexOf(activityID)
       if (recency >= 0) detailRecency.splice(recency, 1)
     }
@@ -274,6 +313,42 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       void refreshInvocations(activityID)
     }
 
+    const ensureInvocationDetail = (invocationID: string) => {
+      touchInvocationDetail(invocationID)
+      const current = state.invocationDetails[invocationID]
+      if (current?.loaded || current?.loading) return
+      const pending = invocationDetailRefreshes.get(invocationID)
+      if (pending) return
+      setState("invocationDetails", invocationID, {
+        loaded: false,
+        loading: true,
+        error: undefined,
+      })
+      const run = (async () => {
+        try {
+          const response = await sdk().oxpInvocationDetail(
+            { invocationID },
+            { throwOnError: true },
+          )
+          if (disposed || !invocationDetailRecency.includes(invocationID)) return
+          setState("invocationDetails", invocationID, {
+            data: response.data ?? undefined,
+            loaded: true,
+            loading: false,
+            error: undefined,
+          })
+        } catch (error) {
+          if (disposed || !invocationDetailRecency.includes(invocationID)) return
+          setState("invocationDetails", invocationID, {
+            loaded: false,
+            loading: false,
+            error: messageOf(error),
+          })
+        }
+      })().finally(() => invocationDetailRefreshes.delete(invocationID))
+      invocationDetailRefreshes.set(invocationID, run)
+    }
+
     const loadMore = async (activityID: string) => {
       touchDetail(activityID)
       const detail = state.details[activityID]
@@ -395,6 +470,8 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       summaryDirty.clear()
       detailDirty.clear()
       detailRecency.length = 0
+      invocationDetailRecency.length = 0
+      invocationDetailRefreshes.clear()
     })
 
     const activities = createMemo(() =>
@@ -414,6 +491,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       activities,
       activity: (activityID: string) => state.summaries[activityID],
       detail: (activityID: string) => state.details[activityID],
+      invocationDetail: (invocationID: string) => state.invocationDetails[invocationID],
       loaded: () => state.loaded,
       loading: () => state.loading,
       loadingMoreActivities: () => state.loadingMoreSummaries,
@@ -422,6 +500,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       ensureLoaded,
       loadOlderActivities,
       ensureInvocations,
+      ensureInvocationDetail,
       refresh,
       refreshOne,
       refreshInvocations,

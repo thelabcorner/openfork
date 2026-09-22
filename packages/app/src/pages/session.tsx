@@ -239,10 +239,11 @@ export function SessionRouteErrorBoundary(
   props: ParentProps<{ sessionID?: string; serverKey?: ServerConnection.Key; padded?: boolean }>,
 ) {
   const settings = useSettings()
+  const platform = usePlatform()
   return (
     <ErrorBoundary
       fallback={(error) =>
-        settings.general.newLayoutDesigns() ? (
+        platform.platform === "pwa" || settings.general.newLayoutDesigns() ? (
           <SessionRouteFrame padded={props.padded}>
             <SessionPanelFrame newLayout raised={!!props.sessionID}>
               <SessionErrorFallback error={error} sessionID={props.sessionID} serverKey={props.serverKey} />
@@ -542,7 +543,10 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const navigate = useNavigate()
   const { params, sessionKey, workspaceKey, tabs, view } = useSessionLayout()
   const sessionOwnership = createSessionOwnership(sessionKey)
-  const newSessionDesign = createMemo(() => settings.general.newLayoutDesigns())
+  // PWA is permanently on the V2 session surface. Do not let a desktop-era
+  // browser preference silently put the mobile route back onto the legacy
+  // prompt/timeline implementation after the router has selected V2.
+  const newSessionDesign = createMemo(() => platform.platform === "pwa" || settings.general.newLayoutDesigns())
 
   createEffect(() => {
     if (!prompt.ready()) return
@@ -1894,7 +1898,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
           if (!next.goal) return
           await goals.quickStart(next.sessionID, {
             objective: next.goal.objective,
-            mode: next.goal.mode,
           })
         },
       }).catch((err) => {

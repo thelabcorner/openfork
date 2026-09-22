@@ -263,6 +263,12 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
     defaultServer: ServerConnection.Key
     canonicalLocalServer?: ServerConnection.Key
     servers?: Array<ServerConnection.Any>
+    /**
+     * Keep externally-owned shells (notably the separate-origin mobile PWA)
+     * pinned to the connection they supplied instead of merging historical
+     * browser-local server entries into the live topology.
+     */
+    includeStoredServers?: boolean
   }) => {
     const [store, setStore, _, ready] = persisted(
       {
@@ -280,7 +286,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
     const url = (x: StoredServer) => (typeof x === "string" ? x : "type" in x ? x.http.url : x.url)
 
     const allServers = createMemo((): Array<ServerConnection.Any> => {
-      return resolveServerList({ stored: store.list, props: props.servers })
+      return resolveServerList({ stored: props.includeStoredServers === false ? [] : store.list, props: props.servers })
     })
 
     const [state, setState] = createStore({

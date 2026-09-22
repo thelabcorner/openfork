@@ -239,91 +239,104 @@ function sessionInfo(session: Session): SessionInfo {
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const current = createCurrentApi(input)
   const v1 = createV1Api(input)
-  return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : current)),
-    current,
-  )
+  return lazyApi(input.protocol.then((protocol) => (protocol === "v1" ? v1 : current)))
 }
 
-function lazyApi<T extends object>(implementation: Promise<T>, shape: T): T {
-  const cache = new Map<PropertyKey, unknown>()
-  return new Proxy(shape, {
-    get(target, property, receiver) {
-      const sample = Reflect.get(target, property, receiver)
-      if (typeof sample === "function") {
-        return (...args: unknown[]) =>
-          implementation.then((value) => {
-            const method = Reflect.get(value, property)
-            if (typeof method !== "function") throw new Error(`API method unavailable: ${String(property)}`)
-            return Reflect.apply(method, value, args)
-          })
-      }
-      if (sample === null || typeof sample !== "object") return sample
-      if (cache.has(property)) return cache.get(property)
-      const nested = lazyApi(
-        implementation.then((value) => {
-          const result = Reflect.get(value, property)
-          if (result === null || typeof result !== "object") {
-            throw new Error(`API namespace unavailable: ${String(property)}`)
+function lazyApi<T extends object>(implementation: Promise<T>): T {
+  const cache = new Map<string, unknown>()
+
+  const node = (path: PropertyKey[]): unknown => {
+    const key = path.map(String).join(".")
+    const cached = cache.get(key)
+    if (cached) return cached
+
+    const proxy = new Proxy(function () {}, {
+      get(_target, property) {
+        if (property === "then") return undefined
+        if (property === Symbol.toStringTag) return "OpenForkCompatibleApi"
+        return node([...path, property])
+      },
+      apply(_target, _thisArg, args) {
+        if (path.length === 0) throw new TypeError("OpenFork compatible API root is not callable")
+        return implementation.then((value) => {
+          let parent: unknown = value
+          for (let index = 0; index < path.length - 1; index++) {
+            parent = Reflect.get(parent as object, path[index]!)
           }
-          return result
-        }),
-        sample,
-      )
-      cache.set(property, nested)
-      return nested
+          const property = path[path.length - 1]!
+          const method = Reflect.get(parent as object, property)
+          if (typeof method !== "function") {
+            throw new Error(`API method unavailable: ${path.map(String).join(".")}`)
+          }
+          return Reflect.apply(method, parent, args)
+        })
+      },
+    })
+
+    cache.set(key, proxy)
+    return proxy
+  }
+
+  return node([]) as T
+}
+
+function overlayApi<T extends object, U extends object>(base: T, overrides: U): T & U {
+  return new Proxy(overrides as T & U, {
+    get(target, property, receiver) {
+      if (Reflect.has(target, property)) return Reflect.get(target, property, receiver)
+      return Reflect.get(base, property, base)
+    },
+    has(target, property) {
+      return Reflect.has(target, property) || Reflect.has(base, property)
     },
   })
 }
 
 function createCurrentApi(input: CompatibleInput): CompatibleApi {
-  return {
-    ...input.current,
-    session: {
-      ...input.current.session,
-      async pause(value) {
+  return overlayApi(input.current, {
+    session: overlayApi(input.current.session, {
+      async pause(value: Parameters<CompatibleSessionApi["pause"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)
       },
-      async resume(value) {
+      async resume(value: Parameters<CompatibleSessionApi["resume"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/resume`)
       },
-      async regenerateTitle(value) {
+      async regenerateTitle(value: Parameters<CompatibleSessionApi["regenerateTitle"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
           model: value.model,
           prompt: value.prompt,
         })
       },
-    },
-    question: {
-      ...input.current.question,
-      async reply(value) {
+    }),
+    question: overlayApi(input.current.question, {
+      async reply(value: Parameters<CompatibleQuestionApi["reply"]>[0]) {
         const path = `/question/${encodeURIComponent(value.requestID)}/reply${
           input.directory ? `?directory=${encodeURIComponent(input.directory)}` : ""
         }`
         await post(input, path, { answers: value.answers, details: value.details })
       },
-    },
+    }),
     find: {
       search() {
         return Promise.reject(new Error("find.search requires a v1 protocol server"))
       },
     },
     promptRevisor: {
-      async revise(value) {
+      async revise(value: CompatiblePromptRevisorInput) {
         const directory = value.location?.directory ?? input.directory
         const path = `/prompt/revise${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`
         return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
       },
     },
     revisionDraft: {
-      recover(value) {
+      recover(value: Parameters<CompatibleRevisionDraftApi["recover"]>[0]) {
         return postJSON<CompatibleRevisionDraftArtifact | null>(input, "/revision-draft/recover", value)
       },
-      async consume(value) {
+      async consume(value: Parameters<CompatibleRevisionDraftApi["consume"]>[0]) {
         await post(input, "/revision-draft/consume", value)
       },
     },
-  }
+  }) as CompatibleApi
 }
 
 async function post(input: CompatibleInput, path: string, body?: unknown) {
@@ -404,10 +417,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
     data,
   })
 
-  return {
-    ...input.current,
-    session: {
-      ...input.current.session,
+  return overlayApi(input.current, {
+    session: overlayApi(input.current.session, {
       async list(
         value?: Parameters<ServerApi["session"]["list"]>[0],
         options?: Parameters<ServerApi["session"]["list"]>[1],
@@ -476,13 +487,13 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
       async interrupt(value: Parameters<ServerApi["session"]["interrupt"]>[0]) {
         await legacy().session.abort(value)
       },
-      async pause(value) {
+      async pause(value: Parameters<CompatibleSessionApi["pause"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)
       },
-      async resume(value) {
+      async resume(value: Parameters<CompatibleSessionApi["resume"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/resume`)
       },
-      async regenerateTitle(value) {
+      async regenerateTitle(value: Parameters<CompatibleSessionApi["regenerateTitle"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
           model: value.model,
           prompt: value.prompt,
@@ -589,24 +600,23 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         },
         commit: input.current.session.revert.commit,
       },
-    },
+    }),
     promptRevisor: {
-      async revise(value) {
+      async revise(value: CompatiblePromptRevisorInput) {
         const target = directory(value.location)
         const path = `/prompt/revise${target ? `?directory=${encodeURIComponent(target)}` : ""}`
         return promptRevisorResult(await postJSON<unknown>(input, path, promptRevisorBody(value), value.signal))
       },
     },
     revisionDraft: {
-      recover(value) {
+      recover(value: Parameters<CompatibleRevisionDraftApi["recover"]>[0]) {
         return postJSON<CompatibleRevisionDraftArtifact | null>(input, "/revision-draft/recover", value)
       },
-      async consume(value) {
+      async consume(value: Parameters<CompatibleRevisionDraftApi["consume"]>[0]) {
         await post(input, "/revision-draft/consume", value)
       },
     },
-    project: {
-      ...input.current.project,
+    project: overlayApi(input.current.project, {
       async list() {
         return ((await legacy().project.list()).data ?? []) as Project[]
       },
@@ -628,7 +638,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         const result = await legacy(value.location).worktree.list()
         return (result.data ?? []).map((item) => ({ directory: item }))
       },
-    },
+    }),
     // path: {
     //   ...input.current.path,
     //   async get(value?: Parameters<ServerApi["path"]["get"]>[0]) {
@@ -637,8 +647,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
     //     return result.data
     //   },
     // },
-    vcs: {
-      ...input.current.vcs,
+    vcs: overlayApi(input.current.vcs, {
       // async get(value?: Parameters<ServerApi["vcs"]["get"]>[0]) {
       //   const result = await legacy(value?.location).vcs.get()
       //   return located({ branch: result.data?.branch, defaultBranch: result.data?.default_branch }, value?.location)
@@ -663,9 +672,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           value.location,
         )
       },
-    },
-    file: {
-      ...input.current.file,
+    }),
+    file: overlayApi(input.current.file, {
       async list(value?: Parameters<ServerApi["file"]["list"]>[0]) {
         const result = await legacy(value?.location).file.list({ path: value?.path ?? "" })
         return located(result.data ?? [], value?.location)
@@ -681,7 +689,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           value.location,
         )
       },
-    },
+    }),
     find: {
       async search(value: CompatibleFindSearchInput) {
         const result = await legacy(value.location).find.search(
@@ -706,8 +714,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         )
       },
     },
-    integration: {
-      ...input.current.integration,
+    integration: overlayApi(input.current.integration, {
       async get(value: Parameters<ServerApi["integration"]["get"]>[0]) {
         const methods = ((await legacy(value.location).provider.auth()).data?.[value.integrationID] ?? []).map(
           (method, index) =>
@@ -725,8 +732,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           value.location,
         )
       },
-      connect: {
-        ...input.current.integration.connect,
+      connect: overlayApi(input.current.integration.connect, {
         key: async (value: Parameters<ServerApi["integration"]["connect"]["key"]>[0]) => {
           await legacy(value.location).auth.set({
             providerID: value.integrationID,
@@ -735,9 +741,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           await legacy(value.location).instance.dispose()
           await input.legacy().instance.dispose()
         },
-      },
-      oauth: {
-        ...input.current.integration.oauth,
+      }),
+      oauth: overlayApi(input.current.integration.oauth, {
         connect: async (value: Parameters<ServerApi["integration"]["oauth"]["connect"]>[0]) => {
           const method = Number(value.methodID)
           const result = await legacy(value.location).provider.oauth.authorize(
@@ -778,10 +783,9 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
             value.location,
           )
         },
-      },
-    },
-    pty: {
-      ...input.current.pty,
+      }),
+    }),
+    pty: overlayApi(input.current.pty, {
       // async shells(value?: Parameters<ServerApi["pty"]["shells"]>[0]) {
       //   return located((await legacy(value?.location).pty.shells()).data ?? [], value?.location)
       // },
@@ -821,9 +825,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
       //   if (!result.data) throw new Error(`Failed to connect terminal: ${value.ptyID}`)
       //   return located(result.data, value.location)
       // },
-    },
-    permission: {
-      ...input.current.permission,
+    }),
+    permission: overlayApi(input.current.permission, {
       async reply(value: Parameters<ServerApi["permission"]["reply"]>[0] & { location?: { directory?: string } }) {
         await legacy(value.location).permission.respond({
           sessionID: value.sessionID,
@@ -832,9 +835,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           directory: directory(value.location),
         })
       },
-    },
-    question: {
-      ...input.current.question,
+    }),
+    question: overlayApi(input.current.question, {
       async reply(value: Parameters<ServerApi["question"]["reply"]>[0] & { details?: string[] }) {
         const details = value.details ?? []
         await legacy().question.reply({
@@ -848,6 +850,6 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
       async reject(value: Parameters<ServerApi["question"]["reject"]>[0]) {
         await legacy().question.reject({ requestID: value.requestID })
       },
-    },
-  }
+    }),
+  }) as CompatibleApi
 }

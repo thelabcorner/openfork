@@ -66,6 +66,132 @@ export type ForkUsageResult = {
   routedAccountSource?: "provider" | "pool"
 }
 
+export type ForkCapacityEvidence = {
+  observations: number
+  requestEffectiveSamples: number
+  sessionEffectiveSamples: number
+  personalWeight: number
+  // Additive hierarchy detail; optional so the renderer remains compatible with
+  // older servers while never reconstructing the estimator locally.
+  baseObservations?: number
+  baseRequestEffectiveSamples?: number
+  baseSessionEffectiveSamples?: number
+  basePersonalWeight?: number
+  accountObservations?: number
+  accountRequestEffectiveSamples?: number
+  accountSessionEffectiveSamples?: number
+  accountPersonalWeight?: number
+  localRequestsApplied?: number
+  localFractionConsumed?: number
+  localUnnormalizedRequests?: number
+}
+
+export type ForkCapacityPredictiveRange =
+  | {
+      status: "learning"
+      effectiveSamples: number
+      matureAt: number
+    }
+  | {
+      status: "calibrated"
+      effectiveSamples: number
+      matureAt: number
+      targetCoverage: number
+      heldOutCoverage: number
+      calibrationBudget: 5 | 20 | 100
+      lowerRequests: number
+      upperRequests: number
+    }
+  | {
+      status: "unavailable"
+      effectiveSamples: number
+      matureAt: number
+      reason: "incomplete-local-accounting"
+    }
+
+export type ForkCapacityEstimate = {
+  modelID: string
+  accountID?: string
+  baselineRequests: number
+  estimatedRequests: number
+  remainingFraction: number
+  remainingPercent: number
+  workloadMultiplier: number
+  workloadSource?: "published-prior" | "personal-base" | "account-hierarchical"
+  personalized: boolean
+  resetAt: number
+  quotaStatus: "ok" | "stale"
+  // Additive so older servers remain readable. New servers mark a projection
+  // unusable when post-snapshot local consumption cannot be normalized exactly.
+  projectionStatus?: "ok" | "incomplete-local-accounting"
+  // Additive for compatibility with older servers. New servers expose either a
+  // calibrated mature-evidence range or an explicit learning/unavailable state.
+  predictiveRange?: ForkCapacityPredictiveRange
+  evidence: ForkCapacityEvidence
+}
+
+
+
+export type ForkProviderCapacityEvidence = {
+  observations: number
+  requestEffectiveSamples: number
+  sessionEffectiveSamples: number
+}
+
+export type ForkProviderCapacityEstimate = {
+  providerID: string
+  modelID?: string
+  accountID?: string
+  accountLabel?: string
+  status: "ready" | "learning" | "unavailable" | "unlimited"
+  source:
+    | "direct-request-budget"
+    | "published-request-rate"
+    | "published-model-capacity"
+    | "standardized-workload-prior"
+    | "personal-current-price"
+    | "provider-observed-burn"
+    | "unmetered"
+    | "insufficient-evidence"
+  estimatedRequests: number | null
+  remainingPercent: number | null
+  resetAt: number | null
+  personalized: boolean
+  limitingWindow?: string
+  reason?: string
+  evidence: ForkProviderCapacityEvidence
+}
+
+export type ForkProviderCapacity = {
+  quotaProviderID: string
+  providerName: string
+  modelProviderIDs: string[]
+  status: "ok" | "error" | "not-configured"
+  reason?: string
+  defaultEstimates: ForkProviderCapacityEstimate[]
+  estimates: ForkProviderCapacityEstimate[]
+  accounts: Array<{
+    accountID: string
+    accountLabel?: string
+    defaultEstimate?: ForkProviderCapacityEstimate
+    estimates: ForkProviderCapacityEstimate[]
+  }>
+}
+
+export type ForkCapacityResult = {
+  providerID: "opencode-go"
+  priorStatus: "ok" | "stale" | "error"
+  priorFetchedAt: number
+  routedAccountID?: string
+  routed: ForkCapacityEstimate[]
+  accounts: Array<{
+    accountID: string
+    estimates: ForkCapacityEstimate[]
+  }>
+  /** Additive generalized provider projections; absent on older servers. */
+  providers?: ForkProviderCapacity[]
+}
+
 function authHeader(server: ForkServer): Record<string, string> {
   if (!server.password) return {}
   return { Authorization: `Basic ${authTokenFromCredentials({ username: server.username, password: server.password })}` }
@@ -111,4 +237,5 @@ export const ForkClient = {
       { method: "DELETE" },
     ),
   usage: (server: ForkServer) => request<ForkUsageResult>(server, "/fork/usage"),
+  capacity: (server: ForkServer) => request<ForkCapacityResult>(server, "/fork/capacity"),
 }

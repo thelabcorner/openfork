@@ -39,6 +39,17 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
 import { BasicTool, GenericTool, type TriggerTitle } from "./basic-tool"
 import { ToolBoundedList, ToolEmpty, ToolParams, ToolRow, ToolScrollArea } from "./tool-parts"
+import {
+  DirectoryOutput,
+  GlobResults,
+  GrepResults,
+  parseGlobOutput,
+  parseGrepOutput,
+  relativizeProjectPath,
+  type GlobResult,
+  type GrepResult,
+} from "./search-results"
+import { ToolFileAccordion as ToolFileAccordionBase } from "./tool-file-accordion"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
@@ -392,18 +403,25 @@ function PacedMarkdown(props: { text: string; cacheKey: string; streaming: boole
   )
 }
 
-function relativizeProjectPath(path: string, directory?: string) {
-  if (!path) return ""
-  if (!directory) return path
-  if (directory === "/") return path
-  if (directory === "\\") return path
-  if (path === directory) return ""
-
-  const separator = directory.includes("\\") ? "\\" : "/"
-  const prefix = directory.endsWith(separator) ? directory : directory + separator
-  if (!path.startsWith(prefix)) return path
-  return path.slice(directory.length)
-}
+/** Pre-parsed read window the native read tool ships on `metadata.display`. */
+type ReadDisplay =
+  | {
+      type: "file"
+      path: string
+      text: string
+      lineStart: number
+      lineEnd: number
+      totalLines: number
+      truncated: boolean
+    }
+  | {
+      type: "directory"
+      path: string
+      entries: string[]
+      offset: number
+      totalEntries: number
+      truncated: boolean
+    }
 
 function getDirectory(path: string | undefined) {
   const data = useData()
@@ -2002,40 +2020,16 @@ export const ToolRegistry = {
   render: getTool,
 }
 
+/**
+ * Session-timeline binding of the shared file accordion: supplies the project
+ * directory so an absolute tool path still renders a project-relative header.
+ */
 export function ToolFileAccordion(props: { path: string; actions?: JSX.Element; children: JSX.Element }) {
-  const value = createMemo(() => props.path || "tool-file")
-
+  const data = useData()
   return (
-    <Accordion
-      multiple
-      data-scope="apply-patch"
-      // Pins directly beneath the tool row, which pins at --sticky-accordion-top.
-      style={{ "--sticky-accordion-offset": "var(--tool-sticky-row-height, 30px)" }}
-      defaultValue={[value()]}
-    >
-      <Accordion.Item value={value()}>
-        <StickyAccordionHeader>
-          <Accordion.Trigger>
-            <div data-slot="apply-patch-trigger-content">
-              <div data-slot="apply-patch-file-info">
-                <FileIcon node={{ path: props.path, type: "file" }} />
-                <div data-slot="apply-patch-file-name-container">
-                  <Show when={props.path.includes("/")}>
-                    <span data-slot="apply-patch-directory">{`\u202A${getDirectory(props.path)}\u202C`}</span>
-                  </Show>
-                  <span data-slot="apply-patch-filename">{getFilename(props.path)}</span>
-                </div>
-              </div>
-              <div data-slot="apply-patch-trigger-actions">
-                {props.actions}
-                <Icon name="chevron-grabber-vertical" size="small" />
-              </div>
-            </div>
-          </Accordion.Trigger>
-        </StickyAccordionHeader>
-        <Accordion.Content>{props.children}</Accordion.Content>
-      </Accordion.Item>
-    </Accordion>
+    <ToolFileAccordionBase path={props.path} directory={data.directory} actions={props.actions}>
+      {props.children}
+    </ToolFileAccordionBase>
   )
 }
 
@@ -2286,194 +2280,6 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
       <div data-component="reasoning-part" data-timeline-part-id={part().id}>
         <PacedMarkdown text={text()} cacheKey={part().id} streaming={streaming()} />
       </div>
-    </Show>
-  )
-}
-
-type ReadDisplay =
-  | {
-      type: "file"
-      path: string
-      text: string
-      lineStart: number
-      lineEnd: number
-      totalLines: number
-      truncated: boolean
-    }
-  | {
-      type: "directory"
-      path: string
-      entries: string[]
-      offset: number
-      totalEntries: number
-      truncated: boolean
-    }
-
-function DirectoryOutput(props: { entries: string[] }) {
-  return (
-    <ToolScrollArea component="directory-output">
-      <For each={props.entries}>
-        {(entry) => {
-          const isDir = entry.endsWith("/")
-          const name = isDir ? entry.slice(0, -1) : entry
-          return (
-            <div data-slot="directory-entry">
-              <FileIcon node={{ path: name, type: isDir ? "directory" : "file" }} />
-              <span data-slot="directory-entry-name">{entry}</span>
-            </div>
-          )
-        }}
-      </For>
-    </ToolScrollArea>
-  )
-}
-
-type GrepFileGroup = { path: string; matches: { line: number; text: string }[] }
-type GrepResult = { total: number; truncated: boolean; files: GrepFileGroup[] }
-
-function parseGrepOutput(output: string): GrepResult | undefined {
-  const lines = output.split("\n")
-  if (lines[0]?.trim() === "No files found") return { total: 0, truncated: false, files: [] }
-  const header = /^Found (\d+) matches/.exec(lines[0] ?? "")
-  if (!header) return undefined
-  const files: GrepFileGroup[] = []
-  let current: GrepFileGroup | undefined
-  for (const line of lines.slice(1)) {
-    if (!line || line.startsWith("(Results truncated")) continue
-    const lineMatch = /^ {2}Line (\d+): (.*)$/.exec(line)
-    if (lineMatch && current) {
-      current.matches.push({ line: Number(lineMatch[1]), text: lineMatch[2] ?? "" })
-      continue
-    }
-    const fileMatch = /^(.+):$/.exec(line)
-    if (fileMatch) {
-      current = { path: fileMatch[1]!, matches: [] }
-      files.push(current)
-    }
-  }
-  return { total: Number(header[1]), truncated: lines[0]!.includes("more matches available"), files }
-}
-
-function GrepMatchText(props: { text: string; term?: string }) {
-  const parts = createMemo(() => {
-    const term = props.term
-    if (!term) return [{ text: props.text, match: false }]
-    let re: RegExp
-    try {
-      re = new RegExp(`(${term})`, "gi")
-    } catch {
-      return [{ text: props.text, match: false }]
-    }
-    return props.text.split(re).map((chunk, i) => ({ text: chunk, match: i % 2 === 1 }))
-  })
-  return (
-    <For each={parts()}>{(part) => (part.match ? <mark data-slot="grep-match-mark">{part.text}</mark> : part.text)}</For>
-  )
-}
-
-/**
- * Matches, grouped by file.
- *
- * The old treatment drew a bordered card per file inside the tool card, with
- * 10px gaps between them, so a four-file result was five nested frames. This is
- * one continuous list: a file row, then its matching lines under it.
- *
- * Both axes are bounded. A repo-wide grep can return hundreds of files with
- * dozens of matches each, and an expansion that long is unusable — you scroll
- * past the answer looking for it.
- */
-const GREP_LINES_PER_FILE = 4
-
-function GrepGroup(props: { group: GrepFileGroup; pattern?: string }) {
-  const i18n = useI18n()
-  const [full, setFull] = createSignal(false)
-  const visible = createMemo(() => (full() ? props.group.matches : props.group.matches.slice(0, GREP_LINES_PER_FILE)))
-  const hidden = createMemo(() => props.group.matches.length - visible().length)
-
-  return (
-    <div data-component="grep-group">
-      <ToolRow
-        lead={<FileIcon node={{ path: props.group.path, type: "file" }} />}
-        primary={getFilename(props.group.path)}
-        secondary={getDirectory(props.group.path)}
-        trailing={String(props.group.matches.length)}
-        mono={false}
-      />
-      <For each={visible()}>
-        {(match) => (
-          <div data-slot="grep-line">
-            <span data-slot="grep-line-number">{match.line}</span>
-            <code data-slot="grep-line-text">
-              <GrepMatchText text={match.text} term={props.pattern} />
-            </code>
-          </div>
-        )}
-      </For>
-      <Show when={hidden() > 0}>
-        <button type="button" data-component="tool-more" onClick={() => setFull(true)}>
-          {i18n.t("ui.toolParts.showMore", { count: hidden() })}
-        </button>
-      </Show>
-    </div>
-  )
-}
-
-function GrepResults(props: { result: GrepResult; pattern?: string }) {
-  const i18n = useI18n()
-  return (
-    <Show
-      when={props.result.files.length > 0}
-      fallback={<ToolEmpty>{i18n.t("ui.tool.grep.noMatches")}</ToolEmpty>}
-    >
-      <div data-component="grep-results">
-        <ToolBoundedList items={props.result.files} limit={6} scroll>
-          {(group) => <GrepGroup group={group} pattern={props.pattern} />}
-        </ToolBoundedList>
-        <Show when={props.result.truncated}>
-          <ToolEmpty>{i18n.t("ui.tool.grep.truncated")}</ToolEmpty>
-        </Show>
-      </div>
-    </Show>
-  )
-}
-
-type GlobResult = { files: string[]; truncated: boolean }
-
-function parseGlobOutput(output: string): GlobResult {
-  const lines = output.split("\n")
-  if (lines[0]?.trim() === "No files found") return { files: [], truncated: false }
-  const files: string[] = []
-  let truncated = false
-  for (const line of lines) {
-    if (!line) continue
-    if (line.startsWith("(Results are truncated")) {
-      truncated = true
-      continue
-    }
-    files.push(line)
-  }
-  return { files, truncated }
-}
-
-function GlobResults(props: { result: GlobResult }) {
-  const i18n = useI18n()
-  return (
-    <Show
-      when={props.result.files.length > 0}
-      fallback={<ToolEmpty>{i18n.t("ui.tool.glob.noMatches")}</ToolEmpty>}
-    >
-      <ToolBoundedList items={props.result.files} limit={12} scroll>
-        {(file) => (
-          <ToolRow
-            lead={<FileIcon node={{ path: file, type: "file" }} />}
-            primary={getFilename(file)}
-            secondary={getDirectory(file)}
-          />
-        )}
-      </ToolBoundedList>
-      <Show when={props.result.truncated}>
-        <ToolEmpty>{i18n.t("ui.tool.glob.truncated")}</ToolEmpty>
-      </Show>
     </Show>
   )
 }

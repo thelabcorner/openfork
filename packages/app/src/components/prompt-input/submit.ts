@@ -45,7 +45,6 @@ export type FollowupDraft = {
     projectID: string
     workspaceID?: string
     objective: string
-    mode: "auto_continue" | "unattended"
   }
 }
 
@@ -243,13 +242,12 @@ type PromptSubmitInput = {
   model?: ModelSelection
   goal?: {
     key: (input: { sessionID?: string; draftID?: string; directory: string }) => string
-    consume: (key: string) => { mode: "auto_continue" | "unattended" } | undefined
-    restore: (key: string, intent: { mode: "auto_continue" | "unattended" } | undefined) => void
+    consume: (key: string) => true | undefined
+    restore: (key: string, intent: true | undefined) => void
     quickStart: (
       sessionID: string,
       input: {
         objective: string
-        mode: "auto_continue" | "unattended"
       },
     ) => Promise<unknown>
     refreshFocused: (sessionID: string) => Promise<void>
@@ -523,7 +521,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             projectID: authoritativeSession!.projectID,
             workspaceID: authoritativeSession!.workspaceID,
             objective: text.trim(),
-            mode: goalArm.mode,
           }
         : undefined,
     }
@@ -700,7 +697,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         if (!next.goal) return
         await input.goal!.quickStart(next.sessionID, {
           objective: next.goal.objective,
-          mode: next.goal.mode,
         })
       },
     })
@@ -713,7 +709,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         if (draft.goal) {
           await input.goal?.refreshFocused(draft.sessionID).catch(() => undefined)
           if (!input.goal?.focused(draft.sessionID)) {
-            input.goal?.restore(draft.goal.armKey, { mode: draft.goal.mode })
+            input.goal?.restore(draft.goal.armKey, true)
           }
         }
         showToast({

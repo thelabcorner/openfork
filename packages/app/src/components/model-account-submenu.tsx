@@ -4,12 +4,16 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import type { AccountVariant, AccountModelItem } from "./dialog-select-model-accounts"
+import type { ForkCapacityPredictiveRange } from "@/utils/fork-client"
 import { ModelStretchBar, stretchTone } from "./model-stretch-bar"
 import { toneForRemaining } from "@/utils/limits-format"
 
 export type AccountOptionUsage = {
-  estimatedRequests: number
+  estimatedRequests?: number
   remainingPercent?: number
+  predictiveRange?: ForkCapacityPredictiveRange
+  status?: "ready" | "learning" | "unavailable" | "unlimited"
+  reason?: string
   account?: string
   creditsExhausted?: boolean
 }
@@ -90,8 +94,23 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
               const usageLabel = () => {
                 const value = usage()
                 if (!value) return ""
+                if (value.status === "learning" && value.estimatedRequests === undefined) return "Learning"
+                if (value.status === "unavailable" && value.estimatedRequests === undefined) return "—"
+                if (value.estimatedRequests === undefined) return ""
                 if (!Number.isFinite(value.estimatedRequests)) return "∞"
                 return `~${Math.round(value.estimatedRequests).toLocaleString()}`
+              }
+              const predictiveLabel = () => {
+                const range = usage()?.predictiveRange
+                if (!range) return ""
+                if (range.status === "calibrated") {
+                  return language.t("model.tooltip.usage.rangeValue", {
+                    lower: range.lowerRequests.toLocaleString(language.intl()),
+                    upper: range.upperRequests.toLocaleString(language.intl()),
+                  })
+                }
+                if (range.status === "learning") return language.t("model.tooltip.usage.range.learning")
+                return language.t("model.tooltip.usage.range.unavailable")
               }
               return (
                 <MenuV2.Item
@@ -113,7 +132,7 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
                       {(value) => (
                         <>
                           <ModelStretchBar
-                            requests={value().estimatedRequests}
+                            requests={value().estimatedRequests ?? 0}
                             remainingPercent={value().remainingPercent}
                             tone={
                               value().remainingPercent !== undefined
@@ -121,13 +140,17 @@ export function AccountOptionList<T extends AccountModelItem>(props: {
                                     | "danger"
                                     | "warning"
                                     | "success")
-                                : stretchTone(value().estimatedRequests)
+                                : stretchTone(value().estimatedRequests ?? 0)
                             }
                           />
                           <span
                             class="w-12 shrink-0 truncate text-right text-[9px] font-[520] leading-4 tabular-nums text-v2-text-text-faint"
                             classList={{ "text-v2-state-fg-danger": value().creditsExhausted }}
-                            title={`${value().account ?? label} · ${value().remainingPercent?.toFixed(1) ?? "—"}% remaining`}
+                            title={[
+                              `${value().account ?? label} · ${value().remainingPercent?.toFixed(1) ?? "—"}% remaining`,
+                              predictiveLabel(),
+                              value().reason,
+                            ].filter(Boolean).join(" · ")}
                           >
                             {usageLabel()}
                           </span>

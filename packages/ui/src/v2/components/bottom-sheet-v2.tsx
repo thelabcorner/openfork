@@ -1,6 +1,7 @@
 import DrawerPrimitive from "@corvu/drawer"
 import type { RootProps } from "@corvu/drawer"
-import { type ComponentProps, createSignal, type JSX, onCleanup, onMount, type ParentProps, splitProps } from "solid-js"
+import { type ComponentProps, type JSX, type ParentProps, splitProps } from "solid-js"
+import { visualViewportInset } from "./viewport-inset"
 import "./bottom-sheet-v2.css"
 
 export interface BottomSheetProps extends Omit<RootProps, "side" | "children"> {
@@ -32,48 +33,12 @@ export function sheetClamp(layoutHeight: number, offsetTop: number, viewportHeig
   }
 }
 
-interface SheetMetrics {
-  layoutHeight: number
-  offsetTop: number
-  viewportHeight: number
-}
-
 function createSheetClampStyle(enabled: boolean) {
-  const [metrics, setMetrics] = createSignal<SheetMetrics>()
-  let frame: number | undefined
-
-  const read = () => {
-    frame = undefined
-    const viewport = window.visualViewport
-    if (!viewport) return
-    setMetrics({ layoutHeight: window.innerHeight, offsetTop: viewport.offsetTop, viewportHeight: viewport.height })
-  }
-
-  const schedule = () => {
-    if (frame !== undefined) return
-    frame = requestAnimationFrame(read)
-  }
-
-  onMount(() => {
-    const viewport = window.visualViewport
-    if (!enabled || !viewport) return
-    read()
-    viewport.addEventListener("resize", schedule)
-    viewport.addEventListener("scroll", schedule)
-    onCleanup(() => {
-      viewport.removeEventListener("resize", schedule)
-      viewport.removeEventListener("scroll", schedule)
-    })
-  })
-
-  onCleanup(() => {
-    if (frame !== undefined) cancelAnimationFrame(frame)
-  })
+  const viewport = visualViewportInset()
 
   return (): ComponentProps<"div">["style"] => {
-    const m = metrics()
-    if (!m) return undefined
-    const clamp = sheetClamp(m.layoutHeight, m.offsetTop, m.viewportHeight)
+    if (!enabled || !viewport.supported) return undefined
+    const clamp = sheetClamp(viewport.layoutHeight, viewport.offsetTop, viewport.viewportHeight)
     return {
       "max-height": `${clamp.maxHeight}px`,
       "padding-bottom": `${clamp.keyboardInset}px`,

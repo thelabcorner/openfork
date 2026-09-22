@@ -15,7 +15,45 @@ export type LiveGenerationRateState = {
   source: GenerationRateSource
 }
 
-const TICK_MS = 200
+export const TICK_MS = 200
+
+// One page-global high-frequency clock shared by the small number of live
+// telemetry consumers in the selected composer. The old implementation created
+// this 200ms interval inside `createLiveGenerationRate`; exposing the same clock
+// lets the turn elapsed display reuse it rather than adding a second timer.
+const [telemetryNow, setTelemetryNow] = createSignal(Date.now(), { name: "liveTelemetryNow" })
+let telemetryTimer: ReturnType<typeof setInterval> | undefined
+let telemetrySubscribers = 0
+
+export function useLiveTelemetryNow(enabled: () => boolean) {
+  let subscribed = false
+
+  const unsubscribe = () => {
+    if (!subscribed) return
+    subscribed = false
+    telemetrySubscribers -= 1
+    if (telemetrySubscribers > 0 || telemetryTimer === undefined) return
+    clearInterval(telemetryTimer)
+    telemetryTimer = undefined
+  }
+
+  createEffect(() => {
+    if (!enabled()) {
+      unsubscribe()
+      return
+    }
+    if (subscribed) return
+    if (telemetrySubscribers === 0) {
+      setTelemetryNow(Date.now())
+      telemetryTimer = setInterval(() => setTelemetryNow(Date.now()), TICK_MS)
+    }
+    telemetrySubscribers += 1
+    subscribed = true
+  })
+
+  onCleanup(unsubscribe)
+  return telemetryNow
+}
 
 /**
  * O(1) live throughput projection for the selected composer session.
@@ -26,17 +64,14 @@ const TICK_MS = 200
  */
 export function createLiveGenerationRate(args: { sessionID: () => string | undefined; working: () => boolean }) {
   const serverSync = useServerSync()
-  const [now, setNow] = createSignal(Date.now())
   const [lastRate, setLastRate] = createSignal<number | null>(null)
+  const now = useLiveTelemetryNow(() => !!args.sessionID() && args.working())
 
   createEffect(() => {
     const id = args.sessionID()
     const active = !!id && args.working()
     if (!active) return
     serverSync().telemetry.ensure([id])
-    setNow(Date.now())
-    const interval = setInterval(() => setNow(Date.now()), TICK_MS)
-    onCleanup(() => clearInterval(interval))
   })
 
   const current = createMemo<LiveGenerationRate>(() => {

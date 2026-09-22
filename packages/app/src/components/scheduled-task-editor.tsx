@@ -29,7 +29,6 @@ import { usePlatform } from "@/context/platform"
 import { useServer } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
-import { useSettings } from "@/context/settings"
 import { useScheduledTasks, type ScheduledTaskDraft } from "@/context/scheduled-tasks"
 import { providerModelID, splitModelIDForProvider } from "@/utils/model-account-identity"
 import { pathKey } from "@/utils/path-key"
@@ -408,7 +407,6 @@ export function ScheduledTaskEditor(props: { task?: ScheduledTaskInfo }) {
   const language = useLanguage()
   const platform = usePlatform()
   const serverSDK = useServerSDK()
-  const settings = useSettings()
   const server = useServer()
   const pickDirectory = useDirectoryPicker()
 
@@ -530,16 +528,6 @@ export function ScheduledTaskEditor(props: { task?: ScheduledTaskInfo }) {
     return scheduledTaskModelRef(form.modelProvider, form.modelID, form.modelVariant)
   }
 
-  const configuredRevisorModel = (): ModelRef | undefined => {
-    const configured = settings.general.promptRevision()?.model
-    if (!configured) return undefined
-    const split = splitModelIDForProvider(configured.modelID, configured.providerID)
-    return {
-      providerID: configured.providerID,
-      id: split.baseModelID,
-      ...(split.accountID ? { accountID: split.accountID } : {}),
-    }
-  }
 
   createEffect(() => {
     if (!existing || (form.sessionMode !== "reuse" && form.sessionMode !== "auto")) {
@@ -744,7 +732,6 @@ export function ScheduledTaskEditor(props: { task?: ScheduledTaskInfo }) {
         target: revisionTarget,
         includeSessionContext: false,
         guidance: revisionGuidance().trim() || undefined,
-        model: configuredRevisorModel(),
         fallbackModel: modelRef(),
         location: { directory },
         signal: controller.signal,

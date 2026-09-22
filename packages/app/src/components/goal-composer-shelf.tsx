@@ -16,10 +16,10 @@ import { type FocusedGoal, useGoals } from "@/context/goals"
 import { useLanguage } from "@/context/language"
 import { useLocal } from "@/context/local"
 import { useSDK } from "@/context/sdk"
-import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useNow } from "@/hooks/use-now"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 import {
   revisionCanApplyNow,
   revisionRecoveryDecision,
@@ -44,23 +44,22 @@ type Props = { sessionID: string; promptText?: () => string }
 type LauncherProps = { sessionID?: string; armKey: string; promptText?: () => string }
 type GoalModelRef = { providerID: string; modelID: string }
 type GoalTone = "muted" | "success" | "warning" | "danger"
-type GoalDisplayStatus =
-  | Exclude<GoalInfo["status"], "verifying">
-  | "audit_requested"
-  | "auditing"
-  | "audit_error"
-  | "ready_for_review"
+type GoalDisplayStatus = Exclude<GoalInfo["status"], "verifying"> | "audit_requested" | "auditing" | "audit_error"
+
+function goalRuntimeModelRef(providerID: string, qualifiedModelID: string, variant?: string) {
+  const split = splitModelIDForProvider(qualifiedModelID, providerID)
+  return {
+    providerID,
+    id: split.baseModelID,
+    ...(split.accountID ? { accountID: split.accountID } : {}),
+    ...(variant ? { variant } : {}),
+  }
+}
 
 /** One label/typography scale for every dense row inside the Goal surfaces. */
 const LABEL = "text-[9px] font-[620] uppercase leading-[14px] tracking-[0.055em] text-v2-text-text-faint"
 const BODY = "text-[11px] leading-[15px] text-v2-text-text-base"
 const META = "text-[10px] leading-[14px] text-v2-text-text-muted"
-
-function automationLabel(language: ReturnType<typeof useLanguage>, mode: "manual" | "auto_continue" | "unattended") {
-  if (mode === "manual") return language.t("goal.mode.manual")
-  if (mode === "auto_continue") return language.t("goal.mode.auto_continue")
-  return language.t("goal.mode.unattended")
-}
 
 function number(value: number | string) {
   return typeof value === "number" ? value : Number(value) || 0
@@ -89,19 +88,15 @@ function lifecycleLabel(language: ReturnType<typeof useLanguage>, status: string
   return language.t("goal.resume")
 }
 
-function goalDisplayStatus(
-  status: GoalInfo["status"],
-  mode: GoalInfo["continuationPolicy"]["mode"],
-  runtimePhase?: string,
-): GoalDisplayStatus {
+function goalDisplayStatus(status: GoalInfo["status"], runtimePhase?: string): GoalDisplayStatus {
   if (runtimePhase === "audit_requested") return "audit_requested"
   if (runtimePhase === "auditing") return "auditing"
   if (runtimePhase === "audit_error") return "audit_error"
   // `verifying` is durable Goal lifecycle state, not evidence that the
-  // independent auditor is executing. Never expose it as a live status label.
-  // For automatic Goals, `verifying` with no live runtime is an invalid/orphaned
-  // state. Call it an error, never a passive "waiting" state that can lie forever.
-  if (status === "verifying") return mode === "manual" ? "ready_for_review" : "audit_error"
+  // independent auditor is executing. Goal Mode always audits automatically, so
+  // a verifying Goal with no live/requested auditor runtime is orphaned/error
+  // state rather than a second passive review mode.
+  if (status === "verifying") return "audit_error"
   return status
 }
 
@@ -111,14 +106,14 @@ function goalStatusLabel(language: ReturnType<typeof useLanguage>, status: GoalD
 
 function goalTone(status: GoalDisplayStatus): GoalTone {
   if (status === "completed") return "success"
-  if (status === "blocked" || status === "audit_requested" || status === "auditing" || status === "ready_for_review") return "warning"
+  if (status === "blocked" || status === "audit_requested" || status === "auditing") return "warning"
   if (status === "failed" || status === "cancelled" || status === "audit_error") return "danger"
   return "muted"
 }
 
 function goalStatusIcon(status: GoalDisplayStatus) {
   if (status === "completed") return "check" as const
-  if (status === "audit_requested" || status === "auditing" || status === "ready_for_review") return "hourglass" as const
+  if (status === "audit_requested" || status === "auditing") return "hourglass" as const
   if (status === "blocked" || status === "failed" || status === "audit_error") return "warning" as const
   if (status === "cancelled") return "xmark-small" as const
   if (status === "active") return "star-filled" as const
@@ -186,7 +181,7 @@ export function GoalComposerShelf(props: Props) {
   const displayStatus = createMemo<GoalDisplayStatus | undefined>(() => {
     const value = goal()
     if (!value) return
-    return goalDisplayStatus(value.status, value.continuationPolicy.mode, runtimePhase())
+    return goalDisplayStatus(value.status, runtimePhase())
   })
   const now = useNow(() => !!goal() && !isGoalTerminal(goal()!.status))
   const elapsed = createMemo(() => {
@@ -509,10 +504,6 @@ function GoalPanel(props: {
     return counts
   })
   const criteriaPassed = createMemo(() => detail().criteria.filter((item) => item.status === "passed").length)
-  const verificationReady = createMemo(() => {
-    if (detail().criteria.length === 0 || detail().criteria.some((item) => item.status !== "passed")) return false
-    return detail().criteria.every((item) => (evidenceCount().get(item.id) ?? 0) > 0)
-  })
   const activityCount = createMemo(
     () => (expanded()?.evidence?.length ?? 0) + (expanded()?.audit?.length ?? 0) + (expanded()?.focuses?.length ?? 0),
   )
@@ -532,12 +523,8 @@ function GoalPanel(props: {
     if (runtimePhase() === "audit_requested") return language.t("goal.auditRequestedHint")
     if (runtimePhase() === "auditing") return language.t("goal.auditingHint")
     if (draft()) return detail().criteria.length === 0 ? language.t("goal.startRequiresCriterion") : startTooltip()
-    if (goal().status === "verifying" && goal().continuationPolicy.mode !== "manual")
-      return language.t("goal.auditNotRunningHint")
-    if (goal().status === "verifying")
-      return verificationReady() ? language.t("goal.complete") : language.t("goal.completeRequires")
-    if (goal().status === "active" && goal().continuationPolicy.mode === "auto_continue")
-      return language.t("goal.autoContinueHint")
+    if (goal().status === "verifying") return language.t("goal.auditNotRunningHint")
+    if (goal().status === "active") return language.t("goal.autoContinueHint")
     return language.t("goal.criterion.cycle")
   })
 
@@ -621,29 +608,9 @@ function GoalPanel(props: {
           </Show>
 
           <Show when={!draft()}>
-            {/* Settings strip: both policies that change how the Goal runs, on
-                one line, the way an IDE seats run-configuration controls. */}
+            {/* Goal Mode has one execution behavior. This strip configures only
+                its independent auditor; there is no runtime-mode selector. */}
             <div class="flex h-8 min-w-0 shrink-0 items-center gap-2 px-2.5">
-              <span class={`shrink-0 ${LABEL}`}>{language.t("goal.automation")}</span>
-              <div class="flex shrink-0 items-center gap-px rounded-[5px] bg-v2-overlay-simple-overlay-hover/60 p-px">
-                <For each={["manual", "auto_continue", "unattended"] as const}>
-                  {(mode) => (
-                    <button
-                      type="button"
-                      class="h-5 rounded-[4px] px-1.5 text-[9px] font-[600] uppercase leading-[14px] tracking-[0.04em] transition-colors enabled:hover:text-v2-text-text-base disabled:opacity-50"
-                      classList={{
-                        "bg-v2-background-bg-base text-v2-text-text-base shadow-sm":
-                          goal().continuationPolicy.mode === mode,
-                        "text-v2-text-text-muted": goal().continuationPolicy.mode !== mode,
-                      }}
-                      disabled={locked()}
-                      onClick={() => props.onRun(() => goals.setContinuationMode(props.sessionID, mode))}
-                    >
-                      {automationLabel(language, mode)}
-                    </button>
-                  )}
-                </For>
-              </div>
               <div class="ml-auto flex min-w-0 items-center justify-end gap-1.5">
                 <span class="shrink-0 text-[9px] font-[520] tabular-nums leading-[14px] text-v2-text-text-faint">
                   {language.plural("goal.auditor.runs", auditorRuns(), { count: auditorRuns() })}
@@ -756,7 +723,12 @@ function GoalPanel(props: {
             </ButtonV2>
           </TooltipV2>
 
-          <Show when={goal().status === "active"}>
+          <Show
+            when={
+              (goal().status === "active" && runtimePhase() === "audit_error") ||
+              (goal().status === "verifying" && runtimePhase() !== "auditing")
+            }
+          >
             <ButtonV2
               size="small"
               variant="contrast"
@@ -764,49 +736,8 @@ function GoalPanel(props: {
               disabled={props.busy || runtimePhase() === "audit_requested" || runtimePhase() === "auditing"}
               onClick={() => props.onRun(() => goals.transition(props.sessionID, "request_verification"))}
             >
-              {runtimePhase() === "audit_error" ? language.t("goal.retryAudit") : language.t("goal.verify")}
+              {language.t("goal.retryAudit")}
             </ButtonV2>
-          </Show>
-
-          <Show when={goal().status === "verifying"}>
-            <Show when={goal().continuationPolicy.mode !== "manual" && runtimePhase() !== "auditing"}>
-              <ButtonV2
-                size="small"
-                variant="contrast"
-                class="shrink-0 whitespace-nowrap"
-                disabled={props.busy || runtimePhase() === "audit_requested" || runtimePhase() === "auditing"}
-                onClick={() => props.onRun(() => goals.transition(props.sessionID, "request_verification"))}
-              >
-                {language.t("goal.retryAudit")}
-              </ButtonV2>
-            </Show>
-            <TooltipV2 placement="top" gutter={4} value={language.t("goal.resumeWork")}>
-              <IconButtonV2
-                type="button"
-                size="small"
-                variant="neutral"
-                class="shrink-0"
-                disabled={props.busy}
-                aria-label={language.t("goal.resumeWork")}
-                icon={<Icon name="reset" size="small" />}
-                onClick={() => props.onRun(() => goals.transition(props.sessionID, "verification_fail"))}
-              />
-            </TooltipV2>
-            <TooltipV2
-              placement="top"
-              gutter={4}
-              value={verificationReady() ? language.t("goal.complete") : language.t("goal.completeRequires")}
-            >
-              <ButtonV2
-                size="small"
-                variant="contrast"
-                class="shrink-0 whitespace-nowrap"
-                disabled={props.busy || !verificationReady()}
-                onClick={() => props.onRun(() => goals.transition(props.sessionID, "verification_pass"))}
-              >
-                {language.t("goal.complete")}
-              </ButtonV2>
-            </TooltipV2>
           </Show>
 
           <Show when={goal().status === "paused" || goal().status === "blocked"}>
@@ -1308,7 +1239,6 @@ type GoalRevisorFlow = {
  */
 function createGoalRefine(input: GoalRefineInput) {
   const sdk = useSDK()
-  const settings = useSettings()
   const local = useLocal()
   const language = useLanguage()
   const [busy, setBusy] = createSignal(false)
@@ -1441,7 +1371,6 @@ function createGoalRefine(input: GoalRefineInput) {
     abort?.abort()
     abort = controller
     try {
-      const configured = settings.general.promptRevision()?.model
       const current = local.model.current()
       const result = await sdk().api.promptRevisor.revise({
         prompt: flow.draft,
@@ -1450,9 +1379,8 @@ function createGoalRefine(input: GoalRefineInput) {
         sessionID: input.sessionID?.(),
         includeSessionContext: false,
         guidance: flow.guidance,
-        model: configured ? { providerID: configured.providerID, id: configured.modelID } : undefined,
         fallbackModel: current
-          ? { providerID: current.provider.id, id: current.id, variant: local.model.variant.current() ?? undefined }
+          ? goalRuntimeModelRef(current.provider.id, current.id, local.model.variant.current() ?? undefined)
           : undefined,
         location: { directory: flow.directory },
         signal: controller.signal,
@@ -1722,9 +1650,8 @@ export function GoalComposerLauncher(props: LauncherProps) {
         title: titleFromObjective(objective()),
         objective: objective().trim(),
         criteria: acceptance,
-        continuationPolicy: { mode: "auto_continue" },
         auditorPolicy: auditorModel()
-          ? { model: { providerID: auditorModel()!.providerID, id: auditorModel()!.modelID } }
+          ? { model: goalRuntimeModelRef(auditorModel()!.providerID, auditorModel()!.modelID) }
           : undefined,
         start,
       })
@@ -1860,14 +1787,14 @@ export function GoalComposerLauncher(props: LauncherProps) {
                             class="flex min-h-9 w-full min-w-0 items-center gap-2 px-2.5 py-1 text-left transition-colors hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none"
                             onClick={() => void focus(item.id)}
                           >
-                            <GoalStatusGlyph status={goalDisplayStatus(item.status, item.continuationPolicy.mode)} />
+                            <GoalStatusGlyph status={goalDisplayStatus(item.status)} />
                             <div class="min-w-0 flex-1">
                               <div class={`truncate ${BODY}`}>{item.title}</div>
                               <div class="truncate text-[9px] leading-[13px] text-v2-text-text-faint">
                                 {item.objective}
                               </div>
                             </div>
-                            <GoalStatusChip status={goalDisplayStatus(item.status, item.continuationPolicy.mode)} />
+                            <GoalStatusChip status={goalDisplayStatus(item.status)} />
                           </button>
                         )}
                       </For>

@@ -8,7 +8,9 @@ import { createSessionNavigation } from "@opencode-ai/session-ui/context"
 import { Button } from "@opencode-ai/ui/button"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { Icon } from "@opencode-ai/ui/icon"
+import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ScrollView, ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
+import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Switch } from "@opencode-ai/ui/switch"
 import { useNavigate } from "@solidjs/router"
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
@@ -16,11 +18,14 @@ import { ScheduledTaskEditor } from "@/components/scheduled-task-editor"
 import { useLanguage } from "@/context/language"
 import { useScheduledTasks } from "@/context/scheduled-tasks"
 import { legacySessionHref } from "@/utils/session-route"
+import { displayWindowLabel, formatPercent } from "@/utils/limits-format"
+import { createScheduledQuotaResets, type QuotaResetOccurrence } from "./scheduled-quota-resets"
 import {
   scheduledCalendarDays,
   scheduledCalendarWindow,
   scheduledLocalDayKey,
   scheduledRunAttentionRank,
+  scheduledTemporalClusters,
   shiftScheduledCalendarAnchor,
   type ScheduledCalendarRange,
 } from "./scheduled-page-model"
@@ -31,6 +36,12 @@ type MobilePane = "calendar" | "tasks" | "activity"
 const HOUR_HEIGHT = 52
 const MINUTE_HEIGHT = HOUR_HEIGHT / 60
 const CALENDAR_HEIGHT = HOUR_HEIGHT * 24
+const SYSTEM_EVENT_RAIL_WIDTH = 30
+const SYSTEM_EVENT_MARKER_HALF = 10
+// At 52px/hour, an 18-minute gap is ~15.6px: close enough that two 20px
+// interactive rail markers would collide. Cluster presentation only; timestamps
+// remain authoritative and each reset keeps its own guide line.
+const RESET_RAIL_CLUSTER_GAP_MS = 18 * 60_000
 
 function formatClock(time: { hour: number; minute: number }) {
   return `${String(time.hour).padStart(2, "0")}:${String(time.minute).padStart(2, "0")}`
@@ -152,6 +163,257 @@ function occurrenceMinute(occurrence: ScheduledTaskAgendaOccurrence) {
   return date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
 }
 
+function calendarMinute(value: number) {
+  const date = new Date(value)
+  return date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
+}
+
+function quotaResetMinute(occurrence: QuotaResetOccurrence) {
+  return calendarMinute(Number(occurrence.resetAt))
+}
+
+function quotaResetSubject(language: ReturnType<typeof useLanguage>, occurrence: QuotaResetOccurrence) {
+  if (occurrence.accountLabel && occurrence.model) return `${occurrence.accountLabel} · ${occurrence.model}`
+  if (occurrence.accountLabel) return occurrence.accountLabel
+  if (occurrence.model) return occurrence.model
+  return language.t("scheduledTasks.calendar.reset.scope.provider")
+}
+
+function quotaResetWindowLabel(language: ReturnType<typeof useLanguage>, occurrence: QuotaResetOccurrence) {
+  return occurrence.windows.map((window) => displayWindowLabel(window.key, language.t)).join(" + ")
+}
+
+function quotaResetRemaining(occurrence: QuotaResetOccurrence) {
+  let remaining: number | null = null
+  for (const window of occurrence.windows) {
+    const value = window.remainingPercent
+    if (value === null || value === undefined || !Number.isFinite(value)) continue
+    remaining = remaining === null ? value : Math.min(remaining, value)
+  }
+  return remaining
+}
+
+function quotaResetSourceLabel(
+  language: ReturnType<typeof useLanguage>,
+  source: QuotaResetOccurrence["windows"][number]["source"],
+) {
+  switch (source) {
+    case "provider":
+      return language.t("scheduledTasks.calendar.reset.source.provider")
+    case "observed":
+      return language.t("scheduledTasks.calendar.reset.source.observed")
+    case "inferred":
+      return language.t("scheduledTasks.calendar.reset.source.inferred")
+    case "local":
+      return language.t("scheduledTasks.calendar.reset.source.local")
+  }
+}
+
+function QuotaResetTooltipBody(props: { occurrence: QuotaResetOccurrence }) {
+  const language = useLanguage()
+  const remaining = () => quotaResetRemaining(props.occurrence)
+  const resetTime = () =>
+    new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(Number(props.occurrence.resetAt)))
+
+  return (
+    <div class="w-64 p-1">
+      <div class="flex items-center gap-2 border-b border-v2-border-border-muted pb-2">
+        <div class="flex size-7 items-center justify-center rounded-md bg-v2-background-bg-layer-02">
+          <ProviderIcon id={props.occurrence.providerId} class="size-4 opacity-90" />
+        </div>
+        <div class="min-w-0">
+          <div class="truncate text-11-medium text-v2-text-text-base">{props.occurrence.providerName}</div>
+          <div class="truncate text-[10px] text-v2-text-text-muted">
+            {quotaResetSubject(language, props.occurrence)}
+          </div>
+        </div>
+        <Show when={remaining() !== null}>
+          <span class="ml-auto rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-v2-text-text-muted">
+            {language.t("scheduledTasks.calendar.reset.remaining", { value: formatPercent(remaining()) })}
+          </span>
+        </Show>
+      </div>
+      <div class="mt-2 flex flex-col gap-1.5">
+        <div class="flex items-center justify-between gap-3 text-[10px]">
+          <span class="text-v2-text-text-faint">{language.t("scheduledTasks.calendar.reset.at")}</span>
+          <span class="text-right tabular-nums text-v2-text-text-base">{resetTime()}</span>
+        </div>
+        <For each={props.occurrence.windows}>
+          {(window) => (
+            <div class="flex min-w-0 items-center gap-2 rounded-md bg-v2-background-bg-layer-01 px-2 py-1.5">
+              <span class="min-w-0 flex-1 truncate text-[10px] font-medium text-v2-text-text-base">
+                {displayWindowLabel(window.key, language.t)}
+              </span>
+              <Show when={window.remainingPercent !== null && window.remainingPercent !== undefined}>
+                <span class="shrink-0 tabular-nums text-[9px] text-v2-text-text-muted">
+                  {formatPercent(window.remainingPercent)}
+                </span>
+              </Show>
+              <span class="shrink-0 text-[9px] text-v2-text-text-faint">
+                {quotaResetSourceLabel(language, window.source)}
+              </span>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  )
+}
+
+function QuotaResetChip(props: { occurrence: QuotaResetOccurrence; compact?: boolean }) {
+  const language = useLanguage()
+  const label = () =>
+    props.compact
+      ? props.occurrence.providerName
+      : `${props.occurrence.providerName} · ${quotaResetWindowLabel(language, props.occurrence)}`
+
+  return (
+    <TooltipV2 placement="right" gutter={6} value={<QuotaResetTooltipBody occurrence={props.occurrence} />}>
+      <button
+        type="button"
+        class="flex max-w-full items-center gap-1 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02/95 px-1.5 py-0.5 text-left text-[9px] font-medium leading-4 text-v2-text-text-muted shadow-xs transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-text-text-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-focus"
+        aria-label={language.t("scheduledTasks.calendar.reset.aria", {
+          provider: props.occurrence.providerName,
+          time: new Date(Number(props.occurrence.resetAt)).toLocaleString(),
+        })}
+      >
+        <ProviderIcon id={props.occurrence.providerId} class="size-3 shrink-0 opacity-85" />
+        <span class="min-w-0 truncate">{label()}</span>
+      </button>
+    </TooltipV2>
+  )
+}
+
+function QuotaResetClusterTooltipBody(props: { occurrences: readonly QuotaResetOccurrence[] }) {
+  const language = useLanguage()
+  const count = () => props.occurrences.length
+
+  return (
+    <div class="w-72 p-1">
+      <div class="border-b border-v2-border-border-muted pb-2 text-11-medium text-v2-text-text-base">
+        {language.t(
+          count() === 1 ? "scheduledTasks.calendar.reset.count.one" : "scheduledTasks.calendar.reset.count.other",
+          {
+            count: count(),
+          },
+        )}
+      </div>
+      <div class="mt-1.5 flex max-h-64 flex-col gap-1 overflow-hidden">
+        <For each={props.occurrences}>
+          {(occurrence) => (
+            <div class="flex min-w-0 items-center gap-2 rounded-md bg-v2-background-bg-layer-01 px-2 py-1.5">
+              <ProviderIcon id={occurrence.providerId} class="size-3.5 shrink-0 opacity-85" />
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-[10px] font-medium text-v2-text-text-base">{occurrence.providerName}</div>
+                <div class="truncate text-[9px] text-v2-text-text-faint">
+                  {quotaResetSubject(language, occurrence)} · {quotaResetWindowLabel(language, occurrence)}
+                </div>
+              </div>
+              <span class="shrink-0 tabular-nums text-[9px] text-v2-text-text-faint">
+                {new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(
+                  new Date(Number(occurrence.resetAt)),
+                )}
+              </span>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  )
+}
+
+function QuotaResetClusterChip(props: { occurrences: readonly QuotaResetOccurrence[] }) {
+  const language = useLanguage()
+  const first = () => props.occurrences[0]
+  const count = () => props.occurrences.length
+
+  return (
+    <Show
+      when={count() > 1}
+      fallback={<Show when={first()}>{(occurrence) => <QuotaResetChip occurrence={occurrence()} />}</Show>}
+    >
+      <TooltipV2 placement="right" gutter={6} value={<QuotaResetClusterTooltipBody occurrences={props.occurrences} />}>
+        <button
+          type="button"
+          class="flex max-w-full items-center gap-1 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02/95 px-1.5 py-0.5 text-[9px] font-medium leading-4 text-v2-text-text-muted shadow-xs transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-text-text-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-focus"
+        >
+          <span class="flex -space-x-1">
+            <For each={props.occurrences.slice(0, 3)}>
+              {(occurrence) => (
+                <span class="flex size-3.5 items-center justify-center rounded-full border border-v2-border-border-muted bg-v2-background-bg-layer-01">
+                  <ProviderIcon id={occurrence.providerId} class="size-2.5 opacity-85" />
+                </span>
+              )}
+            </For>
+          </span>
+          <span class="tabular-nums">
+            {language.t(
+              count() === 1 ? "scheduledTasks.calendar.reset.count.one" : "scheduledTasks.calendar.reset.count.other",
+              {
+                count: count(),
+              },
+            )}
+          </span>
+        </button>
+      </TooltipV2>
+    </Show>
+  )
+}
+
+function QuotaResetRailMarker(props: { occurrences: readonly QuotaResetOccurrence[] }) {
+  const language = useLanguage()
+  const first = () => props.occurrences[0]
+  const count = () => props.occurrences.length
+  const ariaLabel = () => {
+    const occurrence = first()
+    if (!occurrence) return language.t("scheduledTasks.calendar.reset.toggle")
+    if (count() === 1) {
+      return language.t("scheduledTasks.calendar.reset.aria", {
+        provider: occurrence.providerName,
+        time: new Date(Number(occurrence.resetAt)).toLocaleString(),
+      })
+    }
+    return language.t("scheduledTasks.calendar.reset.count.other", { count: count() })
+  }
+
+  return (
+    <Show when={first()}>
+      {(occurrence) => (
+        <TooltipV2
+          placement="left"
+          gutter={8}
+          value={
+            count() === 1 ? (
+              <QuotaResetTooltipBody occurrence={occurrence()} />
+            ) : (
+              <QuotaResetClusterTooltipBody occurrences={props.occurrences} />
+            )
+          }
+        >
+          <button
+            type="button"
+            aria-label={ariaLabel()}
+            class="group relative flex size-5 items-center justify-center rounded-full border border-v2-border-border-muted bg-v2-background-bg-layer-02 text-v2-text-text-muted shadow-xs transition-[background-color,border-color,color,transform] hover:scale-105 hover:border-v2-border-border-focus hover:bg-v2-background-bg-layer-03 hover:text-v2-text-text-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-focus"
+          >
+            <ProviderIcon id={occurrence().providerId} class="size-3 opacity-90" />
+            <Show when={count() > 1}>
+              <span class="absolute -right-1 -top-1 flex min-w-3.5 items-center justify-center rounded-full border border-v2-border-border-muted bg-v2-background-bg-base px-0.5 text-[8px] font-semibold leading-3 text-v2-text-text-base shadow-xs">
+                {count()}
+              </span>
+            </Show>
+          </button>
+        </TooltipV2>
+      )}
+    </Show>
+  )
+}
+
 function ScheduledRunSessionLink(props: { run: ScheduledTaskRun }) {
   const navigate = useNavigate()
   const language = useLanguage()
@@ -188,6 +450,8 @@ function ScheduledRunSessionLink(props: { run: ScheduledTaskRun }) {
 function TimedCalendar(props: {
   days: number[]
   occurrences: ScheduledTaskAgendaOccurrence[]
+  resets: QuotaResetOccurrence[]
+  showSystemEvents: boolean
   now: number
   selectedTaskID?: string
   task: (id: string) => ScheduledTaskInfo | undefined
@@ -206,6 +470,33 @@ function TimedCalendar(props: {
     return result
   })
   const occurrencesFor = (day: number) => occurrencesByDay().get(scheduledLocalDayKey(day)) ?? []
+  const resetClustersByDay = createMemo(() => {
+    const byDay = new Map<string, QuotaResetOccurrence[]>()
+    for (const item of props.resets) {
+      const dayKey = scheduledLocalDayKey(Number(item.resetAt))
+      const bucket = byDay.get(dayKey)
+      if (bucket) bucket.push(item)
+      else byDay.set(dayKey, [item])
+    }
+
+    const result = new Map<
+      string,
+      Array<{
+        at: number
+        startAt: number
+        endAt: number
+        items: readonly QuotaResetOccurrence[]
+      }>
+    >()
+    for (const [dayKey, items] of byDay) {
+      result.set(
+        dayKey,
+        scheduledTemporalClusters(items, (item) => Number(item.resetAt), RESET_RAIL_CLUSTER_GAP_MS),
+      )
+    }
+    return result
+  })
+  const resetClustersFor = (day: number) => resetClustersByDay().get(scheduledLocalDayKey(day)) ?? []
   const nowMinute = () => {
     const date = new Date(props.now)
     return date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
@@ -264,16 +555,65 @@ function TimedCalendar(props: {
                       />
                     )}
                   </For>
+
+                  <Show when={props.showSystemEvents}>
+                    <div
+                      data-calendar-layer="system-event-rail"
+                      class="pointer-events-none absolute inset-y-0 right-0 z-[4] border-l border-v2-border-border-muted/70 bg-v2-background-bg-layer-01/35"
+                      style={{ width: `${SYSTEM_EVENT_RAIL_WIDTH}px` }}
+                    />
+                    <For each={resetClustersFor(day)}>
+                      {(cluster) => {
+                        const markerAt = (cluster.startAt + cluster.endAt) / 2
+                        const markerTop = Math.min(
+                          CALENDAR_HEIGHT - SYSTEM_EVENT_MARKER_HALF,
+                          Math.max(SYSTEM_EVENT_MARKER_HALF, calendarMinute(markerAt) * MINUTE_HEIGHT),
+                        )
+                        return (
+                          <>
+                            <For each={cluster.items}>
+                              {(occurrence) => (
+                                <div
+                                  data-calendar-layer="quota-reset-guide"
+                                  class="pointer-events-none absolute left-0 z-[1] border-t border-dashed border-v2-border-border-muted/55"
+                                  style={{
+                                    right: `${SYSTEM_EVENT_RAIL_WIDTH}px`,
+                                    top: `${Math.max(0, quotaResetMinute(occurrence) * MINUTE_HEIGHT)}px`,
+                                  }}
+                                />
+                              )}
+                            </For>
+                            <div
+                              data-calendar-layer="quota-reset-marker"
+                              class="pointer-events-auto absolute right-0 z-20 flex -translate-y-1/2 items-center justify-center"
+                              style={{
+                                width: `${SYSTEM_EVENT_RAIL_WIDTH}px`,
+                                top: `${markerTop}px`,
+                              }}
+                            >
+                              <QuotaResetRailMarker occurrences={cluster.items} />
+                            </div>
+                          </>
+                        )
+                      }}
+                    </For>
+                  </Show>
+
                   <For each={occurrencesFor(day)}>
                     {(occurrence) => {
                       const task = () => props.task(occurrence.taskID)
                       const selected = () => props.selectedTaskID === occurrence.taskID
                       return (
                         <button
+                          data-calendar-layer="scheduled-task"
                           type="button"
-                          class="absolute inset-x-1 z-10 min-h-5 overflow-hidden rounded border border-border-weak-base bg-surface-base px-1.5 py-0.5 text-left text-[10px] leading-4 text-text-strong shadow-xs hover:bg-surface-raised-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border-strong"
+                          class="absolute z-10 min-h-5 overflow-hidden rounded border border-border-weak-base bg-surface-base px-1.5 py-0.5 text-left text-[10px] leading-4 text-text-strong shadow-xs transition-[right,background-color] hover:bg-surface-raised-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-border-strong"
                           classList={{ "ring-1 ring-border-strong": selected(), "opacity-55": !task()?.enabled }}
-                          style={{ top: `${Math.max(0, occurrenceMinute(occurrence) * MINUTE_HEIGHT)}px` }}
+                          style={{
+                            left: "4px",
+                            right: props.showSystemEvents ? `${SYSTEM_EVENT_RAIL_WIDTH + 4}px` : "4px",
+                            top: `${Math.max(0, occurrenceMinute(occurrence) * MINUTE_HEIGHT)}px`,
+                          }}
                           onClick={() => props.onSelectTask(occurrence.taskID)}
                           title={task()?.name}
                         >
@@ -310,6 +650,7 @@ function TimedCalendar(props: {
 function MonthCalendar(props: {
   days: number[]
   occurrences: ScheduledTaskAgendaOccurrence[]
+  resets: QuotaResetOccurrence[]
   now: number
   selectedTaskID?: string
   task: (id: string) => ScheduledTaskInfo | undefined
@@ -329,6 +670,18 @@ function MonthCalendar(props: {
     return result
   })
   const occurrencesFor = (day: number) => occurrencesByDay().get(scheduledLocalDayKey(day)) ?? []
+  const resetsByDay = createMemo(() => {
+    const result = new Map<string, QuotaResetOccurrence[]>()
+    for (const item of props.resets) {
+      const key = scheduledLocalDayKey(Number(item.resetAt))
+      const bucket = result.get(key)
+      if (bucket) bucket.push(item)
+      else result.set(key, [item])
+    }
+    for (const bucket of result.values()) bucket.sort((a, b) => Number(a.resetAt) - Number(b.resetAt))
+    return result
+  })
+  const resetsFor = (day: number) => resetsByDay().get(scheduledLocalDayKey(day)) ?? []
 
   return (
     <div class="relative min-h-0 flex-1 bg-background-base">
@@ -344,6 +697,7 @@ function MonthCalendar(props: {
             <For each={props.days}>
               {(day) => {
                 const events = () => occurrencesFor(day)
+                const resets = () => resetsFor(day)
                 return (
                   <div
                     class="min-h-28 border-b border-r border-border-weaker-base p-1.5"
@@ -385,6 +739,11 @@ function MonthCalendar(props: {
                       <Show when={events().length > 4}>
                         <span class="px-1 text-[10px] text-text-weak">+{events().length - 4}</span>
                       </Show>
+                      <Show when={resets().length > 0}>
+                        <div class="mt-1 border-t border-dashed border-v2-border-border-muted/70 pt-1">
+                          <QuotaResetClusterChip occurrences={resets()} />
+                        </div>
+                      </Show>
                     </div>
                   </div>
                 )
@@ -400,6 +759,7 @@ function MonthCalendar(props: {
 
 export function ScheduledPage() {
   const store = useScheduledTasks()
+  const quotaResets = createScheduledQuotaResets()
   const dialog = useDialog()
   const language = useLanguage()
   const [pendingDelete, setPendingDelete] = createSignal<string | undefined>(undefined)
@@ -410,9 +770,14 @@ export function ScheduledPage() {
   const [taskQuery, setTaskQuery] = createSignal("")
   const [mobilePane, setMobilePane] = createSignal<MobilePane>("calendar")
   const [activityCollapsed, setActivityCollapsed] = createSignal(false)
+  const [showQuotaResets, setShowQuotaResets] = createSignal(true)
 
   const range = createMemo(() => scheduledCalendarWindow(mode(), anchor()))
   const days = createMemo(() => scheduledCalendarDays(range()))
+  const visibleQuotaResets = createMemo(() => (showQuotaResets() ? quotaResets.occurrences() : []))
+  const systemEventRailVisible = createMemo(
+    () => showQuotaResets() && (quotaResets.loading() || quotaResets.occurrences().length > 0),
+  )
   const selectedTask = createMemo(() => {
     const id = selectedTaskID()
     return id ? store.task(id) : undefined
@@ -441,12 +806,29 @@ export function ScheduledPage() {
 
   onMount(() => {
     store.ensureLoaded()
-    onCleanup(store.retainTicker())
+    const releaseTicker = store.retainTicker()
+    const refreshQuotaIfVisible = () => {
+      if (showQuotaResets() && !document.hidden) quotaResets.refreshIfStale()
+    }
+    window.addEventListener("focus", refreshQuotaIfVisible)
+    document.addEventListener("visibilitychange", refreshQuotaIfVisible)
+    onCleanup(() => {
+      releaseTicker()
+      window.removeEventListener("focus", refreshQuotaIfVisible)
+      document.removeEventListener("visibilitychange", refreshQuotaIfVisible)
+    })
   })
 
   createEffect(() => {
     const current = range()
     void store.loadAgenda({ from: current.from, to: current.to }).catch(() => undefined)
+  })
+
+  createEffect(() => {
+    if (!showQuotaResets()) return
+    quotaResets.scope()
+    const current = range()
+    void quotaResets.load({ from: current.from, to: current.to }).catch(() => undefined)
   })
 
   const openEditor = (task?: ScheduledTaskInfo) => {
@@ -538,6 +920,48 @@ export function ScheduledPage() {
               )}
             </For>
           </div>
+          <TooltipV2
+            placement="bottom"
+            gutter={6}
+            value={
+              quotaResets.failures().length > 0
+                ? language.plural("scheduledTasks.calendar.reset.partial", quotaResets.failures().length, {
+                    count: quotaResets.failures().length,
+                  })
+                : language.t("scheduledTasks.calendar.reset.toggle")
+            }
+          >
+            <button
+              type="button"
+              aria-pressed={showQuotaResets()}
+              class="flex h-7 items-center gap-1.5 rounded-md border border-border-weaker-base px-2 text-[10px] font-medium text-text-weak transition-colors hover:bg-surface-base hover:text-text-strong"
+              classList={{
+                "bg-surface-base text-text-strong": showQuotaResets(),
+                "border-v2-state-border-warning text-v2-state-fg-warning": quotaResets.failures().length > 0,
+              }}
+              onClick={() => setShowQuotaResets((value) => !value)}
+            >
+              <span
+                class="size-1.5 rounded-full border border-current"
+                classList={{ "bg-current": showQuotaResets() }}
+              />
+              <span class="hidden lg:inline">{language.t("scheduledTasks.calendar.reset.toggle")}</span>
+              <span class="tabular-nums opacity-70">{quotaResets.occurrences().length}</span>
+            </button>
+          </TooltipV2>
+          <Show when={showQuotaResets()}>
+            <TooltipV2 placement="bottom" gutter={6} value={language.t("common.refresh")}>
+              <button
+                type="button"
+                class="flex size-7 items-center justify-center rounded-md border border-border-weaker-base text-text-weak transition-colors hover:bg-surface-base hover:text-text-strong disabled:opacity-40"
+                aria-label={language.t("common.refresh")}
+                disabled={quotaResets.loading()}
+                onClick={() => void quotaResets.refresh().catch(() => undefined)}
+              >
+                <span class={quotaResets.loading() ? "animate-spin" : undefined}>↻</span>
+              </button>
+            </TooltipV2>
+          </Show>
           <Switch checked={!store.paused()} onChange={(checked) => void store.setControl(!checked)}>
             <span class="hidden xl:inline">
               {language.t(store.paused() ? "scheduledTasks.resume" : "scheduledTasks.pause")}
@@ -595,6 +1019,8 @@ export function ScheduledPage() {
               <TimedCalendar
                 days={days()}
                 occurrences={store.agenda()}
+                resets={visibleQuotaResets()}
+                showSystemEvents={systemEventRailVisible()}
                 now={store.now()}
                 selectedTaskID={selectedTaskID()}
                 task={store.task}
@@ -605,6 +1031,7 @@ export function ScheduledPage() {
             <MonthCalendar
               days={days()}
               occurrences={store.agenda()}
+              resets={visibleQuotaResets()}
               now={store.now()}
               selectedTaskID={selectedTaskID()}
               task={store.task}
@@ -612,8 +1039,25 @@ export function ScheduledPage() {
             />
           </Show>
           <Show when={store.agendaLoading()}>
-            <div class="pointer-events-none absolute bottom-2 left-2 rounded border border-border-weaker-base bg-background-base/90 px-2 py-1 text-[10px] text-text-weak">
+            <div class="pointer-events-none absolute bottom-2 left-2 z-30 rounded border border-border-weaker-base bg-background-base/90 px-2 py-1 text-[10px] text-text-weak shadow-xs">
               {language.t("scheduledTasks.calendar.loading")}
+            </div>
+          </Show>
+          <Show when={showQuotaResets() && quotaResets.loading()}>
+            <div class="pointer-events-none absolute bottom-2 right-2 z-30 rounded border border-border-weaker-base bg-background-base/90 px-2 py-1 text-[10px] text-text-weak shadow-xs">
+              {language.t("scheduledTasks.calendar.reset.loading")}
+            </div>
+          </Show>
+          <Show when={showQuotaResets() && quotaResets.error()}>
+            <div class="absolute right-2 top-2 z-30 flex items-center gap-2 rounded-md border border-v2-state-border-warning/50 bg-v2-state-bg-warning/10 px-2.5 py-1.5 text-[10px] text-v2-text-text-base shadow-sm">
+              <span>{language.t("scheduledTasks.calendar.reset.loadFailed")}</span>
+              <button
+                type="button"
+                class="rounded px-1.5 py-0.5 font-medium text-v2-state-fg-warning hover:bg-v2-state-bg-warning/30 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-focus"
+                onClick={() => void quotaResets.refresh().catch(() => undefined)}
+              >
+                {language.t("common.refresh")}
+              </button>
             </div>
           </Show>
         </section>

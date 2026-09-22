@@ -27,7 +27,7 @@ type Detail = {
     status: "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
     revision: number
     auditorRuns: number
-    continuationPolicy: { mode: "manual" | "auto_continue" | "unattended" }
+    continuationPolicy: { maxConsecutiveTurns?: number; maxNoProgressTurns?: number; maxDurationMs?: number; tokenBudget?: number }
     auditorPolicy: {
       model?: { providerID: string; id: string }
       blockedThreshold?: number
@@ -161,7 +161,7 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
     }
     const now = Date.now()
@@ -176,7 +176,7 @@ class GoalServer {
         status: "draft",
         revision: 0,
         auditorRuns: 0,
-        continuationPolicy: body.continuationPolicy ?? { mode: "manual" },
+        continuationPolicy: body.continuationPolicy ?? {},
         auditorPolicy: body.auditorPolicy ?? {},
         time: { created: now, updated: now },
       },
@@ -208,7 +208,7 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
       start?: boolean
     }
@@ -225,7 +225,7 @@ class GoalServer {
         status: started ? "active" : "draft",
         revision: started ? 1 : 0,
         auditorRuns: 0,
-        continuationPolicy: body.continuationPolicy ?? { mode: "manual" },
+        continuationPolicy: body.continuationPolicy ?? {},
         auditorPolicy: body.auditorPolicy ?? {},
         time: { created: now, updated: now },
       },
@@ -273,7 +273,7 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
     }
     if (body.title !== undefined) this.detail.goal.title = body.title
@@ -484,12 +484,6 @@ test("drafts are repairable and can traverse the user-visible lifecycle", async 
   await summary.getByRole("button", { name: "Resume Goal", exact: true }).click()
   await expect(shelf).toHaveAttribute("data-goal-status", "active")
 
-  await popover.getByRole("button", { name: "Request verification" }).click()
-  await expect(shelf).toHaveAttribute("data-goal-status", "active")
-  await expect(shelf).toHaveAttribute("data-goal-runtime-phase", "audit_requested")
-  await expect(shelf.locator('[data-slot="goal-status-chip"]')).toHaveText("audit requested", { ignoreCase: true })
-  expect(server.operations).toContain("goal.audit.request")
-
   await page.reload()
   await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
   await expect(page.locator('[data-component="goal-composer-shelf"]')).toContainText("Repairable Goal")
@@ -562,7 +556,7 @@ test("quick Goal arming prepares durable Goal state before the first worker prom
   expect(server.detail?.goal).toMatchObject({
     objective: "Implement the quick Goal ordering contract",
     status: "active",
-    continuationPolicy: { mode: "auto_continue" },
+    continuationPolicy: {},
   })
   expect(server.detail?.criteria).toHaveLength(1)
   await expect(page.locator('[data-component="goal-composer-shelf"]')).toContainText("Implement the quick Goal ordering contract")
@@ -580,7 +574,7 @@ test("persists the auditor model per Goal through the real model picker", async 
       status: "active",
       revision: 3,
       auditorRuns: 2,
-      continuationPolicy: { mode: "auto_continue" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 60_000, updated: now },
     },
@@ -634,7 +628,7 @@ test("shows AUDITING from the session-local runtime projection while the durable
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: { mode: "auto_continue" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -672,7 +666,7 @@ test("enters the live Goal Auditor Session while it is working and keeps the sam
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: { mode: "auto_continue" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -786,7 +780,7 @@ test("enters the live Goal Auditor Session while it is working and keeps the sam
   await expect(completedOpen).toHaveAttribute("href", new RegExp(`/session/${auditorSessionID}$`))
 })
 
-test("shows AUDIT REQUESTED while worker preemption is pending and never claims the auditor is running", async ({ page }) => {
+test("shows AUDIT REQUESTED while the automatic Goal Mode audit is pending and never claims the auditor is running", async ({ page }) => {
   const now = Date.now()
   const initial: Detail = {
     goal: {
@@ -798,7 +792,7 @@ test("shows AUDIT REQUESTED while worker preemption is pending and never claims 
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: { mode: "manual" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -806,11 +800,11 @@ test("shows AUDIT REQUESTED while worker preemption is pending and never claims 
     steps: [],
   }
   const server = new GoalServer(initial)
+  server.automation = { phase: "audit_requested", since: now }
   await openSession(page, server)
 
   const shelf = page.locator('[data-component="goal-composer-shelf"]')
   await shelf.getByRole("button", { name: /Preempt for Audit/ }).click()
-  await shelf.getByRole("button", { name: "Request verification", exact: true }).click()
 
   const chip = shelf.locator('[data-slot="goal-status-chip"]')
   await expect(shelf).toHaveAttribute("data-goal-status", "active")
@@ -818,7 +812,7 @@ test("shows AUDIT REQUESTED while worker preemption is pending and never claims 
   await expect(chip).toHaveText("audit requested", { ignoreCase: true })
   await expect(chip).not.toContainText("auditing", { ignoreCase: true })
   await expect(shelf).toContainText("Stopping worker execution and starting the independent auditor…")
-  expect(server.operations).toContain("goal.audit.request")
+  await expect(shelf.getByRole("button", { name: "Request verification", exact: true })).toHaveCount(0)
 })
 
 test("never presents orphaned verifying or auditor failure as a running auditor", async ({ page }) => {
@@ -833,7 +827,7 @@ test("never presents orphaned verifying or auditor failure as a running auditor"
       status: "verifying",
       revision: 4,
       auditorRuns: 0,
-      continuationPolicy: { mode: "auto_continue" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -851,7 +845,7 @@ test("never presents orphaned verifying or auditor failure as a running auditor"
   await expect(chip).not.toContainText("verifying", { ignoreCase: true })
   await expect(chip).not.toContainText("auditing", { ignoreCase: true })
   await shelf.getByRole("button", { name: /Waiting Goal/ }).click()
-  await expect(shelf).toContainText("Auditor is not running. Retry the audit or resume work.")
+  await expect(shelf).toContainText("Auditor is not running. Retry the audit.")
   await shelf.getByRole("button", { name: "Retry audit", exact: true }).click()
   expect(server.operations).toContain("goal.audit.request")
 
@@ -868,53 +862,36 @@ test("never presents orphaned verifying or auditor failure as a running auditor"
   await expect(errored).toContainText("Auditor failed: Model unavailable")
 })
 
-test("a verified Goal can complete only when every criterion has evidence", async ({ page }) => {
+test("Goal Mode exposes one automatic audit-and-continue behavior with no manual runtime modes", async ({ page }) => {
   const now = Date.now()
   const initial: Detail = {
     goal: {
-      id: "goal_verified",
+      id: "goal_single_mode",
       projectID,
-      title: "Verified Goal",
-      objective: "Exercise completion gating",
+      title: "Single Goal Mode",
+      objective: "Expose one Goal Mode behavior with no manual or unattended variants",
       constraints: [],
-      status: "verifying",
+      status: "active",
       revision: 8,
       auditorRuns: 4,
-      continuationPolicy: { mode: "manual" },
+      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 60_000, updated: now },
     },
-    criteria: [
-      { id: "criterion_verified_1", position: 0, description: "Tests pass", status: "passed" },
-      { id: "criterion_verified_2", position: 1, description: "UX verified", status: "passed" },
-    ],
+    criteria: [{ id: "criterion_single_mode", position: 0, description: "Goal Mode is singular", status: "pending" }],
     steps: [],
   }
   const server = new GoalServer(initial)
-  server.evidence = [
-    { id: "evidence_1", goalID: initial.goal.id, criterionID: "criterion_verified_1", type: "test", summary: "Tests passed", verdict: "pass", createdAt: now },
-  ]
   await openSession(page, server)
-  const shelf = page.locator('[data-component="goal-composer-shelf"]')
-  await expect(shelf.locator('[data-slot="goal-status-chip"]')).toHaveText("ready for review", { ignoreCase: true })
-  await shelf.getByRole("button", { name: /Verified Goal/ }).click()
-  await expect(shelf.locator('[data-slot="goal-panel"]')).toContainText("4 auditor runs")
-  await expect(page.getByRole("button", { name: "Complete Goal" })).toBeDisabled()
 
-  server.evidence.push({
-    id: "evidence_2",
-    goalID: initial.goal.id,
-    criterionID: "criterion_verified_2",
-    type: "review",
-    summary: "UX verified",
-    verdict: "pass",
-    createdAt: now,
-  })
-  // Collapsing and reopening is the refresh boundary that reloads evidence.
-  await shelf.getByRole("button", { name: "Collapse Goal" }).click()
-  await shelf.getByRole("button", { name: /Verified Goal/ }).click()
-  await expect(page.getByRole("button", { name: "Complete Goal" })).toBeEnabled()
-  await page.getByRole("button", { name: "Complete Goal" }).click()
-  await expect(page.getByRole("button", { name: "Goal", exact: true })).toBeVisible()
-  expect(server.detail?.goal.status).toBe("completed")
+  const shelf = page.locator('[data-component="goal-composer-shelf"]')
+  await shelf.getByRole("button", { name: /Single Goal Mode/ }).click()
+  const panel = shelf.locator('[data-slot="goal-panel"]')
+  await expect(panel).toContainText("4 auditor runs")
+  await expect(panel).toContainText("Goal Mode audits every settled cycle and continues until completion")
+  await expect(panel.getByText("Manual", { exact: true })).toHaveCount(0)
+  await expect(panel.getByText("Auto", { exact: true })).toHaveCount(0)
+  await expect(panel.getByText("Unattended", { exact: true })).toHaveCount(0)
+  await expect(panel.getByRole("button", { name: "Request verification", exact: true })).toHaveCount(0)
+  await expect(panel.getByRole("button", { name: "Complete Goal", exact: true })).toHaveCount(0)
 })

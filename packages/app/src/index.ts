@@ -1,4 +1,5 @@
 export { AppBaseProviders, AppInterface } from "./app"
+export { PwaClientApp, type PwaClientAppProps } from "./pwa-client"
 export { useLayout } from "./context/layout"
 export { useServerSDK } from "./context/server-sdk"
 export { useServerSync } from "./context/server-sync"
@@ -27,4 +28,4 @@ export {
   type WslServersState,
 } from "./wsl/types"
 export { ServerConnection } from "./context/server"
-export { createDraftStore, type DraftStore } from "./utils/draft-store"
+export { createBrowserDraftStore, createDraftStore, type DraftStore } from "./utils/draft-store"

@@ -5,15 +5,21 @@ import type {
 } from "@opencode-ai/client/promise"
 import type { AssistantMessage, FilePart, Message, Part, ToolPart, UserMessage } from "@opencode-ai/sdk/v2"
 import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
-import { Option, Schema } from "effect"
 import type { SessionMessageInfo } from "./session-message-info"
 
 type SessionMessageUser = Extract<SessionMessageInfo, { type: "user" }>
 
 const emptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
 const emptyModel: { id: string; providerID: string; variant?: string } = { id: "", providerID: "" }
-const decodeToolInput = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
 const legacyCurrentSyntheticSource = "v2.synthetic"
+
+function decodeToolInput(value: string): unknown {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
 
 export type UserTurnPresentation = "user" | "shell" | "host" | "compaction" | "synthetic"
 
@@ -446,7 +452,7 @@ function toolPart(sessionID: string, messageID: string, tool: SessionMessageAssi
   const start = tool.time.ran ?? tool.time.created
   const state = (() => {
     if (tool.state.status === "streaming") {
-      const value = Option.getOrUndefined(decodeToolInput(tool.state.input))
+      const value = decodeToolInput(tool.state.input)
       const input = normalizeToolInput(tool.name, record(value) ? value : {})
       return { status: "pending" as const, input, raw: tool.state.input }
     }

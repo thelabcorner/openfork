@@ -18,7 +18,12 @@ export function resolvePromptPrimaryAction(input: {
   autoReviseBeforeSending: boolean
   revisionBusy: boolean
   revisionReadyForSend?: boolean
+  questionActive?: boolean
 }): PromptPrimaryAction {
+  // A pending question temporarily owns the composer. Its answer path is
+  // intentionally direct: no prompt-revision, queue, or stop semantics are
+  // allowed to steal the primary from the question controller.
+  if (input.questionActive) return input.canSubmit ? "submit" : "blocked"
   if (input.revisionBusy) return "blocked"
   if (input.working && !input.canSubmit) return "stop"
   if (

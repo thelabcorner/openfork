@@ -7,6 +7,7 @@ import type {
   GoalFocus,
   GoalFocusedGoal,
   GoalInfo,
+  GoalContinuationPolicy,
 } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
@@ -35,10 +36,8 @@ function normalizeFocusedGoal(value: FocusedGoal): FocusedGoal {
   if (value.auditorSessionID || value.automation?.phase !== "auditing") return value
   return { ...value, auditorSessionID: value.automation.auditorSessionID }
 }
-export type GoalArmIntent = {
-  /** Quick Goal Mode intentionally auto-continues by default. */
-  mode: "auto_continue" | "unattended"
-}
+/** Transient composer intent: Goal Mode is either armed or it is not. */
+export type GoalArmIntent = true
 
 export type GoalCreateAndFocusInput = {
   title: string
@@ -46,7 +45,7 @@ export type GoalCreateAndFocusInput = {
   criteria: string[]
   constraints?: string[]
   steps?: Array<{ title: string; description?: string }>
-  continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+  continuationPolicy?: GoalContinuationPolicy
   auditorPolicy?: GoalAuditorPolicy
   start?: boolean
 }
@@ -219,7 +218,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       sessionID: string,
       input: {
         objective: string
-        mode?: GoalArmIntent["mode"]
       },
     ) => {
       let current = state.focused[sessionID]
@@ -247,7 +245,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         // as structured Goals. The agent/verifier must still attach concrete
         // proof before this criterion can pass.
         criteria: ["The Goal objective is fully satisfied and the result is verified."],
-        continuationPolicy: { mode: input.mode ?? "auto_continue" },
         start: true,
       })
     }
@@ -259,8 +256,8 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       setArm(key: string, intent: GoalArmIntent | undefined) {
         setState("armed", key, intent)
       },
-      toggleArm(key: string, mode: GoalArmIntent["mode"] = "auto_continue") {
-        const next = state.armed[key] ? undefined : ({ mode } satisfies GoalArmIntent)
+      toggleArm(key: string) {
+        const next: GoalArmIntent | undefined = state.armed[key] ? undefined : true
         setState("armed", key, next)
         return next
       },
@@ -291,7 +288,7 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         objective: string
         criteria: string[]
         constraints?: string[]
-        continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+        continuationPolicy?: GoalContinuationPolicy
         auditorPolicy?: GoalAuditorPolicy
       }) {
         const response = await sdk().create(input, { throwOnError: true })
@@ -361,7 +358,7 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         )
         if (response.data) setState("focused", sessionID, "detail", response.data)
         // request_verification dispatches the independent auditor asynchronously
-        // in every continuation mode. Re-read after the dispatch response so a
+        // within the same Goal Mode runtime. Re-read after the dispatch response so a
         // fast audit-request/auditing event cannot be overwritten by the older
         // pre-dispatch Goal snapshot returned by the transition endpoint.
         if (action === "request_verification") {
@@ -385,20 +382,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
           },
           { throwOnError: true },
         )
-      },
-      async setContinuationMode(sessionID: string, mode: "manual" | "auto_continue" | "unattended") {
-        const current = state.focused[sessionID]
-        if (!current) throw new Error("No focused Goal")
-        const response = await sdk().update(
-          {
-            goalID: current.detail.goal.id,
-            expectedRevision: current.detail.goal.revision,
-            continuationPolicy: { ...current.detail.goal.continuationPolicy, mode },
-          },
-          { throwOnError: true },
-        )
-        if (response.data) setState("focused", sessionID, "detail", response.data)
-        return response.data
       },
       async setAuditorModel(sessionID: string, model: { providerID: string; modelID: string } | undefined) {
         const current = state.focused[sessionID]

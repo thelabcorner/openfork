@@ -7,10 +7,12 @@ import { ServerConnection, useServer } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
 import { useGlobal } from "@/context/global"
+import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { useSDK } from "@/context/sdk"
 import { useTabs } from "@/context/tabs"
 import { RoutePlaceholder } from "@/components/route-placeholder"
+import { swarmDict } from "@/i18n/en-swarm"
 import { createSessionLineage } from "@/pages/session/session-lineage"
 import {
   legacySessionHref,
@@ -25,6 +27,9 @@ const SessionRouteErrorBoundary = lazy(() =>
 )
 const TargetSessionRouteContent = lazy(() =>
   import("@/pages/session").then((module) => ({ default: module.TargetSessionRouteContent })),
+)
+const TargetSessionCenterRoute = lazy(() =>
+  import("@/pages/session").then((module) => ({ default: module.TargetSessionCenterRoute })),
 )
 const GroupTabPage = lazy(() => import("@/pages/group-tab"))
 const ErrorPage = lazy(() => import("@/pages/error").then((module) => ({ default: module.ErrorPage })))
@@ -98,6 +103,20 @@ export function TargetSessionRouteController() {
   )
 }
 
+/**
+ * Mobile/PWA variant of the canonical target-server route. Keep the visual
+ * center-column specialization inside the same server-key-scoped provider
+ * boundary as desktop so a deep link can never render one server's URL with
+ * another server's SDK/sync state.
+ */
+export function TargetSessionCenterRouteController() {
+  return (
+    <TargetServerRoute>
+      <TargetSessionCenterRoute suppressMobileTabs />
+    </TargetServerRoute>
+  )
+}
+
 export function LegacyTargetSessionRouteController() {
   const params = useParams<{ serverKey: string; id: string }>()
   const serverKey = createMemo(() => parseServerKey(params.serverKey))
@@ -133,6 +152,7 @@ function LegacyTargetSessionRedirect() {
 }
 
 export function GroupTabRouteController() {
+  useLanguage().registerTranslations(swarmDict)
   const params = useParams<{ serverKey: string; groupId: string; sessionId?: string }>()
   const global = useGlobal()
   const serverKey = createMemo(() => parseServerKey(params.serverKey))

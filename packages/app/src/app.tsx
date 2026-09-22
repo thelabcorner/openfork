@@ -45,6 +45,8 @@ import { OfxpServerSeedBridge } from "@/context/ofxp-server-seed-bridge"
 import { ServerSyncProvider } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
 import { LanguageProvider, type Locale, useLanguage } from "@/context/language"
+import { dict as appEnglish } from "@/i18n/en"
+import { DESKTOP_NATIVE_ENGLISH } from "@/i18n/desktop-native"
 import { LayoutProvider } from "@/context/layout"
 import { NotificationProvider } from "@/context/notification"
 import { PermissionProvider } from "@/context/permission"
@@ -54,7 +56,6 @@ import { SettingsProvider, useSettings } from "@/context/settings"
 import { TabsProvider } from "@/context/tabs"
 import { WslServersProvider } from "@/wsl/context"
 import { PersonalUsageProvider } from "@/context/personal-usage"
-import NewLayout from "@/pages/layout-new"
 import { RoutePlaceholder } from "@/components/route-placeholder"
 import { GenericContextMenuProvider } from "@/components/generic-context-menu"
 import { useCheckServerHealth } from "./utils/server-health"
@@ -65,6 +66,13 @@ import { requireServerKey } from "./utils/session-route"
 // route is never visited; session/usage/mobile in particular pull in large
 // editor, markdown, terminal, browser, and analytics subgraphs. Keep the home
 // and active desktop shell eager so first paint does not pay an extra chunk hop.
+const loadNewLayout = () => import("@/pages/layout-new")
+// Mobile never renders the desktop pane/titlebar shell, so keep it completely
+// out of the PWA core graph. Desktop/web still starts this request immediately
+// at module evaluation, preserving the previous eager-loading behavior while
+// allowing the bundler to isolate the shell from PWA consumers.
+const prefetchedNewLayout = import.meta.env.VITE_OPENCODE_PWA === "true" ? undefined : loadNewLayout()
+const NewLayout = lazy(() => prefetchedNewLayout ?? loadNewLayout())
 const LegacyLayout = lazy(() => import("@/pages/layout"))
 const MobileLayout = lazy(() => import("@/pages/layout-mobile"))
 const DirectoryLayout = lazy(() => import("@/pages/directory-layout"))
@@ -81,14 +89,14 @@ const ScheduledPage = lazy(() => import("@/pages/scheduled-page").then((m) => ({
 const SettingsPage = lazy(() =>
   import("@/components/settings-v2/settings-screen").then((m) => ({ default: m.SettingsScreen })),
 )
-const TargetSessionCenterRoute = lazy(() =>
-  import("@/pages/session").then((m) => ({ default: m.TargetSessionCenterRoute })),
-)
 const SessionRoute = lazy(() =>
   import("./app-session-routes").then((m) => ({ default: m.SessionRouteController })),
 )
 const TargetSessionRoute = lazy(() =>
   import("./app-session-routes").then((m) => ({ default: m.TargetSessionRouteController })),
+)
+const TargetSessionCenterRoute = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.TargetSessionCenterRouteController })),
 )
 const LegacyTargetSessionRoute = lazy(() =>
   import("./app-session-routes").then((m) => ({ default: m.LegacyTargetSessionRouteController })),
@@ -101,6 +109,7 @@ const NewLayoutLegacySessionRedirect = lazy(() =>
 )
 const File = lazy(() => import("@opencode-ai/session-ui/file").then((m) => ({ default: m.File })))
 const NewHome = lazy(() => import("@/pages/home").then((m) => ({ default: m.NewHome })))
+const MobileHome = lazy(() => import("@/pages/home-mobile").then((m) => ({ default: m.MobileHome })))
 const PwaPairEntry = lazy(() => import("@/components/pwa/pair-entry").then((m) => ({ default: m.PwaPairEntry })))
 const MarkdownTargetActions = lazy(() =>
   import("@/components/markdown-target-actions").then((m) => ({ default: m.MarkdownTargetActions })),
@@ -214,9 +223,10 @@ function LayoutCompatibility(props: ParentProps) {
   const navigate = useNavigate()
   const server = useServer()
   const settings = useSettings()
+  const platform = usePlatform()
 
   createEffect(() => {
-    if (settings.general.newLayoutDesigns()) return
+    if (platform.platform === "pwa" || settings.general.newLayoutDesigns()) return
     const current = server.current
     if (!current) return
     const protocol = global.ensureServerCtx(current).sdk.protocolKind()
@@ -264,11 +274,14 @@ function QueryProvider(props: ParentProps) {
 
 function BodyDesignClass() {
   const settings = useSettings()
+  const platform = usePlatform()
 
   createRenderEffect(() => {
     if (typeof document === "undefined") return
 
-    const enabled = settings.general.newLayoutDesigns()
+    // The PWA is a first-class V2 presentation surface, not an experiment
+    // controlled by the desktop layout preference stored in this browser.
+    const enabled = platform.platform === "pwa" || settings.general.newLayoutDesigns()
     document.body.toggleAttribute("data-new-layout", enabled)
     document.body.classList.toggle("text-12-regular", !enabled)
     document.body.classList.toggle("font-(family-name:--font-family-text)", enabled)
@@ -384,7 +397,12 @@ export function AppBaseProviders(
           setNativeTitlebarTheme({ mode, scheme })
         }}
       >
-        <LanguageProvider locale={props.locale} onNativeTranslations={props.onNativeTranslations}>
+        <LanguageProvider
+          locale={props.locale}
+          dictionary={appEnglish}
+          nativeEnglish={DESKTOP_NATIVE_ENGLISH}
+          onNativeTranslations={props.onNativeTranslations}
+        >
           <UiI18nBridge>
             <ErrorBoundary
               fallback={(error) => {
@@ -409,7 +427,9 @@ export function AppBaseProviders(
   )
 }
 
-function ConnectionGate(props: ParentProps<{ disableHealthCheck?: boolean; startup?: Promise<void> }>) {
+function ConnectionGate(
+  props: ParentProps<{ disableHealthCheck?: boolean; startup?: Promise<void>; showPwaPairEntry?: boolean }>,
+) {
   const server = useServer()
   const checkServerHealth = useCheckServerHealth()
 
@@ -457,6 +477,7 @@ function ConnectionGate(props: ParentProps<{ disableHealthCheck?: boolean; start
           when={startupHealthCheck.latest}
           fallback={
             <ConnectionError
+              showPwaPairEntry={props.showPwaPairEntry}
               onRetry={() => {
                 if (checkMode() === "background") void healthCheckActions.refetch()
               }}
@@ -480,7 +501,11 @@ function ConnectionGate(props: ParentProps<{ disableHealthCheck?: boolean; start
   )
 }
 
-function ConnectionError(props: { onRetry?: () => void; onServerSelected?: (key: ServerConnection.Key) => void }) {
+function ConnectionError(props: {
+  onRetry?: () => void
+  onServerSelected?: (key: ServerConnection.Key) => void
+  showPwaPairEntry?: boolean
+}) {
   const language = useLanguage()
   const server = useServer()
   const pwa = usePlatform().platform === "pwa"
@@ -504,7 +529,7 @@ function ConnectionError(props: { onRetry?: () => void; onServerSelected?: (key:
         <p class="mt-1 text-12-regular text-text-weak">{language.t("app.server.retrying")}</p>
       </div>
       {/* PWA pairing fallback: manual 6-char code entry on the connect surface (task p3). */}
-      <Show when={pwa}>
+      <Show when={pwa && props.showPwaPairEntry !== false}>
         <Suspense>
           <PwaPairEntry />
         </Suspense>
@@ -549,8 +574,10 @@ export function AppInterface(props: {
   defaultServer: ServerConnection.Key
   canonicalLocalServer?: ServerConnection.Key
   servers?: Array<ServerConnection.Any>
+  includeStoredServers?: boolean
   router?: Component<BaseRouterProps>
   disableHealthCheck?: boolean
+  showPwaPairEntry?: boolean
   startup?: Promise<void>
   serverScoped?: JSX.Element
 }) {
@@ -572,10 +599,15 @@ export function AppInterface(props: {
       defaultServer={props.defaultServer}
       canonicalLocalServer={props.canonicalLocalServer}
       servers={props.servers}
+      includeStoredServers={props.includeStoredServers}
     >
       <GlobalProvider>
         <SettingsProvider>
-          <ConnectionGate disableHealthCheck={props.disableHealthCheck} startup={props.startup}>
+          <ConnectionGate
+            disableHealthCheck={props.disableHealthCheck}
+            startup={props.startup}
+            showPwaPairEntry={props.showPwaPairEntry}
+          >
             <Dynamic
               component={props.router ?? Router}
               root={(routerProps) => (
@@ -621,6 +653,7 @@ export function AppInterface(props: {
 function Routes(props: { serverScoped?: JSX.Element }) {
   const settings = useSettings()
   const pwa = usePlatform().platform === "pwa"
+  const modern = () => pwa || settings.general.newLayoutDesigns()
 
   return (
     <>
@@ -629,7 +662,7 @@ function Routes(props: { serverScoped?: JSX.Element }) {
           <LegacyServerLayout serverScoped={props.serverScoped}>{routeProps.children}</LegacyServerLayout>
         )}
       >
-        <Show when={!settings.general.newLayoutDesigns()}>
+        <Show when={!modern()}>
           {
             <>
               <Route path="/" component={LegacyHome} />
@@ -642,8 +675,8 @@ function Routes(props: { serverScoped?: JSX.Element }) {
           <Route path="/session/:id?" component={SessionRoute} />
         </Route>
       </Route>
-      <Show when={settings.general.newLayoutDesigns()}>
-        <Route path="/" component={NewHome} />
+      <Show when={modern()}>
+        <Route path="/" component={pwa ? MobileHome : NewHome} />
         <Route path="/usage" component={UsagePage} />
         <Route path="/oxp" component={OxpActivityLandingPage} />
         <Route path="/oxp/activity/:activityID" component={OxpActivityPage} />
@@ -652,9 +685,7 @@ function Routes(props: { serverScoped?: JSX.Element }) {
         <Route
           path="/server/:serverKey/session/:id"
           component={
-            pwa
-              ? () => <TargetSessionCenterRoute suppressMobileTabs />
-              : TargetSessionRoute
+            pwa ? TargetSessionCenterRoute : TargetSessionRoute
           }
         />
         <Route path="/server/:serverKey/group/:groupId/session/:sessionId" component={GroupTabRoute} />

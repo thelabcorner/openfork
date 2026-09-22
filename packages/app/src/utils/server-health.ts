@@ -1,8 +1,7 @@
 import { usePlatform } from "@/context/platform"
 import { ServerConnection } from "@/context/server"
-import { authTokenFromCredentials, createSdkForServer } from "./server"
+import { createApiForServer, createSdkForServer } from "./server"
 import { forgetServerStreamLiveness, isServerStreamLive } from "./server-liveness"
-import { ClientError, OpenCode } from "@opencode-ai/client"
 import { Accessor, createEffect, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import type { OfxpSettingsServerSeed } from "@opencode-ai/sdk/v2/client"
@@ -71,7 +70,9 @@ function wait(ms: number, signal?: AbortSignal) {
 
 function retryable(error: unknown, signal?: AbortSignal) {
   if (signal?.aborted) return false
-  if (error instanceof ClientError) return error.reason === "Transport"
+  if (error !== null && typeof error === "object" && "reason" in error) {
+    return (error as { reason?: unknown }).reason === "Transport"
+  }
   if (!(error instanceof Error)) return false
   if (error.name === "AbortError" || error.name === "TimeoutError") return false
   if (error instanceof TypeError) return true
@@ -94,15 +95,7 @@ export async function checkServerHealth(
       .catch(() => ({ healthy: false }))
   }
   const attempt = async (count: number): Promise<ServerHealth> => {
-    const current = await OpenCode.make({
-      baseUrl: server.url,
-      fetch,
-      headers: server.password
-        ? {
-            Authorization: `Basic ${authTokenFromCredentials({ username: server.username, password: server.password })}`,
-          }
-        : undefined,
-    })
+    const current = await createApiForServer({ server, fetch })
       .health.get({ signal })
       .then((x) =>
         typeof x.healthy === "boolean"

@@ -75,7 +75,6 @@ import { perf } from "./perf"
 import { phaseTrace } from "./phase-trace"
 import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
 import type { Info as SessionTelemetryInfo } from "@opencode-ai/schema/session-telemetry"
-import { SessionID } from "@opencode-ai/schema/session-id"
 
 type GlobalStore = {
   ready: boolean
@@ -498,7 +497,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const applyTelemetry = (items: Iterable<SessionTelemetryWire>) => {
     batch(() => {
       for (const wire of items) {
-        const item: SessionTelemetryInfo = { ...wire, sessionID: SessionID.make(wire.sessionID) }
+        // SessionID's runtime schema only enforces the stable "ses" prefix.
+        // Keep that validation on untrusted transport data without pulling the
+        // Effect schema runtime into every connected PWA launch.
+        if (!wire.sessionID.startsWith("ses")) continue
+        const sessionID = wire.sessionID as SessionTelemetryInfo["sessionID"]
+        const item: SessionTelemetryInfo = { ...wire, sessionID }
         telemetryKnown.add(wire.sessionID)
         setGlobalStore("telemetry", wire.sessionID, reconcile(item))
       }

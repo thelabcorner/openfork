@@ -96,6 +96,45 @@ describe("OFXP configured-server seed projection", () => {
     expect(request?.headers.get("authorization")).toBeNull()
   })
 
+  test("treats the advertised public origin as ingress, not an OFXP wire endpoint", async () => {
+    const connection: ServerConnection.Http = { type: "http", http: { url: "https://api.example.com" } }
+    const fetcher = (async () =>
+      Response.json({ ...projection, ofxp: { ...projection.ofxp, publicOrigin: "https://api.example.com" } })) as unknown as
+      typeof globalThis.fetch
+
+    const probed = await probeConfiguredServerOfxp(connection, fetcher)
+    expect(probed?.ofxp).toMatchObject({
+      enabled: true,
+      publicOrigin: "https://api.example.com",
+      compatible: true,
+    })
+    expect(probed?.seed).toBeUndefined()
+    expect(await probeConfiguredServerOfxpSeed(connection, fetcher)).toBeUndefined()
+  })
+
+  test("keeps the wire seed for a direct connection while advertising the ingress origin", async () => {
+    const connection: ServerConnection.Http = { type: "http", http: { url: "https://192.168.1.10:4096" } }
+    const fetcher = (async () =>
+      Response.json({ ...projection, ofxp: { ...projection.ofxp, publicOrigin: "https://api.example.com" } })) as unknown as
+      typeof globalThis.fetch
+
+    expect(await probeConfiguredServerOfxpSeed(connection, fetcher)).toEqual({
+      id: "configured:https://192.168.1.10:4096",
+      peerID,
+      realmID: "realm:remote",
+      openforkVersion: "1.18.30",
+      protocolVersion: 1,
+      pairing: true,
+      endpoint: { host: "192.168.1.10", port: 9443 },
+    })
+  })
+
+  test("rejects a malformed advertised public origin", () => {
+    expect(
+      parseInstanceOfxpProjection({ ...projection, ofxp: { ...projection.ofxp, publicOrigin: "javascript:alert(1)" } }),
+    ).toBeUndefined()
+  })
+
   test("uses the real SSH host for seeds while still probing local identities", async () => {
     const ssh: ServerConnection.Ssh = {
       type: "ssh",
@@ -119,7 +158,7 @@ describe("OFXP configured-server seed projection", () => {
     const fetcher = (async () => {
       calls++
       return Response.json(projection)
-    }) as typeof globalThis.fetch
+    }) as unknown as typeof globalThis.fetch
     expect(await probeConfiguredServerOfxpSeed(sidecar, fetcher)).toBeUndefined()
     expect(await probeConfiguredServerOfxpSeed(loopback, fetcher)).toBeUndefined()
     expect(calls).toBe(2)

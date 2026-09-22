@@ -36,7 +36,12 @@ import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-
 import type { QuestionDetailsBinding } from "@/pages/session/composer/question-controller"
 import { questionDetailsText } from "@/pages/session/composer/question-details"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
-import { createLiveGenerationRate, type LiveGenerationRateState } from "@/components/prompt-input/live-generation-rate"
+import {
+  createLiveGenerationRate,
+  type LiveGenerationRateState,
+  useLiveTelemetryNow,
+} from "@/components/prompt-input/live-generation-rate"
+import "@/components/prompt-input/send-turn-lane.css"
 import {
   isPromptTextRevisable,
   promptOneShotRevisionAction,
@@ -65,6 +70,7 @@ import { useSDK } from "@/context/sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
 import { useSettings } from "@/context/settings"
+import { useServerSync } from "@/context/server-sync"
 import { SessionUsageWarningBanner } from "@/components/session-usage-warning-banner"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
@@ -129,11 +135,13 @@ export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
   readonly autoAccept: { active: () => boolean; toggle: () => void }
   readonly liveRate: () => LiveGenerationRateState
+  readonly sessionID: () => string | undefined
   readonly revisionSend: {
     autoBeforeSend: () => boolean
     setAutoBeforeSend: (value: boolean) => void
     autoSendAfterRevision: () => boolean
     setAutoSendAfterRevision: (value: boolean) => void
+    available: () => boolean
     busy: () => boolean
     readyForSend: () => boolean
     register: (registration: PromptRevisionSendRegistration) => () => void
@@ -213,11 +221,21 @@ type PromptRevisionFlow = {
   restoreBefore: ReturnType<PromptInputV2ComposerController["parts"]>
   restoreDraft: string
   guidance?: string
-  model?: { providerID: string; id: string; variant?: string }
-  fallbackModel?: { providerID: string; id: string; variant?: string }
+  model?: { providerID: string; id: string; accountID?: string; variant?: string }
+  fallbackModel?: { providerID: string; id: string; accountID?: string; variant?: string }
   directory: string
   sessionID?: string
   target: RevisionDraftTarget
+}
+
+function promptRevisionModelRef(providerID: string, qualifiedModelID: string, variant?: string) {
+  const split = splitModelIDForProvider(qualifiedModelID, providerID)
+  return {
+    providerID,
+    id: split.baseModelID,
+    ...(split.accountID ? { accountID: split.accountID } : {}),
+    ...(variant ? { variant } : {}),
+  }
 }
 
 function PromptRevisionBusyIcon() {
@@ -643,7 +661,7 @@ function PromptInputV2RevisionControl(props: {
 
   const run = async (extra?: string, intent: PromptRevisionFlow["intent"] = "review") => {
     const draft = props.controller.value()
-    if (busy() || !draft.trim()) return
+    if (busy() || props.controller.questionActive() || props.controller.state.mode !== "normal" || !draft.trim()) return
     const token = ++request
     const before = props.controller.parts().map((part) => ({ ...part })) as ReturnType<
       PromptInputV2ComposerController["parts"]
@@ -663,7 +681,10 @@ function PromptInputV2RevisionControl(props: {
     )
       return
     const priorRestore = restorable()
-    const configured = modelOverride() ?? settings.general.promptRevision()?.model
+    // Persistent Prompt Revisor model selection is owned by the canonical
+    // `prompt-revisor` agent configuration on the server. The request-level
+    // model is reserved for an explicit one-shot override from this control.
+    const configured = modelOverride()
     const current = props.controller.model.selection.current()
     const variant = props.controller.model.selection.variant.current()
     if (intent === "send") setOpen(false)
@@ -676,8 +697,8 @@ function PromptInputV2RevisionControl(props: {
       restoreBefore: priorRestore?.before ?? before,
       restoreDraft: priorRestore?.text ?? draft,
       guidance: extra?.trim() || undefined,
-      model: configured ? { providerID: configured.providerID, id: configured.modelID } : undefined,
-      fallbackModel: current ? { providerID: current.provider.id, id: current.id, variant } : undefined,
+      model: configured ? promptRevisionModelRef(configured.providerID, configured.modelID) : undefined,
+      fallbackModel: current ? promptRevisionModelRef(current.provider.id, current.id, variant) : undefined,
       directory,
       sessionID: props.sessionID,
       target: {
@@ -707,7 +728,18 @@ function PromptInputV2RevisionControl(props: {
   })
   onCleanup(unregisterRevisionSend)
 
-  const hasDraft = () => props.controller.state.mode === "normal" && props.controller.value().trim().length > 0
+  const hasDraft = () =>
+    props.controller.state.mode === "normal" &&
+    !props.controller.questionActive() &&
+    props.controller.value().trim().length > 0
+
+  // A guidance popover opened for one composer owner must never survive a
+  // transition into shell mode, question ownership, or an emptied draft. Apart
+  // from looking stale, its keyboard shortcut would otherwise remain an
+  // alternate entry point into revision after the primary policy changed.
+  createEffect(() => {
+    if (!hasDraft()) setOpen(false)
+  })
 
   return (
     <div data-prompt-revision-split-control="" class="flex shrink-0 items-center">
@@ -754,7 +786,7 @@ function PromptInputV2RevisionControl(props: {
           type: "button",
           size: "large",
           variant: "ghost-muted",
-          disabled: busy(),
+          disabled: busy() || !hasDraft(),
           "aria-label": language.t("prompt.revision.guidance.open"),
           class: "shrink-0 !w-5 !rounded-l-[3px]",
         }}
@@ -778,7 +810,6 @@ function PromptInputV2RevisionControl(props: {
                     value={modelOverride()}
                     defaultLabel={language.t("prompt.revision.model.inherit")}
                     compact
-                    lightweightSelector
                     onChange={setModelOverride}
                   />
                 </div>
@@ -819,16 +850,56 @@ function PromptInputV2RevisionControl(props: {
   )
 }
 
+const PROMPT_MIN_VISIBLE_TURN_MS = 340
+const PROMPT_SETTLED_VISIBLE_MS = 900
+
+type PromptTurnBaton = "none" | "arming" | "stop" | "stopping" | "settled"
+
+function promptTurnElapsedLabel(ms: number) {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms / 100) * 100) / 1000}s`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const minutes = Math.floor(ms / 60_000)
+  const seconds = Math.floor((ms % 60_000) / 1000)
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`
+}
+
+function PromptQueueGlyph() {
+  return (
+    <svg data-slot="icon-svg" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path
+        fill-rule="evenodd"
+        clip-rule="evenodd"
+        d="M9.99991 1.74121L16.0921 7.83343L15.2083 8.71731L10.6249 4.13397V14.4001H9.37492V4.13398L4.7916 8.71731L3.90771 7.83343L9.99991 1.74121Z"
+        fill="currentColor"
+      />
+      <path d="M4 17.25H16" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
+    </svg>
+  )
+}
+
+function PromptStoppingGlyph() {
+  return (
+    <svg data-slot="icon-svg" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="5.25" y="5.25" width="5.5" height="5.5" stroke="currentColor" stroke-width="1.25" />
+    </svg>
+  )
+}
+
 function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerController }) {
   const language = useLanguage()
+  const serverSync = useServerSync()
   const mode = () => props.controller.state.mode
   const working = () => props.controller.view.submit.working?.() ?? false
   const canSubmit = () => props.controller.canSubmit()
   const autoRevise = () => props.controller.revisionSend.autoBeforeSend()
   const autoSend = () => props.controller.revisionSend.autoSendAfterRevision()
   const revisionBusy = () => props.controller.revisionSend.busy()
+  const revisionAvailable = () => props.controller.revisionSend.available()
   const revisionReadyForSend = () => props.controller.revisionSend.readyForSend()
+  const questionActive = () => props.controller.questionActive()
   const hasRevisableText = () => isPromptTextRevisable(props.controller.value())
+  const revisorArmed = () => autoRevise() && mode() === "normal"
+  const revisorOwnsPrimary = () => revisionBusy() && mode() === "normal" && !questionActive()
   const action = createMemo(() =>
     resolvePromptPrimaryAction({
       mode: mode(),
@@ -838,21 +909,39 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
       autoReviseBeforeSending: autoRevise(),
       revisionBusy: revisionBusy(),
       revisionReadyForSend: revisionReadyForSend(),
+      questionActive: questionActive(),
     }),
   )
   const oneShot = createMemo(() => promptOneShotRevisionAction(autoRevise()))
   const menuAvailable = () => working() || mode() === "normal"
-  const primaryDisabled = () => action() === "blocked" || (!canSubmit() && action() !== "stop")
+  const revisionUnavailable = () => action() === "revise" && !revisionAvailable()
+  const primaryDisabled = () =>
+    action() === "blocked" || action() === "stop" || !canSubmit() || revisionUnavailable()
+  const unavailable = () => mode() === "normal" && !canSubmit() && !props.controller.model.selection.current()
   const primaryLabel = () => {
-    if (revisionBusy()) return language.t("prompt.revision.send.revising")
-    if (action() === "stop") return language.t("prompt.action.stop")
+    if (questionActive()) return language.t("prompt.action.send")
+    if (revisionUnavailable()) return language.t("prompt.revision.send.unavailableAction")
+    if (revisorOwnsPrimary()) return language.t("prompt.revision.send.revising")
     if (action() === "revise")
       return autoSend()
         ? language.t("prompt.revision.send.reviseAndSend")
         : language.t("prompt.revision.send.reviseBeforeSend")
+    if (revisionReadyForSend())
+      return working()
+        ? language.t("prompt.revision.send.stagedNext")
+        : language.t("prompt.revision.send.staged")
+    if (working() && canSubmit()) return language.t("prompt.turnLane.sendNext")
+    if (unavailable()) return language.t("prompt.turnLane.unavailable")
     return language.t("prompt.action.send")
   }
+  const optionsLabel = () => {
+    if (!revisorArmed()) return language.t("prompt.revision.send.options")
+    return autoSend()
+      ? language.t("prompt.revision.send.options.autoSend")
+      : language.t("prompt.revision.send.options.autoRevise")
+  }
   const sendOneShot = () => {
+    if (questionActive()) return
     if (oneShot() === "send-without-revisor") {
       props.controller.revisionSend.sendWithoutRevision()
       return
@@ -860,119 +949,262 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
     props.controller.revisionSend.sendWithRevision()
   }
 
+  const telemetry = () => {
+    const id = props.controller.sessionID()
+    return id ? serverSync().telemetry.get(id) : undefined
+  }
+  createEffect(() => {
+    const id = props.controller.sessionID()
+    if (!id || !working()) return
+    serverSync().telemetry.ensure([id])
+  })
+
+  const [presentation, setPresentation] = createSignal<{ startedAt?: number; completedAt?: number }>()
+  const [stopping, setStopping] = createSignal(false)
+  const [launchAt, setLaunchAt] = createSignal<number>()
+  const now = useLiveTelemetryNow(() => working() || presentation()?.completedAt !== undefined)
+
+  createEffect(() => {
+    const startedAt = telemetry()?.turnStartedAt
+    if (startedAt === undefined) return
+    setPresentation((current) => {
+      if (current?.startedAt === startedAt) return current
+      return { startedAt, ...(working() ? {} : current?.completedAt === undefined ? {} : { completedAt: current.completedAt }) }
+    })
+  })
+
+  createEffect(
+    on(
+      working,
+      (next, previous) => {
+        if (next) {
+          setStopping(false)
+          setPresentation({ startedAt: telemetry()?.turnStartedAt })
+          if (previous === false) setLaunchAt(Date.now())
+          return
+        }
+        if (!previous) return
+        setStopping(false)
+        const completedAt = Date.now()
+        setPresentation((current) => ({
+          startedAt: current?.startedAt ?? telemetry()?.turnStartedAt,
+          completedAt,
+        }))
+      },
+      { defer: true },
+    ),
+  )
+
+  createEffect(() => {
+    const current = presentation()
+    if (working() || current?.completedAt === undefined) return
+    const startedAt = current.startedAt ?? current.completedAt
+    const deadline = Math.max(current.completedAt + PROMPT_SETTLED_VISIBLE_MS, startedAt + PROMPT_MIN_VISIBLE_TURN_MS)
+    if (now() < deadline) return
+    setPresentation(undefined)
+  })
+
+  const baton = createMemo<PromptTurnBaton>(() => {
+    if (working()) {
+      if (stopping()) return "stopping"
+      const current = telemetry()
+      if (!current || current.phase === "requesting" || current.phase === "retrying") return "arming"
+      return "stop"
+    }
+    const current = presentation()
+    if (current?.completedAt === undefined) return "none"
+    const startedAt = current.startedAt ?? current.completedAt
+    if (current.completedAt < startedAt + PROMPT_MIN_VISIBLE_TURN_MS && now() < startedAt + PROMPT_MIN_VISIBLE_TURN_MS)
+      return "stop"
+    return "settled"
+  })
+  const turnLive = () => baton() !== "none"
+  const interruptible = () => working() && !stopping()
+  const elapsedMs = createMemo(() => {
+    const current = presentation()
+    const startedAt = telemetry()?.turnStartedAt ?? current?.startedAt
+    if (startedAt === undefined) return 0
+    const end = working() ? now() : (current?.completedAt ?? now())
+    return Math.max(0, end - startedAt)
+  })
+  const batonLabel = () => {
+    if (baton() === "stopping") return language.t("prompt.turnLane.stopping")
+    if (baton() === "arming") return language.t("prompt.turnLane.starting")
+    if (baton() === "settled") return language.t("prompt.turnLane.done")
+    return language.t("prompt.action.stop")
+  }
+  const sendGlyph = () => {
+    if (questionActive()) return "send"
+    if (revisorOwnsPrimary() || action() === "revise") return "revise"
+    if (mode() === "shell") return "shell"
+    if (working() && canSubmit()) return "queue"
+    return "send"
+  }
+  const launching = () => {
+    const value = launchAt()
+    return value !== undefined && working() && now() - value < 260
+  }
+  const interrupt = () => {
+    if (!interruptible()) return
+    setStopping(true)
+    props.controller.stop()
+  }
+
   return (
-    <div
-      data-prompt-send-split=""
-      data-auto-revise={autoRevise() ? "true" : "false"}
-      data-auto-send-after-revision={autoSend() ? "true" : "false"}
-      data-revision-busy={revisionBusy() ? "true" : "false"}
-      class="relative size-[30px] shrink-0"
-    >
-      {/* The disclosure is embedded into the main surface instead of extending
-       * the outer silhouette. The control is a true 30x30 square. The pocket is
-       * intentionally a little larger than the source-SVG scale for legibility;
-       * its top-left and bottom-right stay square while only its smaller
-       * top-right and larger bottom-left arcs round. */}
-      <svg
-        aria-hidden="true"
-        class="pointer-events-none absolute inset-0 z-0 overflow-visible"
-        viewBox="0 0 30 30"
-        fill="none"
-        style={{
-          filter: "drop-shadow(0 1px 2px color-mix(in srgb, var(--v2-background-bg-deep) 38%, transparent))",
-        }}
+    <div data-slot="prompt-turn-lane">
+      <div
+        data-slot="prompt-turn-group"
+        data-live={turnLive() ? "true" : "false"}
+        style={{ width: turnLive() ? "86px" : "0px" }}
+        inert={turnLive() ? undefined : true}
       >
-        <rect
-          x="0.5"
-          y="0.5"
-          width="29"
-          height="29"
-          rx="8"
-          ry="8"
-          fill="var(--v2-background-bg-layer-02)"
-        />
-        <path
-          d="M0.5 18.5H8C9.933 18.5 11.5 20.067 11.5 22V29.5H8.5C4.082 29.5 0.5 25.918 0.5 21.5V18.5Z"
-          fill="color-mix(in srgb, var(--v2-background-bg-layer-02) 68%, var(--v2-background-bg-deep) 32%)"
-        />
-        <rect
-          x="0.5"
-          y="0.5"
-          width="29"
-          height="29"
-          rx="8"
-          ry="8"
-          fill="none"
-          stroke="var(--v2-border-border-muted)"
-          stroke-width="1"
-        />
-      </svg>
-
-      <TooltipV2 placement="top" gutter={4} value={primaryLabel()}>
-        <IconButtonV2
-          data-action="prompt-submit"
-          type="button"
-          size="large"
-          variant="ghost"
-          disabled={primaryDisabled()}
-          tabIndex={mode() === "normal" ? undefined : -1}
-          aria-label={primaryLabel()}
-          class={`absolute inset-0 z-[2] shrink-0 !size-[30px] !rounded-[8px] !bg-transparent !text-v2-icon-icon-base !shadow-none hover:!bg-transparent active:!bg-transparent ${
-            action() === "stop" ? "!text-v2-state-fg-danger" : ""
-          }`}
-          icon={
-            <Show
-              when={revisionBusy()}
-              fallback={
-                <Show
-                  when={action() === "stop"}
-                  fallback={
-                    <Show when={mode() === "shell"} fallback={<Icon name="arrow-up" size="small" />}>
-                      <Icon name="arrow-undo-down" size="small" />
-                    </Show>
-                  }
-                >
-                  <Icon name="stop" size="small" />
-                </Show>
-              }
-            >
-              <PromptRevisionBusyIcon />
-            </Show>
+        <span data-slot="prompt-turn-clock" data-settled={baton() === "settled" ? "true" : "false"} aria-hidden="true">
+          {promptTurnElapsedLabel(elapsedMs())}
+        </span>
+        <TooltipV2
+          placement="top"
+          gutter={5}
+          inactive={!interruptible()}
+          value={
+            <span class="flex items-center gap-1.5">
+              <span>{batonLabel()}</span>
+              <KeybindV2 keys={["Esc"]} variant="ghost" />
+            </span>
           }
-          onClick={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-            props.controller.submit()
-            requestAnimationFrame(() => props.controller.restoreFocus())
-          }}
-        />
-      </TooltipV2>
-
+        >
+          <button
+            type="button"
+            data-slot="prompt-turn-baton"
+            data-quiet={baton() === "arming" || baton() === "stopping" || baton() === "settled" ? "true" : "false"}
+            aria-label={batonLabel()}
+            aria-disabled={interruptible() ? undefined : "true"}
+            tabIndex={turnLive() ? undefined : -1}
+            onClick={(event) => {
+              event.preventDefault()
+              interrupt()
+            }}
+          >
+            <svg
+              data-slot="prompt-turn-arc"
+              data-frozen={baton() === "stopping" || baton() === "settled" ? "true" : "false"}
+              viewBox="0 0 28 28"
+              fill="none"
+              aria-hidden="true"
+            >
+              <rect data-slot="prompt-turn-track" x="0.5" y="0.5" width="27" height="27" rx="7.5" stroke-width="1" />
+              <rect
+                data-slot="prompt-turn-runner"
+                x="0.5"
+                y="0.5"
+                width="27"
+                height="27"
+                rx="7.5"
+                stroke-width="1"
+                stroke-linecap="round"
+                pathLength="100"
+              />
+            </svg>
+            <Show when={baton() === "arming"}>
+              <span data-slot="prompt-turn-charge" aria-hidden="true" />
+            </Show>
+            <span data-slot="prompt-turn-glyph-stack">
+              <span data-active={baton() === "stop" || baton() === "arming" ? "true" : "false"}>
+                <Icon name="stop" size="small" />
+              </span>
+              <span data-active={baton() === "stopping" ? "true" : "false"}>
+                <PromptStoppingGlyph />
+              </span>
+              <span data-active={baton() === "settled" ? "true" : "false"}>
+                <Icon name="check" size="small" class="opacity-60" />
+              </span>
+            </span>
+          </button>
+        </TooltipV2>
+      </div>
       <MenuV2
         gutter={6}
         modal={false}
-        placement="top-start"
+        placement="top-end"
         onOpenChange={(open) => {
           if (!open) requestAnimationFrame(() => props.controller.restoreFocus())
         }}
       >
-        <MenuV2.Trigger
-          as={IconButtonV2}
-          type="button"
-          size="small"
-          variant="ghost-muted"
-          disabled={!menuAvailable()}
-          data-action="prompt-send-options"
-          aria-label={language.t("prompt.revision.send.options")}
-          class={`absolute bottom-0 left-0 z-[3] !size-[11px] !rounded-none !rounded-bl-[8px] !rounded-tr-[3.5px] !bg-transparent !shadow-none hover:!bg-v2-overlay-simple-overlay-hover hover:!text-v2-icon-icon-base ${
-            autoRevise() && mode() === "normal" ? "!text-v2-icon-icon-accent" : "!text-v2-icon-icon-faint"
-          }`}
-          icon={<Icon name="chevron-down" size="small" class="size-[7px]" />}
-        />
+        <div data-slot="prompt-send-group">
+          <TooltipV2 placement="top" gutter={6} inactive={!menuAvailable()} value={optionsLabel()}>
+            <MenuV2.Trigger
+              as="button"
+              type="button"
+              data-slot="prompt-send-tab"
+              data-action="prompt-send-options"
+              data-armed={revisorArmed() ? "true" : "false"}
+              data-pinned={revisorArmed() ? "true" : "false"}
+              data-auto-send={revisorArmed() && autoSend() ? "true" : "false"}
+              aria-label={optionsLabel()}
+              aria-disabled={menuAvailable() ? undefined : "true"}
+              disabled={!menuAvailable()}
+              tabIndex={menuAvailable() ? undefined : -1}
+            >
+              <Icon name="chevron-down" size="small" class="!size-[7px]" />
+            </MenuV2.Trigger>
+          </TooltipV2>
+          <TooltipV2
+            placement="top"
+            gutter={6}
+            inactive={primaryDisabled() && !revisorOwnsPrimary() && !revisionUnavailable()}
+            value={
+              <span class="flex items-center gap-1.5">
+                <span>{primaryLabel()}</span>
+                <KeybindV2 keys={["Enter"]} variant="ghost" />
+              </span>
+            }
+          >
+            <button
+              type="button"
+              data-slot="prompt-send-primary"
+              data-action="prompt-submit"
+              data-busy={revisorOwnsPrimary() ? "true" : undefined}
+              aria-label={primaryLabel()}
+              aria-disabled={primaryDisabled() ? "true" : undefined}
+              tabIndex={mode() === "normal" ? undefined : -1}
+              onClick={(event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                if (primaryDisabled()) return
+                if (action() === "submit") setLaunchAt(Date.now())
+                props.controller.submit()
+                requestAnimationFrame(() => props.controller.restoreFocus())
+              }}
+            >
+              <span data-slot="prompt-send-launch" data-launching={launching() ? "true" : "false"}>
+                <span data-slot="prompt-send-glyph-stack">
+                  <span data-active={sendGlyph() === "send" ? "true" : "false"}>
+                    <Icon name="arrow-up" size="small" />
+                  </span>
+                  <span data-active={sendGlyph() === "queue" ? "true" : "false"}>
+                    <PromptQueueGlyph />
+                  </span>
+                  <span data-active={sendGlyph() === "shell" ? "true" : "false"}>
+                    <Icon name="arrow-undo-down" size="small" />
+                  </span>
+                  <span data-active={sendGlyph() === "revise" ? "true" : "false"}>
+                    <Icon
+                      name="pencil-sparkles"
+                      size="small"
+                      data-slot={revisorOwnsPrimary() ? "prompt-send-revising" : undefined}
+                    />
+                  </span>
+                </span>
+              </span>
+              <Show when={revisionReadyForSend() && !questionActive() && !revisorOwnsPrimary()}>
+                <span data-slot="prompt-send-staged" aria-hidden="true" />
+              </Show>
+            </button>
+          </TooltipV2>
+        </div>
         <MenuV2.Portal>
           <MenuV2.Content>
             <Show when={working()}>
-              <MenuV2.Item shortcut="Esc" onSelect={() => props.controller.stop()}>
+              <MenuV2.Item shortcut="Esc" onSelect={interrupt}>
                 <span class="text-v2-state-text-danger">{language.t("prompt.revision.send.stopCurrent")}</span>
               </MenuV2.Item>
               <Show when={mode() === "normal"}>
@@ -981,7 +1213,12 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
             </Show>
             <Show when={mode() === "normal"}>
               <MenuV2.Item
-                disabled={!canSubmit() || revisionBusy() || (oneShot() === "send-with-revisor" && !hasRevisableText())}
+                disabled={
+                  questionActive() ||
+                  !canSubmit() ||
+                  revisionBusy() ||
+                  (oneShot() === "send-with-revisor" && (!hasRevisableText() || !revisionAvailable()))
+                }
                 onSelect={sendOneShot}
               >
                 {oneShot() === "send-without-revisor"
@@ -1303,7 +1540,8 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
   const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
-  const liveRate = createLiveGenerationRate({ sessionID: () => props.controls.session.id, working })
+  const sessionID = () => props.controls.session.id
+  const liveRate = createLiveGenerationRate({ sessionID, working })
   const attachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -1438,7 +1676,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
 
   let controller!: PromptInputV2ComposerController
-  let revisionSendRegistration: PromptRevisionSendRegistration | undefined
+  const [revisionSendRegistration, setRevisionSendRegistration] = createSignal<PromptRevisionSendRegistration>()
   const autoReviseBeforeSending = () => settings.general.promptRevision()?.autoBeforeSend === true
   const autoSendAfterRevision = () =>
     autoReviseBeforeSending() && settings.general.promptRevision()?.autoSendAfterRevision === true
@@ -1460,7 +1698,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     })
   }
   const directSubmit = () => {
-    revisionSendRegistration?.cancel()
+    revisionSendRegistration()?.cancel()
     return submission.handleSubmit(new Event("submit"))
   }
   const revisionUnavailable = () =>
@@ -1470,12 +1708,12 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       description: language.t("prompt.revision.send.unavailable"),
     })
   const runRevision = (intent: PromptRevisionFlow["intent"]) => {
-    if (mode() !== "normal" || !controller.canSubmit()) return
+    if (mode() !== "normal" || questionActive() || !controller.canSubmit()) return
     if (!isPromptTextRevisable(controller.value())) {
       void directSubmit()
       return
     }
-    const registration = revisionSendRegistration
+    const registration = revisionSendRegistration()
     if (!registration) {
       revisionUnavailable()
       return
@@ -1489,12 +1727,13 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     setAutoBeforeSend: setAutoReviseBeforeSending,
     autoSendAfterRevision,
     setAutoSendAfterRevision,
-    busy: () => revisionSendRegistration?.busy() ?? false,
-    readyForSend: () => revisionSendRegistration?.readyForSend() ?? false,
+    available: () => revisionSendRegistration() !== undefined,
+    busy: () => revisionSendRegistration()?.busy() ?? false,
+    readyForSend: () => revisionSendRegistration()?.readyForSend() ?? false,
     register(registration: PromptRevisionSendRegistration) {
-      revisionSendRegistration = registration
+      setRevisionSendRegistration(() => registration)
       return () => {
-        if (revisionSendRegistration === registration) revisionSendRegistration = undefined
+        if (revisionSendRegistration() === registration) setRevisionSendRegistration(undefined)
       }
     },
     sendWithRevision,
@@ -1517,6 +1756,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       autoReviseBeforeSending: autoReviseBeforeSending(),
       revisionBusy: revisionSend.busy(),
       revisionReadyForSend: revisionSend.readyForSend(),
+      questionActive: questionActive(),
     })
     if (action === "blocked") return
     if (action === "stop") {
@@ -1891,6 +2131,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     get: () => ({ active: accepting, toggle: toggleAutoAccept }),
   })
   Object.defineProperty(controller, "liveRate", { get: () => liveRate })
+  Object.defineProperty(controller, "sessionID", { get: () => sessionID })
   Object.defineProperty(controller, "revisionSend", { get: () => revisionSend })
   Object.defineProperty(controller, "questionActive", { get: () => questionActive })
   Object.defineProperty(controller, "awaitDraftReady", {

@@ -25,7 +25,9 @@ export interface TitleGenerationSettings {
 }
 
 export interface PromptRevisionSettings {
+  /** @deprecated Persistent Prompt Revisor model selection is owned by agent["prompt-revisor"].model. */
   model?: { providerID: string; modelID: string }
+  /** @deprecated Persistent Prompt Revisor policy is owned by global prompt_revisor_prompt. */
   prompt?: string
   autoBeforeSend?: boolean
   autoSendAfterRevision?: boolean
@@ -42,12 +44,15 @@ export function normalizePromptRevisionSettings(
 ): PromptRevisionSettings | undefined {
   if (!value) return undefined
   const autoBeforeSend = value.autoBeforeSend === true
+  // Model and policy used to live in renderer-local preferences. They are now
+  // canonical server configuration owned by the Prompt Revisor agent/runtime.
+  // Deliberately omit legacy fields so stale local state cannot shadow runtime
+  // routing or make Settings display a model the server will not actually use.
   const next: PromptRevisionSettings = {
-    ...value,
     autoBeforeSend: autoBeforeSend || undefined,
     autoSendAfterRevision: autoBeforeSend && value.autoSendAfterRevision === true ? true : undefined,
   }
-  if (!next.model && !next.prompt && !next.autoBeforeSend && !next.autoSendAfterRevision) return undefined
+  if (!next.autoBeforeSend && !next.autoSendAfterRevision) return undefined
   return next
 }
 

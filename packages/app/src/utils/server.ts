@@ -1,5 +1,5 @@
-import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
-import { OpenCode, type OpenCodeClient } from "@opencode-ai/client/promise"
+import type { OpencodeClient, OpencodeClientConfig } from "@opencode-ai/sdk/v2/client"
+import type { OpenCodeClient } from "@opencode-ai/client/promise"
 import type { ServerConnection } from "@/context/server"
 import { decode64 } from "@/utils/base64"
 
@@ -18,12 +18,62 @@ export function authFromToken(token: string | null) {
   }
 }
 
+type ServerSdkConfig = OpencodeClientConfig & {
+  directory?: string
+  experimental_workspaceID?: string
+}
+
+let sdkModule: Promise<typeof import("@opencode-ai/sdk/v2/client")> | undefined
+const loadSdkModule = () => (sdkModule ??= import("@opencode-ai/sdk/v2/client"))
+let promiseClientModule: Promise<typeof import("@opencode-ai/client/promise")> | undefined
+const loadPromiseClientModule = () => (promiseClientModule ??= import("@opencode-ai/client/promise"))
+
+function lazyMethodClient<T extends object>(load: () => Promise<T>, tag: string): T {
+  const nodes = new Map<string, unknown>()
+
+  const node = (path: PropertyKey[]): unknown => {
+    const key = path.map(String).join(".")
+    const cached = nodes.get(key)
+    if (cached) return cached
+
+    const proxy = new Proxy(function () {}, {
+      get(_target, property) {
+        // A callable proxy with a .then property is treated as a Promise by
+        // Promise.resolve/await, which would eagerly load the entire SDK merely
+        // by passing an endpoint object around.
+        if (property === "then") return undefined
+        if (property === Symbol.toStringTag) return tag
+        return node([...path, property])
+      },
+      apply(_target, _thisArg, args) {
+        if (path.length === 0) throw new TypeError("OpenFork SDK root is not callable")
+        return load().then((client) => {
+          let parent: unknown = client
+          for (let index = 0; index < path.length - 1; index++) {
+            parent = (parent as Record<PropertyKey, unknown>)[path[index]!]
+          }
+          const property = path[path.length - 1]!
+          const method = (parent as Record<PropertyKey, unknown>)?.[property]
+          if (typeof method !== "function") {
+            throw new TypeError(`OpenFork SDK member ${path.map(String).join(".")} is not callable`)
+          }
+          return Reflect.apply(method, parent, args)
+        })
+      },
+    })
+    nodes.set(key, proxy)
+    return proxy
+  }
+
+  return node([]) as T
+}
+
 export function createSdkForServer({
   server,
   ...config
-}: Omit<NonNullable<Parameters<typeof createOpencodeClient>[0]>, "baseUrl"> & {
+}: Omit<ServerSdkConfig, "baseUrl"> & {
   server: ServerConnection.HttpBase
-}) {
+}): OpencodeClient {
   const auth = (() => {
     if (!server.password) return
     return {
@@ -31,33 +81,45 @@ export function createSdkForServer({
     }
   })()
 
-  return createOpencodeClient({
+  const options: ServerSdkConfig = {
     ...config,
     headers: {
       ...(config.headers instanceof Headers ? Object.fromEntries(config.headers.entries()) : config.headers),
       ...auth,
     },
     baseUrl: server.url,
-  })
+  }
+  let client: Promise<OpencodeClient> | undefined
+  return lazyMethodClient(
+    () => (client ??= loadSdkModule().then((mod) => mod.createOpencodeClient(options))),
+    "OpenForkLazySdk",
+  )
 }
 
 export function createApiForServer(input: {
   server: ServerConnection.HttpBase
   fetch?: typeof globalThis.fetch
 }): OpenCodeClient {
-  return withClientContext(
-    OpenCode.make({
-      baseUrl: input.server.url,
-      fetch: input.fetch,
-      headers: input.server.password
-        ? {
-            Authorization: `Basic ${authTokenFromCredentials({
-              username: input.server.username,
-              password: input.server.password,
-            })}`,
-          }
-        : undefined,
-    }),
+  let client: Promise<OpenCodeClient> | undefined
+  return lazyMethodClient(
+    () =>
+      (client ??= loadPromiseClientModule().then((mod) =>
+        withClientContext(
+          mod.OpenCode.make({
+            baseUrl: input.server.url,
+            fetch: input.fetch,
+            headers: input.server.password
+              ? {
+                  Authorization: `Basic ${authTokenFromCredentials({
+                    username: input.server.username,
+                    password: input.server.password,
+                  })}`,
+                }
+              : undefined,
+          }),
+        ),
+      )),
+    "OpenForkLazyApi",
   )
 }
 

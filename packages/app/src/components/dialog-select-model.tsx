@@ -60,6 +60,7 @@ import {
 } from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
 import { useForkUsage } from "@/context/fork-usage"
+import type { ForkCapacityPredictiveRange } from "@/utils/fork-client"
 import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
 import { useVerdentUsage } from "@/hooks/use-verdent-usage"
 import { useGensparkUsage, formatCreditsPerMillion, type GensparkModelUsage } from "@/hooks/use-genspark-usage"
@@ -70,10 +71,9 @@ import { useServerSync } from "@/context/server-sync"
 import { usePersonalUsage } from "@/context/personal-usage"
 import { useLimits } from "@/hooks/use-limits"
 import { useNow } from "@/hooks/use-now"
-import type { ForkWindowUsage } from "@/utils/fork-client"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
-import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
+import { colorFor } from "./usage-gauge-v2"
 import { toneForRemaining } from "@/utils/limits-format"
 import {
   collapseAccountVariants,
@@ -87,14 +87,7 @@ import { splitModelIDForProvider } from "@/utils/model-account-identity"
 import { AccountOptionList, accountLabelForVariant, type AccountOptionUsage } from "./model-account-submenu"
 import { ModelStretchBar, stretchTone } from "./model-stretch-bar"
 import {
-  estimateRequestsRemaining,
-  estimateRequestsRemainingFromCost,
-  isUsageTrackedProvider,
-} from "@/utils/model-usage-estimate"
-import {
   getUsageTables,
-  matchUsagePricing,
-  matchUsageProfile,
   collectThresholdPricingFromIndex,
   prepareThresholdIndex,
 } from "@/utils/model-usage-profile"
@@ -126,7 +119,10 @@ type ModelUsage = {
   percent: number
   estimatedRequests?: number
   personalized?: boolean
+  predictiveRange?: ForkCapacityPredictiveRange
   remainingPercent?: number
+  capacityStatus?: "ready" | "learning" | "unavailable" | "unlimited"
+  capacityReason?: string
   tone?: UsageTone
   /**
    * WorkBuddy-only: credits-per-request and the funding account behind the
@@ -220,10 +216,14 @@ const ModelList: Component<{
   model?: ModelState
 }> = (props) => {
   const model = props.model ?? useLocal().model
-  // One view-level quota projection. Row renderers stay presentational: the
-  // WorkBuddy quota resource must never be created once per model row.
+  // One server-owned Capacity projection for every provider. Row renderers
+  // stay presentational; provider-specific quota math must never be created per row.
   const workbuddy = useWorkBuddyUsage()
+  const forkUsage = useForkUsage()
   const language = useLanguage()
+  createEffect(() => {
+    void forkUsage.ensureCapacity()
+  })
 
   const models = createMemo(() =>
     model
@@ -287,52 +287,45 @@ const ModelList: Component<{
         <div class="w-full flex items-center gap-x-2 text-13-regular">
           <span class="truncate">{stripUnlimitedSuffix(i.name)}</span>
           <Show when={i.provider.id === "workbuddy"}>
-            {(() => {
-              const value = workbuddy.forModel(i.id)
-              return (
-                <>
-                  <WorkBuddyFreeBadge label={workBuddyFreeLabel(workbuddy.rateFor(i.id))} />
-                  <Show when={value}>
-                    {(usage) => (
-                      <>
-                        <ModelStretchBar
-                          requests={usage().estimatedRequests}
-                          remainingPercent={usage().remainingPercent}
-                          tone={
-                            usage().remainingPercent !== undefined
-                              ? (toneForRemaining(usage().remainingPercent) as UsageTone)
-                              : (stretchTone(usage().estimatedRequests) as UsageTone)
-                          }
-                        />
-                        <span
-                          class="shrink-0 text-[10px] font-[520] tabular-nums"
-                          classList={{
-                            "text-v2-state-fg-danger": usage().creditsExhausted,
-                            "text-v2-text-text-faint": !usage().creditsExhausted,
-                          }}
-                          title={
-                            usage().creditsExhausted
-                              ? `${usage().account} · ${language.t("model.tooltip.workbuddy.noCredits")}`
-                              : `${usage().account} · ${usage().free ? `~${usage().estimatedRequests} promo requests left (24h) · ${usage().remainingPercent?.toFixed(1) ?? "—"}%` : `x${usage().rate} credits/request`}`
-                          }
-                        >
-                          {usage().creditsExhausted
-                            ? language.t("model.tag.noCredits")
-                            : usage().free &&
-                                Number.isFinite(usage().estimatedRequests) &&
-                                usage().estimatedRequests !== Number.POSITIVE_INFINITY
-                              ? `~${Math.round(usage().estimatedRequests).toLocaleString()}`
-                              : usage().free
-                                ? "Free"
-                                : `~${Number.isFinite(usage().estimatedRequests) ? Math.round(usage().estimatedRequests).toLocaleString() : "∞"}`}
-                        </span>
-                      </>
-                    )}
-                  </Show>
-                </>
-              )
-            })()}
+            <WorkBuddyFreeBadge label={workBuddyFreeLabel(workbuddy.rateFor(i.id))} />
           </Show>
+          {(() => {
+            const split = splitModelIDForProvider(i.id, i.provider.id)
+            const usage = () => forkUsage.capacityFor(i.provider.id, i.id, split.accountID)
+            return (
+              <Show when={usage()}>
+                {(value) => (
+                  <Show
+                    when={
+                      value().estimatedRequests !== undefined ||
+                      value().remainingPercent !== undefined ||
+                      value().status === "learning"
+                    }
+                  >
+                    <ModelStretchBar
+                      requests={value().estimatedRequests ?? 0}
+                      remainingPercent={value().remainingPercent}
+                      tone={
+                        value().remainingPercent !== undefined
+                          ? (toneForRemaining(value().remainingPercent ?? null) as UsageTone)
+                          : (stretchTone(value().estimatedRequests ?? 0) as UsageTone)
+                      }
+                    />
+                    <span
+                      class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint"
+                      title={value().reason}
+                    >
+                      {value().estimatedRequests !== undefined
+                        ? `~${Math.round(value().estimatedRequests ?? 0).toLocaleString()}`
+                        : value().status === "learning"
+                          ? "Learning"
+                          : "—"}
+                    </span>
+                  </Show>
+                )}
+              </Show>
+            )
+          })()}
           <DeepSeekRateBadge model={i} />
           <Show when={isUnlimitedModel(i)}>
             <Tag>{language.t("model.tag.unlimited")}</Tag>
@@ -1992,6 +1985,7 @@ function ModelSelectorPopoverV2View(props: {
   createEffect(() => {
     if (props.lightweight || !store.open) return
     void personal?.ensure()
+    void forkUsage.ensureCapacity()
   })
   const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
   const limits = props.lightweight
@@ -2574,70 +2568,11 @@ function ModelSelectorPopoverV2View(props: {
     }
     return map
   })
-  // Deliberately does NOT fall back to `usage.latest.aggregate`: that figure
-  // spans every credential the account has ever used (including long-since
-  // reset/exhausted ones), which is why an earlier version of this pinned at
-  // 100%. Without a resolved active credential's own window we simply don't
-  // know, so no bar is shown rather than a misleading one.
-  const activeWindow = createMemo<ForkWindowUsage | undefined>(() => {
-    const windows = forkUsage.usageWindowsFor(forkUsage.activeCredentialID())
-    return windows.find((entry) => entry.label === "5h")
-  })
-  // Personal $/request comes from the server-owned Usage projection.
-  const durableCosts = createMemo(() => {
-    if (props.lightweight) return undefined
-    if (!store.open) return undefined
-    const durable = personal?.personalCosts()
-    return durable && durable.size > 0 ? durable : undefined
-  })
-  const usageFor = (item: ModelItem) => {
-    // WorkBuddy: credits-per-request funded by one account's remaining balance.
-    // Checked first because these models carry no USD cost at all, so the
-    // token-priced path below would render "—" and no bar.
-    if (item.provider.id === "workbuddy") {
-      // Pass the full (possibly account-qualified) id: `hy4-preview@wb-<id>`
-      // must be funded by that account, not by the best account overall.
-      const estimate = workbuddy.forModel(item.id)
-      if (!estimate) return undefined
-      const account = workbuddy
-        .accounts()
-        .find((entry) => entry.id === estimate.account || entry.account === estimate.account)
-      return {
-        percent: 100 - estimate.remainingPercent,
-        estimatedRequests: estimate.estimatedRequests,
-        remainingPercent: estimate.remainingPercent,
-        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
-        workbuddy: {
-          ...estimate,
-          ...(account ? { totalCredits: account.totalCredits } : {}),
-        } as WorkBuddyModelUsage,
-      }
-    }
-    if (item.provider.id === "verdent") {
-      const estimate = verdent.forModel(item.id)
-      if (!estimate) return undefined
-      return {
-        percent: 100 - estimate.remainingPercent,
-        estimatedRequests: estimate.estimatedRequests,
-        remainingPercent: estimate.remainingPercent,
-        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
-        workbuddy: estimate as unknown as WorkBuddyModelUsage,
-      }
-    }
-    if (item.provider.id === "genspark") {
-      const cost = resolveEffectiveCost(item, mergedPricingFallbackForDisplay()).cost
-      const dollarPerM = (cost.input ?? 0) + (cost.output ?? 0)
-      if (!(dollarPerM > 0)) return undefined
-      const estimate = genspark.forModel(dollarPerM)
-      if (!estimate) return undefined
-      return {
-        percent: 100,
-        estimatedRequests: estimate.estimatedRequests,
-        remainingPercent: undefined,
-        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
-        genspark: estimate,
-      }
-    }
+  const usageFor = (item: ModelItem): ModelUsage | undefined => {
+    // OpenRouter's free-model allowance is a distinct provider-side quota pool,
+    // not the paid model's monetary Capacity resource. Preserve that raw
+    // telemetry for :free rows; every request-count projection below comes from
+    // the shared server Capacity owner.
     if (isOpenRouterFreeModel(item)) {
       const report = freeUsage.data()
       if (!report) return undefined
@@ -2647,24 +2582,27 @@ function ModelSelectorPopoverV2View(props: {
         tone: openRouterFreeUsageTone(report.free.status),
       }
     }
-    if (!isUsageTrackedProvider(item.provider.id)) return undefined
-    const window = activeWindow()
-    if (!window) return undefined
-    const durableKey = `${item.provider.id}:${item.id}`
-    const personalEntry = durableCosts()?.get(durableKey)
-    const personalCost = personalEntry?.cost
-    const estimatedRequests =
-      personalCost !== undefined
-        ? estimateRequestsRemainingFromCost(window, personalCost)
-        : estimateRequestsRemaining(
-            window,
-            matchUsagePricing(pricingTable() ?? [], { name: item.name, family: item.family, id: item.id }) ?? item.cost,
-            matchUsageProfile(profileTable() ?? [], { name: item.name, family: item.family, id: item.id }),
-          )
+
+    const split = splitModelIDForProvider(item.id, item.provider.id)
+    const estimate = forkUsage.capacityFor(item.provider.id, item.id, split.accountID)
+    if (!estimate) return undefined
+
+    const remainingPercent = estimate.remainingPercent
+    const estimatedRequests = estimate.estimatedRequests
     return {
-      percent: usagePercent(window),
-      estimatedRequests,
-      personalized: personalCost !== undefined,
+      percent: remainingPercent !== undefined ? 100 - remainingPercent : 0,
+      ...(estimatedRequests !== undefined ? { estimatedRequests } : {}),
+      ...(remainingPercent !== undefined ? { remainingPercent } : {}),
+      personalized: estimate.personalized,
+      ...(estimate.predictiveRange ? { predictiveRange: estimate.predictiveRange } : {}),
+      capacityStatus: estimate.status,
+      ...(estimate.reason ? { capacityReason: estimate.reason } : {}),
+      tone:
+        remainingPercent !== undefined
+          ? (toneForRemaining(remainingPercent) as UsageTone)
+          : estimatedRequests !== undefined
+            ? (stretchTone(estimatedRequests) as UsageTone)
+            : undefined,
     }
   }
   // Shared tooltip: single floating card driven by active row, instead of N
@@ -3247,68 +3185,33 @@ function ModelSelectorPopoverV2View(props: {
       })
     }
   }
-  // Per-provider account-usage resolvers, defined once per view. The
-  // `usageForAccount` prop previously built a fresh 4-branch closure tree on
-  // every MultiAccountRow render; each branch closes over view memos and is
-  // only invoked when the submenu opens, so stable shared functions + a
-  // per-item cached picker cut per-render allocation to an O(1) map hit.
-  const usageForWorkbuddyAccount = (item: ModelItem) => (accountID: string) =>
-    workbuddy.forModel(`${item.id}@${accountID}`)
-  const usageForVerdentAccount = (item: ModelItem) => (accountID: string) => verdent.forModel(`${item.id}@${accountID}`)
-  const usageForZenAccount = (_item: ModelItem) => (accountID: string) => {
-    const key = zenKeyLimits().get(accountID)
-    if (!key) return undefined
-    const estimatedRequests =
-      key.limitEstimate !== null && key.usedObserved !== null
-        ? key.limitEstimate - key.usedObserved
-        : Number.POSITIVE_INFINITY
+  // One account projection path for every multi-account provider. Provider
+  // semantics stay server-side; the submenu only renders the normalized view.
+  const usageForCapacityAccount = (item: ModelItem) => (accountID: string): AccountOptionUsage | undefined => {
+    const estimate = forkUsage.capacityFor(item.provider.id, item.id, accountID)
+    if (!estimate) return undefined
     return {
-      estimatedRequests,
-      ...(key.remainingPercent !== null ? { remainingPercent: key.remainingPercent } : {}),
-      account: key.label,
-      creditsExhausted: key.exhausted,
-    }
-  }
-  const usageForGoAccount = (item: ModelItem) => (accountID: string) => {
-    // Go windows are USD budgets (spentUSD/limitUSD), not
-    // request counts — reuse the same estimator the Go row
-    // path uses instead of inventing parallel math.
-    const window = forkUsage.usageWindowsFor(accountID).find((entry) => entry.label === "5h")
-    if (!window) return undefined
-    const remainingUSD = Math.max(0, window.limitUSD - window.spentUSD)
-    const remainingPercent =
-      window.estimatedPercent ?? (window.limitUSD > 0 ? (remainingUSD / window.limitUSD) * 100 : undefined)
-    // `estimateRequestsRemaining` returns `undefined` when the model has no
-    // usable cost (unpriced and no fallback) — surface "no data" rather than
-    // a mistyped `undefined` where `AccountOptionUsage` requires a number.
-    const estimatedRequests = estimateRequestsRemaining(window, item.cost, undefined)
-    if (estimatedRequests === undefined) return undefined
-    return {
-      estimatedRequests,
-      ...(remainingPercent !== undefined ? { remainingPercent } : {}),
-      account: accountLabels()?.get(accountID) ?? accountID,
-      creditsExhausted: remainingUSD <= 0,
+      ...(estimate.estimatedRequests !== undefined ? { estimatedRequests: estimate.estimatedRequests } : {}),
+      ...(estimate.remainingPercent !== undefined ? { remainingPercent: estimate.remainingPercent } : {}),
+      ...(estimate.predictiveRange ? { predictiveRange: estimate.predictiveRange } : {}),
+      status: estimate.status,
+      ...(estimate.reason ? { reason: estimate.reason } : {}),
+      account: estimate.accountLabel ?? accountLabels()?.get(accountID) ?? accountID,
+      creditsExhausted:
+        estimate.estimatedRequests === 0 ||
+        (estimate.remainingPercent !== undefined && estimate.remainingPercent <= 0),
     }
   }
   const usageForAccountCache = new Map<
     string,
-    { item: ModelItem; fn: ((accountID: string) => AccountOptionUsage | undefined) | undefined }
+    { item: ModelItem; fn: (accountID: string) => AccountOptionUsage | undefined }
   >()
   onCleanup(() => usageForAccountCache.clear())
   const usageForAccountFor = (item: ModelItem) => {
     const key = modelKey(item)
     const cached = usageForAccountCache.get(key)
     if (cached && cached.item === item) return cached.fn
-    const fn =
-      item.provider.id === "workbuddy"
-        ? usageForWorkbuddyAccount(item)
-        : item.provider.id === "verdent"
-          ? usageForVerdentAccount(item)
-          : item.provider.id === "opencode"
-            ? usageForZenAccount(item)
-            : item.provider.id === "opencode-go"
-              ? usageForGoAccount(item)
-              : undefined
+    const fn = usageForCapacityAccount(item)
     usageForAccountCache.set(key, { item, fn })
     return fn
   }

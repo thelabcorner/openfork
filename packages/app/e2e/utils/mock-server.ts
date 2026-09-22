@@ -141,6 +141,12 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     if (path === "/global/preferences") return json(route, {})
     if (path === "/api/skill") return json(route, { location: location(config), data: [] })
     if (path === "/quota/providers") return json(route, { providers: [] })
+    if (path === "/quota/resets") {
+      const url = new URL(route.request().url())
+      const from = Number(url.searchParams.get("from") ?? Date.now())
+      const to = Number(url.searchParams.get("to") ?? from)
+      return json(route, { from, to, generatedAt: from, occurrences: [], failures: [] })
+    }
     // Per-provider quota reads (e.g. /quota/claude, /quota/opencode-zen) come
     // from usage hooks mounted by the app shell. Answer "not configured" so
     // they degrade gracefully instead of falling through to the HTML shell.

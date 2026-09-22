@@ -59,6 +59,17 @@ describe("Prompt Input V2 send policy", () => {
         revisionReadyForSend: true,
       }),
     ).toBe("submit")
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: true,
+        canSubmit: true,
+        hasRevisableText: true,
+        autoReviseBeforeSending: true,
+        revisionBusy: false,
+        revisionReadyForSend: true,
+      }),
+    ).toBe("submit")
   })
 
   test("never applies prompt revision policy to shell commands", () => {
@@ -113,6 +124,32 @@ describe("Prompt Input V2 send policy", () => {
     ).toBe("blocked")
   })
 
+  test("question ownership overrides revisor busy and working-turn policy", () => {
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: true,
+        canSubmit: true,
+        hasRevisableText: true,
+        autoReviseBeforeSending: true,
+        revisionBusy: true,
+        questionActive: true,
+      }),
+    ).toBe("submit")
+
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: true,
+        canSubmit: false,
+        hasRevisableText: false,
+        autoReviseBeforeSending: true,
+        revisionBusy: false,
+        questionActive: true,
+      }),
+    ).toBe("blocked")
+  })
+
   test("one-shot menu action inverts around the persistent auto-revise preference", () => {
     expect(promptOneShotRevisionAction(false)).toBe("send-with-revisor")
     expect(promptOneShotRevisionAction(true)).toBe("send-without-revisor")
@@ -135,5 +172,15 @@ describe("Prompt Input V2 send policy", () => {
     expect(isPromptTextRevisable("  /compact now  ")).toBe(false)
     expect(isPromptTextRevisable("/custom arg")).toBe(false)
     expect(isPromptTextRevisable("implement /compact as a command")).toBe(true)
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: false,
+        canSubmit: true,
+        hasRevisableText: isPromptTextRevisable("/compact now"),
+        autoReviseBeforeSending: true,
+        revisionBusy: false,
+      }),
+    ).toBe("submit")
   })
 })

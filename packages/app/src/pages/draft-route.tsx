@@ -10,6 +10,7 @@ import { ServerConnection } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider } from "@/context/server-sync"
 import { useSettings } from "@/context/settings"
+import { usePlatform } from "@/context/platform"
 import { SDKProvider } from "@/context/sdk"
 import { useGlobal } from "@/context/global"
 import { useSearchParams } from "@solidjs/router"
@@ -61,6 +62,7 @@ function ResolvedDraftRoute(props: { draft: DraftTab }) {
 export default function DraftRoute() {
   const [search] = useSearchParams<{ draftId?: string }>()
   const settings = useSettings()
+  const platform = usePlatform()
   const tabs = useTabs()
   const draft = createMemo(() =>
     search.draftId ? tabs.store.find((tab): tab is DraftTab => tab.type === "draft" && tab.draftID === search.draftId) : undefined,
@@ -77,7 +79,7 @@ export default function DraftRoute() {
           const found = draft()!
           return (
             <Show
-              when={settings.general.newLayoutDesigns()}
+              when={platform.platform === "pwa" || settings.general.newLayoutDesigns()}
               fallback={<Navigate href={`/${base64Encode(found.directory)}/session`} />}
             >
               <ResolvedDraftRoute draft={found} />

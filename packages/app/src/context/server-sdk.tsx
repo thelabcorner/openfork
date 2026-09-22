@@ -17,6 +17,7 @@ import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protoc
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
 import { markServerStreamDead, markServerStreamLive } from "@/utils/server-liveness"
 import { eventStreamFetch } from "@/utils/event-stream-auth"
+import { streamServerEvents, type ServerEventStreamCursor } from "@/utils/server-event-stream"
 import { trackPending } from "@/utils/pending-work"
 import { perf } from "./perf"
 import { phaseTrace } from "./phase-trace"
@@ -897,19 +898,21 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     }
   })()
 
-  // Both clients below are dedicated to the event stream (eventApi →
-  // event.subscribe, eventSdk → global.event), so wrapping their fetch puts
-  // the auth_token query param on SSE requests only — EventSource-style
-  // contexts cannot rely on headers alone (utils/event-stream-auth.ts).
+  // EventSource-style contexts cannot rely on headers alone (some embedded
+  // webviews drop Authorization on cross-origin streams), so the dedicated
+  // stream fetcher adds the auth_token query parameter and interest headers.
+  // Parsing/cursor continuity is intentionally tiny and local; reconnect policy
+  // remains owned by this context rather than a second hidden retry loop inside
+  // the generated all-endpoints SDK.
   const sseFetch = eventStreamFetch(eventFetch ?? globalThis.fetch, server.http, {
     subscriber: streamSubscriber,
     sessions: effectiveStreamSessions,
   })
-  const eventSdk = createSdkForServer({
-    signal: abort.signal,
-    fetch: sseFetch,
-    server: server.http,
-  })
+  const streamCursor: ServerEventStreamCursor = {}
+  const streamURL = (path: string) => {
+    const base = server.http.url.endsWith("/") ? server.http.url : `${server.http.url}/`
+    return new URL(path, base).href
+  }
   const protocolFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
     requests.schedule("critical", () => (platform.fetch ?? globalThis.fetch)(input, init), {
       signal: init?.signal ?? undefined,
@@ -1043,7 +1046,8 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
 
   const reconnectDelay = () => {
     const capped = Math.min(reconnectFailures, 6)
-    const backoff = RECONNECT_BASE_MS * 2 ** capped
+    const base = Math.max(RECONNECT_BASE_MS, streamCursor.retryMs ?? 0)
+    const backoff = base * 2 ** capped
     const delay = Math.min(backoff, RECONNECT_MAX_MS)
     // Full jitter so N servers/clients don't retry in lockstep.
     return delay / 2 + Math.random() * (delay / 2)
@@ -1069,10 +1073,12 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
         const connectedAt = performance.now()
         try {
           const kind = await protocol
-          const events =
-            kind === "v1"
-              ? (await eventSdk.global.event({ signal: attempt.signal })).stream
-              : (await eventSdk.v2.event.subscribe({ signal: attempt.signal })).stream
+          const events = streamServerEvents<NativeEvent | { directory?: string; payload: OpenCodeEvent }>({
+            url: streamURL(kind === "v1" ? "global/event" : "api/event"),
+            fetch: sseFetch,
+            signal: attempt.signal,
+            cursor: streamCursor,
+          })
           let yielded = Date.now()
           for await (const event of events) {
             streamStats.framesRead += 1
@@ -1133,7 +1139,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
             // deliver server.connected, and immediately fail again.
             if (performance.now() - connectedAt >= 30_000) reconnectFailures = 0
             const legacy = "payload" in event
-            if (legacy && event.payload.type === "sync") {
+            if (legacy && frameKind === "sync") {
               streamStats.legacySyncSkipped += 1
               if (Date.now() - yielded >= STREAM_YIELD_MS) {
                 await wait(0)
@@ -1175,7 +1181,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
             // promise client; the generated SDK transport carries the SSE cursor
             // correctly but its checked-in event union can lag one schema field
             // until codegen runs. Normalize through the protocol-owned adapter.
-            const payload = legacy ? (event.payload as Event) : adaptServerEvent(event as NativeEvent)
+            const payload = legacy ? (event.payload as unknown as Event) : adaptServerEvent(event as NativeEvent)
             const dispatchedAt = performance.now()
             receive({ directory, payload })
             phaseTrace.dispatch(performance.now() - dispatchedAt)

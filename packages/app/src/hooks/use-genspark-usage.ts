@@ -79,8 +79,8 @@ export function useGensparkUsage(options?: { limits?: LimitsState }) {
     if (remaining === undefined) return undefined
     const rate = rateFor(dollarCostPerM)
     if (!rate) return undefined
-    // Average request token profile: same fallback as model-usage-estimate.ts
-    // Input 800, cached 65k, output 220 => cost per request
+    // Provider-local request-size heuristic for Genspark credits only. This is
+    // unrelated to OpenCode Go Capacity, whose request projection is server-owned.
     const profile = { input: 800, cached: 65_000, output: 220 }
     // We need per-token cost breakdown, but we only have blended $/M.
     // Approximate: blended $/M = (input+output)/M avg, so credits per request ≈ creditsPerM * avgTokens / 1M

@@ -71,6 +71,65 @@ export function scheduledMonthGrid(anchor: number) {
   return cells
 }
 
+export type ScheduledTemporalCluster<T> = {
+  readonly at: number
+  readonly startAt: number
+  readonly endAt: number
+  readonly items: readonly T[]
+}
+
+/**
+ * Deterministically groups nearby point-in-time calendar events so a narrow
+ * secondary rail never produces overlapping interactive targets.
+ *
+ * Clustering is presentation-only: it preserves every underlying event and
+ * never changes its authoritative timestamp. A new cluster starts once the
+ * gap from the previous event exceeds `maxGapMs`.
+ */
+export function scheduledTemporalClusters<T>(
+  items: readonly T[],
+  timestamp: (item: T) => number,
+  maxGapMs: number,
+): ScheduledTemporalCluster<T>[] {
+  if (items.length === 0) return []
+  const gap = Math.max(0, Number.isFinite(maxGapMs) ? maxGapMs : 0)
+  const sorted = items
+    .map((item, index) => ({ item, index, at: timestamp(item) }))
+    .filter((entry) => Number.isFinite(entry.at))
+    .sort((left, right) => left.at - right.at || left.index - right.index)
+
+  const result: ScheduledTemporalCluster<T>[] = []
+  let current: { startAt: number; endAt: number; items: T[] } | undefined
+
+  for (const entry of sorted) {
+    if (!current || entry.at - current.endAt > gap) {
+      if (current) {
+        result.push({
+          at: current.startAt,
+          startAt: current.startAt,
+          endAt: current.endAt,
+          items: current.items,
+        })
+      }
+      current = { startAt: entry.at, endAt: entry.at, items: [entry.item] }
+      continue
+    }
+
+    current.endAt = entry.at
+    current.items.push(entry.item)
+  }
+
+  if (current) {
+    result.push({
+      at: current.startAt,
+      startAt: current.startAt,
+      endAt: current.endAt,
+      items: current.items,
+    })
+  }
+  return result
+}
+
 export function scheduledRunAttentionRank(input: { status: string; unread: boolean }) {
   if (input.unread && input.status === "waiting") return 0
   if (input.unread && (input.status === "failed" || input.status === "abandoned")) return 1

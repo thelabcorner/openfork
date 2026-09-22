@@ -5,6 +5,7 @@ import { stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 import { blendedCost, evaluateModelUsageYield, FALLBACK_WORKLOAD_CORPUS } from "@/utils/model-usage-yield"
 import { usePersonalUsage } from "@/context/personal-usage"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
+import type { ForkCapacityPredictiveRange } from "@/utils/fork-client"
 
 type InputKey = "text" | "image" | "audio" | "video" | "pdf"
 type InputMap = Record<InputKey, boolean>
@@ -45,8 +46,7 @@ export function parseModelAccount(modelID: string, providerID?: string): string 
   return splitModelIDForProvider(modelID, providerID).accountID
 }
 
-// cost.* is already expressed in $ per 1M tokens (see model-usage-estimate.ts,
-// which divides by 1_000_000 to get $ for a token count) — format directly.
+// cost.* is already expressed in $ per 1M tokens — format directly.
 //
 // Fixed 2-decimal formatting silently rounds real, nonzero rates like
 // cached-read pricing ($0.003625/M is common — see OpenCode Go's published
@@ -195,6 +195,9 @@ export const ModelTooltip: Component<{
     percent: number
     estimatedRequests?: number
     personalized?: boolean
+    predictiveRange?: ForkCapacityPredictiveRange
+    capacityStatus?: "ready" | "learning" | "unavailable" | "unlimited"
+    capacityReason?: string
     /** WorkBuddy-only credit/request breakdown, rendered in place of the USD-window rows. */
     workbuddy?: {
       rate: number
@@ -509,12 +512,47 @@ export const ModelTooltip: Component<{
             </>
           )}
         </Show>
-        <Show when={props.usage?.estimatedRequests !== undefined && !props.usage?.workbuddy && !props.usage?.genspark}>
+        <Show
+          when={
+            !props.usage?.workbuddy &&
+            !props.usage?.genspark &&
+            (props.usage?.estimatedRequests !== undefined ||
+              props.usage?.capacityStatus === "learning" ||
+              props.usage?.capacityStatus === "unavailable")
+          }
+        >
           <div class="h-px bg-v2-border-border-muted" />
           <ModelTooltipRow
             name={language.t("model.tooltip.usage.requests")}
-            value={language.t("model.tooltip.usage.requestsValue", { count: props.usage!.estimatedRequests! })}
+            value={
+              props.usage?.estimatedRequests !== undefined
+                ? language.t("model.tooltip.usage.requestsValue", { count: props.usage.estimatedRequests })
+                : props.usage?.capacityStatus === "learning"
+                  ? language.t("model.tooltip.usage.range.learning")
+                  : language.t("model.tooltip.usage.range.unavailable")
+            }
           />
+          <Show when={props.usage?.capacityReason}>
+            {(reason) => <ModelTooltipRow name={language.t("model.tooltip.usage.source")} value={reason()} />}
+          </Show>
+          <Show when={props.usage?.predictiveRange}>
+            {(range) => (
+              <ModelTooltipRow
+                name={language.t("model.tooltip.usage.range")}
+                value={(() => {
+                  const current = range()
+                  if (current.status === "calibrated") {
+                    return language.t("model.tooltip.usage.rangeValue", {
+                      lower: current.lowerRequests.toLocaleString(language.intl()),
+                      upper: current.upperRequests.toLocaleString(language.intl()),
+                    })
+                  }
+                  if (current.status === "learning") return language.t("model.tooltip.usage.range.learning")
+                  return language.t("model.tooltip.usage.range.unavailable")
+                })()}
+              />
+            )}
+          </Show>
           <ModelTooltipRow
             name={language.t("model.tooltip.usage.source")}
             value={
