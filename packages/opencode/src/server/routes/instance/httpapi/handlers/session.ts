@@ -383,8 +383,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const pause = Effect.fn("SessionHttpApi.pause")(function* (ctx: { params: { sessionID: SessionID } }) {
       const current = yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
       yield* authorizePublicMutableSession(current)
-      yield* promptSvc.cancel(ctx.params.sessionID)
       yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: current.pausedAt ?? Date.now() })
+      // Persist the hard gate before interrupting execution so no concurrent wake
+      // can reclaim the Goal continuation in the cancellation window. Pause then
+      // requeues the exact claimed reservation for the explicit resume wake.
+      yield* promptSvc.pause(ctx.params.sessionID)
       return HttpApiSchema.NoContent.make()
     })
 

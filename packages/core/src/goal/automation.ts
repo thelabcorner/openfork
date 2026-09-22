@@ -111,6 +111,13 @@ export interface Interface {
   readonly claim: (sessionID: SessionSchema.ID) => Effect.Effect<Reservation | undefined>
   /** Releases an in-flight claim after interruption/failure so it is recoverable. */
   readonly release: (input: { sessionID: SessionSchema.ID; reservationID: string }) => Effect.Effect<void>
+  /**
+   * Requeues this process's currently claimed continuation without knowing its
+   * reservation id. Pause/shutdown adapters use this only after execution has
+   * reached a quiescence barrier, so the exact durable continuation survives
+   * without remaining falsely owned by a dead local worker cycle.
+   */
+  readonly requeueClaim: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** User input or an explicit control action invalidates outstanding autonomous work. */
   readonly cancel: (sessionID: SessionSchema.ID) => Effect.Effect<void>
   /** Unclaimed reservations used by runtime startup recovery. */
@@ -607,6 +614,27 @@ const layer = Layer.effect(
       }
     })
 
+    const requeueClaim = Effect.fn("GoalAutomation.requeueClaim")(function* (sessionID: SessionSchema.ID) {
+      const now = Date.now()
+      const row = yield* db
+        .update(GoalAutomationTable)
+        .set({ reservation_owner: null, auditing_at: null, time_updated: now })
+        .where(
+          and(
+            eq(GoalAutomationTable.session_id, sessionID),
+            isNotNull(GoalAutomationTable.reservation_id),
+            eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
+          ),
+        )
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return false
+      const automation = runtimeOf(row)
+      if (automation) yield* publishRuntime(sessionID, row.goal_id, automation)
+      return true
+    })
+
     const afterTurn = Effect.fn("GoalAutomation.afterTurn")(function* (input: {
       sessionID: SessionSchema.ID
       origin: "user" | "host" | "automatic"
@@ -881,6 +909,7 @@ const layer = Layer.effect(
       afterTurn,
       claim,
       release,
+      requeueClaim,
       cancel,
       pendingSessions,
       orphanedAuditSessions,

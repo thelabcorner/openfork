@@ -1231,6 +1231,41 @@ describe("Goal automation reservations", () => {
     }),
   )
 
+  it.effect("requeues a same-process claimed continuation after runner interruption without changing its identity", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        sourceMessageID: "msg_goal_worker_root",
+        expectedLatestUserSeq: 7,
+        audit: continueAudit(active.criteria, true),
+      })
+      const claimed = yield* automation.claim(sessionA)
+      expect(claimed?.id).toBe(decision.reservation?.id)
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "working" })
+
+      expect(yield* automation.requeueClaim(sessionA)).toBe(true)
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "continuation_pending" })
+      expect(yield* automation.pendingSessions()).toContain(sessionA)
+      expect(yield* automation.requeueClaim(sessionA)).toBe(false)
+
+      const recovered = yield* automation.claim(sessionA)
+      expect(recovered).toMatchObject({
+        id: claimed!.id,
+        sourceMessageID: "msg_goal_worker_root",
+        expectedLatestUserSeq: 7,
+        prompt: claimed!.prompt,
+      })
+    }),
+  )
+
   it.effect("user supersession deletes a claimed reservation so stale output cannot recreate it", () =>
     Effect.gen(function* () {
       yield* setup

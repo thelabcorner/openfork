@@ -45,6 +45,7 @@ import { LLM } from "@/session/llm"
 import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { GoalAuditRecovery } from "@/session/goal-audit-recovery"
+import { GoalContinuationRecovery } from "@/session/goal-continuation-recovery"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
@@ -418,6 +419,7 @@ const app = LayerNode.group([
   SessionSummary.node,
   SessionPrompt.node,
   GoalAuditRecovery.node,
+  GoalContinuationRecovery.node,
   Instruction.node,
   LLM.node,
   LSP.node,

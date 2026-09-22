@@ -148,12 +148,20 @@ function goalTokenCount(tokens: SessionV1.Assistant["tokens"]) {
 // Goal reservation ids are globally unique durable cursors. Deriving V1 ids
 // from that cursor gives continuation publication a stable identity across
 // process crashes without pushing V1-specific identifiers into GoalAutomation.
-function goalContinuationMessageID(reservationID: string) {
-  return MessageID.make(`msg_goal_continuation_${reservationID}`)
+function goalContinuationMessageID(reservationID: string, resetBoundaryID?: MessageID) {
+  return MessageID.make(
+    resetBoundaryID
+      ? `msg_goal_continuation_${reservationID}_after_${resetBoundaryID}`
+      : `msg_goal_continuation_${reservationID}`,
+  )
 }
 
-function goalContinuationPartID(reservationID: string) {
-  return PartID.make(`prt_goal_continuation_${reservationID}`)
+function goalContinuationPartID(reservationID: string, resetBoundaryID?: MessageID) {
+  return PartID.make(
+    resetBoundaryID
+      ? `prt_goal_continuation_${reservationID}_after_${resetBoundaryID}`
+      : `prt_goal_continuation_${reservationID}`,
+  )
 }
 
 function visibleWorkerPromptText(message: SessionV1.WithParts | undefined) {
@@ -281,7 +289,17 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 }
 
 export interface Interface {
+  /**
+   * Explicit execution abort. Any autonomous Goal cursor is invalidated so an
+   * operator stop cannot be resurrected by an unrelated later wake.
+   */
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Suspend execution while preserving Goal intent. The exact claimed
+   * continuation is requeued after the runner reaches quiescence so resume can
+   * reclaim it without inventing a new Goal cycle.
+   */
+  readonly pause: (sessionID: SessionID) => Effect.Effect<void>
   /**
    * Synchronous public-user admission preflight. HTTP async prompt routes use
    * this before forking so producer-owned-but-user-drivable roots never return
@@ -311,7 +329,7 @@ export interface Interface {
     provenance: UserActionPromptProvenance,
   ) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
   /**
-   * Host-origin prompt used by unattended runners (Goal continuation, scheduled
+   * Host-origin prompt used by host-driven runners (Goal continuation, scheduled
    * tasks). It is not a synthetic user keystroke: it must not supersede
    * autonomous reservations, and host-owned child Sessions are rejected.
    */
@@ -440,6 +458,13 @@ const layer = Layer.effect(
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+      yield* goalAutomation.cancel(sessionID)
+    })
+
+    const pause = Effect.fn("SessionPrompt.pause")(function* (sessionID: SessionID) {
+      yield* Effect.logInfo("pause", { "session.id": sessionID })
+      yield* state.cancel(sessionID)
+      yield* goalAutomation.requeueClaim(sessionID)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -2551,16 +2576,30 @@ const layer = Layer.effect(
 
     const materializeGoalContinuation = Effect.fn("SessionPrompt.materializeGoalContinuation")(function* (
       reservation: GoalAutomation.Reservation,
+      messages: SessionV1.WithParts[],
     ) {
       const sessionID = SessionID.make(reservation.sessionID)
-      const stableMessageID = goalContinuationMessageID(reservation.id)
-      const stablePartID = goalContinuationPartID(reservation.id)
+      // A continuation reservation is one logical worker cycle, but compaction
+      // is an execution-context reset inside that cycle. If the original
+      // continuation turn fell behind the latest completed compaction boundary,
+      // republish the same reservation after that boundary with deterministic
+      // epoch-specific ids. This preserves the auditor's exact handoff across
+      // compaction/restart without manufacturing a new Goal decision.
+      const visible = messages.findLast((message) =>
+        SessionTurnProvenance.hasGoalContinuationReservation(message, reservation.id),
+      )
+      const resetBoundary = visible ? undefined : MessageV2.latestCompletedCompaction(messages)
+      const resetBoundaryID = resetBoundary?.info.id
+      const stableMessageID = goalContinuationMessageID(reservation.id, resetBoundaryID)
+      const stablePartID = goalContinuationPartID(reservation.id, resetBoundaryID)
       let sourceMessageID = reservation.sourceMessageID ? MessageID.make(reservation.sourceMessageID) : undefined
 
       // Modern reservations always have a causal source and therefore take only
       // direct indexed lookups. The transcript scan below is deliberately
       // quarantined to pre-migration reservations that could not persist it.
-      let existing = yield* MessageV2.get({ sessionID, messageID: stableMessageID }).pipe(Effect.option)
+      let existing = visible
+        ? Option.some(visible)
+        : yield* MessageV2.get({ sessionID, messageID: stableMessageID }).pipe(Effect.option)
       if (Option.isNone(existing) && !sourceMessageID) {
         existing = yield* sessions
           .findMessage(sessionID, (message) =>
@@ -2628,7 +2667,11 @@ const layer = Layer.effect(
         provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.GoalContinuation, source.info, {
           ref: reservation.id,
         }),
-        time: { created: reservation.createdAt },
+        time: {
+          created: resetBoundary
+            ? Math.max(Date.now(), resetBoundary.info.time.created + 1)
+            : reservation.createdAt,
+        },
       }
       // These are intentionally two durable events. Stable ids make the pair
       // convergent: if the process dies after MessageUpdated, restart observes
@@ -2718,7 +2761,7 @@ const layer = Layer.effect(
           )
         }
         if (goalReservation && materializedGoalReservationID !== goalReservation.id) {
-          const changed = yield* materializeGoalContinuation(goalReservation).pipe(
+          const changed = yield* materializeGoalContinuation(goalReservation, msgs).pipe(
             Effect.onError(() => goalAutomation.release({ sessionID, reservationID: goalReservation!.id })),
           )
           if (changed) {
@@ -2953,14 +2996,34 @@ const layer = Layer.effect(
           // another full transcript query while ensuring current Goal state is
           // durable even when compaction stops rather than auto-continues.
           yield* reconcileGoalState(sessionID, MessageV2.filterCompacted(afterCompaction))
+          // Compaction is also an execution-context reset for an in-flight Goal
+          // cycle. The reservation itself remains the same durable decision, but
+          // its host continuation may now sit behind the compacted boundary.
+          // Force the next iteration through the idempotent materializer so the
+          // exact auditor handoff is visible in the post-compaction epoch.
+          if (goalReservation) materializedGoalReservationID = undefined
           const newestUser = MessageV2.latest(afterCompaction).user
           const hasConcurrentUser =
             newestUser !== undefined &&
             (newestUser.time.created > lastUser.time.created ||
               (newestUser.time.created === lastUser.time.created && newestUser.id > lastUser.id))
           if (hasConcurrentUser) continue
-          if (result === "stop") break
-          if (!task.auto && !task.continueAfter) break
+          if (result === "stop") {
+            // A failed compaction cannot safely retry the provider cycle, but it
+            // also must not strand the Goal cursor as process-owned work. Requeue
+            // the exact reservation for the next legitimate wake/recovery.
+            if (goalReservation) {
+              yield* goalAutomation.release({ sessionID, reservationID: goalReservation.id })
+              goalReservation = undefined
+              materializedGoalReservationID = undefined
+            }
+            break
+          }
+          // Manual compaction controls only ordinary chat autocontinue. If a
+          // Goal reservation is already executing, Goal Mode's single server-
+          // owned behavior remains authoritative and the same logical cycle must
+          // resume after the maintenance boundary.
+          if (!task.auto && !task.continueAfter && !goalReservation) break
           continue
         }
 
@@ -3356,7 +3419,17 @@ const layer = Layer.effect(
           input.sessionID,
           lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
           runLoop(input.sessionID).pipe(
-            Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID)),
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit)
+                ? turnCheckpoint.finishAborted(input.sessionID).pipe(
+                    // A claimed Goal continuation is a durable cursor, not a
+                    // property of this Effect fiber. Any abnormal loop exit must
+                    // return the claim to pending so restart/resume/recovery can
+                    // make forward progress instead of leaving a false owner.
+                    Effect.ensuring(goalAutomation.requeueClaim(input.sessionID)),
+                  )
+                : Effect.void,
+            ),
           ) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
         )
       },
@@ -3719,6 +3792,7 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel: cancel as unknown as Interface["cancel"],
+      pause: pause as unknown as Interface["pause"],
       assertUserPromptable: assertUserPromptable as unknown as Interface["assertUserPromptable"],
       auditGoal: auditGoal as unknown as Interface["auditGoal"],
       requestGoalAudit: requestGoalAudit as unknown as Interface["requestGoalAudit"],

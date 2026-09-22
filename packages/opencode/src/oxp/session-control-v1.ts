@@ -333,12 +333,12 @@ function runBasic(
 
         if (action === "pause") {
           yield* commitGuard(target)
-          yield* prompt.cancel(sessionID)
           const current = yield* sessions.get(sessionID)
           yield* sessions.setPaused({
             sessionID,
             pausedAt: current.pausedAt ?? Date.now(),
           })
+          yield* prompt.pause(sessionID)
           return
         }
 

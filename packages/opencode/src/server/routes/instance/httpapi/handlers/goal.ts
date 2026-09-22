@@ -76,11 +76,12 @@ export const goalHandlers = HttpApiBuilder.group(InstanceHttpApi, "goal", (handl
       const { sessionID, ...payload } = ctx.payload
 
       // A user verification request is an execution-preemption command, not a
-      // passive lifecycle transition. It works in every continuation mode:
-      // `manual` controls what happens after the verdict, not whether the
-      // independent auditor may run. SessionPrompt durably latches the request,
-      // brings active worker/tool execution to finalized idle, then starts the
-      // auditor. Existing orphaned `verifying` Goals use this same path.
+      // passive lifecycle transition. Goal Mode has one execution behavior;
+      // this action simply requests the independent auditor immediately rather
+      // than waiting for the current worker cycle to settle. SessionPrompt
+      // durably latches the request, brings active worker/tool execution to
+      // finalized idle, then starts the auditor. Existing orphaned `verifying`
+      // Goals use this same path.
       if (payload.action === "request_verification") {
         // Verification is an execution command, so there must always be a
         // concrete parent Session whose runner can be preempted and whose
