@@ -260,6 +260,70 @@ describe("OxpActivityRecorder", () => {
   )
 
   it.live(
+    "captures readable tool-call request/result detail while redacting credential-shaped values",
+    Effect.gen(function* () {
+      const recorder = yield* OxpActivityRecorder.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const input = {
+        parentCorrelation: chatCorrelation("parent-visible-detail"),
+        tool: "process",
+        args: {
+          action: "start",
+          rootID: "11111111-1111-4111-8111-111111111111",
+          workdir: "opencode",
+          command: "API_TOKEN=top-secret bun test packages/core --filter activity",
+          password: "also-secret",
+        },
+      } as const
+      const handle = yield* recorder.begin(input)
+      expect(handle).toBeDefined()
+      yield* recorder.success(handle, input, {
+        title: "bun test packages/core --filter activity",
+        output: "12 pass\n0 fail",
+        structured: {
+          exitCode: 0,
+          commandEcho: "bun test packages/core --filter activity",
+        },
+        metadata: {
+          path: "/webstormprojects/opencode",
+          authorization: "Bearer hidden-secret",
+        },
+        mutation: { attempted: true, committed: true },
+      })
+
+      const detail = yield* inspection.invocationDetail(handle!.invocationID)
+      expect(detail?.request).toEqual({
+        args: {
+          action: "start",
+          rootID: "11111111-1111-4111-8111-111111111111",
+          workdir: "opencode",
+          command: "API_TOKEN=[redacted] bun test packages/core --filter activity",
+          password: "[redacted]",
+        },
+      })
+      expect(detail?.outcome).toMatchObject({
+        title: "bun test packages/core --filter activity",
+        output: "12 pass\n0 fail",
+        structured: {
+          exitCode: 0,
+          commandEcho: "bun test packages/core --filter activity",
+        },
+        metadata: {
+          path: "/webstormprojects/opencode",
+          authorization: "[redacted]",
+        },
+      })
+
+      const page = yield* inspection.invocations({ activityID: handle!.activityID })
+      expect(JSON.stringify(page)).not.toContain("12 pass")
+      expect(JSON.stringify(page)).not.toContain("top-secret")
+      expect(JSON.stringify(detail)).not.toContain("top-secret")
+      expect(JSON.stringify(detail)).not.toContain("also-secret")
+      expect(JSON.stringify(detail)).not.toContain("hidden-secret")
+    }),
+  )
+
+  it.live(
     "persists bounded mutation presentation data without durable diff bodies",
     Effect.gen(function* () {
       const recorder = yield* OxpActivityRecorder.Service

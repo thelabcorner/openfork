@@ -89,6 +89,16 @@ function responsesStream(chunks: unknown[]) {
   })
 }
 
+function chatStream(chunks: unknown[], headers: Record<string, string> = {}) {
+  return new Response(
+    chunks.map((chunk) => `data: ${JSON.stringify(chunk)}`).join("\n\n") + "\n\ndata: [DONE]\n\n",
+    {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream", ...headers },
+    },
+  )
+}
+
 type NativeRequestInput = Parameters<typeof LLMNative.request>[0]
 
 const sessionText = (text: string) => ({ type: "text" as const, text })
@@ -756,6 +766,80 @@ describe("session.llm-native.request", () => {
         input: [{ type: "item_reference", id: "rs_1" }],
         store: true,
       },
+    }),
+  )
+
+  it.effect("uses provider fetch override and preserves routed account for native opencode-compatible", () =>
+    Effect.gen(function* () {
+      const captures: Array<{ url: string; body: unknown }> = []
+      const customFetch = Object.assign(
+        async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+          const request = input instanceof Request ? input : new Request(input, init)
+          captures.push({ url: request.url, body: await request.clone().json() })
+          return chatStream(
+            [
+              {
+                id: "chatcmpl-native-zen",
+                object: "chat.completion.chunk",
+                created: 1,
+                model: "deepseek-v4.1-flash",
+                choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-native-zen",
+                object: "chat.completion.chunk",
+                created: 1,
+                model: "deepseek-v4.1-flash",
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              },
+            ],
+            { "x-openfork-routed-account-id": "zen-routed-native" },
+          )
+        },
+        { preconnect: () => undefined },
+      ) satisfies typeof fetch
+
+      const llmClient = yield* LLMClient.Service
+      const native = LLMNativeRuntime.stream({
+        model: {
+          ...baseModel,
+          id: ModelV2.ID.make("deepseek-v4.1-flash"),
+          providerID: ProviderV2.ID.make("opencode-go"),
+          api: {
+            id: "deepseek-v4.1-flash",
+            url: "https://opencode.example.test/v1",
+            npm: "@ai-sdk/openai-compatible",
+          },
+        },
+        provider: {
+          ...providerInfo,
+          id: ProviderV2.ID.make("opencode-go"),
+          options: { apiKey: "provider-key", fetch: customFetch },
+        },
+        auth: undefined,
+        llmClient,
+        messages: [{ role: "user", content: "hello" }],
+        tools: {},
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      expect(native.type).toBe("supported")
+      if (native.type === "unsupported") throw new Error(native.reason)
+      const events = Array.from(yield* native.stream.pipe(Stream.runCollect))
+
+      expect(captures).toHaveLength(1)
+      expect(captures[0]?.url).toBe("https://opencode.example.test/v1/chat/completions")
+      expect(captures[0]?.body).toMatchObject({ model: "deepseek-v4.1-flash", stream: true })
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "text-delta", text: "Hello" }),
+          expect.objectContaining({
+            type: "step-finish",
+            providerMetadata: { openfork: { accountID: "zen-routed-native" } },
+          }),
+        ]),
+      )
     }),
   )
 

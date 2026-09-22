@@ -63,17 +63,13 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/ScheduledTaskExecutor") {}
 
 /**
- * Scheduled Goals are unattended by default because the scheduler is the
- * initiating producer. Resource/attempt limits belong to ScheduledTask policy;
- * Goal continuation limits remain opt-in and are never silently injected here.
+ * ScheduledTask owns scheduling/attempt policy; Goal Mode itself has no
+ * scheduled/manual/unattended variant. Preserve only explicitly configured Goal
+ * execution bounds and otherwise let the Goal run its normal audit/continue
+ * cycle.
  */
-export const SCHEDULED_GOAL_DEFAULTS = {
-  mode: "unattended",
-} as const
-
 export function scheduledGoalPolicy(policy: GoalModel.ContinuationPolicy | undefined): GoalModel.ContinuationPolicy {
   return {
-    mode: policy?.mode ?? SCHEDULED_GOAL_DEFAULTS.mode,
     ...(policy?.maxConsecutiveTurns !== undefined ? { maxConsecutiveTurns: policy.maxConsecutiveTurns } : {}),
     ...(policy?.maxNoProgressTurns !== undefined ? { maxNoProgressTurns: policy.maxNoProgressTurns } : {}),
     ...(policy?.maxDurationMs !== undefined ? { maxDurationMs: policy.maxDurationMs } : {}),

@@ -27,4 +27,5 @@ export const LinkKind = OxpActivity.LinkKind
 export type LinkKind = typeof LinkKind.Type
 
 export type SafeSummary = Readonly<Record<string, unknown>>
+export type InvocationDetail = Readonly<Record<string, unknown>>
 

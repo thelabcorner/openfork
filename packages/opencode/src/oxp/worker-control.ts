@@ -44,6 +44,13 @@ export interface ContinueInput {
   readonly expectedAgent?: string
 }
 
+export interface SetSelectionInput {
+  readonly workerID: string
+  readonly identity: Identity
+  readonly model: ModelSelection
+  readonly expectedModel?: ModelSelection
+}
+
 export type State =
   | "running"
   | "completed"
@@ -61,6 +68,15 @@ export interface Snapshot {
   readonly startedAt?: number
   readonly completedAt?: number
   readonly recovered: boolean
+}
+
+export interface SelectionChange {
+  readonly workerID: string
+  readonly previousModel: ModelSelection
+  readonly model: ModelSelection
+  readonly changed: boolean
+  readonly state: State
+  readonly generation?: number
 }
 
 export interface BatchStartInput {
@@ -96,8 +112,9 @@ export class StartCommitted extends Error {
   constructor(
     readonly workerID: string,
     message = "Delegated worker Session committed before execution setup failed",
+    cause?: unknown,
   ) {
-    super(message)
+    super(message, cause === undefined ? undefined : { cause })
   }
 }
 
@@ -106,8 +123,9 @@ export class ContinueCommitted extends Error {
   constructor(
     readonly workerID: string,
     message = "Delegated worker continuation committed before execution setup failed",
+    cause?: unknown,
   ) {
-    super(message)
+    super(message, cause === undefined ? undefined : { cause })
   }
 }
 
@@ -117,8 +135,9 @@ export class BatchCommitted extends Error {
     readonly workerIDs: readonly string[],
     readonly batchID?: string,
     message = "Delegated batch mutation partially committed before failure",
+    cause?: unknown,
   ) {
-    super(message)
+    super(message, cause === undefined ? undefined : { cause })
   }
 }
 
@@ -141,6 +160,10 @@ export interface Interface {
     target: Target,
     input: ContinueInput,
   ) => Effect.Effect<Snapshot, Error>
+  readonly setSelection: (
+    target: Target,
+    input: SetSelectionInput,
+  ) => Effect.Effect<SelectionChange, Error>
   readonly wait: (
     target: Target,
     input: {

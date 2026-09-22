@@ -50,6 +50,7 @@ export const Parameters = Schema.Struct({
     "wait",
     "result",
     "continue",
+    "set_selection",
     "cancel",
     "batch_start",
     "batch_list",
@@ -65,6 +66,7 @@ export const Parameters = Schema.Struct({
   prompt: Schema.optional(Text),
   agent: Schema.optional(Name),
   model: Schema.optional(OxpSchema.ModelSelection),
+  expectedModel: Schema.optional(OxpSchema.ModelSelection),
   nestedDelegation: Schema.optional(Schema.Boolean),
   timeoutMs: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 })),
@@ -94,12 +96,107 @@ export class Service extends Context.Service<Service, Interface>()(
 ) {}
 export const use = serviceUse(Service)
 
-function modelKey(model: OxpSchema.ModelSelection) {
-  return JSON.stringify({
-    providerID: model.providerID,
-    modelID: model.modelID,
-    accountID: model.accountID ?? null,
-    variant: model.variant ?? null,
+const workerHandleMetadata = (workerIDs: readonly string[]) =>
+  Object.fromEntries(
+    workerIDs.map((workerID, index) => ["workerID" + index, workerID]),
+  )
+
+const nativeDependency = (error: unknown) => {
+  let current: unknown = error
+  const seen = new Set<unknown>()
+  for (let depth = 0; depth < 8 && current instanceof Error && !seen.has(current); depth++) {
+    seen.add(current)
+    const service = current.message.match(/Service not found:\s*([^\s)]+)/i)?.[1]
+    if (service) {
+      return {
+        service,
+        nativeError: current.name || "Error",
+      }
+    }
+    current = current.cause
+  }
+  return undefined
+}
+
+export const mapControlError = (
+  error: Error,
+  explicitAccountID?: string,
+): OxpError.Error => {
+  if (OxpError.isError(error)) return error
+  if (error instanceof OxpWorkerControl.InvalidWorker) {
+    return new OxpError.NotFound({
+      detail: "Delegated worker is not available to this OXP principal",
+    })
+  }
+  if (error instanceof OxpWorkerControl.SelectionUnavailable) {
+    if (error.explicitAccount) {
+      return new OxpError.ProviderAccountUnavailable({
+        detail: OxpError.boundDetail(error.message),
+        ...(explicitAccountID
+          ? { metadata: { accountID: explicitAccountID } }
+          : {}),
+      })
+    }
+    return new OxpError.InvalidArgument({ detail: OxpError.boundDetail(error.message) })
+  }
+  const dependency = nativeDependency(error)
+  const dependencyDetail = dependency
+    ? `Native delegated-worker runtime dependency is unavailable: ${dependency.service}`
+    : undefined
+  const dependencyMetadata: Record<string, string | number | boolean> = dependency
+    ? {
+        dependency: dependency.service.slice(0, 256),
+        nativeError: dependency.nativeError.slice(0, 256),
+      }
+    : {}
+  const cause = error.cause
+  const causeDetail =
+    cause instanceof Error && cause.message.length > 0
+      ? OxpError.boundDetail(cause.message)
+      : undefined
+  if (error instanceof OxpWorkerControl.StartCommitted) {
+    return new OxpError.DependencyUnavailable({
+      detail: dependencyDetail ?? causeDetail ?? OxpError.boundDetail(error.message),
+      metadata: {
+        workerID: error.workerID,
+        committed: true,
+        ...dependencyMetadata,
+      },
+    })
+  }
+  if (error instanceof OxpWorkerControl.ContinueCommitted) {
+    return new OxpError.DependencyUnavailable({
+      detail: dependencyDetail ?? causeDetail ?? OxpError.boundDetail(error.message),
+      metadata: {
+        workerID: error.workerID,
+        committed: true,
+        ...dependencyMetadata,
+      },
+    })
+  }
+  if (error instanceof OxpWorkerControl.BatchCommitted) {
+    return new OxpError.DependencyUnavailable({
+      detail: dependencyDetail ?? causeDetail ?? OxpError.boundDetail(error.message),
+      metadata: {
+        committed: error.workerIDs.length > 0 || error.batchID !== undefined,
+        workersCommitted: error.workerIDs.length,
+        ...workerHandleMetadata(error.workerIDs),
+        ...(error.batchID ? { batchID: error.batchID } : {}),
+        ...dependencyMetadata,
+      },
+    })
+  }
+  if (dependency) {
+    return new OxpError.DependencyUnavailable({
+      detail: dependencyDetail!,
+      metadata: dependencyMetadata,
+    })
+  }
+  return new OxpError.DependencyUnavailable({
+    detail: OxpError.boundDetail(error.message || "Native delegated-worker operation failed"),
+    metadata: {
+      nativeError: error.name.slice(0, 256),
+    },
   })
 }
 
@@ -140,73 +237,6 @@ const layer = Layer.effect(
               }),
       })
 
-
-    const mapControlError = (
-      error: Error,
-      explicitAccountID?: string,
-    ): OxpError.Error => {
-      if (OxpError.isError(error)) return error
-      if (error instanceof OxpWorkerControl.InvalidWorker) {
-        return new OxpError.NotFound({
-          detail: "Delegated worker is not available to this OXP principal",
-        })
-      }
-      if (error instanceof OxpWorkerControl.SelectionUnavailable) {
-        if (error.explicitAccount) {
-          return new OxpError.ProviderAccountUnavailable({
-            detail: OxpError.boundDetail(error.message),
-            ...(explicitAccountID
-              ? { metadata: { accountID: explicitAccountID } }
-              : {}),
-          })
-        }
-        return new OxpError.InvalidArgument({ detail: OxpError.boundDetail(error.message) })
-      }
-      if (error instanceof OxpWorkerControl.StartCommitted) {
-        return new OxpError.DependencyUnavailable({
-          detail: OxpError.boundDetail(error.message),
-          metadata: { workerID: error.workerID, committed: true },
-        })
-      }
-      if (error instanceof OxpWorkerControl.ContinueCommitted) {
-        return new OxpError.DependencyUnavailable({
-          detail: OxpError.boundDetail(error.message),
-          metadata: { workerID: error.workerID, committed: true },
-        })
-      }
-      if (error instanceof OxpWorkerControl.BatchCommitted) {
-        return new OxpError.DependencyUnavailable({
-          detail: OxpError.boundDetail(error.message),
-          metadata: {
-            committed: error.workerIDs.length > 0 || error.batchID !== undefined,
-            workersCommitted: error.workerIDs.length,
-            ...workerHandleMetadata(error.workerIDs),
-            ...(error.batchID ? { batchID: error.batchID } : {}),
-          },
-        })
-      }
-      const service = error.message.match(/Service not found:\s*([^\s)]+)/i)?.[1]
-      if (service) {
-        return new OxpError.DependencyUnavailable({
-          detail: `Native delegated-worker runtime dependency is unavailable: ${service}`,
-          metadata: {
-            dependency: service.slice(0, 256),
-            nativeError: error.name.slice(0, 256),
-          },
-        })
-      }
-      return new OxpError.DependencyUnavailable({
-        detail: OxpError.boundDetail(error.message || "Native delegated-worker operation failed"),
-        metadata: {
-          nativeError: error.name.slice(0, 256),
-        },
-      })
-    }
-
-    const workerHandleMetadata = (workerIDs: readonly string[]) =>
-      Object.fromEntries(
-        workerIDs.map((workerID, index) => ["workerID" + index, workerID]),
-      )
 
     const workerAdmission = Effect.fnUntraced(function* (
       row: SessionDelegationInspection.WorkerRow,
@@ -560,6 +590,7 @@ const layer = Layer.effect(
         input.action === "wait" ||
         input.action === "result" ||
         input.action === "continue" ||
+        input.action === "set_selection" ||
         input.action === "cancel"
       ) {
         if (!input.workerID) {
@@ -584,21 +615,73 @@ const layer = Layer.effect(
           producer: "oxp",
           principalRef: target.identity.principalRef,
         }
+        if (input.action === "set_selection") {
+          if (!input.model) {
+            return yield* new OxpError.InvalidArgument({
+              detail: "worker.set_selection requires model",
+            })
+          }
+          if (input.agent && input.agent !== target.origin.agent) {
+            return yield* new OxpError.InvalidArgument({
+              detail:
+                "worker.set_selection changes provider/model/account/variant only; the worker agent remains immutable",
+            })
+          }
+          const model = yield* normalizeModel(input.model)
+          const expectedModel = input.expectedModel
+            ? yield* normalizeModel(input.expectedModel)
+            : undefined
+          const result = yield* control
+            .setSelection(
+              runtimeTarget(target.row, target.admission),
+              {
+                workerID: input.workerID,
+                identity,
+                model,
+                ...(expectedModel ? { expectedModel } : {}),
+              },
+            )
+            .pipe(
+              Effect.mapError((error) =>
+                mapControlError(error, input.model?.accountID),
+              ),
+            )
+          if (signal?.aborted && result.changed) {
+            return yield* new OxpError.Cancelled({
+              detail:
+                "Delegated worker selection mutation committed before caller cancellation was observed",
+              metadata: {
+                workerID: input.workerID,
+                committed: true,
+              },
+            })
+          }
+          const projected = {
+            ...result,
+            appliesTo: "next_turn" as const,
+          }
+          return {
+            title: result.changed
+              ? "OpenFork delegated worker selection updated"
+              : "OpenFork delegated worker selection unchanged",
+            output: JSON.stringify(projected),
+            structured: projected,
+            mutation: {
+              attempted: true,
+              committed: result.changed,
+            },
+          } satisfies OxpResult.CapabilityResult
+        }
+
         if (input.action === "continue") {
           if (!input.prompt) {
             return yield* new OxpError.InvalidArgument({
               detail: "worker.continue requires prompt",
             })
           }
-          if (input.model) {
-            const normalized = yield* normalizeModel(input.model)
-            if (modelKey(normalized) !== modelKey(target.origin.model)) {
-              return yield* new OxpError.InvalidArgument({
-                detail:
-                  "Continuation model/account selection must match the existing worker's durable selection",
-              })
-            }
-          }
+          const expectedModel = input.model
+            ? yield* normalizeModel(input.model)
+            : undefined
           if (input.agent && input.agent !== target.origin.agent) {
             return yield* new OxpError.InvalidArgument({
               detail:
@@ -632,9 +715,7 @@ const layer = Layer.effect(
                 identity,
                 invocationRef,
                 nestedDelegation: nestedAdmission !== undefined,
-                ...(input.model
-                  ? { expectedModel: yield* normalizeModel(input.model) }
-                  : {}),
+                ...(expectedModel ? { expectedModel } : {}),
                 ...(input.agent ? { expectedAgent: input.agent } : {}),
               },
             )
@@ -902,6 +983,7 @@ const layer = Layer.effect(
                   const resolved: Array<{
                     continuation: (typeof input.continuations)[number]
                     worker: (typeof owned.workers)[number]
+                    expectedModel?: OxpSchema.ModelSelection
                   }> = []
                   let needsNested = false
                   for (const continuation of input.continuations) {
@@ -922,20 +1004,9 @@ const layer = Layer.effect(
                           "Delegated batch member is not available to this OXP principal",
                       })
                     }
-                    if (continuation.model) {
-                      const normalized = yield* normalizeModel(
-                        continuation.model,
-                      )
-                      if (
-                        modelKey(normalized) !==
-                        modelKey(worker.origin.model)
-                      ) {
-                        return yield* new OxpError.InvalidArgument({
-                          detail:
-                            "Batch continuation model/account selection must match each existing worker's durable selection",
-                        })
-                      }
-                    }
+                    const expectedModel = continuation.model
+                      ? yield* normalizeModel(continuation.model)
+                      : undefined
                     if (
                       continuation.agent &&
                       continuation.agent !== worker.origin.agent
@@ -946,7 +1017,7 @@ const layer = Layer.effect(
                       })
                     }
                     if (worker.origin.nestedDelegation) needsNested = true
-                    resolved.push({ continuation, worker })
+                    resolved.push({ continuation, worker, expectedModel })
                   }
                   const nested = needsNested
                     ? yield* authority
@@ -962,7 +1033,7 @@ const layer = Layer.effect(
                   const nestedAdmission =
                     nested && nested._tag === "Some" ? nested.value : undefined
                   const items: OxpWorkerControl.ContinueInput[] = []
-                  for (const { continuation, worker } of resolved) {
+                  for (const { continuation, worker, expectedModel } of resolved) {
                     items.push({
                       workerID: continuation.workerID,
                       prompt: continuation.prompt,
@@ -971,13 +1042,7 @@ const layer = Layer.effect(
                       nestedDelegation:
                         worker.origin.nestedDelegation &&
                         nestedAdmission !== undefined,
-                      ...(continuation.model
-                        ? {
-                            expectedModel: yield* normalizeModel(
-                              continuation.model,
-                            ),
-                          }
-                        : {}),
+                      ...(expectedModel ? { expectedModel } : {}),
                       ...(continuation.agent
                         ? { expectedAgent: continuation.agent }
                         : {}),

@@ -12,6 +12,7 @@ import { OxpProject } from "./project"
 import { OxpRefactor } from "./refactor"
 import { OxpPatch } from "./patch"
 import { OxpProcess } from "./process"
+import { OxpRuntimeRefresh } from "./runtime-refresh"
 import { OxpRead } from "./read"
 import { OxpResult } from "./result"
 import { OxpSchedule } from "./schedule"
@@ -262,7 +263,13 @@ const layer = Layer.effect(
           schema: OxpEdit.Parameters,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpEdit.Parameters)(input, { onExcessProperty: "error" }).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP edit arguments" })),
+              Effect.mapError(
+                () =>
+                  new OxpError.InvalidArgument({
+                    detail:
+                      "Invalid OXP edit arguments. Use exactly one edit shape: exact {oldString,newString}, batch {edits}, line/range {line|startLine+endLine,oldText,newText}, delete range, insert, append, or nearText. Do not mix strategies.",
+                  }),
+              ),
               Effect.flatMap((params) => edit.execute(params, signal)),
             ),
         },
@@ -471,8 +478,14 @@ const layer = Layer.effect(
           mutation: "none",
           schema: OxpFind.Parameters,
           execute: (input, signal) =>
-            Schema.decodeUnknownEffect(OxpFind.Parameters)(input).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP find arguments" })),
+            Schema.decodeUnknownEffect(OxpFind.Parameters)(input, { onExcessProperty: "error" }).pipe(
+              Effect.mapError(
+                () =>
+                  new OxpError.InvalidArgument({
+                    detail:
+                      'Invalid OXP find arguments. Choose exactly one search shape: {glob,...} or {grep,...}. grep is literal by default; set syntax:"regex" only when regular-expression semantics are intentional.',
+                  }),
+              ),
               Effect.flatMap((params) => find.execute(params, signal)),
             ),
         },
@@ -490,8 +503,49 @@ const layer = Layer.effect(
           schema: OxpProcess.Parameters,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpProcess.Parameters)(input, { onExcessProperty: "error" }).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP process arguments" })),
+              Effect.mapError(
+                () =>
+                  new OxpError.InvalidArgument({
+                    detail:
+                      "Invalid OXP process arguments. Choose one action-shaped call. For start, provide rootID plus either argv (preferred for executable calls) or command (only when shell syntax is required), never both.",
+                  }),
+              ),
               Effect.flatMap((params) => process.execute(params, signal)),
+            ),
+        },
+      ],
+      [
+        "runtime.refresh",
+        {
+          id: "runtime.refresh",
+          namespace: "openfork",
+          description: OxpProse.capabilityDescription("runtime.refresh"),
+          authority: "process",
+          exposure: "brokered",
+          workspaceTier: 0,
+          mutation: "write",
+          schema: OxpRuntimeRefresh.Parameters,
+          execute: (input) =>
+            Schema.decodeUnknownEffect(OxpRuntimeRefresh.Parameters)(input, {
+              onExcessProperty: "error",
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new OxpError.InvalidArgument({
+                    detail: "Invalid OXP runtime-refresh arguments",
+                  }),
+              ),
+              Effect.flatMap((params) =>
+                Effect.gen(function* () {
+                  const admission = yield* authority.authorize({
+                    plane: "augmentation",
+                    operation: `runtime.${params.action}`,
+                    phase: "mutate",
+                  })
+                  yield* authority.revalidate(admission, "commit")
+                  return yield* OxpRuntimeRefresh.execute(params)
+                }),
+              ),
             ),
         },
       ],

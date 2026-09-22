@@ -46,14 +46,8 @@ export function normalize(input: OxpSchema.ModelSelection): OxpSchema.ModelSelec
 
   const accountID = input.accountID ? trimmed(input.accountID, "accountID") : undefined
   const variant = input.variant ? trimmed(input.variant, "variant") : undefined
-  if (accountID) {
-    const descriptor = multiAccountProvider(providerID)
-    if (!descriptor) {
-      throw invalid(`Provider ${providerID} does not expose first-class account selection`)
-    }
-    if (!accountID.startsWith(descriptor.accountPrefix) || accountID.includes("@")) {
-      throw invalid(`accountID does not belong to provider ${providerID}`)
-    }
+  if (accountID && !multiAccountProvider(providerID)) {
+    throw invalid(`Provider ${providerID} does not expose first-class account selection`)
   }
 
   return Object.freeze({
@@ -72,6 +66,14 @@ export function normalize(input: OxpSchema.ModelSelection): OxpSchema.ModelSelec
  */
 export function materialize(input: OxpSchema.ModelSelection): Materialized {
   const selection = normalize(input)
+  if (selection.accountID) {
+    const descriptor = multiAccountProvider(selection.providerID)!
+    if (!selection.accountID.startsWith(descriptor.accountPrefix) || selection.accountID.includes("@")) {
+      throw invalid(
+        "OXP accountID must be resolved to the provider's stable internal account id before materialization",
+      )
+    }
+  }
   return Object.freeze({
     selection,
     providerModelID: providerModelID(selection.modelID, selection.providerID, selection.accountID),

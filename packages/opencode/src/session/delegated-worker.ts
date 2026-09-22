@@ -15,6 +15,7 @@ import { DelegatedWorkerPolicy } from "./delegated-worker-policy"
 
 export const JOB_TYPE = "delegated-worker"
 const MAX_RESULT_BYTES = 256 * 1024
+const RUNTIME_PROBE_JOB_ID = "__delegated-worker-runtime-probe__"
 
 export interface ModelSelection {
   readonly providerID: string
@@ -51,6 +52,17 @@ export interface ContinueInput {
   readonly beforeCommit?: Effect.Effect<void, Error>
 }
 
+export interface SetSelectionInput {
+  readonly sessionID: SessionID
+  readonly identity: Identity
+  /** Full replacement selection for future admitted worker turns. */
+  readonly model: ModelSelection
+  /** Optional compare-and-set guard against a stale controller view. */
+  readonly expectedModel?: ModelSelection
+  /** Caller-owned authority/CAS barrier run immediately before durable selection mutation. */
+  readonly beforeCommit?: Effect.Effect<void, Error>
+}
+
 export type State =
   | "running"
   | "completed"
@@ -70,6 +82,13 @@ export interface Snapshot {
   readonly recovered: boolean
 }
 
+export interface SelectionChange {
+  readonly previousModel: ModelSelection
+  readonly model: ModelSelection
+  readonly changed: boolean
+  readonly snapshot: Snapshot
+}
+
 export class InvalidWorker extends Error {
   override readonly name = "DelegatedWorkerInvalid"
   constructor(message = "Session is not a delegated worker owned by this principal") {
@@ -79,7 +98,10 @@ export class InvalidWorker extends Error {
 
 export class SelectionMismatch extends Error {
   override readonly name = "DelegatedWorkerSelectionMismatch"
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly explicitAccount = false,
+  ) {
     super(message)
   }
 }
@@ -162,15 +184,25 @@ export const make = Effect.gen(function* () {
       }
       const providerID = ProviderV2.ID.make(selection.providerID)
       const modelID = ModelV2.ID.make(selection.modelID)
+      const accountID = selection.accountID
+        ? yield* provider
+            .resolveAccountID(providerID, selection.accountID)
+            .pipe(
+              Effect.mapError(
+                (error) => new SelectionMismatch(error.message, true),
+              ),
+            )
+        : undefined
       const resolved = yield* provider
-        .getModel(providerID, modelID, selection.accountID)
+        .getModel(providerID, modelID, accountID)
         .pipe(
           Effect.mapError(
             () =>
               new SelectionMismatch(
-                selection.accountID
+                accountID
                   ? "Requested delegated-worker provider account/model is unavailable"
                   : "Requested delegated-worker model is unavailable",
+                accountID !== undefined,
               ),
           ),
         )
@@ -196,7 +228,7 @@ export const make = Effect.gen(function* () {
         model: {
           providerID,
           modelID,
-          ...(selection.accountID ? { accountID: selection.accountID } : {}),
+          ...(accountID ? { accountID } : {}),
           ...(selection.variant ? { variant: selection.variant } : {}),
         },
       }
@@ -289,6 +321,7 @@ export const make = Effect.gen(function* () {
       promptText: string
       agent: string
       model: ModelSelection
+      principalRef: string
       invocationRef: string
       nestedDelegation: boolean
     }) {
@@ -316,6 +349,7 @@ export const make = Effect.gen(function* () {
         {
           source: SessionTurnProvenance.Source.OxpDelegation,
           ref: input.invocationRef,
+          principalRef: input.principalRef,
         },
       )
     },
@@ -336,6 +370,16 @@ export const make = Effect.gen(function* () {
     },
   )
 
+  // BackgroundJob's V1 adapter owns an instance-scoped lazy runtime. Force its
+  // InstanceState/Scope entry to materialize before any durable Session/prompt
+  // mutation so registry bootstrap failure surfaces pre-commit. This probes the
+  // InstanceRef/Scope edge only; it is not a general service-graph preflight.
+  const ensureExecutionRuntime = Effect.fn("DelegatedWorker.ensureExecutionRuntime")(
+    function* () {
+      yield* background.get(RUNTIME_PROBE_JOB_ID)
+    },
+  )
+
   const start = Effect.fn("DelegatedWorker.start")(function* (input: StartInput) {
     const selected = yield* validateSelection(input.agent, input.model)
     if (
@@ -348,9 +392,20 @@ export const make = Effect.gen(function* () {
         ),
       )
     }
+    const origin: SessionMetadataOwnership.WorkerDelegationOrigin = {
+      ...input.origin,
+      agent: selected.agent.name,
+      model: {
+        providerID: String(selected.model.providerID),
+        modelID: String(selected.model.modelID),
+        ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
+        ...(selected.model.variant ? { variant: selected.model.variant } : {}),
+      },
+    }
+    yield* ensureExecutionRuntime()
     const permission = [
       ...selected.agent.permission,
-      ...(input.origin.nestedDelegation
+      ...(origin.nestedDelegation
         ? []
         : [
             {
@@ -377,7 +432,7 @@ export const make = Effect.gen(function* () {
               ? { variant: selected.model.variant }
               : {}),
           },
-          metadata: SessionMetadataOwnership.delegatedWorker(input.origin),
+          metadata: SessionMetadataOwnership.delegatedWorker(origin),
           permission,
         })
 
@@ -385,9 +440,10 @@ export const make = Effect.gen(function* () {
           sessionID: session.id,
           promptText: input.prompt,
           agent: selected.agent.name,
-          model: input.model,
-          invocationRef: input.origin.invocationRef,
-          nestedDelegation: input.origin.nestedDelegation,
+          model: selected.model,
+          principalRef: origin.principalRef,
+          invocationRef: origin.invocationRef,
+          nestedDelegation: origin.nestedDelegation,
         }).pipe(
           Effect.mapError((cause) => new StartCommitted(session.id, cause)),
         )
@@ -399,8 +455,8 @@ export const make = Effect.gen(function* () {
             title: input.title,
             metadata: {
               sessionID: session.id,
-              producer: input.origin.producer,
-              principalRef: input.origin.principalRef,
+              producer: origin.producer,
+              principalRef: origin.principalRef,
             },
             continueOnFailure: true,
             run: drain(session.id).pipe(
@@ -438,14 +494,19 @@ export const make = Effect.gen(function* () {
           ),
         )
       }
-      if (input.expectedModel && !sameSelection(input.expectedModel, origin.model)) {
+      const expected = input.expectedModel
+        ? yield* validateSelection(origin.agent, input.expectedModel)
+        : undefined
+      if (expected && !sameSelection(expected.model, origin.model)) {
         return yield* Effect.fail(
           new SelectionMismatch(
             "Delegated worker is bound to a different model/account selection",
+            input.expectedModel?.accountID !== undefined,
           ),
         )
       }
       yield* validateSelection(origin.agent, origin.model)
+      yield* ensureExecutionRuntime()
 
       return yield* Effect.uninterruptibleMask(() =>
         Effect.gen(function* () {
@@ -455,6 +516,7 @@ export const make = Effect.gen(function* () {
             promptText: input.prompt,
             agent: origin.agent,
             model: origin.model,
+            principalRef: origin.principalRef,
             invocationRef: input.invocationRef,
             nestedDelegation:
               origin.nestedDelegation && input.nestedDelegation,
@@ -582,6 +644,98 @@ export const make = Effect.gen(function* () {
     },
   )
 
+  const setSelection = Effect.fn("DelegatedWorker.setSelection")(
+    function* (input: SetSelectionInput) {
+      const { session, origin } = yield* requireWorker(
+        input.sessionID,
+        input.identity,
+      )
+      const expected = input.expectedModel
+        ? yield* validateSelection(origin.agent, input.expectedModel)
+        : undefined
+      if (expected && !sameSelection(expected.model, origin.model)) {
+        return yield* Effect.fail(
+          new SelectionMismatch(
+            "Delegated worker model selection changed before selection mutation",
+            input.expectedModel?.accountID !== undefined,
+          ),
+        )
+      }
+
+      const selected = yield* validateSelection(origin.agent, input.model)
+      const nextModel: ModelSelection = {
+        providerID: String(selected.model.providerID),
+        modelID: String(selected.model.modelID),
+        ...(selected.model.accountID
+          ? { accountID: selected.model.accountID }
+          : {}),
+        ...(selected.model.variant &&
+        selected.model.variant !== "default"
+          ? { variant: selected.model.variant }
+          : {}),
+      }
+      if (sameSelection(nextModel, origin.model)) {
+        return {
+          previousModel: origin.model,
+          model: nextModel,
+          changed: false,
+          snapshot: yield* snapshot(session.id, input.identity),
+        } satisfies SelectionChange
+      }
+
+      return yield* Effect.uninterruptibleMask(() =>
+        Effect.gen(function* () {
+          if (input.beforeCommit) yield* input.beforeCommit
+
+          // Re-read immediately before the producer-owned update. Combined with
+          // Session.setDelegatedWorkerModel's expected-model check, this gives
+          // selection mutation compare-and-set semantics without weakening the
+          // generic metadata immutability boundary.
+          const latest = yield* requireWorker(session.id, input.identity)
+          if (!sameSelection(latest.origin.model, origin.model)) {
+            return yield* Effect.fail(
+              new SelectionMismatch(
+                "Delegated worker model selection changed before selection commit",
+                input.expectedModel?.accountID !== undefined,
+              ),
+            )
+          }
+          yield* sessions
+            .setDelegatedWorkerModel({
+              sessionID: session.id,
+              principalRef: origin.principalRef,
+              expectedModel: origin.model,
+              model: {
+                providerID: selected.model.providerID,
+                id: selected.model.modelID,
+                ...(selected.model.accountID
+                  ? { accountID: selected.model.accountID }
+                  : {}),
+                variant: selected.model.variant ?? "default",
+              },
+              time: Date.now(),
+            })
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new SelectionMismatch(
+                    error.reason,
+                    input.expectedModel?.accountID !== undefined,
+                  ),
+              ),
+            )
+
+          return {
+            previousModel: origin.model,
+            model: nextModel,
+            changed: true,
+            snapshot: yield* snapshot(session.id, input.identity),
+          } satisfies SelectionChange
+        }),
+      )
+    },
+  )
+
   const wait = Effect.fn("DelegatedWorker.wait")(function* (input: {
     sessionID: SessionID
     identity: Identity
@@ -589,11 +743,13 @@ export const make = Effect.gen(function* () {
   }) {
     yield* requireWorker(input.sessionID, input.identity)
     const live = yield* background.get(input.sessionID)
-    if (live?.status === "running") {
-      yield* background.wait({
-        id: input.sessionID,
-        ...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
-      })
+    if (live) {
+      if (live.status === "running") {
+        yield* background.wait({
+          id: input.sessionID,
+          ...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
+        })
+      }
       return yield* snapshot(input.sessionID, input.identity)
     }
 
@@ -632,9 +788,21 @@ export const make = Effect.gen(function* () {
     sessionID: SessionID
     identity: Identity
   }) {
+    yield* requireWorker(input.sessionID, input.identity)
+    const live = yield* background.get(input.sessionID)
+    if (!live) return yield* durableSnapshot(input.sessionID, input.identity)
     const current = yield* snapshot(input.sessionID, input.identity)
     if (current.result || current.error) return current
-    return yield* durableSnapshot(input.sessionID, input.identity)
+    const durable = yield* durableSnapshot(input.sessionID, input.identity)
+    return {
+      ...current,
+      ...(durable.result !== undefined && current.result === undefined
+        ? { result: durable.result }
+        : {}),
+      ...(durable.error !== undefined && current.error === undefined
+        ? { error: durable.error }
+        : {}),
+    } satisfies Snapshot
   })
 
   return {
@@ -642,6 +810,7 @@ export const make = Effect.gen(function* () {
     resolveSelection,
     start,
     continue: continueWorker,
+    setSelection,
     snapshot,
     wait,
     cancel,

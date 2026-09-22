@@ -83,6 +83,47 @@ describe("OxpPatch", () => {
     expect(yield* Effect.promise(() => fs.readFile(path.join(rootDir, "a.txt"), "utf8"))).toBe("alpha\n")
   }))
 
+  it.live("returns adjacent candidate context for ambiguous hunks so the caller can self-repair", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const patch = yield* OxpPatch.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    yield* Effect.promise(() =>
+      fs.writeFile(
+        path.join(rootDir, "dup.ts"),
+        [
+          "describe('first', () => {",
+          "  const value = makeThing()",
+          "})",
+          "describe('second', () => {",
+          "  const value = makeThing()",
+          "})",
+        ].join("\n"),
+      ),
+    )
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ write: true })
+
+    const error = yield* patch.execute({
+      rootID: root.id,
+      patchText: [
+        "*** Begin Patch",
+        "*** Update File: dup.ts",
+        "@@",
+        "-  const value = makeThing()",
+        "+  const value = makeOtherThing()",
+        "*** End Patch",
+      ].join("\n"),
+    }).pipe(Effect.flip)
+
+    expect(error._tag).toBe("OXP_CONFLICT")
+    expect(error.detail).toContain("Candidate contexts")
+    expect(error.detail).toContain("describe('first'")
+    expect(error.detail).toContain("describe('second'")
+  }))
+
   it.live("refuses path escape and write revocation", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service

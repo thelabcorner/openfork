@@ -309,7 +309,7 @@ const goalMock = Layer.mock(Goal.Service, {
           status: "active",
           revision: 1,
           auditorRuns: 0,
-          continuationPolicy: input.continuationPolicy ?? { mode: "manual" },
+          continuationPolicy: input.continuationPolicy ?? {},
           auditorPolicy: input.auditorPolicy ?? {},
           time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
         }),
@@ -516,9 +516,7 @@ describe("ScheduledTaskExecutor", () => {
         criteria: ["the objective is complete"],
         start: true,
         actor: "system",
-        continuationPolicy: {
-          mode: "unattended",
-        },
+        continuationPolicy: {},
       })
       expect(hostPromptProvenance).toMatchObject({
         runID: "str_executor_goal",
@@ -543,7 +541,7 @@ describe("ScheduledTaskExecutor", () => {
             constraints: [],
             status: "active",
             revision: 1,
-            continuationPolicy: { mode: "manual" },
+            continuationPolicy: {},
             auditorPolicy: {},
             time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
           },
@@ -588,7 +586,7 @@ describe("ScheduledTaskExecutor", () => {
             constraints: [],
             status: "completed",
             revision: 4,
-            continuationPolicy: { mode: "unattended" },
+            continuationPolicy: {},
             auditorPolicy: {},
             time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
           },

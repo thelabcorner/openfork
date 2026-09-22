@@ -6,6 +6,7 @@ import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { OxpActivitySchema } from "./schema"
 import {
+  OxpInvocationDetailTable,
   OxpInvocationLinkTable,
   OxpInvocationTable,
   OxpParentActivityTable,
@@ -18,6 +19,7 @@ const MAX_RESOURCE_PROVENANCE = 50
 export type ParentSummary = typeof OxpParentActivityTable.$inferSelect
 export type Invocation = typeof OxpInvocationTable.$inferSelect
 export type InvocationLink = typeof OxpInvocationLinkTable.$inferSelect
+export type InvocationDetail = typeof OxpInvocationDetailTable.$inferSelect
 export interface ResourceProvenance {
   readonly activityID: OxpActivitySchema.ActivityID
   readonly invocationID: OxpActivitySchema.InvocationID
@@ -78,6 +80,9 @@ export interface Interface {
     readonly ref: string
     readonly limit?: number
   }) => Effect.Effect<readonly ResourceProvenance[]>
+  readonly invocationDetail: (
+    invocationID: OxpActivitySchema.InvocationID,
+  ) => Effect.Effect<InvocationDetail | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -259,7 +264,18 @@ const layer = Layer.effect(
       }))
     })
 
-    return Service.of({ list, get, invocations, resource })
+    const invocationDetail = Effect.fn("OxpActivityInspection.invocationDetail")(
+      function* (invocationID: OxpActivitySchema.InvocationID) {
+        return yield* readDb
+          .select()
+          .from(OxpInvocationDetailTable)
+          .where(eq(OxpInvocationDetailTable.invocation_id, invocationID))
+          .get()
+          .pipe(Effect.orDie)
+      },
+    )
+
+    return Service.of({ list, get, invocations, resource, invocationDetail })
   }),
 )
 

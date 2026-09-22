@@ -236,7 +236,12 @@ describe("session.llm.ai-sdk adapter", () => {
       },
       {
         type: "finish-step",
-        response: { id: "response-1", timestamp: new Date(0), modelId: "gpt-test" },
+        response: {
+          id: "response-1",
+          timestamp: new Date(0),
+          modelId: "gpt-test",
+          headers: { "x-openfork-routed-account-id": "zen-routed-test" },
+        },
         finishReason: "other",
         rawFinishReason: "other",
         usage: {
@@ -305,7 +310,10 @@ describe("session.llm.ai-sdk adapter", () => {
           cacheReadInputTokens: 3,
           cacheWriteInputTokens: 2,
         },
-        providerMetadata: { openai: { step: true } },
+        providerMetadata: {
+          openai: { step: true },
+          openfork: { accountID: "zen-routed-test" },
+        },
       },
       {
         type: "finish",

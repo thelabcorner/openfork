@@ -91,6 +91,7 @@ export function classify(plane: OxpSchema.Plane, operation: string): OxpSchema.A
   if (operation === "archive.system") return "process"
   if (operation === "typecheck.run") return "process"
   if (operation === "refactor.process") return "process"
+  if (operation === "runtime" || operation.startsWith("runtime.")) return "process"
   if (operation === "process" || operation.startsWith("process.")) return "process"
   if (operation === "integration" || operation.startsWith("integration.")) return "integrations"
   if (operation === "browser" || operation.startsWith("browser.")) return "browser"
@@ -139,6 +140,7 @@ function requiresRoot(plane: OxpSchema.Plane, operation: string, authority: OxpS
   }
   if (authority === "integrations" || authority === "browser") return false
   if (operation === "capability.list" || operation === "capability.describe" || operation.startsWith("info.")) return false
+  if (operation === "runtime" || operation.startsWith("runtime.")) return false
   return true
 }
 

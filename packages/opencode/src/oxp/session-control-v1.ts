@@ -104,14 +104,27 @@ const setSelection = (
 
         const providerID = runtime.ProviderV2.ID.make(input.model.providerID)
         const modelID = runtime.ModelV2.ID.make(input.model.modelID)
+        const accountID = input.model.accountID
+          ? yield* provider
+              .resolveAccountID(providerID, input.model.accountID)
+              .pipe(
+                Effect.mapError(
+                  (error) =>
+                    new OxpSessionControl.SelectionUnavailable(
+                      "provider-account",
+                      error.message,
+                    ),
+                ),
+              )
+          : undefined
         const resolved = yield* provider
-          .getModel(providerID, modelID, input.model.accountID)
+          .getModel(providerID, modelID, accountID)
           .pipe(
             Effect.mapError(
               () =>
                 new OxpSessionControl.SelectionUnavailable(
-                  input.model.accountID ? "provider-account" : "model",
-                  input.model.accountID
+                  accountID ? "provider-account" : "model",
+                  accountID
                     ? "Requested provider account/model selection is unavailable"
                     : "Requested model selection is unavailable",
                 ),
@@ -147,7 +160,7 @@ const setSelection = (
           model: runtime.ModelV2.Ref.make({
             providerID,
             id: modelID,
-            ...(input.model.accountID ? { accountID: input.model.accountID } : {}),
+            ...(accountID ? { accountID } : {}),
             ...(input.model.variant
               ? { variant: runtime.ModelV2.VariantID.make(input.model.variant) }
               : {}),
@@ -201,6 +214,7 @@ const ensurePromptSelection = (
   })
 
 const startPrompt = (
+  scope: Scope.Scope,
   target: OxpSessionControl.Target,
   input: OxpSessionControl.PromptInput,
 ) =>
@@ -210,7 +224,6 @@ const startPrompt = (
       Effect.gen(function* () {
         const v1Sessions = yield* runtime.Session.Service
         const prompt = yield* runtime.SessionPrompt.Service
-        const scope = yield* Scope.Scope
         const sessionID = runtime.SessionID.make(target.sessionID)
         const selected = yield* ensurePromptSelection(runtime, target, input.actorRef)
         yield* commitGuard(target)
@@ -305,6 +318,7 @@ async function waitForPrompt(
 }
 
 function runBasic(
+  scope: Scope.Scope,
   target: OxpSessionControl.Target,
   action: BasicAction,
 ): Effect.Effect<void, Error> {
@@ -336,7 +350,6 @@ function runBasic(
 
         yield* commitGuard(target)
         yield* sessions.setPaused({ sessionID, pausedAt: undefined })
-        const scope = yield* Scope.Scope
         yield* prompt.loop({ sessionID }).pipe(
           Effect.catchCause((cause) =>
             Effect.logError("OXP Session resume drain failed", {
@@ -351,109 +364,112 @@ function runBasic(
   )
 }
 
-export const layer = Layer.succeed(
+export const layer = Layer.effect(
   OxpSessionControl.Service,
-  OxpSessionControl.Service.of({
-    pause: (target) => runBasic(target, "pause"),
-    resume: (target) => runBasic(target, "resume"),
-    abort: (target) => runBasic(target, "abort"),
-    setSelection,
-    send: (target, input) =>
-      startPrompt(target, input).pipe(
-        Effect.map((started) => ({
-          admittedMessageID: started.admittedMessageID,
-          paused: started.paused,
-        })),
-      ),
-    turn: (target, input, signal) =>
-      startPrompt(target, input).pipe(
-        Effect.flatMap((started) =>
-          Effect.tryPromise({
-            try: () => waitForPrompt(started, signal),
-            catch: (cause) =>
-              cause instanceof Error
-                ? cause
-                : new Error("Unable to wait for supervised Session turn"),
-          }),
+  Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    return OxpSessionControl.Service.of({
+      pause: (target) => runBasic(scope, target, "pause"),
+      resume: (target) => runBasic(scope, target, "resume"),
+      abort: (target) => runBasic(scope, target, "abort"),
+      setSelection,
+      send: (target, input) =>
+        startPrompt(scope, target, input).pipe(
+          Effect.map((started) => ({
+            admittedMessageID: started.admittedMessageID,
+            paused: started.paused,
+          })),
         ),
-      ),
-    backgroundSubagents: (target) =>
-      enter(
-        target,
-        (runtime) =>
-          Effect.gen(function* () {
-            const background = yield* runtime.BackgroundJob.Service
-            const jobs = (yield* background.list()).filter(
-              (job) =>
-                job.type === "task" &&
-                job.status === "running" &&
-                job.metadata?.parentSessionId === target.sessionID &&
-                job.metadata.background !== true,
-            )
-            let promoted = 0
-            for (const job of jobs) {
+      turn: (target, input, signal) =>
+        startPrompt(scope, target, input).pipe(
+          Effect.flatMap((started) =>
+            Effect.tryPromise({
+              try: () => waitForPrompt(started, signal),
+              catch: (cause) =>
+                cause instanceof Error
+                  ? cause
+                  : new Error("Unable to wait for supervised Session turn"),
+            }),
+          ),
+        ),
+      backgroundSubagents: (target) =>
+        enter(
+          target,
+          (runtime) =>
+            Effect.gen(function* () {
+              const background = yield* runtime.BackgroundJob.Service
+              const jobs = (yield* background.list()).filter(
+                (job) =>
+                  job.type === "task" &&
+                  job.status === "running" &&
+                  job.metadata?.parentSessionId === target.sessionID &&
+                  job.metadata.background !== true,
+              )
+              let promoted = 0
+              for (const job of jobs) {
+                yield* commitGuard(target)
+                const result = yield* background.promote(job.id)
+                if (result) promoted++
+              }
+              return { promoted }
+            }),
+        ),
+      todoGet: (target) =>
+        enter(
+          target,
+          (runtime) =>
+            Effect.gen(function* () {
+              const todo = yield* runtime.Todo.Service
+              return yield* todo.get(runtime.SessionID.make(target.sessionID))
+            }),
+        ),
+      todoSet: (target, todos) =>
+        enter(
+          target,
+          (runtime) =>
+            Effect.gen(function* () {
+              const todo = yield* runtime.Todo.Service
+              const sessionID = runtime.SessionID.make(target.sessionID)
               yield* commitGuard(target)
-              const result = yield* background.promote(job.id)
-              if (result) promoted++
-            }
-            return { promoted }
-          }),
-      ),
-    todoGet: (target) =>
-      enter(
-        target,
-        (runtime) =>
-          Effect.gen(function* () {
-            const todo = yield* runtime.Todo.Service
-            return yield* todo.get(runtime.SessionID.make(target.sessionID))
-          }),
-      ),
-    todoSet: (target, todos) =>
-      enter(
-        target,
-        (runtime) =>
-          Effect.gen(function* () {
-            const todo = yield* runtime.Todo.Service
-            const sessionID = runtime.SessionID.make(target.sessionID)
-            yield* commitGuard(target)
-            yield* todo.update({ sessionID, todos })
-            return yield* todo.get(sessionID)
-          }),
-      ),
-    checkpoint: (target, input) =>
-      enter(
-        target,
-        (runtime) =>
-          Effect.gen(function* () {
-            // Checkpoint is inherently Session-owned. Adapt the native
-            // implementation inside the already-authorized *real* Session
-            // runtime; never create a Session merely to obtain tool context.
-            const info = yield* runtime.CheckpointTool
-            const checkpoint = yield* info.init()
-            return yield* checkpoint.execute(input, {
-              sessionID: runtime.SessionID.make(target.sessionID),
-              messageID: runtime.MessageID.ascending(),
-              agent: "oxp-supervisor",
-              abort: target.signal ?? new AbortController().signal,
-              messages: [],
-              metadata: () => Effect.void,
-              ask: () => commitGuard(target).pipe(Effect.orDie),
-            })
-          }),
-      ),
-    goal: (target, input) =>
-      enter(
-        target,
-        (runtime) =>
-          Effect.gen(function* () {
-            const goals = yield* runtime.GoalAgent.Service
-            // Deliberately omit TurnProvenance. Goal creation is user-owned and
-            // GoalAgent will fail closed without a trusted current human turn;
-            // all existing-Goal operations retain their native semantics.
-            yield* commitGuard(target)
-            return yield* goals.execute(runtime.SessionSchema.ID.make(target.sessionID), input)
-          }),
-      ),
+              yield* todo.update({ sessionID, todos })
+              return yield* todo.get(sessionID)
+            }),
+        ),
+      checkpoint: (target, input) =>
+        enter(
+          target,
+          (runtime) =>
+            Effect.gen(function* () {
+              // Checkpoint is inherently Session-owned. Adapt the native
+              // implementation inside the already-authorized *real* Session
+              // runtime; never create a Session merely to obtain tool context.
+              const info = yield* runtime.CheckpointTool
+              const checkpoint = yield* info.init()
+              return yield* checkpoint.execute(input, {
+                sessionID: runtime.SessionID.make(target.sessionID),
+                messageID: runtime.MessageID.ascending(),
+                agent: "oxp-supervisor",
+                abort: target.signal ?? new AbortController().signal,
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => commitGuard(target).pipe(Effect.orDie),
+              })
+            }),
+        ),
+      goal: (target, input) =>
+        enter(
+          target,
+          (runtime) =>
+            Effect.gen(function* () {
+              const goals = yield* runtime.GoalAgent.Service
+              // Deliberately omit TurnProvenance. Goal creation is user-owned and
+              // GoalAgent will fail closed without a trusted current human turn;
+              // all existing-Goal operations retain their native semantics.
+              yield* commitGuard(target)
+              return yield* goals.execute(runtime.SessionSchema.ID.make(target.sessionID), input)
+            }),
+        ),
+    })
   }),
 )
 

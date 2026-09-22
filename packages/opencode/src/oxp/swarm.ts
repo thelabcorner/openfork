@@ -3,12 +3,10 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { SessionV2 } from "@opencode-ai/core/session"
-import { SwarmV2 } from "@opencode-ai/core/swarm"
+import type { SwarmV2 } from "@opencode-ai/core/swarm"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { InstanceState } from "@/effect/instance-state"
 import { SwarmCommand } from "@/swarm/command"
-import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
-import { Project } from "@/project/project"
 import { Parameters as NativeParameters } from "@/tool/swarm"
 import { OxpAuthority } from "./authority"
 import { OxpError } from "./error"
@@ -73,9 +71,6 @@ const layer = Layer.effect(
     const authority = yield* OxpAuthority.Service
     const roots = yield* OxpRoot.Service
     const supervision = yield* OxpSupervision.Service
-    const swarms = yield* SwarmV2.Service
-    const memberWake = yield* SwarmMemberSessionWake.Service
-    const projects = yield* Project.Service
 
     const executeRaw = Effect.fn("OxpSwarm.execute")(function* (input: Input, signal?: AbortSignal) {
       if (signal?.aborted) return yield* new OxpError.Cancelled({ detail: "OXP Swarm operation was cancelled" })
@@ -89,8 +84,6 @@ const layer = Layer.effect(
       const root = yield* roots.resolveRoot(input.rootID)
       const virtualRoot = "/" + root.root.alias
       const ownerTag = "oxp:connector:" + admission.connectorID
-      const persistedProject = yield* projects.fromDirectory(root.canonicalPath)
-      const projectID = persistedProject.project.id
 
       const settleTarget =
         input.action === "task.settle"
@@ -114,8 +107,22 @@ const layer = Layer.effect(
 
       const raw = yield* OxpRuntimeV1.enter(
         runtimeTarget,
-        async () =>
-          Effect.gen(function* () {
+        async () => {
+          const [
+            { SwarmV2: RuntimeSwarm },
+            { SwarmMemberSessionWake: RuntimeMemberWake },
+            { Project: RuntimeProject },
+          ] = await Promise.all([
+            import("@opencode-ai/core/swarm"),
+            import("@/swarm/member-session-wake"),
+            import("@/project/project"),
+          ])
+          return Effect.gen(function* () {
+            const swarms = yield* RuntimeSwarm.Service
+            const memberWake = yield* RuntimeMemberWake.Service
+            const projects = yield* RuntimeProject.Service
+            const persistedProject = yield* projects.fromDirectory(root.canonicalPath)
+            const projectID = persistedProject.project.id
             const params = input
 
             const commit = () => OxpRuntimeV1.commitGuard(runtimeTarget)
@@ -427,7 +434,8 @@ const layer = Layer.effect(
               }
             }
             return yield* Effect.fail(new Error("Unhandled Swarm action: " + params.action))
-          }),
+          })
+        },
         "Native OpenFork Swarm runtime operation failed",
       ).pipe(Effect.mapError((error) => executionError(error, root.canonicalPath, virtualRoot, signal)))
 
@@ -481,9 +489,6 @@ export const node = makeGlobalNode({
     OxpAuthority.node,
     OxpRoot.node,
     OxpSupervision.node,
-    SwarmV2.node,
-    SwarmMemberSessionWake.node,
-    Project.node,
   ],
 })
 

@@ -69,8 +69,11 @@ describe("OXP Gate J delegation architecture boundary", () => {
     expect(domain).not.toMatch(/sessions?\.create\(|parentID|Tool\.Context/)
     expect(worker).toContain("sessions.create({")
     expect(worker).toContain(
-      "metadata: SessionMetadataOwnership.delegatedWorker(input.origin)",
+      "metadata: SessionMetadataOwnership.delegatedWorker(origin)",
     )
+    expect(worker).toContain("model: selected.model")
+    expect(worker).toContain("model: {")
+    expect(worker).toContain("...(selected.model.accountID ? { accountID: selected.model.accountID } : {})")
     expect(worker).not.toMatch(/parentID\s*:/)
   })
 

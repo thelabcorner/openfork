@@ -111,6 +111,42 @@ describe("OxpFind", () => {
   )
 
   it.live(
+    "treats source-code metacharacters literally by default and requires explicit regex opt-in",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const find = yield* OxpFind.Service
+      const rootDir = path.join(suite, "workspace")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(rootDir, "source.ts"),
+          [
+            "const [data, setData] = tuple",
+            "const runtime = makeRuntime(provider)",
+            "const alpha = 1",
+            "const beta = 2",
+          ].join("\n"),
+        ),
+      )
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+
+      const bracket = yield* find.execute({ grep: "const [data", rootID: root.id })
+      expect(bracket.output).toContain("const [data, setData]")
+      expect(bracket.metadata?.syntax).toBe("literal")
+
+      const paren = yield* find.execute({ grep: "makeRuntime(provider", rootID: root.id })
+      expect(paren.output).toContain("makeRuntime(provider)")
+
+      const regex = yield* find.execute({ grep: "const (alpha|beta)", syntax: "regex", rootID: root.id })
+      expect(regex.metadata?.count).toBe(2)
+      expect(regex.metadata?.syntax).toBe("regex")
+    }),
+  )
+
+  it.live(
     "refuses relative shorthand without an explicit root even when only one root exists",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service

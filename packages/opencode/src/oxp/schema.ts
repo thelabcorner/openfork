@@ -46,8 +46,11 @@ const SelectionID = Schema.String.check(
 )
 
 /**
- * Canonical OXP model selection. Provider-account identity is deliberately a
- * first-class field rather than being smuggled through modelID text.
+ * OXP model selection. Provider-account identity is deliberately a first-class
+ * field rather than being smuggled through modelID text. At external ingress,
+ * accountID may contain either the stable provider account id or one exact
+ * provider-published human label/alias; runtime resolution canonicalizes it to
+ * the stable id before routing or durable persistence.
  *
  * Transport adapters may spell the JSON keys providerId/modelId/accountId; the
  * sidecar/runtime contract keeps the repository's providerID/modelID/accountID

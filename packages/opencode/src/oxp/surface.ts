@@ -298,6 +298,25 @@ function inputSchema(schema: Schema.Top): Tool["inputSchema"] {
   // wrappers flatten. Runtime decoding still uses the full Effect schema.
   const document = Schema.toJsonSchemaDocument(schema, { additionalProperties: false })
   const projected = compactSchema(document.schema) as Record<string, unknown>
+  // MCP's Tool schema requires inputSchema itself to be an object schema.
+  // Effect legitimately emits a root anyOf for discriminated strategy/action
+  // unions (edit/find/process). Preserve those exact branches while making the
+  // shared object domain explicit at the root so strict MCP 2025/2026 clients
+  // can decode tools/list without weakening runtime validation.
+  if (
+    projected.type === undefined &&
+    Array.isArray(projected.anyOf) &&
+    projected.anyOf.length > 0 &&
+    projected.anyOf.every(
+      (branch) =>
+        branch !== null &&
+        typeof branch === "object" &&
+        !Array.isArray(branch) &&
+        (branch as Record<string, unknown>).type === "object",
+    )
+  ) {
+    projected.type = "object"
+  }
   const definitions = document.definitions as Record<string, unknown> | undefined
   const needed = [...schemaRefs(projected)]
   if (!definitions || needed.length === 0) return projected as Tool["inputSchema"]

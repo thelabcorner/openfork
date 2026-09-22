@@ -71,6 +71,24 @@ describe("OxpSwarm", () => {
     expect((paused.structured as { status: string }).status).toBe("paused")
   }))
 
+  it.live("routes member recovery through the authoritative AppRuntime wake owner", Effect.gen(function* () {
+    const { swarm, root } = yield* prepare()
+    const created = yield* swarm.execute({
+      rootID: root.id,
+      action: "delegate",
+      swarmName: "Runtime wake owner",
+    })
+    const swarmID = (created.structured as { swarm: { id: string } }).swarm.id
+
+    const recovered = yield* swarm.execute({
+      rootID: root.id,
+      action: "recover.members",
+      swarmId: swarmID,
+    })
+    expect(recovered.structured).toMatchObject({ requested: true, unresolved: [] })
+    expect(recovered.metadata).toMatchObject({ status: "requested", count: 0 })
+  }))
+
   it.live("fences coordinator mutation to the connector principal that created the Swarm", Effect.gen(function* () {
     const { config, swarm, root } = yield* prepare()
     const created = yield* swarm.execute({

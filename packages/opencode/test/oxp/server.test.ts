@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -30,6 +30,7 @@ import {
   paginateToolList,
 } from "@/oxp/server"
 import { OxpError } from "@/oxp/error"
+import { OxpRuntimeRefresh } from "@/oxp/runtime-refresh"
 import { OxpSessionControl } from "@/oxp/session-control"
 import { OxpSurface } from "@/oxp/surface"
 import { OxpWorkerControl } from "@/oxp/worker-control"
@@ -71,6 +72,7 @@ const noWorkerControl = Layer.succeed(
     resolveSelection: () => Effect.die("server test must not enter worker runtime control"),
     start: () => Effect.die("server test must not enter worker runtime control"),
     continue: () => Effect.die("server test must not enter worker runtime control"),
+    setSelection: () => Effect.die("server test must not enter worker runtime control"),
     wait: () => Effect.die("server test must not enter worker runtime control"),
     result: () => Effect.die("server test must not enter worker runtime control"),
     cancel: () => Effect.die("server test must not enter worker runtime control"),
@@ -125,6 +127,7 @@ beforeEach(async () => {
   await fs.mkdir(stateDir, { recursive: true })
 })
 afterAll(async () => fs.rm(suite, { recursive: true, force: true }))
+afterEach(() => OxpRuntimeRefresh.install(undefined))
 
 function raw(input: {
   port: number
@@ -325,6 +328,10 @@ describe("OxpServer", () => {
         expect(JSON.stringify(status)).toContain('"requestSupervision":false')
         expect(JSON.stringify(status)).toContain('"delegation":"disabled"')
         expect(JSON.stringify(status)).toContain('"nestedDelegation":false')
+        expect(JSON.stringify(status)).toContain('"runtime"')
+        expect(JSON.stringify(status)).toContain('"refreshable":false')
+        expect(JSON.stringify(status)).not.toContain("runtimeModuleUrl")
+        expect(JSON.stringify(status)).not.toContain("dist/node/node.js")
       } finally {
         yield* Effect.promise(() => client.close().catch(() => undefined))
         yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
@@ -472,6 +479,150 @@ describe("OxpServer", () => {
           },
         })
       } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 20_000 },
+  )
+
+
+  it.live(
+    "exposes transactional runtime status and broker mutation over real MCP transport",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const server = yield* OxpServer.Service
+      const runtimeID = `sha256:${"a".repeat(64)}`
+      let refreshCalls = 0
+
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, process: true })
+      OxpRuntimeRefresh.install({
+        status: async () => ({
+          refreshable: true,
+          state: "stable",
+          runtimeID,
+          activationGeneration: 7,
+          activatedAt: 123,
+        }),
+        refresh: async (input) => {
+          refreshCalls += 1
+          expect(input.expectedRuntimeID).toBe(runtimeID)
+          return {
+            action: "refresh",
+            changed: false,
+            status: {
+              refreshable: true,
+              state: "stable",
+              runtimeID,
+              activationGeneration: 7,
+              activatedAt: 123,
+              lastTransition: {
+                trialID: "unchanged-e2e",
+                outcome: "unchanged",
+                at: 124,
+              },
+            },
+          }
+        },
+        accept: async () => {
+          throw new Error("accept must not run")
+        },
+        rollback: async () => {
+          throw new Error("rollback must not run")
+        },
+      })
+
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-runtime-refresh-e2e", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+      try {
+        yield* Effect.promise(() =>
+          client.connect(
+            new ModernStreamableHTTPClientTransport(new URL(endpoint.url)),
+          ),
+        )
+
+        const status = yield* Effect.promise(() =>
+          client.callTool({
+            name: "openfork_info",
+            arguments: { action: "status" },
+          }),
+        )
+        expect(status.isError).not.toBe(true)
+        const statusText =
+          status.content.find((item) => item.type === "text")?.text ?? ""
+        const statusData = JSON.parse(statusText) as {
+          runtime?: { refreshable?: boolean; runtimeID?: string }
+        }
+        expect(statusData.runtime).toMatchObject({
+          refreshable: true,
+          runtimeID,
+        })
+        expect(statusText).not.toContain("runtimeModuleUrl")
+        expect(statusText).not.toContain("dist/node/node.js")
+
+        const described = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "describe",
+              namespace: "openfork",
+              capability: "runtime.refresh",
+            },
+          }),
+        )
+        expect(described.isError).not.toBe(true)
+        const descriptorText =
+          described.content.find((item) => item.type === "text")?.text ?? "{}"
+        const descriptor = JSON.parse(descriptorText) as {
+          contract: string
+          capability: { id: string; authority: string; workspaceTier: number }
+        }
+        expect(descriptor).toMatchObject({
+          capability: {
+            id: "runtime.refresh",
+            authority: "process",
+            workspaceTier: 0,
+          },
+        })
+        expect(descriptor.contract).toMatch(/^broker-v1:[0-9a-f]{24}$/)
+
+        const refreshed = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "call",
+              namespace: "openfork",
+              capability: "runtime.refresh",
+              contract: descriptor.contract,
+              args: {
+                action: "refresh",
+                expectedRuntimeID: runtimeID,
+              },
+            },
+          }),
+        )
+        expect(refreshed.isError).not.toBe(true)
+        expect(refreshCalls).toBe(1)
+        expect(refreshed.structuredContent).toMatchObject({
+          data: {
+            action: "refresh",
+            changed: false,
+            status: {
+              runtimeID,
+              state: "stable",
+            },
+          },
+          mutation: {
+            attempted: true,
+            committed: false,
+          },
+        })
+      } finally {
+        OxpRuntimeRefresh.install(undefined)
         yield* Effect.promise(() => client.close().catch(() => undefined))
         yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
       }

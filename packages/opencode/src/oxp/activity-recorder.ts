@@ -107,6 +107,106 @@ function safePatchFiles(value: unknown) {
 }
 
 const SAFE_SUMMARY_TARGET_BYTES = 7 * 1024
+const DETAIL_TARGET_BYTES = 384 * 1024
+const DETAIL_MAX_STRING_BYTES = 128 * 1024
+const DETAIL_MAX_DEPTH = 12
+const DETAIL_MAX_ARRAY_ITEMS = 256
+const DETAIL_MAX_OBJECT_KEYS = 256
+const SECRET_KEY = /(?:pass(?:word)?|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key|access[_-]?key|refresh[_-]?token)/i
+
+function truncateUtf8(value: string, maxBytes: number) {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return { value, truncated: false }
+  const suffix = "\n… [truncated]"
+  const suffixBytes = Buffer.byteLength(suffix, "utf8")
+  const body = Buffer.from(value, "utf8").subarray(0, Math.max(0, maxBytes - suffixBytes)).toString("utf8")
+  return { value: body + suffix, truncated: true }
+}
+
+function redactInlineSecrets(value: string) {
+  return value
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s"';]+/gi, "$1[redacted]")
+    .replace(/(^|\s)((?:--?)(?:token|api[-_]?key|password|secret)(?:=|\s+))[^\s"';]+/gi, "$1$2[redacted]")
+    .replace(/\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*=)[^\s"';]+/g, "$1[redacted]")
+}
+
+function invocationDetail(value: unknown): OxpActivitySchema.InvocationDetail | undefined {
+  if (value === undefined) return
+  const seen = new WeakSet<object>()
+  let remaining = DETAIL_TARGET_BYTES
+  let truncated = false
+
+  const spend = (bytes: number) => {
+    remaining = Math.max(0, remaining - bytes)
+  }
+
+  const visit = (input: unknown, depth: number, key?: string): unknown => {
+    if (remaining <= 0) {
+      truncated = true
+      return "[truncated]"
+    }
+    if (input === null || typeof input === "boolean" || typeof input === "number") {
+      spend(16)
+      return input
+    }
+    if (typeof input === "bigint") {
+      const next = String(input)
+      spend(Buffer.byteLength(next, "utf8"))
+      return next
+    }
+    if (typeof input === "string") {
+      if (key && SECRET_KEY.test(key)) {
+        spend(10)
+        return "[redacted]"
+      }
+      const redacted = redactInlineSecrets(input)
+      const limit = Math.max(32, Math.min(DETAIL_MAX_STRING_BYTES, remaining))
+      const next = truncateUtf8(redacted, limit)
+      truncated ||= next.truncated
+      spend(Buffer.byteLength(next.value, "utf8"))
+      return next.value
+    }
+    if (typeof input === "undefined") return undefined
+    if (typeof input !== "object") {
+      const next = String(input)
+      spend(Buffer.byteLength(next, "utf8"))
+      return next
+    }
+    if (depth >= DETAIL_MAX_DEPTH) {
+      truncated = true
+      spend(16)
+      return "[max depth]"
+    }
+    if (seen.has(input as object)) {
+      spend(12)
+      return "[circular]"
+    }
+    seen.add(input as object)
+
+    if (Array.isArray(input)) {
+      const source = input.slice(0, DETAIL_MAX_ARRAY_ITEMS)
+      if (source.length !== input.length) truncated = true
+      return source.map((entry) => visit(entry, depth + 1))
+    }
+
+    const result: Record<string, unknown> = {}
+    const entries = Object.entries(input as Record<string, unknown>)
+    if (entries.length > DETAIL_MAX_OBJECT_KEYS) truncated = true
+    for (const [childKey, child] of entries.slice(0, DETAIL_MAX_OBJECT_KEYS)) {
+      spend(Buffer.byteLength(childKey, "utf8"))
+      const next = SECRET_KEY.test(childKey)
+        ? "[redacted]"
+        : visit(child, depth + 1, childKey)
+      if (next !== undefined) result[childKey] = next
+      if (remaining <= 0) break
+    }
+    return result
+  }
+
+  const sanitized = visit(value, 0)
+  const detail = record(sanitized)
+  if (!detail) return
+  return truncated ? { ...detail, detailTruncated: true } : detail
+}
 
 function finishSummary(
   value: Record<string, unknown>,
@@ -626,6 +726,7 @@ const layer = Layer.effect(
         ? (yield* config.get()).roots.find((root) => root.id === rootID)?.alias
         : undefined
       const summary = safeSummary(input)
+      const detail = invocationDetail({ args: input.args })
       const started = yield* activity.begin({
         correlation,
         hostRunID,
@@ -636,6 +737,7 @@ const layer = Layer.effect(
         rootID,
         rootAlias,
         ...(summary ? { summary } : {}),
+        ...(detail ? { detail } : {}),
       })
       yield* linkAll(
         started.invocationID,
@@ -665,6 +767,13 @@ const layer = Layer.effect(
           mutationAttempted: result.mutation?.attempted ?? false,
           mutationCommitted: result.mutation?.committed ?? false,
           summary: safeSummary(input, result),
+          detail: invocationDetail({
+            title: result.title,
+            output: result.output,
+            structured: result.structured,
+            metadata: result.metadata,
+            mutation: result.mutation,
+          }),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }
@@ -681,6 +790,13 @@ const layer = Layer.effect(
           mutationAttempted: committed,
           mutationCommitted: committed,
           summary: safeSummary(input),
+          detail: invocationDetail({
+            error: {
+              code: error._tag,
+              message: error.message,
+              metadata: error.metadata,
+            },
+          }),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }

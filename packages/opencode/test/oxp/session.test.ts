@@ -155,7 +155,7 @@ const controlLayer = Layer.succeed(
                 objective: "fixture",
                 constraints: [],
                 status: "active",
-                continuationPolicy: { mode: "auto_continue" },
+                continuationPolicy: {},
                 revision: 1,
                 createdAt: 1,
                 updatedAt: 1,

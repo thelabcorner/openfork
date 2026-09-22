@@ -15,7 +15,7 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
   read:
     "Read bounded files/directories inside approved roots. Inspection only; paths stay root-confined.",
   edit:
-    "Apply a verified precision edit to one text file in an approved root. Rejects stale or ambiguous matches.",
+    "Apply one strategy-shaped, verified text edit in an approved root. Exact, line/range, batch, insert, append, and anchored edits cannot be mixed.",
   git:
     "Typed Git inspection plus guarded stage/restore/commit in approved repos. Prefer over raw shell Git.",
   json:
@@ -37,9 +37,11 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
   patch:
     "Plan or atomically apply a multi-file patch in one approved root; rejects stale or escaping paths.",
   find:
-    "Find files by glob/name or bounded text search inside approved roots. Use before opening source bodies.",
+    "Find files by glob or bounded text search inside approved roots. Text search is literal by default; opt into regex explicitly.",
   process:
-    "Run workspace processes in approved roots. Upstream may reject model-authored authentication before OXP receives it; use a purpose-specific direct tool.",
+    "Run workspace processes in approved roots. Prefer argv. Upstream may reject model-authored authentication before OXP receives it; use a purpose-specific direct tool.",
+  "runtime.refresh":
+    "Transactionally activate a rebuilt OXP backend with content-addressed identity, bounded trial acceptance, and automatic runtime rollback without touching source or Git.",
   project:
     "Inspect project structure, stack/toolchain metadata, and recent files without opening arbitrary source bodies.",
   refactor:
@@ -83,7 +85,7 @@ export const DIRECT_TOOL_DESCRIPTIONS = Object.freeze({
   openfork_request:
     "Answer/list supervised Session permissions/questions. External paths remain inside approved roots.",
   openfork_worker:
-    "Create/manage worker Sessions for parallel work. Explicit roots/policy; may outlive parent epoch.",
+    "Create/manage worker Sessions for parallel work, including explicit provider/model/account/reasoning-variant rebinding for future turns. Explicit roots/policy; may outlive parent epoch.",
 } as const)
 
 export function capabilityDescription(id: keyof typeof CAPABILITY_DESCRIPTIONS) {

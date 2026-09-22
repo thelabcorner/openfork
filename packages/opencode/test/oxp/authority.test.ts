@@ -300,6 +300,35 @@ describe("OxpAuthority", () => {
   )
 
   it.live(
+    "treats runtime refresh as rootless process authority rather than workspace mutation",
+    Effect.gen(function* () {
+      const authority = yield* OxpAuthority.Service
+      const config = yield* OxpConfig.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ process: true })
+
+      const admitted = yield* authority.authorize({
+        plane: "augmentation",
+        operation: "runtime.refresh",
+        phase: "mutate",
+      })
+      expect(admitted.authority).toBe("process")
+      expect(admitted.root).toBeUndefined()
+
+      yield* config.setGrant({ process: false })
+      const denied = yield* attempt(
+        authority.authorize({
+          plane: "augmentation",
+          operation: "runtime.refresh",
+          phase: "mutate",
+        }),
+      )
+      expect(denied._tag).toBe("Left")
+      if (denied._tag === "Left") expect(denied.left._tag).toBe("OXP_AUTH_DENIED")
+    }),
+  )
+
+  it.live(
     "rejects unknown operation names instead of trusting a caller-supplied authority class",
     Effect.gen(function* () {
       const authority = yield* OxpAuthority.Service

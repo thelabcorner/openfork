@@ -59,16 +59,20 @@ describe("OXP Gate O architecture boundary", () => {
     expect(settings).not.toContain("worker-default-agent")
   })
 
-  test("new workers use runtime selection while continuation remains pinned to durable origin", async () => {
+  test("new workers use runtime selection while rebinding existing workers remains explicit", async () => {
     const [worker, delegated] = await Promise.all([
       fs.readFile(path.join(oxp, "worker.ts"), "utf8"),
       fs.readFile(path.join(root, "packages/opencode/src/session/delegated-worker.ts"), "utf8"),
     ])
     expect(worker).toContain(".resolveSelection(")
-    expect(delegated).toContain("agentName ?? (yield* agents.defaultAgent())")
+    expect(delegated).toContain("yield* agents.defaultInfo()")
     expect(delegated).toContain("yield* provider.defaultModel()")
-    expect(worker).toContain("target.origin.model")
+    expect(delegated).toContain("sameSelection(expected.model, origin.model)")
+    expect(worker).toContain("target.origin.agent")
     expect(worker).toContain("existing worker's durable selection")
+    expect(worker).toContain('"set_selection"')
+    expect(worker).toContain("expectedModel")
+    expect(delegated).toContain("setDelegatedWorkerModel")
   })
 
   test("retains only real delegation authority boundaries", async () => {

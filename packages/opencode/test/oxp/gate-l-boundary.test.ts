@@ -69,6 +69,7 @@ describe("OXP Gate L file-exchange architecture boundary", () => {
     const source = await fs.readFile(path.join(src, "oxp/file-exchange.ts"), "utf8")
     expect(source).toContain("files.oaiusercontent.com")
     expect(source).toContain("oaidalleapiprodscus.blob.core.windows.net")
+    expect(source).toContain("oaisdmntprcentralus.blob.core.windows.net")
     expect(source).toContain('url.protocol !== "https:"')
     expect(source).toContain("source_file must be supplied by ChatGPT; never invent it")
   })

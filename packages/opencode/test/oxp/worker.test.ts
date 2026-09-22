@@ -98,6 +98,20 @@ const controlLayer = Layer.succeed(
         afterCommit?.()
         return snapshot(input.workerID, "running")
       }),
+    setSelection: (target, input) =>
+      Effect.gen(function* () {
+        yield* guard(target)
+        calls.push({ action: "set_selection", target, input })
+        afterCommit?.()
+        return {
+          workerID: input.workerID,
+          previousModel: MODEL,
+          model: input.model,
+          changed:
+            JSON.stringify(input.model) !== JSON.stringify(MODEL),
+          state: "completed" as const,
+        }
+      }),
     wait: (target, input) =>
       Effect.sync(() => {
         calls.push({ action: "wait", target, input })
@@ -675,6 +689,46 @@ describe("OxpWorker", () => {
   )
 
   it.live(
+    "rebinds an existing worker model/account/variant through explicit set_selection",
+    Effect.gen(function* () {
+      const { config, root, directory } = yield* prepare()
+      const workers = yield* OxpWorker.Service
+      const connector = (yield* config.get()).connector.id
+      const workerID = yield* seedWorker({
+        directory,
+        rootID: root.id,
+        principalRef: "oxp:" + connector,
+      })
+
+      const result = yield* workers.execute({
+        action: "set_selection",
+        workerID,
+        model: MODEL_2,
+        expectedModel: MODEL,
+      })
+
+      expect(result.structured).toMatchObject({
+        workerID,
+        previousModel: MODEL,
+        model: MODEL_2,
+        changed: true,
+        state: "completed",
+        appliesTo: "next_turn",
+      })
+      expect(result.mutation).toEqual({ attempted: true, committed: true })
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toMatchObject({
+        action: "set_selection",
+        input: {
+          workerID,
+          model: MODEL_2,
+          expectedModel: MODEL,
+        },
+      })
+    }),
+  )
+
+  it.live(
     "uses durable delegation groups for batch discovery and routes wait/continue/cancel through native worker control",
     Effect.gen(function* () {
       const { config, root, directory } = yield* prepare()
@@ -730,7 +784,11 @@ describe("OxpWorker", () => {
         action: "batch_continue",
         batchID: batch.batchID,
         continuations: [
-          { workerID: batch.workerIDs[0], prompt: "continue a" },
+          {
+            workerID: batch.workerIDs[0],
+            prompt: "continue a",
+            model: { ...MODEL, accountID: "Team Key 2" },
+          },
           { workerID: batch.workerIDs[1], prompt: "continue b" },
         ],
       })
@@ -747,6 +805,7 @@ describe("OxpWorker", () => {
               workerID: batch.workerIDs[0],
               prompt: "continue a",
               nestedDelegation: false,
+              expectedModel: { ...MODEL, accountID: "Team Key 2" },
             },
             {
               workerID: batch.workerIDs[1],

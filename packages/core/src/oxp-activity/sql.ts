@@ -96,6 +96,18 @@ export const OxpInvocationTable = sqliteTable(
   ],
 )
 
+export const OxpInvocationDetailTable = sqliteTable(
+  "oxp_invocation_detail",
+  {
+    invocation_id: text()
+      .$type<OxpActivitySchema.InvocationID>()
+      .primaryKey()
+      .references(() => OxpInvocationTable.id, { onDelete: "cascade" }),
+    request: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
+    outcome: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
+  },
+)
+
 export const OxpInvocationLinkTable = sqliteTable(
   "oxp_invocation_link",
   {

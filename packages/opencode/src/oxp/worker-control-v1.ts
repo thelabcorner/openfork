@@ -33,7 +33,7 @@ const enter = <A>(
     "Native delegated-worker operation failed",
   )
 
-function mapWorkerError(
+export function mapWorkerError(
   runtime: Awaited<ReturnType<typeof runtimeModules>>,
   error: unknown,
 ): Error {
@@ -42,15 +42,23 @@ function mapWorkerError(
   }
   if (error instanceof runtime.DelegatedWorker.SelectionMismatch) {
     return new OxpWorkerControl.SelectionUnavailable(
-      error.message.includes("account"),
+      error.explicitAccount,
       error.message,
     )
   }
   if (error instanceof runtime.DelegatedWorker.StartCommitted) {
-    return new OxpWorkerControl.StartCommitted(String(error.sessionID))
+    return new OxpWorkerControl.StartCommitted(
+      String(error.sessionID),
+      undefined,
+      error.cause,
+    )
   }
   if (error instanceof runtime.DelegatedWorker.ContinueCommitted) {
-    return new OxpWorkerControl.ContinueCommitted(String(error.sessionID))
+    return new OxpWorkerControl.ContinueCommitted(
+      String(error.sessionID),
+      undefined,
+      error.cause,
+    )
   }
   return error instanceof Error
     ? error
@@ -135,6 +143,41 @@ const continueWorker: OxpWorkerControl.Interface["continue"] = (
               Effect.mapError((error) => mapWorkerError(runtime, error)),
             ),
         )
+      }),
+  )
+
+const setSelection: OxpWorkerControl.Interface["setSelection"] = (
+  target,
+  input,
+) =>
+  enter(
+    target,
+    (runtime) =>
+      Effect.gen(function* () {
+        const worker = yield* runtime.DelegatedWorker.make
+        const changed = yield* worker
+          .setSelection({
+            sessionID: runtime.SessionID.make(input.workerID),
+            identity: input.identity,
+            model: input.model,
+            ...(input.expectedModel
+              ? { expectedModel: input.expectedModel }
+              : {}),
+            beforeCommit: guard(target),
+          })
+          .pipe(
+            Effect.mapError((error) => mapWorkerError(runtime, error)),
+          )
+        return {
+          workerID: input.workerID,
+          previousModel: changed.previousModel,
+          model: changed.model,
+          changed: changed.changed,
+          state: changed.snapshot.state,
+          ...(changed.snapshot.generation !== undefined
+            ? { generation: changed.snapshot.generation }
+            : {}),
+        } satisfies OxpWorkerControl.SelectionChange
       }),
   )
 
@@ -225,15 +268,18 @@ const batchStart: OxpWorkerControl.Interface["batchStart"] = (
               Effect.mapError((error) => {
                 const mapped = mapWorkerError(runtime, error)
                 if (mapped instanceof OxpWorkerControl.StartCommitted) {
-                  return new OxpWorkerControl.BatchCommitted([
-                    ...workerIDs,
-                    mapped.workerID,
-                  ])
+                  return new OxpWorkerControl.BatchCommitted(
+                    [...workerIDs, mapped.workerID],
+                    undefined,
+                    undefined,
+                    mapped.cause,
+                  )
                 }
                 return new OxpWorkerControl.BatchCommitted(
                   workerIDs,
                   undefined,
                   mapped.message,
+                  mapped,
                 )
               }),
             )
@@ -259,6 +305,7 @@ const batchStart: OxpWorkerControl.Interface["batchStart"] = (
                 workerIDs,
                 undefined,
                 error instanceof Error ? error.message : String(error),
+                error,
               ),
           ),
         )
@@ -280,6 +327,7 @@ const batchStart: OxpWorkerControl.Interface["batchStart"] = (
                   workerIDs,
                   String(group.id),
                   error instanceof Error ? error.message : String(error),
+                  error,
                 ),
             ),
           )
@@ -310,6 +358,7 @@ const batchContinue: OxpWorkerControl.Interface["batchContinue"] = (
               [...committed, error.workerID],
               undefined,
               error.message,
+              error.cause,
             )
           }
           return committed.length > 0
@@ -317,6 +366,7 @@ const batchContinue: OxpWorkerControl.Interface["batchContinue"] = (
                 committed,
                 undefined,
                 error.message,
+                error,
               )
             : error
         }),
@@ -362,6 +412,7 @@ const batchCancel: OxpWorkerControl.Interface["batchCancel"] = (
                 committed,
                 undefined,
                 error.message,
+                error,
               )
             : error,
         ),
@@ -395,6 +446,7 @@ export const layer = Layer.succeed(
     resolveSelection,
     start,
     continue: continueWorker,
+    setSelection,
     wait,
     result,
     cancel,

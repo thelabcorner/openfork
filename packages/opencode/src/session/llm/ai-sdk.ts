@@ -3,6 +3,7 @@ import { Effect, Schema } from "effect"
 import { type streamText } from "ai"
 import { errorMessage } from "@/util/error"
 import { ProviderError } from "@/provider/error"
+import { routedAccountFromResponse } from "@/provider/routing-metadata"
 
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
@@ -67,6 +68,18 @@ function usage(value: unknown) {
 // OpenRouter resolves router slugs (`free`, `auto`) to a concrete upstream
 // model + endpoint provider; both are reported on the response. The served
 // provider name (e.g. `DeepInfra`) is not a configured catalog entry.
+function withRoutingMetadata(value: ProviderMetadata | undefined, response: unknown) {
+  const accountID = routedAccountFromResponse(response)
+  if (!accountID) return value
+  return {
+    ...value,
+    openfork: {
+      ...value?.openfork,
+      accountID,
+    },
+  } satisfies ProviderMetadata
+}
+
 function servedModel(response: unknown, providerMetadata: unknown) {
   if (!response || typeof response !== "object") return undefined
   const modelID = (response as { modelId?: string }).modelId
@@ -110,7 +123,7 @@ export function toLLMEvents(
       if (event.rawFinishReason === "network_error")
         return Effect.fail(new ProviderError.ResponseStreamError("Provider finish_reason: network_error"))
       return Effect.sync(() => {
-        const original = providerMetadata(event.providerMetadata)
+        const original = withRoutingMetadata(providerMetadata(event.providerMetadata), event.response)
         const metadata =
           state.copilotTotalNanoAiu === undefined
             ? original

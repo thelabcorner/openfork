@@ -11,7 +11,11 @@ import { OxpSchema } from "./schema"
 
 const MAX_BYTES = 512 * 1024 * 1024
 const PURPOSES = ["assistants", "batch", "fine-tune", "vision", "user_data", "evals"] as const
-const CHATGPT_HOSTS = new Set(["files.oaiusercontent.com", "oaidalleapiprodscus.blob.core.windows.net"])
+const CHATGPT_HOSTS = new Set([
+  "files.oaiusercontent.com",
+  "oaidalleapiprodscus.blob.core.windows.net",
+  "oaisdmntprcentralus.blob.core.windows.net",
+])
 
 export const ChatGptFile = Schema.Struct({
   download_url: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(16_384)),

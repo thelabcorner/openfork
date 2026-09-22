@@ -102,6 +102,61 @@ describe("OxpActivity", () => {
   )
 
   it.live(
+    "stores request/outcome detail separately from compact invocation rows and cascades it with history deletion",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const started = yield* activity.begin({
+        correlation: {
+          scheme: "mcp-session-id",
+          digest: "detail-parent",
+          scope: "unknown",
+        },
+        hostRunID: "host-detail",
+        plane: "augmentation",
+        tool: "process",
+        action: "start",
+        detail: {
+          args: {
+            command: "bun test packages/core",
+            workdir: "packages/core",
+          },
+        },
+      })
+      yield* activity.settle({
+        invocationID: started.invocationID,
+        status: "success",
+        detail: {
+          output: "42 pass",
+          metadata: { exitCode: 0 },
+        },
+      })
+
+      const page = yield* inspection.invocations({ activityID: started.activityID })
+      expect(page.items).toHaveLength(1)
+      expect(JSON.stringify(page.items[0])).not.toContain("bun test packages/core")
+      expect(JSON.stringify(page.items[0])).not.toContain("42 pass")
+
+      expect(yield* inspection.invocationDetail(started.invocationID)).toEqual({
+        invocation_id: started.invocationID,
+        request: {
+          args: {
+            command: "bun test packages/core",
+            workdir: "packages/core",
+          },
+        },
+        outcome: {
+          output: "42 pass",
+          metadata: { exitCode: 0 },
+        },
+      })
+
+      expect(yield* activity.deleteHistory(started.activityID)).toBe(true)
+      expect(yield* inspection.invocationDetail(started.invocationID)).toBeUndefined()
+    }),
+  )
+
+  it.live(
     "deduplicates one correlation into one durable parent while preserving concurrent spans",
     Effect.gen(function* () {
       const activity = yield* OxpActivity.Service

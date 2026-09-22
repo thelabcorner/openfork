@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
@@ -33,6 +33,40 @@ beforeEach(async () => {
 afterAll(async () => fs.rm(suite, { recursive: true, force: true }))
 
 describe("OxpEdit", () => {
+  it.live("publishes strategy-shaped edit inputs that reject mixed and underspecified calls before execution", Effect.gen(function* () {
+    const decode = Schema.decodeUnknownEffect(OxpEdit.Parameters, { onExcessProperty: "error" })
+    const exact = yield* decode({ path: "a.ts", oldString: "one", newString: "two" })
+    expect("oldString" in exact).toBe(true)
+
+    const mixed = yield* decode({
+      path: "a.ts",
+      oldString: "one",
+      newString: "two",
+      startLine: 1,
+      endLine: 5,
+      oldText: "one",
+    }).pipe(Effect.flip)
+    expect(mixed).toBeDefined()
+
+    const wideWithoutVerification = yield* decode({
+      path: "a.ts",
+      startLine: 1,
+      endLine: 170,
+      newText: "replacement",
+    }).pipe(Effect.flip)
+    expect(wideWithoutVerification).toBeDefined()
+
+    const unanchoredInsert = yield* decode({
+      path: "a.ts",
+      insertAt: 5,
+      newText: "replacement",
+    }).pipe(Effect.flip)
+    expect(unanchoredInsert).toBeDefined()
+
+    const prepend = yield* decode({ path: "a.ts", insertAt: 0, newText: "header" })
+    expect("insertAt" in prepend && prepend.insertAt).toBe(0)
+  }))
+
   it.live("reuses the precision edit engine under OXP authority without fabricating a Session", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service

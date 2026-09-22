@@ -1,6 +1,7 @@
 import type { Auth } from "@/auth"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
+import { resolveRoutedAccount, routedAccountFromResponse } from "@/provider/routing-metadata"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { asSchema, type ModelMessage, type Tool } from "ai"
@@ -13,8 +14,8 @@ import {
   ToolFailure,
   ToolRuntime,
   toDefinitions,
+  LLMEvent,
   type JsonSchema,
-  type LLMEvent,
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
@@ -73,9 +74,12 @@ function statusWithFetch(
 }
 
 export function stream(input: StreamInput): StreamResult {
-  const fetch = providerFetch(input)
-  const current = statusWithFetch(input, fetch)
+  const baseFetch = providerFetch(input)
+  const current = statusWithFetch(input, baseFetch)
   if (current.type === "unsupported") return current
+
+  const routedAccountIDs = new Set<string>()
+  const fetch = observeRoutedAccounts(baseFetch, routedAccountIDs)
 
   // Integration point with @opencode-ai/llm: native-request lowers session data
   // into an LLMRequest, then LLMClient handles route selection and transport.
@@ -113,6 +117,21 @@ export function stream(input: StreamInput): StreamResult {
             }),
           )
           .pipe(
+            Stream.map((event) => {
+              if (!LLMEvent.is.stepFinish(event)) return event
+              const accountID = resolveRoutedAccount(routedAccountIDs)
+              if (!accountID) return event
+              return LLMEvent.stepFinish({
+                ...event,
+                providerMetadata: {
+                  ...event.providerMetadata,
+                  openfork: {
+                    ...event.providerMetadata?.openfork,
+                    accountID,
+                  },
+                },
+              })
+            }),
             Stream.flatMap((event) =>
               event.type !== "tool-call" || event.providerExecuted
                 ? Stream.make(event)
@@ -151,10 +170,23 @@ export function stream(input: StreamInput): StreamResult {
 }
 
 function providerFetch(input: Pick<StreamInput, "provider" | "auth">): typeof globalThis.fetch | undefined {
-  if (input.provider.id !== "openai" || input.auth?.type !== "oauth") return undefined
   const value: unknown = input.provider.options.fetch
   if (typeof value !== "function") return undefined
   return value as typeof globalThis.fetch
+}
+
+function observeRoutedAccounts(
+  fetch: typeof globalThis.fetch | undefined,
+  routedAccountIDs: Set<string>,
+): typeof globalThis.fetch | undefined {
+  if (!fetch) return undefined
+  const wrapped = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await fetch(input, init)
+    const accountID = routedAccountFromResponse(response)
+    if (accountID) routedAccountIDs.add(accountID)
+    return response
+  }
+  return Object.assign(wrapped, { preconnect: fetch.preconnect?.bind(fetch) ?? (() => undefined) }) as typeof globalThis.fetch
 }
 
 function providerHeaders(value: unknown): Record<string, string> | undefined {

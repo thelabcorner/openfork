@@ -6,6 +6,7 @@ import { Effect } from "effect"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { AppRuntime } from "@/effect/app-runtime"
+import { BackgroundJob } from "@/background/job"
 import { InstanceStore } from "@/project/instance-store"
 import { DelegatedWorker } from "@/session/delegated-worker"
 import { SessionGroup } from "@/session/group"
@@ -68,6 +69,8 @@ describe("OXP AppRuntime wiring", () => {
           Effect.gen(function* () {
             const owner = yield* SessionExecutionOwner.Service
             expect(typeof owner.tryAcquire).toBe("function")
+            const background = yield* BackgroundJob.Service
+            yield* background.get("__oxp_runtime_wiring_probe__")
             yield* DelegatedWorker.make
             return true
           }),

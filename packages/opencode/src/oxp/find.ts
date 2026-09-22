@@ -12,13 +12,27 @@ import { OxpResult } from "./result"
 import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
 
-export const Parameters = Schema.Struct({
-  glob: Schema.optional(Schema.String),
-  grep: Schema.optional(Schema.String),
-  path: Schema.optional(Schema.String),
-  rootID: Schema.optional(OxpSchema.RootID),
-  include: Schema.optional(Schema.String),
+const NonEmpty = Schema.String.check(Schema.isMinLength(1))
+const Scope = Schema.Struct({
+  path: Schema.optionalKey(Schema.String),
+  rootID: Schema.optionalKey(OxpSchema.RootID),
 })
+const GlobSearch = Schema.Struct({
+  ...Scope.fields,
+  glob: NonEmpty,
+})
+const TextSearch = Schema.Struct({
+  ...Scope.fields,
+  grep: NonEmpty,
+  include: Schema.optionalKey(Schema.String),
+  syntax: Schema.optionalKey(Schema.Literals(["literal", "regex"])),
+})
+
+/**
+ * Model-facing search is strategy-shaped. Source-code needles frequently contain
+ * regex metacharacters, so text search is literal unless regex is requested.
+ */
+export const Parameters = Schema.Union([GlobSearch, TextSearch])
 export type Input = Schema.Schema.Type<typeof Parameters>
 
 export interface Interface {
@@ -61,14 +75,20 @@ const layer = Layer.effect(
       if (!admission.root) return yield* new OxpError.RootRequired({ detail: "find requires an approved root" })
       const target = OxpLocation.targetPath(admission.root)
       const root = admission.root.root
+      const search =
+        "glob" in input
+          ? { glob: input.glob }
+          : {
+              grep: input.grep,
+              ...(input.include === undefined ? {} : { include: input.include }),
+              ...(input.syntax === undefined ? {} : { syntax: input.syntax }),
+            }
       return yield* ExchangeFind.execute(
         { fs, ripgrep },
         {
           path: target,
           rootLabel: root.alias,
-          glob: input.glob,
-          grep: input.grep,
-          include: input.include,
+          ...search,
           signal,
           projectionMarker: "<note>OXP find output truncated; narrow the path or pattern</note>",
           toDisplayPath: (value) => roots.toVirtualPath(root, value),

@@ -19,6 +19,7 @@ import { OxpWorker } from "./worker"
 import { OxpParentToolEpoch } from "./parent-tool-epoch"
 import { OxpActivityRecorder } from "./activity-recorder"
 import { OxpActivityIdentity } from "./activity-identity"
+import { OxpRuntimeRefresh } from "./runtime-refresh"
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024
 const TOOL_LIST_PAGE_BYTES = 2 * 1024 * 1024
@@ -412,6 +413,7 @@ const layer = Layer.effect(
         }
         if (input.action === "status") {
           const state = yield* config.get()
+          const runtime = yield* Effect.promise(() => OxpRuntimeRefresh.status())
           const publicRoots = yield* Effect.forEach(state.roots, (root) =>
             roots.verify(root).pipe(
               Effect.as({ id: root.id, alias: root.alias, available: true }),
@@ -423,6 +425,7 @@ const layer = Layer.effect(
             schemaFingerprint: OxpSurface.FINGERPRINT,
             connector: state.connector,
             configRevision: state.revision,
+            runtime,
             enabled: state.enabled,
             roots: publicRoots,
             // Project only authority that is executable on this versioned MCP

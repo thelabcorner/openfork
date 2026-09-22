@@ -22,21 +22,64 @@ const MAX_OUTPUT_BYTES = 256 * 1024
 const MAX_HANDLES = 64
 
 const Handle = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(80), Schema.isPattern(/^proc_[A-Za-z0-9_-]+$/))
+const Workdir = Schema.String.check(Schema.isMaxLength(4096))
+const Command = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_COMMAND_BYTES))
+const Argv = Schema.Array(Schema.String.check(Schema.isMaxLength(MAX_COMMAND_BYTES))).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(128),
+)
+const Mode = Schema.Literals(["foreground", "background"])
+const YieldMs = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 }))
+const TimeoutMs = Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 3_600_000 }))
+const MaxBytes = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_OUTPUT_BYTES }))
+const Offset = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 
-export const Parameters = Schema.Struct({
-  action: Schema.Literals(["start", "poll", "write", "list", "status", "wait", "kill", "remove"]),
-  rootID: Schema.optional(OxpSchema.RootID),
-  workdir: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
-  command: Schema.optional(Schema.String.check(Schema.isMaxLength(MAX_COMMAND_BYTES))),
-  mode: Schema.optional(Schema.Literals(["foreground", "background"])),
-  shell: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
-  yieldMs: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 }))),
-  timeoutMs: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 3_600_000 }))),
-  handle: Schema.optional(Handle),
-  chars: Schema.optional(Schema.String.check(Schema.isMaxLength(256 * 1024))),
-  offset: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
-  maxBytes: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_OUTPUT_BYTES }))),
+const StartShell = Schema.Struct({
+  action: Schema.Literal("start"),
+  rootID: OxpSchema.RootID,
+  workdir: Schema.optionalKey(Workdir),
+  command: Command,
+  mode: Schema.optionalKey(Mode),
+  shell: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(4096))),
+  yieldMs: Schema.optionalKey(YieldMs),
 })
+const StartArgv = Schema.Struct({
+  action: Schema.Literal("start"),
+  rootID: OxpSchema.RootID,
+  workdir: Schema.optionalKey(Workdir),
+  argv: Argv,
+  mode: Schema.optionalKey(Mode),
+  yieldMs: Schema.optionalKey(YieldMs),
+})
+const List = Schema.Struct({ action: Schema.Literal("list"), rootID: OxpSchema.RootID })
+const Status = Schema.Struct({ action: Schema.Literal("status"), handle: Handle })
+const Poll = Schema.Struct({
+  action: Schema.Literal("poll"),
+  handle: Handle,
+  offset: Schema.optionalKey(Offset),
+  maxBytes: Schema.optionalKey(MaxBytes),
+})
+const Write = Schema.Struct({
+  action: Schema.Literal("write"),
+  handle: Handle,
+  chars: Schema.String.check(Schema.isMaxLength(256 * 1024)),
+})
+const Wait = Schema.Struct({
+  action: Schema.Literal("wait"),
+  handle: Handle,
+  timeoutMs: Schema.optionalKey(TimeoutMs),
+  offset: Schema.optionalKey(Offset),
+  maxBytes: Schema.optionalKey(MaxBytes),
+})
+const Kill = Schema.Struct({ action: Schema.Literal("kill"), handle: Handle })
+const Remove = Schema.Struct({ action: Schema.Literal("remove"), handle: Handle })
+
+/**
+ * Action-specific schemas keep irrelevant fields out of the model contract.
+ * start.argv is the preferred path for executable + arguments because it avoids
+ * fragile nested shell/JSON quoting; command remains for actual shell syntax.
+ */
+export const Parameters = Schema.Union([StartArgv, StartShell, List, Status, Poll, Write, Wait, Kill, Remove])
 export type Input = Schema.Schema.Type<typeof Parameters>
 
 type Job = {
@@ -157,6 +200,27 @@ const layer = Layer.effect(
       yield* Scope.close(job.scope, Exit.void).pipe(Effect.ignore)
     })
 
+    const reapSettledForCapacity = Effect.fnUntraced(function* () {
+      if (jobs.size < MAX_HANDLES) return
+      // A child may have exited before the detached settle fiber gets CPU time.
+      // Under pressure, reconcile those handles once before declaring Busy so a
+      // registry full of already-dead children heals itself instead of wedging.
+      for (const job of jobs.values()) {
+        if (job.endedAt !== undefined) continue
+        if (!(yield* job.process.isRunning)) {
+          yield* settle(job).pipe(Effect.ignore)
+        }
+      }
+      const settled = [...jobs.values()]
+        .filter((job) => job.endedAt !== undefined)
+        .sort((left, right) => (left.endedAt ?? 0) - (right.endedAt ?? 0))
+      for (const job of settled) {
+        jobs.delete(job.handle)
+        yield* Scope.close(job.scope, Exit.void).pipe(Effect.ignore)
+        if (jobs.size < MAX_HANDLES) break
+      }
+    })
+
     yield* Effect.addFinalizer(() => Effect.forEach([...jobs.values()], (job) => retire(job).pipe(Effect.ignore), { discard: true }))
 
     // Revocation is active, not merely an admission rule. Process authority or
@@ -213,6 +277,7 @@ const layer = Layer.effect(
       readonly onStdout?: (chunk: string) => void
       readonly onStderr?: (chunk: string) => void
     }) {
+      yield* reapSettledForCapacity()
       if (jobs.size >= MAX_HANDLES) return yield* new OxpError.Busy({ detail: "OXP process handle limit reached" })
       const admission = yield* authority.authorize({
         plane: "augmentation",
@@ -322,6 +387,13 @@ const layer = Layer.effect(
       yield* cancelled(signal)
       if (input.argv.length === 0) {
         return yield* new OxpError.InvalidArgument({ detail: "OXP argv execution requires a program" })
+      }
+      if (input.argv[0] === "") {
+        return yield* new OxpError.InvalidArgument({ detail: "OXP argv execution requires a non-empty program" })
+      }
+      const argvBytes = input.argv.reduce((total, item) => total + Buffer.byteLength(item), 0)
+      if (argvBytes > MAX_COMMAND_BYTES) {
+        return yield* new OxpError.InvalidArgument({ detail: "OXP argv payload exceeds 256 KiB" })
       }
       const [bin, ...args] = input.argv
       const title = input.title ?? [bin, ...args].join(" ")
@@ -453,27 +525,46 @@ const layer = Layer.effect(
         return yield* new OxpError.InvalidArgument({ detail: "Unsupported OXP process action" })
       }
 
-      if (!input.rootID || !input.command) return yield* new OxpError.InvalidArgument({ detail: "process.start requires rootID and command" })
-      if (Buffer.byteLength(input.command) > MAX_COMMAND_BYTES) return yield* new OxpError.InvalidArgument({ detail: "OXP process command exceeds 256 KiB" })
-      const shell = input.shell ?? (process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : process.env.SHELL ?? "/bin/sh")
-      const env = OxpProcessEnvironment.childEnvironment(process.env)
-      const spawned = yield* spawnOwned({
-        rootID: input.rootID,
-        workdir: input.workdir,
-        title: input.command,
-        operation: "process.start",
-        mode: input.mode ?? "foreground",
-        shell,
-        command: (canonicalWorkdir) =>
-          ShellLaunch.command(
-            shell,
-            input.command!,
-            canonicalWorkdir,
-            env,
-            { stream: "pipe", endOnDone: false },
-            { forceKillAfter: "3 seconds" },
-          ),
-      })
+      const mode = input.mode ?? "foreground"
+      const title = "argv" in input ? input.argv.join(" ") : input.command
+      const spawned =
+        "argv" in input
+          ? yield* startArgv(
+              {
+                rootID: input.rootID,
+                workdir: input.workdir,
+                argv: input.argv as [string, ...string[]],
+                title,
+                operation: "process.start",
+                mode,
+              },
+              signal,
+            )
+          : yield* Effect.gen(function* () {
+              if (Buffer.byteLength(input.command) > MAX_COMMAND_BYTES) {
+                return yield* new OxpError.InvalidArgument({ detail: "OXP process command exceeds 256 KiB" })
+              }
+              const shell =
+                input.shell ?? (process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : process.env.SHELL ?? "/bin/sh")
+              const env = OxpProcessEnvironment.childEnvironment(process.env)
+              return yield* spawnOwned({
+                rootID: input.rootID,
+                workdir: input.workdir,
+                title,
+                operation: "process.start",
+                mode,
+                shell,
+                command: (canonicalWorkdir) =>
+                  ShellLaunch.command(
+                    shell,
+                    input.command,
+                    canonicalWorkdir,
+                    env,
+                    { stream: "pipe", endOnDone: false },
+                    { forceKillAfter: "3 seconds" },
+                  ),
+              })
+            })
       const handle = spawned.handle
       const job = jobs.get(handle)!
 
@@ -501,14 +592,15 @@ const layer = Layer.effect(
           ),
         )
       }
+      const state = view(job)
       return {
-        title: input.command,
+        title,
         output: job.endedAt === undefined ? `process running: ${handle}` : (job.output || "(no output)"),
         structured: {
-          ...view(job),
+          ...state,
           ...(job.endedAt === undefined ? {} : { output: job.output }),
         },
-        metadata: view(job),
+        metadata: state,
         mutation: { attempted: true, committed: true },
       } satisfies OxpResult.CapabilityResult
     })

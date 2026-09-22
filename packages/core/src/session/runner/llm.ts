@@ -1030,6 +1030,11 @@ const layer = Layer.effect(
           // waiting, this also guarantees the human turn is promoted after the
           // state it is responding to.
           yield* reconcileGoalProjection(state, input.sessionID)
+          // This cycle is the semantic user-visible turn boundary. A single
+          // cycle may contain many provider steps/tool loops, but a queued or
+          // automatic input promoted by the next loop is a fresh turn and must
+          // receive a fresh `turnStartedAt` on its first provider begin.
+          yield* telemetry.idle(input.sessionID)
           // `decision.reservation` is intentionally not claimed here. The next
           // loop iteration re-runs SessionInput priority first, so a user/host
           // arrival between audit settlement and continuation cannot lose to a
@@ -1045,7 +1050,13 @@ const layer = Layer.effect(
           session: yield* getSession(input.sessionID),
           messages: (yield* state.history.entries(state.baselineSeq)).map((entry) => entry.message),
         })
-      }).pipe(Effect.ensuring(history.close))
+      }).pipe(
+        // Interrupts and defects can leave before the normal cycle boundary.
+        // Always release the live turn latch so a later run cannot inherit an
+        // old turn start timestamp.
+        Effect.ensuring(telemetry.idle(input.sessionID)),
+        Effect.ensuring(history.close),
+      )
     })
 
     return Service.of({

@@ -39,7 +39,7 @@ describe("OXP Gate I supervision architecture boundary", () => {
 
   test("rejects non-language model primitives before OXP commits a Session model switch", async () => {
     const adapter = await fs.readFile(path.join(opencode, "oxp/session-control-v1.ts"), "utf8")
-    expect(adapter).toContain('runtime.Provider.modelPrimitive(resolved) !== "language"')
+    expect(adapter).toContain("!runtime.Provider.isLanguageModel(resolved)")
     expect(adapter).toContain('new OxpSessionControl.SelectionUnavailable(')
     expect(adapter).toContain("Requested model is not a conversational language model")
   })

@@ -13,46 +13,124 @@ import { OxpResult } from "./result"
 import { OxpSchema } from "./schema"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const NonEmptyText = Schema.String.check(Schema.isMinLength(1))
 
 const BatchOp = Schema.Union([
   Schema.Struct({
     line: PositiveInt,
     newText: Schema.String,
-    oldText: Schema.optional(Schema.String),
+    oldText: NonEmptyText,
   }),
   Schema.Struct({
     startLine: PositiveInt,
     endLine: PositiveInt,
-    newText: Schema.optional(Schema.String),
-    oldText: Schema.optional(Schema.String),
-    delete: Schema.optional(Schema.Boolean),
+    newText: Schema.String,
+    oldText: NonEmptyText,
   }),
   Schema.Struct({
-    oldString: Schema.String,
+    startLine: PositiveInt,
+    endLine: PositiveInt,
+    oldText: NonEmptyText,
+    delete: Schema.Literal(true),
+  }),
+  Schema.Struct({
+    oldString: NonEmptyText,
     newString: Schema.String,
   }),
 ])
 
-export const Parameters = Schema.Struct({
+const Target = Schema.Struct({
   path: Schema.String,
-  rootID: Schema.optional(OxpSchema.RootID),
-  oldString: Schema.optional(Schema.String),
-  newString: Schema.optional(Schema.String),
-  replaceAll: Schema.optional(Schema.Boolean),
-  edits: Schema.optional(Schema.Array(BatchOp).check(Schema.isMaxLength(128))),
-  line: Schema.optional(PositiveInt),
-  startLine: Schema.optional(PositiveInt),
-  endLine: Schema.optional(PositiveInt),
-  insertAt: Schema.optional(NonNegativeInt),
-  insertAfter: Schema.optional(PositiveInt),
-  appendFile: Schema.optional(Schema.Boolean),
-  nearText: Schema.optional(Schema.String),
-  occurrence: Schema.optional(PositiveInt),
-  oldText: Schema.optional(Schema.String),
-  newText: Schema.optional(Schema.String),
-  delete: Schema.optional(Schema.Boolean),
+  rootID: Schema.optionalKey(OxpSchema.RootID),
 })
+
+const ExactEdit = Schema.Struct({
+  ...Target.fields,
+  oldString: NonEmptyText,
+  newString: Schema.String,
+  replaceAll: Schema.optionalKey(Schema.Boolean),
+})
+
+const BatchEdit = Schema.Struct({
+  ...Target.fields,
+  edits: Schema.Array(BatchOp).check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+})
+
+const LineEdit = Schema.Struct({
+  ...Target.fields,
+  line: PositiveInt,
+  oldText: NonEmptyText,
+  newText: Schema.String,
+})
+
+const RangeEdit = Schema.Struct({
+  ...Target.fields,
+  startLine: PositiveInt,
+  endLine: PositiveInt,
+  oldText: NonEmptyText,
+  newText: Schema.String,
+})
+
+const DeleteRange = Schema.Struct({
+  ...Target.fields,
+  startLine: PositiveInt,
+  endLine: PositiveInt,
+  oldText: NonEmptyText,
+  delete: Schema.Literal(true),
+})
+
+const Prepend = Schema.Struct({
+  ...Target.fields,
+  insertAt: Schema.Literal(0),
+  newText: Schema.String,
+})
+
+const InsertAt = Schema.Struct({
+  ...Target.fields,
+  insertAt: PositiveInt,
+  oldText: NonEmptyText,
+  newText: Schema.String,
+})
+
+const InsertAfter = Schema.Struct({
+  ...Target.fields,
+  insertAfter: PositiveInt,
+  oldText: NonEmptyText,
+  newText: Schema.String,
+})
+
+const AppendFile = Schema.Struct({
+  ...Target.fields,
+  appendFile: Schema.Literal(true),
+  newText: Schema.String,
+})
+
+const NearTextEdit = Schema.Struct({
+  ...Target.fields,
+  nearText: NonEmptyText,
+  occurrence: Schema.optionalKey(PositiveInt),
+  oldText: NonEmptyText,
+  newText: Schema.String,
+})
+
+/**
+ * Keep the model-facing contract strategy-shaped instead of exposing one bag of
+ * mutually-exclusive optional fields. This makes invalid mixed/no-strategy
+ * calls unrepresentable in the generated MCP schema while preserving the
+ * existing flat wire keys for every valid edit.
+ */
+export const Parameters = Schema.Union([
+  ExactEdit,
+  BatchEdit,
+  LineEdit,
+  RangeEdit,
+  DeleteRange,
+  Prepend,
+  InsertAt,
+  InsertAfter,
+  AppendFile,
+  NearTextEdit,
+])
 export type Input = Schema.Schema.Type<typeof Parameters>
 
 export interface Interface {
@@ -99,25 +177,11 @@ const layer = Layer.effect(
       const principal = (yield* config.get()).connector.id
       const scopedGrounding = grounding.scoped(principal)
       const grounded = scopedGrounding.get(root.id, target)
+      const { rootID: _rootID, ...editInput } = input
       const result = yield* ExchangeEdit.execute(
         fs,
         {
-          path: input.path,
-          oldString: input.oldString,
-          newString: input.newString,
-          replaceAll: input.replaceAll,
-          edits: input.edits,
-          line: input.line,
-          startLine: input.startLine,
-          endLine: input.endLine,
-          insertAt: input.insertAt,
-          insertAfter: input.insertAfter,
-          appendFile: input.appendFile,
-          nearText: input.nearText,
-          occurrence: input.occurrence,
-          oldText: input.oldText,
-          newText: input.newText,
-          delete: input.delete,
+          ...(editInput as ExchangeEdit.Input),
           canonicalPath: target,
           displayPath: virtualPath,
           ...(grounded === undefined ? {} : { groundedFingerprint: grounded }),

@@ -83,6 +83,7 @@ describe("OXP Gate C endpoint boundary", () => {
   test("publishes self-contained input schemas with no dangling local refs", () => {
     for (const tool of OxpSurface.TOOLS) {
       const schema = tool.inputSchema as Record<string, unknown>
+      expect(schema.type).toBe("object")
       const refs = JSON.stringify(schema).match(/#\/\$defs\/[^"\\]+/g) ?? []
       const defs = (schema.$defs ?? {}) as Record<string, unknown>
       for (const ref of refs) {
@@ -90,6 +91,66 @@ describe("OXP Gate C endpoint boundary", () => {
         expect(defs[name]).toBeDefined()
       }
     }
+  })
+
+  test("projects edit/process as strict strategy/action unions instead of ambiguous optional-field bags", () => {
+    type Branch = {
+      properties?: Record<string, { enum?: unknown[]; minimum?: number }>
+      required?: string[]
+      additionalProperties?: boolean
+    }
+    const branches = (name: string) => {
+      const tool = OxpSurface.TOOLS.find((item) => item.name === name)
+      expect(tool).toBeDefined()
+      const anyOf = (tool!.inputSchema as { anyOf?: Branch[] }).anyOf
+      expect(anyOf).toBeArray()
+      expect(anyOf!.length).toBeGreaterThan(1)
+      for (const branch of anyOf!) expect(branch.additionalProperties).toBe(false)
+      return anyOf!
+    }
+
+    const edit = branches("edit")
+    expect(edit.some((branch) => branch.required?.includes("oldString") && branch.required.includes("newString"))).toBe(true)
+    expect(
+      edit.some(
+        (branch) =>
+          branch.properties?.startLine &&
+          branch.properties?.newText &&
+          branch.required?.includes("oldText"),
+      ),
+    ).toBe(true)
+    expect(
+      edit.some((branch) => branch.properties?.oldString && branch.properties?.startLine),
+    ).toBe(false)
+    expect(
+      edit.some(
+        (branch) =>
+          branch.properties?.insertAt?.enum?.includes(0) &&
+          !branch.required?.includes("oldText"),
+      ),
+    ).toBe(true)
+    expect(
+      edit.some(
+        (branch) =>
+          branch.properties?.insertAt?.minimum === 1 &&
+          branch.required?.includes("oldText"),
+      ),
+    ).toBe(true)
+
+    const process = branches("process")
+    const starts = process.filter((branch) => branch.properties?.action?.enum?.includes("start"))
+    expect(starts).toHaveLength(2)
+    expect(starts.some((branch) => branch.required?.includes("argv"))).toBe(true)
+    expect(starts.some((branch) => branch.required?.includes("command"))).toBe(true)
+    expect(starts.some((branch) => branch.properties?.argv && branch.properties?.command)).toBe(false)
+    const poll = process.find((branch) => branch.properties?.action?.enum?.includes("poll"))
+    expect(poll?.required).toContain("handle")
+
+    const find = branches("find")
+    expect(find).toHaveLength(2)
+    expect(find.some((branch) => branch.required?.includes("glob"))).toBe(true)
+    expect(find.some((branch) => branch.required?.includes("grep"))).toBe(true)
+    expect(find.some((branch) => branch.properties?.glob && branch.properties?.grep)).toBe(false)
   })
 
   test("keeps authenticated OpenAI Files actions out of the generic capability broker", async () => {

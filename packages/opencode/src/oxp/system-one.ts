@@ -42,7 +42,7 @@ function metadata(error: unknown): Record<string, string | number | boolean> | u
   if (!error || typeof error !== "object") return
   const source = error as Record<string, unknown>
   const out: Record<string, string | number | boolean> = {}
-  for (const key of ["providerID", "modelID", "primitive", "required", "retryAfterMs"] as const) {
+  for (const key of ["providerID", "modelID", "selector", "primitive", "required", "retryAfterMs"] as const) {
     const value = source[key]
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") out[key] = value
   }
@@ -65,6 +65,9 @@ function mapRuntimeError(error: unknown, signal?: AbortSignal): OxpError.Error {
 
   if (source._tag === "ProviderModelNotFoundError") {
     return new OxpError.NotFound({ detail, metadata: meta })
+  }
+  if (source._tag === "ProviderAccountResolutionError") {
+    return new OxpError.ProviderAccountUnavailable({ detail, metadata: meta })
   }
   if (source._tag === "ProviderUnsupportedModelPrimitiveError") {
     return new OxpError.InvalidArgument({ detail, metadata: meta })
@@ -139,7 +142,6 @@ const layer = Layer.effect(
         metadata: {
           providerID: input.providerID,
           modelID: input.modelID,
-          ...(input.accountID ? { accountID: input.accountID } : {}),
           inputTokens: result.usage.input_tokens,
           outputTokens: result.usage.output_tokens,
           cost: result.cost.total,

@@ -204,6 +204,7 @@ describe("OxpCapability", () => {
       "project",
       "read",
       "refactor",
+      "runtime.refresh",
       "schedule",
       "schedule.create",
       "skill",
@@ -244,6 +245,12 @@ describe("OxpCapability", () => {
     expect(rows.filter((row) => row.id === "edit" || row.id === "patch").every((row) => row.authority === "write" && row.mutation === "write")).toBe(true)
     expect(rows.find((row) => row.id === "git")).toMatchObject({ authority: "git", mutation: "write" })
     expect(rows.find((row) => row.id === "process")).toMatchObject({ authority: "process", mutation: "write" })
+    expect(rows.find((row) => row.id === "runtime.refresh")).toMatchObject({
+      authority: "process",
+      exposure: "brokered",
+      workspaceTier: 0,
+      mutation: "write",
+    })
     expect(rows.find((row) => row.id === "process")?.description).toMatch(/upstream may reject/i)
     expect(rows.find((row) => row.id === "process")?.description).toMatch(/purpose-specific direct tool/i)
     expect(rows.find((row) => row.id === "json")).toMatchObject({
@@ -325,6 +332,7 @@ describe("OxpCapability", () => {
       "patch",
       "process",
       "refactor",
+      "runtime.refresh",
       "schedule",
       "schedule.create",
       "sqlite",
@@ -574,11 +582,11 @@ describe("OxpCapability", () => {
     expect(result.metadata).toMatchObject({
       providerID: "opencode",
       modelID: "jev-1.13-free",
-      accountID: "zen-fixture",
       inputTokens: 12,
       outputTokens: 2,
       cost: 0,
     })
+    expect(result.metadata).not.toHaveProperty("accountID")
     expect(result.output).not.toContain(rootDir)
     expect(JSON.stringify(result)).not.toContain("apiKey")
     expect(JSON.stringify(result)).not.toContain("credentialRef")

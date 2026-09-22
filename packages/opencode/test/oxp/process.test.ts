@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
@@ -30,6 +30,24 @@ beforeEach(async () => {
 afterAll(async () => fs.rm(suite, { recursive: true, force: true }))
 
 describe("OxpProcess", () => {
+  it.live("publishes action-shaped process inputs and accepts exact argv starts without shell quoting", Effect.gen(function* () {
+    const decode = Schema.decodeUnknownEffect(OxpProcess.Parameters, { onExcessProperty: "error" })
+    const argv = yield* decode({
+      action: "start",
+      rootID: OxpSchema.RootID.make("00000000-0000-4000-8000-000000000001"),
+      argv: ["node", "-e", "process.stdout.write('ok')"],
+    })
+    expect("argv" in argv).toBe(true)
+
+    const mixed = yield* decode({
+      action: "start",
+      rootID: OxpSchema.RootID.make("00000000-0000-4000-8000-000000000001"),
+      argv: ["node", "--version"],
+      command: "node --version",
+    }).pipe(Effect.flip)
+    expect(mixed).toBeDefined()
+  }))
+
   it.live("runs a foreground process without manufacturing a Session or exposing native root paths", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service
@@ -50,6 +68,28 @@ describe("OxpProcess", () => {
     expect(result.output).toContain("OXP_PROCESS_OK")
     expect(result.mutation).toEqual({ attempted: true, committed: true })
     expect(JSON.stringify(result)).not.toContain(rootDir)
+  }))
+
+  it.live("runs public argv starts without a shell and preserves exact argument boundaries", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const proc = yield* OxpProcess.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ process: true })
+
+    const script = "process.stdout.write(JSON.stringify(process.argv.slice(1)))"
+    const result = yield* proc.execute({
+      action: "start",
+      rootID: root.id,
+      argv: [process.execPath, "-e", script, "a b", "\"quoted\""],
+      mode: "foreground",
+      yieldMs: 5_000,
+    })
+    expect(JSON.parse(result.output)).toEqual(["a b", "\"quoted\""])
+    expect((result.structured as { handle?: string }).handle).toMatch(/^proc_/)
   }))
 
   it.live("captures short-lived foreground stdout under concurrent spawn pressure", Effect.gen(function* () {
@@ -84,6 +124,33 @@ describe("OxpProcess", () => {
       Array.from({ length: 12 }, (_, index) => `OXP_FAST_${index}`),
     )
   }))
+
+  it.live("reclaims settled handles at capacity instead of wedging future process starts", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const proc = yield* OxpProcess.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ process: true })
+
+    // MAX_HANDLES is 64. Completed handles intentionally remain queryable, but
+    // they must never make the 65th+ process start fail with OXP_BUSY.
+    for (let index = 0; index < 66; index++) {
+      const result = yield* proc.execute({
+        action: "start",
+        rootID: root.id,
+        argv: [process.execPath, "-e", ""],
+        mode: "foreground",
+        yieldMs: 5_000,
+      })
+      expect(result.mutation).toEqual({ attempted: true, committed: true })
+    }
+
+    const listed = yield* proc.execute({ action: "list", rootID: root.id })
+    expect((listed.structured as { processes: unknown[] }).processes.length).toBeLessThanOrEqual(64)
+  }), { timeout: 30_000 })
 
   it.live("returns opaque handles and actively retires owned trees when process authority is revoked", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
@@ -199,7 +266,7 @@ describe("OxpProcess", () => {
     yield* config.setEnabled(true)
     yield* config.setGrant({ process: true })
 
-    const denied = yield* proc.execute({ action: "list" }).pipe(Effect.flip)
+    const denied = yield* proc.execute({ action: "list" } as never).pipe(Effect.flip)
     expect(denied._tag).toBe("OXP_ROOT_REQUIRED")
     const listed = yield* proc.execute({ action: "list", rootID: root.id })
     expect(listed.structured).toEqual({ processes: [] })

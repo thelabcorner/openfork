@@ -29,17 +29,39 @@ describe("OxpModelSelection", () => {
     ).toThrow("use accountID")
   })
 
-  test("fails closed when an account selector does not belong to the chosen provider", () => {
+  test("accepts human account selectors at ingress but refuses to lower them before runtime resolution", () => {
+    expect(
+      OxpModelSelection.normalize({
+        providerID: "workbuddy",
+        modelID: "deepseek-v4.1-flash",
+        accountID: "owner@example.com",
+      }),
+    ).toEqual({
+      providerID: "workbuddy",
+      modelID: "deepseek-v4.1-flash",
+      accountID: "owner@example.com",
+    })
+
+    expect(() =>
+      OxpModelSelection.materialize({
+        providerID: "workbuddy",
+        modelID: "deepseek-v4.1-flash",
+        accountID: "owner@example.com",
+      }),
+    ).toThrow("stable internal account id")
+
     expect(() =>
       OxpModelSelection.materialize({
         providerID: "workbuddy",
         modelID: "deepseek-v4.1-flash",
         accountID: "vd-other-account",
       }),
-    ).toThrow("does not belong to provider")
+    ).toThrow("stable internal account id")
+  })
 
+  test("still rejects account selectors for providers without first-class multi-account routing", () => {
     expect(() =>
-      OxpModelSelection.materialize({
+      OxpModelSelection.normalize({
         providerID: "openrouter",
         modelID: "anthropic/claude-sonnet",
         accountID: "acct-1",

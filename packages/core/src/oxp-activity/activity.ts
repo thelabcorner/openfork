@@ -9,12 +9,14 @@ import { EventV2 } from "../event"
 import { OxpActivitySchema } from "./schema"
 import {
   OxpCorrelationRefTable,
+  OxpInvocationDetailTable,
   OxpInvocationLinkTable,
   OxpInvocationTable,
   OxpParentActivityTable,
 } from "./sql"
 
 const MAX_SAFE_SUMMARY_BYTES = 8 * 1024
+const MAX_INVOCATION_DETAIL_BYTES = 512 * 1024
 const MAX_TOOL_BYTES = 256
 const MAX_ACTION_BYTES = 256
 const MAX_ROOT_ALIAS_BYTES = 64
@@ -40,6 +42,17 @@ function safeSummary(
   return value
 }
 
+function invocationDetail(
+  value: OxpActivitySchema.InvocationDetail | undefined,
+  label: string,
+): OxpActivitySchema.InvocationDetail | undefined {
+  if (value === undefined) return
+  const encoded = JSON.stringify(value)
+  if (Buffer.byteLength(encoded, "utf8") > MAX_INVOCATION_DETAIL_BYTES)
+    throw new Error(`OXP activity ${label} exceeds 512 KiB`)
+  return value
+}
+
 function failed(status: OxpActivitySchema.Status) {
   return status !== "success" && status !== "committed"
 }
@@ -58,6 +71,7 @@ export interface BeginInput {
   readonly rootID?: string
   readonly rootAlias?: string
   readonly summary?: OxpActivitySchema.SafeSummary
+  readonly detail?: OxpActivitySchema.InvocationDetail
   readonly startedAt?: number
 }
 
@@ -74,6 +88,7 @@ export interface SettleInput {
   readonly mutationAttempted?: boolean
   readonly mutationCommitted?: boolean
   readonly summary?: OxpActivitySchema.SafeSummary
+  readonly detail?: OxpActivitySchema.InvocationDetail
   readonly completedAt?: number
 }
 
@@ -163,6 +178,7 @@ const layer = Layer.effect(
         "root alias",
       )
       const summary = safeSummary(input.summary)
+      const detail = invocationDetail(input.detail, "request detail")
       bounded(input.correlation.scheme, 128, "correlation scheme")
       bounded(input.correlation.digest, 256, "correlation digest")
       bounded(input.hostRunID, 128, "host run ID")
@@ -276,6 +292,17 @@ const layer = Layer.effect(
               .run()
               .pipe(Effect.orDie)
 
+            if (detail !== undefined) {
+              yield* tx
+                .insert(OxpInvocationDetailTable)
+                .values({
+                  invocation_id: invocationID,
+                  request: detail,
+                })
+                .run()
+                .pipe(Effect.orDie)
+            }
+
             yield* tx
               .update(OxpParentActivityTable)
               .set({
@@ -351,6 +378,7 @@ const layer = Layer.effect(
     ) {
       const completedAt = input.completedAt ?? Date.now()
       const summary = safeSummary(input.summary)
+      const detail = invocationDetail(input.detail, "outcome detail")
       bounded(input.errorCode, 128, "error code")
       const settled = yield* db.transaction(
         (tx) =>
@@ -376,6 +404,21 @@ const layer = Layer.effect(
               .where(eq(OxpInvocationTable.id, input.invocationID))
               .run()
               .pipe(Effect.orDie)
+
+            if (detail !== undefined) {
+              yield* tx
+                .insert(OxpInvocationDetailTable)
+                .values({
+                  invocation_id: input.invocationID,
+                  outcome: detail,
+                })
+                .onConflictDoUpdate({
+                  target: OxpInvocationDetailTable.invocation_id,
+                  set: { outcome: detail },
+                })
+                .run()
+                .pipe(Effect.orDie)
+            }
 
             if (failed(input.status)) {
               yield* tx
