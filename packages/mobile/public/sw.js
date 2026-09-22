@@ -1,13 +1,53 @@
-const CACHE = "opencode-mobile-shell-v5"
+const RELEASE = "__OPENFORK_PWA_RELEASE__"
+const CACHE_PREFIX = "openfork-mobile-shared-runtime-"
+const CACHE = `${CACHE_PREFIX}${RELEASE}`
+const PRECACHE = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/badge-96.png"]
+
+async function precacheBootstrapShell() {
+  const cache = await caches.open(CACHE)
+  await cache.addAll(PRECACHE)
+
+  // A newly installing worker does not control the document that registered it,
+  // so the browser's initial JS/CSS requests may have bypassed our fetch handler.
+  // Parse the built root shell and explicitly cache its content-addressed entry
+  // assets. If any required shell asset fails, installation fails rather than
+  // activating a worker that cannot actually cold-start offline.
+  const shell = await cache.match("/")
+  if (!shell) throw new Error("OpenFork PWA shell was not cached")
+  const html = await shell.text()
+  const assets = new Set()
+  for (const match of html.matchAll(/\b(?:src|href)=["'](\/assets\/[^"'?#]+)["']/g)) {
+    assets.add(match[1])
+  }
+  if (assets.size > 0) await cache.addAll([...assets])
+}
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(self.skipWaiting())
+  // Do not skipWaiting on updates. The active client may still reference lazy
+  // chunks from the previous release; swapping workers underneath it can create
+  // a mixed-version graph. With no existing worker (first install), activation
+  // proceeds normally. Updates stage until existing clients close.
+  event.waitUntil(precacheBootstrapShell())
 })
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim()),
+    caches
+      .keys()
+      // Never delete unrelated origin caches owned by other applications.
+      .then((keys) =>
+        Promise.all(keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE).map((key) => caches.delete(key))),
+      )
+      .then(() => self.clients.claim()),
   )
+})
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type !== "SKIP_WAITING") return
+  // Only an explicit client action promotes a staged release. The client waits
+  // for controllerchange and reloads immediately, so no interactive old-release
+  // window remains after the controller swap.
+  event.waitUntil(self.skipWaiting())
 })
 
 // Declarative-Web-Push-compatible payload: `{ web_push: 8030, notification: {...} }`.
@@ -23,7 +63,7 @@ self.addEventListener("push", (event) => {
     payload = {}
   }
   const notification = payload.notification ?? payload
-  const title = notification.title ?? "opencode"
+  const title = notification.title ?? "OpenFork"
   event.waitUntil(
     self.registration.showNotification(title, {
       body: notification.body,
@@ -45,7 +85,11 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close()
-  const requested = new URL(event.notification.data?.navigate ?? "/", self.location.origin)
+  const candidate = new URL(event.notification.data?.navigate ?? "/", self.location.origin)
+  // Notification payloads are server-originated, but navigation should still be
+  // constrained to the installed PWA. Never turn a push click into an arbitrary
+  // external-site launcher.
+  const requested = candidate.origin === self.location.origin ? candidate : new URL("/", self.location.origin)
   // `/session/:id` is also an API route on same-origin deployments. Opening it
   // as a document can therefore return session JSON instead of the PWA shell.
   // Normalize notification session targets onto the root document and carry
@@ -87,12 +131,25 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(
     caches.open(CACHE).then(async (cache) => {
       const cached = await cache.match(request)
-      const response = await fetch(request).catch(() => cached)
+      // Built assets are content-addressed by Vite; the two shared app fonts
+      // are versioned by this SW cache namespace. Cache-first avoids a network
+      // round trip for every JS/CSS/font request on installed-app relaunches.
+      if (url.pathname.startsWith("/assets/") && cached) return cached
+
+      // Documents/manifests stay network-first so a deployed shell update is
+      // observed immediately. Canonical client routes are still the same SPA
+      // shell, so an offline/dead-host navigation can fall back to the root
+      // document pre-cached at install instead of failing on the route URL.
+      const response = await fetch(request).catch(() => undefined)
+      if (request.mode === "navigate" && (!response || !response.ok)) {
+        const shell = await cache.match("/")
+        if (shell) return shell
+      }
       const cacheControl = response?.headers.get("cache-control") ?? ""
       if (response && response.ok && !/\b(?:no-store|private)\b/i.test(cacheControl)) {
         await cache.put(request, response.clone())
       }
-      return response ?? new Response("Offline", { status: 503 })
+      return response ?? cached ?? new Response("Offline", { status: 503 })
     }),
   )
 })

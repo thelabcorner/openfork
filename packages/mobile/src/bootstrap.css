@@ -1,0 +1,637 @@
+:root {
+  color-scheme: dark;
+  --pwa-bg: #09090b;
+  --pwa-panel: #111113;
+  --pwa-panel-soft: #18181b;
+  --pwa-panel-hover: #202024;
+  --pwa-border: #27272a;
+  --pwa-border-strong: #3f3f46;
+  --pwa-text: #f4f4f5;
+  --pwa-muted: #a1a1aa;
+  --pwa-faint: #71717a;
+  --pwa-primary-bg: #fafafa;
+  --pwa-primary-text: #18181b;
+  --pwa-danger: #f87171;
+  --pwa-danger-bg: rgba(248, 113, 113, 0.08);
+  --pwa-success: #4ade80;
+  --pwa-focus: #71717a;
+  --pwa-shadow: 0 18px 48px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.16);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --pwa-bg: #f4f4f5;
+    --pwa-panel: #ffffff;
+    --pwa-panel-soft: #f4f4f5;
+    --pwa-panel-hover: #e4e4e7;
+    --pwa-border: #d4d4d8;
+    --pwa-border-strong: #a1a1aa;
+    --pwa-text: #18181b;
+    --pwa-muted: #52525b;
+    --pwa-faint: #71717a;
+    --pwa-primary-bg: #18181b;
+    --pwa-primary-text: #fafafa;
+    --pwa-danger: #dc2626;
+    --pwa-danger-bg: rgba(220, 38, 38, 0.06);
+    --pwa-success: #16a34a;
+    --pwa-focus: #71717a;
+    --pwa-shadow: 0 18px 48px rgba(24, 24, 27, 0.12), 0 2px 8px rgba(24, 24, 27, 0.08);
+  }
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  margin: 0;
+}
+
+html {
+  min-height: 100dvh;
+  background: var(--pwa-bg);
+}
+
+body {
+  min-height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--pwa-bg);
+  color: var(--pwa-text);
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.pwa-bootstrap {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-height: 100dvh;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding:
+    max(20px, env(safe-area-inset-top, 0px))
+    max(16px, env(safe-area-inset-right, 0px))
+    max(20px, env(safe-area-inset-bottom, 0px))
+    max(16px, env(safe-area-inset-left, 0px));
+  background: var(--pwa-bg);
+}
+
+.pwa-bootstrap-loading {
+  min-height: 100dvh;
+}
+
+.pwa-bootstrap-card {
+  box-sizing: border-box;
+  display: flex;
+  width: min(100%, 420px);
+  flex-direction: column;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid var(--pwa-border);
+  border-radius: 14px;
+  background: var(--pwa-panel);
+  box-shadow: var(--pwa-shadow);
+}
+
+.pwa-bootstrap-heading {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pwa-bootstrap-title {
+  color: var(--pwa-text);
+  font-size: 20px;
+  font-weight: 650;
+  line-height: 26px;
+  letter-spacing: -0.025em;
+}
+
+.pwa-bootstrap-copy {
+  color: var(--pwa-muted);
+  font-size: 13px;
+  font-weight: 430;
+  line-height: 19px;
+  letter-spacing: -0.005em;
+}
+
+.pwa-verify-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 13px;
+  border: 1px solid var(--pwa-border);
+  border-radius: 10px;
+  background: var(--pwa-panel-soft);
+}
+
+.pwa-verify-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.pwa-verify-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pwa-verify-title {
+  color: var(--pwa-text);
+  font-size: 13px;
+  font-weight: 590;
+  line-height: 18px;
+}
+
+.pwa-verify-id {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--pwa-faint);
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pwa-bootstrap-spinner {
+  box-sizing: border-box;
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border: 2px solid var(--pwa-border-strong);
+  border-top-color: var(--pwa-text);
+  border-radius: 999px;
+  animation: pwa-spin 720ms linear infinite;
+}
+
+.pwa-bootstrap-spinner--large {
+  width: 24px;
+  height: 24px;
+}
+
+.pwa-bootstrap-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pwa-bootstrap-button {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--pwa-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--pwa-muted);
+  font-size: 13px;
+  font-weight: 560;
+  line-height: 18px;
+  touch-action: manipulation;
+  cursor: pointer;
+  transition:
+    background-color 90ms ease-out,
+    border-color 90ms ease-out,
+    color 90ms ease-out,
+    transform 70ms ease-out;
+}
+
+.pwa-bootstrap-button--soft {
+  background: var(--pwa-panel-soft);
+  color: var(--pwa-text);
+}
+
+.pwa-bootstrap-button--primary {
+  border-color: var(--pwa-primary-bg);
+  background: var(--pwa-primary-bg);
+  color: var(--pwa-primary-text);
+}
+
+.pwa-bootstrap-button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.pwa-bootstrap-button:not(:disabled):active {
+  transform: scale(0.985);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .pwa-bootstrap-button:not(:disabled):not(.pwa-bootstrap-button--primary):hover {
+    border-color: var(--pwa-border-strong);
+    background: var(--pwa-panel-hover);
+    color: var(--pwa-text);
+  }
+}
+
+.pwa-bootstrap-form {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.pwa-bootstrap-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pwa-bootstrap-label {
+  color: var(--pwa-faint);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.pwa-bootstrap-input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 44px;
+  min-width: 0;
+  padding: 0 11px;
+  border: 1px solid var(--pwa-border);
+  border-radius: 8px;
+  outline: none;
+  background: var(--pwa-panel-soft);
+  color: var(--pwa-text);
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 16px;
+  line-height: 20px;
+  transition:
+    border-color 90ms ease-out,
+    box-shadow 90ms ease-out;
+}
+
+.pwa-bootstrap-input::placeholder {
+  color: var(--pwa-faint);
+  opacity: 0.72;
+}
+
+.pwa-bootstrap-input:focus {
+  border-color: var(--pwa-border-strong);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--pwa-focus) 22%, transparent);
+}
+
+.pwa-bootstrap-input--code {
+  height: 48px;
+  text-align: center;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.pwa-bootstrap-submit {
+  width: 100%;
+  margin-top: 1px;
+}
+
+.pwa-bootstrap-alert {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--pwa-danger) 36%, transparent);
+  border-radius: 8px;
+  background: var(--pwa-danger-bg);
+  color: var(--pwa-text);
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.pwa-bootstrap-security {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding-top: 1px;
+  color: var(--pwa-faint);
+}
+
+.pwa-bootstrap-security-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: var(--pwa-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--pwa-success) 11%, transparent);
+}
+
+.pwa-bootstrap-security p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.pwa-camera-skeleton {
+  width: 100%;
+  max-width: 320px;
+  aspect-ratio: 1;
+  margin: 0 auto;
+  border: 1px solid var(--pwa-border);
+  border-radius: 12px;
+  background: var(--pwa-panel-soft);
+  animation: pwa-pulse 1.2s ease-in-out infinite alternate;
+}
+
+/* QR scanner. Kept in the bootstrap layer so qr-scanner remains lazy. */
+.scan-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.scan-frame {
+  position: relative;
+  width: min(100%, 320px);
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid var(--pwa-border);
+  border-radius: 12px;
+  background: var(--pwa-panel-soft);
+}
+
+.scan-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.scan-reticle {
+  position: absolute;
+  inset: 14%;
+  pointer-events: none;
+}
+
+.scan-corner {
+  position: absolute;
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--pwa-text);
+}
+
+.scan-corner.tl {
+  top: 0;
+  left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-top-left-radius: 8px;
+}
+
+.scan-corner.tr {
+  top: 0;
+  right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  border-top-right-radius: 8px;
+}
+
+.scan-corner.bl {
+  bottom: 0;
+  left: 0;
+  border-top: 0;
+  border-right: 0;
+  border-bottom-left-radius: 8px;
+}
+
+.scan-corner.br {
+  right: 0;
+  bottom: 0;
+  border-top: 0;
+  border-left: 0;
+  border-bottom-right-radius: 8px;
+}
+
+.scan-line {
+  position: absolute;
+  left: 4%;
+  right: 4%;
+  height: 1px;
+  background: var(--pwa-text);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--pwa-text) 65%, transparent);
+  animation: openfork-mobile-scan 2.2s ease-in-out infinite;
+}
+
+.scan-success,
+.scan-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-sizing: border-box;
+  padding: 20px;
+  border: 0;
+  text-align: center;
+}
+
+.scan-success {
+  background: color-mix(in srgb, var(--pwa-panel) 88%, transparent);
+  color: var(--pwa-success);
+  cursor: pointer;
+}
+
+.scan-error {
+  background: var(--pwa-panel);
+  color: var(--pwa-muted);
+}
+
+.scan-success-hint,
+.scan-status,
+.scan-fallback-hint {
+  margin: 0;
+  color: var(--pwa-muted);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.scan-error p {
+  margin: 0;
+}
+
+.pwa-update-card {
+  position: fixed;
+  z-index: 2147483000;
+  top: max(10px, env(safe-area-inset-top, 0px));
+  left: 50%;
+  box-sizing: border-box;
+  display: flex;
+  width: min(calc(100% - 24px), 520px);
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 9px 9px 12px;
+  border: 1px solid var(--pwa-border);
+  border-radius: 11px;
+  background: var(--pwa-panel);
+  box-shadow: var(--pwa-shadow);
+  color: var(--pwa-text);
+  transform: translateX(-50%);
+}
+
+.pwa-update-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.pwa-update-title {
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 16px;
+}
+
+.pwa-update-description {
+  overflow: hidden;
+  color: var(--pwa-muted);
+  font-size: 11px;
+  font-weight: 430;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pwa-update-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+
+.pwa-update-later,
+.pwa-update-now {
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 580;
+  line-height: 16px;
+  touch-action: manipulation;
+}
+
+.pwa-update-later {
+  border: 0;
+  background: transparent;
+  color: var(--pwa-muted);
+}
+
+.pwa-update-now {
+  border: 1px solid var(--pwa-primary-bg);
+  background: var(--pwa-primary-bg);
+  color: var(--pwa-primary-text);
+}
+
+.pwa-update-later:disabled,
+.pwa-update-now:disabled {
+  opacity: 0.55;
+}
+
+@media (max-width: 430px) {
+  .pwa-update-card {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px;
+  }
+
+  .pwa-update-description {
+    white-space: normal;
+  }
+
+  .pwa-update-actions {
+    justify-content: flex-end;
+  }
+}
+
+@keyframes pwa-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pwa-pulse {
+  from {
+    opacity: 0.66;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes openfork-mobile-scan {
+  0% {
+    top: 2%;
+    opacity: 0;
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    top: 96%;
+    opacity: 0;
+  }
+}
+
+@media (max-height: 680px) {
+  .pwa-bootstrap {
+    align-items: flex-start;
+    padding-top: max(12px, env(safe-area-inset-top, 0px));
+    padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .pwa-bootstrap-card {
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .scan-frame {
+    width: min(100%, 240px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pwa-bootstrap-spinner,
+  .pwa-camera-skeleton,
+  .scan-line {
+    animation: none;
+  }
+
+  .pwa-bootstrap-button {
+    transition: none;
+  }
+
+  .pwa-bootstrap-button:not(:disabled):active {
+    transform: none;
+  }
+}

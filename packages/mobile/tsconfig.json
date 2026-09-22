@@ -10,6 +10,9 @@
     "jsxImportSource": "solid-js",
     "allowImportingTsExtensions": true,
     "noEmit": true,
+    "paths": {
+      "@opencode-ai/app/pwa-client": ["../app/node_modules/.ts-dist/src/pwa-client.d.ts"]
+    },
     "lib": [
       "ESNext",
       "DOM",

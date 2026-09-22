@@ -1,16 +1,18 @@
 import { render } from "solid-js/web"
-import { App } from "./app"
-import "katex/dist/katex.min.css"
-import "./styles.css"
+import { MobileBootstrap } from "./bootstrap"
+import { registerPwaServiceWorker } from "./service-worker"
+import { PwaUpdatePrompt } from "./update-prompt"
+import "./bootstrap.css"
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    void navigator.serviceWorker.register("/sw.js")
-  })
-  // The service worker posts this after a notification click (either to
-  // focus this window, or immediately on a fresh openWindow() launch). The
-  // app owns actual routing/state, so this is just forwarded as a DOM event
-  // rather than main.tsx reaching into app state directly.
+  // Register immediately: delaying until window.load makes installed-app cold
+  // starts wait behind the entire JS/font graph before offline/push capability
+  // begins reconciling.
+  void registerPwaServiceWorker()
+
+  // The service worker posts this after a notification click (either to focus
+  // this window, or immediately on a fresh openWindow() launch). The app owns
+  // actual routing/state, so this remains a narrow DOM-event bridge.
   navigator.serviceWorker.addEventListener("message", (event) => {
     if (event.data?.type === "PUSH_NAVIGATE" && typeof event.data.url === "string") {
       window.dispatchEvent(new CustomEvent("opencode:push-navigate", { detail: { url: event.data.url } }))
@@ -18,4 +20,12 @@ if ("serviceWorker" in navigator) {
   })
 }
 
-render(() => <App />, document.getElementById("root")!)
+render(
+  () => (
+    <>
+      <MobileBootstrap />
+      <PwaUpdatePrompt />
+    </>
+  ),
+  document.getElementById("root")!,
+)
