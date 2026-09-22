@@ -1,27 +1,36 @@
 import { BottomSheet, BottomSheetBody, BottomSheetHeader, BottomSheetTitle } from "@opencode-ai/ui/v2/bottom-sheet-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
+import { Spinner } from "@opencode-ai/ui/spinner"
 import { SegmentedControlItemV2, SegmentedControlV2 } from "@opencode-ai/ui/v2/segmented-control-v2"
 import { createResource, createSignal, For, Show, type Component } from "solid-js"
 import { useLanguage } from "@/context/language"
+import { settingsGeneralDict } from "@/i18n/en-settings-general"
 
 // Settings-as-sheet (Q5, docs/pwa-mobile/03 §5): settings render as a bottom
-// sheet over any route; no shell registers a /settings route. Sections reuse
-// the desktop settings-v2 panels so both presentations share one source of
-// truth. The keyboard-centric shortcuts panel is omitted on mobile per 03 §2.7.
-type SettingsSection = "general" | "servers"
+// sheet over any route; no shell registers a /settings route. General settings
+// reuse the desktop source of truth, while connection/network gets a dedicated
+// mobile presentation over the same Server + OFXP domain contexts. The desktop
+// Servers panel brings WSL/SSH/server-management chrome that is neither useful
+// nor cheap for a paired phone.
+type SettingsSection = "general" | "connection" | "notifications"
 
 export const PwaSettingsSheet: Component<{ open: boolean; onClose: () => void }> = (props) => {
   const language = useLanguage()
+  language.registerTranslations(settingsGeneralDict)
   const [section, setSection] = createSignal<SettingsSection>("general")
-  const [modules] = createResource(
-    () => props.open,
-    (open) =>
-      open ? Promise.all([import("@/components/settings-v2/general"), import("@/components/settings-v2/servers")]) : null,
+  const [panel] = createResource(
+    () => (props.open ? section() : undefined),
+    async (key) => {
+      if (key === "connection") return (await import("@/components/pwa/connection-settings")).PwaConnectionSettings
+      if (key === "notifications") return (await import("@/components/pwa/notification-settings")).PwaNotificationSettings
+      return (await import("@/components/settings-v2/general")).SettingsGeneralV2
+    },
   )
 
   const sections: Array<{ key: SettingsSection; label: string }> = [
     { key: "general", label: language.t("settings.tab.general") },
-    { key: "servers", label: language.t("status.popover.tab.servers") },
+    { key: "connection", label: language.t("pwa.settings.connection") },
+    { key: "notifications", label: language.t("pwa.settings.notifications") },
   ]
 
   return (
@@ -56,16 +65,17 @@ export const PwaSettingsSheet: Component<{ open: boolean; onClose: () => void }>
         </SegmentedControlV2>
       </BottomSheetHeader>
       <BottomSheetBody class="px-4 py-3">
-        <Show when={modules()} keyed>
-          {(loaded) => {
-            const General = loaded[0].SettingsGeneralV2
-            const Servers = loaded[1].SettingsServersV2
-            return (
-              <Show when={section() === "servers"} fallback={<General />}>
-                <Servers />
-              </Show>
-            )
-          }}
+        <Show
+          when={panel()}
+          keyed
+          fallback={
+            <div class="flex min-h-32 items-center justify-center gap-2 text-[12px] text-v2-text-text-muted">
+              <Spinner class="size-4" />
+              <span>{language.t("common.loading")}</span>
+            </div>
+          }
+        >
+          {(Panel) => <Panel />}
         </Show>
       </BottomSheetBody>
     </BottomSheet>

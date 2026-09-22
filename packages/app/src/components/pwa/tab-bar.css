@@ -2,39 +2,83 @@
    The tab bar OWNS env(safe-area-inset-bottom): parents must not repeat it. */
 
 .pwa-tab-bar {
-  display: flex;
   flex-shrink: 0;
+  background: var(--v2-background-bg-deep);
+  padding: 6px 8px max(6px, env(safe-area-inset-bottom, 0px));
+  contain: layout paint;
+}
+
+.pwa-tab-bar__dock {
+  display: flex;
   align-items: stretch;
+  width: min(100%, 520px);
+  margin: 0 auto;
+  padding: 3px;
+  border: 1px solid var(--v2-border-border-base);
+  border-radius: 13px;
   background: var(--v2-background-bg-base);
-  border-top: 1px solid var(--v2-border-border-muted);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
+  box-shadow: var(--v2-elevation-raised);
 }
 
 .pwa-tab-bar__item {
+  position: relative;
   display: flex;
   flex: 1 1 0;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
-  min-height: 48px;
+  gap: 1px;
+  min-height: 45px;
   min-width: 44px;
-  padding: 4px 8px;
+  padding: 3px 8px 4px;
   border: none;
-  background: none;
-  color: var(--text-weak);
-  font-size: 0.6875rem;
-  line-height: 1.2;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--v2-text-text-faint);
   touch-action: manipulation;
-  transition: transform 80ms ease-out;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color 100ms ease-out,
+    color 100ms ease-out,
+    transform 70ms ease-out;
+}
+
+.pwa-tab-bar__icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  font-size: 16px;
+}
+
+.pwa-tab-bar__bubble {
+  display: block;
+  width: 20px;
+  height: 20px;
+}
+
+.pwa-tab-bar__label {
+  font-size: 10px;
+  font-weight: 530;
+  line-height: 12px;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
 }
 
 .pwa-tab-bar__item[data-active] {
-  color: var(--text-interactive-base);
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-strong);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .pwa-tab-bar__item:not([data-active]):hover {
+    background: var(--v2-overlay-simple-overlay-hover);
+    color: var(--v2-text-text-base);
+  }
 }
 
 .pwa-tab-bar__item:active {
-  transform: scale(0.97);
+  transform: scale(0.975);
 }
 
 @media (prefers-reduced-motion: reduce) {
