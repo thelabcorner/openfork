@@ -70,7 +70,7 @@ const createFocused = Effect.gen(function* () {
     constraints: ["Do not scan transcript history"],
     criteria: ["Projection is durable"],
     steps: [{ title: "Implement", description: "Publish semantic snapshots" }],
-    continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 4, maxNoProgressTurns: 2 },
+    continuationPolicy: { maxConsecutiveTurns: 4, maxNoProgressTurns: 2 },
   })
   yield* goals.focus({ goalID: detail.goal.id, sessionID })
   return detail

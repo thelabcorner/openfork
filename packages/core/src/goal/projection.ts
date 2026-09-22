@@ -73,7 +73,7 @@ export function renderSpec(detail: Goal.Detail) {
         `    <step id="${escapeAttribute(step.id)}" title="${escapeAttribute(step.title)}">${escapeText(step.description)}</step>`,
     ),
     "  </steps>",
-    `  <continuation_policy mode="${escapeAttribute(policy.mode)}"${optionalAttribute("max_consecutive_turns", policy.maxConsecutiveTurns)}${optionalAttribute("max_no_progress_turns", policy.maxNoProgressTurns)}${optionalAttribute("max_duration_ms", policy.maxDurationMs)}${optionalAttribute("token_budget", policy.tokenBudget)} />`,
+    `  <continuation_policy${optionalAttribute("max_consecutive_turns", policy.maxConsecutiveTurns)}${optionalAttribute("max_no_progress_turns", policy.maxNoProgressTurns)}${optionalAttribute("max_duration_ms", policy.maxDurationMs)}${optionalAttribute("token_budget", policy.tokenBudget)} />`,
     "</goal_spec>",
   ].join("\n")
 }

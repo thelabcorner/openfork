@@ -77,6 +77,8 @@ export interface GrepInput {
   readonly pattern: string
   readonly file?: string
   readonly include?: string
+  /** Treat pattern as a fixed string instead of a regular expression. */
+  readonly literal?: boolean
   readonly limit: number
   readonly signal?: AbortSignal
 }
@@ -230,6 +232,7 @@ const layer = Layer.effect(
             "--no-messages",
             ...(input.include ? [`--glob=${input.include}`] : []),
             "--glob=!**/.git/**",
+            ...(input.literal ? ["--fixed-strings"] : []),
             "--",
             input.pattern,
             input.file ?? ".",

@@ -40,6 +40,7 @@ type MutableStep = {
 type MutableInfo = {
   sessionID: SessionSchema.ID
   phase: Phase
+  turnStartedAt?: number
   phaseStartedAt?: number
   updatedAt: number
   model?: {
@@ -369,6 +370,11 @@ const layer = Layer.effect(
       state.toolStarts.clear()
       state.stepGeneratedMs = 0
       state.stepToolMs = 0
+      // `begin` is provider-step scoped and may run repeatedly inside one
+      // user-visible turn (tool loops, retries, continuations). The turn clock
+      // must therefore latch only once and survive subsequent step begins until
+      // the runner declares the whole session drain idle.
+      state.info.turnStartedAt ??= at
       state.info.phase = "requesting"
       state.info.phaseStartedAt = at
       state.info.updatedAt = at
@@ -541,6 +547,7 @@ const layer = Layer.effect(
       closeAllContent(state, timestamp)
       closeAllTools(state, timestamp)
       state.info.phase = "idle"
+      state.info.turnStartedAt = undefined
       state.info.phaseStartedAt = timestamp
       state.info.updatedAt = timestamp
       pruneStates(timestamp)

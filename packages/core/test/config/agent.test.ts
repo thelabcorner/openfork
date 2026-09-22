@@ -199,6 +199,41 @@ describe("ConfigAgentPlugin.Plugin", () => {
     }),
   )
 
+  it.effect("preserves first-class account identity for configured agent models", () =>
+    Effect.gen(function* () {
+      const agents = yield* AgentV2.Service
+      const config = Config.Service.of({
+        entries: () =>
+          Effect.succeed([
+            new Config.Document({
+              type: "document",
+              info: decode({
+                agents: {
+                  "prompt-revisor": {
+                    model: "opencode/gpt-5-nano@zen-account-42",
+                    variant: "high",
+                  },
+                },
+              }),
+            }),
+          ]),
+      })
+
+      yield* ConfigAgentPlugin.Plugin.effect(host({ agent: agentHost(agents) })).pipe(
+        Effect.provideService(Config.Service, config),
+      )
+
+      expect(yield* agents.get(AgentV2.ID.make("prompt-revisor"))).toMatchObject({
+        model: {
+          providerID: "opencode",
+          id: "gpt-5-nano",
+          accountID: "zen-account-42",
+          variant: "high",
+        },
+      })
+    }),
+  )
+
   it.effect("removes a built-in agent disabled by configuration", () =>
     Effect.gen(function* () {
       const agents = yield* AgentV2.Service

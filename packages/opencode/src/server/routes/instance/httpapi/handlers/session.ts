@@ -107,6 +107,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* authorizePublicMutableSession(current)
     })
 
+    const specialAgentExecution = (current: Session.Info): MessageV2.CurrentV1Execution => ({
+      agent: SessionMetadataOwnership.specialAgentKind(current.metadata) ?? current.agent,
+      ...(current.model
+        ? {
+            model: {
+              providerID: current.model.providerID,
+              modelID: current.model.id,
+              ...(current.model.variant ? { variant: current.model.variant } : {}),
+            },
+          }
+        : {}),
+    })
+
     const requireInteractiveSession = Effect.fn("SessionHttpApi.requireInteractiveSession")(function* (
       sessionID: SessionID,
     ) {
@@ -162,17 +175,30 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           catch: () => new HttpApiError.BadRequest({}),
         })
       }
-      yield* requireSession(ctx.params.sessionID)
+      const current = yield* requireSession(ctx.params.sessionID)
+      const specialAgent = SessionMetadataOwnership.isSpecialAgent(current.metadata)
+      const execution = specialAgent ? specialAgentExecution(current) : undefined
       if (ctx.query.limit === undefined || ctx.query.limit === 0) {
-        return yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
+        return yield* SessionError.mapStorageNotFound(
+          specialAgent
+            ? MessageV2.currentAll({ sessionID: ctx.params.sessionID, execution })
+            : session.messages({ sessionID: ctx.params.sessionID }),
+        )
       }
 
       const page = yield* SessionError.mapStorageNotFound(
-        MessageV2.page({
-          sessionID: ctx.params.sessionID,
-          limit: ctx.query.limit,
-          before: ctx.query.before,
-        }),
+        specialAgent
+          ? MessageV2.currentPage({
+              sessionID: ctx.params.sessionID,
+              limit: ctx.query.limit,
+              before: ctx.query.before,
+              execution,
+            })
+          : MessageV2.page({
+              sessionID: ctx.params.sessionID,
+              limit: ctx.query.limit,
+              before: ctx.query.before,
+            }),
       )
       if (!page.cursor) return page.items
 
@@ -194,8 +220,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const message = Effect.fn("SessionHttpApi.message")(function* (ctx: {
       params: { sessionID: SessionID; messageID: MessageID }
     }) {
+      const current = yield* requireSession(ctx.params.sessionID)
       return yield* SessionError.mapStorageNotFound(
-        MessageV2.get({ sessionID: ctx.params.sessionID, messageID: ctx.params.messageID }),
+        SessionMetadataOwnership.isSpecialAgent(current.metadata)
+          ? MessageV2.currentGet({
+              sessionID: ctx.params.sessionID,
+              messageID: ctx.params.messageID,
+              execution: specialAgentExecution(current),
+            })
+          : MessageV2.get({ sessionID: ctx.params.sessionID, messageID: ctx.params.messageID }),
       )
     })
 

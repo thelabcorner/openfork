@@ -45,16 +45,33 @@ const toolChoiceIdentity = (model: Provider.Model): ToolChoiceCapabilityIdentity
 export const makeRuntime = (
   provider: Provider.Interface,
   llm: SessionLLM.Interface,
+  agents: Agent.Interface,
   mcp?: MCP.Interface,
 ): PromptRevisor.Runtime => ({
   resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({ candidates }) {
     const seen = new Set<string>()
     for (const candidate of candidates) {
-      const key = `${candidate.providerID}/${candidate.id}/${candidate.variant ?? ""}`
+      const key = `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
       if (seen.has(key)) continue
       seen.add(key)
-      const resolved = yield* provider.getModel(candidate.providerID, candidate.id).pipe(Effect.option)
+      const resolved = yield* provider
+        .getModel(candidate.providerID, candidate.id, candidate.accountID)
+        .pipe(Effect.option)
       if (resolved._tag === "Some") return { ref: candidate, value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
+    }
+
+    // Match ordinary session semantics: an explicit model chain is authoritative.
+    // If every requested candidate is unavailable, do not silently jump to an
+    // unrelated provider default (which can cross account/auth boundaries, e.g.
+    // into Console's public free tier). The caller already supplies the ordered
+    // special-agent -> composer -> session fallback chain.
+    if (candidates.length > 0) {
+      const requested = candidates
+        .map((candidate) => `${candidate.providerID}/${candidate.id}${candidate.accountID ? `@${candidate.accountID}` : ""}`)
+        .join(", ")
+      return yield* new PromptRevisor.UnavailableError({
+        message: `No requested model is available for prompt revision: ${requested}`,
+      })
     }
 
     const fallbackRef = yield* provider.defaultModel().pipe(
@@ -83,28 +100,30 @@ export const makeRuntime = (
   generate: Effect.fn("PromptRevisorRuntime.generate")(function* (request) {
     const model = request.model.value as Provider.Model
     const sessionID = request.sessionID ?? SessionID.create()
+    const baseAgent = yield* agents.get("prompt-revisor")
+    if (!baseAgent) {
+      return yield* new PromptRevisor.UnavailableError({
+        message: "The canonical prompt-revisor agent is unavailable",
+      })
+    }
     const user = makeV1SpecialAgentAnchor({
       sessionID,
       agent: request.specialAgent,
       model: {
-        providerID: model.providerID,
-        modelID: model.id,
+        providerID: request.model.ref.providerID,
+        modelID: request.model.ref.id,
+        ...(request.model.ref.accountID ? { accountID: request.model.ref.accountID } : {}),
         variant: request.model.ref.variant,
       },
     })
+    // Prompt revision is a real built-in agent, not a synthetic request-local
+    // Agent.Info. Preserve its configured model options, permissions, variant,
+    // plugin identity, and any user overrides; only the operation-owned policy
+    // and bounded generation temperature are request-specific.
     const agent: Agent.Info = {
-      name: request.specialAgent === "goal_revisor" ? "goal-revisor" : "prompt-revisor",
-      description:
-        request.specialAgent === "goal_revisor"
-          ? "Read-only Goal revision runtime"
-          : "Read-only prompt revision runtime",
-      mode: "primary",
-      native: true,
-      hidden: true,
-      permission: [],
-      options: {},
+      ...baseAgent,
       prompt: request.system,
-      temperature: request.generation.temperature,
+      temperature: request.generation.temperature ?? baseAgent.temperature,
     }
 
     const collect = (toolChoice: SessionLLM.StreamInput["toolChoice"]) => {

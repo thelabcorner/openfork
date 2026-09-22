@@ -24,6 +24,7 @@ import { Question } from "@/question"
 import { Permission } from "@/permission"
 import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionGroup } from "@/session/group"
 import { SessionStatus } from "@/session/status"
 import { SessionRunState } from "@/session/run-state"
@@ -60,6 +61,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionExecution } from "@opencode-ai/core/session/execution"
+import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { filesystem, requestExecutor } from "@opencode-ai/core/effect/app-node-platform"
@@ -143,6 +146,11 @@ export const AppLayer = AppNodeBuilderV1.build(
     Permission.node,
     Todo.node,
     Session.node,
+    // OXP's lazy V1 Session-control adapter consumes the core V2 Session
+    // service directly for attributed agent/model switching. Session.node
+    // depends on it transitively, but LayerNode dependencies are provisioned
+    // without being exported from AppRuntime, so keep SessionV2 explicit.
+    SessionV2.node,
     // OXP delegated batches consume SessionGroup directly. A LayerNode dependency
     // of Session.node is provisioned transitively but is not exported from the
     // compiled AppRuntime, so keep SessionGroup explicit at this boundary.
@@ -186,6 +194,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     // httpapi) and transitively by the browser tools via BrokerClient.
     BrowserHostBroker.node,
   ]),
+  [[SessionExecution.node, SessionExecutionLocal.node]],
 ).pipe(Layer.provideMerge(AppNodeBuilderV1.build(Ripgrep.node)), Layer.provideMerge(Observability.layer))
 
 const rt = ManagedRuntime.make(AppLayer, { memoMap })

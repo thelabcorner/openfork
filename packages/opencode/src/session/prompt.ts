@@ -2222,6 +2222,7 @@ const layer = Layer.effect(
       input: PromptInput,
       origin: "user" | "host",
       provenance: SessionV1.UserTurnProvenance,
+      hostPrincipalRef?: string,
     ) {
       const session = yield* requirePromptable(input.sessionID, origin)
       if (origin === "host" && SessionMetadataOwnership.hasScheduledTaskOrigin(session.metadata ?? undefined)) {
@@ -2241,11 +2242,14 @@ const layer = Layer.effect(
       }
       if (origin === "host" && SessionMetadataOwnership.hasWorkerDelegationOrigin(session.metadata ?? undefined)) {
         const delegation = SessionMetadataOwnership.workerDelegation(session.metadata ?? undefined)
+        // Stable principal identity authorizes the producer; provenance.ref is
+        // deliberately reserved for the individual OXP invocation/turn and may
+        // therefore change on every continuation.
         if (
           !delegation ||
           provenance.owner !== "host" ||
           provenance.source !== SessionTurnProvenance.Source.OxpDelegation ||
-          provenance.ref !== delegation.principalRef
+          hostPrincipalRef !== delegation.principalRef
         ) {
           return yield* new HostOwnedSessionError({
             sessionID: input.sessionID,
@@ -2355,6 +2359,7 @@ const layer = Layer.effect(
           ...(provenance?.sourceMessageID ? { sourceMessageID: provenance.sourceMessageID } : {}),
           ...(provenance?.ref ? { ref: provenance.ref } : {}),
         }),
+        provenance?.principalRef,
       )
     })
 
@@ -2887,7 +2892,7 @@ const layer = Layer.effect(
 
         // Allocate a checkpoint only after proving this iteration will actually
         // execute work. A quiescent wake may exist solely to reconcile durable
-        // state (for example after compaction or a terminal manual Goal audit);
+        // state (for example after compaction or a terminal Goal audit);
         // allocating before the terminal-assistant gate creates a duplicate
         // checkpoint for the same canonical worker root.
         if (step === 0 && turn === undefined) {
@@ -3382,11 +3387,15 @@ const layer = Layer.effect(
     })
 
     const auditGoal = Effect.fn("SessionPrompt.auditGoal")(function* (sessionID: SessionID) {
-      const sessionStatus = yield* status.get(sessionID)
-      // If the worker is still producing a turn, that turn owns the transcript
-      // and will run the ordinary end-of-turn audit itself. Never audit a
-      // half-finished worker cycle or create a parallel provider request.
-      if (sessionStatus.type !== "idle") return
+      // Durable execution ownership is the admission authority. SessionStatus is
+      // a process-local presentation projection and can lag the exact-release
+      // boundary during cancellation, or appear idle while another process owns
+      // the Session. Never launch an auditor from that projection alone.
+      const quiescent = yield* state.assertNotBusy(sessionID).pipe(
+        Effect.as(true),
+        Effect.catchTag("SessionBusyError", () => Effect.succeed(false)),
+      )
+      if (!quiescent) return
       const runtime = yield* goalAutomation.runtime(sessionID)
       // A running auditor or an already-authorized continuation owns the Goal.
       // Never create a second independent auditor alongside it.
@@ -3429,7 +3438,7 @@ const layer = Layer.effect(
             const error = Cause.squash(cause)
             const message = error instanceof Error ? error.message : String(error)
             yield* goalAutomation.failAudit({ sessionID, error: message })
-            yield* Effect.logError("manual Goal audit failed", { sessionID, cause: Cause.pretty(cause) })
+            yield* Effect.logError("Goal audit failed", { sessionID, cause: Cause.pretty(cause) })
             return undefined
           }),
         ),
@@ -3446,7 +3455,25 @@ const layer = Layer.effect(
 
       // Only an actual continuation reservation authorizes another worker cycle.
       // The loop claims/materializes that reservation at its own admission seam.
-      if (decision.reservation) yield* loop({ sessionID }).pipe(Effect.asVoid)
+      if (decision.reservation) {
+        yield* loop({ sessionID }).pipe(
+          Effect.asVoid,
+          Effect.catchCause((cause) => {
+            const error = Cause.squash(cause)
+            if (
+              error instanceof Session.BusyError ||
+              (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
+            ) {
+              // A concurrent genuine user turn may acquire the parent Session
+              // after the independent audit settles. User admission cancels the
+              // autonomous reservation, so a busy continuation wake is benign
+              // contention, not an auditor failure.
+              return Effect.logInfo("Goal continuation wake coalesced with existing Session owner", { sessionID })
+            }
+            return Effect.failCause(cause)
+          }),
+        )
+      }
     })
 
     const requestGoalAudit = Effect.fn("SessionPrompt.requestGoalAudit")(function* (sessionID: SessionID) {

@@ -103,6 +103,9 @@ const checksums = [
   "3a99936f443a46ed88796b4ee89af62d3f3a8329b5c4681a7594af8a50809876",
   "4898183641d39784c6ba7aa5814ce5cd478d9f9d38e6fa907907557c7831611b",
   "66ebcf2d24be8d3fa703c360f5cb7ac2d58358aebce1fca2295ba500c1e3a738",
+  "706081139b24053e58023b0d4472ce21e8ff9aff14088f872d26a7a8d2b0ae5d",
+  "a3e0334cbc6eba4e3b2206da481ea2996b646686c72ba1ece04925507a4269b7",
+  "55236f00eae6db0daa40f865e5c79d11bbccb003c1c5636145d16da658700585",
 ] as const
 
 export const migrations = (
@@ -209,6 +212,9 @@ export const migrations = (
     import("./migration/20260920163326_ofxp_peer_trust"),
     import("./migration/20260920180747_ofxp_invocation_receipt"),
     import("./migration/20260921032422_ofxp_peer_authority_epoch"),
+    import("./migration/20260921175050_usage_yield_identity"),
+    import("./migration/20260921180309_oxp_invocation_detail"),
+    import("./migration/20260921192825_usage_yield_statistics"),
   ])
 ).map((module, index) => ({
   ...module.default,

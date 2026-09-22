@@ -150,9 +150,9 @@ const layer = Layer.effect(
             if (files.some((file) => file === undefined)) {
               return []
             }
-            return [{ skill, root, versionFile, files: files as { url: string; destination: string; file: string }[] }]
+            return [{ skill, root, versionFile, legacyVersionFile, files: files as { url: string; destination: string; file: string }[] }]
           }),
-          ({ skill, root, versionFile, files }) =>
+          ({ skill, root, versionFile, legacyVersionFile, files }) =>
             Effect.gen(function* () {
               const version = skill.version
             const current =

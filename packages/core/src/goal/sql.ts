@@ -21,10 +21,7 @@ export const GoalTable = sqliteTable(
     status: text().$type<Goal.Status>().notNull().default("draft"),
     revision: integer().notNull().default(0),
     auditor_runs: integer().notNull().default(0),
-    continuation_policy: text({ mode: "json" })
-      .$type<Goal.ContinuationPolicy>()
-      .notNull()
-      .default({ mode: "manual" }),
+    continuation_policy: text({ mode: "json" }).$type<Goal.ContinuationPolicy>().notNull().default({}),
     auditor_policy: text({ mode: "json" }).$type<Goal.AuditorPolicy>().notNull().default({}),
     blocker: text(),
     time_created: integer()

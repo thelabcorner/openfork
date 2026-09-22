@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { described } from "./metadata"
+import { Capacity } from "@/capacity/capacity"
 
 const DirectoryQuery = Schema.Struct({
   directory: Schema.optional(Schema.String),
@@ -110,6 +111,18 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
       HttpApiEndpoint.get("usage", "/fork/usage", {
         success: described(ForkUsageResult, "Aggregate and per-credential OpenCode Go usage"),
       }).annotateMerge(OpenApi.annotations({ identifier: "fork.usage.get", summary: "Get OpenCode Go usage" })),
+    )
+    .add(
+      HttpApiEndpoint.get("capacity", "/fork/capacity", {
+        success: described(Capacity.Snapshot, "Cross-provider personalized request-capacity projection"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "fork.capacity.get",
+          summary: "Get provider request capacity",
+          description:
+            "Projects request capacity for every configured provider using machine-readable provider resources, published/request-rate priors where available, and durable personal workload statistics. OpenCode Go retains its calibrated hierarchical projection.",
+        }),
+      ),
     )
     .annotateMerge(OpenApi.annotations({ title: "fork-credential", description: "Fork-owned OpenCode Zen credential store." })),
 )

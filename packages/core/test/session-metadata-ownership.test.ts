@@ -189,6 +189,23 @@ describe("Session metadata ownership", () => {
       ordinary: "next",
       workerDelegation: origin,
     })
+
+    const rebound = SessionMetadataOwnership.rebindDelegatedWorkerModel(metadata, {
+      providerID: "opencode-go",
+      modelID: "deepseek-r2",
+      accountID: "go-account",
+      variant: "high",
+    })
+    expect(rebound?.ordinary).toBe(true)
+    expect(SessionMetadataOwnership.workerDelegation(rebound)).toEqual({
+      ...origin,
+      model: {
+        providerID: "opencode-go",
+        modelID: "deepseek-r2",
+        accountID: "go-account",
+        variant: "high",
+      },
+    })
   })
 
   test("malformed worker delegation metadata remains producer-owned but yields no executable policy", () => {

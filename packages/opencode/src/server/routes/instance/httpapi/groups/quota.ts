@@ -7,8 +7,14 @@ import { Authorization } from "../middleware/authorization"
 
 export const QuotaPaths = {
   providers: "/quota/providers",
+  resets: "/quota/resets",
   get: "/quota/:providerID",
 } as const
+
+export const ResetAgendaQuery = Schema.Struct({
+  from: Schema.NumberFromString,
+  to: Schema.NumberFromString,
+})
 
 export const QuotaApi = HttpApi.make("quota").add(
   HttpApiGroup.make("quota")
@@ -21,6 +27,20 @@ export const QuotaApi = HttpApi.make("quota").add(
           summary: "List quota providers",
           description:
             "Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("resets", QuotaPaths.resets, {
+        query: ResetAgendaQuery,
+        success: described(Quota.ResetAgendaResult, "Known provider quota reset deadlines for a bounded calendar range"),
+        error: HttpApiError.BadRequest,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "quota.resets",
+          summary: "Quota reset calendar agenda",
+          description:
+            "Tier 0 bounded projection of reset deadlines already known by the quota/fork usage owners. It does not synthesize future recurrences and never materializes a workspace Instance.",
         }),
       ),
     )

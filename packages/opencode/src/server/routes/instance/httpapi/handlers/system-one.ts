@@ -10,6 +10,7 @@ import {
   ModelNotFoundError,
   QuotaExceededError,
   RateLimitError,
+  ServiceUnavailableError,
   TimeoutError,
   UnauthorizedError,
   UpstreamError,
@@ -29,6 +30,18 @@ export function mapSystemOneError(error: SystemOne.Error) {
       suggestions: [...(error.suggestions ?? [])],
       message: error.message,
     })
+  }
+  if (error instanceof Provider.AccountResolutionError) {
+    return error.reason === "unavailable"
+      ? new ServiceUnavailableError({
+          service: error.providerID,
+          message: error.message,
+        })
+      : new InvalidRequestError({
+          message: error.message,
+          kind: "provider-account",
+          field: "accountID",
+        })
   }
   if (error instanceof Provider.UnsupportedModelPrimitiveError) {
     return new InvalidRequestError({

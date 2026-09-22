@@ -18,6 +18,8 @@ const MAX_SNIPPET_LINES = 14
 const SNIPPET_CONTEXT_LINES = 2
 const MAX_SNIPPET_LINE_CHARS = 160
 const MAX_OCCURRENCES_LISTED = 10
+const MAX_CANDIDATE_CONTEXTS = 6
+const MAX_CANDIDATE_CONTEXT_CHARS = 84
 
 export type Region = { start: number; end: number; score: number }
 
@@ -113,6 +115,36 @@ export function replaceConflictHint(input: { content: string; needle: string }):
   const excerpt = fuzzyExcerpt(input.content, input.needle.split("\n"))
   if (!excerpt) return undefined
   return ["Current file content closest to your target:", "", excerpt].join("\n")
+}
+
+const compactCandidateLine = (value: string) => {
+  const line = displayLine(value).trim()
+  if (line.length <= MAX_CANDIDATE_CONTEXT_CHARS) return line
+  return `${line.slice(0, MAX_CANDIDATE_CONTEXT_CHARS)}…`
+}
+
+/**
+ * Compact ambiguity repair payload for patch hunks. The hunk body itself is
+ * identical at every candidate, so expose the adjacent lines that actually let
+ * the caller construct unique context without another read round-trip.
+ */
+export function candidateConflictHint(input: {
+  content: string
+  candidates: readonly number[]
+  matchedLines: number
+}): string | undefined {
+  if (input.candidates.length === 0) return undefined
+  const lines = input.content.split("\n")
+  const rows = input.candidates.slice(0, MAX_CANDIDATE_CONTEXTS).map((line) => {
+    const start = Math.max(0, line - 1)
+    const end = Math.min(lines.length - 1, start + Math.max(1, input.matchedLines) - 1)
+    const before = start > 0 ? `${start}: ${compactCandidateLine(lines[start - 1]!)}` : "BOF"
+    const after = end + 1 < lines.length ? `${end + 2}: ${compactCandidateLine(lines[end + 1]!)}` : "EOF"
+    return `  match ${line}-${end + 1}: before [${before}] · after [${after}]`
+  })
+  const omitted = input.candidates.length - rows.length
+  if (omitted > 0) rows.push(`  … +${omitted} more candidate(s)`)
+  return ["Candidate contexts (add one unique adjacent line to the hunk):", ...rows].join("\n")
 }
 
 // Hint for the disproportionate-match guard: show the span the fuzzy match

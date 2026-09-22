@@ -255,3 +255,24 @@ export function delegatedWorker(input: WorkerDelegationOrigin & { readonly metad
     [Keys.workerDelegation]: structuredClone(origin),
   }
 }
+
+/**
+ * Trusted producer-only mutation for a delegated worker's model selection.
+ *
+ * Generic metadata replacement deliberately cannot rewrite workerDelegation.
+ * The delegation owner may, however, rebind the worker to another validated
+ * model/account/variant while preserving every other immutable origin field.
+ * Malformed producer metadata stays fail-closed.
+ */
+export function rebindDelegatedWorkerModel(
+  value: Metadata | undefined,
+  model: WorkerDelegationModel,
+): Record<string, unknown> | undefined {
+  const origin = workerDelegation(value)
+  if (!origin) return
+  return delegatedWorker({
+    ...origin,
+    model,
+    metadata: value,
+  })
+}

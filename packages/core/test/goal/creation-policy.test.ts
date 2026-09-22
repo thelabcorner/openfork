@@ -169,19 +169,6 @@ describe("GoalCreationPolicy", () => {
     ).toBe(true)
   })
 
-  test("does not allow unattended mode without an explicit unattended request", () => {
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Create a goal for this task.")).toBe(false)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Create an unattended goal for this task.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Make it unattended.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Keep going until it is complete.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Continue automatically.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Run hands-off.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Work without asking me for confirmation.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Don't stop to ask, just keep going until done.")).toBe(true)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Do not run unattended.")).toBe(false)
-    expect(GoalCreationPolicy.explicitlyRequestsUnattended("Ask me before each automatic continuation.")).toBe(false)
-  })
-
   test("recognizes explicit current-turn Goal update directives without treating discussion as permission", () => {
     const updates = [
       "Update the goal and add stress-test corpuses.",

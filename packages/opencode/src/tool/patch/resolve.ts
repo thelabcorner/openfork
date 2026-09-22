@@ -4,6 +4,7 @@ import { buildLineIndex } from "../edit/line-index"
 import { adaptReplacementTerminators } from "@opencode-ai/core/line-ending"
 import { FUZZ } from "../edit/span"
 import { orderSpans, type Span } from "../edit/span"
+import { candidateConflictHint } from "../conflict"
 import type { UpdateFileChunk } from "../../patch"
 
 export type ResolvedChunk = {
@@ -172,10 +173,16 @@ export function resolveChunks(content: string, chunks: readonly UpdateFileChunk[
     const index = pending[0]!
     const error = errors.get(index)!
     const at = error.candidates.join(", ")
+    const hint = candidateConflictHint({
+      content,
+      candidates: error.candidates,
+      matchedLines: Math.max(1, chunks[index]!.old_lines.length),
+    })
     throw new Error(
       `${filePath}: hunk ${index + 1} matches ${error.candidates.length} locations (lines ${at}) and ` +
         `neighbouring hunks do not narrow it to one. Add surrounding context lines that are unique to the ` +
-        `location you mean — the tool will not guess between identical candidates.`,
+        `location you mean — the tool will not guess between identical candidates.` +
+        (hint ? `\n\n${hint}` : ""),
     )
   }
 

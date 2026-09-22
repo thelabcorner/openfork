@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { makeRuntime } from "@/prompt-revisor/runtime"
+import { Agent } from "@/agent/agent"
 import { Provider } from "@/provider/provider"
 import { LLM as SessionLLM } from "@/session/llm"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -20,6 +21,22 @@ const providerModel = (providerID: string, id: string) =>
 const missing = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
   Effect.fail(new Provider.ModelNotFoundError({ providerID, modelID }))
 
+const canonicalAgent: Agent.Info = {
+  name: "prompt-revisor",
+  description: "canonical prompt revisor",
+  mode: "primary",
+  native: true,
+  hidden: true,
+  permission: [],
+  options: { canonical: true },
+  prompt: "BUILT-IN PROMPT",
+  temperature: 0.7,
+}
+
+const agents = {
+  get: () => Effect.succeed(canonicalAgent),
+} as unknown as Agent.Interface
+
 describe("Prompt Revisor production runtime", () => {
   test("resolves candidates through Provider.getModel in priority order and preserves the selected variant", async () => {
     const dedicated = ref("dedicated", "revisor", "high")
@@ -38,7 +55,7 @@ describe("Prompt Revisor production runtime", () => {
     const llm = { stream: () => Stream.empty } as SessionLLM.Interface
 
     const result = await Effect.runPromise(
-      makeRuntime(provider, llm).resolveModel({ candidates: [dedicated, composer] }),
+      makeRuntime(provider, llm, agents).resolveModel({ candidates: [dedicated, composer] }),
     )
 
     expect(calls).toEqual(["dedicated/revisor"])
@@ -47,7 +64,7 @@ describe("Prompt Revisor production runtime", () => {
     expect(String(result.ref.variant)).toBe("high")
   })
 
-  test("falls back to the production provider default when requested candidates are unavailable", async () => {
+  test("does not escape an explicit model chain into an unrelated provider default", async () => {
     const calls: string[] = []
     const fallback = providerModel("default-provider", "default-model")
     const provider = {
@@ -61,13 +78,55 @@ describe("Prompt Revisor production runtime", () => {
     } as unknown as Provider.Interface
     const llm = { stream: () => Stream.empty } as SessionLLM.Interface
 
-    const result = await Effect.runPromise(
-      makeRuntime(provider, llm).resolveModel({ candidates: [ref("missing", "model")] }),
+    const exit = await Effect.runPromiseExit(
+      makeRuntime(provider, llm, agents).resolveModel({ candidates: [ref("missing", "model")] }),
     )
 
-    expect(calls).toEqual(["missing/model", "default-provider/default-model"])
+    expect(calls).toEqual(["missing/model"])
+    expect(exit._tag).toBe("Failure")
+  })
+
+  test("uses the provider default only when no model candidate exists", async () => {
+    const calls: string[] = []
+    const fallback = providerModel("default-provider", "default-model")
+    const provider = {
+      getModel(providerID: ProviderV2.ID, modelID: ModelV2.ID) {
+        calls.push(`${providerID}/${modelID}`)
+        return Effect.succeed(fallback)
+      },
+      defaultModel: () => Effect.succeed({ providerID: fallback.providerID, modelID: fallback.id }),
+    } as unknown as Provider.Interface
+    const llm = { stream: () => Stream.empty } as SessionLLM.Interface
+
+    const result = await Effect.runPromise(makeRuntime(provider, llm, agents).resolveModel({ candidates: [] }))
+
+    expect(calls).toEqual(["default-provider/default-model"])
     expect(result.value).toBe(fallback)
     expect(result.ref).toEqual(ref("default-provider", "default-model"))
+  })
+
+  test("preserves first-class provider account identity during model resolution", async () => {
+    const selectedRef = ModelV2.Ref.make({
+      providerID: ProviderV2.ID.make("opencode"),
+      id: ModelV2.ID.make("gpt-5-nano"),
+      accountID: "zen-account-42",
+      variant: ModelV2.VariantID.make("high"),
+    })
+    const selected = providerModel("opencode", "gpt-5-nano@zen-account-42")
+    const calls: Array<{ providerID: string; modelID: string; accountID?: string }> = []
+    const provider = {
+      getModel(providerID: ProviderV2.ID, modelID: ModelV2.ID, accountID?: string) {
+        calls.push({ providerID, modelID, accountID })
+        return Effect.succeed(selected)
+      },
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const llm = { stream: () => Stream.empty } as SessionLLM.Interface
+
+    const result = await Effect.runPromise(makeRuntime(provider, llm, agents).resolveModel({ candidates: [selectedRef] }))
+
+    expect(calls).toEqual([{ providerID: "opencode", modelID: "gpt-5-nano", accountID: "zen-account-42" }])
+    expect(result.ref).toEqual(selectedRef)
   })
 
   test("executes revisions through Session LLM without persisting a session and forwards the output cap", async () => {
@@ -89,7 +148,7 @@ describe("Prompt Revisor production runtime", () => {
         ])
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     const response = await Effect.runPromise(
@@ -108,6 +167,7 @@ describe("Prompt Revisor production runtime", () => {
     expect(request?.model).toBe(selected)
     expect(request?.agent.name).toBe("prompt-revisor")
     expect(request?.agent.prompt).toBe("PROMPT REVISOR SYSTEM")
+    expect(request?.agent.options).toEqual({ canonical: true })
     expect(request?.user.model.variant).toBe("high")
     expect(request?.maxOutputTokens).toBe(4096)
     expect(request?.sessionID.startsWith("ses")).toBe(true)
@@ -132,7 +192,7 @@ describe("Prompt Revisor production runtime", () => {
         ])
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     await Effect.runPromise(
@@ -152,6 +212,7 @@ describe("Prompt Revisor production runtime", () => {
       { role: "system", content: "[PROMPT REVISOR REMINDER] not a coding agent" },
     ])
     expect(request?.agent.prompt).toBe("PROMPT REVISOR SYSTEM")
+    expect(request?.agent.temperature).toBe(0.7)
   })
 
   test("stops consuming and finalizes the production Session LLM stream at revised_prompt", async () => {
@@ -182,7 +243,7 @@ describe("Prompt Revisor production runtime", () => {
         ).pipe(Stream.ensuring(Effect.sync(() => (finalized = true))))
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     const response = await Effect.runPromise(
@@ -231,7 +292,7 @@ describe("Prompt Revisor production runtime", () => {
         ])
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     const exit = await Effect.runPromiseExit(
@@ -264,7 +325,7 @@ describe("Prompt Revisor production runtime", () => {
         return Stream.fail(new Error("provider authentication failed"))
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     const exit = await Effect.runPromiseExit(
@@ -297,7 +358,7 @@ describe("Prompt Revisor production runtime", () => {
         return Stream.fail(new Error("[invalid_request_error] invalid tool_choice payload"))
       },
     } as SessionLLM.Interface
-    const runtime = makeRuntime(provider, llm)
+    const runtime = makeRuntime(provider, llm, agents)
     const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
 
     const exit = await Effect.runPromiseExit(

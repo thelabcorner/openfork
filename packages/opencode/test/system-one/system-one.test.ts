@@ -256,6 +256,62 @@ describe("SystemOne host service", () => {
   )
 })
 
+describe("SystemOne provider account resolution", () => {
+  let selectorSeen: string | undefined
+  let accountSeen: string | undefined
+  const model = ProviderTest.model({
+    id: ModelV2.ID.make("deepseek-v4.1-flash"),
+    providerID: ProviderV2.ID.make("workbuddy"),
+    primitive: "system-one",
+    api: {
+      id: "deepseek-v4.1-flash",
+      url: "https://example.com/v1",
+      npm: "@ai-sdk/openai-compatible",
+    },
+  })
+  const provider = ProviderTest.fake({
+    model,
+    resolveAccountID: Effect.fn("TestProvider.resolveHumanAccount")((_providerID, selector) => {
+      selectorSeen = selector
+      return Effect.succeed("wb-internal-222")
+    }),
+    getModel: Effect.fn("TestProvider.getCanonicalModel")((_providerID, _modelID, accountID) => {
+      accountSeen = accountID
+      return Effect.succeed(model)
+    }),
+  })
+  const layer = SystemOne.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        provider.layer,
+        requestLayer(() => {}),
+      ),
+    ),
+  )
+  const it = testEffect(layer)
+
+  it.effect("resolves a human account label before model lookup", () =>
+    Effect.gen(function* () {
+      selectorSeen = undefined
+      accountSeen = undefined
+
+      const service = yield* SystemOne.Service
+      yield* service.infer({
+        providerID: model.providerID,
+        modelID: model.id,
+        accountID: "  Team Key 2  ",
+        state: "candidate",
+        questions,
+      })
+
+      expect([selectorSeen, accountSeen] as Array<string | undefined>).toEqual([
+        "  Team Key 2  ",
+        "wb-internal-222",
+      ])
+    }),
+  )
+})
+
 describe("SystemOne OpenCode Go compatibility", () => {
   let captured:
     | { url: string; authorization?: string; headers: Readonly<Record<string, string>>; body: unknown }

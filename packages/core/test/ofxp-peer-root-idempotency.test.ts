@@ -7,6 +7,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
+import { OfxpPeerSchema } from "@opencode-ai/core/ofxp-peer/schema"
 import { OfxpIdentity } from "@opencode-ai/core/ofxp-peer/identity"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { testEffect } from "./lib/effect"
@@ -92,7 +93,7 @@ describe("OFXP approved-root identity", () => {
         .pipe(Effect.flip)
 
       expect(conflict._tag).toBe("OfxpPeer.ValidationError")
-      expect(conflict.reason).toContain("alias")
+      expect((conflict as OfxpPeerSchema.ValidationError).reason).toContain("alias")
       expect(yield* peers.roots(generated.key.peerID)).toHaveLength(1)
     }),
   )

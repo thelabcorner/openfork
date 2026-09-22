@@ -582,6 +582,7 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
             ? {
                 source: SessionTurnProvenance.Source.OxpDelegation,
                 ref: workerOrigin.invocationRef,
+                principalRef: workerOrigin.principalRef,
               }
             : undefined,
         )

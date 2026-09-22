@@ -31,6 +31,7 @@ import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { PluginPtyEnvironment } from "@/plugin/pty-environment"
 import { Quota } from "@/quota/quota"
+import { Capacity } from "@/capacity/capacity"
 import { InstanceStore } from "@/project/instance-store"
 import { Project } from "@/project/project"
 import { Vcs } from "@/project/vcs"
@@ -228,6 +229,7 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
     globalHandlers,
     providerSettingsHandlers,
     usageHandlers,
+    quotaHandlers,
     ofxpHandlers,
     revisionDraftHandlers,
     scheduledTaskHandlers,
@@ -271,7 +273,6 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     questionHandlers,
     permissionHandlers,
     providerHandlers,
-    quotaHandlers,
     sessionHandlers,
     sessionContextHandlers,
     sessionGroupHandlers,
@@ -445,6 +446,7 @@ const app = LayerNode.group([
   PushV2.node,
   Usage.node,
   Quota.node,
+  Capacity.node,
 ])
 
 export function createRoutes(

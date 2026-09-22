@@ -746,6 +746,20 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       },
     )
 
+    const oxpInvocationDetail = Effect.fn("GlobalHttpApi.oxpInvocationDetail")(
+      function* (ctx: {
+        params: { invocationID: Parameters<typeof oxpInspection.invocationDetail>[0] }
+      }) {
+        const row = yield* oxpInspection.invocationDetail(ctx.params.invocationID)
+        if (!row) return null
+        return {
+          invocationID: row.invocation_id,
+          ...(row.request ? { request: row.request } : {}),
+          ...(row.outcome ? { outcome: row.outcome } : {}),
+        }
+      },
+    )
+
     const oxpResource = Effect.fn("GlobalHttpApi.oxpResource")(
       function* (ctx: { query: typeof GlobalOxpResourceQuery.Type }) {
         return yield* oxpInspection.resource({
@@ -881,6 +895,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("oxpActivities", oxpActivities)
       .handle("oxpActivityGet", oxpActivityGet)
       .handle("oxpInvocations", oxpInvocations)
+      .handle("oxpInvocationDetail", oxpInvocationDetail)
       .handle("oxpResource", oxpResource)
       .handle("oxpActivityUpdate", oxpActivityUpdate)
       .handle("oxpActivityDelete", oxpActivityDelete)

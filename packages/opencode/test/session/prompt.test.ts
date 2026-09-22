@@ -7,6 +7,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
@@ -652,6 +653,235 @@ noLLMServer.instance(
 )
 
 noLLMServer.instance(
+  "delegated-worker host admission authenticates by durable invocation correlation",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:connector-test",
+        invocationRef: "oxp-inv:delegation-test",
+        rootRef: "root-test",
+        agent: "build",
+        model: {
+          providerID: String(ref.providerID),
+          modelID: String(ref.modelID),
+        },
+        nestedDelegation: false,
+      } as const
+      const chat = yield* sessions.create({
+        title: "Delegated worker admission",
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+
+      const wrongPrincipal = yield* prompt
+        .hostPrompt(
+          {
+            sessionID: chat.id,
+            noReply: true,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "wrong principal" }],
+          },
+          {
+            source: SessionTurnProvenance.Source.OxpDelegation,
+            ref: origin.invocationRef,
+            principalRef: "oxp:someone-else",
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(wrongPrincipal)).toBe(true)
+      if (Exit.isFailure(wrongPrincipal)) {
+        expect(Cause.squash(wrongPrincipal.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          kind: "delegated_worker",
+        })
+      }
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(0)
+
+      const admitted = yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "delegated work" }],
+        },
+        {
+          source: SessionTurnProvenance.Source.OxpDelegation,
+          ref: origin.invocationRef,
+          principalRef: origin.principalRef,
+        },
+      )
+      expect(admitted.info.role).toBe("user")
+      if (admitted.info.role !== "user") throw new Error("Expected delegated host admission to produce a user-role turn")
+      expect(admitted.info.provenance).toEqual({
+        owner: "host",
+        source: SessionTurnProvenance.Source.OxpDelegation,
+        ref: origin.invocationRef,
+      })
+
+      const continuationRef = "oxp-inv:delegation-continuation"
+      const continued = yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "continue delegated work" }],
+        },
+        {
+          source: SessionTurnProvenance.Source.OxpDelegation,
+          ref: continuationRef,
+          principalRef: origin.principalRef,
+        },
+      )
+      expect(continued.info.role).toBe("user")
+      if (continued.info.role !== "user") throw new Error("Expected delegated continuation to produce a user-role turn")
+      expect(continued.info.provenance).toEqual({
+        owner: "host",
+        source: SessionTurnProvenance.Source.OxpDelegation,
+        ref: continuationRef,
+      })
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(2)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "delegated-worker prompt admission fails closed for user prompts, wrong/missing principal or source, and malformed envelopes",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:connector-negative-test",
+        invocationRef: "oxp-inv:delegation-negative",
+        rootRef: "root-negative",
+        agent: "build",
+        model: {
+          providerID: String(ref.providerID),
+          modelID: String(ref.modelID),
+        },
+        nestedDelegation: false,
+      } as const
+      const expectRefused = (exit: Exit.Exit<unknown, unknown>) => {
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(Cause.squash(exit.cause)).toMatchObject({
+            _tag: "SessionPrompt.HostOwnedSessionError",
+            kind: "delegated_worker",
+          })
+        }
+      }
+
+      const chat = yield* sessions.create({
+        title: "Delegated worker negatives",
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+
+      // Public user prompting must never convert a producer-owned delegated
+      // worker into an ordinary interactive Session.
+      expectRefused(
+        yield* prompt
+          .prompt({
+            sessionID: chat.id,
+            noReply: true,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "user takeover attempt" }],
+          })
+          .pipe(Effect.exit),
+      )
+
+      // A privileged host turn with the wrong source is not the delegation seam.
+      expectRefused(
+        yield* prompt
+          .hostPrompt(
+            {
+              sessionID: chat.id,
+              noReply: true,
+              agent: "build",
+              model: ref,
+              parts: [{ type: "text", text: "wrong source" }],
+            },
+            {
+              source: SessionTurnProvenance.Source.HostPrompt,
+              ref: origin.invocationRef,
+            },
+          )
+          .pipe(Effect.exit),
+      )
+
+      // A privileged host turn without the durable principal cannot authenticate.
+      // The cast models an untyped host-transport envelope that omits it.
+      const missingPrincipal = {
+        source: SessionTurnProvenance.Source.OxpDelegation,
+        ref: origin.invocationRef,
+      } as unknown as SessionPrompt.HostPromptProvenance
+      expectRefused(
+        yield* prompt
+          .hostPrompt(
+            {
+              sessionID: chat.id,
+              noReply: true,
+              agent: "build",
+              model: ref,
+              parts: [{ type: "text", text: "missing principal" }],
+            },
+            missingPrincipal,
+          )
+          .pipe(Effect.exit),
+      )
+
+      expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(0)
+
+      // Presence of the envelope is fail-closed even when it cannot be parsed:
+      // a corrupt row must not downgrade into an ordinary promptable Session.
+      const malformed = yield* sessions.create({
+        title: "Malformed delegated worker envelope",
+        metadata: { workerDelegation: { producer: "oxp" } },
+      })
+      expect(SessionMetadataOwnership.hasWorkerDelegationOrigin(malformed.metadata)).toBe(true)
+      expect(SessionMetadataOwnership.workerDelegation(malformed.metadata)).toBeUndefined()
+
+      expectRefused(
+        yield* prompt
+          .prompt({
+            sessionID: malformed.id,
+            noReply: true,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "malformed user prompt" }],
+          })
+          .pipe(Effect.exit),
+      )
+      expectRefused(
+        yield* prompt
+          .hostPrompt(
+            {
+              sessionID: malformed.id,
+              noReply: true,
+              agent: "build",
+              model: ref,
+              parts: [{ type: "text", text: "malformed host prompt" }],
+            },
+            {
+              source: SessionTurnProvenance.Source.OxpDelegation,
+              ref: "oxp-inv:malformed",
+              principalRef: origin.principalRef,
+            },
+          )
+          .pipe(Effect.exit),
+      )
+      expect(yield* sessions.messages({ sessionID: malformed.id })).toHaveLength(0)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
   "malformed scheduled-task origin stays fail-closed for user prompting",
   () =>
     Effect.gen(function* () {
@@ -769,7 +999,7 @@ noLLMServer.instance(
           title: "Retry reactivation",
           objective: "Repair blocked Goal state on idempotent user-action admission",
           criteria: ["The blocked Goal is reactivated"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -942,7 +1172,7 @@ goalIt.instance(
           title: "Reactivate from user prompt",
           objective: "Continue when the user provides new input",
           criteria: ["the blocked Goal becomes active on admission"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -992,7 +1222,7 @@ goalIt.instance(
           title: "Goal loop proof",
           objective: "Prove worker -> auditor -> worker until complete",
           criteria: ["the auditor re-drives the session"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1208,7 +1438,7 @@ goalIt.instance(
           title: "Repair partial continuation publication",
           objective: "Recover exactly one complete continuation after a crash between message and part publication",
           criteria: ["the continuation is complete and not duplicated"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1494,7 +1724,7 @@ goalIt.instance(
           title: "Recover verifier",
           objective: "Audit the existing worker result without another worker turn",
           criteria: ["the existing worker result is independently verified"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1537,6 +1767,84 @@ goalIt.instance(
 )
 
 goalIt.instance(
+  "Goal Mode: verification waits for exact parent-runner quiescence before auditor admission",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const runState = yield* SessionRunState.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Goal audit quiescence barrier",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const workerRoot = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: workerRoot.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "worker result awaiting independent verification",
+      })
+
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Quiescence proof",
+          objective: "Do not overlap parent worker execution with independent Goal auditing.",
+          criteria: ["the parent generation is released before auditor admission"],
+          continuationPolicy: {},
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      const criterionID = active.criteria[0]!.id
+
+      yield* llm.tool("audit_verdict", {
+        decision: "complete",
+        rationale: "The parent run is quiescent and its durable transcript is available.",
+        progressMade: true,
+        criteria: [{ criterionID, status: "passed", evidence: "auditor admitted only after exact owner release" }],
+      })
+
+      // Exercise SessionRunState directly so this regression is independent of
+      // the worker provider transport. The run owns the exact same durable
+      // SessionExecutionOwner generation as a real V1 provider turn.
+      const interrupted = { info: workerRoot, parts: [] } satisfies SessionV1.WithParts
+      const worker = yield* runState
+        .ensureRunning(chat.id, Effect.succeed(interrupted), Effect.never)
+        .pipe(Effect.forkChild)
+      yield* waitForBusy(chat.id)
+
+      yield* prompt.requestGoalAudit(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
+
+      yield* runState.assertNotBusy(chat.id)
+      expect((yield* goals.focused(chat.id))?.detail.goal.status).toBe("completed")
+      expect((yield* goals.focused(chat.id))?.detail.goal.auditorRuns).toBe(1)
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+      expect((yield* llm.hits).some((hit) => JSON.stringify(hit.body.tools).includes("audit_verdict"))).toBe(true)
+      expect(Exit.isSuccess(yield* Fiber.await(worker))).toBe(true)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
   "Goal Mode: a user verification request preempts an in-flight worker generation before AUDITING begins",
   () =>
     Effect.gen(function* () {
@@ -1558,7 +1866,7 @@ goalIt.instance(
           title: "Preempt worker for verification",
           objective: "Stop active worker generation when the user requests independent verification",
           criteria: ["the independent auditor verifies the interrupted worker transcript"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1684,7 +1992,7 @@ goalIt.instance(
           title: "Preempt worker tool for verification",
           objective: "Stop an active worker tool when the user requests independent verification",
           criteria: ["the independent auditor sees a finalized interrupted tool state"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1800,7 +2108,7 @@ goalIt.instance(
           title: "Preempt automatic continuation",
           objective: "Manual verification supersedes an already-running automatic Goal continuation",
           criteria: ["the stale automatic continuation cannot resurrect after user verification"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)

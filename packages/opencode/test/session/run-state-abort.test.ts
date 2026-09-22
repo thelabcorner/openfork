@@ -92,6 +92,7 @@ const nextIdle = Effect.gen(function* () {
 it.instance("operator cancel publishes session.idle with reason aborted", () =>
   Effect.gen(function* () {
     const runState = yield* SessionRunState.Service
+    const owner = yield* SessionExecutionOwner.Service
     const sessionID = SessionID.make("session-abort-test")
     yield* seedSession(sessionID)
 
@@ -104,6 +105,11 @@ it.instance("operator cancel publishes session.idle with reason aborted", () =>
     expect(event.type).toBe("session.idle")
     expect(event.data.sessionID).toBe(sessionID)
     expect(event.data.reason).toBe("aborted")
+    // cancel() is an execution barrier, not merely an interrupt request. A
+    // caller that returns from it may immediately hand the Session to another
+    // owner (Goal Auditor preemption relies on this exact invariant).
+    expect((yield* owner.snapshot(sessionID)).ownerID).toBeUndefined()
+    yield* runState.assertNotBusy(sessionID)
   }).pipe(Effect.timeout("5 seconds")),
 )
 

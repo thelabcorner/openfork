@@ -337,6 +337,38 @@ describe("pairing integration gate", () => {
   )
 
   test.skipIf(!PAIRING_PRESENT)(
+    "tunnel ingress: pair URL prefers the configured PWA and API origins",
+    async () => {
+      await gateEnv()
+      const { listener, withTimeout } = await startGateListener({
+        username: BASIC_USERNAME,
+        password: BASIC_PASSWORD,
+      })
+      const previousPwa = process.env.OPENCODE_PWA_URL
+      const previousPublic = process.env.OPENCODE_PUBLIC_URL
+      process.env.OPENCODE_PWA_URL = "https://pwa.example.com/"
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.com"
+      try {
+        const begin = await jsonRequest(
+          new URL(PAIR_BEGIN, listener.url),
+          "POST",
+          {},
+          basicHeader(BASIC_USERNAME, BASIC_PASSWORD),
+        )
+        expect(begin.status).toBe(200)
+        const { code, url } = (await begin.json()) as { code: string; url: string }
+        expect(url).toBe(`https://pwa.example.com/?server=${encodeURIComponent("https://api.example.com")}#pair=${code}`)
+      } finally {
+        if (previousPwa === undefined) delete process.env.OPENCODE_PWA_URL
+        else process.env.OPENCODE_PWA_URL = previousPwa
+        if (previousPublic === undefined) delete process.env.OPENCODE_PUBLIC_URL
+        else process.env.OPENCODE_PUBLIC_URL = previousPublic
+        await withTimeout(stopGateListener(listener), 15_000, "ingress listener stop")
+      }
+    },
+  )
+
+  test.skipIf(!PAIRING_PRESENT)(
     "negative: expired pair code is rejected",
     async () => {
       const root = await gateEnv()

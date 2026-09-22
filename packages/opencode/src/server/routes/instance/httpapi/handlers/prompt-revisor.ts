@@ -6,6 +6,7 @@ import { PromptRevisor } from "@opencode-ai/core/prompt-revisor"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { MCP } from "@/mcp"
+import { Agent } from "@/agent/agent"
 import { makeRuntime } from "@/prompt-revisor/runtime"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -18,7 +19,8 @@ export const promptRevisorHandlers = HttpApiBuilder.group(InstanceHttpApi, "prom
     const provider = yield* Provider.Service
     const llm = yield* LLM.Service
     const mcp = yield* MCP.Service
-    const runtime = makeRuntime(provider, llm, mcp)
+    const agents = yield* Agent.Service
+    const runtime = makeRuntime(provider, llm, agents, mcp)
 
     const revise = Effect.fn("PromptRevisorHttpApi.revise")(function* (ctx) {
       if (!ctx.payload.prompt.trim()) {

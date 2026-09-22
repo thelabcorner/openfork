@@ -29,6 +29,7 @@ import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
+import { resolveRoutedAccount } from "@/provider/routing-metadata"
 import { stableZenIdentity } from "@/plugin/zen-accounts"
 import { SpadSupervisor } from "./spad/supervisor"
 import type { SpadAction } from "./spad/types"
@@ -117,6 +118,8 @@ interface ProcessorContext extends Input {
   pendingTextDelta: PendingDelta | undefined
   /** Buffered deltas keyed by provider reasoning id. */
   pendingReasoningDelta: Record<string, PendingDelta>
+  /** Distinct physical provider accounts observed across this turn's steps. */
+  routedAccountIDs: Set<string>
 }
 
 type StreamEvent = LLMEvent
@@ -168,6 +171,7 @@ const layer = Layer.effect(
         firstTokenRecorded: false,
         pendingTextDelta: undefined,
         pendingReasoningDelta: {},
+        routedAccountIDs: new Set(),
       }
       let aborted = false
 
@@ -692,6 +696,14 @@ const layer = Layer.effect(
               usage: value.usage ?? new Usage({}),
               metadata: value.providerMetadata,
             })
+            const openforkMetadata = isRecord(value.providerMetadata?.openfork)
+              ? value.providerMetadata.openfork
+              : undefined
+            const routedAccountID =
+              openforkMetadata && typeof openforkMetadata.accountID === "string"
+                ? openforkMetadata.accountID
+                : undefined
+            if (routedAccountID) ctx.routedAccountIDs.add(routedAccountID)
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
@@ -715,30 +727,6 @@ const layer = Layer.effect(
               cost: usage.cost,
             })
             yield* session.updateMessage(ctx.assistantMessage)
-            if (ctx.model.providerID === "opencode" || ctx.model.providerID === "opencode-go") {
-              // Per-key attribution: the model id carries the `@zen-...` account
-              // suffix naming the key that served this message. The fork vault
-              // keeps the credential UUID as its primary key, so resolve the
-              // suffix back to the vault id for the usage join.
-              const accountID =
-                typeof ctx.model.id === "string" ? splitAccountModelID(ctx.model.id).accountID : undefined
-              if (accountID) {
-                // The fork store read must never take down a step-finish: a
-                // missing vault/unknown account simply skips attribution, and
-                // any store fault collapses to a no-op instead of failing the
-                // stream (the pinned account may be an env key the vault does
-                // not know about, or was deleted mid-session).
-                yield* Effect.gen(function* () {
-                  const credentials = yield* forkCredentials.list()
-                  const match = credentials.find((credential) => stableZenIdentity(credential.key) === accountID)
-                  if (match)
-                    yield* forkCredentials.recordUsage({
-                      messageID: ctx.assistantMessage.id,
-                      credentialID: match.id,
-                    })
-                }).pipe(Effect.ignore)
-              }
-            }
             if (ctx.snapshot) {
               // `completedSnapshot` is the exact post-step tree we just
               // captured. Compare the immutable trees directly instead of
@@ -910,11 +898,34 @@ const layer = Layer.effect(
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
+
+        const qualifiedAccountID =
+          typeof ctx.model.id === "string" ? splitAccountModelID(ctx.model.id).accountID : undefined
+        // A message may contain multiple provider steps. Only emit an account
+        // overlay when every observed request agrees; mixed-account turns remain
+        // valid base-model evidence but must not be misattributed.
+        const accountID = resolveRoutedAccount(ctx.routedAccountIDs, qualifiedAccountID)
+
+        if ((ctx.model.providerID === "opencode" || ctx.model.providerID === "opencode-go") && accountID) {
+          // The fork store read is observability-only: a missing vault/unknown
+          // account skips attribution, and storage faults must not fail cleanup.
+          yield* Effect.gen(function* () {
+            const credentials = yield* forkCredentials.list()
+            const match = credentials.find((credential) => stableZenIdentity(credential.key) === accountID)
+            if (match)
+              yield* forkCredentials.recordUsage({
+                messageID: ctx.assistantMessage.id,
+                credentialID: match.id,
+              })
+          }).pipe(Effect.ignore)
+        }
+
         yield* usageRecord.record({
           messageID: ctx.assistantMessage.id,
           sessionID: ctx.sessionID,
           providerID: ctx.model.providerID,
           modelID: ctx.model.id,
+          accountID,
           variant: ctx.assistantMessage.variant,
           agent: ctx.assistantMessage.agent,
           mode: ctx.assistantMessage.mode,

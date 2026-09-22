@@ -229,7 +229,7 @@ const focusedGoal = (options: { maxAttempts?: number; configuredModel?: boolean 
         title: "Audit Goal Mode",
         objective: "Verify the implementation before autonomous continuation.",
         criteria: ["The implementation is present and supported by evidence"],
-        continuationPolicy: { mode: "auto_continue" },
+        continuationPolicy: {},
         auditorPolicy: {
           ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
           ...(options.configuredModel ? { model: auditorRef } : {}),

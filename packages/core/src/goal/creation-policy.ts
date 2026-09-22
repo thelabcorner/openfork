@@ -217,25 +217,6 @@ export function authorizeUpdate(turn: TurnProvenance | undefined): Authorization
   }
 }
 
-export function explicitlyRequestsUnattended(value: string) {
-  const text = normalized(value)
-  if (!text || explicitlyDeclinesUnattended(text)) return false
-  return (
-    /\bunattended\b/i.test(text) ||
-    /\b(?:autonomous|autonomously|hands[- ]?off)\b/i.test(text) ||
-    /\b(?:auto[- ]?continue|continue\s+automatically)\b/i.test(text) ||
-    /\b(?:keep\s+going|continue|run|work)\b[^.!?\n]{0,64}\b(?:until|through\s+to)\b[^.!?\n]{0,40}\b(?:done|finished|complete|completion)\b/i.test(text) ||
-    /\bwithout\s+(?:asking|waiting\s+for|checking\s+with|needing)\s+(?:me|my\s+(?:approval|confirmation|input))\b/i.test(text) ||
-    /\b(?:don['’]?t|do\s+not)\s+(?:stop|pause|wait)\s+(?:to\s+)?(?:ask|check\s+in|confirm)\b/i.test(text)
-  )
-}
-
-function explicitlyDeclinesUnattended(value: string) {
-  const text = normalized(value)
-  return /\b(?:do\s+not|don['’]?t|dont|never|no)\b[^.!?\n]{0,48}\b(?:unattended|autonomous|auto[- ]?continue)\b/i.test(text) ||
-    /\b(?:ask|check\s+with|wait\s+for)\s+me\b[^.!?\n]{0,48}\b(?:before|between|each|every)\b/i.test(text)
-}
-
 export function explicitlyRequestsDraft(value: string) {
   const text = normalized(value)
   return (

@@ -1,6 +1,7 @@
 import { Types } from "effect"
 import { Model } from "@opencode-ai/schema/model"
 import { ProviderV2 } from "./provider"
+import { splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
 
 export const ID = Model.ID
 export type ID = typeof ID.Type
@@ -34,11 +35,14 @@ export type MutableInfo = Omit<Types.DeepMutable<Info>, "api"> & {
   api: ProviderV2.MutableApi<Api>
 }
 
-export function parse(input: string): { providerID: ProviderV2.ID; modelID: ID } {
+export function parse(input: string): { providerID: ProviderV2.ID; modelID: ID; accountID?: string } {
   const [providerID, ...modelID] = input.split("/")
+  const provider = ProviderV2.ID.make(providerID)
+  const split = splitModelIDForProvider(modelID.join("/"), provider)
   return {
-    providerID: ProviderV2.ID.make(providerID),
-    modelID: ID.make(modelID.join("/")),
+    providerID: provider,
+    modelID: ID.make(split.baseModelID),
+    ...(split.accountID ? { accountID: split.accountID } : {}),
   }
 }
 

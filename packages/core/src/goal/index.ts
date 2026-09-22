@@ -346,7 +346,7 @@ const layer = Layer.effect(
       if (!criteria.ok) return yield* new GoalSchema.ValidationError({ reason: criteria.reason })
       const steps = normalizeSteps(input.steps ?? [])
       if (!steps.ok) return yield* new GoalSchema.ValidationError({ reason: steps.reason })
-      const policy = input.continuationPolicy ?? { mode: "manual" as const }
+      const policy = input.continuationPolicy ?? {}
       const auditorPolicy = normalizeAuditorPolicy(input.auditorPolicy ?? {})
       if (!auditorPolicy.ok) return yield* new GoalSchema.ValidationError({ reason: auditorPolicy.reason })
       const id = GoalModel.ID.create()
@@ -549,7 +549,7 @@ const layer = Layer.effect(
                 constraints: constraints.value,
                 status,
                 revision,
-                continuation_policy: input.continuationPolicy ?? { mode: "manual" as const },
+                continuation_policy: input.continuationPolicy ?? {},
                 auditor_policy: auditorPolicy.value,
                 time_created: now,
                 time_updated: now,
@@ -2139,7 +2139,18 @@ function hydrateInfo(row: typeof GoalTable.$inferSelect): Info {
     status: row.status,
     revision: row.revision,
     auditorRuns: row.auditor_runs,
-    continuationPolicy: row.continuation_policy,
+    continuationPolicy: {
+      ...(row.continuation_policy.maxConsecutiveTurns === undefined
+        ? {}
+        : { maxConsecutiveTurns: row.continuation_policy.maxConsecutiveTurns }),
+      ...(row.continuation_policy.maxNoProgressTurns === undefined
+        ? {}
+        : { maxNoProgressTurns: row.continuation_policy.maxNoProgressTurns }),
+      ...(row.continuation_policy.maxDurationMs === undefined
+        ? {}
+        : { maxDurationMs: row.continuation_policy.maxDurationMs }),
+      ...(row.continuation_policy.tokenBudget === undefined ? {} : { tokenBudget: row.continuation_policy.tokenBudget }),
+    },
     auditorPolicy: row.auditor_policy,
     blocker: row.blocker ?? undefined,
     time: {

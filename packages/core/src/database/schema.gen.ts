@@ -298,7 +298,7 @@ export default {
           \`status\` text DEFAULT 'draft' NOT NULL,
           \`revision\` integer DEFAULT 0 NOT NULL,
           \`auditor_runs\` integer DEFAULT 0 NOT NULL,
-          \`continuation_policy\` text DEFAULT '{"mode":"manual"}' NOT NULL,
+          \`continuation_policy\` text DEFAULT '{}' NOT NULL,
           \`auditor_policy\` text DEFAULT '{}' NOT NULL,
           \`blocker\` text,
           \`time_created\` integer NOT NULL,
@@ -471,6 +471,14 @@ export default {
           \`last_seen_at\` integer NOT NULL,
           CONSTRAINT \`oxp_correlation_ref_pk\` PRIMARY KEY(\`scheme\`, \`digest\`),
           CONSTRAINT \`fk_oxp_correlation_ref_activity_id_oxp_parent_activity_id_fk\` FOREIGN KEY (\`activity_id\`) REFERENCES \`oxp_parent_activity\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`oxp_invocation_detail\` (
+          \`invocation_id\` text PRIMARY KEY,
+          \`request\` text,
+          \`outcome\` text,
+          CONSTRAINT \`fk_oxp_invocation_detail_invocation_id_oxp_invocation_id_fk\` FOREIGN KEY (\`invocation_id\`) REFERENCES \`oxp_invocation\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`
@@ -1171,6 +1179,8 @@ export default {
           \`session_id\` text NOT NULL,
           \`provider_id\` text NOT NULL,
           \`model_id\` text NOT NULL,
+          \`base_model_id\` text,
+          \`account_id\` text,
           \`variant\` text,
           \`agent\` text,
           \`mode\` text,
@@ -1185,6 +1195,24 @@ export default {
           \`cache_write_tokens\` integer DEFAULT 0 NOT NULL,
           \`output_tokens\` integer DEFAULT 0 NOT NULL,
           \`reasoning_tokens\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`usage_yield_meta\` (
+          \`id\` text PRIMARY KEY,
+          \`version\` integer NOT NULL,
+          \`rebuilt_at\` integer NOT NULL,
+          \`source_rows\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`usage_yield_stat\` (
+          \`stat_key\` text PRIMARY KEY,
+          \`provider_id\` text NOT NULL,
+          \`base_model_id\` text NOT NULL,
+          \`account_id\` text,
+          \`state\` text NOT NULL,
+          \`updated_at\` integer NOT NULL
         );
       `)
       yield* tx.run(
@@ -1495,6 +1523,18 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`usage_record_model_completed_idx\` ON \`usage_record\` (\`provider_id\`,\`model_id\`,\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_record_base_model_completed_idx\` ON \`usage_record\` (\`provider_id\`,\`base_model_id\`,\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_record_account_model_completed_idx\` ON \`usage_record\` (\`provider_id\`,\`base_model_id\`,\`account_id\`,\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_yield_stat_model_idx\` ON \`usage_yield_stat\` (\`provider_id\`,\`base_model_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_yield_stat_account_idx\` ON \`usage_yield_stat\` (\`provider_id\`,\`base_model_id\`,\`account_id\`);`,
       )
     })
   },

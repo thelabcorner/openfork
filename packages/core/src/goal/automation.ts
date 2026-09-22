@@ -336,14 +336,7 @@ const layer = Layer.effect(
       if (!focused) return false
       const goal = focused.detail.goal
       if (goal.status !== "active" && goal.status !== "verifying") return false
-      const row = yield* db
-        .select({ goalID: GoalAutomationTable.goal_id, requestedAt: GoalAutomationTable.audit_requested_at })
-        .from(GoalAutomationTable)
-        .where(eq(GoalAutomationTable.session_id, sessionID))
-        .get()
-        .pipe(Effect.orDie)
-      if (row?.goalID === goal.id && row.requestedAt !== null) return true
-      return goal.continuationPolicy.mode !== "manual"
+      return true
     })
 
     const beginAudit = Effect.fn("GoalAutomation.beginAudit")(function* (input: {
@@ -368,13 +361,6 @@ const layer = Layer.effect(
         yield* db.delete(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, input.sessionID)).run().pipe(Effect.orDie)
         yield* publishRuntime(input.sessionID, existing.goal_id)
       }
-      if (
-        goal.continuationPolicy.mode === "manual" &&
-        (existing?.audit_requested_at === null || existing?.audit_requested_at === undefined)
-      ) {
-        return undefined
-      }
-
       const now = Date.now()
       const leaseWhere = input.reservationID
         ? and(
@@ -383,18 +369,11 @@ const layer = Layer.effect(
             eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
             isNull(GoalAutomationTable.auditing_at),
           )
-        : goal.continuationPolicy.mode === "manual"
-          ? and(
-              eq(GoalAutomationTable.goal_id, goal.id),
-              isNull(GoalAutomationTable.auditing_at),
-              isNull(GoalAutomationTable.reservation_id),
-              isNotNull(GoalAutomationTable.audit_requested_at),
-            )
-          : and(
-              eq(GoalAutomationTable.goal_id, goal.id),
-              isNull(GoalAutomationTable.auditing_at),
-              isNull(GoalAutomationTable.reservation_id),
-            )
+        : and(
+            eq(GoalAutomationTable.goal_id, goal.id),
+            isNull(GoalAutomationTable.auditing_at),
+            isNull(GoalAutomationTable.reservation_id),
+          )
 
       const row = yield* db
         .insert(GoalAutomationTable)
@@ -531,7 +510,6 @@ const layer = Layer.effect(
           directory: SessionTable.directory,
           workspaceID: SessionTable.workspace_id,
           status: GoalTable.status,
-          continuationPolicy: GoalTable.continuation_policy,
           runtimeSessionID: GoalAutomationTable.session_id,
           auditRequestedAt: GoalAutomationTable.audit_requested_at,
           runtimeError: GoalAutomationTable.runtime_error,
@@ -548,8 +526,7 @@ const layer = Layer.effect(
         .filter(
           (row) =>
             row.runtimeError === null &&
-            (row.auditRequestedAt !== null ||
-              (row.status === "verifying" && row.continuationPolicy.mode !== "manual" && row.runtimeSessionID === null)),
+            (row.auditRequestedAt !== null || (row.status === "verifying" && row.runtimeSessionID === null)),
         )
         .map((row) => ({
           sessionID: SessionSchema.ID.make(row.sessionID),
@@ -573,7 +550,6 @@ const layer = Layer.effect(
       if (
         !focused ||
         focused.detail.goal.id !== row.goal_id ||
-        focused.detail.goal.continuationPolicy.mode === "manual" ||
         (focused.detail.goal.status !== "active" && focused.detail.goal.status !== "verifying")
       ) {
         yield* cancel(sessionID)
@@ -715,7 +691,7 @@ const layer = Layer.effect(
         const state = stateFor()
         yield* failAudit({ sessionID: input.sessionID, error: audit.error })
         // Auditor/provider infrastructure failure is not a domain blocker. Stop
-        // unattended execution safely, but leave the Goal lifecycle untouched
+        // Goal Mode execution safely, but leave the Goal lifecycle untouched
         // so a transient catalog/auth outage cannot manufacture `blocked` state.
         return stop(`auditor_error:${audit.error}`, state, detail)
       }
@@ -764,32 +740,12 @@ const layer = Layer.effect(
         return stop("superseded_by_user", state, detail)
       }
 
-      // Manual continuation mode still permits an explicit user-requested
-      // independent audit. It suppresses autonomous worker re-entry after that
-      // verdict, but the auditor does not own Goal lifecycle state. In
-      // particular, an auditor `blocked` diagnosis must not silently turn a
-      // manual Goal into durable `blocked`; the user/worker remains free to act
-      // on the finding or explicitly record a real blocker.
-      if (policy.mode === "manual") {
-        yield* cancel(input.sessionID)
-        return stop(`manual_after_audit:${audit.verdict.decision}`, state, detail)
-      }
-
       const blockedThreshold =
         detail.goal.auditorPolicy.blockedThreshold === undefined
           ? undefined
           : clamp(detail.goal.auditorPolicy.blockedThreshold, 1, 16)
       if (audit.verdict.decision === "blocked") {
-        if (blockedThreshold === undefined) {
-          // A blocked auditor verdict is evidence about the worker's current
-          // environment, not implicit authorization to mutate durable Goal
-          // lifecycle state. Without an explicit hysteresis policy, stop
-          // autonomous re-entry and leave the Goal active for the next genuine
-          // user turn or explicit lifecycle action.
-          yield* cancel(input.sessionID)
-          return stop("auditor_blocked", state, detail)
-        }
-        if (state.auditorBlockedStreak >= blockedThreshold) {
+        if (blockedThreshold !== undefined && state.auditorBlockedStreak >= blockedThreshold) {
           yield* cancel(input.sessionID)
           yield* goals
             .transition({
@@ -898,7 +854,7 @@ const layer = Layer.effect(
       if (automation) yield* publishRuntime(input.sessionID, detail.goal.id, automation)
       return {
         continue: true,
-        reason: policy.mode,
+        reason: "goal_mode",
         state,
         goal: detail,
         reservation: {

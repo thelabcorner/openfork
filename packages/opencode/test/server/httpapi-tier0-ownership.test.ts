@@ -21,9 +21,11 @@ import { Swarm } from "@opencode-ai/schema/swarm"
 import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { ForkCredentials } from "../../src/fork/credentials"
+import { Capacity } from "../../src/capacity/capacity"
 import { OfxpRuntime } from "../../src/ofxp/runtime"
 import { OfxpRoot } from "../../src/ofxp/root"
 import { Usage } from "../../src/usage/usage"
+import { Quota } from "../../src/quota/quota"
 import { Session } from "../../src/session/session"
 import { ServerAuth } from "../../src/server/auth"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
@@ -39,6 +41,7 @@ import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
@@ -106,6 +109,7 @@ const apiLayer = HttpRouter.serve(
       globalHandlers,
       ofxpHandlers,
       providerSettingsHandlers,
+      quotaHandlers,
       revisionDraftHandlers,
       scheduledTaskHandlers,
       swarmHandlers,
@@ -121,6 +125,7 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(
     Layer.mock(Auth.Service)({
       all: () => Effect.succeed({}),
+      get: () => Effect.succeed(undefined),
     }),
   ),
   Layer.provide(
@@ -128,8 +133,37 @@ const apiLayer = HttpRouter.serve(
       getGlobal: () => Effect.succeed({}),
     }),
   ),
-  Layer.provide(Layer.mock(ForkCredentials.Service)({})),
-  Layer.provide(Layer.mock(SessionUsage.Service)({})),
+  Layer.provide(
+    Layer.mock(ForkCredentials.Service)({
+      list: () => Effect.succeed([]),
+      usageByCredential: () => Effect.succeed({ byCredential: new Map(), unattributed: [] }),
+    }),
+  ),
+  Layer.provide(
+    Layer.mock(SessionUsage.Service)({
+      windows: () => Effect.succeed([]),
+    }),
+  ),
+  Layer.provide(
+    Layer.mock(Quota.Service)({
+      providers: () => Effect.succeed({ providers: [] }),
+      get: () => Effect.die("unused quota get"),
+      resets: ({ from, to }) =>
+        Effect.succeed({ from, to, generatedAt: from, occurrences: [], failures: [] }),
+    }),
+  ),
+  Layer.provide(
+    Layer.mock(Capacity.Service)({
+      go: () =>
+        Effect.succeed({
+          providerID: "opencode-go",
+          priorStatus: "ok",
+          priorFetchedAt: 0,
+          routed: [],
+          accounts: [],
+        }),
+    }),
+  ),
   Layer.provide(Layer.mock(MoveSession.Service)({})),
   Layer.provide(
     Layer.mock(ModelsDev.Service)({
@@ -381,6 +415,36 @@ describe("Tier-0 root ownership", () => {
       const response = yield* HttpClientRequest.get("/usage/model-profile").pipe(HttpClient.execute)
       expect(response.status).toBe(200)
       expect(yield* response.json).toEqual({ models: [] })
+    }),
+  )
+
+  it.live("serves the quota reset agenda from the root Tier-0 graph without a workspace runtime", () =>
+    Effect.gen(function* () {
+      const from = 1_700_000_000_000
+      const to = from + 24 * 60 * 60 * 1000
+      const response = yield* HttpClientRequest.get(`/quota/resets?from=${from}&to=${to}`).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        from,
+        to,
+        generatedAt: from,
+        occurrences: [],
+        failures: [],
+      })
+    }),
+  )
+
+  it.live("serves Go capacity without a workspace runtime", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get("/fork/capacity").pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        providerID: "opencode-go",
+        priorStatus: "ok",
+        priorFetchedAt: 0,
+        routed: [],
+        accounts: [],
+      })
     }),
   )
 
@@ -726,6 +790,17 @@ describe("Tier-0 root ownership", () => {
       ).pipe(HttpClient.execute)
       expect(history.status).toBe(200)
       expect(yield* history.json).toEqual({ items: [], more: false })
+
+      const invocationDetail = yield* HttpClientRequest.get(
+        GlobalPaths.oxpInvocationDetail.replace(
+          ":invocationID",
+          "oxpi_missing",
+        ),
+      ).pipe(HttpClient.execute)
+      const invocationDetailBody = yield* invocationDetail.text
+      console.info("OXP invocation detail response", invocationDetail.status, invocationDetailBody)
+      expect(invocationDetail.status).toBe(200)
+      expect(invocationDetailBody).toBe("null")
 
       const provenance = yield* HttpClientRequest.get(
         GlobalPaths.oxpResource + "?kind=session&ref=ses_missing",

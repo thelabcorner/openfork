@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Slug } from "@opencode-ai/core/util/slug"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -443,6 +444,14 @@ export class ManagedRootConflictError extends Schema.TaggedErrorClass<ManagedRoo
   },
 ) {}
 
+export class DelegatedWorkerSelectionConflictError extends Schema.TaggedErrorClass<DelegatedWorkerSelectionConflictError>()(
+  "Session.DelegatedWorkerSelectionConflictError",
+  {
+    sessionID: SessionID,
+    reason: Schema.String,
+  },
+) {}
+
 export type NotFound = NotFoundError
 
 export interface Interface {
@@ -484,6 +493,18 @@ export interface Interface {
     model: NonNullable<Info["model"]>
     time: number
   }) => Effect.Effect<void>
+  /**
+   * Trusted delegated-worker selection mutation. Updates the Session's current
+   * model and protected workerDelegation model in one Session Updated event so
+   * future turns cannot observe a split-brain selection.
+   */
+  readonly setDelegatedWorkerModel: (input: {
+    sessionID: SessionID
+    principalRef: string
+    expectedModel: SessionMetadataOwnership.WorkerDelegationModel
+    model: NonNullable<Info["model"]>
+    time: number
+  }) => Effect.Effect<void, DelegatedWorkerSelectionConflictError>
   readonly setPermission: (input: { sessionID: SessionID; permission: PermissionV1.Ruleset }) => Effect.Effect<void>
   readonly setRevert: (input: {
     sessionID: SessionID
@@ -556,6 +577,7 @@ const layer: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const scope = yield* Scope.Scope
+    const delegatedWorkerSelectionMutex = yield* KeyedMutex.make<SessionID>()
 
     const groupSession = (session: Info) =>
       Effect.gen(function* () {
@@ -1278,6 +1300,72 @@ const layer: Layer.Layer<
       }).pipe(Effect.orDie)
     })
 
+    const setDelegatedWorkerModel = Effect.fn("Session.setDelegatedWorkerModel")(function* (input: {
+      sessionID: SessionID
+      principalRef: string
+      expectedModel: SessionMetadataOwnership.WorkerDelegationModel
+      model: NonNullable<Info["model"]>
+      time: number
+    }) {
+      return yield* delegatedWorkerSelectionMutex.withLock(input.sessionID)(
+        Effect.gen(function* () {
+          const current = yield* getForMutation(input.sessionID).pipe(Effect.orDie)
+          const origin = SessionMetadataOwnership.workerDelegation(current.metadata)
+          const sameModel = (
+            left: SessionMetadataOwnership.WorkerDelegationModel,
+            right: SessionMetadataOwnership.WorkerDelegationModel,
+          ) =>
+            left.providerID === right.providerID &&
+            left.modelID === right.modelID &&
+            left.accountID === right.accountID &&
+            (left.variant && left.variant !== "default" ? left.variant : undefined) ===
+              (right.variant && right.variant !== "default" ? right.variant : undefined)
+
+          if (!origin || origin.principalRef !== input.principalRef) {
+            return yield* new DelegatedWorkerSelectionConflictError({
+              sessionID: input.sessionID,
+              reason: "Delegated worker ownership changed before selection commit",
+            })
+          }
+          if (!sameModel(origin.model, input.expectedModel)) {
+            return yield* new DelegatedWorkerSelectionConflictError({
+              sessionID: input.sessionID,
+              reason: "Delegated worker model selection changed before selection commit",
+            })
+          }
+
+          const metadata = SessionMetadataOwnership.rebindDelegatedWorkerModel(
+            current.metadata,
+            {
+              providerID: input.model.providerID,
+              modelID: input.model.id,
+              ...(input.model.accountID ? { accountID: input.model.accountID } : {}),
+              ...(input.model.variant && input.model.variant !== "default"
+                ? { variant: input.model.variant }
+                : {}),
+            },
+          )
+          if (!metadata) {
+            return yield* new DelegatedWorkerSelectionConflictError({
+              sessionID: input.sessionID,
+              reason: "Delegated worker protected origin is malformed",
+            })
+          }
+
+          const next = {
+            ...current,
+            model: input.model,
+            metadata,
+            time: { ...current.time, updated: input.time },
+          } as Info
+          yield* events.publish(SessionV1.Event.Updated, {
+            sessionID: input.sessionID,
+            info: next,
+          })
+        }),
+      )
+    })
+
     const setPermission = Effect.fn("Session.setPermission")(function* (input: {
       sessionID: SessionID
       permission: PermissionV1.Ruleset
@@ -1419,6 +1507,7 @@ const layer: Layer.Layer<
       setArchived,
       setMetadata,
       setAgentModel,
+      setDelegatedWorkerModel,
       setPermission,
       setRevert,
       clearRevert,

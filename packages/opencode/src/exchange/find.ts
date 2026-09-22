@@ -14,6 +14,8 @@ export interface Input {
   readonly glob?: string
   readonly grep?: string
   readonly include?: string
+  /** Literal by default; regex is an explicit opt-in for model-facing search. */
+  readonly syntax?: "literal" | "regex"
   readonly signal?: AbortSignal
   readonly projectionMarker?: string
   readonly toDisplayPath: (canonicalPath: string) => string
@@ -73,6 +75,7 @@ export function execute<E>(
         path: input.path,
         pattern: input.grep!,
         include: input.include,
+        literal: input.syntax !== "regex",
         signal: abort,
       }).pipe(Effect.mapError(mapSearchError))
     }
@@ -123,6 +126,7 @@ export function execute<E>(
       output: projected.content,
       metadata: {
         action: selected,
+        ...(selected === "grep" ? { syntax: input.syntax ?? "literal" } : {}),
         root: input.rootLabel,
         count,
         producerTruncated: result.truncated,

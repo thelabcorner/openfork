@@ -598,7 +598,6 @@ describe("SessionRunnerLLM", () => {
           objective: "Keep working without another user prompt",
           criteria: ["Complete the autonomous work"],
           continuationPolicy: {
-            mode: "auto_continue",
             maxNoProgressTurns: 2,
             maxConsecutiveTurns: 8,
           },
@@ -745,7 +744,7 @@ describe("SessionRunnerLLM", () => {
           title: "User prompt reactivation",
           objective: "Resume blocked work when the user speaks again",
           criteria: ["Goal is active after admission"],
-          continuationPolicy: { mode: "auto_continue" },
+          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -829,7 +828,7 @@ describe("SessionRunnerLLM", () => {
           title: "Automatic pre-spend revalidation",
           objective: "Prove a newer User owns the provider boundary",
           criteria: ["Do not spend stale automatic work"],
-          continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 8 },
+          continuationPolicy: { maxConsecutiveTurns: 8 },
         })
         .pipe(Effect.orDie)
       const active = yield* goals

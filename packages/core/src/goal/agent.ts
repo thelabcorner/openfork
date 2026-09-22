@@ -50,7 +50,6 @@ export const Input = Schema.Struct({
   criteria: Schema.optionalKey(Schema.Array(Schema.String)),
   steps: Schema.optionalKey(Schema.Array(Step)),
   start: Schema.optionalKey(Schema.Boolean),
-  continuationMode: Schema.optionalKey(Schema.Literals(["manual", "auto_continue", "unattended"])),
 })
 export type Input = typeof Input.Type
 
@@ -107,15 +106,6 @@ const layer = Layer.effect(
         if (criteria.length === 0) {
           return yield* new GoalSchema.ValidationError({ reason: "create requires at least one acceptance criterion" })
         }
-        const unattendedAuthorized =
-          GoalCreationPolicy.explicitlyRequestsUnattended(turn!.userText) ||
-          GoalCreationPolicy.explicitlyRequestsUnattended(authorizingTurn.userText)
-        if (input.continuationMode === "unattended" && !unattendedAuthorized) {
-          return yield* new GoalSchema.ValidationError({
-            reason: "unattended Goal creation requires the user to explicitly request unattended Goal mode",
-          })
-        }
-
         const existing = yield* goals.focused(sessionID)
         const shouldStart =
           GoalCreationPolicy.explicitlyRequestsDraft(turn!.userText) ||
@@ -159,7 +149,7 @@ const layer = Layer.effect(
           constraints: input.constraints,
           criteria,
           steps: input.steps,
-          continuationPolicy: { mode: input.continuationMode ?? "auto_continue" },
+          continuationPolicy: {},
           sourceMessageID: authorizingTurn.userMessageID,
           actor: "agent",
         })
@@ -184,9 +174,9 @@ const layer = Layer.effect(
       if (input.action === "update") {
         const authorization = GoalCreationPolicy.authorizeUpdate(turn)
         if (!authorization.allowed) return yield* new GoalSchema.ValidationError({ reason: authorization.reason })
-        if (input.start !== undefined || input.continuationMode !== undefined) {
+        if (input.start !== undefined) {
           return yield* new GoalSchema.ValidationError({
-            reason: "Goal update does not change start state or automation policy; use only user-directed specification fields",
+            reason: "Goal update does not change start state; use only user-directed specification fields",
           })
         }
         if (

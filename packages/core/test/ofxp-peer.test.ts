@@ -223,7 +223,7 @@ describe("OFXP peer trust domain", () => {
         canonicalPath: directory,
         now: 400,
       })
-      expect(root.alias).toBe("alphagym")
+      expect(String(root.alias)).toBe("alphagym")
       expect(Object.hasOwn(root, "canonicalPath")).toBe(false)
       expect(yield* peers.roots(generated.key.peerID)).toEqual([root])
     }),
@@ -533,7 +533,7 @@ describe("OFXP peer trust domain", () => {
         canonicalPath: directory,
         now: 140,
       })
-      expect(root.alias).toBe("repo")
+      expect(String(root.alias)).toBe("repo")
       expect(yield* peers.roots(generated.key.peerID)).toEqual([root])
     }),
   )

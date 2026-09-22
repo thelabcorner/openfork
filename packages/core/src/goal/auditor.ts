@@ -388,7 +388,7 @@ const safetyUsageEstimate = (
   // Goal token budgets are safety ceilings, not billing estimates. Terminal
   // cancellation can intentionally prevent the provider's final usage packet
   // from arriving, so bias the fallback upward instead of undercounting an
-  // unattended audit cycle.
+  // Goal Mode audit cycle.
   const inputTokens = Math.max(1, Math.ceil(input * 1.5))
   const outputTokens = Math.max(1, Math.ceil(output * 1.5))
   return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }

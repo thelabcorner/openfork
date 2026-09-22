@@ -95,6 +95,14 @@ const setup = Effect.gen(function* () {
     `INSERT INTO maintenance_usage (agent, provider_id, model_id, time_started, time_completed) VALUES ('title', 'provider', 'model', 1, 1)`,
   )
   yield* db.run(
+    `INSERT INTO usage_yield_stat (stat_key, provider_id, base_model_id, account_id, state, updated_at)
+     VALUES ('yield_reset', 'opencode-go', 'model', NULL, '{}', 1)`,
+  )
+  yield* db.run(
+    `INSERT INTO usage_yield_meta (id, version, rebuilt_at, source_rows)
+     VALUES ('global', 2, 1, 1)`,
+  )
+  yield* db.run(
     `INSERT INTO fork_message_credential (message_id, credential_id, time_created) VALUES ('message_reset', 'fork_keep', 1)`,
   )
   yield* db.run(

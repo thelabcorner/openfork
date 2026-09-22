@@ -57,19 +57,16 @@ export type StepStatus = typeof StepStatus.Type
 export const FocusRole = Schema.Literals(["owner", "worker", "verifier"]).annotate({ identifier: "Goal.FocusRole" })
 export type FocusRole = typeof FocusRole.Type
 
-export const AutomationMode = Schema.Literals(["manual", "auto_continue", "unattended"]).annotate({
-  identifier: "Goal.AutomationMode",
-})
-export type AutomationMode = typeof AutomationMode.Type
-
 /**
- * User/producer-owned continuation policy. Optional bounds are opt-in: omitted
- * values mean no host-invented turn, no-progress, duration, or token ceiling.
- * The JSON shape keeps policy extensible without a database migration per knob.
+ * Optional execution bounds for Goal Mode. Goal Mode itself has one behavior:
+ * every settled worker cycle is independently audited and, unless the Goal is
+ * complete or explicitly stopped/blocked, another worker cycle is authorized.
+ *
+ * Bounds are opt-in producer policy. Omitted values mean no host-invented turn,
+ * no-progress, duration, or token ceiling.
  */
 export interface ContinuationPolicy extends Schema.Schema.Type<typeof ContinuationPolicy> {}
 export const ContinuationPolicy = Schema.Struct({
-  mode: AutomationMode,
   maxConsecutiveTurns: optional(Schema.Number),
   maxNoProgressTurns: optional(Schema.Number),
   maxDurationMs: optional(Schema.Number),

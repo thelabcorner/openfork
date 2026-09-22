@@ -4,6 +4,7 @@ import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provena
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -18,7 +19,8 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool } from "../../src/tool/task"
-import type { SessionPromptOps } from "../../src/session/prompt-contract"
+import { DelegatedWorkerPolicy } from "../../src/session/delegated-worker-policy"
+import type { HostPromptProvenance, SessionPromptOps } from "../../src/session/prompt-contract"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -160,7 +162,7 @@ const seedDelegated = Effect.fn("TaskToolTest.seedDelegated")(function* (input: 
 })
 
 function stubOps(opts?: {
-  onPrompt?: (input: SessionPrompt.PromptInput) => void
+  onPrompt?: (input: SessionPrompt.PromptInput, provenance?: HostPromptProvenance) => void
   text?: string
   error?: NonNullable<SessionV1.Assistant["error"]>
   toolError?: string
@@ -168,9 +170,9 @@ function stubOps(opts?: {
   return {
     cancel: () => Effect.void,
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-    prompt: (input) =>
+    prompt: (input, provenance) =>
       Effect.sync(() => {
-        opts?.onPrompt?.(input)
+        opts?.onPrompt?.(input, provenance)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
   }
@@ -357,6 +359,124 @@ describe("tool.task", () => {
           variant: "high",
           source: "inherited_user_policy",
         },
+      })
+    }),
+  )
+
+  it.instance("keeps OXP nested-task principal authorization separate from per-turn invocation correlation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const delegatedModel = {
+        providerID: "user-provider",
+        modelID: "user-model",
+        accountID: "user-account",
+        variant: "high",
+      } as const
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:connector-nested-test",
+        invocationRef: "oxp-inv:nested-root",
+        rootRef: "root-nested-test",
+        agent: "build",
+        model: delegatedModel,
+        nestedDelegation: true,
+      } as const
+      const chat = yield* sessions.create({
+        title: "Protected OXP delegated worker",
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make(delegatedModel.providerID),
+          id: ModelV2.ID.make(delegatedModel.modelID),
+          accountID: delegatedModel.accountID,
+          variant: delegatedModel.variant,
+        },
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+      const root = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        provenance: SessionTurnProvenance.host(
+          SessionTurnProvenance.Source.OxpDelegation,
+          { ref: origin.invocationRef },
+        ),
+        sessionID: chat.id,
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make(delegatedModel.providerID),
+          modelID: ModelV2.ID.make(delegatedModel.modelID),
+          accountID: delegatedModel.accountID,
+        },
+        variant: delegatedModel.variant,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: root.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "delegate nested work",
+        metadata: DelegatedWorkerPolicy.turnMetadata({ nestedDelegation: true }),
+      })
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: root.id,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make(delegatedModel.modelID),
+        providerID: ProviderV2.ID.make(delegatedModel.providerID),
+        variant: delegatedModel.variant,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(assistant)
+
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seenProvenance: HostPromptProvenance | undefined
+      const result = yield* def.execute(
+        {
+          description: "protected nested worker",
+          prompt: "perform nested delegated work",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: stubOps({
+              onPrompt: (_input, provenance) => {
+                seenProvenance = provenance
+              },
+            }),
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="completed"')
+      expect(seenProvenance).toEqual({
+        source: SessionTurnProvenance.Source.OxpDelegation,
+        ref: origin.invocationRef,
+        principalRef: origin.principalRef,
+      })
+      const child = (yield* sessions.children(chat.id))[0]
+      expect(SessionMetadataOwnership.workerDelegation(child?.metadata)).toMatchObject({
+        producer: "oxp",
+        principalRef: origin.principalRef,
+        invocationRef: origin.invocationRef,
+        rootRef: origin.rootRef,
+        agent: "general",
+        parentWorkerID: chat.id,
+        model: delegatedModel,
+        nestedDelegation: true,
       })
     }),
   )

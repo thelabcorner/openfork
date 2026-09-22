@@ -44,11 +44,28 @@ export const PromptInput = Schema.Struct({
 export type PromptInput = Schema.Schema.Type<typeof PromptInput>
 
 /** Trusted producer attribution for host-authored conversational turns. */
-export interface HostPromptProvenance {
-  readonly source: SessionTurnProvenance.CanonicalHostSource
-  readonly sourceMessageID?: MessageID
-  readonly ref?: string
-}
+export type HostPromptProvenance =
+  | {
+      readonly source: typeof SessionTurnProvenance.Source.OxpDelegation
+      readonly sourceMessageID?: MessageID
+      /** Durable per-turn correlation persisted in message provenance. */
+      readonly ref: string
+      /**
+       * Trusted producer principal used only for host-admission authorization.
+       * This is intentionally not persisted into message provenance: OXP worker
+       * turns keep ref available for the per-invocation correlation identity.
+       */
+      readonly principalRef: string
+    }
+  | {
+      readonly source: Exclude<
+        SessionTurnProvenance.CanonicalHostSource,
+        typeof SessionTurnProvenance.Source.OxpDelegation
+      >
+      readonly sourceMessageID?: MessageID
+      readonly ref?: string
+      readonly principalRef?: never
+    }
 
 /** Trusted producer attribution for first-party user-owned actions. */
 export interface UserActionPromptProvenance {

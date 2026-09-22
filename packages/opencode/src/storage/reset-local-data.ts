@@ -44,6 +44,8 @@ export const RESET_TABLES_IN_ORDER = [
   "session_message_lifecycle",
   "session_message",
   "session_telemetry",
+  "usage_yield_stat",
+  "usage_yield_meta",
   "usage_record",
   "session",
   "session_group",

@@ -17,6 +17,13 @@ type Drain = (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts>
 type Entry = {
   readonly runner: Runner.Runner<SessionV1.WithParts>
   readonly token: SessionExecutionOwner.Token
+  /**
+   * Set before explicit cancellation begins. This closes the small handoff
+   * window between durable owner acquisition and Runner.ensureRunning() so work
+   * that was already admitted locally cannot start provider execution after the
+   * generation has been cancelled/released.
+   */
+  stopping: boolean
 }
 
 export interface Interface {
@@ -83,8 +90,15 @@ const layer = Layer.effect(
             yield* Effect.forEach(runners.entries(), ([sessionID, entry]) =>
               Effect.gen(function* () {
                 forceRelease.add(sessionID)
+                entry.stopping = true
                 yield* ownership.requestInterrupt(sessionID, "shutdown")
                 yield* entry.runner.cancel
+                // Runner.cancel is normally followed by onIdle, but Runner is
+                // already locally Idle while its onIdle callback is releasing
+                // durable ownership. Exact release is an idempotent CAS and
+                // closes that race (and the pre-start Idle window) during
+                // shutdown as well.
+                yield* ownership.release(entry.token)
               }), {
               concurrency: 8,
               discard: true,
@@ -109,7 +123,7 @@ const layer = Layer.effect(
         Effect.gen(function* () {
           const data = yield* InstanceState.get(state)
           const existing = data.runners.get(sessionID)
-          if (existing) return existing.runner
+          if (existing) return existing
 
           let acquired = yield* ownership.tryAcquire(sessionID)
           if (acquired.state === "busy") {
@@ -124,17 +138,18 @@ const layer = Layer.effect(
           }
           if (acquired.state === "busy") return yield* busyError(sessionID)
           const token = acquired.token
+          let entry!: Entry
           let next!: Runner.Runner<SessionV1.WithParts>
           next = Runner.make<SessionV1.WithParts>(data.scope, {
             onIdle: Effect.gen(function* () {
               const current = data.runners.get(sessionID)
-              if (!current || current.runner !== next || current.token.generation !== token.generation) return
+              if (!current || current !== entry || current.token.generation !== token.generation) return
 
               const aborted = data.cancelled.has(sessionID)
-              const forced = data.forceRelease.has(sessionID)
+              const forced = entry.stopping || data.forceRelease.has(sessionID)
               const released = forced ? yield* ownership.release(token) : yield* ownership.releaseIfDrained(token)
               if (released !== "continue") {
-                if (data.runners.get(sessionID)?.runner === next) data.runners.delete(sessionID)
+                if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
                 data.forceRelease.delete(sessionID)
                 // A stale local token means a newer owner is authoritative. Do
                 // not publish a false idle transition over that newer runtime.
@@ -150,8 +165,22 @@ const layer = Layer.effect(
                   generation: token.generation,
                 })
                 const exact = yield* ownership.release(token)
-                if (data.runners.get(sessionID)?.runner === next) data.runners.delete(sessionID)
+                if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
                 if (exact === "released") yield* status.set(sessionID, { type: "idle" })
+                return
+              }
+
+              // Cancellation can race this exact boundary: releaseIfDrained()
+              // observed pending input and returned "continue" while the Runner
+              // itself is already Idle. Re-check the local generation fence
+              // before starting the next drain so an explicit stop cannot
+              // resurrect work after establishing quiescence.
+              if (entry.stopping || data.forceRelease.has(sessionID)) {
+                const exact = yield* ownership.release(token)
+                if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
+                data.forceRelease.delete(sessionID)
+                if (exact === "released")
+                  yield* status.set(sessionID, { type: "idle" }, data.cancelled.has(sessionID) ? "aborted" : undefined)
                 return
               }
 
@@ -168,7 +197,9 @@ const layer = Layer.effect(
                   ),
                 ),
               )
-              yield* next.ensureRunning(continued).pipe(
+              yield* next.ensureRunning(
+                Effect.suspend(() => (entry.stopping ? onInterrupt : continued)),
+              ).pipe(
                 Effect.forkIn(data.scope, { startImmediately: true }),
                 Effect.asVoid,
               )
@@ -176,8 +207,9 @@ const layer = Layer.effect(
             onBusy: status.set(sessionID, { type: "busy" }),
             onInterrupt,
           })
-          data.runners.set(sessionID, { runner: next, token })
-          return next
+          entry = { runner: next, token, stopping: false }
+          data.runners.set(sessionID, entry)
+          return entry
         }),
       )
     })
@@ -201,10 +233,20 @@ const layer = Layer.effect(
         if (interrupt.state === "idle") yield* status.set(sessionID, { type: "idle" }, "aborted")
         return
       }
+      existing.stopping = true
       data.forceRelease.add(sessionID)
       data.cancelled.add(sessionID)
       try {
         yield* existing.runner.cancel
+        // Runner transitions its local state to Idle before its onIdle effect
+        // finishes. A verification/cancel caller must not return in that window
+        // while the durable SessionExecutionOwner row still says busy. Exact
+        // release is safe to race with onIdle: one side releases this generation
+        // and the other observes "stale".
+        const released = yield* ownership.release(existing.token)
+        if (data.runners.get(sessionID) === existing) data.runners.delete(sessionID)
+        data.forceRelease.delete(sessionID)
+        if (released === "released") yield* status.set(sessionID, { type: "idle" }, "aborted")
       } finally {
         data.cancelled.delete(sessionID)
       }
@@ -220,7 +262,20 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      const entry = yield* runner(sessionID, onInterrupt)
+      if (entry.stopping) return yield* onInterrupt
+      const result = yield* entry.runner.ensureRunning(
+        Effect.suspend(() => (entry.stopping ? onInterrupt : work)),
+      )
+      if (entry.stopping) {
+        // If cancel won the tiny pre-start race, Runner.onBusy may have fired
+        // after the generation was already released. Never leave a false busy
+        // projection behind; only publish idle when durable ownership is truly
+        // absent so a newer owner cannot be overwritten.
+        const snapshot = yield* ownership.snapshot(sessionID)
+        if (!snapshot.ownerID) yield* status.set(sessionID, { type: "idle" }, "aborted")
+      }
+      return result
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -229,9 +284,16 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+      const entry = yield* runner(sessionID, onInterrupt)
+      if (entry.stopping) return yield* onInterrupt
+      const result = yield* entry.runner
+        .startShell(Effect.suspend(() => (entry.stopping ? onInterrupt : work)), ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+      if (entry.stopping) {
+        const snapshot = yield* ownership.snapshot(sessionID)
+        if (!snapshot.ownerID) yield* status.set(sessionID, { type: "idle" }, "aborted")
+      }
+      return result
     })
 
     const registerDrain = Effect.fn("SessionRunState.registerDrain")((next: Drain) =>

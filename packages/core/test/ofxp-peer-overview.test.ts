@@ -101,7 +101,7 @@ describe("OFXP settings projection", () => {
       const alphaView = overview.find((item) => item.record.info.id === alpha.key.peerID)
       expect(alphaView?.record.info.grantRevision).toBe(alphaGrant.info.grantRevision)
       expect(alphaView?.record.grant).toEqual(alphaGrant.grant)
-      expect(alphaView?.roots.map((root) => root.alias)).toEqual(["alpha", "zeta"])
+      expect(alphaView?.roots.map((root) => String(root.alias))).toEqual(["alpha", "zeta"])
       expect(alphaView?.roots.every((root) => root.available)).toBe(true)
       expect(alphaView?.roots.every((root) => !Object.hasOwn(root, "canonicalPath"))).toBe(true)
 

@@ -19,7 +19,11 @@ import { InstanceRef } from "@/effect/instance-ref"
 
 const ZEN_PROVIDERS = new Set(["opencode", "opencode-go"])
 
-export type Error = Provider.ModelNotFoundError | Provider.UnsupportedModelPrimitiveError | LLMError
+export type Error =
+  | Provider.ModelNotFoundError
+  | Provider.AccountResolutionError
+  | Provider.UnsupportedModelPrimitiveError
+  | LLMError
 
 function stringHeaders(value: unknown): Record<string, string> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
@@ -71,7 +75,10 @@ export const layer = Layer.effect(
     const requestExecutor = yield* RequestExecutor.Service
 
     const infer = Effect.fn("SystemOne.infer")(function* (input: Contract.InferInput) {
-      const model = yield* provider.getModel(input.providerID, input.modelID, input.accountID)
+      const accountID = input.accountID
+        ? yield* provider.resolveAccountID(input.providerID, input.accountID)
+        : undefined
+      const model = yield* provider.getModel(input.providerID, input.modelID, accountID)
       const primitive = Provider.modelPrimitive(model)
       if (primitive !== "system-one") {
         return yield* new Provider.UnsupportedModelPrimitiveError({

@@ -257,6 +257,12 @@ const OxpInvocationPage = Schema.Struct({
   ),
 }).annotate({ identifier: "OxpInvocationPage" })
 
+const OxpInvocationDetailInfo = Schema.Struct({
+  invocationID: OxpActivitySchema.InvocationID,
+  request: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  outcome: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+}).annotate({ identifier: "OxpInvocationDetailInfo" })
+
 export const GlobalOxpActivityPatch = Schema.Struct({
   title: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
   clearTitle: Schema.optional(Schema.Boolean),
@@ -336,6 +342,7 @@ export const GlobalPaths = {
   oxpActivities: "/global/oxp/activity",
   oxpActivity: "/global/oxp/activity/:activityID",
   oxpInvocations: "/global/oxp/activity/:activityID/invocations",
+  oxpInvocationDetail: "/global/oxp/invocation/:invocationID/detail",
   oxpResource: "/global/oxp/resource",
   projects: "/global/project",
   config: "/global/config",
@@ -455,6 +462,20 @@ export const GlobalApi = HttpApi.make("global").add(
           summary: "Read OXP invocation history",
           description:
             "Read one parent activity's bounded invocation spans and causal links without hydrating Sessions, messages, providers, plugins, or workspace runtime state.",
+        }),
+      ),
+      HttpApiEndpoint.get("oxpInvocationDetail", GlobalPaths.oxpInvocationDetail, {
+        params: { invocationID: OxpActivitySchema.InvocationID },
+        success: described(
+          Schema.NullOr(OxpInvocationDetailInfo),
+          "Lazy OXP invocation request/outcome detail",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpInvocationDetail",
+          summary: "Read one OXP invocation detail payload",
+          description:
+            "Read the bounded, redacted request and outcome payload for one invocation. Detail is intentionally separate from invocation-list rows so activity timelines stay compact until a user expands a tool call.",
         }),
       ),
       HttpApiEndpoint.get("oxpResource", GlobalPaths.oxpResource, {

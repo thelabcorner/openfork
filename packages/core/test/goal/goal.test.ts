@@ -153,7 +153,7 @@ describe("Goal", () => {
       expect(result.goal.goal.projectID).toBe(projectA)
       expect(result.goal.goal.workspaceID).toBe(workspaceA)
       expect(result.goal.goal.status).toBe("active")
-      expect(result.goal.goal.continuationPolicy.mode).toBe("auto_continue")
+      expect(result.goal.goal.continuationPolicy).toEqual({})
       expect(result.goal.criteria).toHaveLength(2)
       expect((yield* goals.focused(sessionA))?.focus.role).toBe("owner")
       const created = (yield* goals.audit(result.goal.goal.id)).find((item) => item.type === "created")
@@ -438,7 +438,7 @@ describe("Goal", () => {
         constraints: ["No runner fork"],
         status: "draft",
         revision: 0,
-        continuationPolicy: { mode: "manual" },
+        continuationPolicy: {},
       })
       expect(created.criteria.map((item) => item.description)).toEqual(["Tests pass", "State survives restart"])
       expect(created.steps).toHaveLength(1)
@@ -862,7 +862,7 @@ describe("Goal", () => {
 })
 
 describe("Goal automation reservations", () => {
-  it.effect("audits only focused non-manual Goals while they are runnable", () =>
+  it.effect("audits every focused runnable Goal", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
@@ -870,25 +870,17 @@ describe("Goal automation reservations", () => {
 
       expect(yield* automation.shouldAudit(sessionA)).toBe(false)
 
-      const manual = yield* createGoal({ continuationPolicy: { mode: "manual" } })
-      const manualActive = yield* goals.transition({ id: manual.goal.id, expectedRevision: 0, action: "start" })
-      yield* goals.focus({ goalID: manualActive.goal.id, sessionID: sessionA })
-      expect(yield* automation.shouldAudit(sessionA)).toBe(false)
-
-      const automatic = yield* createGoal({
-        title: "Automatic Goal",
-        continuationPolicy: { mode: "auto_continue" },
-      })
-      const automaticActive = yield* goals.transition({ id: automatic.goal.id, expectedRevision: 0, action: "start" })
-      yield* goals.focus({ goalID: automaticActive.goal.id, sessionID: sessionA2 })
-      expect(yield* automation.shouldAudit(sessionA2)).toBe(true)
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+      expect(yield* automation.shouldAudit(sessionA)).toBe(true)
 
       const verifying = yield* goals.transition({
-        id: automaticActive.goal.id,
-        expectedRevision: automaticActive.goal.revision,
+        id: active.goal.id,
+        expectedRevision: active.goal.revision,
         action: "request_verification",
       })
-      expect(yield* automation.shouldAudit(sessionA2)).toBe(true)
+      expect(yield* automation.shouldAudit(sessionA)).toBe(true)
 
       const activeAgain = yield* goals.transition({
         id: verifying.goal.id,
@@ -901,23 +893,22 @@ describe("Goal automation reservations", () => {
         action: "block",
         blocker: "test blocker",
       })
-      expect(yield* automation.shouldAudit(sessionA2)).toBe(false)
+      expect(yield* automation.shouldAudit(sessionA)).toBe(false)
     }),
   )
 
-  it.effect("lets a user explicitly audit a manual Goal without enabling autonomous continuation", () =>
+  it.effect("treats an explicit audit request as an immediate Goal Mode audit, not a separate mode", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
 
-      const manual = yield* createGoal({ continuationPolicy: { mode: "manual" } })
-      const active = yield* goals.transition({ id: manual.goal.id, expectedRevision: 0, action: "start" })
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
-      expect(yield* automation.shouldAudit(sessionA)).toBe(false)
-      expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
       expect(yield* automation.shouldAudit(sessionA)).toBe(true)
+      expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
 
       const auditorSessionID = yield* goals.auditorSession({ parentSessionID: sessionA, goalID: active.goal.id })
       expect(yield* automation.beginAudit({ sessionID: sessionA, auditorSessionID })).toMatchObject({
@@ -931,22 +922,21 @@ describe("Goal automation reservations", () => {
         origin: "user",
         audit: continueAudit(active.criteria, true),
       })
-      expect(decision).toMatchObject({ continue: false, reason: "manual_after_audit:continue" })
-      expect(decision.reservation).toBeUndefined()
+      expect(decision).toMatchObject({ continue: true, reason: "goal_mode" })
+      expect(decision.reservation).toBeDefined()
       expect((yield* goals.get(active.goal.id)).goal).toMatchObject({ status: "active", auditorRuns: 1 })
-      expect(yield* automation.runtime(sessionA)).toBeUndefined()
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "continuation_pending" })
     }),
   )
 
-  it.effect("keeps a manual Goal active when its explicitly requested auditor reports a blocker", () =>
+  it.effect("continues Goal Mode after an auditor blocker unless explicit blocker hysteresis settles it", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const manual = yield* createGoal({ continuationPolicy: { mode: "manual" } })
-      const active = yield* goals.transition({ id: manual.goal.id, expectedRevision: 0, action: "start" })
+      const created = yield* createGoal()
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
-      expect(yield* automation.requestAudit(sessionA)).toMatchObject({ phase: "audit_requested" })
 
       const decision = yield* automation.afterTurn({
         sessionID: sessionA,
@@ -954,18 +944,19 @@ describe("Goal automation reservations", () => {
         audit: blockedAudit(active.criteria, "Need a user-provided credential"),
       })
 
-      expect(decision).toMatchObject({ continue: false, reason: "manual_after_audit:blocked" })
-      expect((yield* goals.get(manual.goal.id)).goal).toMatchObject({ status: "active", blocker: undefined })
-      expect(yield* automation.runtime(sessionA)).toBeUndefined()
+      expect(decision).toMatchObject({ continue: true, reason: "goal_mode" })
+      expect(decision.reservation?.prompt).toContain("Need a user-provided credential")
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({ status: "active", blocker: undefined })
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "continuation_pending" })
     }),
   )
 
-  it.effect("keeps AUDIT ERROR visible when a manually requested audit fails", () =>
+  it.effect("keeps AUDIT ERROR visible when an explicit Goal Mode audit fails", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "manual" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -986,7 +977,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -1014,7 +1005,7 @@ describe("Goal automation reservations", () => {
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
 
-      const unlimited = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const unlimited = yield* createGoal()
       const active = yield* goals.transition({ id: unlimited.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
       const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(active.criteria, true) })
@@ -1033,12 +1024,12 @@ describe("Goal automation reservations", () => {
         audit: continueAudit(active.criteria, true),
       })
       expect(continued.continue).toBe(true)
-      expect(continued.reason).toBe("auto_continue")
+      expect(continued.reason).toBe("goal_mode")
 
       yield* automation.cancel(sessionA)
       const limited = yield* createGoal({
         title: "Explicit duration limit",
-        continuationPolicy: { mode: "auto_continue", maxDurationMs: 60_000 },
+        continuationPolicy: { maxDurationMs: 60_000 },
       })
       const limitedActive = yield* goals.transition({ id: limited.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: limitedActive.goal.id, sessionID: sessionA })
@@ -1072,7 +1063,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -1105,7 +1096,7 @@ describe("Goal automation reservations", () => {
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
 
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
       const verifying = yield* goals.transition({
@@ -1134,7 +1125,7 @@ describe("Goal automation reservations", () => {
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
 
       expect(active.goal.auditorRuns).toBe(0)
@@ -1194,7 +1185,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -1246,7 +1237,7 @@ describe("Goal automation reservations", () => {
       const { db } = yield* Database.Service
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "unattended" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
       yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(active.criteria, true) })
@@ -1272,7 +1263,7 @@ describe("Goal automation reservations", () => {
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
       const created = yield* createGoal({
-        continuationPolicy: { mode: "auto_continue", maxNoProgressTurns: 1, maxConsecutiveTurns: 8 },
+        continuationPolicy: { maxNoProgressTurns: 1, maxConsecutiveTurns: 8 },
       })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
@@ -1301,7 +1292,7 @@ describe("Goal automation reservations", () => {
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
       const created = yield* createGoal({
-        continuationPolicy: { mode: "auto_continue", maxNoProgressTurns: 1, maxConsecutiveTurns: 8 },
+        continuationPolicy: { maxNoProgressTurns: 1, maxConsecutiveTurns: 8 },
       })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
@@ -1350,7 +1341,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -1387,7 +1378,7 @@ describe("Goal automation reservations", () => {
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
       const created = yield* createGoal({
-        continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 8 },
+        continuationPolicy: { maxConsecutiveTurns: 8 },
         auditorPolicy: { blockedThreshold: 3 },
       })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
@@ -1430,7 +1421,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
@@ -1440,12 +1431,13 @@ describe("Goal automation reservations", () => {
         audit: blockedAudit(active.criteria, "Need a user-provided deployment credential"),
       })
 
-      expect(decision).toMatchObject({ continue: false, reason: "auditor_blocked" })
+      expect(decision).toMatchObject({ continue: true, reason: "goal_mode" })
+      expect(decision.reservation?.prompt).toContain("Need a user-provided deployment credential")
       expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
         status: "active",
         blocker: undefined,
       })
-      expect(yield* automation.runtime(sessionA)).toBeUndefined()
+      expect(yield* automation.runtime(sessionA)).toMatchObject({ phase: "continuation_pending" })
     }),
   )
 
@@ -1454,7 +1446,7 @@ describe("Goal automation reservations", () => {
       yield* setup
       const goals = yield* GoalV2.Service
       const automation = yield* GoalAutomation.Service
-      const created = yield* createGoal({ continuationPolicy: { mode: "unattended" } })
+      const created = yield* createGoal()
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 

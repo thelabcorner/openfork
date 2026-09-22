@@ -1961,8 +1961,62 @@ describe("session HttpApi", () => {
         `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=50`,
         { headers: { "x-opencode-directory": directory } },
       )
-      expect(compat.some((item) => item.info.role === "user" && item.info.provenance?.source === CurrentSessionTurnProvenance.Source.SessionTitle)).toBe(true)
-      expect(compat.some((item) => item.info.role === "assistant" && item.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL))).toBe(true)
+      expect(
+        compat.some(
+          (item) =>
+            item.info.role === "user" &&
+            item.info.provenance?.source === CurrentSessionTurnProvenance.Source.SessionTitle,
+        ),
+      ).toBe(true)
+      expect(
+        compat.some(
+          (item) =>
+            item.info.role === "assistant" &&
+            item.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
+        ),
+      ).toBe(true)
+
+      const assistant = compat.find((item) => item.info.role === "assistant")
+      const prompt = compat.find((item) => item.info.role === "user")
+      expect(assistant?.info.role).toBe("assistant")
+      expect(prompt?.info.role).toBe("user")
+      if (!assistant || assistant.info.role !== "assistant" || !prompt || prompt.info.role !== "user") {
+        return yield* Effect.die("special-agent V1 projection did not expose the expected turn pair")
+      }
+      expect(assistant.info.parentID).toBe(prompt.info.id)
+
+      const firstPageResponse = yield* request(
+        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1`,
+        { headers: { "x-opencode-directory": directory } },
+      )
+      const firstPage = yield* json<SessionV1.WithParts[]>(firstPageResponse)
+      expect(firstPage).toHaveLength(1)
+      expect(firstPage[0]?.info.role).toBe("assistant")
+      const nextCursor = firstPageResponse.headers["x-next-cursor"]
+      expect(nextCursor).toBeTruthy()
+
+      const secondPage = yield* requestJson<SessionV1.WithParts[]>(
+        `${pathFor(SessionPaths.messages, { sessionID: transcriptID })}?limit=1&before=${encodeURIComponent(String(nextCursor))}`,
+        { headers: { "x-opencode-directory": directory } },
+      )
+      expect(secondPage).toHaveLength(1)
+      expect(secondPage[0]?.info.role).toBe("user")
+      expect(firstPage[0]?.info.role === "assistant" ? firstPage[0].info.parentID : undefined).toBe(
+        secondPage[0]?.info.id,
+      )
+
+      const byID = yield* requestJson<SessionV1.WithParts>(
+        pathFor(SessionPaths.message, {
+          sessionID: transcriptID,
+          messageID: assistant.info.id,
+        }),
+        { headers: { "x-opencode-directory": directory } },
+      )
+      expect(byID.info.id).toBe(assistant.info.id)
+      expect(byID.info.role === "assistant" ? byID.info.parentID : undefined).toBe(prompt.info.id)
+      expect(
+        byID.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
+      ).toBe(true)
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )

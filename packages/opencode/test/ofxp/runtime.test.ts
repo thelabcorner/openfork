@@ -259,6 +259,18 @@ describe("OFXP process-global runtime", () => {
       expect(JSON.stringify(bootstrap)).not.toContain("privateKey")
       expect(JSON.stringify(bootstrap)).not.toContain("password")
 
+      const previousPublicOrigin = process.env.OPENCODE_PUBLIC_URL
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.com/"
+      try {
+        const advertised = yield* runtime.bootstrap()
+        expect(advertised.enabled).toBe(true)
+        if (!advertised.enabled) throw new Error("OFXP bootstrap unexpectedly disabled")
+        expect(advertised.publicOrigin).toBe("https://api.example.com")
+      } finally {
+        if (previousPublicOrigin === undefined) delete process.env.OPENCODE_PUBLIC_URL
+        else process.env.OPENCODE_PUBLIC_URL = previousPublicOrigin
+      }
+
       const [candidate] = yield* runtime.candidates()
       expect(candidate?.peerID).toBe(remote.key.peerID)
       expect(candidate?.realmID).toBe(remote.identity.realmID)

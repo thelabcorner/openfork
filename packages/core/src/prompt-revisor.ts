@@ -704,11 +704,25 @@ const layer = Layer.effect(
         })
         const seen = new Set<string>()
         for (const candidate of candidates) {
-          const key = `${candidate.providerID}/${candidate.id}/${candidate.variant ?? ""}`
+          const key = `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
           if (seen.has(key)) continue
           seen.add(key)
           const resolved = yield* models.resolveRef(candidate).pipe(Effect.option)
           if (resolved._tag === "Some") return resolvedModel(candidate, resolved.value)
+        }
+        // Explicit special-agent / request / session candidates are authoritative.
+        // Crossing into an unrelated global catalog default after those candidates
+        // fail can change provider credentials and billing identity. Ordinary
+        // session model resolution does not silently do that, and special agents
+        // must obey the same boundary.
+        if (candidates.length > 0) {
+          return yield* new UnavailableError({
+            message: `No requested model is available for prompt revision: ${candidates
+              .map((candidate) =>
+                `${candidate.providerID}/${candidate.id}${candidate.accountID ? `@${candidate.accountID}` : ""}`,
+              )
+              .join(", ")}`,
+          })
         }
         const fallback = yield* catalog.model.default()
         if (fallback) {

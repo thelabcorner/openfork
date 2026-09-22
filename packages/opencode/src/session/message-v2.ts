@@ -1,6 +1,7 @@
 import { SessionID, MessageID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import {
   APIError,
   AbortedError,
@@ -27,7 +28,9 @@ import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
-import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { MessageTable, PartTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionMessage as CurrentSessionMessage } from "@opencode-ai/core/session/message"
+import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
 import { ProviderError } from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
@@ -35,6 +38,7 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+import * as DateTime from "effect/DateTime"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
@@ -490,6 +494,465 @@ export function toModelMessages(
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options))
 }
+
+/**
+ * Narrow current -> V1 presentation adapter for host-owned special-agent
+ * transcripts.
+ *
+ * Special agents persist one authoritative current Session transcript, but the
+ * OpenFork desktop intentionally hydrates detail Sessions through the mature V1
+ * local message contract. Do not dual-write token-rate V1 rows from the producer;
+ * lower the durable current projection only when this compatibility endpoint is
+ * read.
+ */
+export type CurrentV1Execution = {
+  readonly agent?: string
+  readonly model?: {
+    readonly providerID: SessionV1.User["model"]["providerID"]
+    readonly modelID: SessionV1.User["model"]["modelID"]
+    readonly variant?: string
+  }
+}
+
+const currentVisibleTypes = ["user", "synthetic", "assistant"] as const
+const currentEmptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+function currentPartID(messageID: string, kind: string, ordinal: number) {
+  return SessionV1.PartID.ascending(`prt_current_${messageID.replace(/^msg_?/, "")}_${kind}_${ordinal}`)
+}
+
+function currentMessageID(id: string) {
+  return SessionV1.MessageID.ascending(id)
+}
+
+function currentEpoch(value: DateTime.Utc | undefined, fallback: number) {
+  return value ? DateTime.toEpochMillis(value) : fallback
+}
+
+function currentRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function currentPendingInput(raw: string) {
+  try {
+    return currentRecord(JSON.parse(raw))
+  } catch {
+    return {}
+  }
+}
+
+function currentProvenance(
+  provenance: CurrentSessionMessage.Provenance | undefined,
+): SessionV1.UserTurnProvenance | undefined {
+  if (!provenance) return
+  return provenance.owner === "user"
+    ? {
+        owner: "user",
+        source: provenance.source,
+        ...(provenance.lifetime ? { lifetime: provenance.lifetime } : {}),
+      }
+    : {
+        owner: "host",
+        source: provenance.source,
+        ...(provenance.sourceMessageID ? { sourceMessageID: currentMessageID(provenance.sourceMessageID) } : {}),
+        ...(provenance.ref ? { ref: provenance.ref } : {}),
+        ...(provenance.lifetime ? { lifetime: provenance.lifetime } : {}),
+      }
+}
+
+function currentToolPart(
+  sessionID: SessionID,
+  messageID: SessionV1.MessageID,
+  ordinal: number,
+  tool: CurrentSessionMessage.AssistantTool,
+): SessionV1.ToolPart {
+  const start = currentEpoch(tool.time.ran, DateTime.toEpochMillis(tool.time.created))
+  const end = currentEpoch(tool.time.completed, start)
+  const metadata = {
+    providerState: tool.provider?.metadata,
+    providerResultState: tool.provider?.resultMetadata,
+    providerExecuted: tool.provider?.executed,
+  }
+  const state: SessionV1.ToolState = (() => {
+    if (tool.state.status === "pending") {
+      return {
+        status: "pending",
+        input: currentPendingInput(tool.state.input),
+        raw: tool.state.input,
+      }
+    }
+    if (tool.state.status === "running") {
+      return {
+        status: "running",
+        input: tool.state.input,
+        title: tool.name,
+        metadata: tool.state.structured,
+        time: { start },
+      }
+    }
+    if (tool.state.status === "error") {
+      return {
+        status: "error",
+        input: tool.state.input,
+        error: tool.state.error.message,
+        metadata: tool.state.structured,
+        time: { start, end },
+      }
+    }
+    const attachments = tool.state.content.flatMap((item, index): SessionV1.FilePart[] =>
+      item.type === "file"
+        ? [
+            {
+              id: currentPartID(messageID, `tool_${ordinal}_file`, index),
+              sessionID,
+              messageID,
+              type: "file",
+              mime: item.mime,
+              filename: item.name,
+              url: item.uri,
+            },
+          ]
+        : [],
+    )
+    return {
+      status: "completed",
+      input: tool.state.input,
+      output: tool.state.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n"),
+      title: tool.name,
+      metadata: tool.state.structured,
+      time: { start, end },
+      attachments: attachments.length ? attachments : undefined,
+    }
+  })()
+  return {
+    id: currentPartID(messageID, "tool", ordinal),
+    sessionID,
+    messageID,
+    type: "tool",
+    callID: tool.id,
+    tool: tool.name,
+    state,
+    metadata,
+  }
+}
+
+function currentAssistantParts(
+  sessionID: SessionID,
+  messageID: SessionV1.MessageID,
+  message: CurrentSessionMessage.Assistant,
+): SessionV1.Part[] {
+  let textOrdinal = 0
+  let reasoningOrdinal = 0
+  let toolOrdinal = 0
+  return message.content.flatMap((content): SessionV1.Part[] => {
+    if (content.type === "text") {
+      const ordinal = textOrdinal++
+      if (!content.text.trim()) return []
+      return [
+        {
+          id: currentPartID(messageID, "text", ordinal),
+          sessionID,
+          messageID,
+          type: "text",
+          text: content.text,
+        },
+      ]
+    }
+    if (content.type === "reasoning") {
+      const ordinal = reasoningOrdinal++
+      if (!content.text.trim()) return []
+      const created = currentEpoch(content.time?.created, DateTime.toEpochMillis(message.time.created))
+      return [
+        {
+          id: currentPartID(messageID, "reasoning", ordinal),
+          sessionID,
+          messageID,
+          type: "reasoning",
+          text: content.text,
+          metadata: content.providerMetadata,
+          time: {
+            start: created,
+            end: content.time?.completed ? DateTime.toEpochMillis(content.time.completed) : undefined,
+          },
+        },
+      ]
+    }
+    return [currentToolPart(sessionID, messageID, toolOrdinal++, content)]
+  })
+}
+
+function currentUserParts(
+  sessionID: SessionID,
+  messageID: SessionV1.MessageID,
+  message: CurrentSessionMessage.User | CurrentSessionMessage.Synthetic,
+): SessionV1.Part[] {
+  const text = message.text.trim()
+  const files = message.files ?? []
+  return [
+    ...(text
+      ? [
+          {
+            id: currentPartID(messageID, "text", 0),
+            sessionID,
+            messageID,
+            type: "text" as const,
+            text: message.text,
+            synthetic: message.type === "synthetic" ? true : undefined,
+          },
+        ]
+      : []),
+    ...files.map(
+      (file, index): SessionV1.FilePart => ({
+        id: currentPartID(messageID, "file", index),
+        sessionID,
+        messageID,
+        type: "file",
+        mime: file.mime,
+        filename: file.name,
+        url: file.uri,
+      }),
+    ),
+  ]
+}
+
+function executionFromAssistant(message: CurrentSessionMessage.Assistant): CurrentV1Execution {
+  return {
+    agent: message.agent,
+    model: {
+      providerID: message.model.providerID,
+      modelID: message.model.id,
+      ...(message.model.variant ? { variant: message.model.variant } : {}),
+    },
+  }
+}
+
+export function projectCurrentToV1(
+  sessionID: SessionID,
+  messages: readonly CurrentSessionMessage.Message[],
+  options?: {
+    readonly execution?: CurrentV1Execution
+    readonly parentBefore?: SessionV1.MessageID
+  },
+): SessionV1.WithParts[] {
+  let execution: CurrentV1Execution = options?.execution ?? {}
+  let parentID = options?.parentBefore
+  let parentInPage: SessionV1.WithParts | undefined
+  const result: SessionV1.WithParts[] = []
+
+  for (const message of messages) {
+    if (message.type === "agent-switched") {
+      execution = { ...execution, agent: message.agent }
+      continue
+    }
+    if (message.type === "model-switched") {
+      execution = {
+        ...execution,
+        model: {
+          providerID: message.model.providerID,
+          modelID: message.model.id,
+          ...(message.model.variant ? { variant: message.model.variant } : {}),
+        },
+      }
+      continue
+    }
+    if (message.type === "user" || message.type === "synthetic") {
+      const id = currentMessageID(message.id)
+      const info: SessionV1.User = {
+        id,
+        sessionID,
+        role: "user",
+        provenance: currentProvenance(message.provenance),
+        time: { created: DateTime.toEpochMillis(message.time.created) },
+        agent: execution.agent ?? "",
+        model: {
+          providerID: ProviderV2.ID.make(execution.model?.providerID ?? ""),
+          modelID: ModelV2.ID.make(execution.model?.modelID ?? ""),
+          ...(execution.model?.variant ? { variant: execution.model.variant } : {}),
+        },
+      }
+      const current = { info, parts: currentUserParts(sessionID, id, message) } satisfies SessionV1.WithParts
+      result.push(current)
+      parentID = id
+      parentInPage = current
+      continue
+    }
+    if (message.type !== "assistant" || !parentID) continue
+
+    execution = executionFromAssistant(message)
+    if (parentInPage?.info.role === "user" && parentInPage.info.id === parentID) {
+      parentInPage.info.agent = execution.agent ?? parentInPage.info.agent
+      if (execution.model) {
+        parentInPage.info.model = {
+          providerID: ProviderV2.ID.make(execution.model.providerID),
+          modelID: ModelV2.ID.make(execution.model.modelID),
+          ...(execution.model.variant ? { variant: execution.model.variant } : {}),
+        }
+      }
+    }
+
+    const id = currentMessageID(message.id)
+    const created = DateTime.toEpochMillis(message.time.created)
+    const info: SessionV1.Assistant = {
+      id,
+      sessionID,
+      role: "assistant",
+      time: {
+        created,
+        ...(message.time.completed ? { completed: DateTime.toEpochMillis(message.time.completed) } : {}),
+        ...(message.time.requestSentAt ? { requestSentAt: DateTime.toEpochMillis(message.time.requestSentAt) } : {}),
+        ...(message.time.firstTokenAt ? { firstTokenAt: DateTime.toEpochMillis(message.time.firstTokenAt) } : {}),
+        ...(message.time.streamedAt ? { streamedAt: DateTime.toEpochMillis(message.time.streamedAt) } : {}),
+      },
+      ...(message.error
+        ? {
+            error: {
+              name: "UnknownError" as const,
+              data: { message: message.error.message },
+            },
+          }
+        : {}),
+      parentID,
+      modelID: message.model.id,
+      providerID: message.model.providerID,
+      mode: message.agent,
+      agent: message.agent,
+      path: { cwd: "", root: "" },
+      cost: message.cost ?? 0,
+      tokens: message.tokens ?? currentEmptyTokens,
+      ...(message.model.variant ? { variant: message.model.variant } : {}),
+      ...(message.finish ? { finish: message.finish } : {}),
+    }
+    result.push({ info, parts: currentAssistantParts(sessionID, id, message) })
+  }
+
+  return result
+}
+
+const currentParentBefore = Effect.fnUntraced(function* (
+  db: Database.Interface["db"],
+  sessionID: SessionID,
+  seq: number,
+) {
+  const row = yield* db
+    .select({ id: SessionMessageTable.id })
+    .from(SessionMessageTable)
+    .where(
+      and(
+        eq(SessionMessageTable.session_id, sessionID),
+        lt(SessionMessageTable.seq, seq),
+        inArray(SessionMessageTable.type, ["user", "synthetic"]),
+      ),
+    )
+    .orderBy(desc(SessionMessageTable.seq))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row ? currentMessageID(row.id) : undefined
+})
+
+export const currentAll = Effect.fn("MessageV2.currentAll")(function* (input: {
+  sessionID: SessionID
+  execution?: CurrentV1Execution
+}) {
+  const { db } = yield* Database.Service
+  const rows = yield* db
+    .select()
+    .from(SessionMessageTable)
+    .where(
+      and(
+        eq(SessionMessageTable.session_id, input.sessionID),
+        inArray(SessionMessageTable.type, [...currentVisibleTypes]),
+      ),
+    )
+    .orderBy(SessionMessageTable.seq)
+    .all()
+    .pipe(Effect.orDie)
+  const decoded = yield* SessionMessageProjection.decodeRows(db, rows).pipe(Effect.orDie)
+  return projectCurrentToV1(input.sessionID, decoded, { execution: input.execution })
+})
+
+export const currentPage = Effect.fn("MessageV2.currentPage")(function* (input: {
+  sessionID: SessionID
+  limit: number
+  before?: string
+  execution?: CurrentV1Execution
+}) {
+  const { db } = yield* Database.Service
+  const before = input.before ? cursor.decode(input.before) : undefined
+  const anchor = before
+    ? yield* db
+        .select({ seq: SessionMessageTable.seq })
+        .from(SessionMessageTable)
+        .where(
+          and(
+            eq(SessionMessageTable.session_id, input.sessionID),
+            eq(SessionMessageTable.id, CurrentSessionMessage.ID.make(before.id)),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+    : undefined
+  if (before && !anchor) {
+    return { items: [] as SessionV1.WithParts[], more: false, cursor: undefined }
+  }
+
+  const rows = yield* db
+    .select()
+    .from(SessionMessageTable)
+    .where(
+      and(
+        eq(SessionMessageTable.session_id, input.sessionID),
+        inArray(SessionMessageTable.type, [...currentVisibleTypes]),
+        anchor ? lt(SessionMessageTable.seq, anchor.seq) : undefined,
+      ),
+    )
+    .orderBy(desc(SessionMessageTable.seq))
+    .limit(input.limit + 1)
+    .all()
+    .pipe(Effect.orDie)
+
+  const more = rows.length > input.limit
+  const slice = more ? rows.slice(0, input.limit) : rows
+  const oldest = slice.at(-1)
+  const parentBefore = oldest ? yield* currentParentBefore(db, input.sessionID, oldest.seq) : undefined
+  const decoded = yield* SessionMessageProjection.decodeRows(db, slice.toReversed()).pipe(Effect.orDie)
+  const items = projectCurrentToV1(input.sessionID, decoded, { execution: input.execution, parentBefore })
+  const tail = slice.at(-1)
+  return {
+    items,
+    more,
+    cursor: more && tail ? cursor.encode({ id: MessageID.ascending(tail.id), time: tail.time_created }) : undefined,
+  }
+})
+
+export const currentGet = Effect.fn("MessageV2.currentGet")(function* (input: {
+  sessionID: SessionID
+  messageID: MessageID
+  execution?: CurrentV1Execution
+}) {
+  const { db } = yield* Database.Service
+  const row = yield* db
+    .select()
+    .from(SessionMessageTable)
+    .where(
+      and(
+        eq(SessionMessageTable.session_id, input.sessionID),
+        eq(SessionMessageTable.id, CurrentSessionMessage.ID.make(input.messageID)),
+      ),
+    )
+    .get()
+    .pipe(Effect.orDie)
+  if (!row || !currentVisibleTypes.includes(row.type as (typeof currentVisibleTypes)[number])) {
+    return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  }
+  const parentBefore = yield* currentParentBefore(db, input.sessionID, row.seq)
+  const [decoded] = yield* SessionMessageProjection.decodeRows(db, [row]).pipe(Effect.orDie)
+  if (!decoded) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  const projected = projectCurrentToV1(input.sessionID, [decoded], { execution: input.execution, parentBefore })
+  const item = projected.find((entry) => entry.info.id === input.messageID)
+  if (!item) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+  return item
+})
 
 export const page = Effect.fn("MessageV2.page")(function* (input: {
   sessionID: SessionID

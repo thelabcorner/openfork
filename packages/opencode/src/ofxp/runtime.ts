@@ -89,6 +89,7 @@ export type BootstrapProjection =
       readonly protocolMax: number
       readonly pairing: true
       readonly endpointHints: readonly [{ readonly port: number }]
+      readonly publicOrigin?: string
     }
 
 export interface StartInput {
@@ -194,6 +195,22 @@ export const use = serviceUse(Service)
 function cleanLabel(value: string) {
   const cleaned = value.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80)
   return cleaned || "OpenFork"
+}
+
+function configuredPublicOrigin() {
+  const value = process.env.OPENCODE_PUBLIC_URL?.trim()
+  if (!value) return
+  try {
+    const url = new URL(value)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return
+    url.username = ""
+    url.password = ""
+    url.hash = ""
+    url.search = ""
+    return url.toString().replace(/\/$/, "")
+  } catch {
+    return
+  }
 }
 
 function statusOf(state: State): Status {
@@ -857,6 +874,7 @@ const layer = Layer.effect(
     const bootstrap = Effect.fn("OfxpRuntime.bootstrap")(function* () {
       const current = yield* SynchronizedRef.get(state)
       if (current._tag !== "active") return { enabled: false } satisfies BootstrapProjection
+      const publicOrigin = configuredPublicOrigin()
       return {
         enabled: true,
         peerID: current.identity.id,
@@ -865,6 +883,7 @@ const layer = Layer.effect(
         protocolMax: OfxpDiscovery.PROTOCOL_VERSION,
         pairing: true,
         endpointHints: [{ port: current.endpoint.port }],
+        ...(publicOrigin ? { publicOrigin } : {}),
       } satisfies BootstrapProjection
     })
 

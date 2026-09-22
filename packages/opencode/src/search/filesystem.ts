@@ -31,6 +31,7 @@ export interface GrepInput {
   readonly path: string
   readonly pattern: string
   readonly include?: string
+  readonly literal?: boolean
   readonly limit?: number
   readonly signal?: AbortSignal
 }
@@ -96,6 +97,7 @@ export const grep = Effect.fn("FileSearch.grep")(function* (deps: Dependencies, 
     pattern: input.pattern,
     file: requestedInfo.type === "File" ? path.basename(search) : undefined,
     include: input.include,
+    literal: input.literal,
     limit: limit + 1,
     signal: input.signal,
   })

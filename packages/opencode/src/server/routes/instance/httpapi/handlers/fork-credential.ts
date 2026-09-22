@@ -2,46 +2,23 @@ import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
+import { Capacity } from "@/capacity/capacity"
+import { Quota } from "@/quota/quota"
+import type { ProviderResult } from "@/quota/schema"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { disposeInstance } from "@/effect/instance-registry"
 import { RootHttpApi } from "../api"
-import { stableZenIdentity } from "@/plugin/zen-accounts"
-import { bumpZenVaultPool, zenLimitSnapshot } from "@/plugin/zen"
-import {
-  buildAggregateWindows,
-  buildLocalWindows,
-  bumpUsageCache,
-  localUsageCache,
-  officialUsageCache,
-  type LocalWindow,
-  type OfficialUsage,
-  type WindowBounds,
-} from "@/fork/usage-cache"
-
-type ForkWindowLabel = "5h" | "week" | "month"
-type CredentialWindows = {
-  readonly credentialID: string
-  readonly accountID?: string
-  readonly windows: LocalWindow[]
-  readonly official?: {
-    readonly fetchedAt: number
-    readonly ageMs: number
-    readonly status: "ok" | "stale" | "error"
-  }
-}
-
-function authBearer(info: Auth.Info | undefined): string | undefined {
-  if (!info) return
-  if (info.type === "api") return info.key || undefined
-  if (info.type === "oauth") return info.access || undefined
-  if (info.type === "wellknown") return info.token || undefined
-}
+import { bumpZenVaultPool } from "@/plugin/zen"
+import { bumpUsageCache } from "@/fork/usage-cache"
+import { forkUsageSnapshot } from "@/fork/usage"
 
 export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-credential", (handlers) =>
   Effect.gen(function* () {
     const credentials = yield* ForkCredentials.Service
     const usage = yield* SessionUsage.Service
     const auth = yield* Auth.Service
+    const capacity = yield* Capacity.Service
+    const quota = yield* Quota.Service
 
     const refresh = (directory?: string) =>
       directory ? Effect.promise(() => disposeInstance(directory)).pipe(Effect.asVoid) : Effect.void
@@ -98,105 +75,73 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       return true
     })
 
-    // L2: local spend/calls from the DB, cached process-globally and
-    // invalidated by the generation counter (recordUsage + mutations). No
-    // remote calls in this layer, so local values refresh in ~2-5s via the
-    // SSE-driven client refetch without touching the official API.
-    const getLocal = Effect.fn("ForkCredentialHttpApi.local")(function* () {
-      return yield* localUsageCache.get(() =>
-        Effect.gen(function* () {
-          const bounds = yield* usage.windows()
-          const allCredentials = yield* credentials.list()
-          const grouped = yield* credentials.usageByCredential(bounds)
-          const byCredential = new Map(
-            allCredentials.map((credential) => [
-              credential.id,
-              buildLocalWindows(bounds, grouped.byCredential.get(credential.id) ?? []),
-            ]),
-          )
-          const aggregate = buildAggregateWindows(bounds, grouped.byCredential, grouped.unattributed)
-          return { bounds, allCredentials, byCredential, aggregate }
-        }),
-      )
+    const getUsage = Effect.fn("ForkCredentialHttpApi.usage")(function* () {
+      return (yield* forkUsageSnapshot({ credentials, usage, auth })).result
     })
 
-    const getUsage = Effect.fn("ForkCredentialHttpApi.usage")(function* () {
-      const { bounds, allCredentials, byCredential, aggregate } = yield* getLocal()
+    const getCapacity = Effect.fn("ForkCredentialHttpApi.capacity")(function* () {
+      const current = yield* getUsage()
+      const accounts = current.byCredential.flatMap((entry) => {
+        const window = entry.windows.find((candidate) => candidate.label === "5h")
+        if (!window || window.source !== "api" || !(window.limitUSD > 0)) return []
+        const status = entry.official?.status
+        if (status !== "ok" && status !== "stale") return []
+        const snapshotAt = entry.official?.fetchedAt ?? 0
+        if (!(snapshotAt > 0)) return []
+        // Fresh-vs-stale describes fetch health, not whether the represented
+        // rolling window still exists. Any snapshot whose 5h reset has passed
+        // is historical evidence and must not be projected into the new window.
+        if (window.resetsAt <= Date.now()) return []
 
-      // Shared pool default is retained separately for credential-management
-      // compatibility. Bare Go routing may instead use a directly connected
-      // opencode-go provider credential.
-      const snapshot = zenLimitSnapshot()
-      const poolDefault = snapshot.find((entry) => entry.isDefault) ?? snapshot[0]
-      const directAuth = yield* auth.get("opencode-go").pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-      const directKey = authBearer(directAuth)
-      const directAccountID = directKey ? stableZenIdentity(directKey) : undefined
-      const directLabel =
-        directAuth?.type === "api" && directAuth.metadata?.label ? directAuth.metadata.label : "OpenCode Go"
-      const routed = directAccountID
-        ? { routedAccountID: directAccountID, routedAccountLabel: directLabel, routedAccountSource: "provider" as const }
-        : poolDefault
-          ? {
-              routedAccountID: poolDefault.accountId,
-              routedAccountLabel: poolDefault.label,
-              routedAccountSource: "pool" as const,
-            }
-          : {}
+        // mergeOfficial writes the exact official percent back into
+        // spentUSD/limitUSD. Do NOT use estimatedPercent here: that legacy field
+        // may locally refine an integer percentage through the old universal
+        // dollar budget, whose denominator is not model-specific.
+        const usedFraction = Math.max(0, Math.min(1, window.spentUSD / window.limitUSD))
+        return [{
+          accountID: entry.accountID ?? entry.credentialID,
+          credentialID: entry.credentialID,
+          remainingFraction: 1 - usedFraction,
+          resetAt: window.resetsAt,
+          snapshotAt,
+          status,
+        }]
+      })
 
-      if (allCredentials.length === 0 && !directKey) {
-        // Zero credentials: local aggregate + empty per-credential, and NO
-        // external calls (nothing to ask the official API about).
-        return {
-          aggregate,
-          byCredential: [],
-          ...routed,
-          ...(poolDefault
-            ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
-            : {}),
-        }
-      }
+      const go = yield* capacity.go({
+        routedAccountID: current.routedAccountID,
+        accounts,
+      })
 
-      // L1: gated official snapshots per credential (>=5m per credential).
-      // Serving the cached snapshot (fresh or stale-with-metadata) never
-      // triggers a synchronous remote call; the gate is module-scope.
-      const officialByCredential = yield* Effect.forEach(
-        allCredentials,
-        (credential): Effect.Effect<CredentialWindows> =>
-          Effect.map(officialUsageCache.get(credential.id, credential.key), (official) => ({
-            credentialID: credential.id,
-            ...(credential.id !== stableZenIdentity(credential.key)
-              ? { accountID: stableZenIdentity(credential.key) }
-              : {}),
-            windows: mergeOfficial(byCredential.get(credential.id) ?? [], official.snapshot ?? {}),
-            official: {
-              fetchedAt: official.fetchedAt,
-              ageMs: official.ageMs,
-              status: official.status,
-            },
-          })),
+      const summaries = (yield* quota.providers()).providers
+      const genericSummaries = summaries.filter((provider) => provider.providerId !== "opencode-go")
+      const genericResults: ProviderResult[] = yield* Effect.forEach(
+        genericSummaries.filter((provider) => provider.configured),
+        (provider) =>
+          quota.get({ providerID: provider.providerId }).pipe(
+            Effect.catch(() =>
+              Effect.succeed({
+                providerId: provider.providerId,
+                providerName: provider.providerName,
+                ok: false,
+                configured: true,
+                error: "Usage data unavailable",
+                planLabel: null,
+                usage: null,
+                fetchedAt: Date.now(),
+              }),
+            ),
+          ),
         { concurrency: 4 },
       )
-
-      // Direct /connect OpenCode Go credentials live in auth.json rather than
-      // the fork vault. Project them as a synthetic, key-free usage row so UI
-      // quota indicators follow the same account that request routing uses.
-      if (directKey && directAccountID && !officialByCredential.some((entry) => entry.accountID === directAccountID)) {
-        const official = yield* officialUsageCache.get(`auth:opencode-go:${directAccountID}`, directKey)
-        officialByCredential.push({
-          credentialID: `auth:opencode-go:${directAccountID}`,
-          accountID: directAccountID,
-          windows: mergeOfficial(buildLocalWindows(bounds, []), official.snapshot ?? {}),
-          official: { fetchedAt: official.fetchedAt, ageMs: official.ageMs, status: official.status },
-        })
-      }
+      const providers = yield* capacity.providers({
+        summaries: genericSummaries,
+        results: genericResults,
+      })
 
       return {
-        aggregate: aggregateWindows(aggregate, officialByCredential.map((entry) => entry.windows)),
-        byCredential: officialByCredential,
-        ...routed,
-        ...(poolDefault
-          ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
-          : {}),
+        ...go,
+        providers: [Capacity.goProviderView(go), ...providers],
       }
     })
 
@@ -207,69 +152,8 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       .handle("rename", rename)
       .handle("remove", remove)
       .handle("usage", getUsage)
+      .handle("capacity", getCapacity)
   }),
 )
 
-function mergeOfficial(local: LocalWindow[], official: OfficialUsage): LocalWindow[] {
-  return local.map((window) => {
-    const next = official[window.label]
-    if (!next) return window
-    return {
-      ...window,
-      spentUSD: window.limitUSD * (Math.max(0, Math.min(100, next.percent)) / 100),
-      estimatedPercent: estimatePercent(window, next.percent),
-      resetsAt: next.resetsAt,
-      clearsAt: window.label === "5h" ? next.resetsAt : next.resetsAt,
-      source: "api" as const,
-      status: next.status,
-    }
-  })
-}
 
-function estimatePercent(window: LocalWindow, officialPercent: number) {
-  const official = Math.max(0, Math.min(100, officialPercent))
-  if (!Number.isInteger(official)) return official
-  const local = percentFor(window.spentUSD, window.limitUSD)
-  if (!Number.isFinite(local)) return undefined
-  if (official >= 100) return 100
-  if (Math.floor(local) === official) return roundPercent(local)
-  if (Math.round(local) === official && Math.abs(local - official) <= 0.5) return roundPercent(local)
-  return undefined
-}
-
-function percentFor(spentUSD: number, limitUSD: number) {
-  if (limitUSD <= 0) return 0
-  return Math.max(0, Math.min(100, (spentUSD / limitUSD) * 100))
-}
-
-function roundPercent(percent: number) {
-  return Math.round(percent * 100) / 100
-}
-
-function aggregateWindows(local: LocalWindow[], byCredential: LocalWindow[][]) {
-  return local.map((window) => {
-    const windows = byCredential
-      .map((windows) => windows.find((item) => item.label === window.label))
-      .filter((item): item is LocalWindow => !!item)
-    if (!windows.some((item) => item.source === "api")) return window
-    const resetsAt = Math.min(...windows.map((item) => item.resetsAt))
-    const spentUSD = windows.reduce((total, item) => total + item.spentUSD, 0)
-    const limitUSD = windows.reduce((total, item) => total + item.limitUSD, 0)
-    const estimatedSpentUSD = windows.reduce(
-      (total, item) => total + item.limitUSD * ((item.estimatedPercent ?? percentFor(item.spentUSD, item.limitUSD)) / 100),
-      0,
-    )
-    return {
-      ...window,
-      spentUSD,
-      limitUSD,
-      estimatedPercent: windows.some((item) => item.estimatedPercent !== undefined)
-        ? roundPercent(percentFor(estimatedSpentUSD, limitUSD))
-        : undefined,
-      resetsAt,
-      clearsAt: window.label === "5h" ? resetsAt : resetsAt,
-      source: "api" as const,
-      status: windows.some((item) => item.source !== "api" || (item.status && item.status !== "ok")) ? "mixed" : "ok",
-    }
-  })
-}

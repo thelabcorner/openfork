@@ -25,11 +25,13 @@ import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi
 import { globalHandlers, MAX_REPLAY_FRAMES, SUBSCRIBER_HEADROOM } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { Usage } from "../../src/usage/usage"
+import { Quota } from "../../src/quota/quota"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
@@ -70,6 +72,7 @@ const apiLayer = HttpRouter.serve(
       globalHandlers,
       providerSettingsHandlers,
       usageHandlers,
+      quotaHandlers,
       revisionDraftHandlers,
       scheduledTaskHandlers,
       swarmHandlers,
@@ -85,6 +88,14 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(ForkCredentials.Service)({})),
   Layer.provide(Layer.mock(SessionUsage.Service)({})),
+  Layer.provide(
+    Layer.mock(Quota.Service)({
+      providers: () => Effect.succeed({ providers: [] }),
+      get: () => Effect.die("unused quota get"),
+      resets: ({ from, to }) =>
+        Effect.succeed({ from, to, generatedAt: from, occurrences: [], failures: [] }),
+    }),
+  ),
   Layer.provide(Layer.mock(OxpActivity.Service)({})),
   Layer.provide(Layer.mock(OxpActivityInspection.Service)({})),
   Layer.provide(Layer.mock(RevisionDraft.Service)({})),

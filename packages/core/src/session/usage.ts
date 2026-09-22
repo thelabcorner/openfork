@@ -11,8 +11,15 @@ const GO_PROVIDER_ID = "opencode-go"
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
-/** Dollar limits for the OpenCode Go plan's rolling windows. */
-const LIMITS = { "5h": 12, week: 30, month: 60 } as const
+/**
+ * Legacy nominal dollar windows retained only for local usage-display
+ * compatibility when no official quota percentage is available.
+ *
+ * These are NOT model resource limits and MUST NOT be used to estimate request
+ * capacity. Server-side Capacity owns request projections from official resource
+ * fractions plus the published per-model Go capacity table.
+ */
+const LEGACY_NOMINAL_LIMITS_USD = { "5h": 12, week: 30, month: 60 } as const
 
 export interface WindowUsage {
   readonly label: "5h" | "week" | "month"
@@ -151,15 +158,15 @@ const layer = Layer.effect(
       const month = monthBounds(now, earliest?.earliest ?? undefined)
 
       return [
-        { label: "5h" as const, startMs: fiveHourStart, endMs: now, limitUSD: LIMITS["5h"], resetsAt: now + FIVE_HOURS_MS },
+        { label: "5h" as const, startMs: fiveHourStart, endMs: now, limitUSD: LEGACY_NOMINAL_LIMITS_USD["5h"], resetsAt: now + FIVE_HOURS_MS },
         {
           label: "week" as const,
           startMs: weekStartMs,
           endMs: weekStartMs + WEEK_MS,
-          limitUSD: LIMITS.week,
+          limitUSD: LEGACY_NOMINAL_LIMITS_USD.week,
           resetsAt: weekStartMs + WEEK_MS,
         },
-        { label: "month" as const, startMs: month.startMs, endMs: month.endMs, limitUSD: LIMITS.month, resetsAt: month.endMs },
+        { label: "month" as const, startMs: month.startMs, endMs: month.endMs, limitUSD: LEGACY_NOMINAL_LIMITS_USD.month, resetsAt: month.endMs },
       ]
     })
 

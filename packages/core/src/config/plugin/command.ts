@@ -35,7 +35,12 @@ export const Plugin = define({
               if (command.agent !== undefined) item.agent = command.agent
               if (command.model !== undefined) {
                 const model = ModelV2.parse(command.model)
-                item.model = { id: model.modelID, providerID: model.providerID, variant: item.model?.variant }
+                item.model = {
+                  id: model.modelID,
+                  providerID: model.providerID,
+                  ...(model.accountID ? { accountID: model.accountID } : {}),
+                  variant: item.model?.variant,
+                }
               }
               if (command.variant !== undefined && item.model !== undefined) {
                 item.model.variant = ModelV2.VariantID.make(command.variant)

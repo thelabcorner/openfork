@@ -74,6 +74,8 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(GlobalApi)
   .addHttpApi(ProviderSettingsApi)
   .addHttpApi(UsageApi)
+  // Tier 0 quota/account metadata and calendar projections. Never route through a workspace Instance.
+  .addHttpApi(QuotaApi)
   // Tier 0/1 OFXP operator control plane. Never route peer settings through a workspace Instance.
   .addHttpApi(OfxpApi)
   // Bootstrap-free revision mailbox: stable target identity + durable SQLite only.
@@ -97,7 +99,6 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(QuestionApi)
   .addHttpApi(PermissionApi)
   .addHttpApi(ProviderApi)
-  .addHttpApi(QuotaApi)
   .addHttpApi(SessionApi)
   .addHttpApi(SessionContextApi)
   .addHttpApi(SessionGroupApi)

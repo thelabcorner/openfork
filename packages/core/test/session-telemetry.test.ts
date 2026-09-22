@@ -41,7 +41,10 @@ describe("SessionTelemetry", () => {
         requestSentAt: 1_000,
         model: { providerID: "openai", modelID: "gpt-test", variant: "high", contextLimit: 200_000 },
       })
-      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.phase).toBe("requesting")
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]).toMatchObject({
+        phase: "requesting",
+        turnStartedAt: 1_000,
+      })
 
       yield* telemetry.observe({ sessionID: SESSION_ID, at: 1_100, event: LLMEvent.reasoningStart({ id: "r1" }) })
       yield* telemetry.observe({
@@ -89,6 +92,7 @@ describe("SessionTelemetry", () => {
       expect(settled).toMatchObject({
         sessionID: SESSION_ID,
         phase: "requesting",
+        turnStartedAt: 1_000,
         model: { providerID: "openai", modelID: "gpt-test", variant: "high", contextLimit: 200_000 },
         context: {
           model: { providerID: "openai", modelID: "gpt-test", variant: "high", contextLimit: 200_000 },
@@ -110,11 +114,23 @@ describe("SessionTelemetry", () => {
         toolMs: 500,
       })
 
+      // A subsequent provider step inside the same drain must not restart the
+      // user-visible turn clock. `settle()` is step settlement, not turn
+      // settlement; only `idle()` owns the terminal boundary.
+      yield* telemetry.begin({
+        sessionID: SESSION_ID,
+        assistantMessageID: "msg_1b",
+        requestSentAt: 2_850,
+        model: { providerID: "openai", modelID: "gpt-test", contextLimit: 200_000 },
+      })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.turnStartedAt).toBe(1_000)
+
       // Step settlement is not session settlement: an agent may immediately
       // continue into another provider turn. Only the runner knows when the
       // whole drain is actually idle.
       yield* telemetry.idle(SESSION_ID, 2_900)
-      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.phase).toBe("idle")
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]).toMatchObject({ phase: "idle" })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.turnStartedAt).toBeUndefined()
 
       // A second step accumulates durations instead of rescanning old history.
       yield* telemetry.begin({
@@ -123,6 +139,7 @@ describe("SessionTelemetry", () => {
         requestSentAt: 3_000,
         model: { providerID: "openai", modelID: "gpt-test", contextLimit: 200_000 },
       })
+      expect((yield* telemetry.snapshot([SESSION_ID]))[SESSION_ID]?.turnStartedAt).toBe(3_000)
       yield* telemetry.observe({ sessionID: SESSION_ID, at: 3_100, event: LLMEvent.textStart({ id: "t2" }) })
       yield* telemetry.observe({
         sessionID: SESSION_ID,

@@ -597,6 +597,7 @@ describe("tool.patch", () => {
       const plan = yield* execute({ patchText: patch, apply: false }, ctx)
       expect(plan.output).toContain("CONFLICT")
       expect(plan.output).toContain("1, 4, 7")
+      expect(plan.output).toContain("Candidate contexts")
       yield* expectFailure(execute({ patchText: patch, apply: true }, ctx), "verification failed")
       expect(calls.length).toBe(0)
       expect(yield* readText(path.join(test.directory, "dup.txt"))).toBe(

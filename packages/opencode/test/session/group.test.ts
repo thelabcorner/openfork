@@ -501,7 +501,7 @@ it.instance("couples the reusable Goal Auditor child into the parent subagent gr
         title: "Audited Goal",
         objective: "Keep one durable auditor transcript",
         criteria: ["Auditor is coupled to the parent Session"],
-        continuationPolicy: { mode: "auto_continue" },
+        continuationPolicy: {},
       })
       .pipe(Effect.orDie)
     const active = yield* goals

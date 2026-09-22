@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "b4dfe541-9426-4723-acb0-5543bfb18f0a",
+  "id": "7b48271a-a579-432f-91c7-3048ffe74163",
   "prevIds": [
-    "8bde4d59-96ca-42d1-818e-880ca0642d33"
+    "1e91de53-b1f9-4724-a8fe-9ba10df22b2d"
   ],
   "ddl": [
     {
@@ -148,6 +148,10 @@
     },
     {
       "name": "oxp_correlation_ref",
+      "entityType": "tables"
+    },
+    {
+      "name": "oxp_invocation_detail",
       "entityType": "tables"
     },
     {
@@ -332,6 +336,14 @@
     },
     {
       "name": "usage_record",
+      "entityType": "tables"
+    },
+    {
+      "name": "usage_yield_meta",
+      "entityType": "tables"
+    },
+    {
+      "name": "usage_yield_stat",
       "entityType": "tables"
     },
     {
@@ -2058,7 +2070,7 @@
       "type": "text",
       "notNull": true,
       "autoincrement": false,
-      "default": "'{\"mode\":\"manual\"}'",
+      "default": "'{}'",
       "generated": null,
       "name": "continuation_policy",
       "entityType": "columns",
@@ -3213,6 +3225,36 @@
       "name": "last_seen_at",
       "entityType": "columns",
       "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "invocation_id",
+      "entityType": "columns",
+      "table": "oxp_invocation_detail"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request",
+      "entityType": "columns",
+      "table": "oxp_invocation_detail"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "outcome",
+      "entityType": "columns",
+      "table": "oxp_invocation_detail"
     },
     {
       "type": "text",
@@ -7800,6 +7842,26 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "base_model_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "variant",
       "entityType": "columns",
       "table": "usage_record"
@@ -7933,6 +7995,106 @@
       "name": "reasoning_tokens",
       "entityType": "columns",
       "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "usage_yield_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "version",
+      "entityType": "columns",
+      "table": "usage_yield_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "rebuilt_at",
+      "entityType": "columns",
+      "table": "usage_yield_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_rows",
+      "entityType": "columns",
+      "table": "usage_yield_meta"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "stat_key",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "base_model_id",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "usage_yield_stat"
     },
     {
       "columns": [
@@ -8353,6 +8515,21 @@
       "name": "fk_oxp_correlation_ref_activity_id_oxp_parent_activity_id_fk",
       "entityType": "fks",
       "table": "oxp_correlation_ref"
+    },
+    {
+      "columns": [
+        "invocation_id"
+      ],
+      "tableTo": "oxp_invocation",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_oxp_invocation_detail_invocation_id_oxp_invocation_id_fk",
+      "entityType": "fks",
+      "table": "oxp_invocation_detail"
     },
     {
       "columns": [
@@ -9527,6 +9704,15 @@
     },
     {
       "columns": [
+        "invocation_id"
+      ],
+      "nameExplicit": false,
+      "name": "oxp_invocation_detail_pk",
+      "table": "oxp_invocation_detail",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -9829,6 +10015,24 @@
       "nameExplicit": false,
       "name": "usage_record_pk",
       "table": "usage_record",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "usage_yield_meta_pk",
+      "table": "usage_yield_meta",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "stat_key"
+      ],
+      "nameExplicit": false,
+      "name": "usage_yield_stat_pk",
+      "table": "usage_yield_stat",
       "entityType": "pks"
     },
     {
@@ -12408,6 +12612,94 @@
       "name": "usage_record_model_completed_idx",
       "entityType": "indexes",
       "table": "usage_record"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "base_model_id",
+          "isExpression": false
+        },
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_record_base_model_completed_idx",
+      "entityType": "indexes",
+      "table": "usage_record"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "base_model_id",
+          "isExpression": false
+        },
+        {
+          "value": "account_id",
+          "isExpression": false
+        },
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_record_account_model_completed_idx",
+      "entityType": "indexes",
+      "table": "usage_record"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "base_model_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_yield_stat_model_idx",
+      "entityType": "indexes",
+      "table": "usage_yield_stat"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "base_model_id",
+          "isExpression": false
+        },
+        {
+          "value": "account_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_yield_stat_account_idx",
+      "entityType": "indexes",
+      "table": "usage_yield_stat"
     },
     {
       "columns": [

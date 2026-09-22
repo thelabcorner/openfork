@@ -8,7 +8,7 @@ import { MessageID } from "@/session/schema"
 import { WorkspaceRef } from "@/effect/instance-ref"
 import { InstanceStore } from "@/project/instance-store"
 import { Session } from "@/session/session"
-import { Effect, Scope } from "effect"
+import { Cause, Effect, Scope } from "effect"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import * as ApiError from "../errors"
@@ -115,11 +115,32 @@ export const goalHandlers = HttpApiBuilder.group(InstanceHttpApi, "goal", (handl
           yield* audit.pipe(
             Effect.catchCause((cause) =>
               Effect.gen(function* () {
-                const error = String(cause)
+                const error = Cause.squash(cause)
+                if (
+                  error instanceof Session.BusyError ||
+                  (typeof error === "object" &&
+                    error !== null &&
+                    "_tag" in error &&
+                    error._tag === "SessionBusyError")
+                ) {
+                  // Session execution ownership is a serialization signal, not
+                  // evidence that the auditor itself failed. The durable audit
+                  // request remains latched and SessionPrompt owns preemption.
+                  yield* Effect.logInfo("Goal audit dispatch coalesced with existing Session owner", {
+                    sessionID,
+                    goalID: ctx.params.goalID,
+                  })
+                  return
+                }
+                const message = error instanceof Error ? error.message : String(error)
                 yield* automation
-                  .failAudit({ sessionID, error: `Goal audit dispatch failed before the auditor could run: ${error}` })
+                  .failAudit({ sessionID, error: `Goal audit orchestration failed: ${message}` })
                   .pipe(Effect.ignore)
-                yield* Effect.logError("Goal audit dispatch failed", { sessionID, goalID: ctx.params.goalID, cause })
+                yield* Effect.logError("Goal audit orchestration failed", {
+                  sessionID,
+                  goalID: ctx.params.goalID,
+                  cause: Cause.pretty(cause),
+                })
               }),
             ),
             Effect.forkIn(scope, { startImmediately: true }),
