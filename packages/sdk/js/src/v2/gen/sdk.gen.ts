@@ -92,6 +92,8 @@ import type {
   FindSymbolsResponses,
   FindTextErrors,
   FindTextResponses,
+  ForkCapacityGetErrors,
+  ForkCapacityGetResponses,
   ForkCredentialAddErrors,
   ForkCredentialAddResponses,
   ForkCredentialListErrors,
@@ -130,6 +132,8 @@ import type {
   GlobalOxpActivityPatch,
   GlobalOxpActivityUpdateErrors,
   GlobalOxpActivityUpdateResponses,
+  GlobalOxpInvocationDetailErrors,
+  GlobalOxpInvocationDetailResponses,
   GlobalOxpInvocationsErrors,
   GlobalOxpInvocationsResponses,
   GlobalOxpResourceErrors,
@@ -329,6 +333,8 @@ import type {
   QuotaGetResponses,
   QuotaProvidersErrors,
   QuotaProvidersResponses,
+  QuotaResetsErrors,
+  QuotaResetsResponses,
   RevisionDraftConsumeErrors,
   RevisionDraftConsumeResponses,
   RevisionDraftRecoverErrors,
@@ -1923,6 +1929,20 @@ export class Usage extends HeyApiClient {
   }
 }
 
+export class Capacity extends HeyApiClient {
+  /**
+   * Get OpenCode Go request capacity
+   *
+   * Projects remaining requests from the official quota fraction, published per-model Go priors, and durable personal workload statistics. Does not perform a second ungated usage-endpoint read.
+   */
+  public get<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<ForkCapacityGetResponses, ForkCapacityGetErrors, ThrowOnError>({
+      url: "/fork/capacity",
+      ...options,
+    })
+  }
+}
+
 export class Fork extends HeyApiClient {
   private _credential?: Credential
   get credential(): Credential {
@@ -1932,6 +1952,11 @@ export class Fork extends HeyApiClient {
   private _usage?: Usage
   get usage(): Usage {
     return (this._usage ??= new Usage({ client: this.client }))
+  }
+
+  private _capacity?: Capacity
+  get capacity(): Capacity {
+    return (this._capacity ??= new Capacity({ client: this.client }))
   }
 }
 
@@ -2304,6 +2329,29 @@ export class Global extends HeyApiClient {
   }
 
   /**
+   * Read one OXP invocation detail payload
+   *
+   * Read the bounded, redacted request and outcome payload for one invocation. Detail is intentionally separate from invocation-list rows so activity timelines stay compact until a user expands a tool call.
+   */
+  public oxpInvocationDetail<ThrowOnError extends boolean = false>(
+    parameters: {
+      invocationID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "invocationID" }] }])
+    return (options?.client ?? this.client).get<
+      GlobalOxpInvocationDetailResponses,
+      GlobalOxpInvocationDetailErrors,
+      ThrowOnError
+    >({
+      url: "/global/oxp/invocation/{invocationID}/detail",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Find OXP provenance for a native resource
    *
    * Reverse lookup over durable OXP causal links. This is observability-only history and never grants authority over the referenced resource.
@@ -2633,6 +2681,69 @@ export class Usage2 extends HeyApiClient {
     return (options?.client ?? this.client).get<UsagePricingCatalogResponses, UsagePricingCatalogErrors, ThrowOnError>({
       url: "/usage/pricing-catalog",
       ...options,
+    })
+  }
+}
+
+export class Quota extends HeyApiClient {
+  /**
+   * List quota providers
+   *
+   * Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.
+   */
+  public providers<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<QuotaProvidersResponses, QuotaProvidersErrors, ThrowOnError>({
+      url: "/quota/providers",
+      ...options,
+    })
+  }
+
+  /**
+   * Quota reset calendar agenda
+   *
+   * Tier 0 bounded projection of reset deadlines already known by the quota/fork usage owners. It does not synthesize future recurrences and never materializes a workspace Instance.
+   */
+  public resets<ThrowOnError extends boolean = false>(
+    parameters: {
+      from: string
+      to: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "from" },
+            { in: "query", key: "to" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<QuotaResetsResponses, QuotaResetsErrors, ThrowOnError>({
+      url: "/quota/resets",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get provider quota
+   *
+   * Fetches the provider's account usage/balance endpoint and normalizes it into quota windows. Failures are reported inside the result envelope (ok=false), not as HTTP errors.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      providerID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "providerID" }] }])
+    return (options?.client ?? this.client).get<QuotaGetResponses, QuotaGetErrors, ThrowOnError>({
+      url: "/quota/{providerID}",
+      ...options,
+      ...params,
     })
   }
 }
@@ -6595,39 +6706,6 @@ export class Provider extends HeyApiClient {
   private _oauth?: Oauth
   get oauth(): Oauth {
     return (this._oauth ??= new Oauth({ client: this.client }))
-  }
-}
-
-export class Quota extends HeyApiClient {
-  /**
-   * List quota providers
-   *
-   * Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.
-   */
-  public providers<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
-    return (options?.client ?? this.client).get<QuotaProvidersResponses, QuotaProvidersErrors, ThrowOnError>({
-      url: "/quota/providers",
-      ...options,
-    })
-  }
-
-  /**
-   * Get provider quota
-   *
-   * Fetches the provider's account usage/balance endpoint and normalizes it into quota windows. Failures are reported inside the result envelope (ok=false), not as HTTP errors.
-   */
-  public get<ThrowOnError extends boolean = false>(
-    parameters: {
-      providerID: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "providerID" }] }])
-    return (options?.client ?? this.client).get<QuotaGetResponses, QuotaGetErrors, ThrowOnError>({
-      url: "/quota/{providerID}",
-      ...options,
-      ...params,
-    })
   }
 }
 
@@ -12704,6 +12782,11 @@ export class OpencodeClient extends HeyApiClient {
     return (this._usage ??= new Usage2({ client: this.client }))
   }
 
+  private _quota?: Quota
+  get quota(): Quota {
+    return (this._quota ??= new Quota({ client: this.client }))
+  }
+
   private _ofxp?: Ofxp
   get ofxp(): Ofxp {
     return (this._ofxp ??= new Ofxp({ client: this.client }))
@@ -12827,11 +12910,6 @@ export class OpencodeClient extends HeyApiClient {
   private _provider?: Provider
   get provider(): Provider {
     return (this._provider ??= new Provider({ client: this.client }))
-  }
-
-  private _quota?: Quota
-  get quota(): Quota {
-    return (this._quota ??= new Quota({ client: this.client }))
   }
 
   private _session?: Session2

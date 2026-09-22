@@ -16,11 +16,10 @@ import { useCommandShortcut } from "../keymap"
 import { useProject } from "../context/project"
 import { Spinner } from "./spinner"
 import { DialogWorkspaceFileChanges } from "./dialog-workspace-file-changes"
-import type { ProjectDirectories } from "@opencode-ai/sdk/v2"
 import { useRoute } from "../context/route"
 
 export type MoveSessionSelection = { type: "directory"; directory: string; subdirectory: boolean } | { type: "new" }
-type ProjectDirectory = ProjectDirectories[number]
+type ProjectDirectory = { directory: string; strategy?: string }
 
 type DialogMoveSessionProps = {
   projectID: string
@@ -80,17 +79,17 @@ export function DialogMoveSession(props: DialogMoveSessionProps) {
         )
         const directories = await sdk.client.project.directories({ projectID }, { throwOnError: true })
         setLoadError(undefined)
-        return directories.data ?? []
+        return (directories.data as ProjectDirectory[] | undefined) ?? []
       } catch (error) {
         setLoadError(error)
         // An initial load with no data surfaces the inline error view below. A
         // failed refresh intentionally stays quiet and keeps the already-shown
         // list interactive; reopening the dialog retries the load.
-        return info.value
+        return info.value as ProjectDirectory[] | undefined
       }
     },
   )
-  const directoryData = createMemo(() => directories() ?? props.initialDirectories)
+  const directoryData = createMemo((): ProjectDirectory[] => (directories() as ProjectDirectory[] | undefined) ?? props.initialDirectories ?? [])
   // Show the locked error view only when we have nothing to display. A refresh
   // that fails after the list rendered keeps the list and its actions.
   const showError = createMemo(() => Boolean(loadError()) && !directoryData())

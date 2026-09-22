@@ -1982,6 +1982,7 @@ export type GlobalEvent = {
           items: Array<{
             sessionID: string
             phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+            turnStartedAt?: number
             phaseStartedAt?: number
             updatedAt: number
             model?: {
@@ -2236,6 +2237,7 @@ export type GlobalSessionTelemetryResult = {
   [key: string]: {
     sessionID: string
     phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+    turnStartedAt?: number
     phaseStartedAt?: number
     updatedAt: number
     model?: {
@@ -2341,6 +2343,16 @@ export type OxpInvocationPage = {
   before?: {
     startedAt: number
     id: string
+  }
+}
+
+export type OxpInvocationDetailInfo = {
+  invocationID: string
+  request?: {
+    [key: string]: unknown
+  }
+  outcome?: {
+    [key: string]: unknown
   }
 }
 
@@ -4503,10 +4515,7 @@ export type PermissionV2Boundary = Array<PermissionV2Rule>
 
 export type GoalStatus = "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
 
-export type GoalAutomationMode = "manual" | "auto_continue" | "unattended"
-
 export type GoalContinuationPolicy = {
-  mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -8443,7 +8452,6 @@ export type FileEdited = {
 }
 
 export type GoalContinuationPolicy5 = {
-  mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
@@ -8693,7 +8701,6 @@ export type ScheduledTaskSchedule1 =
     }
 
 export type GoalContinuationPolicy6 = {
-  mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
@@ -9784,6 +9791,7 @@ export type SessionTelemetryUpdated = {
     items: Array<{
       sessionID: string
       phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
       model?: {
@@ -10819,7 +10827,6 @@ export type EventFileEdited = {
 }
 
 export type GoalContinuationPolicy7 = {
-  mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
@@ -10951,7 +10958,6 @@ export type EventOxpActivityLinkAdded = {
 }
 
 export type GoalContinuationPolicy8 = {
-  mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
@@ -11507,6 +11513,7 @@ export type EventSessionTelemetryUpdated = {
     items: Array<{
       sessionID: string
       phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
       model?: {
@@ -12057,6 +12064,145 @@ export type ForkUsageGetResponses = {
 
 export type ForkUsageGetResponse = ForkUsageGetResponses[keyof ForkUsageGetResponses]
 
+export type ForkCapacityGetData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/fork/capacity"
+}
+
+export type ForkCapacityGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkCapacityGetError = ForkCapacityGetErrors[keyof ForkCapacityGetErrors]
+
+export type ForkCapacityGetResponses = {
+  /**
+   * Personalized OpenCode Go request-capacity projection
+   */
+  200: {
+    providerID: "opencode-go"
+    priorStatus: "ok" | "stale" | "error"
+    priorFetchedAt: number
+    routedAccountID?: string
+    routed: Array<{
+      modelID: string
+      accountID?: string
+      baselineRequests: number
+      estimatedRequests: number
+      remainingFraction: number
+      remainingPercent: number
+      workloadMultiplier: number
+      workloadSource: "published-prior" | "personal-base" | "account-hierarchical"
+      personalized: boolean
+      resetAt: number
+      quotaStatus: "ok" | "stale"
+      projectionStatus: "ok" | "incomplete-local-accounting"
+      predictiveRange:
+        | {
+            status: "learning"
+            effectiveSamples: number
+            matureAt: number
+          }
+        | {
+            status: "calibrated"
+            effectiveSamples: number
+            matureAt: number
+            targetCoverage: number
+            heldOutCoverage: number
+            calibrationBudget: 5 | 20 | 100
+            lowerRequests: number
+            upperRequests: number
+          }
+        | {
+            status: "unavailable"
+            effectiveSamples: number
+            matureAt: number
+            reason: "incomplete-local-accounting"
+          }
+      evidence: {
+        observations: number
+        requestEffectiveSamples: number
+        sessionEffectiveSamples: number
+        personalWeight: number
+        baseObservations: number
+        baseRequestEffectiveSamples: number
+        baseSessionEffectiveSamples: number
+        basePersonalWeight: number
+        accountObservations: number
+        accountRequestEffectiveSamples: number
+        accountSessionEffectiveSamples: number
+        accountPersonalWeight: number
+        localRequestsApplied: number
+        localFractionConsumed: number
+        localUnnormalizedRequests: number
+      }
+    }>
+    accounts: Array<{
+      accountID: string
+      estimates: Array<{
+        modelID: string
+        accountID?: string
+        baselineRequests: number
+        estimatedRequests: number
+        remainingFraction: number
+        remainingPercent: number
+        workloadMultiplier: number
+        workloadSource: "published-prior" | "personal-base" | "account-hierarchical"
+        personalized: boolean
+        resetAt: number
+        quotaStatus: "ok" | "stale"
+        projectionStatus: "ok" | "incomplete-local-accounting"
+        predictiveRange:
+          | {
+              status: "learning"
+              effectiveSamples: number
+              matureAt: number
+            }
+          | {
+              status: "calibrated"
+              effectiveSamples: number
+              matureAt: number
+              targetCoverage: number
+              heldOutCoverage: number
+              calibrationBudget: 5 | 20 | 100
+              lowerRequests: number
+              upperRequests: number
+            }
+          | {
+              status: "unavailable"
+              effectiveSamples: number
+              matureAt: number
+              reason: "incomplete-local-accounting"
+            }
+        evidence: {
+          observations: number
+          requestEffectiveSamples: number
+          sessionEffectiveSamples: number
+          personalWeight: number
+          baseObservations: number
+          baseRequestEffectiveSamples: number
+          baseSessionEffectiveSamples: number
+          basePersonalWeight: number
+          accountObservations: number
+          accountRequestEffectiveSamples: number
+          accountSessionEffectiveSamples: number
+          accountPersonalWeight: number
+          localRequestsApplied: number
+          localFractionConsumed: number
+          localUnnormalizedRequests: number
+        }
+      }>
+    }>
+  }
+}
+
+export type ForkCapacityGetResponse = ForkCapacityGetResponses[keyof ForkCapacityGetResponses]
+
 export type GlobalHealthData = {
   body?: never
   path?: never
@@ -12364,6 +12510,34 @@ export type GlobalOxpInvocationsResponses = {
 }
 
 export type GlobalOxpInvocationsResponse = GlobalOxpInvocationsResponses[keyof GlobalOxpInvocationsResponses]
+
+export type GlobalOxpInvocationDetailData = {
+  body?: never
+  path: {
+    invocationID: string
+  }
+  query?: never
+  url: "/global/oxp/invocation/{invocationID}/detail"
+}
+
+export type GlobalOxpInvocationDetailErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpInvocationDetailError = GlobalOxpInvocationDetailErrors[keyof GlobalOxpInvocationDetailErrors]
+
+export type GlobalOxpInvocationDetailResponses = {
+  /**
+   * Lazy OXP invocation request/outcome detail
+   */
+  200: OxpInvocationDetailInfo
+}
+
+export type GlobalOxpInvocationDetailResponse =
+  GlobalOxpInvocationDetailResponses[keyof GlobalOxpInvocationDetailResponses]
 
 export type GlobalOxpResourceData = {
   body?: never
@@ -13252,6 +13426,246 @@ export type UsagePricingCatalogResponses = {
 }
 
 export type UsagePricingCatalogResponse = UsagePricingCatalogResponses[keyof UsagePricingCatalogResponses]
+
+export type QuotaProvidersData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/quota/providers"
+}
+
+export type QuotaProvidersErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type QuotaProvidersError = QuotaProvidersErrors[keyof QuotaProvidersErrors]
+
+export type QuotaProvidersResponses = {
+  /**
+   * Registered quota providers with configured state
+   */
+  200: {
+    providers: Array<{
+      providerId: string
+      providerName: string
+      configured: boolean
+    }>
+  }
+}
+
+export type QuotaProvidersResponse = QuotaProvidersResponses[keyof QuotaProvidersResponses]
+
+export type QuotaResetsData = {
+  body?: never
+  path?: never
+  query: {
+    from: string
+    to: string
+  }
+  url: "/quota/resets"
+}
+
+export type QuotaResetsErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type QuotaResetsError = QuotaResetsErrors[keyof QuotaResetsErrors]
+
+export type QuotaResetsResponses = {
+  /**
+   * Known provider quota reset deadlines for a bounded calendar range
+   */
+  200: {
+    from: number
+    to: number
+    generatedAt: number
+    occurrences: Array<{
+      id: string
+      providerId: string
+      providerName: string
+      resetAt: number
+      observedAt: number
+      scope: "provider" | "account" | "model" | "account-model"
+      accountId?: string
+      accountLabel?: string
+      model?: string
+      windows: Array<{
+        key: string
+        usedPercent: number
+        remainingPercent: number
+        valueLabel: string
+        source: "provider" | "observed" | "inferred" | "local"
+      }>
+    }>
+    failures: Array<{
+      providerId: string
+      providerName: string
+      error: string
+    }>
+  }
+}
+
+export type QuotaResetsResponse = QuotaResetsResponses[keyof QuotaResetsResponses]
+
+export type QuotaGetData = {
+  body?: never
+  path: {
+    providerID: string
+  }
+  query?: never
+  url: "/quota/{providerID}"
+}
+
+export type QuotaGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type QuotaGetError = QuotaGetErrors[keyof QuotaGetErrors]
+
+export type QuotaGetResponses = {
+  /**
+   * Normalized provider quota result
+   */
+  200: {
+    providerId: string
+    providerName: string
+    ok: boolean
+    configured: boolean
+    error?: string
+    planLabel?: string
+    usage: {
+      windows: {
+        [key: string]: {
+          usedPercent: number
+          remainingPercent: number
+          windowSeconds: number
+          resetAt: number
+          resetAfterSeconds: number
+          valueLabel: string
+        }
+      }
+      models?: {
+        [key: string]: {
+          windows: {
+            [key: string]: {
+              usedPercent: number
+              remainingPercent: number
+              windowSeconds: number
+              resetAt: number
+              resetAfterSeconds: number
+              valueLabel: string
+            }
+          }
+          rate?: number
+          rateFree?: boolean
+          rateLabel?: string
+          promotionLabel?: string
+        }
+      }
+      accountLabels?: {
+        [key: string]: string
+      }
+      workbuddyAccounts?: Array<{
+        accountId: string
+        label: string
+        models: Array<{
+          model: string
+          canonical: string
+          unit: string
+          usedObserved: number
+          limitEstimate: number
+          remainingEstimate: number
+          remainingPercent: number
+          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
+          confidence: "low" | "medium" | "high"
+          accuracy: "observed" | "estimate" | "server-confirmed"
+          exhaustedObserved: boolean
+          serverCode: number
+          resetAt: number
+          resetSource: "server-6004" | "inferred" | "unknown"
+          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
+          windowStartedAt: number
+          secondsUntilReset: number
+          lastObservationAt: number
+          burnPerHour: number
+          estimatedExhaustionAt: number
+          willLikelyExhaustBeforeReset: boolean
+          creditsObserved: number
+          tokensInput: number
+          tokensOutput: number
+          tokensCacheHit: number
+          tokensCacheMiss: number
+          creditsPersonalized: boolean
+          coverage: "opencode-only"
+        }>
+      }>
+      verdentAccounts?: Array<{
+        accountId: string
+        label: string
+        models: Array<{
+          model: string
+          canonical: string
+          unit: string
+          usedObserved: number
+          limitEstimate: number
+          remainingEstimate: number
+          remainingPercent: number
+          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
+          confidence: "low" | "medium" | "high"
+          accuracy: "observed" | "estimate" | "server-confirmed"
+          exhaustedObserved: boolean
+          serverCode: number
+          resetAt: number
+          resetSource: "server-6004" | "inferred" | "unknown"
+          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
+          windowStartedAt: number
+          secondsUntilReset: number
+          lastObservationAt: number
+          burnPerHour: number
+          estimatedExhaustionAt: number
+          willLikelyExhaustBeforeReset: boolean
+          creditsObserved: number
+          tokensInput: number
+          tokensOutput: number
+          tokensCacheHit: number
+          tokensCacheMiss: number
+          creditsPersonalized: boolean
+          coverage: "opencode-only"
+        }>
+      }>
+      zenAccounts?: Array<{
+        keyId: string
+        label: string
+        state: "ready" | "cooling" | "exhausted" | "unknown"
+        exhausted: boolean
+        isDefault: boolean
+        resetAt: number
+        resetAfterSeconds: number
+        usedObserved: number
+        limitEstimate: number
+        remainingPercent: number
+        estimateSource: "fallback" | "learned" | "lower-bound"
+      }>
+    }
+    fetchedAt: number
+    nextRefreshAt?: number
+  }
+}
+
+export type QuotaGetResponse = QuotaGetResponses[keyof QuotaGetResponses]
 
 export type OfxpStateData = {
   body?: never
@@ -17568,191 +17982,6 @@ export type ProviderOauthCallbackResponses = {
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
 
-export type QuotaProvidersData = {
-  body?: never
-  path?: never
-  query?: never
-  url: "/quota/providers"
-}
-
-export type QuotaProvidersErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type QuotaProvidersError = QuotaProvidersErrors[keyof QuotaProvidersErrors]
-
-export type QuotaProvidersResponses = {
-  /**
-   * Registered quota providers with configured state
-   */
-  200: {
-    providers: Array<{
-      providerId: string
-      providerName: string
-      configured: boolean
-    }>
-  }
-}
-
-export type QuotaProvidersResponse = QuotaProvidersResponses[keyof QuotaProvidersResponses]
-
-export type QuotaGetData = {
-  body?: never
-  path: {
-    providerID: string
-  }
-  query?: never
-  url: "/quota/{providerID}"
-}
-
-export type QuotaGetErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type QuotaGetError = QuotaGetErrors[keyof QuotaGetErrors]
-
-export type QuotaGetResponses = {
-  /**
-   * Normalized provider quota result
-   */
-  200: {
-    providerId: string
-    providerName: string
-    ok: boolean
-    configured: boolean
-    error?: string
-    planLabel?: string
-    usage: {
-      windows: {
-        [key: string]: {
-          usedPercent: number
-          remainingPercent: number
-          windowSeconds: number
-          resetAt: number
-          resetAfterSeconds: number
-          valueLabel: string
-        }
-      }
-      models?: {
-        [key: string]: {
-          windows: {
-            [key: string]: {
-              usedPercent: number
-              remainingPercent: number
-              windowSeconds: number
-              resetAt: number
-              resetAfterSeconds: number
-              valueLabel: string
-            }
-          }
-          rate?: number
-          rateFree?: boolean
-          rateLabel?: string
-          promotionLabel?: string
-        }
-      }
-      accountLabels?: {
-        [key: string]: string
-      }
-      workbuddyAccounts?: Array<{
-        accountId: string
-        label: string
-        models: Array<{
-          model: string
-          canonical: string
-          unit: string
-          usedObserved: number
-          limitEstimate: number
-          remainingEstimate: number
-          remainingPercent: number
-          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
-          confidence: "low" | "medium" | "high"
-          accuracy: "observed" | "estimate" | "server-confirmed"
-          exhaustedObserved: boolean
-          serverCode: number
-          resetAt: number
-          resetSource: "server-6004" | "inferred" | "unknown"
-          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
-          windowStartedAt: number
-          secondsUntilReset: number
-          lastObservationAt: number
-          burnPerHour: number
-          estimatedExhaustionAt: number
-          willLikelyExhaustBeforeReset: boolean
-          creditsObserved: number
-          tokensInput: number
-          tokensOutput: number
-          tokensCacheHit: number
-          tokensCacheMiss: number
-          creditsPersonalized: boolean
-          coverage: "opencode-only"
-        }>
-      }>
-      verdentAccounts?: Array<{
-        accountId: string
-        label: string
-        models: Array<{
-          model: string
-          canonical: string
-          unit: string
-          usedObserved: number
-          limitEstimate: number
-          remainingEstimate: number
-          remainingPercent: number
-          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
-          confidence: "low" | "medium" | "high"
-          accuracy: "observed" | "estimate" | "server-confirmed"
-          exhaustedObserved: boolean
-          serverCode: number
-          resetAt: number
-          resetSource: "server-6004" | "inferred" | "unknown"
-          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
-          windowStartedAt: number
-          secondsUntilReset: number
-          lastObservationAt: number
-          burnPerHour: number
-          estimatedExhaustionAt: number
-          willLikelyExhaustBeforeReset: boolean
-          creditsObserved: number
-          tokensInput: number
-          tokensOutput: number
-          tokensCacheHit: number
-          tokensCacheMiss: number
-          creditsPersonalized: boolean
-          coverage: "opencode-only"
-        }>
-      }>
-      zenAccounts?: Array<{
-        keyId: string
-        label: string
-        state: "ready" | "cooling" | "exhausted" | "unknown"
-        exhausted: boolean
-        isDefault: boolean
-        resetAt: number
-        resetAfterSeconds: number
-        usedObserved: number
-        limitEstimate: number
-        remainingPercent: number
-        estimateSource: "fallback" | "learned" | "lower-bound"
-      }>
-    }
-    fetchedAt: number
-    nextRefreshAt?: number
-  }
-}
-
-export type QuotaGetResponse = QuotaGetResponses[keyof QuotaGetResponses]
-
 export type SessionListData = {
   body?: never
   path?: never
@@ -20262,6 +20491,10 @@ export type SystemOneInferErrors = {
    */
   502: UpstreamError
   /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+  /**
    * TimeoutError
    */
   504: TimeoutError
@@ -21552,6 +21785,7 @@ export type V2SessionTelemetryResponses = {
         | {
             sessionID: unknown
             phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+            turnStartedAt?: number | null
             phaseStartedAt?: number | null
             updatedAt: number
             model?: {

@@ -717,6 +717,16 @@
                     },
                     "defaultAccountLabel": {
                       "type": "string"
+                    },
+                    "routedAccountID": {
+                      "type": "string"
+                    },
+                    "routedAccountLabel": {
+                      "type": "string"
+                    },
+                    "routedAccountSource": {
+                      "type": "string",
+                      "enum": ["provider", "pool"]
                     }
                   },
                   "required": ["aggregate", "byCredential"],
@@ -742,6 +752,505 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.fork.usage.get({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/fork/capacity": {
+      "get": {
+        "tags": ["fork-credential"],
+        "operationId": "fork.capacity.get",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Personalized OpenCode Go request-capacity projection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "providerID": {
+                      "type": "string",
+                      "enum": ["opencode-go"]
+                    },
+                    "priorStatus": {
+                      "type": "string",
+                      "enum": ["ok", "stale", "error"]
+                    },
+                    "priorFetchedAt": {
+                      "type": "number"
+                    },
+                    "routedAccountID": {
+                      "type": "string"
+                    },
+                    "routed": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "modelID": {
+                            "type": "string"
+                          },
+                          "accountID": {
+                            "type": "string"
+                          },
+                          "baselineRequests": {
+                            "type": "number"
+                          },
+                          "estimatedRequests": {
+                            "type": "number"
+                          },
+                          "remainingFraction": {
+                            "type": "number"
+                          },
+                          "remainingPercent": {
+                            "type": "number"
+                          },
+                          "workloadMultiplier": {
+                            "type": "number"
+                          },
+                          "workloadSource": {
+                            "type": "string",
+                            "enum": ["published-prior", "personal-base", "account-hierarchical"]
+                          },
+                          "personalized": {
+                            "type": "boolean"
+                          },
+                          "resetAt": {
+                            "type": "number"
+                          },
+                          "quotaStatus": {
+                            "type": "string",
+                            "enum": ["ok", "stale"]
+                          },
+                          "projectionStatus": {
+                            "type": "string",
+                            "enum": ["ok", "incomplete-local-accounting"]
+                          },
+                          "predictiveRange": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "status": {
+                                    "type": "string",
+                                    "enum": ["learning"]
+                                  },
+                                  "effectiveSamples": {
+                                    "type": "number"
+                                  },
+                                  "matureAt": {
+                                    "type": "number"
+                                  }
+                                },
+                                "required": ["status", "effectiveSamples", "matureAt"],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "status": {
+                                    "type": "string",
+                                    "enum": ["calibrated"]
+                                  },
+                                  "effectiveSamples": {
+                                    "type": "number"
+                                  },
+                                  "matureAt": {
+                                    "type": "number"
+                                  },
+                                  "targetCoverage": {
+                                    "type": "number"
+                                  },
+                                  "heldOutCoverage": {
+                                    "type": "number"
+                                  },
+                                  "calibrationBudget": {
+                                    "type": "number",
+                                    "enum": [5, 20, 100]
+                                  },
+                                  "lowerRequests": {
+                                    "type": "number"
+                                  },
+                                  "upperRequests": {
+                                    "type": "number"
+                                  }
+                                },
+                                "required": [
+                                  "status",
+                                  "effectiveSamples",
+                                  "matureAt",
+                                  "targetCoverage",
+                                  "heldOutCoverage",
+                                  "calibrationBudget",
+                                  "lowerRequests",
+                                  "upperRequests"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "status": {
+                                    "type": "string",
+                                    "enum": ["unavailable"]
+                                  },
+                                  "effectiveSamples": {
+                                    "type": "number"
+                                  },
+                                  "matureAt": {
+                                    "type": "number"
+                                  },
+                                  "reason": {
+                                    "type": "string",
+                                    "enum": ["incomplete-local-accounting"]
+                                  }
+                                },
+                                "required": ["status", "effectiveSamples", "matureAt", "reason"],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "evidence": {
+                            "type": "object",
+                            "properties": {
+                              "observations": {
+                                "type": "number"
+                              },
+                              "requestEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "sessionEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "personalWeight": {
+                                "type": "number"
+                              },
+                              "baseObservations": {
+                                "type": "number"
+                              },
+                              "baseRequestEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "baseSessionEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "basePersonalWeight": {
+                                "type": "number"
+                              },
+                              "accountObservations": {
+                                "type": "number"
+                              },
+                              "accountRequestEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "accountSessionEffectiveSamples": {
+                                "type": "number"
+                              },
+                              "accountPersonalWeight": {
+                                "type": "number"
+                              },
+                              "localRequestsApplied": {
+                                "type": "number"
+                              },
+                              "localFractionConsumed": {
+                                "type": "number"
+                              },
+                              "localUnnormalizedRequests": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "observations",
+                              "requestEffectiveSamples",
+                              "sessionEffectiveSamples",
+                              "personalWeight",
+                              "baseObservations",
+                              "baseRequestEffectiveSamples",
+                              "baseSessionEffectiveSamples",
+                              "basePersonalWeight",
+                              "accountObservations",
+                              "accountRequestEffectiveSamples",
+                              "accountSessionEffectiveSamples",
+                              "accountPersonalWeight",
+                              "localRequestsApplied",
+                              "localFractionConsumed",
+                              "localUnnormalizedRequests"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "modelID",
+                          "baselineRequests",
+                          "estimatedRequests",
+                          "remainingFraction",
+                          "remainingPercent",
+                          "workloadMultiplier",
+                          "workloadSource",
+                          "personalized",
+                          "resetAt",
+                          "quotaStatus",
+                          "projectionStatus",
+                          "predictiveRange",
+                          "evidence"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "accounts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "accountID": {
+                            "type": "string"
+                          },
+                          "estimates": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "modelID": {
+                                  "type": "string"
+                                },
+                                "accountID": {
+                                  "type": "string"
+                                },
+                                "baselineRequests": {
+                                  "type": "number"
+                                },
+                                "estimatedRequests": {
+                                  "type": "number"
+                                },
+                                "remainingFraction": {
+                                  "type": "number"
+                                },
+                                "remainingPercent": {
+                                  "type": "number"
+                                },
+                                "workloadMultiplier": {
+                                  "type": "number"
+                                },
+                                "workloadSource": {
+                                  "type": "string",
+                                  "enum": ["published-prior", "personal-base", "account-hierarchical"]
+                                },
+                                "personalized": {
+                                  "type": "boolean"
+                                },
+                                "resetAt": {
+                                  "type": "number"
+                                },
+                                "quotaStatus": {
+                                  "type": "string",
+                                  "enum": ["ok", "stale"]
+                                },
+                                "projectionStatus": {
+                                  "type": "string",
+                                  "enum": ["ok", "incomplete-local-accounting"]
+                                },
+                                "predictiveRange": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "string",
+                                          "enum": ["learning"]
+                                        },
+                                        "effectiveSamples": {
+                                          "type": "number"
+                                        },
+                                        "matureAt": {
+                                          "type": "number"
+                                        }
+                                      },
+                                      "required": ["status", "effectiveSamples", "matureAt"],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "string",
+                                          "enum": ["calibrated"]
+                                        },
+                                        "effectiveSamples": {
+                                          "type": "number"
+                                        },
+                                        "matureAt": {
+                                          "type": "number"
+                                        },
+                                        "targetCoverage": {
+                                          "type": "number"
+                                        },
+                                        "heldOutCoverage": {
+                                          "type": "number"
+                                        },
+                                        "calibrationBudget": {
+                                          "type": "number",
+                                          "enum": [5, 20, 100]
+                                        },
+                                        "lowerRequests": {
+                                          "type": "number"
+                                        },
+                                        "upperRequests": {
+                                          "type": "number"
+                                        }
+                                      },
+                                      "required": [
+                                        "status",
+                                        "effectiveSamples",
+                                        "matureAt",
+                                        "targetCoverage",
+                                        "heldOutCoverage",
+                                        "calibrationBudget",
+                                        "lowerRequests",
+                                        "upperRequests"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "status": {
+                                          "type": "string",
+                                          "enum": ["unavailable"]
+                                        },
+                                        "effectiveSamples": {
+                                          "type": "number"
+                                        },
+                                        "matureAt": {
+                                          "type": "number"
+                                        },
+                                        "reason": {
+                                          "type": "string",
+                                          "enum": ["incomplete-local-accounting"]
+                                        }
+                                      },
+                                      "required": ["status", "effectiveSamples", "matureAt", "reason"],
+                                      "additionalProperties": false
+                                    }
+                                  ]
+                                },
+                                "evidence": {
+                                  "type": "object",
+                                  "properties": {
+                                    "observations": {
+                                      "type": "number"
+                                    },
+                                    "requestEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "sessionEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "personalWeight": {
+                                      "type": "number"
+                                    },
+                                    "baseObservations": {
+                                      "type": "number"
+                                    },
+                                    "baseRequestEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "baseSessionEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "basePersonalWeight": {
+                                      "type": "number"
+                                    },
+                                    "accountObservations": {
+                                      "type": "number"
+                                    },
+                                    "accountRequestEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "accountSessionEffectiveSamples": {
+                                      "type": "number"
+                                    },
+                                    "accountPersonalWeight": {
+                                      "type": "number"
+                                    },
+                                    "localRequestsApplied": {
+                                      "type": "number"
+                                    },
+                                    "localFractionConsumed": {
+                                      "type": "number"
+                                    },
+                                    "localUnnormalizedRequests": {
+                                      "type": "number"
+                                    }
+                                  },
+                                  "required": [
+                                    "observations",
+                                    "requestEffectiveSamples",
+                                    "sessionEffectiveSamples",
+                                    "personalWeight",
+                                    "baseObservations",
+                                    "baseRequestEffectiveSamples",
+                                    "baseSessionEffectiveSamples",
+                                    "basePersonalWeight",
+                                    "accountObservations",
+                                    "accountRequestEffectiveSamples",
+                                    "accountSessionEffectiveSamples",
+                                    "accountPersonalWeight",
+                                    "localRequestsApplied",
+                                    "localFractionConsumed",
+                                    "localUnnormalizedRequests"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "required": [
+                                "modelID",
+                                "baselineRequests",
+                                "estimatedRequests",
+                                "remainingFraction",
+                                "remainingPercent",
+                                "workloadMultiplier",
+                                "workloadSource",
+                                "personalized",
+                                "resetAt",
+                                "quotaStatus",
+                                "projectionStatus",
+                                "predictiveRange",
+                                "evidence"
+                              ],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": ["accountID", "estimates"],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": ["providerID", "priorStatus", "priorFetchedAt", "routed", "accounts"],
+                  "additionalProperties": false,
+                  "description": "Personalized OpenCode Go request-capacity projection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Projects remaining requests from the official quota fraction, published per-model Go priors, and durable personal workload statistics. Does not perform a second ungated usage-endpoint read.",
+        "summary": "Get OpenCode Go request capacity",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.fork.capacity.get({\n  ...\n})"
           }
         ]
       }
@@ -1350,6 +1859,53 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.global.oxpInvocations({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/global/oxp/invocation/{invocationID}/detail": {
+      "get": {
+        "tags": ["global"],
+        "operationId": "global.oxpInvocationDetail",
+        "parameters": [
+          {
+            "name": "invocationID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^oxpi_"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lazy OXP invocation request/outcome detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OxpInvocationDetailInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Read the bounded, redacted request and outcome payload for one invocation. Detail is intentionally separate from invocation-list rows so activity timelines stay compact until a user expands a tool call.",
+        "summary": "Read one OXP invocation detail payload",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.global.oxpInvocationDetail({\n  ...\n})"
           }
         ]
       }
@@ -3724,6 +4280,1776 @@
         ]
       }
     },
+    "/quota/providers": {
+      "get": {
+        "tags": ["quota"],
+        "operationId": "quota.providers",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Registered quota providers with configured state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "providers": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "providerId": {
+                            "type": "string"
+                          },
+                          "providerName": {
+                            "type": "string"
+                          },
+                          "configured": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": ["providerId", "providerName", "configured"],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": ["providers"],
+                  "additionalProperties": false,
+                  "description": "Registered quota providers with configured state"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.",
+        "summary": "List quota providers",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.quota.providers({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/quota/resets": {
+      "get": {
+        "tags": ["quota"],
+        "operationId": "quota.resets",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Known provider quota reset deadlines for a bounded calendar range",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "from": {
+                      "type": "number"
+                    },
+                    "to": {
+                      "type": "number"
+                    },
+                    "generatedAt": {
+                      "type": "number"
+                    },
+                    "occurrences": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "providerId": {
+                            "type": "string"
+                          },
+                          "providerName": {
+                            "type": "string"
+                          },
+                          "resetAt": {
+                            "type": "number"
+                          },
+                          "observedAt": {
+                            "type": "number"
+                          },
+                          "scope": {
+                            "type": "string",
+                            "enum": ["provider", "account", "model", "account-model"]
+                          },
+                          "accountId": {
+                            "type": "string"
+                          },
+                          "accountLabel": {
+                            "type": "string"
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "windows": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "key": {
+                                  "type": "string"
+                                },
+                                "usedPercent": {
+                                  "type": "number"
+                                },
+                                "remainingPercent": {
+                                  "type": "number"
+                                },
+                                "valueLabel": {
+                                  "type": "string"
+                                },
+                                "source": {
+                                  "type": "string",
+                                  "enum": ["provider", "observed", "inferred", "local"]
+                                }
+                              },
+                              "required": ["key", "usedPercent", "remainingPercent", "valueLabel", "source"],
+                              "additionalProperties": false
+                            }
+                          }
+                        },
+                        "required": ["id", "providerId", "providerName", "resetAt", "observedAt", "scope", "windows"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "failures": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "providerId": {
+                            "type": "string"
+                          },
+                          "providerName": {
+                            "type": "string"
+                          },
+                          "error": {
+                            "type": "string"
+                          }
+                        },
+                        "required": ["providerId", "providerName", "error"],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": ["from", "to", "generatedAt", "occurrences", "failures"],
+                  "additionalProperties": false,
+                  "description": "Known provider quota reset deadlines for a bounded calendar range"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Tier 0 bounded projection of reset deadlines already known by the quota/fork usage owners. It does not synthesize future recurrences and never materializes a workspace Instance.",
+        "summary": "Quota reset calendar agenda",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.quota.resets({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/quota/{providerID}": {
+      "get": {
+        "tags": ["quota"],
+        "operationId": "quota.get",
+        "parameters": [
+          {
+            "name": "providerID",
+            "in": "path",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Normalized provider quota result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "providerId": {
+                      "type": "string"
+                    },
+                    "providerName": {
+                      "type": "string"
+                    },
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "configured": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string"
+                    },
+                    "planLabel": {
+                      "type": "string"
+                    },
+                    "usage": {
+                      "type": "object",
+                      "properties": {
+                        "windows": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                              "usedPercent": {
+                                "type": "number"
+                              },
+                              "remainingPercent": {
+                                "type": "number"
+                              },
+                              "windowSeconds": {
+                                "type": "number"
+                              },
+                              "resetAt": {
+                                "type": "number"
+                              },
+                              "resetAfterSeconds": {
+                                "type": "number"
+                              },
+                              "valueLabel": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "usedPercent",
+                              "remainingPercent",
+                              "windowSeconds",
+                              "resetAt",
+                              "resetAfterSeconds",
+                              "valueLabel"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "models": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "object",
+                            "properties": {
+                              "windows": {
+                                "type": "object",
+                                "additionalProperties": {
+                                  "type": "object",
+                                  "properties": {
+                                    "usedPercent": {
+                                      "type": "number"
+                                    },
+                                    "remainingPercent": {
+                                      "type": "number"
+                                    },
+                                    "windowSeconds": {
+                                      "type": "number"
+                                    },
+                                    "resetAt": {
+                                      "type": "number"
+                                    },
+                                    "resetAfterSeconds": {
+                                      "type": "number"
+                                    },
+                                    "valueLabel": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "usedPercent",
+                                    "remainingPercent",
+                                    "windowSeconds",
+                                    "resetAt",
+                                    "resetAfterSeconds",
+                                    "valueLabel"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              },
+                              "rate": {
+                                "type": "number"
+                              },
+                              "rateFree": {
+                                "type": "boolean"
+                              },
+                              "rateLabel": {
+                                "type": "string"
+                              },
+                              "promotionLabel": {
+                                "type": "string"
+                              }
+                            },
+                            "required": ["windows"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "accountLabels": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "string"
+                          }
+                        },
+                        "workbuddyAccounts": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "accountId": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "models": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "canonical": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "usedObserved": {
+                                      "type": "number"
+                                    },
+                                    "limitEstimate": {
+                                      "type": "number"
+                                    },
+                                    "remainingEstimate": {
+                                      "type": "number"
+                                    },
+                                    "remainingPercent": {
+                                      "type": "number"
+                                    },
+                                    "status": {
+                                      "type": "string",
+                                      "enum": [
+                                        "healthy",
+                                        "draining",
+                                        "low",
+                                        "critical",
+                                        "terminal",
+                                        "depleted",
+                                        "unknown"
+                                      ]
+                                    },
+                                    "confidence": {
+                                      "type": "string",
+                                      "enum": ["low", "medium", "high"]
+                                    },
+                                    "accuracy": {
+                                      "type": "string",
+                                      "enum": ["observed", "estimate", "server-confirmed"]
+                                    },
+                                    "exhaustedObserved": {
+                                      "type": "boolean"
+                                    },
+                                    "serverCode": {
+                                      "type": "number"
+                                    },
+                                    "resetAt": {
+                                      "type": "number"
+                                    },
+                                    "resetSource": {
+                                      "type": "string",
+                                      "enum": ["server-6004", "inferred", "unknown"]
+                                    },
+                                    "windowType": {
+                                      "type": "string",
+                                      "enum": ["server-defined", "inferred-rolling-24h", "unknown"]
+                                    },
+                                    "windowStartedAt": {
+                                      "type": "number"
+                                    },
+                                    "secondsUntilReset": {
+                                      "type": "number"
+                                    },
+                                    "lastObservationAt": {
+                                      "type": "number"
+                                    },
+                                    "burnPerHour": {
+                                      "type": "number"
+                                    },
+                                    "estimatedExhaustionAt": {
+                                      "type": "number"
+                                    },
+                                    "willLikelyExhaustBeforeReset": {
+                                      "type": "boolean"
+                                    },
+                                    "creditsObserved": {
+                                      "type": "number"
+                                    },
+                                    "tokensInput": {
+                                      "type": "number"
+                                    },
+                                    "tokensOutput": {
+                                      "type": "number"
+                                    },
+                                    "tokensCacheHit": {
+                                      "type": "number"
+                                    },
+                                    "tokensCacheMiss": {
+                                      "type": "number"
+                                    },
+                                    "creditsPersonalized": {
+                                      "type": "boolean"
+                                    },
+                                    "coverage": {
+                                      "type": "string",
+                                      "enum": ["opencode-only"]
+                                    }
+                                  },
+                                  "required": [
+                                    "model",
+                                    "canonical",
+                                    "unit",
+                                    "usedObserved",
+                                    "limitEstimate",
+                                    "remainingEstimate",
+                                    "remainingPercent",
+                                    "status",
+                                    "confidence",
+                                    "accuracy",
+                                    "exhaustedObserved",
+                                    "serverCode",
+                                    "resetAt",
+                                    "resetSource",
+                                    "windowType",
+                                    "windowStartedAt",
+                                    "secondsUntilReset",
+                                    "lastObservationAt",
+                                    "burnPerHour",
+                                    "estimatedExhaustionAt",
+                                    "willLikelyExhaustBeforeReset",
+                                    "creditsObserved",
+                                    "tokensInput",
+                                    "tokensOutput",
+                                    "tokensCacheHit",
+                                    "tokensCacheMiss",
+                                    "creditsPersonalized",
+                                    "coverage"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              }
+                            },
+                            "required": ["accountId", "label", "models"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "verdentAccounts": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "accountId": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "models": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "properties": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "canonical": {
+                                      "type": "string"
+                                    },
+                                    "unit": {
+                                      "type": "string"
+                                    },
+                                    "usedObserved": {
+                                      "type": "number"
+                                    },
+                                    "limitEstimate": {
+                                      "type": "number"
+                                    },
+                                    "remainingEstimate": {
+                                      "type": "number"
+                                    },
+                                    "remainingPercent": {
+                                      "type": "number"
+                                    },
+                                    "status": {
+                                      "type": "string",
+                                      "enum": [
+                                        "healthy",
+                                        "draining",
+                                        "low",
+                                        "critical",
+                                        "terminal",
+                                        "depleted",
+                                        "unknown"
+                                      ]
+                                    },
+                                    "confidence": {
+                                      "type": "string",
+                                      "enum": ["low", "medium", "high"]
+                                    },
+                                    "accuracy": {
+                                      "type": "string",
+                                      "enum": ["observed", "estimate", "server-confirmed"]
+                                    },
+                                    "exhaustedObserved": {
+                                      "type": "boolean"
+                                    },
+                                    "serverCode": {
+                                      "type": "number"
+                                    },
+                                    "resetAt": {
+                                      "type": "number"
+                                    },
+                                    "resetSource": {
+                                      "type": "string",
+                                      "enum": ["server-6004", "inferred", "unknown"]
+                                    },
+                                    "windowType": {
+                                      "type": "string",
+                                      "enum": ["server-defined", "inferred-rolling-24h", "unknown"]
+                                    },
+                                    "windowStartedAt": {
+                                      "type": "number"
+                                    },
+                                    "secondsUntilReset": {
+                                      "type": "number"
+                                    },
+                                    "lastObservationAt": {
+                                      "type": "number"
+                                    },
+                                    "burnPerHour": {
+                                      "type": "number"
+                                    },
+                                    "estimatedExhaustionAt": {
+                                      "type": "number"
+                                    },
+                                    "willLikelyExhaustBeforeReset": {
+                                      "type": "boolean"
+                                    },
+                                    "creditsObserved": {
+                                      "type": "number"
+                                    },
+                                    "tokensInput": {
+                                      "type": "number"
+                                    },
+                                    "tokensOutput": {
+                                      "type": "number"
+                                    },
+                                    "tokensCacheHit": {
+                                      "type": "number"
+                                    },
+                                    "tokensCacheMiss": {
+                                      "type": "number"
+                                    },
+                                    "creditsPersonalized": {
+                                      "type": "boolean"
+                                    },
+                                    "coverage": {
+                                      "type": "string",
+                                      "enum": ["opencode-only"]
+                                    }
+                                  },
+                                  "required": [
+                                    "model",
+                                    "canonical",
+                                    "unit",
+                                    "usedObserved",
+                                    "limitEstimate",
+                                    "remainingEstimate",
+                                    "remainingPercent",
+                                    "status",
+                                    "confidence",
+                                    "accuracy",
+                                    "exhaustedObserved",
+                                    "serverCode",
+                                    "resetAt",
+                                    "resetSource",
+                                    "windowType",
+                                    "windowStartedAt",
+                                    "secondsUntilReset",
+                                    "lastObservationAt",
+                                    "burnPerHour",
+                                    "estimatedExhaustionAt",
+                                    "willLikelyExhaustBeforeReset",
+                                    "creditsObserved",
+                                    "tokensInput",
+                                    "tokensOutput",
+                                    "tokensCacheHit",
+                                    "tokensCacheMiss",
+                                    "creditsPersonalized",
+                                    "coverage"
+                                  ],
+                                  "additionalProperties": false
+                                }
+                              }
+                            },
+                            "required": ["accountId", "label", "models"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "zenAccounts": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "keyId": {
+                                "type": "string"
+                              },
+                              "label": {
+                                "type": "string"
+                              },
+                              "state": {
+                                "type": "string",
+                                "enum": ["ready", "cooling", "exhausted", "unknown"]
+                              },
+                              "exhausted": {
+                                "type": "boolean"
+                              },
+                              "isDefault": {
+                                "type": "boolean"
+                              },
+                              "resetAt": {
+                                "type": "number"
+                              },
+                              "resetAfterSeconds": {
+                                "type": "number"
+                              },
+                              "usedObserved": {
+                                "type": "number"
+                              },
+                              "limitEstimate": {
+                                "type": "number"
+                              },
+                              "remainingPercent": {
+                                "type": "number"
+                              },
+                              "estimateSource": {
+                                "type": "string",
+                                "enum": ["fallback", "learned", "lower-bound"]
+                              }
+                            },
+                            "required": [
+                              "keyId",
+                              "label",
+                              "state",
+                              "exhausted",
+                              "isDefault",
+                              "resetAt",
+                              "resetAfterSeconds",
+                              "usedObserved",
+                              "limitEstimate",
+                              "remainingPercent",
+                              "estimateSource"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": ["windows"],
+                      "additionalProperties": false
+                    },
+                    "fetchedAt": {
+                      "type": "number"
+                    },
+                    "nextRefreshAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": ["providerId", "providerName", "ok", "configured", "usage", "fetchedAt"],
+                  "additionalProperties": false,
+                  "description": "Normalized provider quota result"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Fetches the provider's account usage/balance endpoint and normalizes it into quota windows. Failures are reported inside the result envelope (ok=false), not as HTTP errors.",
+        "summary": "Get provider quota",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.quota.get({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/state": {
+      "get": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.state",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Compact OpenFork peer-network settings state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Read the compact Tier-0/Tier-1 OFXP settings projection: local runtime state, nearby untrusted candidates, pending pairing ceremonies, trusted peers, grants, and approved root aliases. This endpoint never materializes a workspace runtime or remote capability catalog.",
+        "summary": "Get OpenFork peer network state",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.state({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/runtime": {
+      "patch": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.runtime",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Start or stop the narrow OFXP listener and discovery owner for this OpenFork process. Disabling OFXP stops its listener and mDNS work without affecting the ordinary OpenFork server API.",
+        "summary": "Enable or disable OpenFork peer networking",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsRuntimePayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.runtime({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/discovery/server-seeds": {
+      "put": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.discovery.serverSeeds",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.ServerSeedsResult",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsServerSeedsResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Replace the bounded secret-free discovery hints projected from the caller's already configured OpenFork ServerConnections. These hints are untrusted routing metadata only and never grant peer trust or capability authority.",
+        "summary": "Replace configured-server OFXP discovery hints",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsServerSeedsPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.discovery.serverSeeds({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/runtime/rotate-identity": {
+      "post": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.rotateIdentity",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Atomically replace the local OFXP key, restart the narrow listener, and retain a short-lived old-key continuity proof for fresh SAS re-verification. Existing remote grants are never copied to the replacement identity.",
+        "summary": "Rotate the local OFXP identity",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsIdentityMutationPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.rotateIdentity({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/runtime/rotation/finalize": {
+      "post": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.finalizeIdentityRotation",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Explicitly discard the persisted old-key continuity journal for the current replacement identity after re-verification is complete or intentionally abandoned. The replacement key is preserved; finalization transfers no authority and is required before another rotation.",
+        "summary": "Finalize the current OFXP identity rotation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsIdentityMutationPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.finalizeIdentityRotation({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/peer/{peerID}/pair": {
+      "post": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.pair",
+        "parameters": [
+          {
+            "name": "peerID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Begin an operator-controlled OFXP identity ceremony with a currently discovered candidate. Pairing establishes identity continuity only and grants no capability authority.",
+        "summary": "Begin pairing with a nearby OpenFork peer",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.pair({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/pairing/{pairingID}/confirm": {
+      "post": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.pairing.confirm",
+        "parameters": [
+          {
+            "name": "pairingID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_pair_"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Confirm a pending pairing only after the operator has compared the displayed short authentication string on both peers. The newly trusted peer remains deny-by-default.",
+        "summary": "Confirm an OFXP pairing ceremony",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.pairing.confirm({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/pairing/{pairingID}": {
+      "delete": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.pairing.cancel",
+        "parameters": [
+          {
+            "name": "pairingID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_pair_"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Cancel an OFXP pairing ceremony",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.pairing.cancel({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/peer/{peerID}/grant": {
+      "patch": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.peer.grant",
+        "parameters": [
+          {
+            "name": "peerID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Replace one trusted peer's directional inbound grant using optimistic revision fencing. This operator surface changes authority; model-facing OFXP tools cannot call it.",
+        "summary": "Update a trusted peer grant",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsGrantPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.peer.grant({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/peer/{peerID}": {
+      "delete": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.peer.revoke",
+        "parameters": [
+          {
+            "name": "peerID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Revoke peer trust immediately. Re-pairing later does not resurrect the peer's previous grants or roots.",
+        "summary": "Revoke a trusted OpenFork peer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsRevokePayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.peer.revoke({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/peer/{peerID}/root": {
+      "post": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.peer.root.add",
+        "parameters": [
+          {
+            "name": "peerID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Approve one explicit local directory for a trusted peer. The canonical host path is validated locally and is never returned in the public root projection.",
+        "summary": "Approve a local root for a trusted peer",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OfxpSettingsRootPayload"
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.peer.root.add({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/ofxp/peer/{peerID}/root/{rootID}": {
+      "delete": {
+        "tags": ["ofxp"],
+        "operationId": "ofxp.peer.root.remove",
+        "parameters": [
+          {
+            "name": "peerID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+            },
+            "required": true
+          },
+          {
+            "name": "rootID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ofxr_"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OfxpSettings.State",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfxpSettingsState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Remove an approved peer root",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.ofxp.peer.root.remove({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/revision-draft/recover": {
       "post": {
         "tags": ["revision draft"],
@@ -4046,7 +6372,7 @@
                     "type": "boolean"
                   },
                   "schedule": {
-                    "$ref": "#/components/schemas/ScheduledTaskSchedule"
+                    "$ref": "#/components/schemas/ScheduledTaskScheduleInput"
                   },
                   "timezone": {
                     "type": "string"
@@ -4135,7 +6461,7 @@
                 "type": "object",
                 "properties": {
                   "schedule": {
-                    "$ref": "#/components/schemas/ScheduledTaskSchedule"
+                    "$ref": "#/components/schemas/ScheduledTaskScheduleInput"
                   },
                   "timezone": {
                     "type": "string"
@@ -4908,7 +7234,7 @@
                     "$ref": "#/components/schemas/ScheduledTaskSessionPolicy"
                   },
                   "schedule": {
-                    "$ref": "#/components/schemas/ScheduledTaskSchedule"
+                    "$ref": "#/components/schemas/ScheduledTaskScheduleInput"
                   },
                   "timezone": {
                     "type": "string"
@@ -12892,627 +15218,6 @@
         ]
       }
     },
-    "/quota/providers": {
-      "get": {
-        "tags": ["quota"],
-        "operationId": "quota.providers",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "description": "Registered quota providers with configured state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "providers": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "properties": {
-                          "providerId": {
-                            "type": "string"
-                          },
-                          "providerName": {
-                            "type": "string"
-                          },
-                          "configured": {
-                            "type": "boolean"
-                          }
-                        },
-                        "required": ["providerId", "providerName", "configured"],
-                        "additionalProperties": false
-                      }
-                    }
-                  },
-                  "required": ["providers"],
-                  "additionalProperties": false,
-                  "description": "Registered quota providers with configured state"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.",
-        "summary": "List quota providers",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.quota.providers({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/quota/{providerID}": {
-      "get": {
-        "tags": ["quota"],
-        "operationId": "quota.get",
-        "parameters": [
-          {
-            "name": "providerID",
-            "in": "path",
-            "schema": {
-              "type": "string"
-            },
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Normalized provider quota result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "providerId": {
-                      "type": "string"
-                    },
-                    "providerName": {
-                      "type": "string"
-                    },
-                    "ok": {
-                      "type": "boolean"
-                    },
-                    "configured": {
-                      "type": "boolean"
-                    },
-                    "error": {
-                      "type": "string"
-                    },
-                    "planLabel": {
-                      "type": "string"
-                    },
-                    "usage": {
-                      "type": "object",
-                      "properties": {
-                        "windows": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "object",
-                            "properties": {
-                              "usedPercent": {
-                                "type": "number"
-                              },
-                              "remainingPercent": {
-                                "type": "number"
-                              },
-                              "windowSeconds": {
-                                "type": "number"
-                              },
-                              "resetAt": {
-                                "type": "number"
-                              },
-                              "resetAfterSeconds": {
-                                "type": "number"
-                              },
-                              "valueLabel": {
-                                "type": "string"
-                              }
-                            },
-                            "required": [
-                              "usedPercent",
-                              "remainingPercent",
-                              "windowSeconds",
-                              "resetAt",
-                              "resetAfterSeconds",
-                              "valueLabel"
-                            ],
-                            "additionalProperties": false
-                          }
-                        },
-                        "models": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "object",
-                            "properties": {
-                              "windows": {
-                                "type": "object",
-                                "additionalProperties": {
-                                  "type": "object",
-                                  "properties": {
-                                    "usedPercent": {
-                                      "type": "number"
-                                    },
-                                    "remainingPercent": {
-                                      "type": "number"
-                                    },
-                                    "windowSeconds": {
-                                      "type": "number"
-                                    },
-                                    "resetAt": {
-                                      "type": "number"
-                                    },
-                                    "resetAfterSeconds": {
-                                      "type": "number"
-                                    },
-                                    "valueLabel": {
-                                      "type": "string"
-                                    }
-                                  },
-                                  "required": [
-                                    "usedPercent",
-                                    "remainingPercent",
-                                    "windowSeconds",
-                                    "resetAt",
-                                    "resetAfterSeconds",
-                                    "valueLabel"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              },
-                              "rate": {
-                                "type": "number"
-                              },
-                              "rateFree": {
-                                "type": "boolean"
-                              },
-                              "rateLabel": {
-                                "type": "string"
-                              },
-                              "promotionLabel": {
-                                "type": "string"
-                              }
-                            },
-                            "required": ["windows"],
-                            "additionalProperties": false
-                          }
-                        },
-                        "accountLabels": {
-                          "type": "object",
-                          "additionalProperties": {
-                            "type": "string"
-                          }
-                        },
-                        "workbuddyAccounts": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "accountId": {
-                                "type": "string"
-                              },
-                              "label": {
-                                "type": "string"
-                              },
-                              "models": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "properties": {
-                                    "model": {
-                                      "type": "string"
-                                    },
-                                    "canonical": {
-                                      "type": "string"
-                                    },
-                                    "unit": {
-                                      "type": "string"
-                                    },
-                                    "usedObserved": {
-                                      "type": "number"
-                                    },
-                                    "limitEstimate": {
-                                      "type": "number"
-                                    },
-                                    "remainingEstimate": {
-                                      "type": "number"
-                                    },
-                                    "remainingPercent": {
-                                      "type": "number"
-                                    },
-                                    "status": {
-                                      "type": "string",
-                                      "enum": [
-                                        "healthy",
-                                        "draining",
-                                        "low",
-                                        "critical",
-                                        "terminal",
-                                        "depleted",
-                                        "unknown"
-                                      ]
-                                    },
-                                    "confidence": {
-                                      "type": "string",
-                                      "enum": ["low", "medium", "high"]
-                                    },
-                                    "accuracy": {
-                                      "type": "string",
-                                      "enum": ["observed", "estimate", "server-confirmed"]
-                                    },
-                                    "exhaustedObserved": {
-                                      "type": "boolean"
-                                    },
-                                    "serverCode": {
-                                      "type": "number"
-                                    },
-                                    "resetAt": {
-                                      "type": "number"
-                                    },
-                                    "resetSource": {
-                                      "type": "string",
-                                      "enum": ["server-6004", "inferred", "unknown"]
-                                    },
-                                    "windowType": {
-                                      "type": "string",
-                                      "enum": ["server-defined", "inferred-rolling-24h", "unknown"]
-                                    },
-                                    "windowStartedAt": {
-                                      "type": "number"
-                                    },
-                                    "secondsUntilReset": {
-                                      "type": "number"
-                                    },
-                                    "lastObservationAt": {
-                                      "type": "number"
-                                    },
-                                    "burnPerHour": {
-                                      "type": "number"
-                                    },
-                                    "estimatedExhaustionAt": {
-                                      "type": "number"
-                                    },
-                                    "willLikelyExhaustBeforeReset": {
-                                      "type": "boolean"
-                                    },
-                                    "creditsObserved": {
-                                      "type": "number"
-                                    },
-                                    "tokensInput": {
-                                      "type": "number"
-                                    },
-                                    "tokensOutput": {
-                                      "type": "number"
-                                    },
-                                    "tokensCacheHit": {
-                                      "type": "number"
-                                    },
-                                    "tokensCacheMiss": {
-                                      "type": "number"
-                                    },
-                                    "creditsPersonalized": {
-                                      "type": "boolean"
-                                    },
-                                    "coverage": {
-                                      "type": "string",
-                                      "enum": ["opencode-only"]
-                                    }
-                                  },
-                                  "required": [
-                                    "model",
-                                    "canonical",
-                                    "unit",
-                                    "usedObserved",
-                                    "limitEstimate",
-                                    "remainingEstimate",
-                                    "remainingPercent",
-                                    "status",
-                                    "confidence",
-                                    "accuracy",
-                                    "exhaustedObserved",
-                                    "serverCode",
-                                    "resetAt",
-                                    "resetSource",
-                                    "windowType",
-                                    "windowStartedAt",
-                                    "secondsUntilReset",
-                                    "lastObservationAt",
-                                    "burnPerHour",
-                                    "estimatedExhaustionAt",
-                                    "willLikelyExhaustBeforeReset",
-                                    "creditsObserved",
-                                    "tokensInput",
-                                    "tokensOutput",
-                                    "tokensCacheHit",
-                                    "tokensCacheMiss",
-                                    "creditsPersonalized",
-                                    "coverage"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              }
-                            },
-                            "required": ["accountId", "label", "models"],
-                            "additionalProperties": false
-                          }
-                        },
-                        "verdentAccounts": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "accountId": {
-                                "type": "string"
-                              },
-                              "label": {
-                                "type": "string"
-                              },
-                              "models": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "properties": {
-                                    "model": {
-                                      "type": "string"
-                                    },
-                                    "canonical": {
-                                      "type": "string"
-                                    },
-                                    "unit": {
-                                      "type": "string"
-                                    },
-                                    "usedObserved": {
-                                      "type": "number"
-                                    },
-                                    "limitEstimate": {
-                                      "type": "number"
-                                    },
-                                    "remainingEstimate": {
-                                      "type": "number"
-                                    },
-                                    "remainingPercent": {
-                                      "type": "number"
-                                    },
-                                    "status": {
-                                      "type": "string",
-                                      "enum": [
-                                        "healthy",
-                                        "draining",
-                                        "low",
-                                        "critical",
-                                        "terminal",
-                                        "depleted",
-                                        "unknown"
-                                      ]
-                                    },
-                                    "confidence": {
-                                      "type": "string",
-                                      "enum": ["low", "medium", "high"]
-                                    },
-                                    "accuracy": {
-                                      "type": "string",
-                                      "enum": ["observed", "estimate", "server-confirmed"]
-                                    },
-                                    "exhaustedObserved": {
-                                      "type": "boolean"
-                                    },
-                                    "serverCode": {
-                                      "type": "number"
-                                    },
-                                    "resetAt": {
-                                      "type": "number"
-                                    },
-                                    "resetSource": {
-                                      "type": "string",
-                                      "enum": ["server-6004", "inferred", "unknown"]
-                                    },
-                                    "windowType": {
-                                      "type": "string",
-                                      "enum": ["server-defined", "inferred-rolling-24h", "unknown"]
-                                    },
-                                    "windowStartedAt": {
-                                      "type": "number"
-                                    },
-                                    "secondsUntilReset": {
-                                      "type": "number"
-                                    },
-                                    "lastObservationAt": {
-                                      "type": "number"
-                                    },
-                                    "burnPerHour": {
-                                      "type": "number"
-                                    },
-                                    "estimatedExhaustionAt": {
-                                      "type": "number"
-                                    },
-                                    "willLikelyExhaustBeforeReset": {
-                                      "type": "boolean"
-                                    },
-                                    "creditsObserved": {
-                                      "type": "number"
-                                    },
-                                    "tokensInput": {
-                                      "type": "number"
-                                    },
-                                    "tokensOutput": {
-                                      "type": "number"
-                                    },
-                                    "tokensCacheHit": {
-                                      "type": "number"
-                                    },
-                                    "tokensCacheMiss": {
-                                      "type": "number"
-                                    },
-                                    "creditsPersonalized": {
-                                      "type": "boolean"
-                                    },
-                                    "coverage": {
-                                      "type": "string",
-                                      "enum": ["opencode-only"]
-                                    }
-                                  },
-                                  "required": [
-                                    "model",
-                                    "canonical",
-                                    "unit",
-                                    "usedObserved",
-                                    "limitEstimate",
-                                    "remainingEstimate",
-                                    "remainingPercent",
-                                    "status",
-                                    "confidence",
-                                    "accuracy",
-                                    "exhaustedObserved",
-                                    "serverCode",
-                                    "resetAt",
-                                    "resetSource",
-                                    "windowType",
-                                    "windowStartedAt",
-                                    "secondsUntilReset",
-                                    "lastObservationAt",
-                                    "burnPerHour",
-                                    "estimatedExhaustionAt",
-                                    "willLikelyExhaustBeforeReset",
-                                    "creditsObserved",
-                                    "tokensInput",
-                                    "tokensOutput",
-                                    "tokensCacheHit",
-                                    "tokensCacheMiss",
-                                    "creditsPersonalized",
-                                    "coverage"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              }
-                            },
-                            "required": ["accountId", "label", "models"],
-                            "additionalProperties": false
-                          }
-                        },
-                        "zenAccounts": {
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "properties": {
-                              "keyId": {
-                                "type": "string"
-                              },
-                              "label": {
-                                "type": "string"
-                              },
-                              "state": {
-                                "type": "string",
-                                "enum": ["ready", "cooling", "exhausted", "unknown"]
-                              },
-                              "exhausted": {
-                                "type": "boolean"
-                              },
-                              "isDefault": {
-                                "type": "boolean"
-                              },
-                              "resetAt": {
-                                "type": "number"
-                              },
-                              "resetAfterSeconds": {
-                                "type": "number"
-                              },
-                              "usedObserved": {
-                                "type": "number"
-                              },
-                              "limitEstimate": {
-                                "type": "number"
-                              },
-                              "remainingPercent": {
-                                "type": "number"
-                              },
-                              "estimateSource": {
-                                "type": "string",
-                                "enum": ["fallback", "learned", "lower-bound"]
-                              }
-                            },
-                            "required": [
-                              "keyId",
-                              "label",
-                              "state",
-                              "exhausted",
-                              "isDefault",
-                              "resetAt",
-                              "resetAfterSeconds",
-                              "usedObserved",
-                              "limitEstimate",
-                              "remainingPercent",
-                              "estimateSource"
-                            ],
-                            "additionalProperties": false
-                          }
-                        }
-                      },
-                      "required": ["windows"],
-                      "additionalProperties": false
-                    },
-                    "fetchedAt": {
-                      "type": "number"
-                    },
-                    "nextRefreshAt": {
-                      "type": "number"
-                    }
-                  },
-                  "required": ["providerId", "providerName", "ok", "configured", "usage", "fetchedAt"],
-                  "additionalProperties": false,
-                  "description": "Normalized provider quota result"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "BadRequest | InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "NotFoundError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NotFoundError"
-                }
-              }
-            }
-          }
-        },
-        "description": "Fetches the provider's account usage/balance endpoint and normalizes it into quota windows. Failures are reported inside the result envelope (ok=false), not as HTTP errors.",
-        "summary": "Get provider quota",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.quota.get({\n  ...\n})"
-          }
-        ]
-      }
-    },
     "/session": {
       "get": {
         "tags": ["session"],
@@ -18298,6 +20003,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
           }
         },
         "description": "Update the automatic membership policy for a session group.",
@@ -20029,12 +21744,39 @@
               }
             }
           },
+          "429": {
+            "description": "RateLimitError | QuotaExceededError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RateLimitError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/QuotaExceededError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "502": {
             "description": "UpstreamError",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UpstreamError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableError"
                 }
               }
             }
@@ -23489,6 +25231,16 @@
                             "phase": {
                               "type": "string",
                               "enum": ["idle", "requesting", "reasoning", "generating", "tool", "retrying"]
+                            },
+                            "turnStartedAt": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
                             },
                             "phaseStartedAt": {
                               "anyOf": [
@@ -30747,6 +32499,20 @@
                                 },
                                 "required": ["kind", "sessionId"],
                                 "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": ["external"]
+                                  },
+                                  "principalId": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": ["kind", "principalId"],
+                                "additionalProperties": false
                               }
                             ]
                           },
@@ -31198,6 +32964,20 @@
                               },
                               "required": ["kind", "sessionId"],
                               "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "string",
+                                  "enum": ["external"]
+                                },
+                                "principalId": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": ["kind", "principalId"],
+                              "additionalProperties": false
                             }
                           ]
                         }
@@ -31277,6 +33057,20 @@
                           }
                         },
                         "required": ["kind", "sessionId"],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "enum": ["external"]
+                          },
+                          "principalId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": ["kind", "principalId"],
                         "additionalProperties": false
                       }
                     ]
@@ -38113,6 +39907,9 @@
                               "type": "string",
                               "enum": ["idle", "requesting", "reasoning", "generating", "tool", "retrying"]
                             },
+                            "turnStartedAt": {
+                              "type": "number"
+                            },
                             "phaseStartedAt": {
                               "type": "number"
                             },
@@ -39027,6 +40824,9 @@
               "type": "string",
               "enum": ["idle", "requesting", "reasoning", "generating", "tool", "retrying"]
             },
+            "turnStartedAt": {
+              "type": "number"
+            },
             "phaseStartedAt": {
               "type": "number"
             },
@@ -39444,6 +41244,9 @@
           "continuityMarker": {
             "$ref": "#/components/schemas/OxpActivityContinuityMarker"
           },
+          "safeSummary": {
+            "type": "object"
+          },
           "errorCode": {
             "type": "string"
           },
@@ -39508,6 +41311,23 @@
           }
         },
         "required": ["items", "more"],
+        "additionalProperties": false
+      },
+      "OxpInvocationDetailInfo": {
+        "type": "object",
+        "properties": {
+          "invocationID": {
+            "type": "string",
+            "pattern": "^oxpi_"
+          },
+          "request": {
+            "type": "object"
+          },
+          "outcome": {
+            "type": "object"
+          }
+        },
+        "required": ["invocationID"],
         "additionalProperties": false
       },
       "OxpResourceProvenanceInfo": {
@@ -39636,6 +41456,15 @@
         },
         "additionalProperties": false,
         "description": "Server configuration for opencode serve and web commands"
+      },
+      "OfxpConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
       },
       "PermissionActionConfig": {
         "type": "string",
@@ -40208,6 +42037,9 @@
           },
           "server": {
             "$ref": "#/components/schemas/ServerConfig"
+          },
+          "ofxp": {
+            "$ref": "#/components/schemas/OfxpConfig"
           },
           "command": {
             "type": "object",
@@ -40859,6 +42691,23 @@
             "type": "string"
           },
           "code": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "ServiceUnavailableError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["ServiceUnavailableError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "service": {
             "type": "string"
           }
         },
@@ -44207,23 +46056,6 @@
         "required": ["_tag", "sessionID", "message"],
         "additionalProperties": false
       },
-      "ServiceUnavailableError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["ServiceUnavailableError"]
-          },
-          "message": {
-            "type": "string"
-          },
-          "service": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "message"],
-        "additionalProperties": false
-      },
       "TextPartInput": {
         "type": "object",
         "properties": {
@@ -44676,6 +46508,63 @@
             "enum": ["ForbiddenError"]
           },
           "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "RateLimitError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["RateLimitError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "retryAfterMs": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "QuotaExceededError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["QuotaExceededError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "service": {
             "type": "string"
           }
         },
@@ -47088,16 +48977,9 @@
         "type": "string",
         "enum": ["draft", "active", "paused", "blocked", "verifying", "completed", "cancelled", "failed"]
       },
-      "GoalAutomationMode": {
-        "type": "string",
-        "enum": ["manual", "auto_continue", "unattended"]
-      },
       "GoalContinuationPolicy": {
         "type": "object",
         "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/GoalAutomationMode"
-          },
           "maxConsecutiveTurns": {
             "anyOf": [
               {
@@ -47191,7 +49073,6 @@
             ]
           }
         },
-        "required": ["mode"],
         "additionalProperties": false
       },
       "GoalAuditorPolicy": {
@@ -52677,6 +54558,787 @@
           }
         ]
       },
+      "OfxpSettingsRuntimeStatus": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "peerID": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "label": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer"
+          },
+          "discovery": {
+            "type": "string",
+            "enum": ["disabled", "active", "degraded"]
+          },
+          "discoveryError": {
+            "type": "string"
+          },
+          "identityRotationSupported": {
+            "type": "boolean"
+          },
+          "rotation": {
+            "type": "object",
+            "properties": {
+              "previousPeerID": {
+                "type": "string",
+                "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+              },
+              "expiresAt": {
+                "type": "integer"
+              },
+              "expired": {
+                "type": "boolean"
+              }
+            },
+            "required": ["previousPeerID", "expiresAt", "expired"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["active", "discovery"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsCandidate": {
+        "type": "object",
+        "properties": {
+          "peerID": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "realmID": {
+            "type": "string"
+          },
+          "openforkVersion": {
+            "type": "string"
+          },
+          "protocolVersion": {
+            "type": "integer"
+          },
+          "pairing": {
+            "type": "boolean"
+          },
+          "endpointCount": {
+            "type": "integer"
+          },
+          "lastSeenAt": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "peerID",
+          "realmID",
+          "openforkVersion",
+          "protocolVersion",
+          "pairing",
+          "endpointCount",
+          "lastSeenAt"
+        ],
+        "additionalProperties": false
+      },
+      "OfxpSettingsPairingPeer": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "realmID": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        },
+        "required": ["id", "realmID", "label", "fingerprint"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsPairingPreview": {
+        "type": "object",
+        "properties": {
+          "pairingID": {
+            "type": "string",
+            "pattern": "^ofxp_pair_"
+          },
+          "peer": {
+            "$ref": "#/components/schemas/OfxpSettingsPairingPeer"
+          },
+          "sas": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "integer"
+          },
+          "continuityClaim": {
+            "type": "object",
+            "properties": {
+              "previousPeerID": {
+                "type": "string",
+                "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+              },
+              "expiresAt": {
+                "type": "integer"
+              }
+            },
+            "required": ["previousPeerID", "expiresAt"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["pairingID", "peer", "sas", "expiresAt"],
+        "additionalProperties": false
+      },
+      "OfxpRekeyState": {
+        "type": "string",
+        "enum": ["stable", "required"]
+      },
+      "OfxpPeerInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "realmID": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "rekeyState": {
+            "$ref": "#/components/schemas/OfxpRekeyState"
+          },
+          "pairedAt": {
+            "type": "integer"
+          },
+          "lastSeenAt": {
+            "type": "integer"
+          },
+          "revokedAt": {
+            "type": "integer"
+          },
+          "grantRevision": {
+            "type": "integer"
+          },
+          "grantExpiresAt": {
+            "type": "integer"
+          }
+        },
+        "required": ["id", "realmID", "label", "fingerprint", "rekeyState", "pairedAt", "grantRevision"],
+        "additionalProperties": false
+      },
+      "OfxpSessionSupervision": {
+        "type": "string",
+        "enum": ["none", "approved-roots"]
+      },
+      "OfxpDelegation": {
+        "type": "string",
+        "enum": ["disabled", "spawn"]
+      },
+      "OfxpGrant": {
+        "type": "object",
+        "properties": {
+          "read": {
+            "type": "boolean"
+          },
+          "write": {
+            "type": "boolean"
+          },
+          "git": {
+            "type": "boolean"
+          },
+          "process": {
+            "type": "boolean"
+          },
+          "integrations": {
+            "type": "boolean"
+          },
+          "browser": {
+            "type": "boolean"
+          },
+          "filesReceive": {
+            "type": "boolean"
+          },
+          "filesSend": {
+            "type": "boolean"
+          },
+          "automation": {
+            "type": "boolean"
+          },
+          "messaging": {
+            "type": "boolean"
+          },
+          "sessionSupervision": {
+            "$ref": "#/components/schemas/OfxpSessionSupervision"
+          },
+          "requestSupervision": {
+            "type": "boolean"
+          },
+          "delegation": {
+            "$ref": "#/components/schemas/OfxpDelegation"
+          },
+          "nestedDelegation": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "read",
+          "write",
+          "git",
+          "process",
+          "integrations",
+          "browser",
+          "filesReceive",
+          "filesSend",
+          "automation",
+          "messaging",
+          "sessionSupervision",
+          "requestSupervision",
+          "delegation",
+          "nestedDelegation"
+        ],
+        "additionalProperties": false
+      },
+      "OfxpSettingsApprovedRoot": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ofxr_"
+          },
+          "alias": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$"
+          },
+          "source": {
+            "type": "string",
+            "enum": ["manual", "project"]
+          },
+          "approvedAt": {
+            "type": "integer"
+          }
+        },
+        "required": ["id", "alias", "source", "approvedAt"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsAuthenticatedEndpoint": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "port": {
+            "type": "integer"
+          },
+          "pendingRequests": {
+            "type": "integer"
+          }
+        },
+        "required": ["host", "port", "pendingRequests"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsPeerOverview": {
+        "type": "object",
+        "properties": {
+          "info": {
+            "$ref": "#/components/schemas/OfxpPeerInfo"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/OfxpGrant"
+          },
+          "roots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsApprovedRoot"
+            }
+          },
+          "online": {
+            "type": "boolean"
+          },
+          "openforkVersion": {
+            "type": "string"
+          },
+          "protocolVersion": {
+            "type": "integer"
+          },
+          "authenticatedEndpoint": {
+            "$ref": "#/components/schemas/OfxpSettingsAuthenticatedEndpoint"
+          }
+        },
+        "required": ["info", "grant", "roots", "online"],
+        "additionalProperties": false
+      },
+      "OfxpCommitClass": {
+        "type": "string",
+        "enum": ["safe_read", "idempotent_mutation", "non_idempotent_mutation", "durable_start"]
+      },
+      "OfxpReceiptState": {
+        "type": "string",
+        "enum": ["admitted", "started", "committed", "failed", "cancelled"]
+      },
+      "OfxpSettingsRecentActivity": {
+        "type": "object",
+        "properties": {
+          "sourcePeerID": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "operation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "commitClass": {
+            "$ref": "#/components/schemas/OfxpCommitClass"
+          },
+          "state": {
+            "$ref": "#/components/schemas/OfxpReceiptState"
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "settledAt": {
+            "type": "integer"
+          }
+        },
+        "required": ["sourcePeerID", "operation", "commitClass", "state", "createdAt"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsState": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/OfxpSettingsRuntimeStatus"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsCandidate"
+            }
+          },
+          "pairings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsPairingPreview"
+            }
+          },
+          "peers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsPeerOverview"
+            }
+          },
+          "activity": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsRecentActivity"
+            },
+            "maxItems": 256
+          }
+        },
+        "required": ["status", "candidates", "pairings", "peers", "activity"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsRuntimePayload": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": ["enabled"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsServerSeed": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "peerID": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          },
+          "realmID": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "openforkVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "protocolVersion": {
+            "type": "integer"
+          },
+          "pairing": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 253
+              },
+              "port": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 65535
+              },
+              "addresses": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                },
+                "maxItems": 16
+              }
+            },
+            "required": ["host", "port"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "peerID", "realmID", "openforkVersion", "protocolVersion", "pairing", "endpoint"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsServerSeedsPayload": {
+        "type": "object",
+        "properties": {
+          "seeds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OfxpSettingsServerSeed"
+            },
+            "maxItems": 256
+          }
+        },
+        "required": ["seeds"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsServerSeedsResult": {
+        "type": "object",
+        "properties": {
+          "accepted": {
+            "type": "integer"
+          }
+        },
+        "required": ["accepted"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsIdentityMutationPayload": {
+        "type": "object",
+        "properties": {
+          "expectedPeerID": {
+            "type": "string",
+            "pattern": "^ofxp_[A-Za-z0-9_-]{43}$"
+          }
+        },
+        "required": ["expectedPeerID"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsGrantPayload": {
+        "type": "object",
+        "properties": {
+          "expectedRevision": {
+            "type": "integer"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/OfxpGrant"
+          }
+        },
+        "required": ["expectedRevision", "grant"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsRevokePayload": {
+        "type": "object",
+        "properties": {
+          "expectedRevision": {
+            "type": "integer"
+          }
+        },
+        "required": ["expectedRevision"],
+        "additionalProperties": false
+      },
+      "OfxpSettingsRootPayload": {
+        "type": "object",
+        "properties": {
+          "expectedRevision": {
+            "type": "integer"
+          },
+          "alias": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$"
+          },
+          "canonicalPath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "source": {
+            "type": "string",
+            "enum": ["manual", "project"]
+          }
+        },
+        "required": ["expectedRevision", "alias", "canonicalPath"],
+        "additionalProperties": false
+      },
+      "ScheduledTaskRecurringSchedule": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["daily"]
+              },
+              "times": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskTimeOfDay"
+                }
+              }
+            },
+            "required": ["kind", "times"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["weekly"]
+              },
+              "weekdays": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskWeekday"
+                }
+              },
+              "times": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskTimeOfDay"
+                }
+              }
+            },
+            "required": ["kind", "weekdays", "times"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["cron"]
+              },
+              "expression": {
+                "type": "string"
+              }
+            },
+            "required": ["kind", "expression"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ScheduledTaskScheduleInput": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["once"]
+              },
+              "at": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["kind", "at"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["daily"]
+              },
+              "times": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskTimeOfDay"
+                }
+              }
+            },
+            "required": ["kind", "times"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["weekly"]
+              },
+              "weekdays": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskWeekday"
+                }
+              },
+              "times": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScheduledTaskTimeOfDay"
+                }
+              }
+            },
+            "required": ["kind", "weekdays", "times"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["cron"]
+              },
+              "expression": {
+                "type": "string"
+              }
+            },
+            "required": ["kind", "expression"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["relative"]
+              },
+              "delayMs": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["kind", "delayMs"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["timestamp"]
+              },
+              "at": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["NaN"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["-Infinity"]
+                  },
+                  {
+                    "type": "string",
+                    "enum": ["Infinity", "-Infinity", "NaN"]
+                  }
+                ]
+              }
+            },
+            "required": ["kind", "at"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["recurring"]
+              },
+              "schedule": {
+                "$ref": "#/components/schemas/ScheduledTaskRecurringSchedule"
+              }
+            },
+            "required": ["kind", "schedule"],
+            "additionalProperties": false
+          }
+        ]
+      },
       "ScheduledTaskPolicy": {
         "type": "object",
         "properties": {
@@ -53813,6 +56475,9 @@
             "type": "string"
           },
           "accountID": {
+            "type": "string"
+          },
+          "affinityID": {
             "type": "string"
           },
           "state": {
@@ -59254,9 +61919,6 @@
       "GoalContinuationPolicy5": {
         "type": "object",
         "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/GoalAutomationMode"
-          },
           "maxConsecutiveTurns": {
             "anyOf": [
               {
@@ -59334,7 +61996,6 @@
             ]
           }
         },
-        "required": ["mode"],
         "additionalProperties": false
       },
       "GoalAuditorPolicy4": {
@@ -60056,7 +62717,7 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
-      "ScheduledTaskSchedule2": {
+      "ScheduledTaskSchedule1": {
         "anyOf": [
           {
             "type": "object",
@@ -60147,9 +62808,6 @@
       "GoalContinuationPolicy6": {
         "type": "object",
         "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/GoalAutomationMode"
-          },
           "maxConsecutiveTurns": {
             "anyOf": [
               {
@@ -60227,7 +62885,6 @@
             ]
           }
         },
-        "required": ["mode"],
         "additionalProperties": false
       },
       "ScheduledTaskResolvedPolicy1": {
@@ -60399,7 +63056,7 @@
             ]
           },
           "schedule": {
-            "$ref": "#/components/schemas/ScheduledTaskSchedule2"
+            "$ref": "#/components/schemas/ScheduledTaskSchedule1"
           },
           "timezone": {
             "type": "string"
@@ -63584,6 +66241,9 @@
                     "phase": {
                       "type": "string",
                       "enum": ["idle", "requesting", "reasoning", "generating", "tool", "retrying"]
+                    },
+                    "turnStartedAt": {
+                      "type": "number"
                     },
                     "phaseStartedAt": {
                       "type": "number"
@@ -66779,9 +69439,6 @@
       "GoalContinuationPolicy7": {
         "type": "object",
         "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/GoalAutomationMode"
-          },
           "maxConsecutiveTurns": {
             "anyOf": [
               {
@@ -66859,7 +69516,6 @@
             ]
           }
         },
-        "required": ["mode"],
         "additionalProperties": false
       },
       "GoalAuditorPolicy5": {
@@ -67342,9 +69998,6 @@
       "GoalContinuationPolicy8": {
         "type": "object",
         "properties": {
-          "mode": {
-            "$ref": "#/components/schemas/GoalAutomationMode"
-          },
           "maxConsecutiveTurns": {
             "anyOf": [
               {
@@ -67422,7 +70075,6 @@
             ]
           }
         },
-        "required": ["mode"],
         "additionalProperties": false
       },
       "ScheduledTaskInfo6": {
@@ -67470,7 +70122,7 @@
             ]
           },
           "schedule": {
-            "$ref": "#/components/schemas/ScheduledTaskSchedule2"
+            "$ref": "#/components/schemas/ScheduledTaskSchedule1"
           },
           "timezone": {
             "type": "string"
@@ -69381,6 +72033,9 @@
                       "type": "string",
                       "enum": ["idle", "requesting", "reasoning", "generating", "tool", "retrying"]
                     },
+                    "turnStartedAt": {
+                      "type": "number"
+                    },
                     "phaseStartedAt": {
                       "type": "number"
                     },
@@ -70023,6 +72678,13 @@
       "description": "Global usage analytics."
     },
     {
+      "name": "quota",
+      "description": "Proactive provider-account quota status. Advisory display state only."
+    },
+    {
+      "name": "ofxp"
+    },
+    {
       "name": "revision draft",
       "description": "Bootstrap-free durable handoff for model-produced editor revisions."
     },
@@ -70093,10 +72755,6 @@
     {
       "name": "provider",
       "description": "Experimental HttpApi provider routes."
-    },
-    {
-      "name": "quota",
-      "description": "Proactive provider-account quota status. Advisory display state only."
     },
     {
       "name": "session",

@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | Desktop GUI | `packages/desktop` + `packages/app` | **Primary OpenFork product** | Electron host plus Solid renderer and local sidecar lifecycle. |
 | Browser GUI | `packages/app` | Supported OpenFork client surface | Solid/Vite client that connects to the OpenFork local server over HTTP/SSE. |
-| Mobile PWA | `packages/mobile` | Fork product surface | Separate static/mobile client for the same local-server model. |
+| Mobile PWA | `packages/mobile` + `packages/app/src/pwa-*.tsx` | Fork product surface | Independently hosted PWA shell around the authoritative shared application runtime, with pairing/OFXP identity pinning and verified sidecar transport at the host boundary. |
 | TUI | `packages/tui` + embedded CLI references in `packages/opencode` | **Not an OpenFork product** | Retained coupling dependency required by inherited embedded CLI code. |
 | Local server/sidecar | `packages/opencode`, `packages/server`, `packages/core` | Internal client runtime | Sessions, tools, providers, persistence, local APIs, workspace execution. |
 | OXP / ChatGPT external-agent surface | `packages/opencode/src/oxp` + `packages/desktop/src/main/oxp` | First-party OpenFork integration surface | Secure-MCP augmentation, Session supervision, durable worker delegation, file exchange, tunnel lifecycle, and parent-tool-epoch continuity guidance. |
@@ -99,12 +99,22 @@ SaaS backend.
 
 ## Mobile PWA
 
-`packages/mobile` is a separate static client rather than a responsive bundle served
-by the Electron sidecar. It connects to the same server model with its own reconnect,
-streaming, navigation, and mobile presentation logic.
+`packages/mobile` is an independently hosted static PWA shell rather than an HTML
+bundle served by the Electron sidecar. It is intentionally thin: pairing, QR scanning,
+service-worker/install behavior, OFXP/OpenFork Network identity pinning, credential
+persistence, and the verified development proxy belong to the mobile host.
 
-The desktop README documents the intended split: the sidecar can be exposed as an API
-server, while the PWA itself is hosted separately.
+After trust succeeds the shell lazy-loads `@opencode-ai/app/pwa-client`. Session
+transport/sync, reconnect behavior, navigation, timeline rendering, prompt assembly,
+tools, permissions, models, goals, settings, and other application semantics remain
+owned by `packages/app` and the shared browser-safe contexts. Mobile-specific
+presentation can specialize those shared surfaces, but must not grow a parallel
+session/runtime implementation.
+
+The PWA and API server can be deployed separately. The stored API URL is a transport
+location, not the durable backend identity: paired mobile clients pin the public OFXP
+peer/fingerprint/realm when available and verify it before sending a stored device
+credential on later cold starts.
 
 ## TUI
 
