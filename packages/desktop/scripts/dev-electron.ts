@@ -17,10 +17,31 @@ const child = Bun.spawn([process.execPath, electronVite, "dev"], {
   stderr: "inherit",
 })
 
-const stop = () => child.kill()
+const sidecarWatcher = Bun.spawn(
+  [process.execPath, "./scripts/watch-node-sidecar.ts"],
+  {
+    cwd: join(import.meta.dir, ".."),
+    env,
+    stdin: "ignore",
+    stdout: "inherit",
+    stderr: "inherit",
+  },
+)
+
+const stop = () => {
+  child.kill()
+  sidecarWatcher.kill()
+}
 process.once("SIGINT", stop)
 process.once("SIGTERM", stop)
 
-process.exitCode = await child.exited
+const first = await Promise.race([
+  child.exited.then((code) => ({ owner: "electron" as const, code })),
+  sidecarWatcher.exited.then((code) => ({ owner: "sidecar-watcher" as const, code })),
+])
+if (first.owner === "electron") sidecarWatcher.kill()
+else child.kill()
+await Promise.allSettled([child.exited, sidecarWatcher.exited])
+process.exitCode = first.code
 process.off("SIGINT", stop)
 process.off("SIGTERM", stop)

@@ -1,5 +1,6 @@
 import { createRequire, enableCompileCache, registerHooks } from "node:module"
 import * as http from "node:http"
+import path from "node:path"
 import * as tls from "node:tls"
 import { pathToFileURL } from "node:url"
 import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
@@ -9,6 +10,11 @@ import {
   type OxpSidecarRequest,
   type SidecarMessage,
 } from "./sidecar-protocol"
+import {
+  RuntimeRefreshCoordinator,
+  type RuntimeBackendModule,
+} from "./oxp/runtime-refresh"
+import { recoverAcceptedRuntime } from "./oxp/runtime-artifacts"
 
 enableCompileCache()
 
@@ -32,7 +38,7 @@ type NodeTlsWithSystemCertificates = typeof tls & {
 }
 
 type StartCommand = Extract<ReturnType<typeof parseSidecarCommand>, { type: "start" }>
-type OxpHostModule = typeof import("virtual:opencode-server").OxpHost
+type OxpHostModule = RuntimeBackendModule["OxpHost"]
 type OxpHostState = Awaited<ReturnType<OxpHostModule["restore"]>>
 
 type ParentPort = {
@@ -47,6 +53,7 @@ type Listener = {
 const parentPort = getParentPort()
 let listener: Listener | undefined
 let oxpHost: OxpHostModule | undefined
+let runtimeRefresh: RuntimeRefreshCoordinator | undefined
 
 autopsyMark("sidecar-module-eval") // STARTUP-AUTOPSY (utility process module graph loaded)
 
@@ -71,9 +78,36 @@ async function start(command: StartCommand) {
     ensureLoopbackNoProxy()
     useSystemCertificates()
     useEnvProxy()
-    const { Server, OxpHost } = await import("virtual:opencode-server")
+    const runtimeArtifactUrl = import.meta.env.OPENCODE_RUNTIME_MODULE_URL
+    const runtimeCheckpointRoot = path.join(
+      command.userDataPath,
+      "oxp-runtime-refresh",
+    )
+    if (runtimeArtifactUrl) {
+      await recoverAcceptedRuntime(
+        runtimeArtifactUrl,
+        runtimeCheckpointRoot,
+      )
+    }
+    const backend = (await import("virtual:opencode-server")) as typeof import("virtual:opencode-server") &
+      RuntimeBackendModule
+    const { Server, OxpHost } = backend
     oxpHost = OxpHost
     autopsyMark("sidecar-server-imported") // STARTUP-AUTOPSY (33 MB server bundle parsed+evaluated)
+
+    runtimeRefresh = await RuntimeRefreshCoordinator.create(backend, {
+      publish: (state) => parentPort.postMessage({ type: "oxp-state", state }),
+      probe: probeOxpRuntime,
+      artifactUrl: runtimeArtifactUrl || undefined,
+      checkpointRoot: runtimeArtifactUrl
+        ? runtimeCheckpointRoot
+        : undefined,
+      log: (level, message, metadata) => {
+        if (level === "error") console.error(message, metadata ?? {})
+        else if (level === "warn") console.warn(message, metadata ?? {})
+        else console.log(message, metadata ?? {})
+      },
+    })
 
     listener = await Server.listen({
       port: command.port,
@@ -89,7 +123,9 @@ async function start(command: StartCommand) {
     // runtime can never make the primary HTTP server unavailable. If OXP was
     // disabled, restore returns without opening a listener; if enabled it
     // recreates a fresh secret path/generation for this sidecar lifetime.
-    void oxpHost
+    const host = currentOxpHost()
+    if (!host) throw new Error("OXP host unavailable after backend import")
+    void host
       .restore()
       .then((state: OxpHostState) => parentPort.postMessage({ type: "oxp-state", state }))
       .catch((_error: unknown) => {
@@ -107,10 +143,12 @@ async function start(command: StartCommand) {
 
 async function stop() {
   try {
-    await oxpHost?.dispose().catch(() => undefined)
+    if (runtimeRefresh) await runtimeRefresh.dispose().catch(() => undefined)
+    else await oxpHost?.dispose().catch(() => undefined)
     await listener?.stop()
   } finally {
     listener = undefined
+    runtimeRefresh = undefined
     oxpHost = undefined
     parentPort.postMessage({ type: "stopped" })
     setImmediate(() => process.exit(0))
@@ -118,16 +156,17 @@ async function stop() {
 }
 
 async function publishOxpState() {
-  if (!oxpHost) return
+  const host = currentOxpHost()
+  if (!host) return
   try {
-    parentPort.postMessage({ type: "oxp-state", state: await oxpHost.getState() })
+    parentPort.postMessage({ type: "oxp-state", state: await host.getState() })
   } catch {
     // OXP is optional. Ordinary sidecar readiness remains independent.
   }
 }
 
 async function handleOxp(id: number, request: OxpSidecarRequest) {
-  const host = oxpHost
+  const host = currentOxpHost()
   if (!host) {
     parentPort.postMessage({ type: "oxp-response", id, ok: false, error: { message: "OXP host is not ready" } })
     return
@@ -162,6 +201,34 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
       ok: false,
       error: { message, ...((error as { _tag?: unknown })?._tag ? { code: String((error as { _tag?: unknown })._tag) } : {}) },
     })
+  }
+}
+
+function currentOxpHost() {
+  return runtimeRefresh?.host ?? oxpHost
+}
+
+async function probeOxpRuntime(state: OxpHostState) {
+  const endpoint = state.endpoint
+  if (
+    !state.enabled ||
+    endpoint.state !== "ready" ||
+    !endpoint.url ||
+    !endpoint.metadataUrl ||
+    !endpoint.schemaFingerprint
+  ) {
+    throw new Error("OXP runtime probe requires a ready endpoint")
+  }
+  const response = await fetch(endpoint.metadataUrl, {
+    method: "GET",
+    signal: AbortSignal.timeout(3_000),
+  })
+  if (!response.ok) {
+    throw new Error("OXP runtime metadata probe failed")
+  }
+  const metadata = (await response.json()) as { resource?: unknown }
+  if (metadata.resource !== endpoint.url) {
+    throw new Error("OXP runtime metadata probe returned a mismatched resource")
   }
 }
 

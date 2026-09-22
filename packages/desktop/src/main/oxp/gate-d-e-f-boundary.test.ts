@@ -66,7 +66,7 @@ describe("OXP Gate D/E/F boundaries", () => {
 
   test("live endpoint identity changes invalidate and reconverge the bound tunnel", async () => {
     const source = await fs.readFile(path.join(import.meta.dir, "controller.ts"), "utf8")
-    expect(source).toContain("observed.endpointChanged && activeTunnel(this.tunnelReport.state)")
+    expect(source).toContain("observed.endpointChanged && (this.tunnel !== undefined || activeTunnel(this.tunnelReport.state))")
     expect(source).toContain("this.connectionGeneration += 1")
     expect(source).toContain("await this.stopTunnelOnly()")
     expect(source).toContain("await this.connectNow()")
@@ -113,7 +113,7 @@ describe("OXP Gate D/E/F boundaries", () => {
     const appRoot = path.resolve(desktop, "../app/src")
     const [surface, english] = await Promise.all([
       fs.readFile(path.join(appRoot, "components/settings-v2/oxp.tsx"), "utf8"),
-      fs.readFile(path.join(appRoot, "i18n/en.ts"), "utf8"),
+      fs.readFile(path.join(appRoot, "i18n/en-desktop-network-settings.ts"), "utf8"),
     ])
     const active = surface.slice(surface.indexOf("const activeAugmentationRows"), surface.indexOf("const lifecycleRows"))
     for (const key of ["read", "automation", "write", "process", "git", "integrations", "browser", "filesReceive", "filesSend"]) {
@@ -125,7 +125,7 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(english).not.toContain('"settings.oxp.policyOnly"')
     expect(english).toContain('"settings.oxp.capability.automation.title": "Scheduled automation"')
     expect(english).toMatch(/Scheduled Tasks inside approved folders.*disabled by default/)
-    expect(english).toMatch(/Configure live OXP supervision, request mediation, delegated-worker policy/)
+    expect(english).toMatch(/Configure live OXP supervision, request mediation, and delegated-worker authority/)
   })
 
   test("scheduled automation grant is one default-off authority from OXP schema through desktop Settings", async () => {
@@ -241,6 +241,49 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(ready).toBeGreaterThan(-1)
     expect(restore).toBeGreaterThan(ready)
     expect(source.slice(restore, restore + 500)).toContain(".catch")
+  })
+
+  test("backend dev rebuilds stage a candidate without using electron-vite main-watch activation", async () => {
+    const [vite, devElectron, watcher, packageJson] = await Promise.all([
+      fs.readFile(path.join(desktop, "electron.vite.config.ts"), "utf8"),
+      fs.readFile(path.join(desktop, "scripts/dev-electron.ts"), "utf8"),
+      fs.readFile(path.join(desktop, "scripts/watch-node-sidecar.ts"), "utf8"),
+      fs.readFile(path.join(desktop, "package.json"), "utf8"),
+    ])
+    expect(vite).not.toContain("nodeSidecarDevSync")
+    expect(vite).not.toContain("collectNodeSidecarWatchFiles")
+    expect(devElectron).toContain("./scripts/watch-node-sidecar.ts")
+    expect(watcher).toContain("script/build-node.ts")
+    expect(watcher).toContain("activation remains explicit via OXP runtime.refresh")
+    expect(watcher).not.toMatch(/electron-vite|app\.relaunch|process\.exit\(1\)/)
+    expect(packageJson).toContain('"@parcel/watcher": "2.5.1"')
+  })
+
+  test("every Node backend build serializes against the runtime artifact transaction", async () => {
+    const [builder, watcher] = await Promise.all([
+      fs.readFile(path.resolve(desktop, "../opencode/script/build-node.ts"), "utf8"),
+      fs.readFile(path.join(desktop, "scripts/watch-node-sidecar.ts"), "utf8"),
+    ])
+    expect(builder).toContain(".oxp-runtime-refresh.lock")
+    expect(builder).toContain("build:${process.pid}")
+    expect(builder).toContain('flag: "wx"')
+    expect(builder).toContain("process.exit(75)")
+    expect(watcher).toContain("code === 75")
+    expect(watcher).not.toContain('flag: "wx"')
+  })
+
+  test("runtime refresh keeps module selection host-owned and never accepts a caller path", async () => {
+    const [runtime, bridge, node] = await Promise.all([
+      fs.readFile(path.join(import.meta.dir, "runtime-refresh.ts"), "utf8"),
+      fs.readFile(path.resolve(desktop, "../opencode/src/oxp/runtime-refresh.ts"), "utf8"),
+      fs.readFile(path.resolve(desktop, "../opencode/src/node.ts"), "utf8"),
+    ])
+    expect(runtime).toContain("runtimeModuleUrl")
+    expect(runtime).toContain("dist/node/node.js")
+    expect(runtime).toContain("expectedRuntimeID")
+    expect(runtime).not.toMatch(/input\.(?:path|module|url)/)
+    expect(bridge).not.toMatch(/path:\s*Schema|moduleUrl|runtimeModuleUrl/)
+    expect(node).toContain("export const runtimeModuleUrl = import.meta.url")
   })
 
   test("packages the pinned tunnel runtime outside app.asar", async () => {

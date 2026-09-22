@@ -190,7 +190,7 @@ export class OxpController {
       if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
       const observed = this.observeSidecarState(sidecar, state)
       if (!observed.accepted) return
-      if (observed.endpointChanged && activeTunnel(this.tunnelReport.state)) {
+      if (observed.endpointChanged && (this.tunnel !== undefined || activeTunnel(this.tunnelReport.state))) {
         // A tunnel is bound to one exact secret local URL. Invalidate callbacks
         // immediately even if Connect is still starting and has not installed
         // its handle yet. Then serialize retirement/reconnection so an old

@@ -2,6 +2,7 @@ import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig } from "electron-vite"
 import appPlugin from "@opencode-ai/app/vite"
 import * as fs from "node:fs/promises"
+import * as path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { tailwindDevCachePlugins } from "./scripts/tailwind-dev-cache"
 
@@ -40,6 +41,9 @@ export default defineConfig(({ command }) => ({
   main: {
     define: {
       "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel),
+      "import.meta.env.OPENCODE_RUNTIME_MODULE_URL": JSON.stringify(
+        command === "serve" ? pathToFileURL(OPENCODE_SERVER_FILE).href : "",
+      ),
     },
     build: {
       rollupOptions: {

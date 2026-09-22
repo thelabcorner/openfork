@@ -181,7 +181,7 @@ export const TAB_GROUP_EXTENSION_LANE = {
 export type ExtensionDispatch = (
   tabId: string | undefined,
   operation: BrowserOperation,
-  sessionId: string,
+  sessionId: string | undefined,
 ) => Promise<Record<string, unknown>>
 
 export interface ExtensionOperationsAdapterOptions {
