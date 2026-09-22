@@ -1,0 +1,509 @@
+/* ===========================================================================
+   OXP activity transcript.
+
+   The page is a read-only reconstruction of a session: the rows are the same
+   `BasicTool` component the live timeline uses, so everything in here is the
+   chrome *around* them — page header, filter bar, day/epoch rules, and the few
+   containers the tool card does not already own.
+
+   Surfaces deliberately match `basic-tool.css`'s neutral ramp rather than the
+   zinc ramp: a blue-leaning grey next to the diff viewer reads as a different
+   product. Density follows the same scale as the session timeline — 20px rows,
+   11px metadata, 13px labels, 4/6/8/10px rhythm.
+   =========================================================================== */
+
+[data-component="oxp-activity"] {
+  --oxp-rule: var(--v2-border-border-muted);
+  --oxp-gutter: 16px;
+
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  flex: 1;
+  align-self: stretch;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--v2-background-bg-base);
+  box-shadow: var(--v2-elevation-raised);
+  contain: strict;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────
+   One title row and one metadata line. The previous six equal-weight metric
+   tiles said that "epochs" mattered as much as "43 calls", which is how a
+   product page starts reading like a dashboard. Everything secondary moved
+   into the overflow menu or the expanded row's diagnostics. */
+
+[data-slot="oxp-header"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 8px var(--oxp-gutter) 9px;
+  border-bottom: 1px solid var(--oxp-rule);
+}
+
+[data-slot="oxp-header-top"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+}
+
+[data-slot="oxp-title"] {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 560;
+  line-height: 20px;
+  letter-spacing: -0.1px;
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-title-input"] {
+  flex: 0 1 420px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--v2-border-border-base);
+  border-radius: 5px;
+  background: var(--v2-background-bg-layer-01);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 22px;
+  color: var(--v2-text-text-base);
+  outline: none;
+}
+
+[data-slot="oxp-title-input"]:focus {
+  border-color: var(--v2-border-border-focus);
+}
+
+[data-slot="oxp-header-actions"] {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+[data-slot="oxp-meta"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 6px;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 440;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-meta-item"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-meta-item"][data-tone="danger"] {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-slot="oxp-meta-item"][data-tone="strong"] {
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oxp-meta-dot"] {
+  flex-shrink: 0;
+  color: var(--v2-text-text-faint);
+  opacity: 0.6;
+  user-select: none;
+}
+
+[data-slot="oxp-badge"] {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--v2-background-bg-layer-02);
+  font-size: 9.5px;
+  font-weight: 620;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oxp-badge"][data-tone="warning"] {
+  color: var(--v2-state-fg-warning);
+  background: var(--v2-state-bg-warning);
+}
+
+/* ── Toolbar ─────────────────────────────────────────────────────────────
+   The same segmented treatment the usage page uses, so the two product pages
+   do not disagree about what a filter control looks like. */
+
+[data-slot="oxp-toolbar"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-height: 34px;
+  padding: 4px var(--oxp-gutter);
+  border-bottom: 1px solid var(--oxp-rule);
+}
+
+[data-slot="oxp-segments"] {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--v2-background-bg-layer-02);
+}
+
+[data-slot="oxp-segment"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 520;
+  line-height: 22px;
+  color: var(--v2-text-text-muted);
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+[data-slot="oxp-segment"]:hover {
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-segment"][aria-pressed="true"] {
+  background: var(--v2-background-bg-base);
+  color: var(--v2-text-text-base);
+  box-shadow: var(--v2-elevation-switch-on);
+}
+
+[data-slot="oxp-segment"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -1px;
+}
+
+[data-slot="oxp-segment-count"] {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-segment"][aria-pressed="true"] [data-slot="oxp-segment-count"] {
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oxp-search"] {
+  flex: 0 1 200px;
+  min-width: 96px;
+  margin-left: auto;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: var(--v2-background-bg-layer-02);
+  font-size: 11.5px;
+  line-height: 22px;
+  color: var(--v2-text-text-base);
+  outline: none;
+}
+
+[data-slot="oxp-search"]::placeholder {
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-search"]:focus {
+  border-color: var(--v2-border-border-focus);
+  background: var(--v2-background-bg-base);
+}
+
+[data-slot="oxp-search"]::-webkit-search-cancel-button {
+  display: none;
+}
+
+[data-slot="oxp-count"] {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+/* ── Timeline ────────────────────────────────────────────────────────────
+   Flat by default. Only an expanded row gets a container — the same principle
+   that keeps the session timeline readable at 200 tool calls. */
+
+[data-slot="oxp-timeline"] {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 6px calc(var(--oxp-gutter) - 2px) 24px;
+}
+
+[data-slot="oxp-row"] {
+  position: relative;
+  min-width: 0;
+  padding-left: 6px;
+  border-left: 1px solid transparent;
+}
+
+/* A call that started before the previous one finished. Enough to explain a
+   duration that overlaps the next row without laying the page out in lanes. */
+[data-slot="oxp-row"][data-concurrent="true"] {
+  border-left-color: var(--v2-border-border-base);
+}
+
+[data-slot="oxp-rule"] {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 6px 0 4px;
+  padding-left: 6px;
+  font-size: 10px;
+  font-weight: 560;
+  letter-spacing: 0.35px;
+  line-height: 14px;
+  color: var(--v2-text-text-faint);
+  user-select: none;
+}
+
+[data-slot="oxp-rule"]:first-child {
+  margin-top: 0;
+}
+
+[data-slot="oxp-rule-label"] {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+[data-slot="oxp-rule-line"] {
+  flex: 1 1 auto;
+  min-width: 8px;
+  height: 1px;
+  background: var(--oxp-rule);
+}
+
+[data-slot="oxp-rule"][data-kind="day"] [data-slot="oxp-rule-label"] {
+  text-transform: uppercase;
+}
+
+[data-slot="oxp-rule"][data-kind="marker"] {
+  color: var(--v2-text-text-faint);
+  font-weight: 460;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* ── States ──────────────────────────────────────────────────────────────── */
+
+[data-slot="oxp-state"] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 56px 24px;
+  text-align: center;
+}
+
+[data-slot="oxp-state-title"] {
+  font-size: 12.5px;
+  font-weight: 520;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+}
+
+[data-slot="oxp-state-body"] {
+  max-width: 360px;
+  font-size: 11.5px;
+  line-height: 17px;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-footnote"] {
+  padding: 10px 6px 0;
+  font-size: 10.5px;
+  line-height: 16px;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-load-older"] {
+  align-self: flex-start;
+  margin: 0 0 6px 6px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--v2-background-bg-layer-02);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+  cursor: pointer;
+  transition: color 0.12s ease;
+}
+
+[data-slot="oxp-load-older"]:hover:not(:disabled) {
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-load-older"]:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* ── Expanded detail ─────────────────────────────────────────────────────
+   Everything below lives inside `[data-slot="tool-content"]`, so it inherits
+   the tool card's surface variables and never draws its own outer frame. */
+
+[data-component="oxp-detail"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+[data-component="oxp-detail"] > * + * {
+  border-top: 1px solid var(--tool-border);
+}
+
+[data-component="oxp-command"] {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+[data-component="oxp-command"] [data-slot="oxp-command-marker"] {
+  flex-shrink: 0;
+  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px;
+  line-height: 18px;
+  color: var(--v2-text-text-faint);
+  user-select: none;
+}
+
+[data-component="oxp-command"] [data-slot="oxp-command-text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px;
+  line-height: 18px;
+  color: var(--v2-text-text-base);
+}
+
+[data-component="oxp-command"] [data-slot="oxp-command-copy"] {
+  flex-shrink: 0;
+  margin: -1px -4px 0 0;
+}
+
+[data-component="oxp-prose"] {
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--v2-text-text-muted);
+}
+
+[data-component="oxp-skeleton"] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+}
+
+[data-component="oxp-skeleton"] span {
+  height: 9px;
+  border-radius: 3px;
+  background: var(--tool-surface-badge);
+  animation: oxp-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+[data-component="oxp-skeleton"] span:nth-child(1) {
+  width: 38%;
+}
+[data-component="oxp-skeleton"] span:nth-child(2) {
+  width: 72%;
+  animation-delay: 0.12s;
+}
+[data-component="oxp-skeleton"] span:nth-child(3) {
+  width: 56%;
+  animation-delay: 0.24s;
+}
+
+@keyframes oxp-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-component="oxp-skeleton"] span {
+    animation: none;
+  }
+}
+
+/* The diff viewer keeps its own header/scroller; the card only has to stop it
+   from pushing the page into a horizontal scroll. */
+[data-component="oxp-diff"] {
+  min-width: 0;
+  overflow: clip;
+}
+
+[data-component="oxp-diff"] [data-component="read-content"],
+[data-component="oxp-code"] [data-component="tool-output-json"] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+[data-component="oxp-link-row"] {
+  all: unset;
+  display: block;
+  min-width: 0;
+  cursor: pointer;
+}
+
+[data-component="oxp-link-row"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+[data-component="oxp-link-row"][aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.6;
+}

@@ -1,536 +1,70 @@
-import type {
-  OxpActivityStatus,
-  OxpInvocationInfo,
-} from "@opencode-ai/sdk/v2/client"
-import { BasicToolV2 } from "@opencode-ai/session-ui/v2/basic-tool-v2"
-import { Button } from "@opencode-ai/ui/button"
-import { ScrollView } from "@opencode-ai/ui/scroll-view"
-import { DiffChanges } from "@opencode-ai/ui/v2/diff-changes-v2"
 import { useNavigate, useParams } from "@solidjs/router"
-import {
-  createEffect,
-  createMemo,
-  createSignal,
-  For,
-  onCleanup,
-  onMount,
-  Show,
-} from "solid-js"
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { useOxpActivity } from "@/context/oxp-activity"
 import { useServerSDK } from "@/context/server-sdk"
+import { useLanguage } from "@/context/language"
 import { legacySessionHref } from "@/utils/session-route"
+import { OxpActivityHeader } from "@/pages/oxp/oxp-activity-header"
+import { OxpInvocationRow } from "@/pages/oxp/oxp-invocation-row"
+import {
+  ascending,
+  isRunning,
+  matchesFilter,
+  matchesQuery,
+  numeric,
+  OXP_FILTERS,
+  timelineEntries,
+  type OxpFilter,
+} from "@/pages/oxp/oxp-presentation"
+import { say } from "@/pages/oxp/oxp-phrase"
+import "@/pages/oxp/oxp-activity.css"
 
-type TimelineFilter =
-  | "all"
-  | "augmentation"
-  | "supervision"
-  | "delegation"
-  | "mutations"
-  | "errors"
-  | "workers"
-
-const FILTERS: ReadonlyArray<{ id: TimelineFilter; label: string }> = [
-  { id: "all", label: "All" },
-  { id: "augmentation", label: "Augmentation" },
-  { id: "supervision", label: "Supervision" },
-  { id: "delegation", label: "Delegation" },
-  { id: "mutations", label: "Mutations" },
-  { id: "errors", label: "Errors" },
-  { id: "workers", label: "Workers" },
-]
-
-const failureStatuses = new Set<OxpActivityStatus>([
-  "cancelled_before_commit",
-  "cancelled_after_commit",
-  "denied",
-  "conflict",
-  "failed",
-  "ambiguous_external_result",
-  "interrupted",
-])
-
-function numeric(value: unknown, fallback = 0) {
-  const next = Number(value)
-  return Number.isFinite(next) ? next : fallback
-}
-
-function formatTime(value: unknown) {
-  const time = numeric(value)
-  return time > 0 ? new Date(time).toLocaleString() : "—"
-}
-
-function durationLabel(item: OxpInvocationInfo, now: number) {
-  const start = numeric(item.startedAt)
-  const end = item.completedAt === undefined ? now : numeric(item.completedAt, now)
-  const ms = Math.max(0, end - start)
-  if (ms < 1000) return `${Math.round(ms)} ms`
-  const seconds = ms / 1000
-  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`
-  const minutes = Math.floor(seconds / 60)
-  const tail = Math.floor(seconds % 60)
-  return `${minutes}m ${String(tail).padStart(2, "0")}s`
-}
-
-function statusLabel(status: OxpActivityStatus) {
-  return status.replaceAll("_", " ")
-}
-
-function linkKindLabel(kind: OxpInvocationInfo["links"][number]["kind"]) {
-  switch (kind) {
-    case "session":
-      return "Session"
-    case "worker_session":
-      return "Worker"
-    case "worker_group":
-      return "Worker group"
-    case "scheduled_task":
-      return "Scheduled task"
-    case "process":
-      return "Process"
-    case "root":
-      return "Root"
-    case "external_mcp":
-      return "External MCP"
-    case "file_transfer":
-      return "File"
-  }
-}
-
-type SafeSummary = Record<string, unknown>
-type SafeFileSummary = {
-  path: string
-  type?: string
-  movePath?: string
-  additions: number
-  deletions: number
-}
-
-function asRecord(value: unknown): SafeSummary | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as SafeSummary)
-    : undefined
-}
-
-function safeSummaryOf(item: OxpInvocationInfo) {
-  return asRecord((item as OxpInvocationInfo & { safeSummary?: unknown }).safeSummary)
-}
-
-function summaryText(summary: SafeSummary | undefined, key: string) {
-  const value = summary?.[key]
-  return typeof value === "string" && value ? value : undefined
-}
-
-function summaryNumber(summary: SafeSummary | undefined, key: string) {
-  const value = summary?.[key]
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined
-}
-
-function summaryBoolean(summary: SafeSummary | undefined, key: string) {
-  const value = summary?.[key]
-  return typeof value === "boolean" ? value : undefined
-}
-
-function summaryFiles(summary: SafeSummary | undefined): SafeFileSummary[] {
-  if (!Array.isArray(summary?.files)) return []
-  return summary.files.flatMap((value) => {
-    const row = asRecord(value)
-    const path = summaryText(row, "path")
-    if (!path) return []
-    return [{
-      path,
-      type: summaryText(row, "type"),
-      movePath: summaryText(row, "movePath"),
-      additions: summaryNumber(row, "additions") ?? 0,
-      deletions: summaryNumber(row, "deletions") ?? 0,
-    }]
-  })
-}
-
-function summaryModel(summary: SafeSummary | undefined) {
-  const model = asRecord(summary?.model)
-  const providerID = summaryText(model, "providerID")
-  const modelID = summaryText(model, "modelID")
-  const variant = summaryText(model, "variant")
-  if (!providerID || !modelID) return
-  return `${providerID}/${modelID}${variant ? ` · ${variant}` : ""}`
-}
-
-function summaryRows(summary: SafeSummary | undefined) {
-  const rows: Array<{ label: string; value: string }> = []
-  const addText = (key: string, label: string) => {
-    const value = summaryText(summary, key)
-    if (value) rows.push({ label, value })
-  }
-  const addNumber = (key: string, label: string) => {
-    const value = summaryNumber(summary, key)
-    if (value !== undefined) rows.push({ label, value: value.toLocaleString() })
-  }
-  const addBoolean = (key: string, label: string) => {
-    const value = summaryBoolean(summary, key)
-    if (value !== undefined) rows.push({ label, value: value ? "Yes" : "No" })
-  }
-
-  addText("path", "Path")
-  addText("kind", "Search")
-  addText("pattern", "Pattern")
-  addText("include", "Include")
-  addText("root", "Root")
-  addText("strategy", "Strategy")
-  addText("format", "Format")
-  addText("handle", "Handle")
-  addText("workdir", "Working directory")
-  addText("mode", "Mode")
-  addText("branch", "Branch")
-  addText("ref", "Ref")
-  addText("workerID", "Worker")
-  addText("batchID", "Worker group")
-  addText("sessionID", "Session")
-  addText("requestID", "Request")
-  addText("agent", "Agent")
-  addText("namespace", "Namespace")
-  addText("capability", "Capability")
-  addNumber("count", "Results")
-  addNumber("lines", "Lines")
-  addNumber("offset", "Offset")
-  addNumber("entries", "Entries")
-  addNumber("fileCount", "Files")
-  addNumber("workerCount", "Workers")
-  addNumber("exitCode", "Exit code")
-  addNumber("outputBytes", "Output bytes")
-  addNumber("retainedBytes", "Retained bytes")
-  addNumber("bytes", "Bytes")
-  addBoolean("directory", "Directory")
-  addBoolean("attachment", "Attachment")
-  addBoolean("applied", "Applied")
-  addBoolean("changed", "Changed")
-  addBoolean("running", "Running")
-  const model = summaryModel(summary)
-  if (model) rows.push({ label: "Model", value: model })
-  return rows
-}
-
-function toolTitle(item: OxpInvocationInfo) {
-  const base = item.tool
-    .replace(/^openfork_/, "")
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (value) => value.toUpperCase())
-  return item.action ? `${base} · ${item.action.replaceAll("_", " ")}` : base
-}
-
-function invocationPresentation(item: OxpInvocationInfo) {
-  const summary = safeSummaryOf(item)
-  const files = summaryFiles(summary)
-  const changes = files.reduce(
-    (total, file) => ({
-      additions: total.additions + file.additions,
-      deletions: total.deletions + file.deletions,
-    }),
-    { additions: 0, deletions: 0 },
-  )
-  const changed = changes.additions > 0 || changes.deletions > 0
-
-  let subtitle = item.rootAlias
-  if (item.tool === "read") subtitle = summaryText(summary, "path") ?? subtitle
-  else if (item.tool === "find") {
-    const kind = summaryText(summary, "kind")
-    const pattern = summaryText(summary, "pattern")
-    subtitle = [kind, pattern].filter(Boolean).join(" · ") || subtitle
-  } else if (item.tool === "edit" || item.tool === "write" || item.tool === "patch") {
-    subtitle = files.length === 1 ? files[0]!.path : files.length > 1 ? `${files.length} files` : subtitle
-  } else if (item.tool === "process") {
-    subtitle = summaryText(summary, "handle") ?? summaryText(summary, "workdir") ?? subtitle
-  } else if (item.tool === "git") {
-    subtitle =
-      summaryText(summary, "branch") ??
-      summaryText(summary, "ref") ??
-      summaryText(summary, "workdir") ??
-      subtitle
-  } else if (item.tool === "openfork_worker") {
-    subtitle =
-      summaryText(summary, "workerID") ??
-      summaryText(summary, "batchID") ??
-      (summaryNumber(summary, "workerCount") ? `${summaryNumber(summary, "workerCount")} workers` : subtitle)
-  } else if (item.tool === "openfork_session") {
-    subtitle = summaryText(summary, "sessionID") ?? subtitle
-  } else if (item.tool === "openfork_request") {
-    subtitle = summaryText(summary, "requestID") ?? summaryText(summary, "sessionID") ?? subtitle
-  } else if (item.tool === "capability") {
-    const namespace = summaryText(summary, "namespace")
-    const capability = summaryText(summary, "capability")
-    subtitle = [namespace, capability].filter(Boolean).join(" / ") || subtitle
-  }
-
-  const args: string[] = []
-  const count = summaryNumber(summary, "count")
-  const lines = summaryNumber(summary, "lines")
-  const entries = summaryNumber(summary, "entries")
-  const applied = summaryNumber(summary, "applied")
-  const outputBytes = summaryNumber(summary, "outputBytes")
-  const exitCode = summaryNumber(summary, "exitCode")
-  const model = summaryModel(summary)
-  if (count !== undefined) args.push(`${count} results`)
-  if (lines !== undefined) args.push(`${lines} lines`)
-  if (entries !== undefined) args.push(`${entries} entries`)
-  if (applied !== undefined) args.push(`${applied} edits`)
-  if (outputBytes !== undefined) args.push(`${outputBytes.toLocaleString()} B`)
-  if (exitCode !== undefined) args.push(`exit ${exitCode}`)
-  if (model) args.push(model)
-  if (
-    summaryBoolean(summary, "truncated") ||
-    summaryBoolean(summary, "pageTruncated") ||
-    summaryBoolean(summary, "summaryTruncated") ||
-    summaryBoolean(summary, "filesTruncated")
-  )
-    args.push("truncated")
-
-  return {
-    summary,
-    files,
-    rows: summaryRows(summary),
-    changes: changed ? changes : undefined,
-    subtitle,
-    args,
-  }
-}
-
-function filterMatches(item: OxpInvocationInfo, filter: TimelineFilter) {
-  if (filter === "all") return true
-  if (
-    filter === "augmentation" ||
-    filter === "supervision" ||
-    filter === "delegation"
-  )
-    return item.plane === filter
-  if (filter === "mutations")
-    return item.mutationAttempted || item.mutationCommitted
-  if (filter === "errors") return failureStatuses.has(item.status)
-  return (
-    item.tool === "openfork_worker" ||
-    item.links.some(
-      (link) =>
-        link.kind === "worker_session" || link.kind === "worker_group",
-    )
-  )
-}
-
-function timelineGeometry(items: readonly OxpInvocationInfo[], now: number) {
-  const ordered = [...items].sort(
-    (left, right) =>
-      numeric(left.startedAt) - numeric(right.startedAt) ||
-      left.id.localeCompare(right.id),
-  )
-  const laneEnds: number[] = []
-  const lanes = new Map<string, number>()
-  const overlaps = new Set<string>()
-  let furthestEnd = Number.NEGATIVE_INFINITY
-  let furthestID: string | undefined
-
-  for (const item of ordered) {
-    const start = numeric(item.startedAt)
-    const end =
-      item.completedAt === undefined ? now : numeric(item.completedAt, now)
-    let lane = laneEnds.findIndex((candidate) => candidate <= start)
-    if (lane < 0) lane = laneEnds.length
-    laneEnds[lane] = Math.max(start, end)
-    lanes.set(item.id, lane)
-
-    if (start < furthestEnd && furthestID) {
-      overlaps.add(item.id)
-      overlaps.add(furthestID)
-    }
-    if (end > furthestEnd) {
-      furthestEnd = end
-      furthestID = item.id
-    }
-  }
-  return { lanes, overlaps }
-}
-
-function InvocationTimelineItem(props: {
-  item: OxpInvocationInfo
-  now: number
-  lane: number
-  overlaps: boolean
-  linkBusy?: string
-  onOpenSession: (sessionID: string) => void
-  onOpenScheduled: () => void
-}) {
-  const view = createMemo(() => invocationPresentation(props.item))
-  const mutation = () =>
-    props.item.mutationCommitted
-      ? "committed"
-      : props.item.mutationAttempted
-        ? "attempted"
-        : undefined
-  const statusTone = () =>
-    failureStatuses.has(props.item.status)
-      ? "text-v2-state-fg-danger"
-      : props.item.status === "running"
-        ? "text-v2-state-fg-info"
-        : props.item.status === "committed"
-          ? "text-v2-state-fg-success"
-          : "text-v2-text-text-muted"
-
-  return (
-    <div
-      class="rounded-[8px] border border-v2-border-border-subtle bg-v2-background-bg-layer-01 px-3 py-1.5"
-      classList={{ "border-l-2 border-l-v2-border-border-base": props.overlaps }}
-      style={{
-        "margin-left": `${Math.min(props.lane * 12, 48)}px`,
-        "content-visibility": "auto",
-        "contain-intrinsic-size": "84px",
-      }}
-    >
-      <BasicToolV2
-        status={props.item.status}
-        trigger={{
-          title: toolTitle(props.item),
-          subtitle: view().subtitle,
-          args: view().args,
-          changes: view().changes,
-          action: (
-            <span class={`ml-auto shrink-0 text-[11px] tabular-nums ${statusTone()}`}>
-              {durationLabel(props.item, props.now)}
-            </span>
-          ),
-        }}
-      >
-        <div class="flex min-w-0 flex-col gap-2 border-t border-v2-border-border-subtle pt-2">
-          <Show when={view().files.length > 0}>
-            <div class="overflow-hidden rounded-[6px] border border-v2-border-border-subtle bg-v2-background-bg-base">
-              <For each={view().files}>
-                {(file) => (
-                  <div class="flex min-w-0 items-center gap-2 border-b border-v2-border-border-subtle px-2.5 py-1.5 last:border-b-0">
-                    <span class="min-w-0 flex-1 truncate text-[12px] leading-4 text-v2-text-text-base" title={file.path}>
-                      {file.path}
-                      <Show when={file.movePath}>
-                        {(target) => <span class="text-v2-text-text-muted"> → {target()}</span>}
-                      </Show>
-                    </span>
-                    <Show when={file.type}>
-                      {(type) => (
-                        <span class="shrink-0 text-[10px] uppercase tracking-[0.04em] text-v2-text-text-faint">
-                          {type()}
-                        </span>
-                      )}
-                    </Show>
-                    <Show when={file.additions > 0 || file.deletions > 0}>
-                      <DiffChanges changes={{ additions: file.additions, deletions: file.deletions }} />
-                    </Show>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
-
-          <div class="grid grid-cols-2 gap-x-5 gap-y-1 text-[11px] leading-4 sm:grid-cols-4">
-            <DetailField label="Status" value={statusLabel(props.item.status)} valueClass={statusTone()} />
-            <DetailField label="Plane" value={props.item.plane} />
-            <DetailField label="Started" value={formatTime(props.item.startedAt)} />
-            <DetailField label="Duration" value={durationLabel(props.item, props.now)} />
-            <Show when={props.item.rootAlias}>
-              {(root) => <DetailField label="Root" value={root()} />}
-            </Show>
-            <Show when={props.item.observedEpoch !== undefined}>
-              <DetailField label="Epoch" value={String(numeric(props.item.observedEpoch))} />
-            </Show>
-            <Show when={mutation()}>
-              {(value) => <DetailField label="Mutation" value={value()} />}
-            </Show>
-            <Show when={props.item.errorCode}>
-              {(code) => <DetailField label="Error" value={code()} valueClass="text-v2-state-fg-danger" />}
-            </Show>
-          </div>
-
-          <Show when={view().rows.length > 0}>
-            <div class="grid gap-x-5 gap-y-1 rounded-[6px] bg-v2-background-bg-base px-2.5 py-2 text-[11px] leading-4 sm:grid-cols-2">
-              <For each={view().rows}>
-                {(row) => (
-                  <div class="flex min-w-0 gap-2">
-                    <span class="w-24 shrink-0 text-[10px] text-v2-text-text-faint">{row.label}</span>
-                    <span class="min-w-0 flex-1 truncate text-[11px] tabular-nums text-v2-text-text-muted" title={row.value}>
-                      {row.value}
-                    </span>
-                  </div>
-                )}
-              </For>
-            </div>
-          </Show>
-
-          <Show when={props.item.links.length > 0}>
-            <div class="flex flex-wrap gap-1">
-              <For each={props.item.links}>
-                {(link) => {
-                  const session = link.kind === "session" || link.kind === "worker_session"
-                  const task = link.kind === "scheduled_task"
-                  const label = () => `${linkKindLabel(link.kind)} · ${link.label ?? link.ref}`
-                  return (
-                    <Show
-                      when={session || task}
-                      fallback={
-                        <span
-                          class="inline-flex h-6 max-w-[340px] items-center truncate rounded-[5px] border border-v2-border-border-subtle bg-v2-background-bg-base px-2 text-[10.5px] text-v2-text-text-muted"
-                          title={link.ref}
-                        >
-                          {label()}
-                        </span>
-                      }
-                    >
-                      <button
-                        type="button"
-                        disabled={session && props.linkBusy === link.ref}
-                        class="h-6 max-w-[340px] truncate rounded-[5px] border border-v2-border-border-subtle bg-v2-background-bg-base px-2 text-[10.5px] text-v2-text-text-muted transition-colors hover:border-v2-border-border-base hover:text-v2-text-text-base disabled:opacity-50"
-                        title={link.ref}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          if (session) props.onOpenSession(link.ref)
-                          else props.onOpenScheduled()
-                        }}
-                      >
-                        {label()}
-                      </button>
-                    </Show>
-                  )
-                }}
-              </For>
-            </div>
-          </Show>
-
-          <div class="flex min-w-0 flex-wrap gap-x-4 gap-y-1 border-t border-v2-border-border-subtle pt-2 text-[10px] text-v2-text-text-faint">
-            <span class="truncate" title={props.item.id}>invocation {props.item.id}</span>
-            <span class="truncate" title={props.item.hostRunID}>host {props.item.hostRunID}</span>
-          </div>
-        </div>
-      </BasicToolV2>
-    </div>
-  )
-}
-
-function DetailField(props: { label: string; value: string; valueClass?: string }) {
-  return (
-    <div class="min-w-0">
-      <div class="text-[9px] font-[560] uppercase tracking-[0.055em] text-v2-text-text-faint">{props.label}</div>
-      <div class={`truncate text-[11px] text-v2-text-text-muted ${props.valueClass ?? ""}`}>{props.value}</div>
-    </div>
-  )
-}
-
+/**
+ * ChatGPT/OXP activity, read as a transcript.
+ *
+ * The page is a chronological reconstruction of what an external session did
+ * inside OpenFork, not a telemetry view of it — same tool rows, same expansion
+ * behaviour, same density as a live session. Everything expensive stays behind
+ * an explicit expand: the list consumes the compact server projection, and a
+ * call's recorded request/result payload is fetched once, on first open, and
+ * then served from the store's bounded cache.
+ */
 export function OxpActivityPage() {
   const params = useParams<{ activityID: string }>()
   const navigate = useNavigate()
   const store = useOxpActivity()
   const serverSDK = useServerSDK()
-  const [filter, setFilter] = createSignal<TimelineFilter>("all")
-  const [now, setNow] = createSignal(Date.now())
-  const [titleDraft, setTitleDraft] = createSignal("")
-  const [editingTitle, setEditingTitle] = createSignal(false)
-  const [savingTitle, setSavingTitle] = createSignal(false)
-  const [confirmDelete, setConfirmDelete] = createSignal(false)
-  const [busyAction, setBusyAction] = createSignal<"archive" | "delete" | undefined>()
+  const language = useLanguage()
+
+  const [filter, setFilter] = createSignal<OxpFilter>("all")
+  const [query, setQuery] = createSignal("")
+  const [busy, setBusy] = createSignal(false)
   const [linkBusy, setLinkBusy] = createSignal<string | undefined>()
 
-  onMount(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+  const summary = createMemo(() => store.activity(params.activityID))
+  const detail = createMemo(() => store.detail(params.activityID))
+  const items = createMemo(() => detail()?.items ?? [])
+
+  // Two clocks, both shared, both conditional.
+  //
+  // A single page-wide one-second tick that every row reads is N re-renders per
+  // second on a transcript that is almost entirely settled. The fast clock only
+  // runs while something is actually running, and only running rows read it; the
+  // coarse clock exists for the header's "12m ago" and never wakes a row.
+  const anyRunning = createMemo(() => items().some(isRunning))
+  const [fastNow, setFastNow] = createSignal(Date.now())
+  const [minuteNow, setMinuteNow] = createSignal(Date.now())
+
+  createEffect(() => {
+    if (!anyRunning()) return
+    setFastNow(Date.now())
+    const timer = window.setInterval(() => setFastNow(Date.now()), 1000)
+    onCleanup(() => window.clearInterval(timer))
+  })
+
+  createEffect(() => {
+    const timer = window.setInterval(() => setMinuteNow(Date.now()), 60_000)
     onCleanup(() => window.clearInterval(timer))
   })
 
@@ -541,332 +75,251 @@ export function OxpActivityPage() {
     store.ensureInvocations(activityID)
   })
 
-  const summary = createMemo(() => store.activity(params.activityID))
-  const detail = createMemo(() => store.detail(params.activityID))
-
-  createEffect(() => {
-    const value = summary()
-    if (!value || editingTitle()) return
-    setTitleDraft(value.title ?? "")
+  const ordered = createMemo(() => ascending(items()))
+  const visible = createMemo(() => {
+    const active = filter()
+    const needle = query()
+    return ordered().filter((item) => matchesFilter(item, active) && matchesQuery(item, needle))
   })
+  const entries = createMemo(() => timelineEntries(visible()))
 
-  const geometry = createMemo(() =>
-    timelineGeometry(detail()?.items ?? [], now()),
-  )
-  const visible = createMemo(() =>
-    (detail()?.items ?? []).filter((item) => filterMatches(item, filter())),
-  )
-  const segmentBoundaries = createMemo(() => {
-    const items = detail()?.items ?? []
-    const boundaries = new Map<string, string>()
-    for (let index = 0; index + 1 < items.length; index++) {
-      const current = items[index]!
-      const older = items[index + 1]!
-      if (current.hostRunID !== older.hostRunID) {
-        boundaries.set(
-          current.id,
-          current.observedEpoch === undefined
-            ? "Host observation restarted"
-            : `Host observation restarted · epoch ${numeric(current.observedEpoch)}`,
-        )
-        continue
-      }
-      if (
-        current.observedEpoch !== undefined &&
-        current.observedEpoch !== older.observedEpoch
-      ) {
-        boundaries.set(
-          current.id,
-          `Observed epoch ${numeric(current.observedEpoch)} began`,
-        )
+  const counts = createMemo(() => {
+    const rows = ordered()
+    const result: Record<OxpFilter, number> = { all: 0, tools: 0, workers: 0, changes: 0, errors: 0 }
+    for (const item of rows) {
+      result.all += 1
+      for (const option of OXP_FILTERS) {
+        if (option.id === "all") continue
+        if (matchesFilter(item, option.id)) result[option.id] += 1
       }
     }
-    return boundaries
+    return result
   })
 
-  const saveTitle = async () => {
-    setSavingTitle(true)
-    try {
-      const value = titleDraft().trim()
-      await store.rename(params.activityID, value || undefined)
-      setEditingTitle(false)
-    } finally {
-      setSavingTitle(false)
-    }
+  // Ascending order means the newest call is at the bottom, like a session. Land
+  // there on first paint, and keep following only when the reader is already at
+  // the bottom — scrolling up to read history must never be yanked back by a
+  // call that just landed.
+  let viewport: HTMLDivElement | undefined
+  let pinned = true
+  const atBottom = () =>
+    !viewport || viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 64
+
+  const onScroll = () => {
+    pinned = atBottom()
   }
 
-  const archive = async () => {
-    setBusyAction("archive")
-    try {
-      await store.archive(params.activityID, true)
-      navigate("/oxp")
-    } finally {
-      setBusyAction(undefined)
-    }
-  }
+  createEffect(
+    on(
+      () => [params.activityID, detail()?.loaded, entries().length] as const,
+      () => {
+        if (!viewport || !pinned) return
+        queueMicrotask(() => viewport?.scrollTo({ top: viewport.scrollHeight }))
+      },
+    ),
+  )
 
-  const remove = async () => {
-    setBusyAction("delete")
+  createEffect(
+    on(
+      () => params.activityID,
+      () => {
+        pinned = true
+      },
+    ),
+  )
+
+  const withBusy = async (run: () => Promise<unknown>) => {
+    setBusy(true)
     try {
-      await store.remove(params.activityID)
-      navigate("/oxp")
+      await run()
     } finally {
-      setBusyAction(undefined)
+      setBusy(false)
     }
   }
 
   const openNativeSession = async (sessionID: string) => {
     setLinkBusy(sessionID)
     try {
-      const response = await serverSDK().client.global.sessionGet(
-        { sessionID },
-        { throwOnError: true },
-      )
+      const response = await serverSDK().client.global.sessionGet({ sessionID }, { throwOnError: true })
       const session = response.data
       if (!session?.directory) return
       navigate(legacySessionHref(session.directory, session.id))
+    } catch {
+      // Opening a native session is a navigation affordance, not a data path.
+      // A worker whose session was archived away should not raise a page error.
     } finally {
       setLinkBusy(undefined)
     }
   }
 
+  // Older pages prepend, so the reader's current line has to stay put: capture
+  // the distance from the bottom and restore it once the new rows are in.
+  const loadOlder = async () => {
+    const anchor = viewport ? viewport.scrollHeight - viewport.scrollTop : undefined
+    pinned = false
+    await store.loadMore(params.activityID)
+    if (anchor === undefined) return
+    queueMicrotask(() => {
+      if (!viewport) return
+      viewport.scrollTop = viewport.scrollHeight - anchor
+    })
+  }
+
   return (
-    <div
-      data-component="oxp-activity-page"
-      class="m-2 flex min-h-0 min-w-0 flex-1 self-stretch flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
-    >
-      <header class="shrink-0 border-b border-border-weaker-base px-5 py-3">
-        <div class="flex min-w-0 items-center gap-3">
-          <div class="min-w-0 flex-1">
-            <div class="mb-1 flex items-center gap-2 text-[10px] font-[600] uppercase tracking-[0.08em] text-text-weak">
-              <span>ChatGPT / OXP</span>
-              <span class="font-normal normal-case tracking-normal">
-                durable activity
-              </span>
-            </div>
-            <Show
-              when={editingTitle()}
-              fallback={
-                <button
-                  type="button"
-                  class="max-w-full truncate text-left text-14-medium text-text-strong hover:underline"
-                  onClick={() => setEditingTitle(true)}
-                >
-                  {summary()?.title ??
-                    summary()?.lastRootAlias ??
-                    "ChatGPT activity"}
-                </button>
-              }
-            >
-              <div class="flex max-w-[520px] items-center gap-1.5">
-                <input
-                  value={titleDraft()}
-                  maxlength={256}
-                  autofocus
-                  class="h-7 min-w-0 flex-1 rounded border border-border-base bg-background-base px-2 text-12-regular text-text-strong outline-none focus:border-border-strong"
-                  onInput={(event) => setTitleDraft(event.currentTarget.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") void saveTitle()
-                    if (event.key === "Escape") setEditingTitle(false)
-                  }}
-                />
-                <Button
-                  size="small"
-                  variant="primary"
-                  disabled={savingTitle()}
-                  onClick={() => void saveTitle()}
-                >
-                  Save
-                </Button>
-                <Button
-                  size="small"
-                  variant="ghost"
-                  onClick={() => setEditingTitle(false)}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </Show>
-          </div>
-          <div class="flex shrink-0 items-center gap-1">
-            <Button
-              size="small"
-              variant="ghost"
-              onClick={() => void store.refreshInvocations(params.activityID)}
-            >
-              Refresh
-            </Button>
-            <Button
-              size="small"
-              variant="ghost"
-              disabled={busyAction() !== undefined}
-              onClick={() => void archive()}
-            >
-              Archive
-            </Button>
-            <Show
-              when={confirmDelete()}
-              fallback={
-                <Button
-                  size="small"
-                  variant="ghost"
-                  onClick={() => setConfirmDelete(true)}
-                >
-                  Delete history
-                </Button>
-              }
-            >
-              <Button
-                size="small"
-                variant="primary"
-                disabled={busyAction() !== undefined}
-                onClick={() => void remove()}
+    <div data-component="oxp-activity">
+      <OxpActivityHeader
+        activity={summary()}
+        minuteNow={minuteNow()}
+        busy={busy()}
+        onRename={(title) => store.rename(params.activityID, title)}
+        onArchive={() =>
+          void withBusy(async () => {
+            await store.archive(params.activityID, true)
+            navigate("/oxp")
+          })
+        }
+        onDelete={() =>
+          void withBusy(async () => {
+            await store.remove(params.activityID)
+            navigate("/oxp")
+          })
+        }
+        onRefresh={() => void store.refreshInvocations(params.activityID)}
+      />
+
+      <div data-slot="oxp-toolbar" role="toolbar" aria-label={language.t("oxpActivity.tab.title")}>
+        <div data-slot="oxp-segments" role="group">
+          <For each={OXP_FILTERS}>
+            {(option) => (
+              <button
+                type="button"
+                data-slot="oxp-segment"
+                aria-pressed={filter() === option.id}
+                onClick={() => setFilter(option.id)}
               >
-                Confirm delete
-              </Button>
-              <Button
-                size="small"
-                variant="ghost"
-                onClick={() => setConfirmDelete(false)}
-              >
-                Cancel
-              </Button>
-            </Show>
-          </div>
+                {language.t(option.key)}
+                <Show when={counts()[option.id] > 0 && option.id !== "all"}>
+                  <span data-slot="oxp-segment-count">{counts()[option.id]}</span>
+                </Show>
+              </button>
+            )}
+          </For>
         </div>
 
-        <Show when={summary()}>
-          {(activity) => (
-            <div class="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3 xl:grid-cols-6">
-              <Metric label="Calls" value={numeric(activity().callCount)} />
-              <Metric label="Failures" value={numeric(activity().failureCount)} />
-              <Metric
-                label="Epochs"
-                value={numeric(activity().observedEpochCount)}
-              />
-              <Metric label="First seen" value={formatTime(activity().firstSeenAt)} />
-              <Metric label="Last seen" value={formatTime(activity().lastSeenAt)} />
-              <Metric label="Last tool" value={activity().lastTool ?? "—"} />
-            </div>
-          )}
-        </Show>
-      </header>
-
-      <div class="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border-weaker-base px-5 py-2">
-        <For each={FILTERS}>
-          {(item) => (
-            <button
-              type="button"
-              class="h-6 shrink-0 rounded px-2 text-[11px] font-[520] transition-colors"
-              classList={{
-                "bg-surface-base text-text-strong": filter() === item.id,
-                "text-text-weak hover:bg-surface-base hover:text-text-strong":
-                  filter() !== item.id,
-              }}
-              onClick={() => setFilter(item.id)}
-            >
-              {item.label}
-            </button>
-          )}
-        </For>
-        <span class="ml-auto shrink-0 text-[10px] tabular-nums text-text-weak">
-          {visible().length} loaded
+        <input
+          type="search"
+          data-slot="oxp-search"
+          value={query()}
+          placeholder={language.t("oxpActivity.filter.search")}
+          aria-label={language.t("oxpActivity.filter.search")}
+          onInput={(event) => setQuery(event.currentTarget.value)}
+        />
+        <span data-slot="oxp-count">
+          {language.t("oxpActivity.filter.count", { visible: visible().length, total: ordered().length })}
         </span>
       </div>
 
-      <ScrollView class="min-h-0 flex-1">
-        <main class="px-5 py-4">
-        <Show
-          when={summary()}
-          fallback={
-            <div class="py-10 text-center text-12-regular text-text-weak">
-              {store.error() ? "Unable to load OXP activity." : "Loading activity…"}
-            </div>
-          }
-        >
+      <ScrollView class="min-h-0 flex-1" viewportRef={(element) => (viewport = element)} onScroll={onScroll}>
+        <div data-slot="oxp-timeline">
           <Show
-            when={visible().length > 0}
+            when={detail()?.loaded || items().length > 0}
             fallback={
-              <div class="py-10 text-center text-12-regular text-text-weak">
-                {detail()?.loading
-                  ? "Loading invocation spans…"
-                  : "No invocation spans match this filter."}
+              <div data-slot="oxp-state">
+                <span data-slot="oxp-state-title">
+                  {detail()?.error || store.error()
+                    ? language.t("oxpActivity.timeline.error")
+                    : language.t("oxpActivity.timeline.loading")}
+                </span>
+                <Show when={detail()?.error ?? store.error()}>
+                  {(message) => <span data-slot="oxp-state-body">{message()}</span>}
+                </Show>
               </div>
             }
           >
-            <div class="mx-auto flex w-full max-w-[1100px] flex-col gap-1.5">
-              <For each={visible()}>
-                {(item) => {
-                  const lane = () => geometry().lanes.get(item.id) ?? 0
-                  const overlaps = () => geometry().overlaps.has(item.id)
-                  return (
-                    <>
-                      <Show when={item.continuityMarker === "handoff_advisory"}>
-                        <div
-                          class="flex items-center gap-2 py-1 text-[10px] font-[560] uppercase tracking-[0.05em] text-text-weak"
-                          style={{
-                            "margin-left": `${Math.min(lane() * 12, 48)}px`,
-                          }}
-                        >
-                          <span class="h-px min-w-4 flex-1 bg-border-weaker-base" />
-                          <span>Continuity · 20-minute handoff advisory delivered</span>
-                          <span class="h-px min-w-4 flex-1 bg-border-weaker-base" />
-                        </div>
-                      </Show>
-                      <InvocationTimelineItem
-                        item={item}
-                        now={now()}
-                        lane={lane()}
-                        overlaps={overlaps()}
+            <Show when={detail()?.more}>
+              <button
+                type="button"
+                data-slot="oxp-load-older"
+                disabled={detail()?.loading}
+                onClick={() => void loadOlder()}
+              >
+                {detail()?.loading
+                  ? language.t("oxpActivity.timeline.loadingOlder")
+                  : language.t("oxpActivity.timeline.loadOlder")}
+              </button>
+            </Show>
+
+            <Show
+              when={entries().length > 0}
+              fallback={
+                <div data-slot="oxp-state">
+                  <span data-slot="oxp-state-title">
+                    {ordered().length === 0
+                      ? language.t("oxpActivity.timeline.empty")
+                      : language.t("oxpActivity.timeline.noMatches")}
+                  </span>
+                </div>
+              }
+            >
+              <For each={entries()}>
+                {(entry) => (
+                  <Show
+                    when={entry.kind === "invocation" && entry}
+                    fallback={
+                      <div data-slot="oxp-rule" data-kind={entry.kind}>
+                        <span data-slot="oxp-rule-label">
+                          {entry.kind === "day"
+                            ? dayLabel(entry.at, language.intl())
+                            : entry.kind === "marker"
+                              ? say(language, entry.label)
+                              : ""}
+                        </span>
+                        <span data-slot="oxp-rule-line" />
+                      </div>
+                    }
+                  >
+                    {(row) => (
+                      <OxpInvocationRow
+                        item={row().item}
+                        concurrent={row().concurrent}
+                        now={fastNow}
+                        detail={store.invocationDetail(row().item.id)}
                         linkBusy={linkBusy()}
+                        onEnsureDetail={(id) => store.ensureInvocationDetail(id)}
                         onOpenSession={(sessionID) => void openNativeSession(sessionID)}
                         onOpenScheduled={() => navigate("/scheduled")}
                       />
-                      <Show when={segmentBoundaries().get(item.id)}>
-                        {(label) => (
-                          <div
-                            class="flex items-center gap-2 py-1 text-[10px] font-[520] text-text-weak"
-                            style={{
-                              "margin-left": `${Math.min(lane() * 12, 48)}px`,
-                            }}
-                          >
-                            <span class="h-px min-w-4 flex-1 bg-border-weaker-base" />
-                            <span>{label()}</span>
-                            <span class="h-px min-w-4 flex-1 bg-border-weaker-base" />
-                          </div>
-                        )}
-                      </Show>
-                    </>
-                  )
-                }}
+                    )}
+                  </Show>
+                )}
               </For>
-              <Show when={detail()?.more}>
-                <Button
-                  size="small"
-                  variant="ghost"
-                  disabled={detail()?.loading}
-                  onClick={() => void store.loadMore(params.activityID)}
-                >
-                  {detail()?.loading ? "Loading…" : "Load older spans"}
-                </Button>
-              </Show>
-              <Show when={detail()?.capped}>
-                <div class="py-2 text-center text-[10px] text-text-weak">
-                  Renderer history cache is capped at 2,000 spans. Refreshing this activity keeps the newest window bounded.
-                </div>
-              </Show>
-            </div>
+            </Show>
+
+            <Show when={detail()?.capped}>
+              <div data-slot="oxp-footnote">{language.t("oxpActivity.timeline.capped")}</div>
+            </Show>
           </Show>
-        </Show>
-        </main>
+        </div>
       </ScrollView>
     </div>
   )
 }
 
+const dayFormatters = new Map<string, Intl.DateTimeFormat>()
+
+function dayLabel(at: number, locale: string) {
+  let formatter = dayFormatters.get(locale)
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat(locale, { weekday: "short", month: "short", day: "numeric" })
+    dayFormatters.set(locale, formatter)
+  }
+  return formatter.format(new Date(numeric(at)))
+}
+
 export function OxpActivityLandingPage() {
   const navigate = useNavigate()
   const store = useOxpActivity()
+  const language = useLanguage()
 
   createEffect(() => {
     store.ensureLoaded()
@@ -876,34 +329,16 @@ export function OxpActivityLandingPage() {
   })
 
   return (
-    <div
-      data-component="oxp-activity-page"
-      class="m-2 flex min-h-0 min-w-0 flex-1 self-stretch flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
-    >
-      <div class="flex min-h-0 flex-1 items-center justify-center px-6 text-center">
-        <div class="max-w-sm">
-          <div class="text-[13px] font-[560] text-v2-text-text-base">
-            {store.loading() ? "Loading OXP activity…" : "No OXP activity yet"}
-          </div>
+    <div data-component="oxp-activity">
+      <div class="flex min-h-0 flex-1 items-center justify-center">
+        <div data-slot="oxp-state">
+          <span data-slot="oxp-state-title">
+            {store.loading() ? language.t("oxpActivity.landing.loading") : language.t("oxpActivity.landing.empty")}
+          </span>
           <Show when={!store.loading()}>
-            <div class="mt-1 text-[11px] leading-4 text-v2-text-text-muted">
-              ChatGPT/OXP tool activity will appear here as soon as this OpenFork instance observes a correlated parent.
-            </div>
+            <span data-slot="oxp-state-body">{language.t("oxpActivity.landing.emptyDescription")}</span>
           </Show>
         </div>
-      </div>
-    </div>
-  )
-}
-
-function Metric(props: { label: string; value: string | number }) {
-  return (
-    <div class="min-w-0">
-      <div class="text-[9.5px] font-[560] uppercase tracking-[0.06em] text-text-weak">
-        {props.label}
-      </div>
-      <div class="truncate text-[11.5px] tabular-nums text-text-strong">
-        {props.value}
       </div>
     </div>
   )

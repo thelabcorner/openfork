@@ -22,7 +22,7 @@ import { useServerSDK } from "@/context/server-sdk"
 import { showToast } from "@/utils/toast"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
-import { SettingsLocalScope } from "./parts/local-scope"
+import { SettingsModelCatalogScope } from "./parts/model-catalog-scope"
 import { SettingsModelPickerV2 } from "./parts/model-picker"
 import { SettingsRowV2 } from "./parts/row"
 import { LayoutRetirementNotice, LayoutTransitionToggle } from "./interface-transition"
@@ -682,18 +682,14 @@ const AuditorPromptDialog: Component<{ onClose: () => void }> = (props) => {
 
 const PromptRevisionPromptDialog: Component<{ onClose: () => void }> = (props) => {
   const language = useLanguage()
-  const settings = useSettings()
   const serverSync = useServerSync()
-  const savedPrompt = () => settings.general.promptRevision()?.prompt?.trim()
+  const savedPrompt = () => serverSync().data.config.prompt_revisor_prompt?.trim()
   const [prompt, setPrompt] = createSignal(savedPrompt() || DEFAULT_PROMPT_REVISOR)
   const usesDefaultPrompt = createMemo(() => prompt().trim() === DEFAULT_PROMPT_REVISOR.trim())
 
   const save = () => {
-    const next = settings.general.promptRevision() ?? {}
     const value = prompt().trim()
     const promptValue = value && value !== DEFAULT_PROMPT_REVISOR.trim() ? value : undefined
-    if (!promptValue && !next.model && !next.autoBeforeSend) settings.general.setPromptRevision(undefined)
-    else settings.general.setPromptRevision({ ...next, prompt: promptValue })
     void serverSync().updateConfig({ prompt_revisor_prompt: promptValue })
     props.onClose()
   }
@@ -781,10 +777,25 @@ const PromptRevisionSection: Component = () => {
   const language = useLanguage()
   const dialog = useDialog()
   const settings = useSettings()
+  const serverSync = useServerSync()
+  const configuredAgentModel = createMemo(() => {
+    const value = serverSync().data.config.agent?.["prompt-revisor"]?.model?.trim()
+    if (!value) return undefined
+    const [providerID, ...parts] = value.split("/")
+    const modelID = parts.join("/")
+    return providerID && modelID ? { providerID, modelID } : undefined
+  })
   const selectModel = (model: { providerID: string; modelID: string } | undefined) => {
-    const next = settings.general.promptRevision() ?? {}
-    if (!model && !next.prompt && !next.autoBeforeSend) settings.general.setPromptRevision(undefined)
-    else settings.general.setPromptRevision({ ...next, model })
+    // Persistent selection belongs to the canonical prompt-revisor agent,
+    // exactly like every other special agent. Renderer preferences own only
+    // composer automation toggles; they never participate in model routing.
+    void serverSync().updateConfig({
+      agent: {
+        "prompt-revisor": {
+          model: model ? `${model.providerID}/${model.modelID}` : undefined,
+        },
+      },
+    })
   }
   const setAutoBeforeSend = (autoBeforeSend: boolean) => {
     const next = settings.general.promptRevision() ?? {}
@@ -813,7 +824,7 @@ const PromptRevisionSection: Component = () => {
           <div class="flex items-center gap-1.5">
             <SettingsModelPickerV2
               action="settings-prompt-revision-model"
-              value={settings.general.promptRevision()?.model}
+              value={configuredAgentModel()}
               defaultLabel={language.t("settings.general.row.promptRevisionModel.default")}
               onChange={selectModel}
             />
@@ -1418,13 +1429,13 @@ export const SettingsGeneralV2: Component<{
 
         <GeneralSection />
 
-        <SettingsLocalScope>
+        <SettingsModelCatalogScope>
           <TitleGenerationSection />
           <PromptRevisionSection />
           <AuditorSection />
           <SpadAuditorSection />
           <CompactionSection />
-        </SettingsLocalScope>
+        </SettingsModelCatalogScope>
 
         <AppearanceSection controller={appearance} />
 

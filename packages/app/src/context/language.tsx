@@ -1,14 +1,13 @@
 import * as i18n from "@solid-primitives/i18n"
-import { createEffect, createMemo } from "solid-js"
+import { createEffect, createMemo, createSignal } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { pluralCategory, type UiI18nPluralKey } from "@opencode-ai/ui/context/i18n"
 import { Persist, persisted } from "@/utils/persist"
-import { dict as en } from "@/i18n/en"
+import type { dict as fullEnglishDictionary } from "@/i18n/en"
 import { dict as uiEn } from "@opencode-ai/ui/i18n/en"
 import {
   createDesktopNativeBundle,
-  DESKTOP_NATIVE_ENGLISH,
   DESKTOP_NATIVE_LABELS,
   DESKTOP_NATIVE_LOCALE_TAGS,
   DESKTOP_NATIVE_LOCALES,
@@ -19,8 +18,9 @@ import {
 export type Locale = DesktopNativeLocale
 export type Direction = "ltr" | "rtl"
 
-type RawDictionary = typeof en & typeof uiEn
+type RawDictionary = typeof fullEnglishDictionary & typeof uiEn
 type Dictionary = i18n.Flatten<RawDictionary>
+type AppDictionary = Partial<typeof fullEnglishDictionary>
 type PluralKey =
   | UiI18nPluralKey
   | "session.question.pending"
@@ -41,6 +41,16 @@ type PluralKey =
   | "projectExplorer.folder.count"
   | "settings.providers.accounts.count"
   | "goal.auditor.runs"
+  | "scheduledTasks.calendar.reset.partial"
+  | "scheduledTasks.calendar.reset.count"
+  | "oxpActivity.calls"
+  | "oxpActivity.concurrent"
+  | "oxpActivity.result.edits"
+  | "oxpActivity.result.entries"
+  | "oxpActivity.result.files"
+  | "oxpActivity.result.lines"
+  | "oxpActivity.result.matches"
+  | "oxpActivity.result.workers"
 
 const pluralCountFormatters = new Map<string, Intl.NumberFormat>()
 /** Locale-grouped rendering of a plural string's `{{count}}` placeholder. */
@@ -53,19 +63,12 @@ function pluralCount(locale: string, count: number) {
   return formatter.format(count)
 }
 
-const base = i18n.flatten({ ...en, ...uiEn })
-const dicts = new Map<Locale, Dictionary>([["en", base]])
-
-function loadDict(locale: Locale) {
-  return Promise.resolve(dicts.get(locale) ?? base)
-}
-
 export function loadInitialLocale(): Promise<Locale> {
   return Promise.resolve("en")
 }
 
-export function loadLocaleDict(locale: Locale) {
-  return loadDict(locale).then(() => undefined)
+export function loadLocaleDict(_locale: Locale) {
+  return Promise.resolve()
 }
 
 export function normalizeLocale(_value: string): Locale {
@@ -75,7 +78,12 @@ export function normalizeLocale(_value: string): Locale {
 export const { use: useLanguage, provider: LanguageProvider } = createSimpleContext({
   name: "Language",
   gate: false,
-  init: (props: { locale?: Locale; onNativeTranslations?: (bundle: DesktopNativeBundle) => void }) => {
+  init: (props: {
+    locale?: Locale
+    dictionary: AppDictionary
+    nativeEnglish?: Readonly<Record<string, string>>
+    onNativeTranslations?: (bundle: DesktopNativeBundle) => void
+  }) => {
     const [, setStore, _, ready] = persisted(
       Persist.global("language", ["language.v1"]),
       createStore({
@@ -87,14 +95,31 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
     const direction = createMemo<Direction>(() => "ltr")
     const layoutLocale = createMemo(() => intl())
 
-    const t = i18n.translator(() => base, i18n.resolveTemplate) as (
+    const [dictionary, setDictionary] = createSignal(
+      i18n.flatten({ ...props.dictionary, ...uiEn }) as Dictionary,
+    )
+    const t = i18n.translator(dictionary, i18n.resolveTemplate) as (
       key: keyof Dictionary,
       params?: Record<string, string | number | boolean>,
     ) => string
 
+    const registerTranslations = (next: Readonly<Record<string, string>>) => {
+      setDictionary((current) => {
+        const source = current as Record<string, string>
+        let changed = false
+        for (const [key, value] of Object.entries(next)) {
+          if (source[key] === value) continue
+          changed = true
+          break
+        }
+        if (!changed) return current
+        return { ...current, ...next } as Dictionary
+      })
+    }
+
     const plural = (key: PluralKey, count: number, params?: Record<string, string | number | boolean>) => {
       const category = pluralCategory(intl(), count)
-      const current = base as Record<string, string>
+      const current = dictionary() as Record<string, string>
       const candidate = `${key}.${category}`
       const fallback = `${key}.other`
       // `{{count}}` is display text, so it goes through the locale's number
@@ -116,10 +141,10 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
     })
 
     createEffect(() => {
-      if (!props.onNativeTranslations) return
-      const current = base as Record<string, string>
+      if (!props.onNativeTranslations || !props.nativeEnglish) return
+      const current = dictionary() as Record<string, string>
       props.onNativeTranslations(
-        createDesktopNativeBundle(locale(), (key) => current[key] ?? DESKTOP_NATIVE_ENGLISH[key]),
+        createDesktopNativeBundle(locale(), (key) => current[key] ?? props.nativeEnglish?.[key] ?? key),
       )
     })
 
@@ -133,6 +158,7 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
       label,
       t,
       plural,
+      registerTranslations,
       setLocale(_next: Locale) {
         setStore("locale", "en")
       },

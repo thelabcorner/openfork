@@ -119,7 +119,9 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
         <SettingsProvidersV2 directory={props.directory} onBack={props.onProviderBack} />
       </TabsV2.Content>
       <TabsV2.Content value="models" class="settings-v2-panel">
-        <SettingsModelsV2 />
+        <Show when={props.tab() === "models"}>
+          <SettingsModelsV2 />
+        </Show>
       </TabsV2.Content>
       <TabsV2.Content value="devices" class="settings-v2-panel">
         <SettingsDevicesV2 />

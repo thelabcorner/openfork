@@ -1,13 +1,13 @@
-import { Component, Show, createMemo } from "solid-js"
+import { Component, Show, createMemo, onCleanup } from "solid-js"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
-import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
+import { ModelSelectorPopoverV2, type ModelSelectorModelState } from "@/components/dialog-select-model"
 import { useLanguage } from "@/context/language"
-import { useLocal } from "@/context/local"
+import { useModels } from "@/context/models"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
-import { SettingsLocalScope } from "./local-scope"
+import { SettingsModelCatalogScope, useSettingsModelCatalogScope } from "./model-catalog-scope"
 
 export type SettingsModelRef = { providerID: string; modelID: string }
 
@@ -17,33 +17,58 @@ type SettingsModelPickerProps = {
   action: string
   onChange: (value: SettingsModelRef | undefined) => void
   compact?: boolean
-  /** Use the catalog/search selector without session-history/quota analytics. */
-  lightweightSelector?: boolean
 }
 
-export const SettingsModelPickerV2: Component<SettingsModelPickerProps> = (props) => (
-  // Routed settings can render outside DirectoryLayout. Keep the context
-  // boundary with the reusable picker so new settings callers cannot forget it.
-  <SettingsLocalScope>
-    <SettingsModelPickerContent {...props} />
-  </SettingsLocalScope>
-)
+function tryUseModels() {
+  try {
+    return useModels()
+  } catch {
+    return undefined
+  }
+}
+
+export const SettingsModelPickerV2: Component<SettingsModelPickerProps> = (props) => {
+  // Session/composer surfaces already own a ModelsProvider. Routed settings do
+  // not, so fall back to the narrow lazy catalog scope rather than manufacturing
+  // a full Local/session context tree per picker.
+  if (tryUseModels()) return <SettingsModelPickerContent {...props} />
+  return (
+    <SettingsModelCatalogScope>
+      <SettingsModelPickerContent {...props} />
+    </SettingsModelCatalogScope>
+  )
+}
 
 const SettingsModelPickerContent: Component<SettingsModelPickerProps> = (props) => {
   const language = useLanguage()
-  const local = useLocal()
+  const models = useModels()
+  const scope = useSettingsModelCatalogScope()
+  const pickerToken = {}
+  onCleanup(() => scope?.setPickerOpen(pickerToken, false))
+
+  const selected = createMemo(() => {
+    const saved = props.value
+    if (!saved) return undefined
+    return models.find(saved)
+  })
+  const recent = createMemo(() =>
+    models.recent.list().flatMap((key) => {
+      const item = models.find(key)
+      return item ? [item] : []
+    }),
+  )
   const model = {
-    ...local.model,
-    current: () => {
-      const saved = props.value
-      if (!saved) return undefined
-      return local.model.list().find((item) => item.provider.id === saved.providerID && item.id === saved.modelID)
-    },
+    current: selected,
+    recent,
+    list: models.list,
     set: (value: SettingsModelRef | undefined) => {
       props.onChange(value ? { providerID: value.providerID, modelID: value.modelID } : undefined)
     },
-  }
-  const selected = createMemo(() => model.current())
+    visible: models.visible,
+    favorite: models.favorite,
+    subProvider: models.subProvider,
+    order: models.order,
+  } satisfies ModelSelectorModelState
   const label = createMemo(() => {
     const item = selected()
     if (item) return stripUnlimitedSuffix(item.name)
@@ -56,9 +81,11 @@ const SettingsModelPickerContent: Component<SettingsModelPickerProps> = (props) 
     <div class="flex min-w-0 items-center gap-1.5">
       <ModelSelectorPopoverV2
         model={model}
+        directory={scope?.directory()}
         placement="bottom-end"
         commitSelectionBeforeClose
-        lightweight={props.lightweightSelector}
+        lightweight
+        onOpenChange={(open) => scope?.setPickerOpen(pickerToken, open)}
         trigger={(triggerProps) => (
           <button
             {...triggerProps}
