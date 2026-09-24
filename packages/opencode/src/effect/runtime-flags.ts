@@ -71,7 +71,10 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalLspTool: enabledByExperimental("OPENCODE_EXPERIMENTAL_LSP_TOOL"),
   experimentalOxfmt: enabledByExperimental("OPENCODE_EXPERIMENTAL_OXFMT"),
   experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE"),
-  experimentalCodeMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_CODE_MODE"),
+  // OpenFork ships upstream Code Mode as the default MCP orchestration path.
+  // Keep the upstream compatibility flag as an explicit opt-out: setting
+  // OPENCODE_EXPERIMENTAL_CODE_MODE=false restores direct MCP tool exposure.
+  experimentalCodeMode: Config.boolean("OPENCODE_EXPERIMENTAL_CODE_MODE").pipe(Config.withDefault(true)),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),
   experimentalIconDiscovery: enabledByExperimental("OPENCODE_EXPERIMENTAL_ICON_DISCOVERY"),

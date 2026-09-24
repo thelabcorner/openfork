@@ -18,6 +18,18 @@ describe("RuntimeFlags", () => {
     }),
   )
 
+  it.effect("Code Mode defaults on and keeps the upstream flag as an explicit opt-out", () =>
+    Effect.gen(function* () {
+      const defaults = yield* readFlags.pipe(Effect.provide(fromConfig({})))
+      const disabled = yield* readFlags.pipe(
+        Effect.provide(fromConfig({ OPENCODE_EXPERIMENTAL_CODE_MODE: "false" })),
+      )
+
+      expect(defaults.experimentalCodeMode).toBe(true)
+      expect(disabled.experimentalCodeMode).toBe(false)
+    }),
+  )
+
   it.effect("layer parses plugin flags from the active ConfigProvider", () =>
     Effect.gen(function* () {
       const flags = yield* readFlags.pipe(
@@ -56,6 +68,7 @@ describe("RuntimeFlags", () => {
       expect(flags.experimentalLspTool).toBe(true)
       expect(flags.experimentalOxfmt).toBe(true)
       expect(flags.experimentalPlanMode).toBe(true)
+      expect(flags.experimentalCodeMode).toBe(true)
       expect(flags.experimentalEventSystem).toBe(true)
       expect(flags.experimentalWorkspaces).toBe(true)
       expect(flags.experimentalIconDiscovery).toBe(true)
@@ -116,6 +129,7 @@ describe("RuntimeFlags", () => {
       expect(flags.enableExa).toBe(false)
       expect(flags.experimentalIconDiscovery).toBe(false)
       expect(flags.experimentalOxfmt).toBe(false)
+      expect(flags.experimentalCodeMode).toBe(true)
       expect(flags.outputTokenMax).toBeUndefined()
       expect(flags.bashDefaultTimeoutMs).toBe(1_000)
       expect(flags.enableExperimentalModels).toBe(false)
