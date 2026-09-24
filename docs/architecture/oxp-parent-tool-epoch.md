@@ -23,7 +23,10 @@ keepalive behavior.
 ## Core invariant
 
 Long-running work must not require continued possession of the ChatGPT parent's
-current OXP tool window for correctness or forward progress.
+current OXP tool window for correctness or ordinary execution progress. Native
+permission and question requests are deliberate external decision points: a worker
+may pause there until an authorized supervisor responds, including after a later
+parent-tool epoch reopens.
 
 Direct augmentation and supervision calls remain appropriate for bounded work.
 When meaningful work may outlive the current parent-tool window, the ChatGPT
@@ -37,6 +40,49 @@ worker before the window expires.
 
 The worker is a real native OpenFork Session with durable execution ownership. It
 does not depend on the MCP request or parent tool window that created it.
+
+### Native request blocking
+
+Delegated workers must distinguish **executing** from **waiting for external
+input**. A native Permission or Question request is not a worker failure and must
+not be hidden behind an indefinitely generic `running` state.
+
+Supervisors must likewise never derive a stale-worker conclusion solely from a
+quiet message tail, unchanged Session timestamp, or elapsed wall time. Those are
+all expected while the native runner is suspended on the Permission/Question
+Deferred. Before replacing, cancelling, or declaring a worker exhausted, the
+supervisor must classify it through `openfork_worker wait/result`; a
+`state="blocked"` result means the execution is healthy but externally gated.
+
+The ownership split is:
+
+- native Permission/Question services remain the authoritative owners of pending
+  requests and their deferred execution;
+- the delegated-worker owner projects a safe `blocked` execution state plus
+  non-sensitive request references;
+- OXP `openfork_worker wait/result` carries that projection to the external
+  supervisor;
+- OXP `openfork_request` remains the single mutation surface for listing and
+  resolving those requests. Every projected blocker carries its owning
+  `sessionID`: for a direct blocker this equals the worker ID, while a blocker in
+  a nested delegated child carries that child Session ID.
+
+The supervisor resolves the request and then waits on the **same worker** again.
+It must not cancel/restart a healthy worker merely because it is blocked. OXP must
+also never let a delegated worker approve its own permission request: request
+supervision remains a separately authorized plane with commit-time authority
+revalidation. An `external_directory` blocker is explicitly marked and remains
+reject-only over OXP; its native path stays redacted.
+
+If the process-local delegated BackgroundJob is absent, OXP must not treat a stale
+durable execution-owner row as proof of active execution. The worker is projected
+from durable message/request state as recoverable, blocked, terminal, or idle
+instead of polling forever as generic `running`.
+
+If the parent tool epoch expires while a worker is blocked, the worker remains
+truthfully blocked rather than losing or fabricating the decision. A later epoch
+can rediscover the worker, inspect the pending request, resolve it if authorized,
+and allow the existing execution to continue.
 
 ## Parent-session scope
 
@@ -357,7 +403,8 @@ Architecture and packaged-runtime certification must cover:
 2. the first call at or after 20 minutes gets the handoff reminder;
 3. the reminder does not alter the underlying tool result or mutation truth;
 4. worker start before expiry survives complete loss of parent OXP access;
-5. no parent call is required for the worker to finish;
+5. absent an explicit native Permission/Question decision point, no parent call is
+   required for the worker to finish;
 6. a successful call after 25 minutes creates a new epoch and resets reminder
    state;
 7. reopened parent can recover the worker by durable handle or list discovery;
@@ -373,8 +420,26 @@ Architecture and packaged-runtime certification must cover:
 15. `openai/subject` never becomes conversation identity;
 16. 2025-era ingress is accepted only through the stateless transport adapter,
     while `Mcp-Session-Id` is never accepted or inferred as parent identity;
-17. correlation-source counters distinguish canonical and unattributed calls
-    without retaining any identifier value.
+17. a delegated worker awaiting Permission/Question is surfaced as `blocked`
+    rather than indefinitely `running`;
+18. blocked worker output exposes only safe request references and directs
+    resolution through `openfork_request`;
+19. resolving a blocked request resumes the same worker execution instead of
+    requiring cancellation/restart;
+20. parent-epoch expiry while blocked does not discard, auto-approve, or fabricate
+    the pending decision;
+21. correlation-source counters distinguish canonical and unattributed calls
+    without retaining any identifier value;
+22. a blocker in a nested delegated child is projected on the parent worker with
+    the child `sessionID`, and resolving that child request resumes the same
+    parent worker;
+23. a request resolved concurrently by another supervisor is reported as
+    `OXP_NOT_FOUND`, never as a dependency/infrastructure failure;
+24. a stale durable execution-owner row without a live delegated BackgroundJob
+    projects `recoverable`/terminal state instead of polling forever as
+    `running`;
+25. an `external_directory` blocker exposes only a reject-only marker and safe
+    request reference; its native path remains redacted.
 
 This behavior is a Gate N replacement/soak requirement. OXP should not be called a
 complete standalone LocalMCP replacement until long-running work survives the

@@ -1,6 +1,8 @@
 # Custom Runtime - persistent agent-authored functions and interactive kernels
 
-> Status: architecture proposal for OpenFork. No implementation is implied by this document.
+> **Status: superseded.** OpenFork adopted upstream/Cloudflare-style Code Mode as the product architecture instead. See [`code-mode.md`](./code-mode.md). This document is retained only as historical design context and must not be treated as an implementation plan.
+>
+> Former status: architecture proposal for OpenFork. No implementation is implied by this document.
 > The design is grounded in the current OpenFork tool stack, especially
 > `packages/opencode/src/tool/registry.ts`, `tool/custom.ts`, `tool/reload.ts`,
 > `tool/code-mode.ts`, `session/tools.ts`, and `packages/codemode`.

@@ -58,7 +58,7 @@ These surfaces are compressed/multiplexed, but their permanent outer schema alre
 
 ### Code Mode `execute`
 
-Experimental Code Mode is a separate composition strategy. It compresses MCP calls behind `execute`, but its current description is built with the connected MCP catalog schemas already embedded. It therefore does not have the "hidden nested args + speculative call" defect addressed here. Its eager catalog context cost is a separate architecture/performance question and must not be "fixed" by weakening the descriptor rule above.
+Code Mode is OpenFork's default MCP composition strategy. It compresses MCP calls behind `execute`, using a token-budgeted inline catalog plus `$codemode.search` when the complete catalog does not fit. Exact selected signatures are therefore available to the generated program without the opaque nested-`args` contract problem addressed here. Code Mode remains a separate orchestration protocol; do not retrofit `BrokerContract` handshakes into its generated tool calls.
 
 ## Construction invariant
 

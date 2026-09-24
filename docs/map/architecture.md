@@ -175,6 +175,11 @@ The V1 production stack and its internal backward-bridge seams are centered in:
 This path remains important because much of the mature local OpenFork execution
 behavior and fork tooling still runs through it. It is not “dead code”.
 
+OpenFork also backports upstream Code Mode into this V1 production path. Code Mode
+is the default MCP exposure strategy: native OpenFork tools stay direct while MCP
+tools are orchestrated through the confined `execute` tool. See
+[`docs/architecture/code-mode.md`](../architecture/code-mode.md).
+
 ### Current/V2 path
 
 The current Effect-native domain is centered in:
