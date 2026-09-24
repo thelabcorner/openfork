@@ -7,6 +7,7 @@ import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
 import { waitForServerHealth } from "./server-health"
+import { resolveWorktreeStoreSidecarEnv } from "./worktree-store-env"
 import {
   isSidecarMessage,
   type OxpSidecarRequest,
@@ -297,6 +298,10 @@ function createSidecarEnv(extra?: Record<string, string>): Record<string, string
   if (!app.isPackaged && env.OPENCODE_PRINT_LOGS === undefined) {
     env.OPENCODE_PRINT_LOGS = "1"
   }
+  // Publish the packaged managed-sidecar location only when the staged
+  // payload actually exists; the server's capability resolution stays the
+  // authority and fails closed (unmanaged fallback) when it does not.
+  Object.assign(env, resolveWorktreeStoreSidecarEnv({ resourcesPath: process.resourcesPath, env }))
   return env
 }
 function delay(ms: number) {

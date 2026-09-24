@@ -49,6 +49,13 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Fail-closed channel behavior and the staged-layout/runtime-discovery
+      # contract for the managed worktree-store sidecar. Focused on purpose: the
+      # full desktop suite needs packaged native resources this job does not build.
+      - name: Desktop worktree-store packaging tests
+        working-directory: packages/desktop
+        run: bun run test:worktree-store
+
       - name: App utility tests
         run: bun test packages/app/test/utils
 

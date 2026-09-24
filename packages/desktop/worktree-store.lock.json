@@ -1,0 +1,12 @@
+{
+  "schema": "openfork.worktree-store.lock/v1",
+  "version": null,
+  "targets": {
+    "darwin-arm64": null,
+    "darwin-x64": null,
+    "linux-arm64": null,
+    "linux-x64": null,
+    "win32-arm64": null,
+    "win32-x64": null
+  }
+}

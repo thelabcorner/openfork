@@ -248,6 +248,12 @@ jobs:
         working-directory: packages/desktop
         run: bun ./scripts/verify-oxp-package.ts
 
+      # Channel-aware: dev passes only when no staged worktree-store payload was
+      # packaged while the lock pins no target; pinned builds must match the pin.
+      - name: Verify packaged worktree-store sidecar
+        working-directory: packages/desktop
+        run: bun ./scripts/verify-worktree-store-package.ts dist
+
       - name: Upload installers to draft pre-release
         if: always()
         shell: bash

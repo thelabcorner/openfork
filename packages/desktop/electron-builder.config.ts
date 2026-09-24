@@ -69,7 +69,13 @@ const getBase = (appId: string): Configuration => ({
   extraMetadata: {
     desktopName: `${appId}.desktop`,
   },
-  files: ["out/**/*", "resources/**/*", "!resources/opencode-cli*", "!resources/tunnel/**/*"],
+  files: [
+    "out/**/*",
+    "resources/**/*",
+    "!resources/opencode-cli*",
+    "!resources/tunnel/**/*",
+    "!resources/worktree-store/**/*",
+  ],
   extraResources: [
     ...(channel === "dev"
       ? [
@@ -97,6 +103,13 @@ const getBase = (appId: string): Configuration => ({
       // outside app.asar, together with its release license/SBOM sidecars.
       from: "resources/tunnel/",
       to: "tunnel/",
+    },
+    {
+      // The pinned worktree-store sidecar is a real filesystem executable tree
+      // staged by scripts/fetch-worktree-store.ts. Keep it outside app.asar
+      // with its VERSION/STAGE.json stamps so the packaged verifier can check it.
+      from: "resources/worktree-store/",
+      to: "worktree-store/",
     },
   ],
   mac: {

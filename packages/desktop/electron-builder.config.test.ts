@@ -106,3 +106,23 @@ for (const channel of ["dev", "beta", "prod"] as const) {
     ])
   })
 }
+
+// Every channel must keep the staged worktree-store sidecar outside app.asar.
+for (const channel of ["dev", "beta", "prod"] as const) {
+  test(`keeps the worktree-store sidecar outside the app archive in ${channel} builds`, async () => {
+    const previous = process.env.OPENCODE_CHANNEL
+    process.env.OPENCODE_CHANNEL = channel
+
+    const module = await import(`./electron-builder.config.ts?worktree-store-resource=${channel}`)
+    const config = module.default as Configuration
+
+    if (previous === undefined) delete process.env.OPENCODE_CHANNEL
+    else process.env.OPENCODE_CHANNEL = previous
+
+    expect(config.files).toContain("!resources/worktree-store/**/*")
+    expect(config.extraResources).toContainEqual({
+      from: "resources/worktree-store/",
+      to: "worktree-store/",
+    })
+  })
+}
