@@ -55,6 +55,7 @@ const limit = 2 * 1024 * 1024
 const core = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"]
 const cfg = [...GitRuntime.args([]), ...core]
 const quote = [...cfg, "-c", "core.quotepath=false"]
+const CAPTURE_TIMEOUT = Duration.minutes(5)
 interface GitResult {
   readonly code: ChildProcessSpawner.ExitCode
   readonly text: string
@@ -256,7 +257,13 @@ const layer: Layer.Layer<
         const git = Effect.fnUntraced(
           function* (cmd: string[], opts?: { cwd?: string; env?: Record<string, string>; stdin?: string }) {
             const result = yield* appProcess.run(
-              ChildProcess.make("git", cmd, { cwd: opts?.cwd, env: opts?.env, extendEnv: true }),
+              ChildProcess.make("git", cmd, {
+                cwd: opts?.cwd,
+                env: opts?.env,
+                extendEnv: true,
+                stdin: opts?.stdin === undefined ? "ignore" : undefined,
+                forceKillAfter: Duration.seconds(3),
+              }),
               { stdin: opts?.stdin },
             )
             return {
@@ -640,6 +647,24 @@ const layer: Layer.Layer<
                       return tree
                     }),
                   ),
+                ).pipe(
+                  Effect.timeoutOrElse({
+                    duration: CAPTURE_TIMEOUT,
+                    orElse: () =>
+                      Effect.gen(function* () {
+                        const current = yield* SynchronizedRef.get(materialization)
+                        yield* Effect.logWarning("snapshot capture timed out", {
+                          directory: state.directory,
+                          git: state.gitdir,
+                          captures: current.captures,
+                          invalidations: current.invalidations,
+                        })
+                        yield* SynchronizedRef.update(materialization, (snapshot) =>
+                          snapshot.cached?.token === token ? { ...snapshot, cached: undefined } : snapshot,
+                        )
+                        return undefined
+                      }),
+                  }),
                 ),
               )
               const cached: CachedCapture = { revision, token, effect: capture }

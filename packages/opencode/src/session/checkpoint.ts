@@ -247,18 +247,18 @@ const layer = Layer.effect(
           `--count=${RETENTION_PAGE_SIZE}`,
           "--format=%(refname)",
           ...(cursor ? [`--start-after=${cursor}`] : []),
-          RETENTION_REF_PREFIX,
         ]
         const page = yield* git.run(args, { cwd: ctx.worktree })
         if (page.exitCode !== 0) break
-        const refs = page
+        const rawRefs = page
           .text()
           .split(/\r?\n/)
           .map((value) => value.trim())
           .filter(Boolean)
-        if (refs.length === 0) break
+        if (rawRefs.length === 0) break
+        const refs = rawRefs.filter((ref) => ref.startsWith(RETENTION_REF_PREFIX))
         scanned += refs.length
-        cursor = refs[refs.length - 1]
+        cursor = rawRefs[rawRefs.length - 1]
 
         const parsed = refs.map((ref) => {
           const key = ref.startsWith(RETENTION_ROOT) ? ref.slice(RETENTION_ROOT.length) : ref
@@ -297,7 +297,7 @@ const layer = Layer.effect(
               })), Effect.ignore),
           { concurrency: 4, discard: true },
         )
-        if (refs.length < RETENTION_PAGE_SIZE) break
+        if (rawRefs.length < RETENTION_PAGE_SIZE) break
       }
       return { scanned, released }
     })

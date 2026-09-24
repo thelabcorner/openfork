@@ -215,6 +215,56 @@ it.instance(
 )
 
 it.instance(
+  "retention reconciliation paginates beyond one page",
+  () =>
+    Effect.gen(function* () {
+      const svc = yield* TurnCheckpoint.Service
+      const snapshot = yield* Snapshot.Service
+      yield* seedSession("ses_checkpoint_retention_pagination")
+      const tree = yield* snapshot.track()
+      if (!tree) throw new Error("expected snapshot tree")
+
+      const ctx = yield* InstanceState.context
+      const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+      const commit = Bun.spawnSync([
+        "git",
+        "-c",
+        "user.name=opencode",
+        "-c",
+        "user.email=opencode@localhost",
+        `--git-dir=${gitdir}`,
+        "commit-tree",
+        tree,
+        "-m",
+        "retention-pagination-fixture",
+      ])
+      expect(commit.exitCode).toBe(0)
+      const commitID = commit.stdout.toString().trim()
+      const refs = Array.from({ length: 130 }, (_, index) =>
+        `refs/opencode/retained/${Checkpoint.snapshotRetentionKey(`orphan-${index}`, "after", `orphan-tree-${index}`)}`,
+      )
+      yield* Effect.promise(async () => {
+        const update = Bun.spawn(["git", `--git-dir=${gitdir}`, "update-ref", "--stdin"], {
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "pipe",
+        })
+        update.stdin.write(refs.map((ref) => `create ${ref} ${commitID}`).join("\n") + "\n")
+        update.stdin.end()
+        const exitCode = await update.exited
+        if (exitCode !== 0) throw new Error(await new Response(update.stderr).text())
+      })
+
+      const result = yield* svc.reconcileRetention()
+      expect(result.scanned).toBe(130)
+      expect(result.released).toBe(130)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", refs[0]!]).exitCode).not.toBe(0)
+      expect(Bun.spawnSync(["git", `--git-dir=${gitdir}`, "show-ref", "--verify", refs.at(-1)!]).exitCode).not.toBe(0)
+    }),
+  { git: true },
+)
+
+it.instance(
   "fail() CAS-marks capturing rows; finish afterwards cannot resurrect",
   () =>
     Effect.gen(function* () {
