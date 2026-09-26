@@ -51,7 +51,8 @@ export const Info = Schema.Struct({
 export type Info = Schema.Schema.Type<typeof Info>
 
 export function userAgent(client = "cli") {
-  return InstallationUserAgent(client)
+  void client
+  return InstallationUserAgent()
 }
 
 export const USER_AGENT = userAgent()

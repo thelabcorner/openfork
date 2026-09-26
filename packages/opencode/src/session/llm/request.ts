@@ -206,7 +206,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 
   // The Console free-tier gate validates the canonical installation identity,
   // so provider requests must share one owner for channel/version/client.
-  const userAgent = InstallationUserAgent(input.flags.client)
+  const userAgent = InstallationUserAgent()
 
   const sortedTools = preserveCanonicalFindToolMap(
     tools,

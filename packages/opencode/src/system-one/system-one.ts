@@ -122,7 +122,7 @@ export const layer = Layer.effect(
 
         const client = Flag.OPENCODE_CLIENT
         const instance = yield* InstanceRef
-        headers["User-Agent"] = InstallationUserAgent(client)
+        headers["User-Agent"] = InstallationUserAgent()
         headers["x-opencode-client"] = client
         headers["x-opencode-session"] = semanticSessionID(input.affinityID)
         headers["x-opencode-request"] = MessageID.ascending()

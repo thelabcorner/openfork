@@ -21,7 +21,7 @@ const InterleavedField = Schema.Union([
   Schema.String,
 ])
 
-const USER_AGENT = InstallationUserAgent(Flag.OPENCODE_CLIENT)
+const USER_AGENT = InstallationUserAgent()
 
 const CostTier = Schema.Struct({
   input: Schema.Finite,
