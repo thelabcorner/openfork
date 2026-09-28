@@ -2,6 +2,7 @@ import watcher from "@parcel/watcher"
 import { spawn } from "node:child_process"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { busyBuildRetryDelay, failedBuildRetryDelay } from "./node-sidecar-build-retry"
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url))
 const opencodePackage = path.join(repoRoot, "packages", "opencode")
@@ -46,6 +47,17 @@ let building = false
 let timer: ReturnType<typeof setTimeout> | undefined
 let stopping = false
 let activeBuild: ReturnType<typeof spawn> | undefined
+let busyRetryAttempt = 0
+let failedRetryAttempt = 0
+
+function resetRetryBudget() {
+  busyRetryAttempt = 0
+  failedRetryAttempt = 0
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
 
 async function rebuild() {
   if (building || stopping) return
@@ -62,21 +74,49 @@ async function rebuild() {
         windowsHide: true,
       })
       activeBuild = child
-      const code = await new Promise<number | null>((resolve, reject) => {
-        child.once("error", reject)
-        child.once("exit", (exitCode) => resolve(exitCode))
+      const outcome = await new Promise<{ code: number | null; error?: Error }>((resolve) => {
+        child.once("error", (error) => resolve({ code: null, error }))
+        child.once("exit", (exitCode) => resolve({ code: exitCode }))
       })
       activeBuild = undefined
+      if (outcome.error) {
+        console.error("[opencode:node-sidecar] candidate build process failed to start", outcome.error)
+      }
+      const code = outcome.code
       if (code === 75) {
+        const delay = busyBuildRetryDelay(busyRetryAttempt++)
+        if (delay === undefined) {
+          console.error(
+            "[opencode:node-sidecar] candidate artifact stayed busy through the retry budget; waiting for the next backend source change",
+          )
+          continue
+        }
         dirty = true
-        await new Promise((resolve) => setTimeout(resolve, 250))
+        console.warn(
+          `[opencode:node-sidecar] candidate artifact transaction busy; retrying in ${delay}ms`,
+        )
+        await sleep(delay)
         continue
       }
+      busyRetryAttempt = 0
       if (code !== 0) {
+        const delay = failedBuildRetryDelay(failedRetryAttempt++)
         console.error(
           `[opencode:node-sidecar] candidate build failed (exit ${code ?? "unknown"}); active OXP runtime is unchanged`,
         )
+        if (delay !== undefined) {
+          dirty = true
+          console.warn(
+            `[opencode:node-sidecar] retrying failed candidate build in ${delay}ms`,
+          )
+          await sleep(delay)
+          continue
+        }
+        console.error(
+          "[opencode:node-sidecar] candidate build retries exhausted; waiting for the next backend source change",
+        )
       } else {
+        failedRetryAttempt = 0
         console.log(
           "[opencode:node-sidecar] candidate backend ready; use OXP runtime.refresh to trial/accept it",
         )
@@ -105,7 +145,10 @@ const subscription = await watcher.subscribe(
       console.error("[opencode:node-sidecar] watcher error", error)
       return
     }
-    if (events.some((event) => isBackendInput(event.path))) schedule()
+    if (events.some((event) => isBackendInput(event.path))) {
+      resetRetryBudget()
+      schedule()
+    }
   },
   {
     ignore: [
@@ -124,6 +167,7 @@ console.log(
 // One freshness pass after startup is intentional. If crash recovery restored a
 // previously accepted artifact, its preserved mtime lets build-node stage the
 // newer source tree again without making that candidate authoritative.
+resetRetryBudget()
 schedule()
 
 const stop = async () => {
