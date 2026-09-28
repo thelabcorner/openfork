@@ -49,6 +49,13 @@
   word-break: break-all;
 }
 
+.settings-wakatime-cli-unresolved {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .settings-wakatime-privacy {
   font-size: 12px;
   font-weight: 440;

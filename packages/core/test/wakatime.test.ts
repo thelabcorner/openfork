@@ -67,6 +67,7 @@ const scenarios = [
   "managed-cli-stays-offline",
   "managed-cli-freshness",
   "managed-cli-update-failure",
+  "enable-prepares-managed-cli",
   "unauthenticated-no-delivery",
   "coding-activity-single-consumer",
   "set-enabled",
@@ -951,11 +952,13 @@ describe("WakaTime managed CLI freshness", () => {
   test("only the managed binary is ever auto-updated", async () => {
     const text = await source()
     const resolve = section(text, "const resolveUncached", "const resolveBinary =")
-    // override > system > managed precedence is preserved: an operator override
-    // and a system install are returned untouched, and the initial install also
-    // goes through the pinned, version-observing path.
-    expect(resolve).toContain('if (probed && probed.source !== "managed") return probed')
-    expect(resolve).toContain("refreshManaged(probed)")
+    // Background delivery preserves override > system > managed precedence:
+    // override/system binaries are returned untouched. The extra
+    // forceInitialInstall branch exists only for the explicit user-enable path;
+    // when false, a managed binary is still the only source that reaches the
+    // bounded refresh machinery.
+    expect(resolve).toContain('if (probed && (forceInitialInstall || probed.source !== "managed")) return probed')
+    expect(resolve).toContain("refreshManaged(probed, forceInitialInstall && probed === undefined)")
     // The check runs on the delivery path, not on the probe.
     expect(section(text, "const probeBinary", "const refreshManaged")).not.toContain("refreshManaged")
   })
@@ -980,13 +983,21 @@ describe("WakaTime managed CLI freshness", () => {
   })
 
   test("a cached managed binary stays eligible for its bounded check", async () => {
-    const resolve = section(await source(), "const resolveBinary = () =>", "const send = Effect.fn")
+    const text = await source()
+    const resolve = section(text, "const resolveBinary = () =>", "const prepareBinary = () =>")
     // Memoizing the resolved binary unconditionally would make a managed binary
     // stale for the life of the process. The override/system early return is the
     // only short-circuit, and a managed binary re-enters the check every time.
     expect(resolve).toContain('if (settled.source !== "managed") return Effect.succeed(settled)')
     expect(resolve).toContain("refreshManaged(settled)")
     expect(resolve).not.toMatch(/if \(resolved\) return/)
+
+    // The explicit settings action is intentionally different: it may reuse a
+    // resolved CLI immediately rather than turning a checkbox mutation into an
+    // update check.
+    const prepare = section(text, "const prepareBinary = () =>", "const send = Effect.fn")
+    expect(prepare).toContain("if (resolved) return Effect.succeed(resolved)")
+    expect(prepare).toContain("resolveUncached(true)")
   })
 
   test("an unknown installed version is refreshed, not merely recorded", async () => {

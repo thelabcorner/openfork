@@ -210,9 +210,21 @@ export const SettingsWakaTimeV2: Component = () => {
                 <Show
                   when={cli()}
                   fallback={
-                    <span class="settings-wakatime-connection-state">
-                      {language.t("settings.wakatime.configuration.cli.unresolved")}
-                    </span>
+                    <div class="settings-wakatime-cli-unresolved">
+                      <span class="settings-wakatime-connection-state">
+                        {language.t("settings.wakatime.configuration.cli.unresolved")}
+                      </span>
+                      <Show when={connection() === "missing-cli"}>
+                        <ButtonV2
+                          size="small"
+                          variant="outline"
+                          disabled={saving()}
+                          onClick={() => void setEnabled(true)}
+                        >
+                          {language.t("settings.wakatime.action.prepareCli")}
+                        </ButtonV2>
+                      </Show>
+                    </div>
                   }
                 >
                   <code class="settings-wakatime-cli">{cli()}</code>

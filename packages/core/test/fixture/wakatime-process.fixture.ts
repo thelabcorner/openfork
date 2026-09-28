@@ -968,6 +968,64 @@ const scenarios: Record<string, () => Promise<unknown>> = {
   },
 
   /**
+   * Explicit enablement is a user-driven preparation boundary. A failed
+   * initial managed install must leave the opt-in disabled, while an immediate
+   * retry must be allowed even though the failed background-style attempt
+   * consumed the normal four-hour managed freshness window.
+   */
+  "enable-prepares-managed-cli": async () => {
+    const home = await managedHome(true)
+    if (!home) return { skipped: true }
+    optInPersisted()
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        const wakatime = yield* buildInto(scope, managedBuild)
+        const settings = WakaTime.settingsFile()
+        yield* TestClock.adjust("1 second")
+
+        const before = yield* wakatime.status()
+        equal(before, { enabled: false, configured: true }, "passive status must remain install-free before opt-in")
+        equal(versionFetches, 0, "status must not fetch release metadata")
+        equal(archiveFetches, 0, "status must not fetch a managed archive")
+
+        const failed = yield* wakatime.setEnabled(true).pipe(Effect.exit)
+        assert(Exit.isFailure(failed), "a corrupt initial managed install must fail explicit enablement")
+        equal(versionFetches, 1, "the first explicit enable must attempt one managed release lookup")
+        equal(archiveFetches, 1, "the first explicit enable must attempt one managed archive download")
+        equal(
+          yield* Effect.promise(() => Bun.file(settings).exists()),
+          false,
+          "failed CLI preparation must not persist the opt-in",
+        )
+        assert(!(yield* wakatime.status()).enabled, "failed preparation must leave the exporter disabled")
+
+        const archive = storedZip(home.asset.binary, new TextEncoder().encode(RELEASE_BYTES))
+        servedArchiveChecksum = `${createHash("sha256").update(archive).digest("hex")}  ${home.asset.archive}\n`
+
+        // No clock advance: this retry is deliberately inside the four-hour
+        // automatic backoff window consumed by the failed attempt above.
+        const enabled = yield* wakatime.setEnabled(true)
+        equal(versionFetches, 2, "an explicit retry must bypass the background freshness backoff")
+        equal(archiveFetches, 2, "an explicit retry must retry the managed archive immediately")
+        equal(enabled.enabled, true, "successful preparation must enable the exporter")
+        equal(enabled.configured, true, "the configured credential must remain visible")
+        equal(enabled.source, "managed", "successful preparation must report the managed CLI source")
+        equal(enabled.cli, home.binary, "successful preparation must return the resolved managed CLI path")
+        equal(yield* readText(home.binary), RELEASE_BYTES, "the verified managed CLI must be installed before success")
+        equal(
+          JSON.parse(yield* Effect.promise(() => Bun.file(settings).text())),
+          { enabled: true },
+          "the opt-in may be persisted only after CLI preparation succeeds",
+        )
+
+        yield* Scope.close(scope, Exit.void)
+        return { versionFetches, archiveFetches, source: enabled.source }
+      }).pipe(Effect.provide(TestClock.layer())),
+    )
+  },
+
+  /**
    * The host Idle/End call. It must be O(1) process-memory work that returns
    * before any CLI work can complete, must not create a per-session fiber or
    * timer, and an urgent session must bypass the project limiter while every

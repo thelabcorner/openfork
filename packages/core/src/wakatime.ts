@@ -198,9 +198,11 @@ export interface Interface {
   /** Bootstrap-free diagnostics for settings/CLI surfaces. Never downloads. */
   readonly status: () => Effect.Effect<Status>
   /**
-   * Persist the explicit opt-in and return the resulting status. Core owns this
-   * mutation: no other layer may hold enablement authority. A write failure is
-   * reported rather than swallowed, and leaves the previous state in force.
+   * Persist the explicit opt-in and return the resulting status. Enabling is an
+   * explicit user action, so Core prepares a usable CLI before committing the
+   * opt-in; passive status reads remain install-free. A preparation or write
+   * failure is reported rather than swallowed, and leaves the previous
+   * enablement state in force.
    */
   readonly setEnabled: (enabled: boolean) => Effect.Effect<Status, Error>
 }
@@ -1033,18 +1035,21 @@ const buildRuntime = () =>
       )
     }
 
-    const refreshManaged = Effect.fn("WakaTime.refreshManaged")(function* (current: Binary | undefined) {
+    const refreshManaged = Effect.fn("WakaTime.refreshManaged")(function* (
+      current: Binary | undefined,
+      force = false,
+    ) {
       if (!platformAsset()) return current
       if (freshnessRunning) return current
       const now = yield* Clock.currentTimeMillis
       // In-memory fast path: inside the window a delivery costs one comparison and
       // touches neither the state directory nor the network. The persisted record
       // is the cross-process backstop, read only once this bound is spent.
-      if (lastCheck !== undefined && !managedCheckDue(lastCheck, now)) return current
+      if (!force && lastCheck !== undefined && !managedCheckDue(lastCheck, now)) return current
       // The snapshot that justifies this check, and the value the commit compares
       // against once the candidate is in hand.
       const observed = yield* loadManagedState()
-      if (!managedCheckDue(observed, now)) {
+      if (!force && !managedCheckDue(observed, now)) {
         lastCheck = observed
         // Rare and off the hot path: a peer may have installed and published the
         // managed binary after our earlier probe found nothing. Adopt it now so
@@ -1076,17 +1081,18 @@ const buildRuntime = () =>
       return outcome.value.binary
     })
 
-    const resolveUncached = Effect.fn("WakaTime.resolveBinary")(function* () {
+    const resolveUncached = Effect.fn("WakaTime.resolveBinary")(function* (forceInitialInstall = false) {
       const probed = yield* probeBinary()
-      // Delivery is what triggers a managed freshness check, so status and
-      // settings reads stay network-free.
-      if (probed && probed.source !== "managed") return probed
+      // Delivery triggers bounded managed freshness checks. Explicit enablement
+      // is different: if any usable CLI already exists, use it immediately
+      // rather than turning the settings mutation into an update check.
+      if (probed && (forceInitialInstall || probed.source !== "managed")) return probed
       // This is also the initial-install path. With no binary to probe, a due
       // check installs the exact release the metadata named and records its
       // normalized version. With no readable release there is nothing to install
       // without pinning to a pointer that can move mid-flight, so resolution
       // fails here rather than guessing a release.
-      const managed = yield* refreshManaged(probed)
+      const managed = yield* refreshManaged(probed, forceInitialInstall && probed === undefined)
       if (managed) return managed
       return yield* Effect.fail(
         new Error(`WakaTime managed CLI is unavailable: no installable release was observed at ${managedBinary()}`),
@@ -1121,6 +1127,24 @@ const buildRuntime = () =>
             resolved = refreshed ?? settled
             return settled
           })
+        }),
+      )
+
+    /**
+     * Explicit user preparation path.
+     *
+     * Background delivery honors the four-hour managed-CLI backoff so a
+     * transient network failure cannot turn telemetry into a retry storm.
+     * Enabling from Settings is different: a person explicitly asked OpenFork
+     * to become ready, so when no usable CLI exists this path may retry the
+     * initial managed install immediately. An already-resolved or already
+     * installed CLI is reused without a freshness/network check.
+     */
+    const prepareBinary = () =>
+      resolveGate.withPermit(
+        Effect.suspend(() => {
+          if (resolved) return Effect.succeed(resolved)
+          return resolveUncached(true).pipe(Effect.tap((binary) => Effect.sync(() => (resolved = binary))))
         }),
       )
 
@@ -1685,6 +1709,13 @@ const buildRuntime = () =>
 
     const setEnabled: Interface["setEnabled"] = (next) =>
       Effect.gen(function* () {
+        // Explicit enablement is the active preparation boundary. The env
+        // override remains authoritative: OPENFORK_WAKATIME=0 means the
+        // persisted checkbox cannot effectively enable the exporter, so do not
+        // download anything merely because the lower-precedence setting changed.
+        const effectiveRequested = envToggle(process.env.OPENFORK_WAKATIME) ?? next
+        if (next && effectiveRequested) yield* prepareBinary()
+
         const saved = yield* saveSettings({ enabled: next })
         yield* mutex.withPermit(
           Effect.gen(function* () {

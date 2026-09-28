@@ -60,8 +60,9 @@ export function didApplyWakaTimeEnabled(status: WakaTimeStatusView, requested: b
  * - `missing-key`: opted in, but no WAKATIME_API_KEY and no `~/.wakatime.cfg`,
  *   so delivery would silently no-op.
  * - `missing-cli`: opted in and authenticated, but no already-resolved CLI was
- *   found. Core downloads one on the first heartbeat, so this is a diagnostic,
- *   not a blocking error.
+ *   found. Explicit enablement normally prepares one immediately; this state can
+ *   still occur for an env-forced or legacy opt-in, or if a managed binary was
+ *   removed after enablement.
  * - `ready`: opted in, authenticated, and a CLI is already resolved.
  */
 export type WakaTimeConnection = "disabled" | "missing-key" | "missing-cli" | "ready"

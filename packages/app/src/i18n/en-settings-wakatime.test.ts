@@ -92,6 +92,15 @@ describe("WakaTime settings copy", () => {
     expect(source).toContain("didApplyWakaTimeEnabled(next, enabled)")
   })
 
+  test("an enabled unresolved CLI exposes an explicit preparation retry", async () => {
+    const source = await Bun.file(panel).text()
+    expect(source).toContain('connection() === "missing-cli"')
+    expect(source).toContain("setEnabled(true)")
+    expect(source).toContain("settings.wakatime.action.prepareCli")
+    expect(settingsWakaTimeDict["settings.wakatime.action.prepareCli"]).toBe("Prepare command line")
+    expect(settingsWakaTimeDict["settings.wakatime.configuration.cli.unresolved"]).toBe("Command line not prepared")
+  })
+
   test("the dictionary carries no key the panel never renders", async () => {
     const source = await Bun.file(panel).text()
     const referenced = new Set(source.match(/settings\.wakatime\.[a-zA-Z.]+/g) ?? [])
