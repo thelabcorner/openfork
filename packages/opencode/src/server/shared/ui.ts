@@ -65,14 +65,26 @@ export function serveEmbeddedUIEffect(
   requestPath: string,
   fs: FSUtil.Interface,
   embeddedWebUI: Record<string, string>,
+  allowIndexFallback = true,
 ) {
-  const file = embeddedWebUI[requestPath.replace(/^\//, "")] ?? embeddedWebUI["index.html"] ?? null
+  const exact = embeddedWebUI[requestPath.replace(/^\//, "")]
+  const file = exact ?? (allowIndexFallback ? embeddedWebUI["index.html"] : undefined) ?? null
   if (!file) return Effect.succeed(notFound())
 
   return fs.readFile(file).pipe(
     Effect.map((body) => embeddedUIResponse(file, body)),
     Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(notFound())),
   )
+}
+
+function documentNavigation(request: HttpServerRequest.HttpServerRequest) {
+  if (request.method !== "GET" && request.method !== "HEAD") return false
+  return request.headers.accept?.toLowerCase().includes("text/html") === true
+}
+
+function staticAssetPath(path: string) {
+  const name = path.split("/").at(-1) ?? ""
+  return name.includes(".") && name !== "." && name !== ".."
 }
 
 export function serveUIEffect(
@@ -82,8 +94,13 @@ export function serveUIEffect(
   return Effect.gen(function* () {
     const embeddedWebUI = yield* Effect.promise(() => embeddedUI(services.disableEmbeddedWebUi))
     const path = new URL(request.url, "http://localhost").pathname
+    const navigation = documentNavigation(request)
 
-    if (embeddedWebUI) return yield* serveEmbeddedUIEffect(path, services.fs, embeddedWebUI)
+    if (request.method !== "GET" && request.method !== "HEAD") return notFound()
+
+    if (embeddedWebUI) return yield* serveEmbeddedUIEffect(path, services.fs, embeddedWebUI, navigation)
+
+    if (!navigation && !staticAssetPath(path)) return notFound()
 
     const response = yield* services.client.execute(
       HttpClientRequest.make(request.method)(upstreamURL(path), {

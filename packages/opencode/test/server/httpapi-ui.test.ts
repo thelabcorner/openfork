@@ -197,7 +197,7 @@ describe("HttpApi UI fallback", () => {
             proxiedUrl = request.url
           },
         ),
-      }).request("/")
+      }).request("/", { headers: { accept: "text/html" } })
 
       expect(response.status).toBe(200)
       expect(response.headers.get("content-type")).toContain("text/html")
@@ -264,11 +264,14 @@ describe("HttpApi UI fallback", () => {
         const fs = yield* FSUtil.Service
         const client = yield* HttpClient.HttpClient
         const flags = yield* RuntimeFlags.Service
-        return yield* serveUIEffect(HttpServerRequest.fromWeb(new Request("http://localhost/")), {
-          fs,
-          client,
-          disableEmbeddedWebUi: flags.disableEmbeddedWebUi,
-        })
+        return yield* serveUIEffect(
+          HttpServerRequest.fromWeb(new Request("http://localhost/", { headers: { accept: "text/html" } })),
+          {
+            fs,
+            client,
+            disableEmbeddedWebUi: flags.disableEmbeddedWebUi,
+          },
+        )
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
@@ -300,6 +303,72 @@ describe("HttpApi UI fallback", () => {
     }),
   )
 
+  it.live("does not route an unknown JSON GET into the SPA fallback", () =>
+    Effect.gen(function* () {
+      let proxiedUrl: string | undefined
+      const response = yield* uiApp({
+        disableEmbeddedWebUi: true,
+        client: httpClient(new Response("<html>wrong</html>"), (request) => {
+          proxiedUrl = request.url
+        }),
+      }).request("/global/wakatime", { headers: { accept: "application/json" } })
+
+      expect(response.status).toBe(404)
+      expect(response.headers.get("content-type")).toContain("application/json")
+      expect(proxiedUrl).toBeUndefined()
+      expect(yield* responseText(response)).toContain("Not Found")
+    }),
+  )
+
+  it.live("does not route an unknown PATCH into the SPA fallback", () =>
+    Effect.gen(function* () {
+      let proxiedUrl: string | undefined
+      const response = yield* uiApp({
+        disableEmbeddedWebUi: true,
+        client: httpClient(new Response("<html>wrong</html>"), (request) => {
+          proxiedUrl = request.url
+        }),
+      }).request("/global/wakatime", {
+        method: "PATCH",
+        headers: { accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      })
+
+      expect(response.status).toBe(404)
+      expect(response.headers.get("content-type")).toContain("application/json")
+      expect(proxiedUrl).toBeUndefined()
+      expect(yield* responseText(response)).toContain("Not Found")
+    }),
+  )
+
+  it.live("uses embedded index fallback only for an explicit HTML navigation", () =>
+    Effect.gen(function* () {
+      const fs = yield* FSUtil.Service
+      let reads = 0
+      const files = { "index.html": "/$bunfs/root/index.html" }
+      const facade = {
+        ...fs,
+        readFile: (path: string) => {
+          reads += 1
+          return path === "/$bunfs/root/index.html"
+            ? Effect.succeed(new TextEncoder().encode("<html>app</html>"))
+            : Effect.die(`unexpected embedded UI path: ${path}`)
+        },
+      }
+
+      const navigation = yield* serveEmbeddedUIEffect("/settings", facade, files, true).pipe(
+        Effect.map(HttpServerResponse.toWeb),
+      )
+      expect(navigation.status).toBe(200)
+      expect(yield* responseText(navigation)).toBe("<html>app</html>")
+
+      const apiMiss = yield* serveEmbeddedUIEffect("/global/wakatime", facade, files, false).pipe(
+        Effect.map(HttpServerResponse.toWeb),
+      )
+      expect(apiMiss.status).toBe(404)
+      expect(reads).toBe(1)
+    }),
+  )
   it.live("serves embedded UI assets when Bun can read them but access reports missing", () =>
     Effect.gen(function* () {
       let readPath: string | undefined
@@ -387,7 +456,7 @@ describe("HttpApi UI fallback", () => {
         username: "opencode",
         disableEmbeddedWebUi: true,
         client: httpClient(new Response("<html>opencode</html>", { headers: { "content-type": "text/html" } })),
-      }).request(`/?auth_token=${btoa("opencode:secret")}`)
+      }).request(`/?auth_token=${btoa("opencode:secret")}`, { headers: { accept: "text/html" } })
 
       expect(response.status).toBe(200)
       expect(yield* responseText(response)).toBe("<html>opencode</html>")
@@ -401,7 +470,7 @@ describe("HttpApi UI fallback", () => {
         username: "opencode",
         disableEmbeddedWebUi: true,
       }).request("/", {
-        headers: { authorization: `Basic ${btoa("opencode:secret")}` },
+        headers: { accept: "text/html", authorization: `Basic ${btoa("opencode:secret")}` },
       })
 
       expect(response.status).toBe(200)
@@ -415,7 +484,7 @@ describe("HttpApi UI fallback", () => {
         username: "opencode",
         disableEmbeddedWebUi: true,
       }).request("/", {
-        headers: { authorization: `Basic ${btoa("opencode:sec:ret")}` },
+        headers: { accept: "text/html", authorization: `Basic ${btoa("opencode:sec:ret")}` },
       })
 
       expect(response.status).toBe(200)
