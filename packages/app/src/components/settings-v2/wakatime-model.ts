@@ -15,6 +15,44 @@ export interface WakaTimeStatusView {
   readonly source?: "override" | "system" | "managed"
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+const CLI_SOURCES = ["override", "system", "managed"] as const
+
+/**
+ * Generated SDK types are compile-time only. A stale desktop sidecar can serve
+ * the SPA fallback for a route it does not know about, so every server payload
+ * must be validated before the renderer treats it as WakaTime state.
+ *
+ * Extra fields are ignored for forward compatibility. Unknown future CLI
+ * sources are sanitized to undefined instead of rejecting an otherwise valid
+ * status projection.
+ */
+export function parseWakaTimeStatus(value: unknown): WakaTimeStatusView | undefined {
+  if (!isRecord(value)) return
+  if (typeof value.enabled !== "boolean" || typeof value.configured !== "boolean") return
+  if (value.cli !== undefined && typeof value.cli !== "string") return
+
+  const source =
+    typeof value.source === "string" && CLI_SOURCES.includes(value.source as (typeof CLI_SOURCES)[number])
+      ? (value.source as (typeof CLI_SOURCES)[number])
+      : undefined
+
+  return {
+    enabled: value.enabled,
+    configured: value.configured,
+    ...(typeof value.cli === "string" ? { cli: value.cli } : {}),
+    ...(source ? { source } : {}),
+  }
+}
+
+/** The server, not the requested value, is authoritative after an update. */
+export function didApplyWakaTimeEnabled(status: WakaTimeStatusView, requested: boolean) {
+  return status.enabled === requested
+}
+
 /**
  * Why the exporter is or is not sending.
  *
@@ -33,8 +71,6 @@ export function connectionState(status: WakaTimeStatusView | undefined): WakaTim
   if (!status.configured) return "missing-key"
   return status.cli === undefined || status.cli.length === 0 ? "missing-cli" : "ready"
 }
-
-const CLI_SOURCES = ["override", "system", "managed"] as const
 
 /**
  * How the resolved CLI was found. An unrecognized value from a newer server is

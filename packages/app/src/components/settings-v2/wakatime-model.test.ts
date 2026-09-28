@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import * as model from "./wakatime-model"
-import { cliPath, cliSource, connectionState, type WakaTimeStatusView } from "./wakatime-model"
+import {
+  cliPath,
+  cliSource,
+  connectionState,
+  didApplyWakaTimeEnabled,
+  parseWakaTimeStatus,
+  type WakaTimeStatusView,
+} from "./wakatime-model"
 
 const status = (value: Partial<WakaTimeStatusView> = {}): WakaTimeStatusView => ({
   enabled: false,
@@ -34,9 +41,53 @@ describe("wakatime settings view-model", () => {
     expect(cliSource(status({ source: "bundled" as never }))).toBeUndefined()
   })
 
+  test("runtime status decoding rejects stale-route HTML and malformed payloads", () => {
+    expect(parseWakaTimeStatus("<!doctype html>")).toBeUndefined()
+    expect(parseWakaTimeStatus(null)).toBeUndefined()
+    expect(parseWakaTimeStatus([])).toBeUndefined()
+    expect(parseWakaTimeStatus({ enabled: true })).toBeUndefined()
+    expect(parseWakaTimeStatus({ enabled: true, configured: "yes" })).toBeUndefined()
+    expect(parseWakaTimeStatus({ enabled: true, configured: true, cli: 42 })).toBeUndefined()
+  })
+
+  test("runtime status decoding accepts the Core projection and sanitizes future source values", () => {
+    expect(
+      parseWakaTimeStatus({
+        enabled: true,
+        configured: true,
+        cli: " C:/wakatime-cli.exe ",
+        source: "system",
+        futureField: "ignored",
+      }),
+    ).toEqual({
+      enabled: true,
+      configured: true,
+      cli: " C:/wakatime-cli.exe ",
+      source: "system",
+    })
+
+    expect(parseWakaTimeStatus({ enabled: false, configured: true, source: "bundled" })).toEqual({
+      enabled: false,
+      configured: true,
+    })
+  })
+
+  test("toggle success follows returned effective state, never requested intent alone", () => {
+    expect(didApplyWakaTimeEnabled(status({ enabled: true }), true)).toBe(true)
+    expect(didApplyWakaTimeEnabled(status({ enabled: false }), false)).toBe(true)
+    expect(didApplyWakaTimeEnabled(status({ enabled: false }), true)).toBe(false)
+    expect(didApplyWakaTimeEnabled(status({ enabled: true }), false)).toBe(false)
+  })
+
   test("the model exposes no credential or persistence surface", () => {
     // The panel must not grow a key draft, a flush control, or queue telemetry:
     // Core publishes none of those, so there is nothing here to render.
-    expect(Object.keys(model).sort()).toEqual(["cliPath", "cliSource", "connectionState"])
+    expect(Object.keys(model).sort()).toEqual([
+      "cliPath",
+      "cliSource",
+      "connectionState",
+      "didApplyWakaTimeEnabled",
+      "parseWakaTimeStatus",
+    ])
   })
 })

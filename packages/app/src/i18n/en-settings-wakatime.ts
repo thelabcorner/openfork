@@ -31,6 +31,13 @@ export const settingsWakaTimeDict = {
   "settings.wakatime.status.missingKey.hint": "Set WAKATIME_API_KEY or add ~/.wakatime.cfg, then reload.",
   "settings.wakatime.error.load": "Could not load WakaTime status",
   "settings.wakatime.error.save": "Could not update WakaTime settings",
+  "settings.wakatime.error.unsupported.title": "WakaTime settings are not available on this server",
+  "settings.wakatime.error.unsupported.local":
+    "The OpenFork interface is newer than the active local backend. Restart OpenFork to activate WakaTime settings.",
+  "settings.wakatime.error.unsupported.remote":
+    "The connected server does not support WakaTime settings. Update or restart that server, then retry.",
+  "settings.wakatime.error.notApplied": "The server did not apply the requested WakaTime setting",
+  "settings.wakatime.action.restart": "Restart OpenFork",
   "settings.wakatime.toast.enabled": "WakaTime enabled",
   "settings.wakatime.toast.disabled": "WakaTime disabled",
 } as const

@@ -6,11 +6,20 @@ import { Switch } from "@opencode-ai/ui/v2/switch-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { type Component, createMemo, createSignal, onMount, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
+import { usePlatform } from "@/context/platform"
+import { ServerConnection, useServer } from "@/context/server"
 import { useServerSDK } from "@/context/server-sdk"
 import { showToast } from "@/utils/toast"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
-import { cliPath, cliSource, connectionState, type WakaTimeStatusView } from "./wakatime-model"
+import {
+  cliPath,
+  cliSource,
+  connectionState,
+  didApplyWakaTimeEnabled,
+  parseWakaTimeStatus,
+  type WakaTimeStatusView,
+} from "./wakatime-model"
 import "./settings-v2.css"
 import "./settings-wakatime.css"
 
@@ -25,25 +34,44 @@ import "./settings-wakatime.css"
  */
 export const SettingsWakaTimeV2: Component = () => {
   const language = useLanguage()
+  const platform = usePlatform()
+  const server = useServer()
   const sdk = useServerSDK()
   const [status, setStatus] = createSignal<WakaTimeStatusView>()
   const [loading, setLoading] = createSignal(true)
-  const [loadError, setLoadError] = createSignal(false)
+  const [loadError, setLoadError] = createSignal<"load" | "unsupported">()
   const [saving, setSaving] = createSignal(false)
 
   const client = () => sdk().client
+  const canRestartLocalSidecar = createMemo(() => {
+    const current = server.current
+    return platform.platform === "desktop" && current !== undefined && ServerConnection.builtin(current)
+  })
   const connection = createMemo(() => connectionState(status()))
   const cli = createMemo(() => cliPath(status()))
   const source = createMemo(() => cliSource(status()))
 
+  const acceptStatus = (value: unknown) => {
+    const next = parseWakaTimeStatus(value)
+    if (!next) {
+      setStatus(undefined)
+      setLoadError("unsupported")
+      return
+    }
+    setStatus(next)
+    setLoadError(undefined)
+    return next
+  }
+
   const load = async () => {
     setLoading(true)
+    setLoadError(undefined)
     try {
       const response = await client().wakatime.status({ throwOnError: true })
-      setStatus(response.data)
-      setLoadError(false)
+      acceptStatus(response.data)
     } catch {
-      setLoadError(true)
+      setStatus(undefined)
+      setLoadError("load")
     } finally {
       setLoading(false)
     }
@@ -57,9 +85,16 @@ export const SettingsWakaTimeV2: Component = () => {
     if (saving()) return
     setSaving(true)
     try {
-
       const response = await client().wakatime.update({ wakaTimeUpdatePayload: { enabled } }, { throwOnError: true })
-      setStatus(response.data)
+      const next = acceptStatus(response.data)
+      if (!next) {
+        showToast({ variant: "error", title: language.t("settings.wakatime.error.unsupported.title") })
+        return
+      }
+      if (!didApplyWakaTimeEnabled(next, enabled)) {
+        showToast({ variant: "error", title: language.t("settings.wakatime.error.notApplied") })
+        return
+      }
       showToast({
         variant: "success",
         icon: "check",
@@ -102,12 +137,30 @@ export const SettingsWakaTimeV2: Component = () => {
               <Show
                 when={loading()}
                 fallback={
-                  <>
-                    <span>{language.t("settings.wakatime.error.load")}</span>
-                    <ButtonV2 size="small" variant="outline" onClick={() => void load()}>
-                      {language.t("settings.ofxp.retry")}
-                    </ButtonV2>
-                  </>
+                  <Show
+                    when={loadError() === "unsupported"}
+                    fallback={
+                      <>
+                        <span>{language.t("settings.wakatime.error.load")}</span>
+                        <ButtonV2 size="small" variant="outline" onClick={() => void load()}>
+                          {language.t("settings.ofxp.retry")}
+                        </ButtonV2>
+                      </>
+                    }
+                  >
+                    <span>
+                      {language.t(
+                        canRestartLocalSidecar()
+                          ? "settings.wakatime.error.unsupported.local"
+                          : "settings.wakatime.error.unsupported.remote",
+                      )}
+                    </span>
+                    <Show when={canRestartLocalSidecar()}>
+                      <ButtonV2 size="small" variant="outline" onClick={() => void platform.restart()}>
+                        {language.t("settings.wakatime.action.restart")}
+                      </ButtonV2>
+                    </Show>
+                  </Show>
                 }
               >
                 <Spinner class="size-4 shrink-0" />

@@ -81,6 +81,17 @@ describe("WakaTime settings copy", () => {
     expect(unresolved).toEqual([])
   })
 
+  test("stale backend handling fails closed and restart is local-sidecar-only", async () => {
+    const source = await Bun.file(panel).text()
+    expect(source).toContain("const next = parseWakaTimeStatus(value)")
+    expect(source).toContain("acceptStatus(response.data)")
+    expect(source).toContain('loadError() === "unsupported"')
+    expect(source).toContain('platform.platform === "desktop"')
+    expect(source).toContain("ServerConnection.builtin(current)")
+    expect(source).toContain("platform.restart()")
+    expect(source).toContain("didApplyWakaTimeEnabled(next, enabled)")
+  })
+
   test("the dictionary carries no key the panel never renders", async () => {
     const source = await Bun.file(panel).text()
     const referenced = new Set(source.match(/settings\.wakatime\.[a-zA-Z.]+/g) ?? [])
