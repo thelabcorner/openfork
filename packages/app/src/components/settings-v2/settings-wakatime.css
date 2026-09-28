@@ -1,0 +1,61 @@
+.settings-wakatime-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-wakatime-intro {
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 20px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-wakatime-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding-block: 48px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 1;
+  color: var(--v2-text-text-muted);
+  text-align: center;
+}
+
+.settings-wakatime-connection-state {
+  color: var(--v2-text-text-muted);
+}
+
+.settings-wakatime-connection-state[data-state="ready"] {
+  color: var(--v2-text-text-base);
+}
+
+.settings-wakatime-connection-state[data-state="missing-key"],
+.settings-wakatime-connection-state[data-state="missing-cli"] {
+  color: var(--v2-state-fg-warning, var(--v2-text-text-muted));
+}
+
+.settings-wakatime-cli {
+  font-family: var(--v2-font-mono, monospace);
+  font-size: 12px;
+  font-weight: 440;
+  line-height: 16px;
+  color: var(--v2-text-text-base);
+  text-align: right;
+  word-break: break-all;
+}
+
+.settings-wakatime-privacy {
+  font-size: 12px;
+  font-weight: 440;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-wakatime-privacy + .settings-wakatime-privacy {
+  margin-top: 8px;
+}

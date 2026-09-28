@@ -1,4 +1,5 @@
 import { Effect, Option, Schema, Scope } from "effect"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as path from "path"
 import * as Tool from "./tool"
@@ -60,6 +61,48 @@ const noteRead = (
     Option.getOrElse(stat.mtime, () => new Date(0)).getTime(),
     Number(stat.size),
   )
+}
+
+const activityModel = (extra: Tool.Context["extra"]): CodingActivity.Model | undefined => {
+  const model = extra?.["model"]
+  if (!model || typeof model !== "object") return undefined
+  const candidate = model as Record<string, unknown>
+  const providerID = typeof candidate["providerID"] === "string" ? candidate["providerID"] : undefined
+  const modelID =
+    typeof candidate["id"] === "string"
+      ? candidate["id"]
+      : typeof candidate["modelID"] === "string"
+        ? candidate["modelID"]
+        : undefined
+  if (!providerID || !modelID) return undefined
+  const variant = typeof candidate["variant"] === "string" ? candidate["variant"] : undefined
+  return variant === undefined ? { providerID, modelID } : { providerID, modelID, variant }
+}
+
+/**
+ * The canonical absolute project root this instance already holds.
+ *
+ * `worktree` is the executing instance's own root, with one exception: a
+ * non-git project carries the `"/"` sentinel (see `containsPath` in
+ * `@/project/instance-context`), which matches any absolute path and therefore
+ * names no directory at all. `directory` is the only real root in that case.
+ *
+ * This is deliberately a value the instance already proved, never one re-derived
+ * from a read path or a project display name, and it is never resolved against
+ * the host cwd - an instance holding neither real root reports no folder at all
+ * rather than an invented one.
+ *
+ * Stamping it is pure O(1) metadata on a value already in memory: this performs
+ * no filesystem discovery, no Git call, and keeps no per-session cache, so a read
+ * that records nothing costs exactly as much as one that does.
+ */
+const instanceRoot = (instance: { readonly directory: string; readonly worktree: string }): string | undefined => {
+  const candidates = instance.worktree === "/" ? [instance.directory] : [instance.worktree, instance.directory]
+  for (const candidate of candidates) {
+    if (candidate.length === 0 || !path.isAbsolute(candidate)) continue
+    return path.resolve(candidate)
+  }
+  return undefined
 }
 
 export const Parameters = Schema.Struct({
@@ -249,7 +292,25 @@ export const ReadTool = Tool.define<
       ctx: Tool.Context<Metadata>,
     ) {
       const instance = yield* InstanceState.context
+      const projectFolder = instanceRoot(instance)
       const action = resolveAction(params)
+
+      const activityPaths = new Set<string>()
+      const noteActivity = (filepath: string) => {
+        if (activityPaths.has(filepath)) return Effect.void
+        activityPaths.add(filepath)
+        const model = activityModel(ctx.extra)
+        return CodingActivity.record({
+          entity: filepath,
+          kind: "read",
+          aiSession: ctx.sessionID,
+          project: instance.project.name ?? (path.basename(instance.worktree) || path.basename(instance.directory)),
+          ...(projectFolder === undefined ? {} : { projectFolder }),
+          ...(model ? { model } : {}),
+          source: "session",
+          sourceRef: ctx.callID || ctx.messageID,
+        }).pipe(Effect.ignore)
+      }
 
       const singlePathInput = resolveSinglePathInput(params)
       const hasSinglePath = singlePathInput !== undefined
@@ -340,6 +401,7 @@ export const ReadTool = Tool.define<
             offset: request.offset || 1,
           })
           noteRead(ctx.sessionID, filepath, resolved.stat)
+          if (resolved.stat?.type === "File") yield* noteActivity(filepath)
           const heal = resolved.repaired ? renderHeal(input, filepath, resolved.repaired) : ""
           const block = [
             heal,
@@ -496,6 +558,8 @@ export const ReadTool = Tool.define<
       }
 
       noteRead(ctx.sessionID, filepath, stat)
+
+      yield* noteActivity(filepath)
 
       if (action === "outline") {
         const cache = yield* InstanceState.get(cacheState)

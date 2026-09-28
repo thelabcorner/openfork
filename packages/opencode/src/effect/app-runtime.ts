@@ -90,6 +90,8 @@ import { SwarmRecovery } from "@/swarm/recovery"
 import { SwarmDeadlineOwner } from "@/swarm/deadline-owner"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SystemOne } from "@/system-one/system-one"
+import { WakaTime } from "@opencode-ai/core/wakatime"
+import { WakaTimeSessionFlush } from "@/wakatime/session-flush"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
@@ -193,6 +195,31 @@ export const AppLayer = AppNodeBuilderV1.build(
     // Browser host broker: needed by the session-delete orphan path (CLI +
     // httpapi) and transitively by the browser tools via BrokerClient.
     BrowserHostBroker.node,
+    // Tier-0 process-global WakaTime exporter. Direct AppRuntime execution
+    // (CLI commands, TUI worker, delegated/remote agents) never builds the
+    // httpapi served graph, so the exporter has to be reachable here too or
+    // those processes would produce CodingActivity with no consumer.
+    //
+    // Core's node is a process singleton, so registering it in both this graph
+    // and the served graph cannot create a second CodingActivity subscriber.
+    WakaTime.node,
+    // Tier-0 process-global settlement flush: the single `session.idle`
+    // subscriber that asks Core to deliver one session's queued time once
+    // durable execution ownership is released. It depends only on the
+    // process-global EventV2 bus and the Core exporter, never on a directory,
+    // so it belongs beside the exporter in the direct graph for the same
+    // reason: direct AppRuntime execution never builds the served graph.
+    //
+    // Registering it here and in the served graph installs exactly one Idle
+    // listener. The adapter is a standard `makeGlobalNode` whose scoped
+    // acquireRelease owns the one `EventV2.listenType` subscription, and both
+    // graphs build it through the shared process-wide `memoMap`, so the second
+    // graph reuses the live layer instead of installing a second listener and
+    // the first graph to close releases only its own lease. Its Idle callback
+    // calls `WakaTime.requestFlushSession` — Core's O(1) scheduler request, not
+    // a delivery — because EventV2 runs that callback inline on the publish
+    // path and settlement must never wait on CLI or network work.
+    WakaTimeSessionFlush.node,
   ]),
   [[SessionExecution.node, SessionExecutionLocal.node]],
 ).pipe(Layer.provideMerge(AppNodeBuilderV1.build(Ripgrep.node)), Layer.provideMerge(Observability.layer))

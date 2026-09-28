@@ -9,6 +9,7 @@ import { buildPlan, type EditPlan } from "@/tool/edit/plan"
 import { applyEditStrategy, type BatchOpType } from "@/tool/edit/strategy"
 import { resolveReplacement } from "@/tool/edit/match"
 import { assertTextContent } from "@/tool/patch/core"
+import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
 import { ExchangeFileMutation } from "./file-mutation"
 import { ExchangeRead } from "./read"
@@ -54,6 +55,7 @@ export interface ExecuteInput extends Input {
   readonly groundedFingerprint?: string
   readonly ungroundedWarning?: string
   readonly signal?: AbortSignal
+  readonly attribution?: ExchangeAttribution.Attribution
 }
 
 export interface Hooks<E> {
@@ -297,6 +299,7 @@ export function execute<E>(
         beforeCommit: hooks.beforeCommit,
       },
       input.signal,
+      input.attribution,
     )
 
     let fingerprint = transaction.value.fingerprint

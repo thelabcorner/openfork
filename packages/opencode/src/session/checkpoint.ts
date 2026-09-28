@@ -5,6 +5,7 @@ import path from "path"
 import { Effect, Fiber, Layer, Context, Clock, Scope, Schema, Semaphore, Schedule, Duration } from "effect"
 import { and, eq, lt, desc, inArray } from "drizzle-orm"
 import { randomUUID } from "crypto"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { Database } from "@opencode-ai/core/database/database"
 import { Global } from "@opencode-ai/core/global"
 import { Hash } from "@opencode-ai/core/util/hash"
@@ -148,6 +149,24 @@ const lock = (key: string) => {
   const next = Semaphore.makeUnsafe(1)
   locks.set(key, next)
   return next
+}
+
+/**
+ * The canonical absolute project root a turn checkpoint already holds.
+ *
+ * `worktree` is the instance root the checkpoint diff was captured against, so
+ * it is the only directory these records may name. The `"/"` sentinel a
+ * non-git instance carries names no directory and is never reported as one.
+ * Nothing here consults cwd or the project display name, and stamping it is pure
+ * O(1) metadata on a value already in memory - no filesystem discovery, no Git
+ * call, and no per-turn cache.
+ */
+const checkpointRoot = (ctx: InstanceContext): string | undefined => {
+  const base = ctx.worktree === "/" ? ctx.directory : ctx.worktree
+  if (base.length === 0 || !path.isAbsolute(base)) return undefined
+  // Same canonicalization the entity paths below use, so the folder and the
+  // entities it contains always agree.
+  return path.resolve(base)
 }
 
 const layer = Layer.effect(
@@ -703,6 +722,37 @@ const layer = Layer.effect(
         additions,
         deletions,
       })
+
+      if (diff.length > 0) {
+        const ctx = yield* InstanceState.context
+        yield* Effect.gen(function* () {
+          const branch = yield* git.branch(ctx.worktree)
+          const project = ctx.project.name ?? (path.basename(ctx.worktree) || path.basename(ctx.directory))
+          // The diff paths are worktree-relative and the entities resolve against
+          // `ctx.worktree`, so that worktree is the folder this checkpoint proves.
+          // `aiLineChanges` is already the signed net delta (additions minus
+          // deletions), matching the edit/patch producers.
+          const projectFolder = checkpointRoot(ctx)
+          yield* Effect.forEach(
+            mapped,
+            (file) =>
+              file.path
+                ? CodingActivity.record({
+                    entity: path.resolve(ctx.worktree, file.path),
+                    kind: "write",
+                    aiLineChanges: file.additions - file.deletions,
+                    aiSession: turn.sessionID,
+                    project,
+                    ...(projectFolder === undefined ? {} : { projectFolder }),
+                    branch,
+                    source: "session",
+                    sourceRef: turn.checkpointID,
+                  })
+                : Effect.void,
+            { discard: true },
+          )
+        }).pipe(Effect.ignore)
+      }
     })
 
     const releaseWorktree = (sessionID: SessionID, key: string) => {

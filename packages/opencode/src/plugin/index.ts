@@ -39,6 +39,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { javascriptRuntime } from "@/util/javascript-runtime"
+import { ToolActivity } from "@/wakatime/tool-activity"
 
 type State = {
   hooks: Hooks[]
@@ -230,6 +231,13 @@ const layer = Layer.effect(
           $: typeof Bun === "undefined" ? undefined : Bun.$,
           runtime: javascriptRuntime(),
         }
+
+        // Host-owned producer: `Plugin.trigger("tool.execute.after", ...)` in
+        // session/tools.ts dispatches to this hook, projecting mutation-tool
+        // result metadata onto CodingActivity. It is a host seam, not a
+        // user-configurable plugin, so it is registered here rather than in
+        // internalPlugins() and is not suppressed by disableDefaultPlugins.
+        hooks.push(ToolActivity.hooks(input, bridge))
 
         for (const plugin of flags.disableDefaultPlugins ? [] : internalPlugins(flags)) {
           const init = yield* Effect.tryPromise({

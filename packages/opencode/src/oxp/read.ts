@@ -5,6 +5,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 import { ExchangeRead } from "@/exchange/read"
 import { OxpAuthority } from "./authority"
+import { OxpAttribution } from "./attribution"
 import { OxpConfig } from "./config"
 import { OxpError } from "./error"
 import { OxpGrounding } from "./grounding"
@@ -82,6 +83,15 @@ const layer = Layer.effect(
           limit: window.limit,
           signal,
           projectionMarker: "<note>OXP read output truncated; narrow the read window</note>",
+          // The shared exchange read already publishes the one canonical
+          // CodingActivity record for this read, so attribution is supplied here
+          // rather than emitted a second time. It is derived from the approved
+          // root this call's admission re-verified on disk, not from the virtual
+          // path spelling, so a nested file and a file at the root name one
+          // project — and one canonical project folder — instead of a parent
+          // directory. Exactly-once is preserved: the folder enriches the record
+          // the exchange read already emits and never adds a second one.
+          attribution: OxpAttribution.attribution(admission.root),
         },
         { revalidate: () => authority.revalidate(admission, "egress") },
       ).pipe(Effect.mapError((error) => (OxpError.isError(error) ? error : mapExchangeError(error))))

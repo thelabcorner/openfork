@@ -38,6 +38,7 @@ import { SyncApi } from "./groups/sync"
 import { ToolApi } from "./groups/tool"
 import { TuiApi } from "./groups/tui"
 import { UsageApi } from "./groups/usage"
+import { WakaTimeApi } from "./groups/wakatime"
 import { WorkspaceApi } from "./groups/workspace"
 import { PromptRevisorApi } from "./groups/prompt-revisor"
 import { RevisionDraftApi } from "./groups/revision-draft"
@@ -74,6 +75,9 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(GlobalApi)
   .addHttpApi(ProviderSettingsApi)
   .addHttpApi(UsageApi)
+  // Tier-0 process-global WakaTime opt-in exporter control. Never routes
+  // through a workspace Instance, never crosses InstanceContextMiddleware.
+  .addHttpApi(WakaTimeApi)
   // Tier 0 quota/account metadata and calendar projections. Never route through a workspace Instance.
   .addHttpApi(QuotaApi)
   // Tier 0/1 OFXP operator control plane. Never route peer settings through a workspace Instance.

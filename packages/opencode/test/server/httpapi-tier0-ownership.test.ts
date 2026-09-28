@@ -26,6 +26,7 @@ import { OfxpRuntime } from "../../src/ofxp/runtime"
 import { OfxpRoot } from "../../src/ofxp/root"
 import { Usage } from "../../src/usage/usage"
 import { Quota } from "../../src/quota/quota"
+import { WakaTime } from "@opencode-ai/core/wakatime"
 import { Session } from "../../src/session/session"
 import { ServerAuth } from "../../src/server/auth"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
@@ -41,6 +42,8 @@ import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { WakaTimePaths } from "../../src/server/routes/instance/httpapi/groups/wakatime"
+import { wakatimeHandlers } from "../../src/server/routes/instance/httpapi/handlers/wakatime"
 import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
@@ -94,6 +97,33 @@ const httpTask = Swarm.Task.make({
 })
 
 /**
+ * Core owns the exporter. The transport mock therefore exposes exactly the Core
+ * `Status` shape - enabled/configured plus the optional resolved CLI and its
+ * source - and nothing else. There is deliberately no credential mutation here:
+ * enablement authority is the only writable fact on this surface.
+ */
+const instanceLoads = Ref.makeUnsafe(0)
+const wakatimeState = Ref.makeUnsafe<{
+  enabled: boolean
+  configured: boolean
+  cli?: string
+  source?: "override" | "system" | "managed"
+  failNext: boolean
+}>({ enabled: false, configured: true, cli: "/usr/bin/wakatime-cli", source: "system", failNext: false })
+
+const wakatimeStatus = (state: {
+  enabled: boolean
+  configured: boolean
+  cli?: string
+  source?: "override" | "system" | "managed"
+}) => ({
+  enabled: state.enabled,
+  configured: state.configured,
+  ...(state.cli === undefined ? {} : { cli: state.cli }),
+  ...(state.source === undefined ? {} : { source: state.source }),
+}) satisfies WakaTime.Status
+
+/**
  * Negative ownership invariant.
  *
  * This layer intentionally does NOT provide InstanceStore, workspace routing,
@@ -114,6 +144,7 @@ const apiLayer = HttpRouter.serve(
       scheduledTaskHandlers,
       swarmHandlers,
       usageHandlers,
+      wakatimeHandlers,
     ]),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
@@ -356,6 +387,21 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(
     Layer.mock(SwarmMemberSessionWake.Service)({
       request: () => Effect.succeed(false),
+    }),
+  ),
+  Layer.provide(
+    Layer.mock(WakaTime.Service)({
+      status: () => Ref.get(wakatimeState).pipe(Effect.map(wakatimeStatus)),
+      setEnabled: (enabled: boolean) =>
+        Ref.get(wakatimeState).pipe(
+          Effect.flatMap((state) =>
+            state.failNext
+              ? Effect.fail(new Error("Unable to persist WakaTime settings"))
+              : Ref.update(wakatimeState, (current) => ({ ...current, enabled })).pipe(
+                  Effect.andThen(Ref.get(wakatimeState).pipe(Effect.map(wakatimeStatus))),
+                ),
+          ),
+        ),
     }),
   ),
   Layer.provide(
@@ -807,6 +853,82 @@ describe("Tier-0 root ownership", () => {
       ).pipe(HttpClient.execute)
       expect(provenance.status).toBe(200)
       expect(yield* provenance.json).toEqual([])
+    }),
+  )
+})
+
+describe("Tier-0 WakaTime opt-in surface", () => {
+  const configuredStatus = { enabled: false, configured: true, cli: "/usr/bin/wakatime-cli", source: "system" as const }
+  const resetWakaTime = Ref.set(wakatimeState, { ...configuredStatus, failNext: false })
+
+  it.live("serves WakaTime status without a workspace runtime", () =>
+    Effect.gen(function* () {
+      yield* resetWakaTime
+      const response = yield* HttpClientRequest.get(WakaTimePaths.status).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      // Exactly Core's Status projection: opt-in, configuration, resolved CLI,
+      // and how that CLI was found. No queue depth, no last-send telemetry.
+      expect(yield* response.json).toEqual({
+        enabled: false,
+        configured: true,
+        cli: "/usr/bin/wakatime-cli",
+        source: "system",
+      })
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
+    }),
+  )
+
+  it.live("omits the CLI and source when no binary is resolved yet", () =>
+    Effect.gen(function* () {
+      yield* Ref.set(wakatimeState, { enabled: false, configured: false, failNext: false })
+      const response = yield* HttpClientRequest.get(WakaTimePaths.status).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({ enabled: false, configured: false })
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
+    }),
+  )
+
+  it.live("toggles WakaTime opt-in through Core without a workspace runtime", () =>
+    Effect.gen(function* () {
+      yield* resetWakaTime
+      const response = yield* HttpClientRequest.patch(WakaTimePaths.status).pipe(
+        HttpClientRequest.setBody(HttpBody.jsonUnsafe({ enabled: true })),
+        HttpClient.execute,
+      )
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        enabled: true,
+        configured: true,
+        cli: "/usr/bin/wakatime-cli",
+        source: "system",
+      })
+      expect((yield* Ref.get(wakatimeState)).enabled).toBe(true)
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
+    }),
+  )
+
+  it.live("maps a Core settings failure to an internal error without leaking state", () =>
+    Effect.gen(function* () {
+      yield* Ref.set(wakatimeState, { ...configuredStatus, failNext: true })
+      const response = yield* HttpClientRequest.patch(WakaTimePaths.status).pipe(
+        HttpClientRequest.setBody(HttpBody.jsonUnsafe({ enabled: true })),
+        HttpClient.execute,
+      )
+      expect(response.status).toBe(500)
+      expect(JSON.parse(yield* response.text)).toMatchObject({ message: "Unable to persist WakaTime settings" })
+    }),
+  )
+
+  it.live("exposes no credential write path on the WakaTime surface", () =>
+    Effect.gen(function* () {
+      // Core holds no API-key store, so the transport must not offer one. Any
+      // request aimed at a key/flush path has to fail as an unknown route.
+      yield* resetWakaTime
+      for (const path of ["/global/wakatime/key", "/global/wakatime/flush"]) {
+        const response = yield* HttpClientRequest.post(path).pipe(HttpClient.execute)
+        expect({ path, status: response.status }).toEqual({ path, status: 404 })
+      }
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
     }),
   )
 })

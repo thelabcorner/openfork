@@ -24,6 +24,8 @@ import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi
 import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { wakatimeHandlers } from "../../src/server/routes/instance/httpapi/handlers/wakatime"
+import { WakaTime } from "@opencode-ai/core/wakatime"
 import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
@@ -44,6 +46,7 @@ const apiLayer = HttpRouter.serve(
       globalHandlers,
       providerSettingsHandlers,
       usageHandlers,
+      wakatimeHandlers,
       quotaHandlers,
       revisionDraftHandlers,
       scheduledTaskHandlers,
@@ -76,6 +79,7 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(ScheduledTaskSessionBinding.Service)({})),
   Layer.provide(Layer.mock(SwarmV2.Service)({})),
   Layer.provide(Layer.mock(SwarmMemberSessionWake.Service)({})),
+  Layer.provide(Layer.mock(WakaTime.Service)({})),
   Layer.provide(
     Layer.mock(Usage.Service)({
       summary: () => Effect.die("unused usage summary"),

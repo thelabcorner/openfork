@@ -1,6 +1,8 @@
 import { describe, expect } from "bun:test"
+import { resolve } from "node:path"
 import { LLMClient, LLMEvent, LLMResponse, Model, type LLMClientShape, type LLMRequest } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -25,7 +27,7 @@ import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance
 import { MaintenanceUsageTable } from "@opencode-ai/core/usage/sql"
 import { Config } from "@opencode-ai/core/config"
 import { and, eq } from "drizzle-orm"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import { testEffect } from "../lib/effect"
@@ -57,6 +59,7 @@ let currentCriteria: ReadonlyArray<{ id: string }> = []
 let readClockAdvanceMs = 0
 let resolveClockAdvanceMs = 0
 let defectReadPaths = new Set<string>()
+let binaryReadPaths = new Set<string>()
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
@@ -84,6 +87,8 @@ const filesystem = Layer.succeed(
       Effect.gen(function* () {
         readCalls.push(path)
         if (defectReadPaths.has(path)) return yield* Effect.die(new Error(`NotFound: FileSystem.stat (${path})`))
+        if (binaryReadPaths.has(path))
+          return { content: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]), mime: "image/png" }
         if (readClockAdvanceMs > 0) yield* TestClock.adjust(readClockAdvanceMs)
         return { content: new TextEncoder().encode("export const shipped = true\n"), mime: "text/plain" }
       }),
@@ -197,6 +202,7 @@ const setup = Effect.gen(function* () {
   readClockAdvanceMs = 0
   resolveClockAdvanceMs = 0
   defectReadPaths = new Set()
+  binaryReadPaths = new Set()
 
   const { db } = yield* Database.Service
   yield* db
@@ -762,6 +768,76 @@ describe("GoalAuditor", () => {
       expect(generateRequests).toHaveLength(4)
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain("Protocol correction")
       expect(JSON.stringify(generateRequests[3]!.messages)).toContain("Protocol correction")
+    }),
+  )
+
+  it.effect("records exactly one Special-Agent read heartbeat for a successful auditor file read", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      const fiber = yield* CodingActivity.stream().pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+      generateResponses = [
+        response({ id: "recorded-read", name: "read", input: { path: "src/feature.ts" } }),
+        verdict("after-recorded-read", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+
+      expect(result.ok).toBe(true)
+      expect(readCalls).toEqual(["src/feature.ts"])
+      const [activity] = Array.from(yield* Fiber.join(fiber))
+      expect(activity).toMatchObject({
+        entity: resolve(String(directory), "src/feature.ts"),
+        kind: "read",
+        source: "special-agent",
+        // The auditor reads inside one authorized workspace, so the folder is
+        // Location's own directory: the same directory the entity resolves
+        // against, never a basename and never cwd.
+        projectFolder: String(directory),
+      })
+      // The auditor runs outside any session turn and proves no principal, so
+      // neither a session nor a per-call ref may be invented alongside the folder.
+      expect(activity?.aiSession).toBeUndefined()
+      expect(activity?.model).toBeUndefined()
+      expect(activity?.sourceRef).toBeUndefined()
+      expect(activity?.aiLineChanges).toBeUndefined()
+    }),
+  )
+
+  it.effect("records no heartbeat for sensitive, missing, binary, or discovery-only auditor reads", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      defectReadPaths.add("docs")
+      binaryReadPaths.add("assets/logo.png")
+      const fiber = yield* CodingActivity.stream().pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.yieldNow
+      generateResponses = [
+        response(
+          { id: "sensitive-read", name: "read", input: { path: ".env" } },
+          { id: "discovery-grep", name: "grep", input: { pattern: "shipped", path: "src" } },
+          { id: "discovery-glob", name: "glob", input: { pattern: "src/**/*.ts" } },
+          { id: "missing-read", name: "read", input: { path: "docs" } },
+          { id: "binary-read", name: "read", input: { path: "assets/logo.png" } },
+        ),
+        verdict("after-muted-reads", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+
+      expect(result.ok).toBe(true)
+      expect(readCalls).toEqual(["docs", "assets/logo.png"])
+      expect(grepCalls).toEqual(["shipped"])
+      expect(globCalls).toEqual(["src/**/*.ts"])
+      const transcript = JSON.stringify(generateRequests.at(-1)!.messages)
+      expect(transcript).toContain("Sensitive files are not available")
+      expect(transcript).toContain("Unable to read docs")
+      expect(transcript).toContain("Binary files are not available")
+
+      expect(yield* CodingActivity.record({ entity: "/sentinel/heartbeat.ts", kind: "read", source: "core" })).toBe(true)
+      const received = Array.from(yield* Fiber.join(fiber))
+      expect(received.map((entry) => entry.entity)).toEqual(["/sentinel/heartbeat.ts"])
     }),
   )
 })

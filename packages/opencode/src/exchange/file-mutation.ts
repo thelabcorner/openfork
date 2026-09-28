@@ -2,8 +2,10 @@ export * as ExchangeFileMutation from "./file-mutation"
 
 import { Effect } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { atomicWrite } from "@/tool/edit/commit"
 import { withFileLocks } from "@/tool/file-lock"
+import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
 
 export type Change =
@@ -75,6 +77,51 @@ function sameBytes(left: Uint8Array, right: Uint8Array) {
 
 function targets(changes: readonly Change[]) {
   return changes.flatMap((change) => (change.type === "move" ? [change.path, change.movePath] : [change.path]))
+}
+
+function lineCount(bytes: Uint8Array) {
+  if (bytes.length === 0) return 0
+  const text = new TextDecoder().decode(bytes)
+  if (text.length === 0) return 0
+  let lines = 1
+  for (let index = 0; index < text.length; index++) if (text.charCodeAt(index) === 10) lines += 1
+  return text.endsWith("\n") ? lines - 1 : lines
+}
+
+function lineDelta(change: Change) {
+  const before = change.type === "add" ? 0 : lineCount(change.before)
+  const after = change.type === "delete" ? 0 : lineCount(change.after)
+  return after - before
+}
+
+function projectName(entity: string, displayPath: string) {
+  const canonical = entity.replace(/\\/g, "/")
+  const relative = displayPath.replace(/\\/g, "/").replace(/^\.\//, "")
+  if (relative && canonical.endsWith(`/${relative}`)) {
+    const root = canonical.slice(0, canonical.length - relative.length - 1)
+    const name = root.slice(root.lastIndexOf("/") + 1)
+    if (name) return name
+  }
+  const segments = canonical.split("/").filter(Boolean)
+  return segments.length > 1 ? segments[segments.length - 2] : segments[0]
+}
+
+function recordChanges(changes: readonly Change[], attribution?: ExchangeAttribution.Attribution) {
+  if (changes.length === 0) return Effect.void
+  return Effect.forEach(
+    changes,
+    (change) => {
+      const entity = change.type === "move" ? change.movePath : change.path
+      const displayPath = change.type === "move" ? change.moveDisplayPath : change.displayPath
+      return CodingActivity.record({
+        entity,
+        kind: "write",
+        aiLineChanges: lineDelta(change),
+        ...ExchangeAttribution.apply(attribution, { project: projectName(entity, displayPath) }),
+      }).pipe(Effect.ignore)
+    },
+    { discard: true },
+  )
 }
 
 function ensureNotCancelled(signal?: AbortSignal) {
@@ -251,6 +298,7 @@ export function commit<E, A>(
   lockPaths: readonly string[],
   hooks: Hooks<E, A>,
   signal?: AbortSignal,
+  attribution?: ExchangeAttribution.Attribution,
 ): Effect.Effect<Result<A>, ExchangeError.Error | E> {
   return withFileLocks(
     lockPaths,
@@ -293,6 +341,6 @@ export function commit<E, A>(
 
       return { value: prepared.value, changes: prepared.changes, committed: true }
     }),
-  )
+  ).pipe(Effect.tap((result) => recordChanges(result.changes, attribution)))
 }
 

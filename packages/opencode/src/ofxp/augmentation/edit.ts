@@ -9,6 +9,7 @@ import { ExchangeEdit } from "@/exchange/edit"
 import { ExchangeError } from "@/exchange/error"
 import { ExchangeGrounding } from "@/exchange/grounding"
 import { ExchangeRequestDigest } from "@/exchange/request-digest"
+import { OfxpAttribution } from "../attribution"
 import type { PeerCertificateIdentity } from "../certificate"
 import { OfxpPrincipal } from "../principal"
 import { OfxpRoot } from "../root"
@@ -118,6 +119,7 @@ export const execute = Effect.fn("OfxpEditCapability.execute")(function* (
       ungroundedWarning:
         "This file has no OFXP read-grounding record for this peer/session. The edit is still verified against current content, but read it first when relying on line coordinates.",
       signal,
+      attribution: OfxpAttribution.attribution(resolved, peer, call),
     },
     {
       revalidate: () => revalidate().pipe(Effect.asVoid),

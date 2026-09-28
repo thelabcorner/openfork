@@ -14,6 +14,7 @@ import { LSP } from "@/lsp/lsp"
 import { Permission } from "../../src/permission"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Instruction } from "../../src/session/instruction"
+import { InstanceState } from "@/effect/instance-state"
 import { ReadTool } from "../../src/tool/read"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
@@ -25,6 +26,7 @@ import {
   TestInstance,
   tmpdirScoped,
 } from "../fixture/fixture"
+import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 import { testEffect } from "../lib/effect"
 
 const FIXTURES_DIR = path.join(import.meta.dir, "fixtures")
@@ -907,6 +909,78 @@ describe("tool.read subtools", () => {
       const err = yield* fail(dir, { filePath: path.join(dir, "git.ts") })
       expect(err.message).toContain("File not found")
       expect(err.message).toContain("(directory — not opened)")
+    }),
+  )
+})
+
+describe("tool.read coding activity", () => {
+  it.live("records one activity per successful file read across single and batch executions", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "one.txt"), "alpha\n")
+      yield* put(path.join(dir, "two.txt"), "bravo\n")
+      yield* put(path.join(dir, "three.txt"), "charlie\n")
+      const log = yield* subscribeCodingActivity
+      const instance = yield* provideInstance(dir)(InstanceState.context)
+
+      yield* exec(dir, { filePath: path.join(dir, "one.txt"), offset: 1, limit: 1 })
+      yield* exec(dir, { filePaths: [path.join(dir, "two.txt"), path.join(dir, "three.txt")] })
+      yield* exec(dir, {
+        reads: [{ filePath: path.join(dir, "one.txt") }, { filePath: path.join(dir, "one.txt") }],
+      })
+
+      const events = yield* drainCodingActivity(log, "read-sentinel")
+      const mine = events.filter((event) => event.aiSession === "ses_test" && event.kind === "read")
+      const names = mine.map((event) => path.basename(event.entity)).sort()
+      expect(names).toEqual(["one.txt", "one.txt", "three.txt", "two.txt"])
+      for (const event of mine) {
+        expect(event.source).toBe("session")
+        expect(event.sourceRef).toBe("msg_test")
+        expect(event.project).toBe(
+          instance.project.name ?? (path.basename(instance.worktree) || path.basename(instance.directory)),
+        )
+        // The folder is the executing instance's own root, taken from context the
+        // read already holds. It is not derived from the entity path or the name.
+        expect(event.projectFolder).toBe(
+          path.resolve(instance.worktree === "/" ? instance.directory : instance.worktree),
+        )
+        expect(path.isAbsolute(event.projectFolder!)).toBe(true)
+      }
+    }),
+  )
+
+  it.live("does not record directory listings or failed reads", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "nested", "file.txt"), "content")
+      const log = yield* subscribeCodingActivity
+
+      yield* exec(dir, { filePath: path.join(dir, "nested") })
+      yield* fail(dir, { filePath: path.join(dir, "missing.txt") })
+
+      const events = yield* drainCodingActivity(log, "read-negative-sentinel")
+      expect(events.filter((event) => event.aiSession === "ses_test")).toEqual([])
+    }),
+  )
+
+  it.live("a nested read records the same root folder as a root-level read", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "top.txt"), "alpha\n")
+      yield* put(path.join(dir, "pkg", "deep", "nested.ts"), "bravo\n")
+      const log = yield* subscribeCodingActivity
+      const instance = yield* provideInstance(dir)(InstanceState.context)
+
+      yield* exec(dir, { filePath: path.join(dir, "top.txt") })
+      yield* exec(dir, { filePath: path.join(dir, "pkg", "deep", "nested.ts") })
+
+      const events = yield* drainCodingActivity(log, "read-nested-folder-sentinel")
+      const mine = events.filter((event) => event.aiSession === "ses_test")
+      expect(mine).toHaveLength(2)
+      // Entity depth cannot move the folder: both records name the instance root.
+      expect([...new Set(mine.map((event) => event.projectFolder))]).toEqual([
+        path.resolve(instance.worktree === "/" ? instance.directory : instance.worktree),
+      ])
     }),
   )
 })

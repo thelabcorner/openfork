@@ -2853,6 +2853,21 @@ export type NotFoundError = {
   }
 }
 
+export type WakaTimeStatus = {
+  enabled: boolean
+  configured: boolean
+  cli?: string
+  source?: "override" | "system" | "managed"
+}
+
+export type WakaTimeUpdatePayload = {
+  enabled: boolean
+}
+
+export type WakaTimeSettingsError = {
+  message: string
+}
+
 export type ConflictError = {
   _tag: "ConflictError"
   message: string
@@ -13426,6 +13441,60 @@ export type UsagePricingCatalogResponses = {
 }
 
 export type UsagePricingCatalogResponse = UsagePricingCatalogResponses[keyof UsagePricingCatalogResponses]
+
+export type WakatimeStatusData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/wakatime"
+}
+
+export type WakatimeStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type WakatimeStatusError = WakatimeStatusErrors[keyof WakatimeStatusErrors]
+
+export type WakatimeStatusResponses = {
+  /**
+   * Current WakaTime opt-in and configuration status
+   */
+  200: WakaTimeStatus
+}
+
+export type WakatimeStatusResponse = WakatimeStatusResponses[keyof WakatimeStatusResponses]
+
+export type WakatimeUpdateData = {
+  body?: WakaTimeUpdatePayload
+  path?: never
+  query?: never
+  url: "/global/wakatime"
+}
+
+export type WakatimeUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * WakaTimeSettingsError
+   */
+  500: WakaTimeSettingsError
+}
+
+export type WakatimeUpdateError = WakatimeUpdateErrors[keyof WakatimeUpdateErrors]
+
+export type WakatimeUpdateResponses = {
+  /**
+   * Updated WakaTime opt-in status
+   */
+  200: WakaTimeStatus
+}
+
+export type WakatimeUpdateResponse = WakatimeUpdateResponses[keyof WakatimeUpdateResponses]
 
 export type QuotaProvidersData = {
   body?: never

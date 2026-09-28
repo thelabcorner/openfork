@@ -7,7 +7,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { Global } from "@opencode-ai/core/global"
 import { eq } from "drizzle-orm"
-import { Effect, Fiber, Layer } from "effect"
+import { Effect, Fiber, Layer, Ref } from "effect"
 import path from "path"
 import { TurnCheckpoint } from "../../src/session/checkpoint"
 import { Snapshot } from "../../src/snapshot"
@@ -17,6 +17,7 @@ import {
   testInstanceStoreLayer,
   TestInstance,
 } from "../fixture/fixture"
+import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { seedSessionRow } from "./checkpoint-seed"
 
@@ -641,6 +642,103 @@ it.instance(
       )
       expect(row2.files).toBe(1)
       expect(row2.diff![0]!.path as string).toBe("agent.txt")
+    }),
+  { git: true },
+)
+
+it.instance(
+  "finalize records one coding-activity write per changed file after the durable CAS",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const dir = tmp.directory
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_checkpoint_activity"
+      yield* seedSession(sessionID)
+      const log = yield* subscribeCodingActivity
+      const ctx = yield* InstanceState.context
+
+      yield* Effect.promise(() => Bun.write(path.join(dir, "a.txt"), "hello"))
+      // Seeded BEFORE begin() so the pre-turn baseline already contains it: a file
+      // created during the turn is an addition, not a shrink, and could never
+      // prove a negative delta.
+      yield* Effect.promise(() => Bun.write(path.join(dir, "shrunk.txt"), "x\ny\nz\nw\n"))
+      const turn = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_1" })
+      expect(turn).toBeDefined()
+      yield* Fiber.join(turn!.beforeFiber)
+
+      yield* Effect.promise(() => Bun.write(path.join(dir, "a.txt"), "changed one\nchanged two\n"))
+      yield* Effect.promise(() => Bun.write(path.join(dir, "b.txt"), "new file\n"))
+      // Deletion-heavy rewrite: four lines become one, so the exact signed net
+      // delta is -3 and must never be inflated into a count of touched lines.
+      yield* Effect.promise(() => Bun.write(path.join(dir, "shrunk.txt"), "y\n"))
+
+      yield* svc.finish(turn)
+      const finalized = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* getRows(sessionID)
+          return current[0]?.status === "ready" ? current : undefined
+        }),
+        "turn checkpoint never finalized",
+        30_000,
+      )
+      const checkpointID = String(finalized[0]!.id)
+
+      const events = yield* pollWithTimeout(
+        Effect.map(Ref.get(log.events), (all) => {
+          const mine = all.filter((event) => event.sourceRef === checkpointID)
+          return mine.length === 3 ? mine : undefined
+        }),
+        "coding activity writes were never recorded",
+      )
+
+      const a = events.find((event) => event.entity === path.resolve(dir, "a.txt"))
+      const b = events.find((event) => event.entity === path.resolve(dir, "b.txt"))
+      expect(a).toBeDefined()
+      expect(b).toBeDefined()
+      expect(a!.kind).toBe("write")
+      // Signed net delta (additions minus deletions), matching the edit/patch
+      // producers, so a shrinking file reports a negative count.
+      expect(a!.aiLineChanges).toBe(1)
+      expect(b!.aiLineChanges).toBe(1)
+      const shrunk = events.find((event) => event.entity === path.resolve(dir, "shrunk.txt"))
+      expect(shrunk).toBeDefined()
+      expect(shrunk!.aiLineChanges).toBe(-3)
+      // Exactly-once survives the new metadata: one file, one record.
+      expect(events.filter((event) => event.entity === path.resolve(dir, "shrunk.txt"))).toHaveLength(1)
+      for (const event of events) {
+        expect(event.aiSession).toBe(sessionID)
+        expect(event.project).toBe(ctx.project.name ?? (path.basename(ctx.worktree) || path.basename(ctx.directory)))
+        // The worktree the diff was captured against is the only folder these
+        // records may name; entity depth cannot move it.
+        expect(event.projectFolder).toBe(path.resolve(ctx.worktree === "/" ? ctx.directory : ctx.worktree))
+        expect(event.source).toBe("session")
+      }
+    }),
+  { git: true },
+)
+
+it.instance(
+  "finalize emits no coding-activity for a zero-diff turn",
+  () =>
+    Effect.gen(function* () {
+      const svc = yield* TurnCheckpoint.Service
+      const sessionID = "ses_checkpoint_activity_noop"
+      yield* seedSession(sessionID)
+      const log = yield* subscribeCodingActivity
+
+      const turn = yield* svc.begin({ sessionID: sessionID as any, userMessageID: "msg_noop" })
+      expect(turn).toBeDefined()
+      yield* Fiber.join(turn!.beforeFiber)
+      yield* svc.finish(turn)
+      yield* svc.quiesce(sessionID as any)
+
+      const rows = yield* getRows(sessionID)
+      expect(rows[0]!.status).toBe("ready")
+      expect(rows[0]!.files).toBe(0)
+
+      const events = yield* drainCodingActivity(log, "noop-turn-sentinel")
+      expect(events.filter((event) => event.sourceRef === String(rows[0]!.id))).toEqual([])
     }),
   { git: true },
 )

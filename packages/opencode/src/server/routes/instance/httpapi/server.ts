@@ -110,6 +110,8 @@ import { Usage } from "@/usage/usage"
 import { OfxpRuntime } from "@/ofxp/runtime"
 import { OfxpRoot } from "@/ofxp/root"
 import { lazy } from "@/util/lazy"
+import { WakaTime } from "@opencode-ai/core/wakatime"
+import { WakaTimeSessionFlush } from "@/wakatime/session-flush"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
 import { ServerAuth } from "@/server/auth"
@@ -158,6 +160,7 @@ import { syncHandlers } from "./handlers/sync"
 import { toolHandlers } from "./handlers/tool"
 import { tuiHandlers } from "./handlers/tui"
 import { usageHandlers } from "./handlers/usage"
+import { wakatimeHandlers } from "./handlers/wakatime"
 import { revisionDraftHandlers } from "./handlers/revision-draft"
 import { handlers } from "@opencode-ai/server/handlers"
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
@@ -230,6 +233,7 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
     globalHandlers,
     providerSettingsHandlers,
     usageHandlers,
+    wakatimeHandlers,
     quotaHandlers,
     ofxpHandlers,
     revisionDraftHandlers,
@@ -449,6 +453,32 @@ const app = LayerNode.group([
   Usage.node,
   Quota.node,
   Capacity.node,
+  // Tier-0 process-global WakaTime exporter, owned by Core. This served graph
+  // (built by both Server.listen and Server.Default()'s in-process fetch, under
+  // the shared memoMap) serves the /global/wakatime control surface.
+  //
+  // AppRuntime also registers WakaTime.node, because direct AppRuntime
+  // execution never builds a server graph. That is safe only because Core's
+  // node is a process singleton: the first graph to build publishes the live
+  // exporter and every later graph reuses that same Interface, so exactly one
+  // CodingActivity subscriber exists per process. Never replace this with a
+  // second exporter, and never construct the service per request.
+  WakaTime.node,
+  // Tier-0 process-global settlement flush. The served graph is where sessions
+  // actually run for desktop/server/PWA/ACP execution, so this is the graph
+  // that must own the single `session.idle` -> `WakaTime.requestFlushSession`
+  // listener for a hosted process.
+  //
+  // AppRuntime also registers it, and that installs exactly one listener. The
+  // adapter is a standard `makeGlobalNode` whose scoped acquireRelease owns the
+  // one `EventV2.listenType` subscription, and both graphs build it through the
+  // shared process-wide `memoMap`, so the second graph reuses the live layer
+  // instead of installing a second listener, and the first graph to close
+  // releases only its own lease rather than the survivor's subscription. Its
+  // Idle callback calls Core's O(1) `requestFlushSession`, never
+  // `flushSession`, because EventV2 runs that callback inline on the publish
+  // path and settlement must never wait on CLI or network work.
+  WakaTimeSessionFlush.node,
 ])
 
 export function createRoutes(

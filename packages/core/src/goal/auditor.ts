@@ -14,14 +14,17 @@ import {
   ToolRuntime,
   toDefinitions,
 } from "@opencode-ai/llm"
+import nodePath from "node:path"
 import { Clock, Context, DateTime, Duration, Effect, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Goal as GoalModel } from "@opencode-ai/schema/goal"
 import { splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
+import { CodingActivity } from "../coding-activity"
 import { Config } from "../config"
 import { makeLocationNode } from "../effect/app-node"
 import { llmClient } from "../effect/app-node-platform"
 import { FileSystem } from "../filesystem"
+import { Location } from "../location"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
 import { RelativePath } from "../schema"
@@ -402,6 +405,7 @@ const layer = Layer.effect(
     const models = yield* SessionRunnerModel.Service
     const llm = yield* LLMClient.Service
     const files = yield* FileSystem.Service
+    const location = yield* Location.Service
     const config = yield* Config.Service
     const events = yield* EventV2.Service
     const usageRecord = yield* UsageRecord.Service
@@ -428,7 +432,19 @@ const layer = Layer.effect(
               )
             if (result.content.includes(0))
               return yield* toolFailure("Binary files are not available to the Goal auditor")
-            return lineSlice(new TextDecoder().decode(result.content))
+            const content = lineSlice(new TextDecoder().decode(result.content))
+            yield* CodingActivity.record({
+              entity: nodePath.resolve(location.directory, path),
+              kind: "read",
+              // The auditor reads inside one authorized workspace, so Location's
+              // own directory is the root this record proves. It is the same
+              // directory the entity above resolves against, never a basename
+              // and never cwd. No `aiSession` or `sourceRef` is invented: the
+              // auditor runs outside any session turn and proves no principal.
+              projectFolder: location.directory,
+              source: "special-agent",
+            }).pipe(Effect.ignore)
+            return content
           }),
       }),
       grep: Tool.make({
@@ -1084,6 +1100,7 @@ export const node = makeLocationNode({
     GoalAutomation.node,
     SessionRunnerModel.node,
     FileSystem.node,
+    Location.node,
     Config.node,
     EventV2.node,
     UsageRecord.node,

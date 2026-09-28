@@ -39,6 +39,7 @@ import { OfxpJsonCapability } from "./augmentation/json"
 import { OfxpSqliteCapability } from "./augmentation/sqlite"
 import { OfxpMemoryCapability } from "./augmentation/memory"
 import { OfxpRefactorCapability } from "./augmentation/refactor"
+import { OfxpAttribution } from "./attribution"
 import { OfxpRoot } from "./root"
 import { OfxpPrincipal } from "./principal"
 import type { PeerCertificateIdentity } from "./certificate"
@@ -469,8 +470,21 @@ function success(
   }
 }
 
-export interface Interface {
-  readonly dispatch: (
+  /**
+   * Every OFXP read/write/edit/patch record is produced by the shared exchange
+   * kernel, so this boundary's only job is to hand that kernel the two facts it
+   * cannot prove for itself: the granted root's canonical `rootPath` (which
+   * becomes the record's `projectFolder`) and the authenticated principal key
+   * (which becomes `sourceRef`).
+   *
+   * Both are already re-verified by the `peers.authorize` + `roots.resolve` pair
+   * that admitted this exact call, and both are derived by `OfxpAttribution`
+   * rather than spelled here. Nothing in this file constructs a CodingActivity
+   * record directly, which is what keeps every remote file operation attributed
+   * exactly once.
+   */
+  export interface Interface {
+    readonly dispatch: (
     peer: PeerCertificateIdentity,
     method: string,
     body: unknown,
@@ -581,6 +595,7 @@ const layer = Layer.effect(
           limit: args.limit,
           signal,
           projectionMarker: "<note>OFXP read output truncated; narrow the read window</note>",
+          attribution: OfxpAttribution.attribution(resolved, peer, call),
         },
         {
           revalidate: () =>
@@ -784,6 +799,7 @@ const layer = Layer.effect(
           expectedFingerprint: args.expectedFingerprint,
           signal,
           projectionMarker: "<note>OFXP write diff truncated; inspect the remote file for complete post-state</note>",
+          attribution: OfxpAttribution.attribution(resolved, peer, call),
         },
         {
           beforeCommit: ({ targetRef, resultDigest }) =>

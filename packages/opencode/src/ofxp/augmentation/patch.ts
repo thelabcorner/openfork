@@ -10,6 +10,7 @@ import { ExchangeGrounding } from "@/exchange/grounding"
 import { ExchangePatch } from "@/exchange/patch"
 import { ExchangeRead } from "@/exchange/read"
 import { ExchangeRequestDigest } from "@/exchange/request-digest"
+import { OfxpAttribution } from "../attribution"
 import type { PeerCertificateIdentity } from "../certificate"
 import { OfxpPrincipal } from "../principal"
 import { OfxpRoot } from "../root"
@@ -123,6 +124,7 @@ export const execute = Effect.fn("OfxpPatchCapability.execute")(function* (
           .pipe(Effect.tap(() => Effect.sync(() => (started = true))), Effect.asVoid),
     },
     signal,
+    OfxpAttribution.attribution(root, peer, call),
   ).pipe(
     Effect.tapError((error) => {
       if (error instanceof ExchangeError.AmbiguousCommit) return Effect.void

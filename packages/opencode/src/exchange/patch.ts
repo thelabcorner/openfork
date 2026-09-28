@@ -7,6 +7,7 @@ import { parsePatch } from "@/patch"
 import * as Bom from "@/util/bom"
 import * as Core from "@/tool/patch/core"
 import { deriveContent } from "@/tool/patch/resolve"
+import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
 import { ExchangeFileMutation } from "./file-mutation"
 
@@ -107,6 +108,7 @@ export function execute<E>(
   input: Input,
   hooks: Hooks<E>,
   signal?: AbortSignal,
+  attribution?: ExchangeAttribution.Attribution,
 ): Effect.Effect<Result, ExchangeError.Error | E> {
   return Effect.gen(function* () {
     if (signal?.aborted) return yield* new ExchangeError.Cancelled({ detail: "Patch was cancelled" })
@@ -292,6 +294,7 @@ export function execute<E>(
         beforeCommit: hooks.beforeCommit,
       },
       signal,
+      attribution,
     )
 
     return {

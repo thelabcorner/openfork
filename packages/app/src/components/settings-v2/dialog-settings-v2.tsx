@@ -1,4 +1,4 @@
-import { Component, createEffect, createMemo, createSignal, onMount, Show, startTransition, type Accessor } from "solid-js"
+import { Component, createEffect, createMemo, createSignal, lazy, onMount, Show, startTransition, type Accessor } from "solid-js"
 import { useLocation, useNavigate, useSearchParams } from "@solidjs/router"
 import { Dialog } from "@opencode-ai/ui/v2/dialog-v2"
 import { TabsV2 } from "@opencode-ai/ui/v2/tabs-v2"
@@ -18,6 +18,8 @@ import { useLayout } from "@/context/layout"
 import { useTabs } from "@/context/tabs"
 import { useServerSync } from "@/context/server-sync"
 import { normalizeSettingsTab, useSettingsNavigation, type SettingsTab } from "./navigation"
+
+const SettingsWakaTimeV2 = lazy(() => import("./wakatime"))
 
 type SettingsViewProps = {
   tab: Accessor<SettingsTab>
@@ -89,6 +91,10 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
                     <Icon name="models" />
                     {language.t("settings.models.title")}
                   </TabsV2.Trigger>
+                  <TabsV2.Trigger value="wakatime">
+                    <Icon name="code" />
+                    {language.t("settings.wakatime.nav")}
+                  </TabsV2.Trigger>
                   <TabsV2.Trigger value="devices">
                     <Icon name="shield" />
                     {language.t("settings.devices.title")}
@@ -121,6 +127,11 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
       <TabsV2.Content value="models" class="settings-v2-panel">
         <Show when={props.tab() === "models"}>
           <SettingsModelsV2 />
+        </Show>
+      </TabsV2.Content>
+      <TabsV2.Content value="wakatime" class="settings-v2-panel">
+        <Show when={props.tab() === "wakatime"}>
+          <SettingsWakaTimeV2 />
         </Show>
       </TabsV2.Content>
       <TabsV2.Content value="devices" class="settings-v2-panel">

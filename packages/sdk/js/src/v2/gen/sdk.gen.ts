@@ -754,6 +754,11 @@ import type {
   VcsGetResponses,
   VcsStatusErrors,
   VcsStatusResponses,
+  WakatimeStatusErrors,
+  WakatimeStatusResponses,
+  WakatimeUpdateErrors,
+  WakaTimeUpdatePayload,
+  WakatimeUpdateResponses,
   WorktreeCreateErrors,
   WorktreeCreateInput,
   WorktreeCreateResponses,
@@ -2681,6 +2686,44 @@ export class Usage2 extends HeyApiClient {
     return (options?.client ?? this.client).get<UsagePricingCatalogResponses, UsagePricingCatalogErrors, ThrowOnError>({
       url: "/usage/pricing-catalog",
       ...options,
+    })
+  }
+}
+
+export class Wakatime extends HeyApiClient {
+  /**
+   * Get WakaTime status
+   *
+   * Read the process-global WakaTime exporter status: the effective opt-in, whether authentication material resolves, and the already-resolved CLI plus its source. Never resolves a download, never returns secret material, and never materializes a workspace instance.
+   */
+  public status<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<WakatimeStatusResponses, WakatimeStatusErrors, ThrowOnError>({
+      url: "/global/wakatime",
+      ...options,
+    })
+  }
+
+  /**
+   * Update WakaTime opt-in
+   *
+   * Persist the WakaTime opt-in preference through the Core exporter that owns it and return the updated status. Tier-0 global operation; never requires a workspace instance.
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters?: {
+      wakaTimeUpdatePayload?: WakaTimeUpdatePayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "wakaTimeUpdatePayload", map: "body" }] }])
+    return (options?.client ?? this.client).patch<WakatimeUpdateResponses, WakatimeUpdateErrors, ThrowOnError>({
+      url: "/global/wakatime",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
@@ -12780,6 +12823,11 @@ export class OpencodeClient extends HeyApiClient {
   private _usage?: Usage2
   get usage(): Usage2 {
     return (this._usage ??= new Usage2({ client: this.client }))
+  }
+
+  private _wakatime?: Wakatime
+  get wakatime(): Wakatime {
+    return (this._wakatime ??= new Wakatime({ client: this.client }))
   }
 
   private _quota?: Quota

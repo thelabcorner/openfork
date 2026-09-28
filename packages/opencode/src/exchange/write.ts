@@ -4,13 +4,15 @@ import { createHash } from "node:crypto"
 import { createTwoFilesPatch } from "diff"
 import { Effect } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { adaptWriteTerminators } from "@opencode-ai/core/line-ending"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 import * as Bom from "@/util/bom"
 import { atomicWrite } from "@/tool/edit/commit"
 import { withLock } from "@/tool/file-lock"
-import { ExchangeRead } from "./read"
+import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
+import { ExchangeRead } from "./read"
 
 const OUTPUT_BYTES = 96 * 1024
 const OUTPUT_LINES = 500
@@ -25,6 +27,12 @@ export interface Input {
   readonly expectedFingerprint?: string
   readonly signal?: AbortSignal
   readonly projectionMarker?: string
+  /**
+   * Optional boundary attribution folded into the single write record. It is
+   * the only thing that can give this producer a `projectFolder`; the
+   * display-path heuristic below names a project and never a directory.
+   */
+  readonly attribution?: ExchangeAttribution.Attribution
 }
 
 export interface CommitInfo {
@@ -80,6 +88,31 @@ function diff(displayPath: string, before: string, after: string, marker: string
     marker,
   })
   return { content: projected.content, truncated: projected.truncated }
+}
+
+function lineCount(text: string) {
+  if (text.length === 0) return 0
+  let lines = 1
+  for (let index = 0; index < text.length; index++) if (text.charCodeAt(index) === 10) lines += 1
+  return text.endsWith("\n") ? lines - 1 : lines
+}
+
+/**
+ * Display-name-only project heuristic for producers no boundary attributed.
+ *
+ * It derives a *name*, so it can never supply a project folder. Attributed
+ * boundaries carry their own canonical root instead; see `ExchangeAttribution`.
+ */
+function projectName(entity: string, displayPath: string) {
+  const canonical = entity.replace(/\\/g, "/")
+  const relative = displayPath.replace(/\\/g, "/").replace(/^\.\//, "")
+  if (relative && canonical.endsWith(`/${relative}`)) {
+    const root = canonical.slice(0, canonical.length - relative.length - 1)
+    const name = root.slice(root.lastIndexOf("/") + 1)
+    if (name) return name
+  }
+  const segments = canonical.split("/").filter(Boolean)
+  return segments.length > 1 ? segments[segments.length - 2] : segments[0]
 }
 
 function dependency(detail: string) {
@@ -204,6 +237,15 @@ export function execute<RevalidateError, PrepareError = never>(
         }
       }),
     )
+
+    if (committed.wrote) {
+      yield* CodingActivity.record({
+        entity: input.path,
+        kind: "write",
+        aiLineChanges: lineCount(committed.after) - lineCount(committed.before),
+        ...ExchangeAttribution.apply(input.attribution, { project: projectName(input.path, input.displayPath) }),
+      }).pipe(Effect.ignore)
+    }
 
     const projectedDiff = committed.wrote
       ? diff(

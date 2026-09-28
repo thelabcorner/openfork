@@ -4,7 +4,7 @@ import { useServer } from "@/context/server"
 import { useServerSync } from "@/context/server-sync"
 import { useTabs } from "@/context/tabs"
 
-export const settingsTabs = ["general", "shortcuts", "oxp", "servers", "providers", "models", "devices"] as const
+export const settingsTabs = ["general", "shortcuts", "oxp", "servers", "providers", "models", "wakatime", "devices"] as const
 export type SettingsTab = (typeof settingsTabs)[number]
 
 const settingsTabSet = new Set<string>(settingsTabs)

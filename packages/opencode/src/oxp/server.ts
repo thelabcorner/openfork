@@ -1,11 +1,14 @@
 import { randomBytes, timingSafeEqual } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import type { Socket } from "node:net"
-import { Context, Effect, Layer, Schema } from "effect"
+import path from "node:path"
+import { Context, Effect, Layer, Result, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { createMcpHandler, fromJsonSchema, Server, type CallToolResult, type Tool } from "@modelcontextprotocol/server"
 import { OxpAuthority } from "./authority"
+import { OxpAttribution } from "./attribution"
 import { OxpCapability } from "./capability"
 import { OxpConfig } from "./config"
 import { OxpError } from "./error"
@@ -266,6 +269,132 @@ export function durableContinuationObserved(
   return error === undefined || error.metadata?.committed === true
 }
 
+/**
+ * OpenAI file-exchange actions that leave a truthful local file effect, mapped
+ * to the canonical CodingActivity kind they represent.
+ *
+ * `get_openai_file` / `list_openai_files` are intentionally absent: they are
+ * remote metadata discovery and touch no local file, so they record nothing.
+ */
+const FILE_ACTIVITY_ACTIONS: Readonly<Record<string, CodingActivity.Kind>> = Object.freeze({
+  save_chatgpt_file: "write",
+  download_openai_file: "write",
+  upload_openai_file: "read",
+})
+
+export interface FileActivityTarget {
+  readonly kind: CodingActivity.Kind
+  /** Canonical OXP virtual path; never a caller spelling and never cwd-relative. */
+  readonly virtualPath: string
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+function boundedText(source: Record<string, unknown> | undefined, key: string, max: number) {
+  const value = source?.[key]
+  return typeof value === "string" && value.length > 0 && value.length <= max ? value : undefined
+}
+
+/**
+ * True when this OXP call can reach the OpenAI file-exchange broker, whether it
+ * arrived as the direct `openai_files` tool or was brokered through
+ * `capability` -> `file.transfer`.
+ */
+export function fileActivityRoute(name: string, args: unknown) {
+  if (name === "openai_files") return true
+  if (name !== "capability") return false
+  const source = record(args)
+  return (
+    boundedText(source, "namespace", 64) === "openfork" &&
+    boundedText(source, "capability", 512) === "file.transfer"
+  )
+}
+
+/**
+ * Derives the canonical CodingActivity targets an OXP success boundary owns.
+ *
+ * The principal-neutral exchange kernel (`@/exchange/read`, `write`, `edit`,
+ * `file-mutation`) already publishes the canonical record for every committed
+ * read/write with exact before/after line deltas. OXP must therefore stay silent
+ * for `read`/`write`/`edit`/`patch`: re-emitting them here would double-count the
+ * same file on the same call. The OpenAI file-exchange broker is the one
+ * file-touching OXP surface that publishes local bytes through its own verified
+ * `link()` publication instead of the exchange kernel, so it is the only thing
+ * this seam records.
+ */
+export function fileActivityTargets(
+  name: string,
+  args: unknown,
+  result: OxpResult.CapabilityResult,
+): readonly FileActivityTarget[] {
+  if (!fileActivityRoute(name, args)) return []
+  const structured = record(result.structured)
+  if (!structured) return []
+  const action = boundedText(structured, "action", 64)
+  const kind = action === undefined ? undefined : FILE_ACTIVITY_ACTIONS[action]
+  if (kind === undefined) return []
+  // Only a committed operation is real file activity. Discovery, uncommitted
+  // attempts, and externally ambiguous transfers never reach this boundary.
+  if (result.mutation?.committed !== true) return []
+  const virtualPath =
+    kind === "write" ? boundedText(structured, "path", 4096) : boundedText(structured, "source", 4096)
+  if (virtualPath === undefined) return []
+  // A transferred blob publishes verified byte counts, never a before/after line
+  // delta. There is deliberately no line-count field to read here: any number
+  // this seam attached would be a fabricated delta the producer never proved.
+  return [{ kind, virtualPath }]
+}
+
+/** Canonical identity of a local path for dedupe within one OXP call. */
+export function fileActivityIdentity(value: string) {
+  const resolved = path.resolve(value)
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+/**
+ * Canonical project identity for the approved root that already proved a file.
+ *
+ * `OxpAttribution` owns this rule for the whole OXP boundary: the exchange
+ * producer's display-path heuristic cannot identify an approved root from an
+ * absolute `/alias/...` virtual path and instead names a containing directory,
+ * so both this seam and the shared exchange read derive project identity from the
+ * re-verified canonical root path instead.
+ */
+export function fileActivityProject(canonicalRootPath: string, alias?: string) {
+  return OxpAttribution.project(canonicalRootPath, alias)
+}
+
+/**
+ * Canonical CodingActivity input for one file-transfer target whose virtual path
+ * `OxpRoot.resolvePath` has already resolved against an approved root.
+ *
+ * Only state the resolve proved is used. `canonicalPath` is the approved root
+ * this exact file was proven under, already re-verified against the on-disk
+ * directory, so a file directly in the root and a file nested under it attribute
+ * to the same project. Nothing here reads cwd, the caller's spelling, the
+ * absolute `/alias/...` virtual path, or the operator alias as an identity.
+ *
+ * That approved root's `canonicalPath` is also this seam's `projectFolder`: the
+ * target was reached through `OxpRoot.resolvePath`, so the seam holds genuine
+ * root authority even though the transfer broker itself never saw a directory.
+ */
+export function fileActivityInput(
+  kind: CodingActivity.Kind,
+  resolved: OxpRoot.ResolvedPath,
+): CodingActivity.Input {
+  return {
+    entity: resolved.path,
+    kind,
+    project: fileActivityProject(resolved.canonicalPath, resolved.root.alias),
+    projectFolder: resolved.canonicalPath,
+    source: "oxp",
+  }
+}
+
 function withContinuity(
   result: CallToolResult,
   observation: OxpParentToolEpoch.Observation,
@@ -327,6 +456,44 @@ const layer = Layer.effect(
       delegationCalls: 0,
     }
     const metrics = (): Metrics => Object.freeze({ ...metricState, ...parentEpochs.stats() })
+
+    /**
+     * Emits canonical CodingActivity for the file operations this success
+     * boundary owns. Attribution is observability, so this is total: a root
+     * change, a vanished target, or a defective observer must never turn a
+     * successful OXP call into a failure.
+     */
+    const recordFileActivity = Effect.fn("OxpServer.fileActivity")(function* (
+      name: string,
+      args: unknown,
+      result: OxpResult.CapabilityResult,
+    ) {
+      const targets = fileActivityTargets(name, args, result)
+      if (targets.length === 0) return
+      // Exactly-once per distinct local file. Dedupe runs on the root-verified
+      // absolute path so repeated reports of one file in a single call collapse
+      // deterministically onto the first producer entry. The map is call-local,
+      // so concurrent OXP calls share no mutable state.
+      const inputs = new Map<string, CodingActivity.Input>()
+      for (const target of targets) {
+        const resolved = yield* roots.resolvePath(target.virtualPath).pipe(
+          Effect.result,
+          Effect.map((settled) => (Result.isSuccess(settled) ? settled.success : undefined)),
+        )
+        // Fail closed. An unresolvable virtual path is never replaced by a cwd
+        // guess, a caller spelling, or a project-name approximation.
+        if (resolved === undefined) continue
+        const identity = fileActivityIdentity(resolved.path)
+        if (inputs.has(identity)) continue
+        inputs.set(identity, fileActivityInput(target.kind, resolved))
+      }
+      yield* Effect.forEach([...inputs.values()], (input) => CodingActivity.record(input).pipe(Effect.ignore), {
+        discard: true,
+      })
+    })
+
+    const fileActivity = (name: string, args: unknown, result: OxpResult.CapabilityResult) =>
+      recordFileActivity(name, args, result).pipe(Effect.catchCause(() => Effect.void))
 
     const dispatch = Effect.fn("OxpServer.dispatch")(function* (
       name: string,
@@ -513,18 +680,18 @@ const layer = Layer.effect(
                         }),
                       ),
                     onSuccess: (result) =>
-                      activity.success(recording, activityInput, result).pipe(
-                        Effect.map(() => {
-                          if (durableContinuationObserved(name, args)) {
-                            parentEpochs.markDurableContinuation(parentCorrelation)
-                          }
-                          return withContinuity(
-                            toolResult(result),
-                            continuity,
-                            parentEpochs.hasDurableContinuation(parentCorrelation),
-                          )
-                        }),
-                      ),
+                      Effect.gen(function* () {
+                        yield* fileActivity(name, args, result)
+                        yield* activity.success(recording, activityInput, result)
+                        if (durableContinuationObserved(name, args)) {
+                          parentEpochs.markDurableContinuation(parentCorrelation)
+                        }
+                        return withContinuity(
+                          toolResult(result),
+                          continuity,
+                          parentEpochs.hasDurableContinuation(parentCorrelation),
+                        )
+                      }),
                   }),
                 )
               }),

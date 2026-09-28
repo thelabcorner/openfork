@@ -1,8 +1,10 @@
 import { Effect, Option } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 import { ReadFilesystem } from "@/read/filesystem"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
 
 const OUTPUT_BYTES = 96 * 1024
@@ -40,6 +42,12 @@ export interface Input {
   readonly limit?: number
   readonly signal?: AbortSignal
   readonly projectionMarker?: string
+  /**
+   * Optional boundary attribution folded into the single read record. It is the
+   * only thing that can give this producer a `projectFolder`; the display-path
+   * heuristic below names a project and never a directory.
+   */
+  readonly attribution?: ExchangeAttribution.Attribution
 }
 
 export interface Execution {
@@ -64,6 +72,31 @@ function positive(value: number | undefined, fallback: number) {
 export function statFingerprint(stat: { readonly mtime: Option.Option<Date>; readonly size: unknown }) {
   return `${Option.getOrElse(stat.mtime, () => new Date(0)).getTime()}:${Number(stat.size)}`
 }
+
+/**
+ * Display-name-only project heuristic for producers no boundary attributed.
+ *
+ * It derives a *name*, so it can never supply a project folder. Attributed
+ * boundaries carry their own canonical root instead; see `ExchangeAttribution`.
+ */
+function projectName(entity: string, displayPath: string) {
+  const canonical = entity.replace(/\\/g, "/")
+  const relative = displayPath.replace(/\\/g, "/").replace(/^\.\//, "")
+  if (relative && canonical.endsWith(`/${relative}`)) {
+    const root = canonical.slice(0, canonical.length - relative.length - 1)
+    const name = root.slice(root.lastIndexOf("/") + 1)
+    if (name) return name
+  }
+  const segments = canonical.split("/").filter(Boolean)
+  return segments.length > 1 ? segments[segments.length - 2] : segments[0]
+}
+
+const recordRead = (input: Input) =>
+  CodingActivity.record({
+    entity: input.path,
+    kind: "read",
+    ...ExchangeAttribution.apply(input.attribution, { project: projectName(input.path, input.displayPath) }),
+  }).pipe(Effect.ignore)
 
 function dependency(error: unknown): Error {
   if (error instanceof ReadFilesystem.Aborted || (error instanceof globalThis.Error && error.name === "AbortError")) {
@@ -162,6 +195,7 @@ export function execute<E>(
     const mime = sniffAttachmentMime(sample, FSUtil.mimeType(input.path))
     if (SUPPORTED_IMAGE_MIMES.has(mime) || isPdfAttachment(mime)) {
       yield* hooks.revalidate().pipe(Effect.asVoid)
+      yield* recordRead(input)
       return {
         result: project(
           {
@@ -202,6 +236,7 @@ export function execute<E>(
       return yield* new Conflict({ detail: "File changed while it was being read; retry before relying on this content" })
     }
     yield* hooks.revalidate().pipe(Effect.asVoid)
+    yield* recordRead(input)
     const rendered = renderWindow(input.displayPath, file)
     return {
       result: project(
