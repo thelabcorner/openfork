@@ -23,7 +23,7 @@ HTTP, event, session, or provider concepts.
 ## Audited consumer snapshot
 
 The current contract was audited on **2026-09-29** against
-`pingdotgg/t3code` main at `8792f95762092ea33e74d41a07e8818befd84970`.
+`pingdotgg/t3code` main at `0fcd5f90611451cca842689faea53b5450c022da`.
 
 At that snapshot:
 
