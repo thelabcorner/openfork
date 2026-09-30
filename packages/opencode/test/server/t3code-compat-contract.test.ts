@@ -21,6 +21,7 @@ type Method = "get" | "post" | "patch"
 type Parameter = {
   readonly name?: string
   readonly in?: string
+  readonly required?: boolean
 }
 type Operation = {
   readonly parameters?: ReadonlyArray<Parameter>
@@ -91,7 +92,8 @@ describe("T3 Code OpenCode 1.15.13 consumer contract", () => {
     const status = spec.paths["/session/status"]?.get
 
     expect(fork?.parameters?.some((parameter) => parameter.in === "query" && parameter.name === "directory")).toBe(true)
-    expect(status?.parameters?.some((parameter) => parameter.name === "directory")).toBe(false)
+    const statusDirectory = status?.parameters?.find((parameter) => parameter.name === "directory")
+    expect(statusDirectory?.required ?? false).toBe(false)
   })
 
   test("retains every event type consumed by the T3 Code adapter", () => {

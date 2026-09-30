@@ -120,8 +120,9 @@ SDK, such as `session.fork`, keep that value at the routing boundary rather
 than forcing it into the domain payload.
 
 `session.status` is deliberately bootstrap-free and does not require a
-directory. Its implementation may move internally as long as it continues to
-return the legacy session-id map.
+directory. It may expose optional directory/workspace scoping as long as an
+unscoped call remains valid and returns the legacy session-id map. T3 currently
+invokes this operation with an undefined request payload.
 
 ## Multi-account model projection
 
