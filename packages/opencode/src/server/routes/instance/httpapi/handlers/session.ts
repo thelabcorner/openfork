@@ -18,6 +18,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Provider } from "@/provider/provider"
+import { canonicalT3CodeModelRef, canonicalT3CodeModelSlug } from "@/compat/t3code"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -544,15 +545,17 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       const currentPrompt = messages.findLast(SessionTurnProvenance.isWorkerPromptTurn)
       if (!currentPrompt || currentPrompt.info.role !== "user") return yield* new HttpApiError.BadRequest({})
       const currentAgent = currentPrompt.info.agent || defaultAgent
+      const selectedModel = canonicalT3CodeModelRef({
+        providerID: ctx.payload.providerID,
+        modelID: ctx.payload.modelID,
+        ...(ctx.payload.accountID ? { accountID: ctx.payload.accountID } : {}),
+      })
 
       yield* compactSvc.create({
         sessionID: ctx.params.sessionID,
         agent: currentAgent,
         sourceMessageID: currentPrompt.info.id,
-        model: {
-          providerID: ctx.payload.providerID,
-          modelID: ctx.payload.modelID,
-        },
+        model: selectedModel,
         auto: ctx.payload.auto ?? false,
         continueAfter: wasRunning,
       })
@@ -565,9 +568,12 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requirePromptableSession(ctx.params.sessionID)
+      const payload = ctx.payload.model
+        ? { ...ctx.payload, model: canonicalT3CodeModelRef(ctx.payload.model) }
+        : ctx.payload
       const message = yield* promptSvc
         .prompt({
-          ...ctx.payload,
+          ...payload,
           sessionID: ctx.params.sessionID,
         })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
@@ -593,13 +599,16 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       if (ctx.payload.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
         return yield* new HttpApiError.BadRequest({})
       }
+      const payload = ctx.payload.model
+        ? { ...ctx.payload, model: canonicalT3CodeModelRef(ctx.payload.model) }
+        : ctx.payload
       // Admission must be durable before the 204 acknowledgement. Execution is
       // a separate best-effort wake: if another process/instance already owns
       // this Session, the pending SessionInput row is the wake signal and that
       // owner's release-if-drained transaction will continue it. A busy wake is
       // therefore successful coalescing, not a user-visible Session error.
       yield* promptSvc
-        .prompt({ ...ctx.payload, sessionID: ctx.params.sessionID, noReply: true })
+        .prompt({ ...payload, sessionID: ctx.params.sessionID, noReply: true })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       if (ctx.payload.noReply !== true) {
         yield* promptSvc.loop({ sessionID: ctx.params.sessionID }).pipe(
@@ -638,8 +647,18 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof CommandPayload.Type
     }) {
       yield* requirePromptableSession(ctx.params.sessionID)
+      const selected = ctx.payload.model ? canonicalT3CodeModelSlug(ctx.payload.model) : undefined
       return yield* promptSvc
-        .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
+        .command({
+          ...ctx.payload,
+          ...(selected
+            ? {
+                model: selected.slug,
+                ...(selected.accountID ? { accountID: selected.accountID } : {}),
+              }
+            : {}),
+          sessionID: ctx.params.sessionID,
+        })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
     })
 

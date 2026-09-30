@@ -41,10 +41,14 @@ API, plugin, extension, CLI, config, or behavioral compatibility.
   OpenCode support channels.
 - Preserve **OpenCode Zen**, **OpenCode Go**, and **OpenCode Console** when those
   names identify upstream-operated services that OpenFork consumes.
-- Preserve compatibility identifiers such as the `opencode` executable,
-  `OPENCODE_*`, `@opencode-ai/*`, provider IDs, protocol keys, and `opencode://`
-  unless an explicit migration changes that contract. A compatibility identifier
-  is not product branding. Fork-owned persistence/configuration has been explicitly
+- The canonical executable is `openfork` / `openfork.exe`. The historical
+  `opencode` command is a compatibility launcher, not product identity. It may
+  activate an explicitly documented local-client compatibility profile (today the
+  audited T3 Code/OpenCode-1.x facade); canonical first-party integrations must
+  target `openfork` unless a named compatibility exception requires otherwise. Preserve
+  compatibility identifiers such as `OPENCODE_*`, `@opencode-ai/*`, provider IDs,
+  protocol keys, and `opencode://` unless an explicit migration changes that
+  contract. A compatibility identifier is not product branding. Fork-owned persistence/configuration has been explicitly
   migrated: new roots/files use `openfork` / `.openfork` / `openfork.json(c)`;
   `opencode`-named storage/config paths are migration inputs only.
 - Upstream-sync work must not reintroduce generic OpenCode product branding onto
@@ -57,8 +61,9 @@ API, plugin, extension, CLI, config, or behavioral compatibility.
   **externally managed**: they may receive update-available notifications, but
   OpenFork must not invoke an upstream package manager to replace itself.
 - The CLI may self-replace only when ownership and replacement semantics are
-  explicit. Today the canonical POSIX path is `~/.openfork/bin/opencode`; the
-  legacy `~/.opencode/bin/opencode` path remains recognized only so existing
+  explicit. Today the canonical POSIX path is `~/.openfork/bin/openfork`; the
+  compatibility path `~/.openfork/bin/opencode` and the legacy
+  `~/.opencode/bin/opencode` path remain recognized only so existing
   direct installs can transition safely. Windows and other installations fail
   closed to the OpenFork releases page.
 - Retaining `@opencode-ai/*`, `opencode-ai`, or `opencode` as compatibility

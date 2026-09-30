@@ -1550,8 +1550,21 @@ export type Error =
   | UnsupportedModelPrimitiveError
   | AccountResolutionError
 
+/**
+ * Secret-free account-scoped discovery row used by compatibility/inspection
+ * surfaces. This is deliberately not the canonical provider catalog: normal
+ * OpenFork discovery remains account-neutral and deduplicated.
+ */
+export interface AccountModelProjection {
+  readonly accountID: string
+  readonly accountLabel: string
+  readonly provider: Info
+  readonly model: Model
+}
+
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
+  readonly listAccountModelProjections: () => Effect.Effect<readonly AccountModelProjection[]>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   /**
    * Resolve a stable provider account id from either that exact id or one
@@ -2302,6 +2315,73 @@ const layer = Layer.effect(
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
+    const listAccountModelProjections = Effect.fn("Provider.listAccountModelProjections")(function* () {
+      const s = yield* currentState()
+      const stored = yield* credentials.list(opencodeIntegrationID)
+      const projected = stored.flatMap((credential) => {
+        const account = projectOpencodeCredential(credential)
+        return account ? [{ credential, account }] : []
+      })
+      const accountCounts = new Map<string, number>()
+      for (const entry of projected) {
+        accountCounts.set(entry.account.accountID, (accountCounts.get(entry.account.accountID) ?? 0) + 1)
+      }
+      // A duplicated stable account identity would be ambiguous to the route
+      // resolver. Do not advertise an explicit picker row that cannot be
+      // executed deterministically.
+      const unique = projected.filter((entry) => accountCounts.get(entry.account.accountID) === 1)
+      const labelCounts = new Map<string, number>()
+      const baseLabel = (entry: (typeof unique)[number]) =>
+        entry.account.label.trim() ||
+        entry.account.metadata?.email?.trim() ||
+        entry.account.accountID
+      for (const entry of unique) {
+        const key = baseLabel(entry).normalize("NFKC").toLowerCase()
+        labelCounts.set(key, (labelCounts.get(key) ?? 0) + 1)
+      }
+
+      const rows = yield* Effect.forEach(
+        unique,
+        (entry) =>
+          consoleAccounts.resolve(entry.credential.id).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.map((execution) => {
+              if (!execution) return [] as AccountModelProjection[]
+              const label = baseLabel(entry)
+              const labelKey = label.normalize("NFKC").toLowerCase()
+              const accountLabel =
+                (labelCounts.get(labelKey) ?? 0) > 1
+                  ? `${label} #${entry.account.accountID.slice(-6)}`
+                  : label
+              const result: AccountModelProjection[] = []
+              for (const [rawProviderID, capability] of Object.entries(execution.capabilities.providers)) {
+                const providerID = ProviderV2.ID.make(rawProviderID)
+                const baseProvider = s.catalog[providerID] ?? s.providers[providerID]
+                for (const rawModelID of Object.keys(capability.models)) {
+                  const modelID = ModelV2.ID.make(rawModelID)
+                  const materialized = consoleModel(providerID, modelID, capability, baseProvider?.models[modelID])
+                  if (!materialized) continue
+                  if (materialized.status === "deprecated") continue
+                  if (materialized.status === "alpha" && !runtimeFlags.enableExperimentalModels) continue
+                  result.push({
+                    accountID: entry.account.accountID,
+                    accountLabel,
+                    provider: consoleProviderInfo(providerID, capability, materialized, baseProvider),
+                    model: materialized,
+                  })
+                }
+              }
+              return result
+            }),
+            // One stale/broken account must not erase healthy peers or turn a
+            // T3 model-picker refresh into a provider-list failure.
+            Effect.catchCause(() => Effect.succeed([] as AccountModelProjection[])),
+          ),
+        { concurrency: 4 },
+      )
+      return rows.flat()
+    })
+
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
         const provider = s.providers[model.providerID]
@@ -2693,6 +2773,7 @@ const layer = Layer.effect(
 
     return Service.of({
       list,
+      listAccountModelProjections,
       getProvider,
       resolveAccountID,
       getModel,

@@ -8,16 +8,16 @@
 | Provider | Multi-account? | Exposed id shape | Bare (auto) id? | Account label source | Server-side router | Per-account quota in `ProviderResult` | Picker usage surface today |
 |---|---|---|---|---|---|---|---|
 | `workbuddy` | **Yes** | `<model>[#ctx-N]@wb-<hash>` (`workbuddy.ts:1185-1194`) | Yes, but only from `accounts[0]`'s catalog (`:1253-1261`) — **gap, see T3** | `accountLabels()` → nickname/email, baked into `Model.name` (`:1160`) | `AccountRouter` session-affine + 429 rotation (`workbuddy-accounts.ts:598`) | `usage.workbuddyAccounts[]` + `usage.accountLabels` (`quota/providers/workbuddy.ts:362-461`) | Full: credits bar, rate, promo badge, `modelVariants()` (`use-workbuddy-usage`) |
-| `verdent` | **Yes** | `<model>@vd-<hash>` (`verdent.ts:2384-2392`) | Yes, for the whole catalog (`:2381-2384`) | `verdentAccountLabels()`, baked into `Model.name` (`:2328`) | `VerdentRouter`, same shape (`verdent-accounts.ts:591`) | `usage.verdentAccounts[]` (`quota/providers/verdent.ts:203-210`) | **None** — no hook, no bar, no badge. Fixed as a side effect of T2 |
+| `opencode` | **Yes** | `<model>@zen-<hash>` | Yes | unified Zen env/vault pool label | explicit suffix or automatic ProviderRoute/Zen pool selection | `usage.zenAccounts[]` | Window/headroom account surface |
+| `opencode-go` | **Yes** | `<model>@zen-<hash>` | Yes; bare Go preserves its direct-provider bearer before pool fallback | unified Zen env/vault pool label | explicit suffix or automatic ProviderRoute/Zen pool selection | `usage.zenAccounts[]` | Window/headroom account surface |
 | `openrouter` | No (one key, many upstreams) | plain | n/a | n/a | OpenRouter's own | `credits` + free-tier report | Sub-provider submenu (the pattern we borrow) |
 | `genspark` | No | plain | n/a | n/a | n/a | credits | `use-genspark-usage` |
-| `opencode-go` | Multi-**credential**, not multi-account-per-model | plain | n/a | Fork credential label | key switcher (`fork-client`) | `byCredential[]` | 5h window bar |
 | everything else | No | plain | n/a | n/a | n/a | varies | varies |
 
-**`opencode-go` note.** It is multi-credential, but the credential is chosen by a *global*
-key switcher (`dialog-credential-switcher.tsx`), not per model id — so it does not produce
-duplicate rows and is explicitly out of scope. If it ever exposes per-credential model ids,
-it becomes a descriptor like any other.
+**Zen/Go note.** Both providers now share the same unified Zen account pool and
+publish account-qualified model ids. Go still retains its independent
+direct-provider credential precedence for a bare model selection; an explicit
+`@zen-...` model always names the selected pool account.
 
 ## 2. Capability descriptor per provider
 
@@ -32,13 +32,22 @@ export const MULTI_ACCOUNT_PROVIDERS = {
     headroomKind: "credits",       // pool balance funds every model
     autoLabelKey: "dialog.model.account.auto",
   },
-  verdent: {
-    id: "verdent",
-    accountPrefix: "vd-",
-    accountsField: "verdentAccounts",
+  opencode: {
+    id: "opencode",
+    accountPrefix: "zen-",
+    accountsField: "zenAccounts",
     aliasMarkers: [],
-    policies: ["sticky", "headroom", "spread"],
-    headroomKind: "window",        // no credit pool; per-(account,model) 24h windows
+    policies: ["sticky"],
+    headroomKind: "window",
+    autoLabelKey: "dialog.model.account.auto",
+  },
+  "opencode-go": {
+    id: "opencode-go",
+    accountPrefix: "zen-",
+    accountsField: "zenAccounts",
+    aliasMarkers: [],
+    policies: ["sticky"],
+    headroomKind: "window",
     autoLabelKey: "dialog.model.account.auto",
   },
 } as const satisfies Record<string, MultiAccountProvider>
@@ -46,20 +55,26 @@ export const MULTI_ACCOUNT_PROVIDERS = {
 
 `headroomKind` is the only behavioural fork in the UI: `credits` renders
 "1,204 credits · resets …", `window` renders "~412 requests · resets …". Both come out of
-the same normalized `AccountOption.headroom`.
+the same normalized `AccountOption.headroom`. WorkBuddy exercises the
+`credits` branch; Zen and Go exercise `window`. Keep this descriptor-driven
+so another provider remains a registry entry rather than a picker branch.
 
 ## 3. Semantic differences that the normalizer must absorb
 
-| Concept | WorkBuddy | Verdent | Normalized as |
-|---|---|---|---|
-| Funding unit | credit pool (Basic/Gift/Extra; only Basic gates — `use-workbuddy-usage/index.ts:24-26`) | none; free-tier 5h + weekly buckets (`quota/providers/verdent.ts:15-20`) | `headroom.kind` |
-| Per-(account,model) limit | promo models Hy3/Hy4 have inferred 24h frequency windows (`workbuddy-model-entitlement.ts`) | governor windows, with hy3/hy4 placeholders filtered (`verdent.ts:104`) | `remainingPercent` + `resetAt` |
-| "Exhausted" | `packageCreditsRemaining <= 0` blocks **every** model, even promo ones (Tencent balance check — `workbuddy-accounts.ts:625-629`) | governor `QUOTA_EXHAUSTED` | `state: "exhausted"` |
-| Catalog membership | `account.catalog.ids` per account, live-discovered (`workbuddy.ts:787-819`) | shared catalog, all accounts | `servesModel` (undefined ⇒ assume yes) |
-| Account id stability | `stableAccountIdentity()` (uid hash) | `stableVerdentIdentity()` | opaque string |
-| Header vs id routing | id suffix **and** baked `X-WorkBuddy-Account` header per model (`:1245`) | id suffix decoded in `chat.headers` → `x-verdent-account` (`verdent.ts:2400-2403`) | irrelevant to the UI; both honour the id |
+| Concept | WorkBuddy today | Normalized as |
+|---|---|---|
+| Funding unit | credit pool (Basic/Gift/Extra; only Basic gates — `use-workbuddy-usage/index.ts:24-26`) | `headroom.kind` |
+| Per-(account,model) limit | promo models Hy3/Hy4 have inferred 24h frequency windows (`workbuddy-model-entitlement.ts`) | `remainingPercent` + `resetAt` |
+| "Exhausted" | `packageCreditsRemaining <= 0` blocks **every** model, even promo ones (Tencent balance check — `workbuddy-accounts.ts:625-629`) | `state: "exhausted"` |
+| Catalog membership | `account.catalog.ids` per account, live-discovered (`workbuddy.ts:787-819`) | `servesModel` (undefined ⇒ assume yes) |
+| Account id stability | `stableAccountIdentity()` (uid hash) | opaque string |
+| Header vs id routing | id suffix **and** baked `X-WorkBuddy-Account` header per model (`:1245`) | irrelevant to the UI; the id is honoured either way |
 
-## 4. Adding a third multi-account provider — the checklist
+`headroomKind: "window"` is now exercised by the live Zen/Go descriptors.
+Future providers should still enter through the registry rather than adding
+provider-specific picker branches.
+
+## 4. Adding a new multi-account provider — the checklist
 
 1. **Plugin**: expose `<model>@<prefix><accountId>` ids, bake the label into `Model.name`,
    and emit bare ids for the *union* of all accounts' catalogs.

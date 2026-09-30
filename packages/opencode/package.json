@@ -16,6 +16,8 @@
     "dev:temporary": "bun run ./src/temporary.ts"
   },
   "bin": {
+    "openfork": "./bin/openfork",
+    "openfork-t3code": "./bin/openfork-t3code",
     "opencode": "./bin/opencode"
   },
   "exports": {

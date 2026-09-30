@@ -29,6 +29,7 @@ import { DbCommand } from "./cli/cmd/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { localClientReportedVersion } from "./compat/t3code"
 
 const args = hideBin(process.argv)
 
@@ -48,7 +49,7 @@ const cli = yargs(args)
   .wrap(100)
   .help("help", "show help")
   .alias("help", "h")
-  .version("version", "show version number", InstallationVersion)
+  .version("version", "show version number", localClientReportedVersion(InstallationVersion))
   .alias("version", "v")
   .option("print-logs", {
     describe: "print logs to stderr",

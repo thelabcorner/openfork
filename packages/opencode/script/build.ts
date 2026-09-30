@@ -3,7 +3,7 @@
 import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
-import { readdir, rm } from "node:fs/promises"
+import { chmod, readdir, rm, writeFile } from "node:fs/promises"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { validateChunkDbCapability } from "./chunkdb-capability"
 
@@ -16,8 +16,14 @@ process.chdir(dir)
 const generated = await import("./generate.ts")
 
 import { Script } from "@opencode-ai/script"
-import { PRODUCT_REPOSITORY } from "@opencode-ai/core/brand"
+import {
+  LEGACY_PRODUCT_EXECUTABLE,
+  PRODUCT_EXECUTABLE,
+  PRODUCT_REPOSITORY,
+  PRODUCT_SLUG,
+} from "@opencode-ai/core/brand"
 import pkg from "../package.json"
+import { T3_CODE_COMPAT_EXECUTABLE, T3_CODE_COMPAT_PROFILE } from "../src/compat/t3code"
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -160,16 +166,16 @@ if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
 }
 for (const item of targets) {
-  const name = [
-    pkg.name,
-    // changing to win32 flags npm for some reason
+  const targetParts = [
+    // Bun names its Windows compile target "windows", not "win32".
     item.os === "win32" ? "windows" : item.os,
     item.arch,
     item.avx2 === false ? "baseline" : undefined,
     item.abi === undefined ? undefined : item.abi,
   ]
     .filter(Boolean)
-    .join("-")
+  const name = [PRODUCT_SLUG, ...targetParts].join("-")
+  const bunTarget = ["bun", ...targetParts].join("-")
   console.log(`building ${name}`)
   await $`mkdir -p dist/${name}/bin`
 
@@ -191,8 +197,8 @@ for (const item of targets) {
       autoloadDotenv: false,
       autoloadTsconfig: true,
       autoloadPackageJson: true,
-      target: name.replace(pkg.name, "bun") as any,
-      outfile: `dist/${name}/bin/opencode`,
+      target: bunTarget as any,
+      outfile: `dist/${name}/bin/${PRODUCT_EXECUTABLE}`,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -219,9 +225,46 @@ for (const item of targets) {
     },
   })
 
+  // OpenFork owns the real executable name. Keep the historical `opencode`
+  // command as a transparent forwarding compatibility surface so existing
+  // OpenFork scripts do not silently enter a consumer-specific profile.
+  const compatibilityPath = path.join(
+    "dist",
+    name,
+    "bin",
+    item.os === "win32" ? `${LEGACY_PRODUCT_EXECUTABLE}.cmd` : LEGACY_PRODUCT_EXECUTABLE,
+  )
+  const compatibilityLauncher =
+    item.os === "win32"
+      ? `@echo off\r\n"%~dp0${PRODUCT_EXECUTABLE}.exe" %*\r\nexit /b %ERRORLEVEL%\r\n`
+      : `#!/bin/sh\nexec "$(dirname "$0")/${PRODUCT_EXECUTABLE}" "$@"\n`
+  await writeFile(compatibilityPath, compatibilityLauncher)
+  if (item.os !== "win32") await chmod(compatibilityPath, 0o755)
+
+  // Ship an explicitly named OpenFork-owned T3 launcher. T3 already exposes a
+  // configurable OpenCode binaryPath, so this consumer-specific compatibility
+  // profile does not need to leak into canonical or historical OpenFork entrypoints.
+  const t3CodeCompatibilityPath = path.join(
+    "dist",
+    name,
+    "bin",
+    item.os === "win32" ? `${T3_CODE_COMPAT_EXECUTABLE}.cmd` : T3_CODE_COMPAT_EXECUTABLE,
+  )
+  const t3CodeCompatibilityLauncher =
+    item.os === "win32"
+      ? `@echo off\r\nset "OPENFORK_COMPAT_PROFILE=${T3_CODE_COMPAT_PROFILE}"\r\n"%~dp0${PRODUCT_EXECUTABLE}.exe" %*\r\nexit /b %ERRORLEVEL%\r\n`
+      : `#!/bin/sh\nOPENFORK_COMPAT_PROFILE=${T3_CODE_COMPAT_PROFILE} exec "$(dirname "$0")/${PRODUCT_EXECUTABLE}" "$@"\n`
+  await writeFile(t3CodeCompatibilityPath, t3CodeCompatibilityLauncher)
+  if (item.os !== "win32") await chmod(t3CodeCompatibilityPath, 0o755)
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
+    const binaryPath = path.join(
+      "dist",
+      name,
+      "bin",
+      item.os === "win32" ? `${PRODUCT_EXECUTABLE}.exe` : PRODUCT_EXECUTABLE,
+    )
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()

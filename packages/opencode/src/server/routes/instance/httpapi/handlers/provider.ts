@@ -11,6 +11,8 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { ProviderAuthApiError } from "../groups/provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { isT3CodeCompatibilityProfile } from "@/compat/t3code"
+import { filterT3CodeAccountModels, projectT3CodeAccountModels } from "@/compat/t3code-provider"
 
 function mapProviderAuthError<A, R>(self: Effect.Effect<A, ProviderAuth.Error, R>) {
   return self.pipe(
@@ -54,10 +56,27 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
         mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
         connected,
       )
+      // Preserve the canonical account-neutral defaults before adding T3's
+      // compatibility-only one-row-per-account aliases.
+      const defaults = Provider.defaultModelIDs(providers)
+      const accountModels = isT3CodeCompatibilityProfile()
+        ? filterT3CodeAccountModels(
+            yield* provider.listAccountModelProjections(),
+            {
+              enabledProviders: config.enabled_providers,
+              disabledProviders: config.disabled_providers,
+            },
+          )
+        : []
+      const t3Projection = accountModels.length > 0
+        ? projectT3CodeAccountModels(providers, accountModels)
+        : { providers, connected: new Set<string>() }
       return {
-        all: Object.values(providers).map(Provider.toPublicInfo),
-        default: Provider.defaultModelIDs(providers),
-        connected: Object.keys(providers).filter((id) => id in connected || credentials[id]),
+        all: Object.values(t3Projection.providers).map(Provider.toPublicInfo),
+        default: defaults,
+        connected: Object.keys(t3Projection.providers).filter(
+          (id) => id in connected || credentials[id] || t3Projection.connected.has(id),
+        ),
       }
     })
 

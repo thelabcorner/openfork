@@ -50,6 +50,10 @@ import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
 import { serializeLegacyEvent } from "@/server/event-serialization"
+import {
+  isT3CodeCompatibilityProfile,
+  localClientReportedVersion,
+} from "@/compat/t3code"
 import { RootHttpApi } from "../api"
 import {
   GlobalSessionRootsQuery,
@@ -628,10 +632,17 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     yield* Effect.addFinalizer(() => Effect.sync(unregisterTransport))
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
+      const version = localClientReportedVersion(InstallationVersion)
+      if (isT3CodeCompatibilityProfile()) {
+        return {
+          healthy: true as const,
+          version,
+        }
+      }
       const directory = FSUtil.resolve(process.cwd())
       return {
         healthy: true as const,
-        version: InstallationVersion,
+        version,
         path: {
           home: Global.Path.home,
           state: Global.Path.state,

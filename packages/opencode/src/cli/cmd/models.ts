@@ -4,6 +4,9 @@ import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { effectCmd, fail } from "../effect-cmd"
 import { UI } from "../ui"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Config } from "@/config/config"
+import { isT3CodeCompatibilityProfile } from "@/compat/t3code"
+import { filterT3CodeAccountModels, projectT3CodeAccountModels } from "@/compat/t3code-provider"
 
 export const ModelsCommand = effectCmd({
   command: "models [provider]",
@@ -31,7 +34,19 @@ export const ModelsCommand = effectCmd({
     }
 
     const provider = yield* Provider.Service
-    const providers = yield* provider.list()
+    const canonicalProviders = yield* provider.list()
+    let providers = canonicalProviders
+    if (isT3CodeCompatibilityProfile()) {
+      const config = yield* Config.Service.use((service) => service.get())
+      const accountModels = filterT3CodeAccountModels(
+        yield* provider.listAccountModelProjections(),
+        {
+          enabledProviders: config.enabled_providers,
+          disabledProviders: config.disabled_providers,
+        },
+      )
+      providers = projectT3CodeAccountModels(canonicalProviders, accountModels).providers
+    }
 
     const print = (providerID: ProviderV2.ID, verbose?: boolean) => {
       const p = providers[providerID]

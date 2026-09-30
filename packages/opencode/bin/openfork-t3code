@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+
+// Explicit T3 Code -> OpenFork compatibility launcher. T3 can point its
+// configurable OpenCode binaryPath here without changing T3 or weakening the
+// canonical OpenFork CLI/server contract.
+process.env.OPENFORK_COMPAT_PROFILE = "t3code-opencode-v1"
+await import("./openfork")

@@ -63,6 +63,24 @@ If OpenFork intentionally supports a particular upstream local integration, that
 an **explicit compatibility exception**. Name the exact surface and version range,
 add tests, and document the support boundary.
 
+### Explicit compatibility exception: T3 Code OpenCode 1.x provider
+
+T3 Code is supported through a narrow OpenCode-1.x compatibility profile, not
+by making canonical or historical OpenFork entrypoints generically
+OpenCode-compatible. The current façade is pinned to the OpenCode **1.15.13**
+client contract consumed by T3 Code and is activated by the explicit
+`openfork-t3code` launcher. T3 already exposes a configurable OpenCode
+`binaryPath`, so this requires no upstream source change.
+
+The exception covers only the process handshake, legacy HTTP operations, request
+shapes, and legacy event/status semantics actually consumed by T3's OpenCode
+provider. Canonical `openfork`, OpenFork persistence/domain semantics, and
+unrelated provider identities remain native OpenFork surfaces.
+
+The full consumer snapshot, operation/event matrix, distribution requirements,
+and update procedure are documented in
+`docs/architecture/t3code-compatibility.md`.
+
 ## Distribution is not compatibility
 
 Retained executable, config, package, and protocol identifiers exist to avoid
