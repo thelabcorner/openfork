@@ -33,6 +33,10 @@ export type MarkdownTraceEvent =
   | {
       phase: "worker"
       kind: "parse" | "project" | "highlight"
+      priority?: "background" | "visible" | "tail"
+      lane?: number
+      queuedJobs?: number
+      queuedBytes?: number
       status: "ok" | "superseded" | "error" | "disposed"
       ms: number
       chars: number

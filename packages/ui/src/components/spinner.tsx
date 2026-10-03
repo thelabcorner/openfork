@@ -51,3 +51,19 @@ export function Spinner(props: {
     </svg>
   )
 }
+
+export function denseWorkingIndicatorClass(animated: boolean, className = "") {
+  return `inline-block size-1.5 shrink-0 rounded-full bg-current ${animated ? "animate-pulse" : ""} ${className}`
+}
+
+/** Lightweight indicator for repeated navigation rows; unlike Spinner it has one HTML animation. */
+export function DenseWorkingIndicator(props: { class?: string; animated?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      data-component="dense-working-indicator"
+      data-animated={props.animated ? "true" : "false"}
+      class={denseWorkingIndicatorClass(!!props.animated, props.class)}
+    />
+  )
+}

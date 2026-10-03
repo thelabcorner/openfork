@@ -46,7 +46,8 @@ export type MarkdownWorkerRequest =
   | MarkdownParseRequest
   | MarkdownProjectRequest
   | MarkdownHighlightRequest
-  | { type: "dispose"; key: string }
+  | { type: "dispose"; id: number; key: string }
+  | { type: "dispose-owner"; id: number; key: string }
 
 export type MarkdownWorkerResponse =
   | {
@@ -62,6 +63,8 @@ export type MarkdownWorkerResponse =
   | { type: "project"; id: number; key: string; patch: MarkdownProjectionPatch; workerMs?: number; workerQueueMs?: number }
   | { type: "project-miss"; id: number; key: string }
   | { type: "highlight-miss"; id: number; key: string }
+  | { type: "disposed"; id: number; key: string }
+  | { type: "disposed-owner"; id: number; key: string }
   | {
       type: "highlight"
       id: number
@@ -90,6 +93,11 @@ export function shouldReleaseMarkdownWorkerState(complete: boolean, latestID: nu
 
 export function markdownBlockKey(owner: string, cacheKey: string | undefined, index: number, mode: string) {
   return `${owner}:${cacheKey ? `${cacheKey}:${index}:${mode}` : `block:${index}`}`
+}
+
+/** Owner keys use a delimiter so `row-1` never owns `row-10` work. */
+export function markdownKeyBelongsToOwner(owner: string, key: string) {
+  return key === owner || key.startsWith(`${owner}:`)
 }
 
 /** Convert a host full-source parse request into a reset or append-only wire request. */

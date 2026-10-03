@@ -308,6 +308,15 @@ export const PART_MAPPING: Record<string, PartComponent | undefined> = {}
 const TEXT_RENDER_PACE_MS = 24
 const TEXT_RENDER_IMMEDIATE = 512
 const TEXT_RENDER_SNAP = /[\s.,!?;:)\]]/
+const TOOL_OUTPUT_RENDER_PACE_MS = 100
+const TOOL_OUTPUT_STREAM_PREVIEW_CHARS = 64 * 1024
+const TOOL_OUTPUT_OMITTED_PREFIX = "[Earlier output omitted while the tool is running]\n"
+
+function toolOutputStreamPreview(value: unknown) {
+  if (typeof value !== "string" || value.startsWith(TOOL_OUTPUT_OMITTED_PREFIX) || value.length <= TOOL_OUTPUT_STREAM_PREVIEW_CHARS)
+    return value
+  return TOOL_OUTPUT_OMITTED_PREFIX + value.slice(-TOOL_OUTPUT_STREAM_PREVIEW_CHARS)
+}
 
 function step(size: number) {
   if (size <= 12) return 2
@@ -1242,6 +1251,18 @@ export function registerPartComponent(type: string, component: PartComponent) {
 export function Message(props: MessageProps) {
   const i18n = useI18n()
   const [automationOpen, setAutomationOpen] = createSignal(false)
+  const [automationCopied, setAutomationCopied] = createSignal(false)
+  let automationCopyTimer: ReturnType<typeof setTimeout> | undefined
+  const copyAutomation = (text: string) => {
+    void navigator.clipboard.writeText(text).then(() => {
+      setAutomationCopied(true)
+      if (automationCopyTimer !== undefined) clearTimeout(automationCopyTimer)
+      automationCopyTimer = setTimeout(() => setAutomationCopied(false), 2000)
+    }, () => {})
+  }
+  onCleanup(() => {
+    if (automationCopyTimer !== undefined) clearTimeout(automationCopyTimer)
+  })
   const automation = createMemo(() => {
     const presentation = messageProvenancePresentation(props.message)
     if (!presentation) return
@@ -1253,6 +1274,17 @@ export function Message(props: MessageProps) {
       segments,
     }
   })
+  const automationPreview = createMemo(() => {
+    const entry = automation()
+    if (!entry) return
+    for (const segment of entry.segments) {
+      for (const line of segment.text.split("\n")) {
+        const value = line.trim()
+        if (value) return value
+      }
+    }
+    return i18n.t(entry.presentation.previewKey, { defaultValue: entry.presentation.previewDefault })
+  })
   const semanticUser = createMemo(
     () => props.message.role === "user" && SessionTurnProvenance.isSemanticUserInfo(props.message),
   )
@@ -1263,12 +1295,20 @@ export function Message(props: MessageProps) {
         {(entry) => (
           <SystemInjectionCardV2
             badge={i18n.t(entry().presentation.badgeKey, { defaultValue: entry().presentation.badgeDefault })}
-            preview={i18n.t(entry().presentation.previewKey, { defaultValue: entry().presentation.previewDefault })}
+            kind={entry().presentation.kind}
+            tone={entry().presentation.tone}
+            preview={automationPreview()}
             segments={entry().segments}
             open={automationOpen()}
             onOpenChange={setAutomationOpen}
             expandLabel={i18n.t(entry().presentation.expandKey, { defaultValue: entry().presentation.expandDefault })}
             collapseLabel={i18n.t(entry().presentation.collapseKey, { defaultValue: entry().presentation.collapseDefault })}
+            copyLabel={i18n.t("ui.message.copy")}
+            copiedLabel={i18n.t("ui.message.copied")}
+            rawLabel={i18n.t("ui.message.injection.raw")}
+            richLabel={i18n.t("ui.message.injection.rich")}
+            copied={automationCopied()}
+            onCopy={copyAutomation}
           />
         )}
       </Match>
@@ -2049,6 +2089,39 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   const input = () => part().state?.input ?? emptyInput
   // @ts-expect-error
   const partMetadata = () => part().state?.metadata ?? emptyMetadata
+  let latestMetadata = partMetadata()
+  let latestOutput: unknown = (part().state as any).output ?? latestMetadata.output
+  let outputTimer: ReturnType<typeof setTimeout> | undefined
+  const initialOutput = part().state.status === "running" ? toolOutputStreamPreview(latestOutput) : latestOutput
+  const [outputProjection, setOutputProjection] = createSignal({ metadata: latestMetadata, output: initialOutput })
+  createEffect(() => {
+    const metadata = partMetadata()
+    const output = (part().state as any).output ?? metadata.output
+    const running = part().state.status === "running"
+    latestMetadata = metadata
+    latestOutput = output
+    if (!running) {
+      if (outputTimer !== undefined) clearTimeout(outputTimer)
+      outputTimer = undefined
+      setOutputProjection({ metadata, output })
+      return
+    }
+    if (outputTimer !== undefined) return
+    outputTimer = setTimeout(() => {
+      outputTimer = undefined
+      setOutputProjection({ metadata: latestMetadata, output: toolOutputStreamPreview(latestOutput) })
+    }, TOOL_OUTPUT_RENDER_PACE_MS)
+  })
+  onCleanup(() => {
+    if (outputTimer !== undefined) clearTimeout(outputTimer)
+  })
+  const displayMetadata = createMemo(() => {
+    const projection = outputProjection()
+    if (typeof projection.output !== "string" || typeof projection.metadata.output !== "string") {
+      return projection.metadata
+    }
+    return { ...projection.metadata, output: projection.output }
+  })
   const taskId = createMemo(() => {
     if (part().tool !== "task") return
     const value = partMetadata().sessionId
@@ -2110,9 +2183,9 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               tool={part().tool}
               sessionID={part().sessionID}
               callID={part().callID}
-              metadata={partMetadata()}
+              metadata={displayMetadata()}
               // @ts-expect-error
-              output={part().state.output}
+              output={outputProjection().output}
               status={part().state.status}
               hideDetails={props.hideDetails}
               defaultOpen={props.defaultOpen}

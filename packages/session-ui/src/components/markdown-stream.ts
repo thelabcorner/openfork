@@ -1,6 +1,5 @@
 import { marked, type Tokens } from "marked"
 import remend from "remend"
-import { completedProjection } from "./markdown-projection"
 import { hasTextPrefix } from "./text-prefix"
 
 export type Block = {
@@ -14,6 +13,22 @@ export type Block = {
 export type Projection = {
   text: string
   blocks: Block[]
+}
+
+export const MARKDOWN_RICH_BLOCK_MAX_BYTES = 512 * 1024
+
+/**
+ * Freeze a completed source at the Markdown lexer’s semantic top-level
+ * boundaries. This bounds individual renderer parse/sanitize jobs without
+ * splitting inline syntax, lists, tables, or code fences at arbitrary offsets.
+ */
+export function completedProjection(text: string): Projection {
+  if (!text) return { text, blocks: [] }
+  const blocks = stream(text, true).map((block): Block => {
+    if (block.mode === "code") return { ...block, complete: true }
+    return { raw: block.raw, src: block.raw, mode: "full" }
+  })
+  return { text, blocks }
 }
 
 function refs(text: string) {

@@ -16,8 +16,8 @@ import { isServer, render } from "solid-js/web"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import { canReusePendingBlock, completedProjection } from "./markdown-projection"
-import type { Block, Projection } from "./markdown-stream"
+import { canReusePendingBlock } from "./markdown-projection"
+import { completedProjection, MARKDOWN_RICH_BLOCK_MAX_BYTES, type Block, type Projection } from "./markdown-stream"
 import {
   disposeMarkdownProjection,
   disposeStreamingCode,
@@ -28,10 +28,29 @@ import {
   MarkdownWorkerUnavailableError,
   parseMarkdown,
   projectMarkdown,
+  registerMarkdownOwnerKey,
 } from "./markdown-worker"
 import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol"
+import type { MarkdownWorkPriority } from "./markdown-worker-admission"
+import { observeMarkdownVisibility } from "./markdown-visibility"
+import {
+  cancelMarkdownDomCommit,
+  canCommitMarkdownDom,
+  commitMarkdownDom,
+  resumeMarkdownDomCommit,
+  subscribeMarkdownDomCapacity,
+} from "./markdown-dom-commit"
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
+import {
+  MARKDOWN_FRAME_WORK_MAX_JOB_BYTES,
+  cancelMarkdownFrameWork,
+  releaseMarkdownFrameWorkReservation,
+  reserveMarkdownFrameWork,
+  resumeMarkdownFrameWork,
+  runMarkdownFrameWork,
+  type MarkdownFrameWorkReservation,
+} from "./markdown-frame-work"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
 import {
   disposeMermaidBlocks,
@@ -42,7 +61,7 @@ import {
 import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
 
 type RenderedBlock =
-  | (MarkdownCacheEntry & { key: string; mode: Exclude<Block["mode"], "code"> })
+  | (MarkdownCacheEntry & { key: string; mode: Exclude<Block["mode"], "code">; plainText?: string; plainCode?: boolean })
   | {
       key: string
       mode: "code"
@@ -65,6 +84,12 @@ type RenderResult = {
 }
 
 const renderedCodeTokens = new WeakMap<HTMLDivElement, RenderedCodeState>()
+const renderedCodeSource = new WeakMap<HTMLElement, string>()
+const MARKDOWN_CRITICAL_WORK_MAX_BYTES = MARKDOWN_RICH_BLOCK_MAX_BYTES
+const MARKDOWN_RICH_HTML_MAX_BYTES = 256 * 1024
+const MARKDOWN_DOM_COOPERATIVE_THRESHOLD = 16 * 1024
+const MARKDOWN_PARSE_BATCH_BLOCKS = 8
+const MARKDOWN_PARSE_BATCH_BYTES = 2 * 1024 * 1024
 
 function escape(text: string) {
   return text
@@ -79,7 +104,13 @@ function fallback(markdown: string) {
   return escape(markdown).replace(/\r\n?/g, "\n").replace(/\n/g, "<br>")
 }
 
-async function code(text: string, language: string | undefined, key: string, complete = false) {
+async function code(
+  text: string,
+  language: string | undefined,
+  key: string,
+  complete = false,
+  priority: MarkdownWorkPriority = "visible",
+) {
   if (isMermaidLanguage(language)) {
     return {
       language: "mermaid",
@@ -89,7 +120,7 @@ async function code(text: string, language: string | undefined, key: string, com
     }
   }
   try {
-    const result = await highlightStreamingCode(key, text, language ?? "text", complete)
+    const result = await highlightStreamingCode(key, text, language ?? "text", complete, priority)
     return {
       language: result.language,
       generation: result.generation,
@@ -321,9 +352,9 @@ function setupCodeCopy(root: HTMLDivElement, getLabels: () => CopyLabels) {
     if (!(target instanceof Element)) return
 
     const button = target.closest('[data-slot="markdown-copy-button"]')
-    if (!(button instanceof HTMLElement)) return
+  if (!(button instanceof HTMLElement)) return
     const code = button.closest('[data-component="markdown-code"]')?.querySelector("code")
-    const content = code?.textContent ?? ""
+    const content = code instanceof HTMLElement ? renderedCodeSource.get(code) ?? code.textContent ?? "" : ""
     if (!content) return
     const clipboard = navigator?.clipboard
     if (!clipboard) return
@@ -397,16 +428,40 @@ export function Markdown(
   const [local, others] = splitProps(props, ["text", "cacheKey", "streaming", "class", "classList"])
   const i18n = useI18n()
   const [root, setRoot] = createSignal<HTMLDivElement>()
+  const [visible, setVisible] = createSignal(false)
+  const [domCapacityTick, setDomCapacityTick] = createSignal(0)
   const owner = createUniqueId()
   const activeCodeKeys = new Set<string>()
   const completedCode = new Map<string, Extract<RenderedBlock, { mode: "code" }>>()
   const COMPLETED_CODE_MAX = 200
   const COMPLETED_CODE_BYTES = 8 * 1024 * 1024
   const completedCodeSizes = new Map<string, number>()
+  const activeDomKeys = new Set<string>()
   let completedCodeBytes = 0
+  let domCapacityCleanup: (() => void) | undefined
+  let markdownWorkActive = false
+  createEffect(() => {
+    const element = root()
+    if (!element) return
+    setVisible(false)
+    onCleanup(observeMarkdownVisibility(element, setVisible))
+  })
+  const domPriority = (): MarkdownWorkPriority => {
+    if (!visible()) return "background"
+    return local.streaming ? "tail" : "visible"
+  }
+  const workPriority = (): MarkdownWorkPriority => {
+    const priority = domPriority()
+    // Large completed bodies first commit a safe text projection to the
+    // selected surface. Their expensive rich parse stays on the background
+    // lane so it cannot occupy the shared selected/tail lane for megabytes.
+    if (priority === "visible" && local.text.length * 2 > MARKDOWN_CRITICAL_WORK_MAX_BYTES) return "background"
+    return priority
+  }
   const codeBytes = (value: Extract<RenderedBlock, { mode: "code" }>) => {
     let total = (value.raw.length + value.src.length + value.language.length) * 2
-    for (const token of [...value.stable, ...value.unstable]) total += token[0].length * 2 + token[1].length * 2
+    for (const token of value.stable) total += token[0].length * 2 + token[1].length * 2
+    for (const token of value.unstable) total += token[0].length * 2 + token[1].length * 2
     return total
   }
   const cacheCompletedCode = (key: string, value: Extract<RenderedBlock, { mode: "code" }>) => {
@@ -427,31 +482,27 @@ export function Markdown(
       completedCodeSizes.delete(oldest)
     }
   }
-  let streamed = false
+  let htmlGeneration = 0
   const [projection] = createResource(
     () => {
       if (isServer) return
+      if (!visible()) return
       const live = local.streaming ?? false
-      if (live) streamed = true
-      if (!live && !streamed) return
-      return { key: owner, text: local.text, live }
+      return { key: owner, text: local.text, live, priority: workPriority() }
     },
     (src) =>
-      projectMarkdown(src.key, src.text, src.live).catch((error) => {
+      projectMarkdown(src.key, src.text, src.live, src.priority).catch((error) => {
         // Component cleanup cancels in-flight worker requests. Do not turn that
         // expected cancellation into an unhandled createResource rejection.
-        if (
-          error instanceof MarkdownWorkerDisposedError ||
-          error instanceof MarkdownWorkerSupersededError
-        ) {
-          return { text: src.text, blocks: [] } satisfies Projection
-        }
-        throw error
+        if (error instanceof MarkdownWorkerDisposedError || error instanceof MarkdownWorkerSupersededError)
+          return pendingProjection(src.text)
+        // The worker is optional presentation work. If it is unavailable,
+        // retain complete source text and let the bounded DOM path show it.
+        return { text: src.text, blocks: src.text ? [{ raw: src.text, src: src.text, mode: "live" }] : [] } satisfies Projection
       }),
     { initialValue: pendingProjection("") },
   )
   const currentProjection = () => {
-    if (!(local.streaming ?? false) && !streamed) return completedProjection(local.text)
     const value = projection.latest
     if (value?.text === local.text) return value
     if (value?.text) return value
@@ -464,13 +515,16 @@ export function Markdown(
           text: local.text,
           key: local.cacheKey,
           projection: pendingProjection(local.text),
+          priority: workPriority(),
         }
-      const value = !(local.streaming ?? false) && !streamed ? completedProjection(local.text) : projection.latest
+      if (!visible()) return
+      const value = projection.latest
       if (!value || value.text !== local.text) return
       return {
         text: local.text,
         key: local.cacheKey,
         projection: value,
+        priority: workPriority(),
       }
     },
     async (src, info) => {
@@ -490,6 +544,7 @@ export function Markdown(
           ],
         } satisfies RenderResult
       if (!src.text) return { text: src.text, cacheKey: src.key, blocks: [], changedFrom: 0 } satisfies RenderResult
+      const generation = ++htmlGeneration
 
       // stream() freezes every completed top-level block. Only the tail can be
       // live, so a full-array `.some()` on every token is unnecessary.
@@ -497,7 +552,8 @@ export function Markdown(
       // A live message changes on every token. Avoid hashing its entire
       // accumulated text and avoid populating the durable HTML cache with a
       // value that will be invalidated on the next token.
-      const base = src.key ?? (hasLiveBlock ? undefined : checksum(src.text))
+      const oversizedSource = src.text.length * 2 > MARKDOWN_CRITICAL_WORK_MAX_BYTES
+      const base = src.key ?? (hasLiveBlock || oversizedSource ? undefined : checksum(src.text))
       const change = (src.projection as HostMarkdownProjection).change
       const previous = info.value as RenderResult | undefined
       const canReusePrefix =
@@ -510,113 +566,199 @@ export function Markdown(
       const changedFrom = canReusePrefix ? change!.keep : 0
       const prefix = canReusePrefix ? previous!.blocks.slice(0, changedFrom) : []
       const suffix = src.projection.blocks.slice(changedFrom)
-      return Promise.all(
-        suffix.map(async (block, offset) => {
-          const index = changedFrom + offset
-          const key = base ? `${base}:${index}:${block.mode}` : undefined
-          const blockKey = markdownBlockKey(owner, src.key, index, block.mode)
-
-          if (block.mode === "code") {
-            const cached = completedCode.get(blockKey)
-            if (block.complete && cached?.raw === block.raw) {
-              completedCode.delete(blockKey)
-              completedCode.set(blockKey, cached)
-              return cached
-            }
-            const result = await code(block.src, block.language, blockKey, block.complete)
-            const rendered = {
+      const renderBlock = async (block: Block, index: number): Promise<RenderedBlock> => {
+        const oversizedBlock = Math.max(block.raw.length, block.src.length) * 2 > MARKDOWN_RICH_BLOCK_MAX_BYTES
+        const key = base && !oversizedBlock ? `${base}:${index}:${block.mode}` : undefined
+        const blockKey = markdownBlockKey(owner, src.key, index, block.mode)
+        registerMarkdownOwnerKey(owner, blockKey)
+        if (oversizedBlock) {
+          if (block.mode === "code")
+            return {
               key: blockKey,
-              mode: block.mode,
+              mode: "full",
               raw: block.raw,
-              src: block.src,
-              hash: String(block.raw.length),
-              complete: !!block.complete,
-              ...result,
+              hash: "oversized-code",
+              html: "",
+              plainText: block.src,
+              plainCode: true,
             }
-            if (block.complete) cacheCompletedCode(blockKey, rendered)
-            return rendered
+          return { key: blockKey, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: "", plainText: block.raw }
+        }
+        if (block.mode === "code") {
+          const cached = completedCode.get(blockKey)
+          if (block.complete && cached?.raw === block.raw) {
+            completedCode.delete(blockKey)
+            completedCode.set(blockKey, cached)
+            return cached
           }
-
-          if (key) {
-            const cached = getCachedMarkdown(key)
-            if (cached?.raw === block.raw) {
-              touchCachedMarkdown(key, cached)
-              return { key: blockKey, mode: block.mode, ...cached }
-            }
+          const work = markdownBlockPriority(block, src.priority)
+          const result = await code(block.src, block.language, blockKey, block.complete, work)
+          const rendered = {
+            key: blockKey,
+            mode: block.mode,
+            raw: block.raw,
+            src: block.src,
+            hash: String(block.raw.length),
+            complete: !!block.complete,
+            ...result,
           }
-
-          const hash = block.mode === "live" ? String(block.raw.length) : checksum(block.raw)
-          const parsed = await parseMarkdown(block.src, blockKey)
+          if (block.complete) cacheCompletedCode(blockKey, rendered)
+          return rendered
+        }
+        if (key) {
+          const cached = getCachedMarkdown(key)
+          if (cached?.raw === block.raw) {
+            touchCachedMarkdown(key, cached)
+            return { key: blockKey, mode: block.mode, ...cached }
+          }
+        }
+        const hash = block.mode === "live" ? String(block.raw.length) : checksum(block.raw)
+        const work = markdownBlockPriority(block, src.priority)
+        let frameReservation: MarkdownFrameWorkReservation | undefined
+        try {
+          frameReservation = await reserveMarkdownFrameWork({
+            key: blockKey,
+            bytes: MARKDOWN_FRAME_WORK_MAX_JOB_BYTES,
+            current: () => generation === htmlGeneration && visible(),
+          })
+          const parsed = await parseMarkdown(block.src, blockKey, work)
+          if (generation !== htmlGeneration || !visible()) throw new MarkdownWorkerSupersededError()
+          if (parsed.length * 2 > MARKDOWN_RICH_HTML_MAX_BYTES) throw new Error("Markdown HTML output exceeded the block limit")
           const sanitizeStarted = markdownTraceEnabled() ? performance.now() : 0
-          const safe = sanitizeMarkdown(parsed)
+          const safe = await runMarkdownFrameWork({
+            key: blockKey,
+            priority: work,
+            bytes: parsed.length * 2,
+            current: () => generation === htmlGeneration && visible(),
+            run: () => sanitizeMarkdown(parsed),
+          }, frameReservation)
+          frameReservation = undefined
+          if (safe.length * 2 > MARKDOWN_RICH_HTML_MAX_BYTES) throw new Error("Sanitized Markdown HTML exceeded the block limit")
           if (sanitizeStarted !== 0)
-            traceMarkdown({
-              phase: "sanitize",
-              ms: performance.now() - sanitizeStarted,
-              chars: block.src.length,
-              htmlChars: parsed.length,
-            })
+            traceMarkdown({ phase: "sanitize", ms: performance.now() - sanitizeStarted, chars: block.src.length, htmlChars: parsed.length })
           if (key && hash && block.mode !== "live") touchCachedMarkdown(key, { raw: block.raw, hash, html: safe })
           return { key: blockKey, mode: block.mode, raw: block.raw, hash: hash ?? "", html: safe }
-        }),
-      )
-        .then((blocks) => ({
-          text: src.text,
-          cacheKey: src.key,
-          changedFrom,
-          blocks: [...prefix, ...blocks],
-        }) satisfies RenderResult)
-        .catch(
-          () =>
-            ({
-              text: src.text,
-              cacheKey: src.key,
-              changedFrom: 0,
-              blocks: [
-                {
-                  key: base ?? "fallback",
-                  mode: "full" as const,
-                  raw: src.text,
-                  hash: checksum(src.text) ?? "",
-                  html: fallback(src.text),
-                },
-              ],
-            }) satisfies RenderResult,
-        )
+        } catch (error) {
+          if (
+            error instanceof MarkdownWorkerDisposedError ||
+            error instanceof MarkdownWorkerSupersededError ||
+            (error instanceof DOMException && error.name === "AbortError")
+          ) throw new MarkdownWorkerSupersededError()
+          return { key: blockKey, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: "", plainText: block.raw }
+        } finally {
+          if (frameReservation) releaseMarkdownFrameWorkReservation(frameReservation)
+        }
+      }
+
+      const rendered: RenderedBlock[] = [...prefix]
+      let cursor = 0
+      while (cursor < suffix.length) {
+        if (generation !== htmlGeneration || !visible()) break
+        let batchBytes = 0
+        const batch: Array<{ block: Block; index: number }> = []
+        while (cursor < suffix.length && batch.length < MARKDOWN_PARSE_BATCH_BLOCKS) {
+          const block = suffix[cursor]!
+          const bytes = Math.min(MARKDOWN_RICH_BLOCK_MAX_BYTES, Math.max(block.raw.length, block.src.length) * 2)
+          if (batch.length && batchBytes + bytes > MARKDOWN_PARSE_BATCH_BYTES) break
+          batch.push({ block, index: changedFrom + cursor })
+          batchBytes += bytes
+          cursor++
+        }
+        rendered.push(...(await Promise.all(batch.map(({ block, index }) => renderBlock(block, index)))))
+        if (cursor < suffix.length) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      }
+      return {
+        text: src.text,
+        cacheKey: src.key,
+        changedFrom,
+        blocks: rendered,
+      } satisfies RenderResult
     },
     {
-      initialValue: initialResult(
-        local.text,
-        local.cacheKey,
-        local.streaming ? pendingProjection(local.text) : completedProjection(local.text),
-        owner,
-      ),
+      // SSR keeps its complete synchronous output. A browser mount starts with
+      // an empty result so no checksum, fallback escaping, projection, or DOM
+      // parse runs before the shared visibility owner admits this consumer.
+      initialValue: isServer
+        ? initialResult(
+            local.text,
+            local.cacheKey,
+            local.streaming ? pendingProjection(local.text) : completedProjection(local.text),
+            owner,
+          )
+        : { text: "", cacheKey: local.cacheKey, blocks: [], changedFrom: 0 },
     },
   )
 
   let copyCleanup: (() => void) | undefined
   let previousBlocks: RenderedBlock[] = []
+  let requestedBlocks: RenderedBlock[] = []
   let previousCopyLabels: CopyLabels | undefined
 
   createEffect(() => {
+    domCapacityTick()
     const tracing = markdownTraceEnabled()
     const effectStarted = tracing ? performance.now() : 0
     const container = root()
+    if (!container) return
+    if (isServer) return
+    if (!visible()) {
+      if (markdownWorkActive) {
+        markdownWorkActive = false
+        htmlGeneration++
+        disposeMarkdownProjection(owner)
+        cancelMarkdownFrameWork(owner)
+        activeCodeKeys.clear()
+      }
+      // Retain a rendered tree when it scrolls away. A cold hidden mount gets
+      // only a bounded, explicit placeholder box; it does not touch message
+      // bytes or create per-row work while waiting for activation.
+      if (!container.dataset.markdownReady && !container.firstElementChild) {
+        const placeholder = document.createElement("div")
+        placeholder.dataset.markdownPlaceholder = ""
+        placeholder.setAttribute("aria-hidden", "true")
+        placeholder.style.blockSize = `${Math.min(320, Math.max(96, Math.ceil(local.text.length / 120) * 24))}px`
+        container.appendChild(placeholder)
+      }
+      if (activeDomKeys.size) {
+        requestedBlocks = []
+        for (const child of Array.from(container.children)) {
+          if (!(child instanceof HTMLElement) || !activeDomKeys.has(child.dataset.markdownKey ?? "")) continue
+          const key = child.dataset.markdownKey!
+          cancelMarkdownDomCommit(key)
+          activeDomKeys.delete(key)
+          const code = child.querySelector("code")
+          if (code instanceof HTMLElement) renderedCodeSource.delete(code)
+          child.replaceChildren()
+          child.removeAttribute("data-markdown-hash")
+          child.removeAttribute("data-markdown-pending")
+          renderedCodeTokens.delete(child as HTMLDivElement)
+        }
+        previousBlocks = []
+      }
+      return
+    }
+    markdownWorkActive = true
+    resumeMarkdownDomCommit()
+    resumeMarkdownFrameWork()
+    container.dataset.markdownReady = "true"
+    container.querySelector("[data-markdown-placeholder]")?.remove()
     const result = (html.latest ?? html()) as RenderResult | undefined
     const projected = currentProjection()
     const pending = local.text
       ? pendingBlocks(result, projected, local.cacheKey, owner)
       : { blocks: [] as RenderedBlock[], changedFrom: 0 }
     const content = pending.blocks
-    if (!container) return
-    if (isServer) return
+    requestedBlocks = content
     if (content.length === 0) {
+      requestedBlocks = []
       activeCodeKeys.forEach(disposeCode)
       activeCodeKeys.clear()
       previousBlocks = []
       disposeCopyButtons(container)
       disposeMermaidBlocks(container)
       container.innerHTML = ""
+      activeDomKeys.forEach(cancelMarkdownDomCommit)
+      activeDomKeys.clear()
       if (tracing)
         traceMarkdown({
           phase: "effect",
@@ -651,22 +793,42 @@ export function Markdown(
     // every historical markdown block on each paced live token still performs
     // DOM child lookup, mode dispatch, code-token bookkeeping, and (for code)
     // querySelector work. Touch only blocks whose rendered object changed.
+    let domBackpressured = false
     for (let index = changedFrom; index < content.length; index++) {
       const block = content[index]!
       if (previousBlocks[index] === block && container.children[index]) continue
-      updateBlock(container, index, block, labels, tracing)
+      const committed = updateBlock(container, index, block, labels, tracing, domPriority(), {
+        activeDomKeys,
+        isCurrent: () => requestedBlocks[index] === block,
+      })
+      if (!committed) {
+        domCapacityCleanup ??= subscribeMarkdownDomCapacity(() => {
+          domCapacityCleanup?.()
+          domCapacityCleanup = undefined
+          setDomCapacityTick((value) => value + 1)
+        })
+        previousBlocks = content.slice(0, index)
+        domBackpressured = true
+        break
+      }
     }
     while (container.children.length > content.length) {
       const child = container.lastElementChild
       if (!child) break
+      if (child instanceof HTMLElement && child.dataset.markdownKey) {
+        cancelMarkdownDomCommit(child.dataset.markdownKey)
+        activeDomKeys.delete(child.dataset.markdownKey)
+      }
       disposeCopyButtons(child)
       disposeMermaidBlocks(child)
       child.remove()
     }
-    if (changedFrom === 0) previousBlocks = content.slice()
-    else {
-      previousBlocks.length = changedFrom
-      for (let index = changedFrom; index < content.length; index++) previousBlocks.push(content[index]!)
+    if (!domBackpressured) {
+      if (changedFrom === 0) previousBlocks = content.slice()
+      else {
+        previousBlocks.length = changedFrom
+        for (let index = changedFrom; index < content.length; index++) previousBlocks.push(content[index]!)
+      }
     }
     // New copy controls receive current labels when their block is decorated.
     // Existing controls only need a tree-wide update when locale labels change,
@@ -700,6 +862,11 @@ export function Markdown(
     const container = root()
     if (container) disposeMermaidBlocks(container)
     disposeMarkdownProjection(owner)
+    cancelMarkdownFrameWork(owner)
+    activeDomKeys.forEach(cancelMarkdownDomCommit)
+    activeDomKeys.clear()
+    domCapacityCleanup?.()
+    domCapacityCleanup = undefined
     activeCodeKeys.forEach(disposeCode)
     completedCode.clear()
     completedCodeSizes.clear()
@@ -748,7 +915,7 @@ function pendingBlocks(
     }
     const key = markdownBlockKey(owner, cacheKey, index, block.mode)
     if (block.mode !== "code") {
-      blocks.push({ key, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: fallback(block.src) })
+      blocks.push({ key, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: "", plainText: block.src })
       continue
     }
     blocks.push({
@@ -771,22 +938,30 @@ function disposeCode(key: string) {
   disposeStreamingCode(key)
 }
 
+function markdownBlockPriority(block: Block, messagePriority: MarkdownWorkPriority): MarkdownWorkPriority {
+  if (messagePriority === "background") return "background"
+  if (block.mode === "live" || (block.mode === "code" && !block.complete)) return "tail"
+  return "visible"
+}
+
 function updateBlock(
   container: HTMLDivElement,
   index: number,
   block: RenderedBlock,
   labels: CopyLabels,
   tracing: boolean,
-) {
+  priority: MarkdownWorkPriority,
+  state: { activeDomKeys: Set<string>; isCurrent: () => boolean },
+): boolean {
   const started = tracing ? performance.now() : 0
   const current = container.children[index]
+  if (block.mode !== "code" && block.plainCode) return updatePlainCodeBlock(container, current, block, labels, priority, state)
   if (block.mode === "code") {
     if (block.complete && isMermaidLanguage(block.language)) {
       updateMermaidBlock(container, current, block, labels, tracing, started)
-      return
+      return true
     }
-    updateCodeBlock(container, current, block, labels, tracing, started)
-    return
+    return updateCodeBlock(container, current, block, labels, tracing, started, priority, state)
   }
   if (
     current instanceof HTMLDivElement &&
@@ -802,7 +977,87 @@ function updateBlock(
         chars: block.raw.length,
         htmlChars: block.html.length,
       })
-    return
+    return true
+  }
+
+  if (block.plainText !== undefined && block.plainText.length >= MARKDOWN_DOM_COOPERATIVE_THRESHOLD) {
+    const bytes = Math.min(block.plainText.length * 2, 1024 * 1024)
+    if (!canCommitMarkdownDom(bytes)) return false
+    const next = document.createElement("div")
+    next.dataset.markdownBlock = ""
+    next.dataset.markdownKey = block.key
+    next.dataset.markdownHash = block.hash
+    next.dataset.markdownPending = "true"
+    next.style.display = "contents"
+    if (current instanceof HTMLDivElement) {
+      disposeCopyButtons(current)
+      disposeMermaidBlocks(current)
+      current.replaceWith(next)
+    } else {
+      container.appendChild(next)
+    }
+    state.activeDomKeys.add(block.key)
+    if (!commitMarkdownDom({
+      key: block.key,
+      html: "",
+      plainText: block.plainText,
+      parent: container,
+      wrapper: next,
+      priority,
+      isCurrent: () => state.isCurrent() && container.children[index] === next,
+      complete: () => state.activeDomKeys.delete(block.key),
+    })) return false
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "cooperative-text-commit",
+        mode: block.mode,
+        chars: block.plainText.length,
+        htmlChars: 0,
+      })
+    return true
+  }
+
+  if (block.html.length >= MARKDOWN_DOM_COOPERATIVE_THRESHOLD) {
+    if (!canCommitMarkdownDom(block.html.length * 2)) return false
+    const next = document.createElement("div")
+    next.dataset.markdownBlock = ""
+    next.dataset.markdownKey = block.key
+    next.dataset.markdownHash = block.hash
+    next.dataset.markdownPending = "true"
+    next.style.display = "contents"
+    if (current instanceof HTMLDivElement) {
+      disposeCopyButtons(current)
+      disposeMermaidBlocks(current)
+      current.replaceWith(next)
+    } else {
+      container.appendChild(next)
+    }
+    state.activeDomKeys.add(block.key)
+    if (!commitMarkdownDom({
+      key: block.key,
+      html: block.html,
+      parent: container,
+      wrapper: next,
+      priority,
+      isCurrent: () => state.isCurrent() && container.children[index] === next,
+      complete: () => {
+        state.activeDomKeys.delete(block.key)
+        decorate(next, labels, block.mode === "live")
+        if (block.mode !== "live") hydrateMermaidBlocks(next, labels)
+      },
+    })) return false
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "cooperative-commit",
+        mode: block.mode,
+        chars: block.raw.length,
+        htmlChars: block.html.length,
+      })
+    return true
   }
 
   const next = document.createElement("div")
@@ -811,7 +1066,12 @@ function updateBlock(
   next.dataset.markdownHash = block.hash
   next.style.display = "contents"
   const innerHTMLStarted = tracing ? performance.now() : 0
-  next.innerHTML = block.html
+  if (block.plainText !== undefined) {
+    next.style.whiteSpace = "pre-line"
+    next.textContent = block.plainText
+  } else {
+    next.innerHTML = block.html
+  }
   const innerHTMLMs = tracing ? performance.now() - innerHTMLStarted : undefined
   const decorateStarted = tracing ? performance.now() : 0
   decorate(next, labels, block.mode === "live")
@@ -831,7 +1091,7 @@ function updateBlock(
         innerHTMLMs,
         decorateMs,
       })
-    return
+    return true
   }
 
   const morphStarted = tracing ? performance.now() : 0
@@ -869,6 +1129,65 @@ function updateBlock(
       decorateMs,
       morphMs: performance.now() - morphStarted,
     })
+  return true
+}
+
+function updatePlainCodeBlock(
+  container: HTMLDivElement,
+  current: Element | undefined,
+  block: Extract<RenderedBlock, { plainCode?: boolean }>,
+  labels: CopyLabels,
+  priority: MarkdownWorkPriority,
+  state: { activeDomKeys: Set<string>; isCurrent: () => boolean },
+): boolean {
+  const source = block.plainText ?? ""
+  const existing = current instanceof HTMLDivElement && current.dataset.markdownKey === block.key ? current : undefined
+  const existingCode = existing?.querySelector("code")
+  if (existingCode instanceof HTMLElement && renderedCodeSource.get(existingCode) === source) return true
+  const bytes = Math.min(source.length * 2, 1024 * 1024)
+  if (!canCommitMarkdownDom(bytes)) return false
+  const next = document.createElement("div")
+  next.dataset.markdownBlock = ""
+  next.dataset.markdownKey = block.key
+  next.dataset.markdownHash = block.hash
+  next.dataset.markdownPending = "true"
+  next.dataset.markdownPlainCode = "true"
+  next.style.display = "contents"
+  const wrapper = document.createElement("div")
+  wrapper.setAttribute("data-component", "markdown-code")
+  applyCodeMetadata(wrapper, "text")
+  const pre = document.createElement("pre")
+  pre.className = "shiki OpenCode"
+  const code = document.createElement("code")
+  code.className = "language-text"
+  renderedCodeSource.set(code, source)
+  pre.appendChild(code)
+  wrapper.appendChild(pre)
+  wrapper.appendChild(createCopyButton(labels))
+  next.appendChild(wrapper)
+  if (current) {
+    disposeCopyButtons(current)
+    current.replaceWith(next)
+  } else container.appendChild(next)
+  state.activeDomKeys.add(block.key)
+  const committed = commitMarkdownDom({
+    key: block.key,
+    html: "",
+    plainText: source,
+    bytes,
+    target: code,
+    parent: container,
+    wrapper: next,
+    priority,
+    isCurrent: () => state.isCurrent() && next.parentElement === container,
+    complete: () => state.activeDomKeys.delete(block.key),
+  })
+  if (!committed) {
+    state.activeDomKeys.delete(block.key)
+    next.remove()
+    return false
+  }
+  return true
 }
 
 function updateMermaidBlock(
@@ -927,9 +1246,44 @@ function updateCodeBlock(
   labels: CopyLabels,
   tracing: boolean,
   started: number,
-) {
+  priority: MarkdownWorkPriority,
+  state: { activeDomKeys: Set<string>; isCurrent: () => boolean },
+): boolean {
   const existing = current instanceof HTMLDivElement && current.dataset.markdownKey === block.key ? current : undefined
   const next = existing ?? document.createElement("div")
+  const existingCode = existing?.querySelector("code")
+  if (existing?.dataset.markdownPlainCode === "true" && existingCode instanceof HTMLElement) {
+    if (renderedCodeSource.get(existingCode) === block.src) return true
+    if (existing.dataset.markdownPending === "true") {
+      cancelMarkdownDomCommit(block.key)
+      state.activeDomKeys.delete(block.key)
+    }
+    existingCode.replaceChildren()
+    renderedCodeSource.delete(existingCode)
+    renderedCodeTokens.delete(existing)
+    existing.removeAttribute("data-markdown-plain-code")
+    existing.removeAttribute("data-markdown-pending")
+    existing.removeAttribute("data-markdown-hash")
+  }
+  if (existing?.dataset.markdownPending === "true") {
+    const previous = renderedCodeTokens.get(existing)
+    if (
+      previous?.raw === block.raw &&
+      previous.language === block.language &&
+      previous.generation === block.generation
+    ) return true
+    const pendingCode = existing.querySelector("code")
+    cancelMarkdownDomCommit(block.key)
+    state.activeDomKeys.delete(block.key)
+    if (pendingCode instanceof HTMLElement) {
+      pendingCode.replaceChildren()
+      renderedCodeSource.delete(pendingCode)
+    }
+    renderedCodeTokens.delete(existing)
+    existing.removeAttribute("data-markdown-pending")
+    existing.removeAttribute("data-markdown-hash")
+    return updateCodeBlock(container, existing, block, labels, tracing, started, priority, state)
+  }
   next.dataset.markdownBlock = ""
   next.dataset.markdownKey = block.key
   next.dataset.markdownHash = block.hash
@@ -937,7 +1291,7 @@ function updateCodeBlock(
   next.style.display = "contents"
 
   const code = existing?.querySelector("code")
-  if (code instanceof HTMLElement) {
+  if (existing && code instanceof HTMLElement) {
     const wrapper = code.closest('[data-component="markdown-code"]')
     if (wrapper instanceof HTMLElement) applyCodeMetadata(wrapper, block.language)
     code.className = `language-${block.language}`
@@ -953,12 +1307,65 @@ function updateCodeBlock(
     const prior = reset ? [] : previous!.unstable
     const prefix = prior.findIndex((token, index) => !sameToken(token, tail[index]))
     const keep = stableCount + (prefix < 0 ? Math.min(prior.length, tail.length) : prefix)
+    const append = tail.slice(keep - stableCount)
+    const appendChars = Math.max(0, block.raw.length - (reset ? 0 : previous?.raw.length ?? 0))
+    const estimatedBytes =
+      append.length > 4096
+        ? 1024 * 1024 + 1
+        : append.reduce((total, token) => total + token[1].length * 2 + 64, appendChars * 2)
+    if ((appendChars >= MARKDOWN_DOM_COOPERATIVE_THRESHOLD || append.length > 128) && append.length > 0) {
+      const codeBytes = Math.min(block.raw.length * 2, 1024 * 1024)
+      const plainFallback = estimatedBytes > 1024 * 1024
+      if (!canCommitMarkdownDom(plainFallback ? codeBytes : estimatedBytes)) return false
+      if (plainFallback) code.replaceChildren()
+      else while (code.children.length > keep) code.lastElementChild?.remove()
+      const wrapper = code.closest('[data-component="markdown-code"]')
+      if (wrapper instanceof HTMLElement) renderedCodeSource.set(code, block.src)
+      existing.dataset.markdownHash = block.hash
+      existing.dataset.markdownPending = "true"
+      if (plainFallback) existing.dataset.markdownPlainCode = "true"
+      state.activeDomKeys.add(block.key)
+      const committed = commitMarkdownDom({
+        key: block.key,
+        html: "",
+        ...(plainFallback ? { plainText: block.src } : { tokens: append }),
+        bytes: plainFallback ? codeBytes : estimatedBytes,
+        tokenSpan: createTokenSpan,
+        target: code,
+        parent: container,
+        wrapper: next,
+        priority,
+        isCurrent: () => state.isCurrent() && next.parentElement === container,
+        complete: () => state.activeDomKeys.delete(block.key),
+      })
+      if (!committed) {
+        state.activeDomKeys.delete(block.key)
+        existing.removeAttribute("data-markdown-pending")
+        if (plainFallback) existing.removeAttribute("data-markdown-plain-code")
+        return false
+      }
+      if (!plainFallback)
+        renderedCodeTokens.set(next, {
+          language: block.language,
+          generation: block.generation,
+          stableCount: block.stable.length,
+          unstable: block.unstable,
+          raw: block.raw,
+        })
+      if (tracing)
+        traceMarkdown({
+          phase: "block",
+          ms: performance.now() - started,
+          action: "cooperative-code-append",
+          mode: block.mode,
+          chars: appendChars,
+          tokenCount: append.length,
+        })
+      return true
+    }
     while (code.children.length > keep) code.lastElementChild?.remove()
     const codeStarted = tracing ? performance.now() : 0
-    tail
-      .slice(keep - stableCount)
-      .map(createTokenSpan)
-      .forEach((span) => code.appendChild(span))
+    append.map(createTokenSpan).forEach((span) => code.appendChild(span))
     if (tracing)
       traceMarkdown({
         phase: "block",
@@ -976,7 +1383,8 @@ function updateCodeBlock(
       unstable: block.unstable,
       raw: block.raw,
     })
-    return
+    renderedCodeSource.set(code, block.src)
+    return true
   }
 
   const wrapper = document.createElement("div")
@@ -986,11 +1394,72 @@ function updateCodeBlock(
   pre.className = "shiki OpenCode"
   const codeElement = document.createElement("code")
   codeElement.className = `language-${block.language}`
-  ;[...block.stable, ...block.unstable].map(createTokenSpan).forEach((span) => codeElement.appendChild(span))
+  const tokens = [...block.stable, ...block.unstable]
+  const tokenBytes =
+    tokens.length > 4096
+      ? 1024 * 1024 + 1
+      : tokens.reduce((total, token) => total + token[1].length * 2 + 64, block.raw.length * 2)
   pre.appendChild(codeElement)
   wrapper.appendChild(pre)
   wrapper.appendChild(createCopyButton(labels))
   next.appendChild(wrapper)
+  renderedCodeSource.set(codeElement, block.src)
+  if (current) {
+    disposeCopyButtons(current)
+    current.replaceWith(next)
+  } else container.appendChild(next)
+  if ((block.raw.length >= MARKDOWN_DOM_COOPERATIVE_THRESHOLD || tokens.length > 128) && tokens.length > 0) {
+    if (!canCommitMarkdownDom(tokenBytes)) {
+      const codeBytes = Math.min(block.raw.length * 2, 1024 * 1024)
+      if (!canCommitMarkdownDom(codeBytes)) return false
+      next.dataset.markdownPlainCode = "true"
+      next.dataset.markdownPending = "true"
+      state.activeDomKeys.add(block.key)
+      const committed = commitMarkdownDom({
+        key: block.key,
+        html: "",
+        plainText: block.src,
+        bytes: codeBytes,
+        target: codeElement,
+        parent: container,
+        wrapper: next,
+        priority,
+        isCurrent: () => state.isCurrent() && next.parentElement === container,
+        complete: () => state.activeDomKeys.delete(block.key),
+      })
+      if (!committed) {
+        state.activeDomKeys.delete(block.key)
+        next.remove()
+        return false
+      }
+      renderedCodeTokens.delete(next)
+      return true
+    }
+    next.dataset.markdownPending = "true"
+    state.activeDomKeys.add(block.key)
+    const committed = commitMarkdownDom({
+      key: block.key,
+      html: "",
+      tokens,
+      bytes: tokenBytes,
+      tokenSpan: createTokenSpan,
+      target: codeElement,
+      parent: container,
+      wrapper: next,
+      priority,
+      isCurrent: () => state.isCurrent() && next.parentElement === container,
+      complete: () => state.activeDomKeys.delete(block.key),
+    })
+    if (!committed) {
+      state.activeDomKeys.delete(block.key)
+      next.remove()
+      return false
+    }
+    if (tracing)
+      traceMarkdown({ phase: "block", ms: performance.now() - started, action: "cooperative-code-mount", mode: block.mode, chars: block.raw.length, tokenCount: tokens.length })
+    return true
+  }
+  tokens.map(createTokenSpan).forEach((span) => codeElement.appendChild(span))
   renderedCodeTokens.set(next, {
     language: block.language,
     generation: block.generation,
@@ -998,22 +1467,6 @@ function updateCodeBlock(
     unstable: block.unstable,
     raw: block.raw,
   })
-  if (current) {
-    disposeCopyButtons(current)
-    current.replaceWith(next)
-    if (tracing)
-      traceMarkdown({
-        phase: "block",
-        ms: performance.now() - started,
-        action: "code-replace",
-        mode: block.mode,
-        chars: block.raw.length,
-        codeMs: performance.now() - started,
-        tokenCount: block.stable.length + block.unstable.length,
-      })
-    return
-  }
-  container.appendChild(next)
   if (tracing)
     traceMarkdown({
       phase: "block",
@@ -1024,6 +1477,7 @@ function updateCodeBlock(
       codeMs: performance.now() - started,
       tokenCount: block.stable.length + block.unstable.length,
     })
+  return true
 }
 
 function sameToken(left: MarkdownToken, right: MarkdownToken | undefined) {

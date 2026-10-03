@@ -1,11 +1,27 @@
 /*
- * System-injection card: reads as a sibling of the user prompt bubble (same
- * column, same radius, same max width) but is unmistakably not the user's text
- * -- hairline dashed edge, no filled bubble, muted type, and a leading badge.
+ * System-injection card.
+ *
+ * Two states, two personalities. COLLAPSED it is a quiet right-aligned pill in
+ * the prompt column -- same radius and max width as the user bubble, hairline
+ * dashed edge, no fill -- so it reads as a sibling of the turn and can never be
+ * mistaken for something the user typed. EXPANDED it drops that disguise and
+ * becomes a full-width, solid, dense panel, because the payload is a document:
+ * a parsed envelope of titled frames, status pills and markdown bodies.
+ *
+ * Tone (`data-tone`) is derived from the payload itself, not from the caller's
+ * taxonomy, so a failed background task carries a red accent without any
+ * producer having to know about this file.
  */
 [data-component="system-injection"] {
   --sysinj-edge: var(--v2-border-border-base, var(--border-weak-base));
+  --sysinj-edge-strong: var(--v2-border-border-strong, var(--border-weak-base));
   --sysinj-accent: var(--v2-text-text-muted, var(--text-weak));
+  --sysinj-fg: var(--v2-text-text-base, var(--text-base));
+  --sysinj-faint: var(--v2-text-text-faint, var(--text-weaker));
+  --sysinj-layer-01: var(--v2-background-bg-layer-01, var(--surface-raised-base));
+  --sysinj-layer-02: var(--v2-background-bg-layer-02, var(--surface-raised-stronger));
+  --sysinj-radius: 10px;
+  --sysinj-mono: var(--font-family-mono, ui-monospace, SFMono-Regular, monospace);
 
   box-sizing: border-box;
   display: flex;
@@ -16,17 +32,51 @@
   max-width: min(82%, 64ch);
   margin-inline-start: auto;
   border: 1px dashed color-mix(in srgb, var(--sysinj-edge) 80%, transparent);
-  border-radius: 10px;
+  border-radius: var(--sysinj-radius);
   background: transparent;
   transition:
     border-color 0.15s ease,
-    background-color 0.15s ease;
+    background-color 0.15s ease,
+    max-width 0.18s ease;
+
+  &[data-tone="info"] {
+    --sysinj-tone-fg: var(--v2-state-fg-info);
+    --sysinj-tone-bg: var(--v2-state-bg-info);
+    --sysinj-tone-border: var(--v2-state-border-info);
+  }
+  &[data-tone="success"] {
+    --sysinj-tone-fg: var(--v2-state-fg-success);
+    --sysinj-tone-bg: var(--v2-state-bg-success);
+    --sysinj-tone-border: var(--v2-state-border-success);
+  }
+  &[data-tone="warning"] {
+    --sysinj-tone-fg: var(--v2-state-fg-warning);
+    --sysinj-tone-bg: var(--v2-state-bg-warning);
+    --sysinj-tone-border: var(--v2-state-border-warning);
+  }
+  &[data-tone="danger"] {
+    --sysinj-tone-fg: var(--v2-state-fg-danger);
+    --sysinj-tone-bg: var(--v2-state-bg-danger);
+    --sysinj-tone-border: var(--v2-state-border-danger);
+  }
 
   &:hover,
   &:focus-within {
-    border-color: var(--v2-border-border-strong, var(--border-weak-base));
-    background: color-mix(in srgb, var(--v2-background-bg-layer-01, var(--surface-raised-base)) 45%, transparent);
+    border-color: var(--sysinj-edge-strong);
+    background: color-mix(in srgb, var(--sysinj-layer-01) 45%, transparent);
   }
+
+  /* Expanded is a panel, not a pill: full width, solid edge, real surface. */
+  &[data-expanded] {
+    width: 100%;
+    max-width: 100%;
+    border-style: solid;
+    border-color: var(--sysinj-edge);
+    background: color-mix(in srgb, var(--sysinj-layer-01) 62%, transparent);
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--v2-alpha-dark-6, rgb(0 0 0 / 6%)) 100%, transparent);
+  }
+
+  /* ── Trigger ─────────────────────────────────────────────────────────── */
 
   [data-slot="system-injection-trigger"] {
     box-sizing: border-box;
@@ -45,7 +95,13 @@
     color: inherit;
     cursor: pointer;
     outline: none;
-    border-radius: 10px;
+    border-radius: var(--sysinj-radius);
+  }
+
+  &[data-expanded] [data-slot="system-injection-trigger"] {
+    min-height: 30px;
+    padding: 5px 8px 5px 9px;
+    border-radius: var(--sysinj-radius) var(--sysinj-radius) 0 0;
   }
 
   [data-slot="system-injection-trigger"]:focus-visible {
@@ -62,7 +118,7 @@
     padding: 0 5px 0 4px;
     border-radius: var(--radius-xs, 4px);
     border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 90%, transparent);
-    background: var(--v2-background-bg-layer-02, var(--surface-raised-stronger));
+    background: var(--sysinj-layer-02);
     color: var(--sysinj-accent);
     font-family: var(--font-family-sans);
     font-size: 11px;
@@ -73,10 +129,21 @@
     white-space: nowrap;
   }
 
+  &[data-tone="info"] [data-slot="system-injection-badge"],
+  &[data-tone="success"] [data-slot="system-injection-badge"],
+  &[data-tone="warning"] [data-slot="system-injection-badge"],
+  &[data-tone="danger"] [data-slot="system-injection-badge"] {
+    border-color: color-mix(in srgb, var(--sysinj-tone-border) 70%, transparent);
+    background: color-mix(in srgb, var(--sysinj-tone-bg) 70%, transparent);
+    color: var(--sysinj-tone-fg);
+  }
+
   [data-slot="system-injection-glyph"] {
     display: block;
     flex-shrink: 0;
-    opacity: 0.85;
+    width: 12px;
+    height: 12px;
+    opacity: 0.9;
   }
 
   [data-slot="system-injection-count"] {
@@ -113,6 +180,11 @@
     user-select: none;
   }
 
+  &[data-expanded] [data-slot="system-injection-preview"] {
+    color: var(--sysinj-fg);
+    font-weight: 500;
+  }
+
   [data-slot="system-injection-chevron-wrap"] {
     display: flex;
     align-items: center;
@@ -120,7 +192,7 @@
     flex-shrink: 0;
     width: 14px;
     height: 18px;
-    color: var(--v2-text-text-faint, var(--text-weaker));
+    color: var(--sysinj-faint);
   }
 
   [data-slot="system-injection-chevron"] {
@@ -133,50 +205,115 @@
     transform: rotate(90deg);
   }
 
+  /* ── Status pill ─────────────────────────────────────────────────────── */
+
+  [data-slot="system-injection-status"] {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    height: 16px;
+    padding: 0 6px;
+    border-radius: 999px;
+    border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 85%, transparent);
+    background: var(--sysinj-layer-02);
+    color: var(--sysinj-accent);
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 560;
+    line-height: 16px;
+    letter-spacing: 0.03em;
+    text-transform: lowercase;
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-status"][data-tone="info"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-info) 70%, transparent);
+    background: color-mix(in srgb, var(--v2-state-bg-info) 70%, transparent);
+    color: var(--v2-state-fg-info);
+  }
+  [data-slot="system-injection-status"][data-tone="success"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-success) 70%, transparent);
+    background: color-mix(in srgb, var(--v2-state-bg-success) 70%, transparent);
+    color: var(--v2-state-fg-success);
+  }
+  [data-slot="system-injection-status"][data-tone="warning"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-warning) 70%, transparent);
+    background: color-mix(in srgb, var(--v2-state-bg-warning) 70%, transparent);
+    color: var(--v2-state-fg-warning);
+  }
+  [data-slot="system-injection-status"][data-tone="danger"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-danger) 70%, transparent);
+    background: color-mix(in srgb, var(--v2-state-bg-danger) 70%, transparent);
+    color: var(--v2-state-fg-danger);
+  }
+
+  /* ── Expanded shell ──────────────────────────────────────────────────── */
+
   [data-slot="system-injection-content"] {
     box-sizing: border-box;
     min-width: 0;
-    border-top: 1px dashed color-mix(in srgb, var(--sysinj-edge) 65%, transparent);
+    border-top: 1px solid color-mix(in srgb, var(--sysinj-edge) 70%, transparent);
+    animation: system-injection-reveal 0.16s ease-out;
+  }
+
+  [data-slot="system-injection-scroll"] {
+    position: relative;
+    min-width: 0;
+    min-height: 0;
   }
 
   /* Bounded growth: one reminder can be tens of kilobytes, and an unbounded
-     row would dominate the virtualizer's measured height for the whole turn. */
+     row would dominate the virtualizer's measured height for the whole turn.
+     The native bar is suppressed so the app's overlay thumb is the only one. */
   [data-slot="system-injection-body"] {
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    max-height: 420px;
+    gap: 10px;
+    max-height: min(56vh, 560px);
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 7px 8px;
+    padding: 10px;
+    scrollbar-width: none !important;
+    -ms-overflow-style: none;
+    outline: none;
+  }
+
+  [data-slot="system-injection-body"]::-webkit-scrollbar {
+    display: none !important;
+  }
+
+  [data-slot="system-injection-body"]:focus-visible {
+    outline: 2px solid var(--v2-border-border-focus, var(--border-focus));
+    outline-offset: -2px;
+    border-radius: 6px;
   }
 
   [data-slot="system-injection-segment"] {
     display: flex;
-    flex-direction: row;
-    align-items: flex-start;
-    gap: 7px;
+    flex-direction: column;
+    gap: 8px;
     min-width: 0;
   }
 
   [data-slot="system-injection-segment"] + [data-slot="system-injection-segment"] {
-    border-top: 0.5px dashed color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
-    padding-top: 8px;
+    border-top: 1px dashed color-mix(in srgb, var(--sysinj-edge) 60%, transparent);
+    padding-top: 10px;
   }
 
   [data-slot="system-injection-segment-index"] {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
-    width: 15px;
+    align-self: flex-start;
+    min-width: 16px;
     height: 15px;
-    margin-top: 2px;
+    padding: 0 4px;
     border-radius: 3px;
     border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 75%, transparent);
-    color: var(--v2-text-text-faint, var(--text-weaker));
-    font-family: var(--font-family-sans);
+    color: var(--sysinj-faint);
+    font-family: var(--sysinj-mono);
     font-size: 10px;
     font-weight: 560;
     line-height: 1;
@@ -184,26 +321,267 @@
     user-select: none;
   }
 
-  [data-slot="system-injection-text"] {
+  /* ── Parsed envelope ─────────────────────────────────────────────────── */
+
+  [data-slot="system-injection-block"] {
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
     min-width: 0;
-    flex: 1 1 auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    unicode-bidi: plaintext;
-    color: var(--v2-text-text-muted, var(--text-weak));
-    font-family: var(--font-family-sans);
-    font-size: 12px;
-    font-weight: 440;
-    line-height: var(--line-height-large, 1.5);
-    letter-spacing: -0.04px;
+    border: 1px solid color-mix(in srgb, var(--sysinj-edge) 70%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--sysinj-layer-01) 55%, transparent);
+    overflow: clip;
   }
+
+  /* Nested frames drop their fill so depth reads as indentation, not stacking. */
+  [data-slot="system-injection-block"] [data-slot="system-injection-block"] {
+    background: transparent;
+    border-color: color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
+  }
+
+  [data-slot="system-injection-block"][data-tone="info"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-info) 55%, transparent);
+  }
+  [data-slot="system-injection-block"][data-tone="warning"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-warning) 55%, transparent);
+  }
+  [data-slot="system-injection-block"][data-tone="danger"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-danger) 55%, transparent);
+  }
+
+  [data-slot="system-injection-block-head"] {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    min-height: 24px;
+    padding: 4px 8px;
+    background: color-mix(in srgb, var(--sysinj-layer-02) 55%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
+  }
+
+  [data-slot="system-injection-block"]:not(:has([data-slot="system-injection-block-body"]))
+    [data-slot="system-injection-block-head"] {
+    border-bottom: none;
+  }
+
+  [data-slot="system-injection-block-label"] {
+    flex-shrink: 0;
+    color: var(--sysinj-accent);
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-block"][data-tone="danger"] [data-slot="system-injection-block-label"] {
+    color: var(--v2-state-fg-danger);
+  }
+  [data-slot="system-injection-block"][data-tone="warning"] [data-slot="system-injection-block-label"] {
+    color: var(--v2-state-fg-warning);
+  }
+  [data-slot="system-injection-block"][data-tone="info"] [data-slot="system-injection-block-label"] {
+    color: var(--v2-state-fg-info);
+  }
+
+  [data-slot="system-injection-block-meta"] {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+    margin-inline-start: auto;
+    justify-content: flex-end;
+  }
+
+  [data-slot="system-injection-chip"] {
+    display: inline-flex;
+    align-items: center;
+    max-width: 30ch;
+    height: 16px;
+    border-radius: 4px;
+    border: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 80%, transparent);
+    background: var(--sysinj-layer-02);
+    overflow: hidden;
+    user-select: none;
+  }
+
+  [data-slot="system-injection-chip-name"] {
+    flex-shrink: 0;
+    padding: 0 4px;
+    color: var(--sysinj-faint);
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 560;
+    line-height: 15px;
+    letter-spacing: 0.02em;
+  }
+
+  [data-slot="system-injection-chip-value"] {
+    min-width: 0;
+    padding: 0 5px 0 4px;
+    border-inline-start: 0.5px solid color-mix(in srgb, var(--sysinj-edge) 70%, transparent);
+    color: var(--sysinj-accent);
+    font-family: var(--sysinj-mono);
+    font-size: 10px;
+    line-height: 15px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: ltr;
+  }
+
+  [data-slot="system-injection-block-body"] {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    padding: 8px;
+  }
+
+  /* The envelope's declared summary: the one sentence worth reading first. */
+  [data-slot="system-injection-lead"] {
+    min-width: 0;
+    margin: 0;
+    padding: 0 0 0 9px;
+    border-inline-start: 2px solid color-mix(in srgb, var(--sysinj-tone-border, var(--sysinj-edge-strong)) 85%, transparent);
+    color: var(--sysinj-fg);
+    font-family: var(--font-family-sans);
+    font-size: 12.5px;
+    font-weight: 500;
+    line-height: 1.5;
+    letter-spacing: -0.05px;
+    text-wrap: pretty;
+    overflow-wrap: break-word;
+  }
+
+  [data-slot="system-injection-field"] {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  [data-slot="system-injection-field-name"] {
+    flex-shrink: 0;
+    color: var(--sysinj-faint);
+    font-family: var(--font-family-sans);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  [data-slot="system-injection-field-value"] {
+    min-width: 0;
+    color: var(--sysinj-fg);
+    font-family: var(--sysinj-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+  }
+
+  [data-slot="system-injection-pre"],
+  [data-slot="system-injection-raw"] {
+    box-sizing: border-box;
+    min-width: 0;
+    margin: 0;
+    padding: 8px 9px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
+    background: color-mix(in srgb, var(--sysinj-layer-02) 65%, transparent);
+    color: var(--sysinj-accent);
+    font-family: var(--sysinj-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    unicode-bidi: plaintext;
+    tab-size: 2;
+  }
+
+  [data-slot="system-injection-block"][data-tone="danger"] [data-slot="system-injection-pre"] {
+    border-color: color-mix(in srgb, var(--v2-state-border-danger) 45%, transparent);
+    color: var(--v2-state-fg-danger);
+  }
+
+  /* ── Markdown, scaled down to injection density ──────────────────────── */
+
+  [data-slot="system-injection-markdown"] {
+    min-width: 0;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--sysinj-accent);
+
+    p,
+    ul,
+    ol,
+    blockquote,
+    table {
+      margin-bottom: 8px;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+      margin-top: 12px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      letter-spacing: 0.01em;
+      color: var(--sysinj-fg);
+    }
+
+    strong,
+    b {
+      color: var(--sysinj-fg);
+    }
+
+    ul,
+    ol {
+      padding-inline-start: 18px;
+    }
+
+    li {
+      margin-bottom: 3px;
+    }
+
+    pre {
+      font-size: 11.5px;
+      line-height: 1.5;
+    }
+
+    code {
+      font-size: 11.5px;
+    }
+
+    /* The card owns the only vertical scroller; inner code blocks keep their
+       horizontal scroll but must not introduce a second vertical one. */
+    [data-component="markdown-code"] > pre {
+      max-height: none;
+    }
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────────── */
 
   [data-slot="system-injection-actions"] {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
-    padding: 0 8px 7px;
+    gap: 4px;
+    padding: 5px 8px 6px;
+    border-top: 1px dashed color-mix(in srgb, var(--sysinj-edge) 55%, transparent);
   }
 
+  [data-slot="system-injection-view"],
   [data-slot="system-injection-copy"] {
     display: inline-flex;
     align-items: center;
@@ -213,7 +591,7 @@
     border: 0.5px solid transparent;
     border-radius: var(--radius-xs, 4px);
     background: transparent;
-    color: var(--v2-text-text-faint, var(--text-weaker));
+    color: var(--sysinj-faint);
     font-family: var(--font-family-sans);
     font-size: 11px;
     font-weight: 530;
@@ -225,18 +603,46 @@
       background-color 0.15s ease;
   }
 
+  [data-slot="system-injection-view"]:hover,
   [data-slot="system-injection-copy"]:hover {
-    color: var(--v2-text-text-base, var(--text-base));
+    color: var(--sysinj-fg);
     border-color: color-mix(in srgb, var(--sysinj-edge) 85%, transparent);
-    background: var(--v2-background-bg-layer-02, var(--surface-raised-stronger));
+    background: var(--sysinj-layer-02);
+  }
+
+  [data-slot="system-injection-view"][data-active] {
+    color: var(--sysinj-fg);
+    border-color: color-mix(in srgb, var(--sysinj-edge) 85%, transparent);
+    background: var(--sysinj-layer-02);
   }
 
   [data-slot="system-injection-copy"][data-copied] {
     color: var(--v2-state-fg-success, var(--text-base));
   }
 
+  [data-slot="system-injection-view"]:focus-visible,
   [data-slot="system-injection-copy"]:focus-visible {
     outline: 2px solid var(--v2-border-border-focus, var(--border-focus));
     outline-offset: 1px;
+  }
+}
+
+@keyframes system-injection-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-component="system-injection"] [data-slot="system-injection-content"] {
+    animation: none;
+  }
+  [data-component="system-injection"] [data-slot="system-injection-chevron"] {
+    transition: none;
   }
 }

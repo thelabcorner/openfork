@@ -14,6 +14,7 @@ import {
 } from "shiki"
 import {
   diffMarkdownProjection,
+  markdownKeyBelongsToOwner,
   type MarkdownParseRequest,
   type MarkdownProjectRequest,
   type MarkdownToken,
@@ -37,10 +38,9 @@ const projections = new Map<string, Projection>()
 const projectionSizes = new Map<string, number>()
 let projectionBytesTotal = 0
 const MAX_PROJECTIONS = 512
-// The host runs two stable-affinity workers to eliminate cross-session parse
-// head-of-line blocking. Keep the aggregate cache budget near the former
-// singleton total instead of doubling retained Markdown source/state merely
-// because there are now two CPU lanes.
+// The host reserves a worker lane for selected live-tail work. Each lane keeps
+// bounded local caches; a key that changes lanes is rehydrated from the host's
+// authoritative full source, and disposal is broadcast to clear migrated state.
 const MAX_PROJECTION_BYTES = 8 * 1024 * 1024
 const MAX_STREAM_BYTES = 8 * 1024 * 1024
 const MAX_PARSE_STATE_BYTES = 8 * 1024 * 1024
@@ -128,10 +128,30 @@ function plainCode(code: string, language: string) {
 }
 
 self.onmessage = (event: MessageEvent<MarkdownWorkerRequest>) => {
+  if (event.data.type === "dispose-owner") {
+    const keys = new Set(
+      [
+        ...streams.keys(),
+        ...projections.keys(),
+        ...parseStates.keys(),
+      ].filter((key) => markdownKeyBelongsToOwner(event.data.key, key)),
+    )
+    keys.add(event.data.key)
+    for (const key of keys) {
+      highlightQueue.dispose(key)
+      projectQueue.dispose(key)
+      parseQueue.dispose(key)
+    }
+    void Promise.all([highlightQueue.idle(), projectQueue.idle(), parseQueue.idle()]).then(() =>
+      post({ type: "disposed-owner", id: event.data.id, key: event.data.key }),
+    )
+    return
+  }
   if (event.data.type === "dispose") {
     highlightQueue.dispose(event.data.key)
     projectQueue.dispose(event.data.key)
     parseQueue.dispose(event.data.key)
+    queueMicrotask(() => post({ type: "disposed", id: event.data.id, key: event.data.key }))
     return
   }
   if (event.data.type === "parse") {

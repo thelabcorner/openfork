@@ -758,6 +758,7 @@ function PromptInputV2ConfiguredSelect(props: {
         </>
       }
       onSelect={props.control.onSelect}
+      manage={props.control.manage}
     />
   )
 }
@@ -772,6 +773,10 @@ export function PromptInputV2Select(props: {
   class?: string
   onOpenChange?: (open: boolean) => void
   onSelect: (id: string) => void
+  manage?: {
+    label: string
+    onSelect: () => void
+  }
 }) {
   return (
     <TooltipV2
@@ -815,6 +820,17 @@ export function PromptInputV2Select(props: {
                 )}
               </For>
             </MenuV2.RadioGroup>
+            <Show when={props.manage}>
+              {(manage) => (
+                <>
+                  <MenuV2.Separator />
+                  <MenuV2.Item onSelect={manage().onSelect}>
+                    <IconV2 name="outline-sliders" size="small" />
+                    <span class="min-w-0 flex-1 truncate">{manage().label}</span>
+                  </MenuV2.Item>
+                </>
+              )}
+            </Show>
           </MenuV2.Content>
         </MenuV2.Portal>
       </MenuV2>

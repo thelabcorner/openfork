@@ -40,12 +40,41 @@ describe("messageProvenancePresentation", () => {
     ).toMatchObject({ badgeDefault: "Swarm continuation", previewDefault: "Task continuation" })
   })
 
-  test("keeps non-Swarm host turns explicit but generic", () => {
+  test("gives scheduled work a specific automation identity", () => {
     expect(
       messageProvenancePresentation({
         role: "user",
         provenance: { owner: "host", source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "stk_1" },
       }),
-    ).toMatchObject({ badgeDefault: "Automation", previewDefault: SessionTurnProvenance.Source.ScheduledTaskRun })
+    ).toMatchObject({ badgeDefault: "Scheduled task", previewDefault: "Scheduled task" })
+  })
+
+  test("covers every canonical synthetic provenance source with a timeline presentation", () => {
+    for (const source of Object.values(SessionTurnProvenance.Source)) {
+      const policy = SessionTurnProvenance.policy(source)
+      if (policy?.kind !== "synthetic") continue
+
+      expect(
+        messageProvenancePresentation({
+          role: "user",
+          provenance: { owner: policy.owner, source },
+        }),
+      ).toBeDefined()
+    }
+  })
+
+  test("keeps shell and compaction on their dedicated timeline presentations", () => {
+    expect(
+      messageProvenancePresentation({
+        role: "user",
+        provenance: { owner: "user", source: SessionTurnProvenance.Source.Shell },
+      }),
+    ).toBeUndefined()
+    expect(
+      messageProvenancePresentation({
+        role: "user",
+        provenance: { owner: "host", source: SessionTurnProvenance.Source.Compaction },
+      }),
+    ).toBeUndefined()
   })
 })

@@ -4,6 +4,7 @@ import {
   applyMarkdownWorkerResponse,
   diffMarkdownProjection,
   markdownBlockKey,
+  markdownKeyBelongsToOwner,
   markdownHighlightRequest,
   markdownParseRequest,
   shouldReleaseMarkdownWorkerState,
@@ -19,6 +20,14 @@ const response = (id: number, reset: boolean, stable: [string, string][], unstab
   reset,
   stable,
   unstable,
+})
+
+test("Markdown owner disposal keys use delimiter-safe child identity", () => {
+  const child = markdownBlockKey("row-1", "session", 3, "full")
+  expect(markdownKeyBelongsToOwner("row-1", child)).toBe(true)
+  expect(markdownKeyBelongsToOwner("row-1", "row-1")).toBe(true)
+  expect(markdownKeyBelongsToOwner("row-1", markdownBlockKey("row-10", "session", 3, "full"))).toBe(false)
+  expect(markdownKeyBelongsToOwner("row-1", "row-1x:session:3:full")).toBe(false)
 })
 
 test("accumulates stable worker tokens and replaces the unstable tail", () => {

@@ -344,6 +344,8 @@ export const dict: Record<string, string> = {
   "ui.message.revertMessage": "Revert message",
   "ui.message.copyResponse": "Copy response",
   "ui.message.copied": "Copied",
+  "ui.message.injection.raw": "Raw",
+  "ui.message.injection.rich": "Rich",
   "ui.message.duration.seconds": "{{count}}s",
   "ui.message.duration.minutesSeconds": "{{minutes}}m {{seconds}}s",
   "ui.message.throughput": "{{rate}} tok/s",

@@ -5,6 +5,7 @@ import { PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
 
 export type NormalizedProviderListResponse = {
   all: Map<string, Provider>
+  catalog?: { status: "pending" | "partial" | "ready"; revision: number }
   defaultModel?: {
     providerID: string
     modelID: string
