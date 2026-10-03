@@ -3231,6 +3231,9 @@ describe("SessionRunnerLLM", () => {
         "x-opencode-request": admitted.id,
         "x-opencode-client": Flag.OPENCODE_CLIENT,
         "User-Agent": OpenCodeHostedUserAgent(),
+        "x-opencode-session-id": sessionID,
+        "x-session-affinity": sessionID,
+        "X-Session-Id": sessionID,
       })
     }),
   )
