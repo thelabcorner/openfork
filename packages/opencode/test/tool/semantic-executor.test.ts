@@ -75,7 +75,7 @@ describe("Tool semantic executor", () => {
         Effect.succeed({
           description: "probe",
           parameters,
-          execute: (): Effect.Effect<Probe> => Effect.fail(denial),
+          execute: () => Effect.fail(denial) as Effect.Effect<Probe, PolicyDenied>,
         }),
       ),
     )
