@@ -1,16 +1,13 @@
 {
   "name": "@opencode-ai/desktop",
   "private": true,
-  "version": "1.18.30",
+  "version": "1.18.34",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://github.com/thelabcorner/openfork",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/thelabcorner/openfork.git"
-  },
+  "homepage": "https://opencode.ai",
   "author": {
-    "name": "OpenFork"
+    "name": "OpenCode",
+    "email": "hello@opencode.ai"
   },
   "scripts": {
     "typecheck": "tsgo -b",
@@ -18,18 +15,18 @@
     "dev": "bun ./scripts/dev.ts",
     "prebuild": "bun ./scripts/prebuild.ts",
     "build": "electron-vite build",
-    "verify:oxp-package": "bun ./scripts/verify-oxp-package.ts dist",
-    "stage:worktree-store": "bun ./scripts/fetch-worktree-store.ts",
-    "lock:worktree-store": "bun ./scripts/worktree-store-lock-update.ts",
-    "test:worktree-store": "bun test worktree-store",
-    "verify:worktree-store-package": "bun ./scripts/verify-worktree-store-package.ts dist",
-    "verify:visual-webview": "bun ./scripts/verify-visual-webview.ts",
     "preview": "electron-vite preview",
     "package": "electron-builder --config electron-builder.config.ts",
     "package:mac": "electron-builder --mac --config electron-builder.config.ts",
     "package:win": "electron-builder --win --config electron-builder.config.ts",
     "package:linux": "electron-builder --linux --config electron-builder.config.ts",
-    "native:build": "bun install --cwd native"
+    "native:build": "bun install --cwd native",
+    "verify:oxp-package": "bun ./scripts/verify-oxp-package.ts dist",
+    "stage:worktree-store": "bun ./scripts/fetch-worktree-store.ts",
+    "lock:worktree-store": "bun ./scripts/worktree-store-lock-update.ts",
+    "test:worktree-store": "bun test worktree-store",
+    "verify:worktree-store-package": "bun ./scripts/verify-worktree-store-package.ts dist",
+    "verify:visual-webview": "bun ./scripts/verify-visual-webview.ts"
   },
   "main": "./out/main/index.js",
   "dependencies": {
@@ -46,9 +43,7 @@
     "@actions/artifact": "4.0.0",
     "@lydell/node-pty": "catalog:",
     "@opencode-ai/app": "workspace:*",
-    "@opencode-ai/browser-visual": "workspace:*",
     "@opencode-ai/ui": "workspace:*",
-    "@parcel/watcher": "2.5.1",
     "@sentry/solid": "catalog:",
     "@sentry/vite-plugin": "catalog:",
     "@solid-primitives/i18n": "2.2.1",
@@ -67,6 +62,8 @@
     "typescript": "~5.6.2",
     "vite": "catalog:",
     "zod-openapi": "5.4.6",
+    "@opencode-ai/browser-visual": "workspace:*",
+    "@parcel/watcher": "2.5.1",
     "@shikijs/stream": "catalog:",
     "concurrently": "^9.1.2",
     "remend": "catalog:",
@@ -87,5 +84,9 @@
     "@parcel/watcher-linux-x64-musl": "2.5.1",
     "@parcel/watcher-win32-arm64": "2.5.1",
     "@parcel/watcher-win32-x64": "2.5.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thelabcorner/openfork.git"
   }
 }

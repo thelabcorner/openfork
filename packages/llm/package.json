@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "version": "1.18.30",
+  "version": "1.18.34",
   "name": "@opencode-ai/llm",
   "type": "module",
   "license": "MIT",
@@ -12,7 +12,6 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./system-one": "./src/system-one.ts",
     "./route": "./src/route/index.ts",
     "./provider": "./src/provider.ts",
     "./providers": "./src/providers/index.ts",
@@ -33,7 +32,8 @@
     "./protocols/gemini": "./src/protocols/gemini.ts",
     "./protocols/openai-chat": "./src/protocols/openai-chat.ts",
     "./protocols/openai-compatible-chat": "./src/protocols/openai-compatible-chat.ts",
-    "./protocols/openai-responses": "./src/protocols/openai-responses.ts"
+    "./protocols/openai-responses": "./src/protocols/openai-responses.ts",
+    "./system-one": "./src/system-one.ts"
   },
   "devDependencies": {
     "@clack/prompts": "1.0.0-alpha.1",

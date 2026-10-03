@@ -5,8 +5,8 @@
   "defaultBranch": "main",
   "sync": "tags",
   "openCodeHostedCompatibility": {
-    "tag": "v1.18.30",
-    "version": "1.18.30"
+    "tag": "v1.18.34",
+    "version": "1.18.34"
   },
   "stage": "prune-main",
   "workspace": [

@@ -24,9 +24,21 @@ export function providerRequestHeaders(input: {
   readonly parentSessionID?: string
   readonly client?: string
 }): Record<string, string> {
-  const parent: Record<string, string> = input.parentSessionID
-    ? { "x-parent-session-id": input.parentSessionID }
-    : {}
+  // Upstream V1 uses these aliases for provider-side session affinity and
+  // parent/child correlation. Keep them centralized here so every Core request
+  // class (runner, title, compaction, goal auditor, prompt revisor, etc.) stays
+  // on the same physical wire contract instead of re-declaring headers ad hoc.
+  const affinity: Record<string, string> = {
+    "x-opencode-session-id": input.sessionID,
+    "x-session-affinity": input.sessionID,
+    "X-Session-Id": input.sessionID,
+    ...(input.parentSessionID
+      ? {
+          "x-opencode-parent-session-id": input.parentSessionID,
+          "x-parent-session-id": input.parentSessionID,
+        }
+      : {}),
+  }
   if (input.providerID.startsWith("opencode")) {
     return {
       "x-opencode-project": input.projectID,
@@ -34,12 +46,8 @@ export function providerRequestHeaders(input: {
       "x-opencode-request": input.requestID,
       "x-opencode-client": input.client ?? Flag.OPENCODE_CLIENT,
       "User-Agent": OpenCodeHostedUserAgent(),
-      ...parent,
+      ...affinity,
     }
   }
-  return {
-    "x-session-affinity": input.sessionID,
-    "X-Session-Id": input.sessionID,
-    ...parent,
-  }
+  return affinity
 }

@@ -19,10 +19,12 @@ describe("V2 SessionRunner OpenCode hosted identity", () => {
       "x-opencode-request": "msg_test",
       "x-opencode-client": "desktop",
       "User-Agent": OpenCodeHostedUserAgent(),
+      "x-opencode-session-id": "ses_test",
+      "x-opencode-parent-session-id": "ses_parent",
+      "x-session-affinity": "ses_test",
+      "X-Session-Id": "ses_test",
       "x-parent-session-id": "ses_parent",
     })
-    expect(headers).not.toHaveProperty("x-session-affinity")
-    expect(headers).not.toHaveProperty("X-Session-Id")
   })
 
   test("covers opencode provider variants such as opencode-go", () => {
@@ -49,6 +51,8 @@ describe("V2 SessionRunner OpenCode hosted identity", () => {
     })
 
     expect(headers).toEqual({
+      "x-opencode-session-id": "ses_test",
+      "x-opencode-parent-session-id": "ses_parent",
       "x-session-affinity": "ses_test",
       "X-Session-Id": "ses_test",
       "x-parent-session-id": "ses_parent",

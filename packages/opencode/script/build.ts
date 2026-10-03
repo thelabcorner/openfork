@@ -268,6 +268,12 @@ for (const item of targets) {
   await writeFile(t3CodeCompatibilityPath, t3CodeCompatibilityLauncher)
   if (item.os !== "win32") await chmod(t3CodeCompatibilityPath, 0o755)
 
+  // Embedding the bundle invalidates the linker's ad-hoc signature, and macOS 27+
+  // SIGKILLs binaries with invalid pages. Re-sign ad-hoc; release CI re-signs with Developer ID.
+  if (item.os === "darwin" && process.platform === "darwin") {
+    await $`codesign --force --sign - ${path.join("dist", name, "bin", PRODUCT_EXECUTABLE)}`
+  }
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
     const binaryPath = path.join(

@@ -1,18 +1,18 @@
 {
   "name": "@opencode-ai/app",
-  "version": "1.18.30",
+  "version": "1.18.34",
   "description": "",
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./pwa-client": "./src/pwa-client.tsx",
     "./desktop-menu": "./src/desktop-menu.ts",
     "./i18n/desktop-native": "./src/i18n/desktop-native.ts",
     "./updater": "./src/updater.ts",
     "./wsl/types": "./src/wsl/types.ts",
-    "./sidecar-control-request": "./src/utils/sidecar-control-request.ts",
     "./vite": "./vite.js",
-    "./index.css": "./src/index.css"
+    "./index.css": "./src/index.css",
+    "./pwa-client": "./src/pwa-client.tsx",
+    "./sidecar-control-request": "./src/utils/sidecar-control-request.ts"
   },
   "scripts": {
     "typecheck": "tsgo -b",

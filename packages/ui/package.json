@@ -1,11 +1,11 @@
 {
   "name": "@opencode-ai/ui",
-  "version": "1.18.30",
+  "version": "1.18.34",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thelabcorner/openfork.git",
+    "url": "git+https://github.com/anomalyco/opencode.git",
     "directory": "packages/ui"
   },
   "publishConfig": {
