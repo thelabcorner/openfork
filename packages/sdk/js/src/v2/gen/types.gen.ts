@@ -24,6 +24,7 @@ export type Event =
   | EventSessionNextSyntheticAdmitted
   | EventSessionNextSyntheticPromoted
   | EventSessionNextSyntheticRevoked
+  | EventSessionNextInputCompleted
   | EventSessionNextContextUpdated
   | EventSessionNextSynthetic
   | EventSessionNextShellStarted
@@ -139,6 +140,8 @@ export type Event =
   | EventWorktreeFailed
   | EventServerConnected
   | EventGlobalDisposed
+  | EventProviderCatalogUpdated
+  | EventServerPendingResponseStateInvalidated
   | EventServerInstanceDisposed
 
 export type QuestionReplied = {
@@ -191,6 +194,23 @@ export type InvalidRequestError = {
 
 export type MoveSessionError = {
   name: "MoveSessionError"
+  data: {
+    message: string
+  }
+}
+
+export type FenceAcquireError = {
+  name: string
+  data: {
+    message: string
+    directory?: string
+    count?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    guardId?: string
+  }
+}
+
+export type LoopbackRequiredError = {
+  name: string
   data: {
     message: string
   }
@@ -718,6 +738,19 @@ export type Prompt = {
   agents?: Array<PromptAgentAttachment>
 }
 
+export type ProviderRouteIntent =
+  | {
+      kind: "auto"
+    }
+  | {
+      kind: "public"
+    }
+  | {
+      kind: "account"
+      accountID: ProviderRouteIntentAccountId
+      pin?: ProviderRouteIntentPin
+    }
+
 export type Pty = {
   id: string
   title: string
@@ -990,6 +1023,15 @@ export type GlobalEvent = {
           sessionID: string
           messageID: string
           reason: SessionInputRevocationReason
+        }
+      }
+    | {
+        id: string
+        type: "session.next.input.completed"
+        properties: {
+          timestamp: number
+          sessionID: string
+          messageID: string
         }
       }
     | {
@@ -1368,6 +1410,7 @@ export type GlobalEvent = {
           partID: string
           field: string
           delta: string
+          offset?: number
         }
       }
     | {
@@ -1985,6 +2028,9 @@ export type GlobalEvent = {
             turnStartedAt?: number
             phaseStartedAt?: number
             updatedAt: number
+            turnElapsedMs?: number
+            phaseElapsedMs?: number
+            sampledAt?: number
             model?: {
               providerID: string
               modelID: string
@@ -2134,6 +2180,22 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "provider.catalog.updated"
+        properties: {
+          directory?: string
+          revision: number
+          status: "pending" | "partial" | "ready"
+        }
+      }
+    | {
+        id: string
+        type: "server.pending-response-state-invalidated"
+        properties: {
+          all?: boolean
+        }
+      }
+    | {
+        id: string
         type: "server.heartbeat"
         properties: {
           [key: string]: unknown
@@ -2178,6 +2240,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextSyntheticAdmitted
     | SyncEventSessionNextSyntheticPromoted
     | SyncEventSessionNextSyntheticRevoked
+    | SyncEventSessionNextInputCompleted
     | SyncEventSessionNextContextUpdated
     | SyncEventSessionNextSynthetic
     | SyncEventSessionNextShellStarted
@@ -2223,10 +2286,33 @@ export type GlobalEvent = {
 export type GlobalEventInterestInput = {
   subscriber: string
   sessions: Array<string>
+  generation?: number
 }
 
 export type GlobalEventInterestResult = {
   updated: boolean
+  generation?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type GlobalSessionMetadataInput = {
+  sessions: Array<string>
+}
+
+export type GlobalArchivedSessionRootsCursor = {
+  archivedAt: number
+  id: string
+}
+
+export type GlobalArchivedSessionRootsInput = {
+  directories: Array<string>
+  limit?: number
+  before?: GlobalArchivedSessionRootsCursor
+}
+
+export type GlobalArchivedSessionRootsPage = {
+  items: Array<Session>
+  more: boolean
+  before?: GlobalArchivedSessionRootsCursor
 }
 
 export type GlobalSessionTelemetryInput = {
@@ -2240,6 +2326,9 @@ export type GlobalSessionTelemetryResult = {
     turnStartedAt?: number
     phaseStartedAt?: number
     updatedAt: number
+    turnElapsedMs?: number
+    phaseElapsedMs?: number
+    sampledAt?: number
     model?: {
       providerID: string
       modelID: string
@@ -2366,6 +2455,145 @@ export type OxpResourceProvenanceInfo = {
   tool: string
   action?: string
   startedAt: number
+}
+
+export type OxpAttributionTool = {
+  tool: string
+  calls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uniqueRequestChars: number
+  uniqueResultChars: number
+  uniqueChars: number
+  uniqueTokens: number
+  requestChars: number
+  resultChars: number
+  chars: number
+  requestTokens: number
+  resultTokens: number
+  tokens: number
+}
+
+export type OxpAttributionSource =
+  | "observed_boundary"
+  | "historical_detail"
+  | "calibrated_surrogate"
+  | "calibrated_donor"
+
+export type OxpAttributionSourceBreakdown = {
+  source: OxpAttributionSource
+  requestCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  resultCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uniqueChars: number
+  requestChars: number
+  resultChars: number
+  chars: number
+  requestTokens: number
+  resultTokens: number
+  tokens: number
+}
+
+export type OxpAttributionTotals = {
+  calls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  activities: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  inferredRounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uniqueRequestChars: number
+  uniqueResultChars: number
+  uniqueChars: number
+  uniqueTokens: number
+  amplification: number
+  requestChars: number
+  resultChars: number
+  chars: number
+  requestTokens: number
+  resultTokens: number
+  tokens: number
+  byTool: Array<OxpAttributionTool>
+  bySource: Array<OxpAttributionSourceBreakdown>
+}
+
+export type OxpAttributionCoverage = {
+  request: {
+    observed_boundary: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    historical_detail: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    calibrated_surrogate: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    calibrated_donor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    unavailable: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  result: {
+    observed_boundary: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    historical_detail: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    calibrated_surrogate: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    calibrated_donor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    unavailable: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    not_applicable: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  invalidPersistedMeasurements: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  complete: boolean
+}
+
+export type OxpAttributionCalibration = {
+  productionDigest: string
+  sourceDigest: string
+  calibratedAt: string
+  observations: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  corpus: {
+    observations: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    activities: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    tools: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    toolStatusGroups: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    minStartedAt: number
+    maxStartedAt: number
+    maxCompletedAt: number
+  }
+  validation: {
+    toolPriorChars: number
+    statusPriorChars: number
+    statusSpecialization: string
+    exposureAggregateBiasRMSE: number
+    exposureWAPE: number
+  }
+}
+
+export type OxpAttributionSnapshot = {
+  generatedAt: number
+  scope: {
+    since?: number
+    until?: number
+    activityID?: string
+  }
+  totals: OxpAttributionTotals
+  sensitivity: {
+    low: {
+      rho: 0.75
+      tokens: number
+    }
+    calibrated: {
+      rho: number
+      tokens: number
+    }
+    high: {
+      rho: 0.99
+      tokens: number
+    }
+  }
+  coverage: OxpAttributionCoverage
+  model: {
+    kind: "geometric-context-residency"
+    rho: number
+    gapThresholdMs: number
+    requestCharsPerToken: number
+    resultCharsPerToken: number
+    components: {
+      callTranscript: true
+      returnedContent: true
+      repeatedContextExposure: true
+      availabilitySchema: false
+    }
+    calibration: OxpAttributionCalibration
+  }
+  causalAttribution: {
+    available: false
+    reason: "trace-chain-unavailable"
+  }
 }
 
 export type GlobalOxpActivityPatch = {
@@ -2886,38 +3114,27 @@ export type InvalidCursorError = {
   message: string
 }
 
-export type PairBeginResult = {
-  code: string
-  url: string
-  expiresAt: string
-}
-
-export type PairClaimResult = {
-  token: string
-  device: {
-    id: string
-    name: string
+export type Agent = {
+  name: string
+  description?: string
+  mode: "subagent" | "primary" | "all"
+  native?: boolean
+  hidden?: boolean
+  topP?: number
+  temperature?: number
+  color?: string
+  permission: PermissionRuleset
+  model?: {
+    modelID: string
+    providerID: string
+    accountID?: string
   }
-  server: {
-    name: string
-    version: string
+  variant?: string
+  prompt?: string
+  options: {
+    [key: string]: unknown
   }
-}
-
-export type PairCodeError = {
-  name: "PairCodeError"
-  data: {
-    message: string
-    reason: "invalid" | "expired" | "exhausted"
-  }
-}
-
-export type ClaimRateLimitedError = {
-  name: "ClaimRateLimitedError"
-  data: {
-    message: string
-    retryAfterMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
+  steps?: number
 }
 
 export type Model = {
@@ -3018,6 +3235,172 @@ export type Provider = {
   }
 }
 
+export type OpenRouterEndpoint = {
+  providerName: string
+  tag: string
+  provider: string
+  pricing: {
+    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    cacheRead: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  uptime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  quantization?: string
+  contextLength?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxCompletionTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxPromptTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  supportedParameters?: Array<string>
+  supportsImplicitCaching?: boolean
+  latencyP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  throughputP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uptime5m?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uptime1d?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  status?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type OpenRouterEndpoints = Array<OpenRouterEndpoint>
+
+export type EffectHttpApiErrorInternalServerError = {
+  _tag: "InternalServerError"
+}
+
+export type OpenRouterTelemetryItem = {
+  endpointId: string
+  providerName: string
+  providerSlug: string
+  cacheHitPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  throughputTps?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type OpenRouterTelemetry = Array<OpenRouterTelemetryItem>
+
+export type OpenRouterFreeUsageModel = {
+  model: string
+  paidSibling: string
+  requests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  tokens: {
+    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  value: {
+    equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    pricingFound: boolean
+  }
+}
+
+export type OpenRouterFreeUsage = {
+  free: {
+    remaining: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    limit: 50 | 1000
+    remainingPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    used: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    usedPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted"
+    tier: {
+      source: "override" | "credits-api"
+      totalCreditsPurchased: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    tokens: {
+      prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    value: {
+      equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      valuedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      unvaluedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      methodology: "current-paid-sibling-list-price"
+      cacheAware: false
+      note: string
+    }
+    window: {
+      type: "calendar-day"
+      timezone: "UTC"
+      startedAt: string
+      resetsAt: string
+      secondsUntilReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    reset: {
+      policy: "midnight-utc"
+      confidence: "high"
+      basis: string
+    }
+    rate: {
+      limitPerMinute: 20
+      observedRequestsPerMinute: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      source: "snapshot-delta" | "day-average" | "insufficient-data"
+    }
+    projection: {
+      requestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      rateSource: "snapshot-delta" | "day-average" | "insufficient-data"
+      sustainableRequestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      projectedRemainingAtReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      willExhaustBeforeReset: boolean
+      estimatedExhaustionAt: string
+    }
+    models: Array<OpenRouterFreeUsageModel>
+  }
+  source: {
+    mode: "openrouter-analytics"
+    scope: "account"
+    analyticsAsOf: string
+    fetchedAt: string
+    stale: boolean
+    analyticsRows: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    analyticsTruncated: boolean
+    upstreamCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type PermissionNotFoundError = {
+  _tag: "PermissionNotFoundError"
+  requestID: string
+  message: string
+}
+
+export type QuestionNotFoundError = {
+  _tag: "QuestionNotFoundError"
+  requestID: string
+  message: string
+}
+
+export type PairBeginResult = {
+  code: string
+  url: string
+  expiresAt: string
+}
+
+export type PairClaimResult = {
+  token: string
+  device: {
+    id: string
+    name: string
+  }
+  server: {
+    name: string
+    version: string
+  }
+}
+
+export type PairCodeError = {
+  name: "PairCodeError"
+  data: {
+    message: string
+    reason: "invalid" | "expired" | "exhausted"
+  }
+}
+
+export type ClaimRateLimitedError = {
+  name: "ClaimRateLimitedError"
+  data: {
+    message: string
+    retryAfterMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
 export type ExperimentalCapabilities = {
   backgroundSubagents: boolean
 }
@@ -3026,10 +3409,6 @@ export type ConsoleState = {
   consoleManagedProviders: Array<string>
   activeOrgName?: string
   switchableOrgCount: number
-}
-
-export type EffectHttpApiErrorInternalServerError = {
-  _tag: "InternalServerError"
 }
 
 export type ToolListItem = {
@@ -3060,6 +3439,7 @@ export type WorktreeError = {
     | "WorktreeRemoveFailedError"
     | "WorktreeResetFailedError"
     | "WorktreeListFailedError"
+    | "WorktreeManagedCreateFailedError"
   data: {
     message: string
   }
@@ -3155,122 +3535,6 @@ export type McpResource = {
   description?: string
   mimeType?: string
   client: string
-}
-
-export type OpenRouterTelemetryItem = {
-  endpointId: string
-  providerName: string
-  providerSlug: string
-  cacheHitPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  throughputTps?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-}
-
-export type OpenRouterTelemetry = Array<OpenRouterTelemetryItem>
-
-export type OpenRouterEndpoint = {
-  providerName: string
-  tag: string
-  provider: string
-  pricing: {
-    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    cacheRead: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
-  uptime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  quantization?: string
-  contextLength?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  maxCompletionTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  maxPromptTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  supportedParameters?: Array<string>
-  supportsImplicitCaching?: boolean
-  latencyP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  throughputP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  uptime5m?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  uptime1d?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  status?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-}
-
-export type OpenRouterEndpoints = Array<OpenRouterEndpoint>
-
-export type OpenRouterFreeUsageModel = {
-  model: string
-  paidSibling: string
-  requests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  tokens: {
-    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
-  value: {
-    equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    pricingFound: boolean
-  }
-}
-
-export type OpenRouterFreeUsage = {
-  free: {
-    remaining: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    limit: 50 | 1000
-    remainingPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    used: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    usedPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted"
-    tier: {
-      source: "override" | "credits-api"
-      totalCreditsPurchased: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    }
-    tokens: {
-      prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    }
-    value: {
-      equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      valuedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      unvaluedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      methodology: "current-paid-sibling-list-price"
-      cacheAware: false
-      note: string
-    }
-    window: {
-      type: "calendar-day"
-      timezone: "UTC"
-      startedAt: string
-      resetsAt: string
-      secondsUntilReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    }
-    reset: {
-      policy: "midnight-utc"
-      confidence: "high"
-      basis: string
-    }
-    rate: {
-      limitPerMinute: 20
-      observedRequestsPerMinute: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      source: "snapshot-delta" | "day-average" | "insufficient-data"
-    }
-    projection: {
-      requestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      rateSource: "snapshot-delta" | "day-average" | "insufficient-data"
-      sustainableRequestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      projectedRemainingAtReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      willExhaustBeforeReset: boolean
-      estimatedExhaustionAt: string
-    }
-    models: Array<OpenRouterFreeUsageModel>
-  }
-  source: {
-    mode: "openrouter-analytics"
-    scope: "account"
-    analyticsAsOf: string
-    fetchedAt: string
-    stale: boolean
-    analyticsRows: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    analyticsTruncated: boolean
-    upstreamCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
 }
 
 export type MentionResult =
@@ -3440,29 +3704,6 @@ export type Command = {
   hints: Array<string>
 }
 
-export type Agent = {
-  name: string
-  description?: string
-  mode: "subagent" | "primary" | "all"
-  native?: boolean
-  hidden?: boolean
-  topP?: number
-  temperature?: number
-  color?: string
-  permission: PermissionRuleset
-  model?: {
-    modelID: string
-    providerID: string
-    accountID?: string
-  }
-  variant?: string
-  prompt?: string
-  options: {
-    [key: string]: unknown
-  }
-  steps?: number
-}
-
 export type LspStatus = {
   id: string
   name: string
@@ -3542,12 +3783,6 @@ export type QuestionRequest = {
   tool?: QuestionTool
 }
 
-export type QuestionNotFoundError = {
-  _tag: "QuestionNotFoundError"
-  requestID: string
-  message: string
-}
-
 export type PermissionRequest = {
   id: string
   sessionID: string
@@ -3561,12 +3796,6 @@ export type PermissionRequest = {
     messageID: string
     callID: string
   }
-}
-
-export type PermissionNotFoundError = {
-  _tag: "PermissionNotFoundError"
-  requestID: string
-  message: string
 }
 
 export type ProviderAuthMethod = {
@@ -3974,6 +4203,7 @@ export type SessionDurableEvent =
   | SessionNextSyntheticAdmitted
   | SessionNextSyntheticPromoted
   | SessionNextSyntheticRevoked
+  | SessionNextInputCompleted
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -4171,6 +4401,7 @@ export type V2Event =
   | SessionNextSyntheticAdmitted
   | SessionNextSyntheticPromoted
   | SessionNextSyntheticRevoked
+  | SessionNextInputCompleted
   | SessionNextContextUpdated
   | SessionNextSynthetic
   | SessionNextShellStarted
@@ -4285,6 +4516,8 @@ export type V2Event =
   | WorktreeReady
   | WorktreeFailed
   | GlobalDisposed
+  | ProviderCatalogUpdated
+  | ServerPendingResponseStateInvalidated
   | V2EventServerConnected
   | V2EventServerHeartbeat
   | V2EventServerStreamGap
@@ -4455,9 +4688,14 @@ export type SessionSyntheticDelegatedTurnAuthority = {
   authorizedAgentNames?: Array<string>
 }
 
+export type ProviderRouteIntentAccountId = string
+
+export type ProviderRouteIntentPin = "hard" | "soft"
+
 export type SessionInputSyntheticExecution = {
   agent: string
   model: ModelRef
+  routeIntent?: ProviderRouteIntent
 }
 
 export type SessionInputSyntheticAdmissionClass = "host" | "automatic"
@@ -4530,16 +4768,8 @@ export type PermissionV2Boundary = Array<PermissionV2Rule>
 
 export type GoalStatus = "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
 
-export type GoalContinuationPolicy = {
-  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-}
-
 export type GoalAuditorPolicy = {
   model?: ModelRef
-  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   maxAttempts?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
@@ -4553,7 +4783,6 @@ export type GoalInfo = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   auditorRuns: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  continuationPolicy: GoalContinuationPolicy
   auditorPolicy: GoalAuditorPolicy
   blocker?: string
   time: {
@@ -4644,13 +4873,13 @@ export type ScheduledTaskGoalAction = {
   title: string
   objective: string
   criteria?: Array<string>
-  continuationPolicy?: GoalContinuationPolicy
 }
 
 export type ScheduledTaskAction = {
   prompt: string
   agent?: string
   model?: ModelRef
+  routeIntent?: ProviderRouteIntent
   goal?: ScheduledTaskGoalAction
 }
 
@@ -4789,11 +5018,27 @@ export type SwarmMemberKind = "coordinator" | "managed_worker" | "external" | "g
 
 export type SwarmMemberLifecycle = "active" | "held" | "stopping" | "stopped"
 
+export type SwarmModelRequirement =
+  | "toolcall"
+  | "reasoning"
+  | "attachment"
+  | "temperature"
+  | "input_text"
+  | "input_audio"
+  | "input_image"
+  | "input_video"
+  | "input_pdf"
+  | "output_text"
+  | "output_audio"
+  | "output_image"
+  | "output_video"
+  | "output_pdf"
+
 export type SwarmMemberExecutionProfile = {
   agent: string
   model: ModelRef
   permissionBoundary: PermissionV2Boundary
-  requestedCapabilities?: Array<string>
+  modelRequirements?: Array<SwarmModelRequirement>
 }
 
 export type SwarmWorkspacePolicy =
@@ -4810,6 +5055,8 @@ export type SwarmWorkspacePolicy =
 
 export type SwarmMemberCapabilities = {
   tags: Array<string>
+  legacyRoutingTags?: Array<string>
+  legacyUnprovenRequirements?: Array<string>
 }
 
 export type SwarmMember = {
@@ -4899,7 +5146,14 @@ export type SwarmTaskLease = {
   renewedAt?: number
 }
 
-export type SwarmTaskRunStatus = "admitted" | "running" | "completed" | "failed" | "cancelled" | "superseded"
+export type SwarmTaskRunStatus =
+  | "admitted"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "superseded"
+  | "unsettled"
 
 export type SwarmTaskFailureKind =
   | "semantic"
@@ -4923,6 +5177,7 @@ export type SwarmTaskRun = {
   status: SwarmTaskRunStatus
   failureKind?: SwarmTaskFailureKind
   failureDetail?: string
+  resultSummary?: string
   admittedAt?: number
   startedAt?: number
   endedAt?: number
@@ -5376,6 +5631,22 @@ export type SyncEventSessionNextSyntheticRevoked = {
       sessionID: string
       messageID: string
       reason: SessionInputRevocationReason
+    }
+  }
+}
+
+export type SyncEventSessionNextInputCompleted = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.input.completed.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      messageID: string
     }
   }
 }
@@ -6148,6 +6419,91 @@ export type ConnectionEnvInfo = {
 
 export type ConnectionInfo = ConnectionCredentialInfo | ConnectionEnvInfo
 
+export type IntegrationWhen = {
+  key: string
+  op: "eq" | "neq"
+  value: string
+}
+
+export type IntegrationTextPrompt = {
+  type: "text"
+  key: string
+  message: string
+  placeholder?: string
+  when?: IntegrationWhen
+}
+
+export type IntegrationSelectPrompt = {
+  type: "select"
+  key: string
+  message: string
+  options: Array<{
+    label: string
+    value: string
+    hint?: string
+  }>
+  when?: IntegrationWhen
+}
+
+export type IntegrationOAuthMethod = {
+  id: string
+  type: "oauth"
+  label: string
+  prompts?: Array<IntegrationTextPrompt | IntegrationSelectPrompt>
+}
+
+export type IntegrationKeyMethod = {
+  type: "key"
+  label?: string
+}
+
+export type IntegrationEnvMethod = {
+  type: "env"
+  names: Array<string>
+}
+
+export type IntegrationAttempt = {
+  attemptID: string
+  url: string
+  instructions: string
+  mode: "auto" | "code"
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type IntegrationAttemptStatus =
+  | {
+      status: "pending"
+      time: {
+        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    }
+  | {
+      status: "complete"
+      time: {
+        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    }
+  | {
+      status: "failed"
+      message: string
+      time: {
+        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    }
+  | {
+      status: "expired"
+      time: {
+        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    }
+
 export type OfxpSettingsRuntimeStatus = {
   active: boolean
   peerID?: string
@@ -6524,6 +6880,7 @@ export type SessionGroupMember = {
   origin: SessionGroupMemberOrigin
   originPlugin?: string
   originRef?: string
+  specialAgent?: string
   position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   timeAdded: number
 }
@@ -6671,6 +7028,7 @@ export type SystemOneQuestions = {
 export type SystemOneInferInput = {
   providerID: string
   modelID: string
+  routeIntent?: ProviderRouteIntent
   accountID?: string
   affinityID?: string
   state: SystemOneContent
@@ -6750,6 +7108,8 @@ export type ProviderRequest = {
   }
 }
 
+export type AgentMode = "subagent" | "primary" | "all"
+
 export type AgentColor = string | "primary" | "secondary" | "accent" | "success" | "warning" | "error" | "info"
 
 export type PermissionV2Ruleset = Array<PermissionV2Rule>
@@ -6760,7 +7120,7 @@ export type AgentV2Info = {
   request: ProviderRequest
   system?: string
   description?: string
-  mode: "subagent" | "primary" | "all"
+  mode: AgentMode
   hidden: boolean
   color?: AgentColor
   steps?: number
@@ -7215,6 +7575,25 @@ export type SessionNextSyntheticRevoked = {
     sessionID: string
     messageID: string
     reason: SessionInputRevocationReason
+  }
+}
+
+export type SessionNextInputCompleted = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.input.completed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    messageID: string
   }
 }
 
@@ -7927,97 +8306,12 @@ export type ProviderV2Info = {
   request: ProviderRequest
 }
 
-export type IntegrationWhen = {
-  key: string
-  op: "eq" | "neq"
-  value: string
-}
-
-export type IntegrationTextPrompt = {
-  type: "text"
-  key: string
-  message: string
-  placeholder?: string
-  when?: IntegrationWhen
-}
-
-export type IntegrationSelectPrompt = {
-  type: "select"
-  key: string
-  message: string
-  options: Array<{
-    label: string
-    value: string
-    hint?: string
-  }>
-  when?: IntegrationWhen
-}
-
-export type IntegrationOAuthMethod = {
-  id: string
-  type: "oauth"
-  label: string
-  prompts?: Array<IntegrationTextPrompt | IntegrationSelectPrompt>
-}
-
-export type IntegrationKeyMethod = {
-  type: "key"
-  label?: string
-}
-
-export type IntegrationEnvMethod = {
-  type: "env"
-  names: Array<string>
-}
-
 export type IntegrationInfo = {
   id: string
   name: string
   methods: Array<IntegrationMethod>
   connections: Array<ConnectionInfo>
 }
-
-export type IntegrationAttempt = {
-  attemptID: string
-  url: string
-  instructions: string
-  mode: "auto" | "code"
-  time: {
-    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-    expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-  }
-}
-
-export type IntegrationAttemptStatus =
-  | {
-      status: "pending"
-      time: {
-        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      }
-    }
-  | {
-      status: "complete"
-      time: {
-        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      }
-    }
-  | {
-      status: "failed"
-      message: string
-      time: {
-        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      }
-    }
-  | {
-      status: "expired"
-      time: {
-        created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-        expires: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-      }
-    }
 
 export type PermissionV2Request = {
   id: string
@@ -8368,6 +8662,7 @@ export type MessagePartDelta = {
     partID: string
     field: string
     delta: string
+    offset?: number
   }
 }
 
@@ -8466,16 +8761,8 @@ export type FileEdited = {
   }
 }
 
-export type GoalContinuationPolicy5 = {
-  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
-  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
-}
-
 export type GoalAuditorPolicy4 = {
   model?: ModelRef
-  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
   maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
@@ -8489,7 +8776,6 @@ export type GoalInfo1 = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
   auditorRuns: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy5
   auditorPolicy: GoalAuditorPolicy4
   blocker?: string
   time: {
@@ -8714,13 +9000,6 @@ export type ScheduledTaskSchedule1 =
       kind: "cron"
       expression: string
     }
-
-export type GoalContinuationPolicy6 = {
-  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
-  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
-}
 
 export type ScheduledTaskResolvedPolicy1 = {
   catchUp: ScheduledTaskCatchUpPolicy
@@ -9809,6 +10088,9 @@ export type SessionTelemetryUpdated = {
       turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
+      turnElapsedMs?: number
+      phaseElapsedMs?: number
+      sampledAt?: number
       model?: {
         providerID: string
         modelID: string
@@ -10019,6 +10301,42 @@ export type GlobalDisposed = {
   location?: LocationRef
   data: {
     [key: string]: unknown
+  }
+}
+
+export type ProviderCatalogUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "provider.catalog.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    directory?: string
+    revision: number
+    status: "pending" | "partial" | "ready"
+  }
+}
+
+export type ServerPendingResponseStateInvalidated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "server.pending-response-state-invalidated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    all?: boolean
   }
 }
 
@@ -10377,6 +10695,16 @@ export type EventSessionNextSyntheticRevoked = {
     sessionID: string
     messageID: string
     reason: SessionInputRevocationReason
+  }
+}
+
+export type EventSessionNextInputCompleted = {
+  id: string
+  type: "session.next.input.completed"
+  properties: {
+    timestamp: number
+    sessionID: string
+    messageID: string
   }
 }
 
@@ -10788,6 +11116,7 @@ export type EventMessagePartDelta = {
     partID: string
     field: string
     delta: string
+    offset?: number
   }
 }
 
@@ -10841,16 +11170,8 @@ export type EventFileEdited = {
   }
 }
 
-export type GoalContinuationPolicy7 = {
-  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
-  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
-}
-
 export type GoalAuditorPolicy5 = {
   model?: ModelRef
-  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
   maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
@@ -10864,7 +11185,6 @@ export type GoalInfo2 = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
   auditorRuns: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy7
   auditorPolicy: GoalAuditorPolicy5
   blocker?: string
   time: {
@@ -10970,13 +11290,6 @@ export type EventOxpActivityLinkAdded = {
     activityID: string
     invocationID: string
   }
-}
-
-export type GoalContinuationPolicy8 = {
-  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
-  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
-  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
 export type ScheduledTaskInfo6 = {
@@ -11531,6 +11844,9 @@ export type EventSessionTelemetryUpdated = {
       turnStartedAt?: number
       phaseStartedAt?: number
       updatedAt: number
+      turnElapsedMs?: number
+      phaseElapsedMs?: number
+      sampledAt?: number
       model?: {
         providerID: string
         modelID: string
@@ -11688,6 +12004,24 @@ export type EventGlobalDisposed = {
   type: "global.disposed"
   properties: {
     [key: string]: unknown
+  }
+}
+
+export type EventProviderCatalogUpdated = {
+  id: string
+  type: "provider.catalog.updated"
+  properties: {
+    directory?: string
+    revision: number
+    status: "pending" | "partial" | "ready"
+  }
+}
+
+export type EventServerPendingResponseStateInvalidated = {
+  id: string
+  type: "server.pending-response-state-invalidated"
+  properties: {
+    all?: boolean
   }
 }
 
@@ -11861,6 +12195,152 @@ export type ExperimentalControlPlaneMoveSessionResponses = {
 
 export type ExperimentalControlPlaneMoveSessionResponse =
   ExperimentalControlPlaneMoveSessionResponses[keyof ExperimentalControlPlaneMoveSessionResponses]
+
+export type ExperimentalDirectoryActivityFenceAcquireData = {
+  body?: {
+    guardId: string
+    directories: [string, string]
+  }
+  path?: never
+  query?: never
+  url: "/experimental/directory-activity-fence/acquire"
+}
+
+export type ExperimentalDirectoryActivityFenceAcquireErrors = {
+  /**
+   * FenceAcquireError | InvalidRequestError
+   */
+  400: FenceAcquireError | InvalidRequestError
+  /**
+   * LoopbackRequiredError
+   */
+  403: LoopbackRequiredError
+}
+
+export type ExperimentalDirectoryActivityFenceAcquireError =
+  ExperimentalDirectoryActivityFenceAcquireErrors[keyof ExperimentalDirectoryActivityFenceAcquireErrors]
+
+export type ExperimentalDirectoryActivityFenceAcquireResponses = {
+  /**
+   * Fence acquisition outcome
+   */
+  200:
+    | {
+        fenceProtocolVersion: 1
+        state: "acquired"
+        token: {
+          acquisitionId: string
+          guardId: string
+          ownerID: string
+          generation: number
+          directories: [string, string]
+        }
+      }
+    | {
+        fenceProtocolVersion: 1
+        state: "blocked"
+        blocked: Array<{
+          directory: string
+          guardId: string
+          ownerID: string
+          acquisitionId: string
+          generation: number
+          state: "active" | "reconcile_required"
+        }>
+        executing: Array<{
+          sessionID: string
+          ownerID: string
+          generation: number
+          persistedDirectory: string
+          directory: string
+          recoveryOwnerID?: string
+        }>
+      }
+}
+
+export type ExperimentalDirectoryActivityFenceAcquireResponse =
+  ExperimentalDirectoryActivityFenceAcquireResponses[keyof ExperimentalDirectoryActivityFenceAcquireResponses]
+
+export type ExperimentalDirectoryActivityFenceHealthData = {
+  body?: {
+    token: unknown
+  }
+  path?: never
+  query?: never
+  url: "/experimental/directory-activity-fence/health"
+}
+
+export type ExperimentalDirectoryActivityFenceHealthErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * LoopbackRequiredError
+   */
+  403: LoopbackRequiredError
+}
+
+export type ExperimentalDirectoryActivityFenceHealthError =
+  ExperimentalDirectoryActivityFenceHealthErrors[keyof ExperimentalDirectoryActivityFenceHealthErrors]
+
+export type ExperimentalDirectoryActivityFenceHealthResponses = {
+  /**
+   * Fence health outcome
+   */
+  200:
+    | {
+        fenceProtocolVersion: 1
+        state: "healthy"
+      }
+    | {
+        fenceProtocolVersion: 1
+        state: "unhealthy"
+        issues: Array<{
+          directory: string
+          reason: string
+        }>
+      }
+}
+
+export type ExperimentalDirectoryActivityFenceHealthResponse =
+  ExperimentalDirectoryActivityFenceHealthResponses[keyof ExperimentalDirectoryActivityFenceHealthResponses]
+
+export type ExperimentalDirectoryActivityFenceReleaseData = {
+  body?: {
+    token: unknown
+  }
+  path?: never
+  query?: never
+  url: "/experimental/directory-activity-fence/release"
+}
+
+export type ExperimentalDirectoryActivityFenceReleaseErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * LoopbackRequiredError
+   */
+  403: LoopbackRequiredError
+}
+
+export type ExperimentalDirectoryActivityFenceReleaseError =
+  ExperimentalDirectoryActivityFenceReleaseErrors[keyof ExperimentalDirectoryActivityFenceReleaseErrors]
+
+export type ExperimentalDirectoryActivityFenceReleaseResponses = {
+  /**
+   * Fence release outcome
+   */
+  200: {
+    fenceProtocolVersion: 1
+    state: "released" | "stale"
+  }
+}
+
+export type ExperimentalDirectoryActivityFenceReleaseResponse =
+  ExperimentalDirectoryActivityFenceReleaseResponses[keyof ExperimentalDirectoryActivityFenceReleaseResponses]
 
 export type ForkCredentialListData = {
   body?: never
@@ -12040,6 +12520,7 @@ export type ForkUsageGetResponses = {
       label: "5h" | "week" | "month"
       spentUSD: number
       limitUSD: number
+      officialPercent?: number
       estimatedPercent?: number
       resetsAt: number
       clearsAt: number
@@ -12055,6 +12536,7 @@ export type ForkUsageGetResponses = {
         label: "5h" | "week" | "month"
         spentUSD: number
         limitUSD: number
+        officialPercent?: number
         estimatedPercent?: number
         resetsAt: number
         clearsAt: number
@@ -12079,6 +12561,105 @@ export type ForkUsageGetResponses = {
 
 export type ForkUsageGetResponse = ForkUsageGetResponses[keyof ForkUsageGetResponses]
 
+export type ForkGeneralUsageGetData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/fork/general-usage"
+}
+
+export type ForkGeneralUsageGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkGeneralUsageGetError = ForkGeneralUsageGetErrors[keyof ForkGeneralUsageGetErrors]
+
+export type ForkGeneralUsageGetResponses = {
+  /**
+   * Generalized workload projection
+   */
+  200: {
+    source: "personal-general" | "standardized-workload-prior"
+    fingerprint: string
+    fallback: {
+      inputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+      outputTokens: number
+      reasoningTokens: number
+      contextTokens: number
+      generationTokens: number
+      totalTokens: number
+    }
+    typical: {
+      inputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+      outputTokens: number
+      reasoningTokens: number
+      contextTokens: number
+      generationTokens: number
+      totalTokens: number
+    }
+    corpus: Array<{
+      inputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+      outputTokens: number
+      reasoningTokens: number
+      contextTokens: number
+      generationTokens: number
+      totalTokens: number
+    }>
+    evidence: {
+      observations: number
+      requestEffectiveSamples: number
+      sessionEffectiveSamples: number
+    }
+    observedModelScopes: number
+    models: Array<{
+      providerID: string
+      modelID: string
+      source: "personal-model"
+      personalized: true
+      workload: {
+        inputTokens: number
+        cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        reasoningTokens: number
+        contextTokens: number
+        generationTokens: number
+        totalTokens: number
+      }
+      evidence: {
+        observations: number
+        requestEffectiveSamples: number
+        sessionEffectiveSamples: number
+      }
+    }>
+    observedRequestBand?: {
+      requests: number
+      lowerContextTokens: number
+      upperContextTokens: number
+      lowerGenerationTokens: number
+      upperGenerationTokens: number
+    }
+    observedScopeBand?: {
+      scopeCount: number
+      lowerContextTokens: number
+      upperContextTokens: number
+      lowerGenerationTokens: number
+      upperGenerationTokens: number
+    }
+  }
+}
+
+export type ForkGeneralUsageGetResponse = ForkGeneralUsageGetResponses[keyof ForkGeneralUsageGetResponses]
+
 export type ForkCapacityGetData = {
   body?: never
   path?: never
@@ -12097,7 +12678,7 @@ export type ForkCapacityGetError = ForkCapacityGetErrors[keyof ForkCapacityGetEr
 
 export type ForkCapacityGetResponses = {
   /**
-   * Personalized OpenCode Go request-capacity projection
+   * Cross-provider personalized request-capacity projection
    */
   200: {
     providerID: "opencode-go"
@@ -12139,6 +12720,17 @@ export type ForkCapacityGetResponses = {
             matureAt: number
             reason: "incomplete-local-accounting"
           }
+      windowCapacity: Array<{
+        window: "5h" | "week" | "month"
+        baselineRequests: number
+        pointRequests: number
+        remaining?: {
+          remainingPercent: number
+          remainingRequests: number
+          resetAt?: number
+          status: "ready" | "unavailable"
+        }
+      }>
       evidence: {
         observations: number
         requestEffectiveSamples: number
@@ -12194,6 +12786,17 @@ export type ForkCapacityGetResponses = {
               matureAt: number
               reason: "incomplete-local-accounting"
             }
+        windowCapacity: Array<{
+          window: "5h" | "week" | "month"
+          baselineRequests: number
+          pointRequests: number
+          remaining?: {
+            remainingPercent: number
+            remainingRequests: number
+            resetAt?: number
+            status: "ready" | "unavailable"
+          }
+        }>
         evidence: {
           observations: number
           requestEffectiveSamples: number
@@ -12213,10 +12816,319 @@ export type ForkCapacityGetResponses = {
         }
       }>
     }>
+    providers: Array<{
+      quotaProviderID: string
+      providerName: string
+      modelProviderIDs: Array<string>
+      status: "ok" | "error" | "not-configured"
+      reason?: string
+      defaultEstimates: Array<{
+        providerID: string
+        modelID?: string
+        accountID?: string
+        accountLabel?: string
+        status: "ready" | "learning" | "unavailable" | "unlimited"
+        source:
+          | "direct-request-budget"
+          | "published-request-rate"
+          | "published-model-capacity"
+          | "standardized-workload-prior"
+          | "personal-current-price"
+          | "provider-observed-burn"
+          | "unmetered"
+          | "insufficient-evidence"
+        estimatedRequests: number | null
+        remainingPercent: number | null
+        resetAt: number | null
+        personalized: boolean
+        limitingWindow?: string
+        reason?: string
+        windows?: Array<{
+          id: string
+          label: string
+          basis: "observed-remaining" | "personalized-total-capacity"
+          status: "ready" | "learning" | "unavailable" | "unlimited"
+          source:
+            | "direct-request-budget"
+            | "published-request-rate"
+            | "published-model-capacity"
+            | "standardized-workload-prior"
+            | "personal-current-price"
+            | "provider-observed-burn"
+            | "unmetered"
+            | "insufficient-evidence"
+          personalized: boolean
+          estimatedRequests: number
+          lowerRequests?: number
+          upperRequests?: number
+          remainingPercent: number
+          resetAt: number
+        }>
+        evidence: {
+          observations: number
+          requestEffectiveSamples: number
+          sessionEffectiveSamples: number
+        }
+      }>
+      estimates: Array<{
+        providerID: string
+        modelID?: string
+        accountID?: string
+        accountLabel?: string
+        status: "ready" | "learning" | "unavailable" | "unlimited"
+        source:
+          | "direct-request-budget"
+          | "published-request-rate"
+          | "published-model-capacity"
+          | "standardized-workload-prior"
+          | "personal-current-price"
+          | "provider-observed-burn"
+          | "unmetered"
+          | "insufficient-evidence"
+        estimatedRequests: number | null
+        remainingPercent: number | null
+        resetAt: number | null
+        personalized: boolean
+        limitingWindow?: string
+        reason?: string
+        windows?: Array<{
+          id: string
+          label: string
+          basis: "observed-remaining" | "personalized-total-capacity"
+          status: "ready" | "learning" | "unavailable" | "unlimited"
+          source:
+            | "direct-request-budget"
+            | "published-request-rate"
+            | "published-model-capacity"
+            | "standardized-workload-prior"
+            | "personal-current-price"
+            | "provider-observed-burn"
+            | "unmetered"
+            | "insufficient-evidence"
+          personalized: boolean
+          estimatedRequests: number
+          lowerRequests?: number
+          upperRequests?: number
+          remainingPercent: number
+          resetAt: number
+        }>
+        evidence: {
+          observations: number
+          requestEffectiveSamples: number
+          sessionEffectiveSamples: number
+        }
+      }>
+      accounts: Array<{
+        accountID: string
+        accountLabel?: string
+        defaultEstimate?: {
+          providerID: string
+          modelID?: string
+          accountID?: string
+          accountLabel?: string
+          status: "ready" | "learning" | "unavailable" | "unlimited"
+          source:
+            | "direct-request-budget"
+            | "published-request-rate"
+            | "published-model-capacity"
+            | "standardized-workload-prior"
+            | "personal-current-price"
+            | "provider-observed-burn"
+            | "unmetered"
+            | "insufficient-evidence"
+          estimatedRequests: number | null
+          remainingPercent: number | null
+          resetAt: number | null
+          personalized: boolean
+          limitingWindow?: string
+          reason?: string
+          windows?: Array<{
+            id: string
+            label: string
+            basis: "observed-remaining" | "personalized-total-capacity"
+            status: "ready" | "learning" | "unavailable" | "unlimited"
+            source:
+              | "direct-request-budget"
+              | "published-request-rate"
+              | "published-model-capacity"
+              | "standardized-workload-prior"
+              | "personal-current-price"
+              | "provider-observed-burn"
+              | "unmetered"
+              | "insufficient-evidence"
+            personalized: boolean
+            estimatedRequests: number
+            lowerRequests?: number
+            upperRequests?: number
+            remainingPercent: number
+            resetAt: number
+          }>
+          evidence: {
+            observations: number
+            requestEffectiveSamples: number
+            sessionEffectiveSamples: number
+          }
+        }
+        estimates: Array<{
+          providerID: string
+          modelID?: string
+          accountID?: string
+          accountLabel?: string
+          status: "ready" | "learning" | "unavailable" | "unlimited"
+          source:
+            | "direct-request-budget"
+            | "published-request-rate"
+            | "published-model-capacity"
+            | "standardized-workload-prior"
+            | "personal-current-price"
+            | "provider-observed-burn"
+            | "unmetered"
+            | "insufficient-evidence"
+          estimatedRequests: number | null
+          remainingPercent: number | null
+          resetAt: number | null
+          personalized: boolean
+          limitingWindow?: string
+          reason?: string
+          windows?: Array<{
+            id: string
+            label: string
+            basis: "observed-remaining" | "personalized-total-capacity"
+            status: "ready" | "learning" | "unavailable" | "unlimited"
+            source:
+              | "direct-request-budget"
+              | "published-request-rate"
+              | "published-model-capacity"
+              | "standardized-workload-prior"
+              | "personal-current-price"
+              | "provider-observed-burn"
+              | "unmetered"
+              | "insufficient-evidence"
+            personalized: boolean
+            estimatedRequests: number
+            lowerRequests?: number
+            upperRequests?: number
+            remainingPercent: number
+            resetAt: number
+          }>
+          evidence: {
+            observations: number
+            requestEffectiveSamples: number
+            sessionEffectiveSamples: number
+          }
+        }>
+      }>
+    }>
+    generalUsage: {
+      source: "personal-general" | "standardized-workload-prior"
+      fingerprint: string
+      fallback: {
+        inputTokens: number
+        cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        reasoningTokens: number
+        contextTokens: number
+        generationTokens: number
+        totalTokens: number
+      }
+      typical: {
+        inputTokens: number
+        cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        reasoningTokens: number
+        contextTokens: number
+        generationTokens: number
+        totalTokens: number
+      }
+      corpus: Array<{
+        inputTokens: number
+        cacheReadTokens: number
+        cacheWriteTokens: number
+        outputTokens: number
+        reasoningTokens: number
+        contextTokens: number
+        generationTokens: number
+        totalTokens: number
+      }>
+      evidence: {
+        observations: number
+        requestEffectiveSamples: number
+        sessionEffectiveSamples: number
+      }
+      observedModelScopes: number
+      models: Array<{
+        providerID: string
+        modelID: string
+        source: "personal-model"
+        personalized: true
+        workload: {
+          inputTokens: number
+          cacheReadTokens: number
+          cacheWriteTokens: number
+          outputTokens: number
+          reasoningTokens: number
+          contextTokens: number
+          generationTokens: number
+          totalTokens: number
+        }
+        evidence: {
+          observations: number
+          requestEffectiveSamples: number
+          sessionEffectiveSamples: number
+        }
+      }>
+      observedRequestBand?: {
+        requests: number
+        lowerContextTokens: number
+        upperContextTokens: number
+        lowerGenerationTokens: number
+        upperGenerationTokens: number
+      }
+      observedScopeBand?: {
+        scopeCount: number
+        lowerContextTokens: number
+        upperContextTokens: number
+        lowerGenerationTokens: number
+        upperGenerationTokens: number
+      }
+    }
   }
 }
 
 export type ForkCapacityGetResponse = ForkCapacityGetResponses[keyof ForkCapacityGetResponses]
+
+export type SyncCapabilitiesData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/sync/capabilities"
+}
+
+export type SyncCapabilitiesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type SyncCapabilitiesError = SyncCapabilitiesErrors[keyof SyncCapabilitiesErrors]
+
+export type SyncCapabilitiesResponses = {
+  /**
+   * Sync protocol capabilities
+   */
+  200: {
+    version: 1
+    features: Array<string>
+  }
+}
+
+export type SyncCapabilitiesResponse = SyncCapabilitiesResponses[keyof SyncCapabilitiesResponses]
 
 export type GlobalHealthData = {
   body?: never
@@ -12332,6 +13244,57 @@ export type GlobalSessionRootsResponses = {
 
 export type GlobalSessionRootsResponse = GlobalSessionRootsResponses[keyof GlobalSessionRootsResponses]
 
+export type GlobalSessionMetadataData = {
+  body?: GlobalSessionMetadataInput
+  path?: never
+  query?: never
+  url: "/global/session/metadata"
+}
+
+export type GlobalSessionMetadataErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalSessionMetadataError = GlobalSessionMetadataErrors[keyof GlobalSessionMetadataErrors]
+
+export type GlobalSessionMetadataResponses = {
+  /**
+   * Durable session metadata for explicit session IDs
+   */
+  200: Array<Session>
+}
+
+export type GlobalSessionMetadataResponse = GlobalSessionMetadataResponses[keyof GlobalSessionMetadataResponses]
+
+export type GlobalArchivedSessionRootsData = {
+  body?: GlobalArchivedSessionRootsInput
+  path?: never
+  query?: never
+  url: "/global/session/archived-roots"
+}
+
+export type GlobalArchivedSessionRootsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalArchivedSessionRootsError = GlobalArchivedSessionRootsErrors[keyof GlobalArchivedSessionRootsErrors]
+
+export type GlobalArchivedSessionRootsResponses = {
+  /**
+   * A page of archived root session metadata
+   */
+  200: GlobalArchivedSessionRootsPage
+}
+
+export type GlobalArchivedSessionRootsResponse =
+  GlobalArchivedSessionRootsResponses[keyof GlobalArchivedSessionRootsResponses]
+
 export type GlobalSessionGetData = {
   body?: never
   path: {
@@ -12383,6 +13346,36 @@ export type GlobalSessionTelemetryResponses = {
 }
 
 export type GlobalSessionTelemetryResponse = GlobalSessionTelemetryResponses[keyof GlobalSessionTelemetryResponses]
+
+export type SessionStatusData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/status"
+}
+
+export type SessionStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type SessionStatusError = SessionStatusErrors[keyof SessionStatusErrors]
+
+export type SessionStatusResponses = {
+  /**
+   * Working-session status optionally scoped to one explicit directory
+   */
+  200: {
+    [key: string]: SessionStatus
+  }
+}
+
+export type SessionStatusResponse = SessionStatusResponses[keyof SessionStatusResponses]
 
 export type GlobalOxpActivitiesData = {
   body?: never
@@ -12583,6 +13576,35 @@ export type GlobalOxpResourceResponses = {
 
 export type GlobalOxpResourceResponse = GlobalOxpResourceResponses[keyof GlobalOxpResourceResponses]
 
+export type GlobalOxpAttributionData = {
+  body?: never
+  path?: never
+  query?: {
+    activityID?: string
+    since?: string
+    until?: string
+  }
+  url: "/global/oxp/attribution"
+}
+
+export type GlobalOxpAttributionErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalOxpAttributionError = GlobalOxpAttributionErrors[keyof GlobalOxpAttributionErrors]
+
+export type GlobalOxpAttributionResponses = {
+  /**
+   * Modeled OXP context footprint and exposure
+   */
+  200: OxpAttributionSnapshot
+}
+
+export type GlobalOxpAttributionResponse = GlobalOxpAttributionResponses[keyof GlobalOxpAttributionResponses]
+
 export type GlobalProjectsData = {
   body?: never
   path?: never
@@ -12657,6 +13679,60 @@ export type GlobalConfigUpdateResponses = {
 }
 
 export type GlobalConfigUpdateResponse = GlobalConfigUpdateResponses[keyof GlobalConfigUpdateResponses]
+
+export type GlobalConfigAgentDeleteData = {
+  body?: never
+  path: {
+    agentID: string
+  }
+  query?: never
+  url: "/global/config/agent/{agentID}"
+}
+
+export type GlobalConfigAgentDeleteErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type GlobalConfigAgentDeleteError = GlobalConfigAgentDeleteErrors[keyof GlobalConfigAgentDeleteErrors]
+
+export type GlobalConfigAgentDeleteResponses = {
+  /**
+   * Global config after exact agent deletion
+   */
+  200: Config
+}
+
+export type GlobalConfigAgentDeleteResponse = GlobalConfigAgentDeleteResponses[keyof GlobalConfigAgentDeleteResponses]
+
+export type GlobalConfigAgentSetData = {
+  body?: AgentConfig
+  path: {
+    agentID: string
+  }
+  query?: never
+  url: "/global/config/agent/{agentID}"
+}
+
+export type GlobalConfigAgentSetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type GlobalConfigAgentSetError = GlobalConfigAgentSetErrors[keyof GlobalConfigAgentSetErrors]
+
+export type GlobalConfigAgentSetResponses = {
+  /**
+   * Global config after exact agent replacement
+   */
+  200: Config
+}
+
+export type GlobalConfigAgentSetResponse = GlobalConfigAgentSetResponses[keyof GlobalConfigAgentSetResponses]
 
 export type GlobalPreferencesGetData = {
   body?: never
@@ -12864,6 +13940,157 @@ export type ProviderSettingsConnectKeyResponses = {
 
 export type ProviderSettingsConnectKeyResponse =
   ProviderSettingsConnectKeyResponses[keyof ProviderSettingsConnectKeyResponses]
+
+export type ProviderSettingsAuthData = {
+  body?: never
+  path: {
+    providerID: string
+  }
+  query?: never
+  url: "/provider-settings/{providerID}/auth"
+}
+
+export type ProviderSettingsAuthErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsAuthError = ProviderSettingsAuthErrors[keyof ProviderSettingsAuthErrors]
+
+export type ProviderSettingsAuthResponses = {
+  /**
+   * Bootstrap-free provider authentication methods
+   */
+  200: {
+    methods: Array<IntegrationMethod>
+  }
+}
+
+export type ProviderSettingsAuthResponse = ProviderSettingsAuthResponses[keyof ProviderSettingsAuthResponses]
+
+export type ProviderSettingsConnectOauthData = {
+  body?: {
+    methodID: string
+    inputs: IntegrationInputs
+    label?: string
+  }
+  path: {
+    providerID: string
+  }
+  query?: never
+  url: "/provider-settings/{providerID}/oauth"
+}
+
+export type ProviderSettingsConnectOauthErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+}
+
+export type ProviderSettingsConnectOauthError =
+  ProviderSettingsConnectOauthErrors[keyof ProviderSettingsConnectOauthErrors]
+
+export type ProviderSettingsConnectOauthResponses = {
+  /**
+   * Integration.Attempt
+   */
+  200: IntegrationAttempt
+}
+
+export type ProviderSettingsConnectOauthResponse =
+  ProviderSettingsConnectOauthResponses[keyof ProviderSettingsConnectOauthResponses]
+
+export type ProviderSettingsOauthCancelData = {
+  body?: never
+  path: {
+    attemptID: string
+  }
+  query?: never
+  url: "/provider-settings/oauth/{attemptID}"
+}
+
+export type ProviderSettingsOauthCancelErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsOauthCancelError =
+  ProviderSettingsOauthCancelErrors[keyof ProviderSettingsOauthCancelErrors]
+
+export type ProviderSettingsOauthCancelResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsOauthCancelResponse =
+  ProviderSettingsOauthCancelResponses[keyof ProviderSettingsOauthCancelResponses]
+
+export type ProviderSettingsOauthStatusData = {
+  body?: never
+  path: {
+    attemptID: string
+  }
+  query?: never
+  url: "/provider-settings/oauth/{attemptID}"
+}
+
+export type ProviderSettingsOauthStatusErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsOauthStatusError =
+  ProviderSettingsOauthStatusErrors[keyof ProviderSettingsOauthStatusErrors]
+
+export type ProviderSettingsOauthStatusResponses = {
+  /**
+   * Integration.AttemptStatus
+   */
+  200: IntegrationAttemptStatus
+}
+
+export type ProviderSettingsOauthStatusResponse =
+  ProviderSettingsOauthStatusResponses[keyof ProviderSettingsOauthStatusResponses]
+
+export type ProviderSettingsOauthCompleteData = {
+  body?: {
+    code?: string
+  }
+  path: {
+    attemptID: string
+  }
+  query?: never
+  url: "/provider-settings/oauth/{attemptID}/complete"
+}
+
+export type ProviderSettingsOauthCompleteErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+}
+
+export type ProviderSettingsOauthCompleteError =
+  ProviderSettingsOauthCompleteErrors[keyof ProviderSettingsOauthCompleteErrors]
+
+export type ProviderSettingsOauthCompleteResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsOauthCompleteResponse =
+  ProviderSettingsOauthCompleteResponses[keyof ProviderSettingsOauthCompleteResponses]
 
 export type ProviderSettingsModelsData = {
   body?: never
@@ -13442,6 +14669,200 @@ export type UsagePricingCatalogResponses = {
 
 export type UsagePricingCatalogResponse = UsagePricingCatalogResponses[keyof UsagePricingCatalogResponses]
 
+export type UsageSessionContextData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/usage/session/{sessionID}/context"
+}
+
+export type UsageSessionContextErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type UsageSessionContextError = UsageSessionContextErrors[keyof UsageSessionContextErrors]
+
+export type UsageSessionContextResponses = {
+  /**
+   * Session context projection
+   */
+  200: {
+    history: {
+      sessionID: string
+      createdAt: number
+      updatedAt: number
+      counts: {
+        all: number
+        user: number
+        assistant: number
+      }
+      systemPrompt: string
+      totals: {
+        messages: number
+        toolCalls: number
+        cost: number
+        freeMessages: number
+        tokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        freeTokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        generatedMs: number
+        toolMs: number
+        ttftMs: number
+        ttftRecords: number
+        upstreamTTFTMs: number
+        upstreamTTFTRecords: number
+      }
+      models: Array<{
+        providerID: string
+        modelID: string
+        variant: string
+        providerName: string
+        modelName: string
+        messages: number
+        toolCalls: number
+        cost: number
+        freeMessages: number
+        tokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        freeTokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        generatedMs: number
+        toolMs: number
+        ttftMs: number
+        ttftRecords: number
+        upstreamTTFTMs: number
+        upstreamTTFTRecords: number
+        firstMessageTime: number
+        lastMessageTime: number
+        costRate?: {
+          input: number
+          output: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }>
+      latest?: {
+        providerID: string
+        modelID: string
+        variant?: string
+        providerName: string
+        modelName: string
+        contextLimit?: number
+        completedAt: number
+        tokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+      }
+      breakdown: {
+        system: number
+        user: number
+        synthetic: number
+        shell: number
+        compaction: number
+        assistant: number
+        tool: number
+        other: number
+      }
+    }
+    telemetry: {
+      sessionID: string
+      phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      turnStartedAt?: number
+      phaseStartedAt?: number
+      updatedAt: number
+      turnElapsedMs?: number
+      phaseElapsedMs?: number
+      sampledAt?: number
+      model?: {
+        providerID: string
+        modelID: string
+        name?: string
+        variant?: string
+        contextLimit?: number
+      }
+      context?: {
+        model: {
+          providerID: string
+          modelID: string
+          name?: string
+          variant?: string
+          contextLimit?: number
+        }
+        tokens: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      step?: {
+        assistantMessageID?: string
+        requestSentAt?: number
+        firstTokenAt?: number
+        streamedAt?: number
+        completedAt?: number
+        visibleChars: number
+        reasoningChars: number
+        generatedMs: number
+        toolMs: number
+        cost?: number
+        tokens?: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      generatedMs: number
+      toolMs: number
+    }
+  }
+}
+
+export type UsageSessionContextResponse = UsageSessionContextResponses[keyof UsageSessionContextResponses]
+
 export type WakatimeStatusData = {
   body?: never
   path?: never
@@ -13520,6 +14941,7 @@ export type QuotaProvidersResponses = {
     providers: Array<{
       providerId: string
       providerName: string
+      aliases: Array<string>
       configured: boolean
     }>
   }
@@ -13624,6 +15046,15 @@ export type QuotaGetResponses = {
           resetAt: number
           resetAfterSeconds: number
           valueLabel: string
+          resource?: {
+            kind: "requests" | "credits" | "money" | "relative" | "provider-units"
+            unit: string
+            used: number
+            remaining: number
+            limit: number
+            currency?: string
+            usdPerUnit?: number
+          }
         }
       }
       models?: {
@@ -13636,6 +15067,15 @@ export type QuotaGetResponses = {
               resetAt: number
               resetAfterSeconds: number
               valueLabel: string
+              resource?: {
+                kind: "requests" | "credits" | "money" | "relative" | "provider-units"
+                unit: string
+                used: number
+                remaining: number
+                limit: number
+                currency?: string
+                usdPerUnit?: number
+              }
             }
           }
           rate?: number
@@ -13648,40 +15088,6 @@ export type QuotaGetResponses = {
         [key: string]: string
       }
       workbuddyAccounts?: Array<{
-        accountId: string
-        label: string
-        models: Array<{
-          model: string
-          canonical: string
-          unit: string
-          usedObserved: number
-          limitEstimate: number
-          remainingEstimate: number
-          remainingPercent: number
-          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
-          confidence: "low" | "medium" | "high"
-          accuracy: "observed" | "estimate" | "server-confirmed"
-          exhaustedObserved: boolean
-          serverCode: number
-          resetAt: number
-          resetSource: "server-6004" | "inferred" | "unknown"
-          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
-          windowStartedAt: number
-          secondsUntilReset: number
-          lastObservationAt: number
-          burnPerHour: number
-          estimatedExhaustionAt: number
-          willLikelyExhaustBeforeReset: boolean
-          creditsObserved: number
-          tokensInput: number
-          tokensOutput: number
-          tokensCacheHit: number
-          tokensCacheMiss: number
-          creditsPersonalized: boolean
-          coverage: "opencode-only"
-        }>
-      }>
-      verdentAccounts?: Array<{
         accountId: string
         label: string
         models: Array<{
@@ -15563,6 +16969,387 @@ export type SwarmRecoverResponses = {
 
 export type SwarmRecoverResponse = SwarmRecoverResponses[keyof SwarmRecoverResponses]
 
+export type AppAgentsData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/agent"
+}
+
+export type AppAgentsResponses = {
+  /**
+   * List of configured agents
+   */
+  200: Array<Agent>
+}
+
+export type AppAgentsResponse = AppAgentsResponses[keyof AppAgentsResponses]
+
+export type ProviderListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/provider"
+}
+
+export type ProviderListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderListError = ProviderListErrors[keyof ProviderListErrors]
+
+export type ProviderListResponses = {
+  /**
+   * Progressive provider catalog
+   */
+  200: {
+    all: Array<Provider>
+    default: {
+      [key: string]: string
+    }
+    connected: Array<string>
+    catalog?: {
+      status: "pending" | "partial" | "ready"
+      revision: number
+    }
+  }
+}
+
+export type ProviderListResponse = ProviderListResponses[keyof ProviderListResponses]
+
+export type ExperimentalOpenrouterEndpointsGetData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    model: string
+  }
+  url: "/experimental/openrouter-endpoints"
+}
+
+export type ExperimentalOpenrouterEndpointsGetErrors = {
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type ExperimentalOpenrouterEndpointsGetError =
+  ExperimentalOpenrouterEndpointsGetErrors[keyof ExperimentalOpenrouterEndpointsGetErrors]
+
+export type ExperimentalOpenrouterEndpointsGetResponses = {
+  /**
+   * OpenRouter upstream providers
+   */
+  200: OpenRouterEndpoints
+}
+
+export type ExperimentalOpenrouterEndpointsGetResponse =
+  ExperimentalOpenrouterEndpointsGetResponses[keyof ExperimentalOpenrouterEndpointsGetResponses]
+
+export type ExperimentalOpenrouterTelemetryGetData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    model: string
+    timeRange?: "1w" | "3d"
+  }
+  url: "/experimental/openrouter-telemetry"
+}
+
+export type ExperimentalOpenrouterTelemetryGetErrors = {
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type ExperimentalOpenrouterTelemetryGetError =
+  ExperimentalOpenrouterTelemetryGetErrors[keyof ExperimentalOpenrouterTelemetryGetErrors]
+
+export type ExperimentalOpenrouterTelemetryGetResponses = {
+  /**
+   * OpenRouter telemetry
+   */
+  200: OpenRouterTelemetry
+}
+
+export type ExperimentalOpenrouterTelemetryGetResponse =
+  ExperimentalOpenrouterTelemetryGetResponses[keyof ExperimentalOpenrouterTelemetryGetResponses]
+
+export type ExperimentalOpenrouterFreeUsageGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    includeValue?: "true" | "false"
+    forceRefresh?: "true" | "false"
+  }
+  url: "/experimental/openrouter-free-usage"
+}
+
+export type ExperimentalOpenrouterFreeUsageGetErrors = {
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type ExperimentalOpenrouterFreeUsageGetError =
+  ExperimentalOpenrouterFreeUsageGetErrors[keyof ExperimentalOpenrouterFreeUsageGetErrors]
+
+export type ExperimentalOpenrouterFreeUsageGetResponses = {
+  /**
+   * OpenRouter free usage
+   */
+  200: OpenRouterFreeUsage
+}
+
+export type ExperimentalOpenrouterFreeUsageGetResponse =
+  ExperimentalOpenrouterFreeUsageGetResponses[keyof ExperimentalOpenrouterFreeUsageGetResponses]
+
+export type SessionListData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    scope?: "project"
+    path?: string
+    roots?: boolean | "true" | "false"
+    start?: number
+    search?: string
+    limit?: number
+  }
+  url: "/session"
+}
+
+export type SessionListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type SessionListError = SessionListErrors[keyof SessionListErrors]
+
+export type SessionListResponses = {
+  /**
+   * List of sessions
+   */
+  200: Array<Session>
+}
+
+export type SessionListResponse = SessionListResponses[keyof SessionListResponses]
+
+export type SessionCreateData = {
+  body?: {
+    parentID?: string
+    title?: string
+    agent?: string
+    model?: {
+      id: string
+      providerID: string
+      accountID?: string
+      variant?: string
+    }
+    metadata?: {
+      [key: string]: unknown
+    }
+    permission?: PermissionRuleset
+    workspaceID?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session"
+}
+
+export type SessionCreateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type SessionCreateError = SessionCreateErrors[keyof SessionCreateErrors]
+
+export type SessionCreateResponses = {
+  /**
+   * Successfully created session
+   */
+  200: Session
+}
+
+export type SessionCreateResponse = SessionCreateResponses[keyof SessionCreateResponses]
+
+export type PermissionReplyData = {
+  body?: {
+    reply: "once" | "always" | "reject"
+    message?: string
+  }
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/permission/{requestID}/reply"
+}
+
+export type PermissionReplyErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * PermissionNotFoundError
+   */
+  404: PermissionNotFoundError
+}
+
+export type PermissionReplyError = PermissionReplyErrors[keyof PermissionReplyErrors]
+
+export type PermissionReplyResponses = {
+  /**
+   * Permission processed successfully
+   */
+  200: boolean
+}
+
+export type PermissionReplyResponse = PermissionReplyResponses[keyof PermissionReplyResponses]
+
+export type PermissionRespondData = {
+  body?: {
+    response: "once" | "always" | "reject"
+  }
+  path: {
+    sessionID: string
+    permissionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/permissions/{permissionID}"
+}
+
+export type PermissionRespondErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * PermissionNotFoundError
+   */
+  404: PermissionNotFoundError
+}
+
+export type PermissionRespondError = PermissionRespondErrors[keyof PermissionRespondErrors]
+
+export type PermissionRespondResponses = {
+  /**
+   * Permission processed successfully
+   */
+  200: boolean
+}
+
+export type PermissionRespondResponse = PermissionRespondResponses[keyof PermissionRespondResponses]
+
+export type QuestionReplyData = {
+  body?: {
+    /**
+     * Selected option labels in question order
+     */
+    answers: Array<QuestionAnswer>
+    details?: Array<string>
+  }
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/question/{requestID}/reply"
+}
+
+export type QuestionReplyErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * QuestionNotFoundError
+   */
+  404: QuestionNotFoundError
+}
+
+export type QuestionReplyError = QuestionReplyErrors[keyof QuestionReplyErrors]
+
+export type QuestionReplyResponses = {
+  /**
+   * Question answered successfully
+   */
+  200: boolean
+}
+
+export type QuestionReplyResponse = QuestionReplyResponses[keyof QuestionReplyResponses]
+
+export type QuestionRejectData = {
+  body?: never
+  path: {
+    requestID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/question/{requestID}/reject"
+}
+
+export type QuestionRejectErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * QuestionNotFoundError
+   */
+  404: QuestionNotFoundError
+}
+
+export type QuestionRejectError = QuestionRejectErrors[keyof QuestionRejectErrors]
+
+export type QuestionRejectResponses = {
+  /**
+   * Question rejected successfully
+   */
+  200: boolean
+}
+
+export type QuestionRejectResponse = QuestionRejectResponses[keyof QuestionRejectResponses]
+
 export type EventSubscribeData = {
   body?: never
   path?: never
@@ -15581,6 +17368,395 @@ export type EventSubscribeResponses = {
 }
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
+
+export type SessionDeleteData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}"
+}
+
+export type SessionDeleteErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionDeleteError = SessionDeleteErrors[keyof SessionDeleteErrors]
+
+export type SessionDeleteResponses = {
+  /**
+   * Successfully deleted session
+   */
+  200: boolean
+}
+
+export type SessionDeleteResponse = SessionDeleteResponses[keyof SessionDeleteResponses]
+
+export type SessionGetData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}"
+}
+
+export type SessionGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionGetError = SessionGetErrors[keyof SessionGetErrors]
+
+export type SessionGetResponses = {
+  /**
+   * Get session
+   */
+  200: Session
+}
+
+export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
+
+export type SessionUpdateData = {
+  body?: {
+    title?: string
+    metadata?: {
+      [key: string]: unknown
+    }
+    permission?: PermissionRuleset
+    agent?: string
+    model?: {
+      providerID: string
+      id: string
+      variant?: string
+    }
+    time?: {
+      archived?: SessionNullableArchivedTimestamp | null
+    }
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}"
+}
+
+export type SessionUpdateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionUpdateError = SessionUpdateErrors[keyof SessionUpdateErrors]
+
+export type SessionUpdateResponses = {
+  /**
+   * Successfully updated session
+   */
+  200: Session
+}
+
+export type SessionUpdateResponse = SessionUpdateResponses[keyof SessionUpdateResponses]
+
+export type SessionChildrenData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/children"
+}
+
+export type SessionChildrenErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionChildrenError = SessionChildrenErrors[keyof SessionChildrenErrors]
+
+export type SessionChildrenResponses = {
+  /**
+   * List of children
+   */
+  200: Array<Session>
+}
+
+export type SessionChildrenResponse = SessionChildrenResponses[keyof SessionChildrenResponses]
+
+export type SessionTodoData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/todo"
+}
+
+export type SessionTodoErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionTodoError = SessionTodoErrors[keyof SessionTodoErrors]
+
+export type SessionTodoResponses = {
+  /**
+   * Todo list
+   */
+  200: Array<Todo>
+}
+
+export type SessionTodoResponse = SessionTodoResponses[keyof SessionTodoResponses]
+
+export type SessionMessagesData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+    limit?: number
+    before?: string
+  }
+  url: "/session/{sessionID}/message"
+}
+
+export type SessionMessagesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionMessagesError = SessionMessagesErrors[keyof SessionMessagesErrors]
+
+export type SessionMessagesResponses = {
+  /**
+   * List of messages
+   */
+  200: Array<{
+    info: Message
+    parts: Array<Part>
+  }>
+}
+
+export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMessagesResponses]
+
+export type SessionPromptData = {
+  body?: {
+    messageID?: string
+    model?: {
+      providerID: string
+      modelID: string
+      accountID?: string
+    }
+    agent?: string
+    noReply?: boolean
+    tools?: {
+      [key: string]: boolean
+    }
+    format?: OutputFormat
+    system?: string
+    variant?: string
+    subProvider?: string
+    parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message"
+}
+
+export type SessionPromptErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
+
+export type SessionPromptResponses = {
+  /**
+   * Created message
+   */
+  200: {
+    info: AssistantMessage
+    parts: Array<Part>
+  }
+}
+
+export type SessionPromptResponse = SessionPromptResponses[keyof SessionPromptResponses]
+
+export type SessionDeleteMessageData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}"
+}
+
+export type SessionDeleteMessageErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * SessionBusyError
+   */
+  409: SessionBusyError
+}
+
+export type SessionDeleteMessageError = SessionDeleteMessageErrors[keyof SessionDeleteMessageErrors]
+
+export type SessionDeleteMessageResponses = {
+  /**
+   * Successfully deleted message
+   */
+  200: boolean
+}
+
+export type SessionDeleteMessageResponse = SessionDeleteMessageResponses[keyof SessionDeleteMessageResponses]
+
+export type SessionMessageData = {
+  body?: never
+  path: {
+    sessionID: string
+    messageID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/message/{messageID}"
+}
+
+export type SessionMessageErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionMessageError = SessionMessageErrors[keyof SessionMessageErrors]
+
+export type SessionMessageResponses = {
+  /**
+   * Message
+   */
+  200: {
+    info: Message
+    parts: Array<Part>
+  }
+}
+
+export type SessionMessageResponse = SessionMessageResponses[keyof SessionMessageResponses]
+
+export type SessionAbortData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/abort"
+}
+
+export type SessionAbortErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionAbortError = SessionAbortErrors[keyof SessionAbortErrors]
+
+export type SessionAbortResponses = {
+  /**
+   * Abort request accepted
+   */
+  200: boolean
+}
+
+export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
 
 export type PairBeginData = {
   body?: never
@@ -16179,113 +18355,6 @@ export type ExperimentalResourceListResponses = {
 
 export type ExperimentalResourceListResponse =
   ExperimentalResourceListResponses[keyof ExperimentalResourceListResponses]
-
-export type ExperimentalOpenrouterTelemetryGetData = {
-  body?: never
-  path?: never
-  query: {
-    directory?: string
-    workspace?: string
-    model: string
-    timeRange?: "1w" | "3d"
-  }
-  url: "/experimental/openrouter-telemetry"
-}
-
-export type ExperimentalOpenrouterTelemetryGetErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-  /**
-   * InternalServerError
-   */
-  500: EffectHttpApiErrorInternalServerError
-}
-
-export type ExperimentalOpenrouterTelemetryGetError =
-  ExperimentalOpenrouterTelemetryGetErrors[keyof ExperimentalOpenrouterTelemetryGetErrors]
-
-export type ExperimentalOpenrouterTelemetryGetResponses = {
-  /**
-   * OpenRouter telemetry
-   */
-  200: OpenRouterTelemetry
-}
-
-export type ExperimentalOpenrouterTelemetryGetResponse =
-  ExperimentalOpenrouterTelemetryGetResponses[keyof ExperimentalOpenrouterTelemetryGetResponses]
-
-export type ExperimentalOpenrouterEndpointsGetData = {
-  body?: never
-  path?: never
-  query: {
-    directory?: string
-    workspace?: string
-    model: string
-  }
-  url: "/experimental/openrouter-endpoints"
-}
-
-export type ExperimentalOpenrouterEndpointsGetErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-  /**
-   * InternalServerError
-   */
-  500: EffectHttpApiErrorInternalServerError
-}
-
-export type ExperimentalOpenrouterEndpointsGetError =
-  ExperimentalOpenrouterEndpointsGetErrors[keyof ExperimentalOpenrouterEndpointsGetErrors]
-
-export type ExperimentalOpenrouterEndpointsGetResponses = {
-  /**
-   * OpenRouter upstream providers
-   */
-  200: OpenRouterEndpoints
-}
-
-export type ExperimentalOpenrouterEndpointsGetResponse =
-  ExperimentalOpenrouterEndpointsGetResponses[keyof ExperimentalOpenrouterEndpointsGetResponses]
-
-export type ExperimentalOpenrouterFreeUsageGetData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-    includeValue?: "true" | "false"
-    forceRefresh?: "true" | "false"
-  }
-  url: "/experimental/openrouter-free-usage"
-}
-
-export type ExperimentalOpenrouterFreeUsageGetErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-  /**
-   * InternalServerError
-   */
-  500: EffectHttpApiErrorInternalServerError
-}
-
-export type ExperimentalOpenrouterFreeUsageGetError =
-  ExperimentalOpenrouterFreeUsageGetErrors[keyof ExperimentalOpenrouterFreeUsageGetErrors]
-
-export type ExperimentalOpenrouterFreeUsageGetResponses = {
-  /**
-   * OpenRouter free usage
-   */
-  200: OpenRouterFreeUsage
-}
-
-export type ExperimentalOpenrouterFreeUsageGetResponse =
-  ExperimentalOpenrouterFreeUsageGetResponses[keyof ExperimentalOpenrouterFreeUsageGetResponses]
 
 export type FindTextData = {
   body?: never
@@ -16925,34 +18994,6 @@ export type CommandListResponses = {
 
 export type CommandListResponse = CommandListResponses[keyof CommandListResponses]
 
-export type AppAgentsData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/agent"
-}
-
-export type AppAgentsErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type AppAgentsError = AppAgentsErrors[keyof AppAgentsErrors]
-
-export type AppAgentsResponses = {
-  /**
-   * List of agents
-   */
-  200: Array<Agent>
-}
-
-export type AppAgentsResponse = AppAgentsResponses[keyof AppAgentsResponses]
-
 export type AppSkillsData = {
   body?: never
   path?: never
@@ -17504,38 +19545,6 @@ export type ExperimentalProjectCopyGenerateNameResponses = {
 export type ExperimentalProjectCopyGenerateNameResponse =
   ExperimentalProjectCopyGenerateNameResponses[keyof ExperimentalProjectCopyGenerateNameResponses]
 
-export type PtyShellsData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/pty/shells"
-}
-
-export type PtyShellsErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type PtyShellsError = PtyShellsErrors[keyof PtyShellsErrors]
-
-export type PtyShellsResponses = {
-  /**
-   * List of shells
-   */
-  200: Array<{
-    path: string
-    name: string
-    acceptable: boolean
-  }>
-}
-
-export type PtyShellsResponse = PtyShellsResponses[keyof PtyShellsResponses]
-
 export type PtyListData = {
   body?: never
   path?: never
@@ -17774,80 +19783,6 @@ export type QuestionListResponses = {
 
 export type QuestionListResponse = QuestionListResponses[keyof QuestionListResponses]
 
-export type QuestionReplyData = {
-  body?: {
-    /**
-     * Selected option labels in question order
-     */
-    answers: Array<QuestionAnswer>
-    details?: Array<string>
-  }
-  path: {
-    requestID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/question/{requestID}/reply"
-}
-
-export type QuestionReplyErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * QuestionNotFoundError
-   */
-  404: QuestionNotFoundError
-}
-
-export type QuestionReplyError = QuestionReplyErrors[keyof QuestionReplyErrors]
-
-export type QuestionReplyResponses = {
-  /**
-   * Question answered successfully
-   */
-  200: boolean
-}
-
-export type QuestionReplyResponse = QuestionReplyResponses[keyof QuestionReplyResponses]
-
-export type QuestionRejectData = {
-  body?: never
-  path: {
-    requestID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/question/{requestID}/reject"
-}
-
-export type QuestionRejectErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * QuestionNotFoundError
-   */
-  404: QuestionNotFoundError
-}
-
-export type QuestionRejectError = QuestionRejectErrors[keyof QuestionRejectErrors]
-
-export type QuestionRejectResponses = {
-  /**
-   * Question rejected successfully
-   */
-  200: boolean
-}
-
-export type QuestionRejectResponse = QuestionRejectResponses[keyof QuestionRejectResponses]
-
 export type PermissionListData = {
   body?: never
   path?: never
@@ -17875,77 +19810,6 @@ export type PermissionListResponses = {
 }
 
 export type PermissionListResponse = PermissionListResponses[keyof PermissionListResponses]
-
-export type PermissionReplyData = {
-  body?: {
-    reply: "once" | "always" | "reject"
-    message?: string
-  }
-  path: {
-    requestID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/permission/{requestID}/reply"
-}
-
-export type PermissionReplyErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * PermissionNotFoundError
-   */
-  404: PermissionNotFoundError
-}
-
-export type PermissionReplyError = PermissionReplyErrors[keyof PermissionReplyErrors]
-
-export type PermissionReplyResponses = {
-  /**
-   * Permission processed successfully
-   */
-  200: boolean
-}
-
-export type PermissionReplyResponse = PermissionReplyResponses[keyof PermissionReplyResponses]
-
-export type ProviderListData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/provider"
-}
-
-export type ProviderListErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type ProviderListError = ProviderListErrors[keyof ProviderListErrors]
-
-export type ProviderListResponses = {
-  /**
-   * List of providers
-   */
-  200: {
-    all: Array<Provider>
-    default: {
-      [key: string]: string
-    }
-    connected: Array<string>
-  }
-}
-
-export type ProviderListResponse = ProviderListResponses[keyof ProviderListResponses]
 
 export type ProviderAuthData = {
   body?: never
@@ -18051,298 +19915,6 @@ export type ProviderOauthCallbackResponses = {
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
 
-export type SessionListData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-    scope?: "project"
-    path?: string
-    roots?: boolean | "true" | "false"
-    start?: number
-    search?: string
-    limit?: number
-  }
-  url: "/session"
-}
-
-export type SessionListErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type SessionListError = SessionListErrors[keyof SessionListErrors]
-
-export type SessionListResponses = {
-  /**
-   * List of sessions
-   */
-  200: Array<Session>
-}
-
-export type SessionListResponse = SessionListResponses[keyof SessionListResponses]
-
-export type SessionCreateData = {
-  body?: {
-    parentID?: string
-    title?: string
-    agent?: string
-    model?: {
-      id: string
-      providerID: string
-      accountID?: string
-      variant?: string
-    }
-    metadata?: {
-      [key: string]: unknown
-    }
-    permission?: PermissionRuleset
-    workspaceID?: string
-  }
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session"
-}
-
-export type SessionCreateErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-}
-
-export type SessionCreateError = SessionCreateErrors[keyof SessionCreateErrors]
-
-export type SessionCreateResponses = {
-  /**
-   * Successfully created session
-   */
-  200: Session
-}
-
-export type SessionCreateResponse = SessionCreateResponses[keyof SessionCreateResponses]
-
-export type SessionStatusData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/status"
-}
-
-export type SessionStatusErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-}
-
-export type SessionStatusError = SessionStatusErrors[keyof SessionStatusErrors]
-
-export type SessionStatusResponses = {
-  /**
-   * Get session status
-   */
-  200: {
-    [key: string]: SessionStatus
-  }
-}
-
-export type SessionStatusResponse = SessionStatusResponses[keyof SessionStatusResponses]
-
-export type SessionDeleteData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}"
-}
-
-export type SessionDeleteErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionDeleteError = SessionDeleteErrors[keyof SessionDeleteErrors]
-
-export type SessionDeleteResponses = {
-  /**
-   * Successfully deleted session
-   */
-  200: boolean
-}
-
-export type SessionDeleteResponse = SessionDeleteResponses[keyof SessionDeleteResponses]
-
-export type SessionGetData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}"
-}
-
-export type SessionGetErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionGetError = SessionGetErrors[keyof SessionGetErrors]
-
-export type SessionGetResponses = {
-  /**
-   * Get session
-   */
-  200: Session
-}
-
-export type SessionGetResponse = SessionGetResponses[keyof SessionGetResponses]
-
-export type SessionUpdateData = {
-  body?: {
-    title?: string
-    metadata?: {
-      [key: string]: unknown
-    }
-    permission?: PermissionRuleset
-    agent?: string
-    model?: {
-      providerID: string
-      id: string
-      variant?: string
-    }
-    time?: {
-      archived?: SessionNullableArchivedTimestamp | null
-    }
-  }
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}"
-}
-
-export type SessionUpdateErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionUpdateError = SessionUpdateErrors[keyof SessionUpdateErrors]
-
-export type SessionUpdateResponses = {
-  /**
-   * Successfully updated session
-   */
-  200: Session
-}
-
-export type SessionUpdateResponse = SessionUpdateResponses[keyof SessionUpdateResponses]
-
-export type SessionChildrenData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/children"
-}
-
-export type SessionChildrenErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionChildrenError = SessionChildrenErrors[keyof SessionChildrenErrors]
-
-export type SessionChildrenResponses = {
-  /**
-   * List of children
-   */
-  200: Array<Session>
-}
-
-export type SessionChildrenResponse = SessionChildrenResponses[keyof SessionChildrenResponses]
-
-export type SessionTodoData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/todo"
-}
-
-export type SessionTodoErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionTodoError = SessionTodoErrors[keyof SessionTodoErrors]
-
-export type SessionTodoResponses = {
-  /**
-   * Todo list
-   */
-  200: Array<Todo>
-}
-
-export type SessionTodoResponse = SessionTodoResponses[keyof SessionTodoResponses]
-
 export type SessionDiffData = {
   body?: never
   path: {
@@ -18373,176 +19945,6 @@ export type SessionDiffResponses = {
 }
 
 export type SessionDiffResponse = SessionDiffResponses[keyof SessionDiffResponses]
-
-export type SessionMessagesData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-    limit?: number
-    before?: string
-  }
-  url: "/session/{sessionID}/message"
-}
-
-export type SessionMessagesErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionMessagesError = SessionMessagesErrors[keyof SessionMessagesErrors]
-
-export type SessionMessagesResponses = {
-  /**
-   * List of messages
-   */
-  200: Array<{
-    info: Message
-    parts: Array<Part>
-  }>
-}
-
-export type SessionMessagesResponse2 = SessionMessagesResponses[keyof SessionMessagesResponses]
-
-export type SessionPromptData = {
-  body?: {
-    messageID?: string
-    model?: {
-      providerID: string
-      modelID: string
-      accountID?: string
-    }
-    agent?: string
-    noReply?: boolean
-    tools?: {
-      [key: string]: boolean
-    }
-    format?: OutputFormat
-    system?: string
-    variant?: string
-    subProvider?: string
-    parts: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
-  }
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/message"
-}
-
-export type SessionPromptErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionPromptError = SessionPromptErrors[keyof SessionPromptErrors]
-
-export type SessionPromptResponses = {
-  /**
-   * Created message
-   */
-  200: {
-    info: AssistantMessage
-    parts: Array<Part>
-  }
-}
-
-export type SessionPromptResponse = SessionPromptResponses[keyof SessionPromptResponses]
-
-export type SessionDeleteMessageData = {
-  body?: never
-  path: {
-    sessionID: string
-    messageID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/message/{messageID}"
-}
-
-export type SessionDeleteMessageErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-  /**
-   * SessionBusyError
-   */
-  409: SessionBusyError
-}
-
-export type SessionDeleteMessageError = SessionDeleteMessageErrors[keyof SessionDeleteMessageErrors]
-
-export type SessionDeleteMessageResponses = {
-  /**
-   * Successfully deleted message
-   */
-  200: boolean
-}
-
-export type SessionDeleteMessageResponse = SessionDeleteMessageResponses[keyof SessionDeleteMessageResponses]
-
-export type SessionMessageData = {
-  body?: never
-  path: {
-    sessionID: string
-    messageID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/message/{messageID}"
-}
-
-export type SessionMessageErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError
-   */
-  404: NotFoundError
-}
-
-export type SessionMessageError = SessionMessageErrors[keyof SessionMessageErrors]
-
-export type SessionMessageResponses = {
-  /**
-   * Message
-   */
-  200: {
-    info: Message
-    parts: Array<Part>
-  }
-}
-
-export type SessionMessageResponse = SessionMessageResponses[keyof SessionMessageResponses]
 
 export type SessionForkData = {
   body?: {
@@ -18582,36 +19984,6 @@ export type SessionForkResponses = {
 }
 
 export type SessionForkResponse = SessionForkResponses[keyof SessionForkResponses]
-
-export type SessionAbortData = {
-  body?: never
-  path: {
-    sessionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/abort"
-}
-
-export type SessionAbortErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-}
-
-export type SessionAbortError = SessionAbortErrors[keyof SessionAbortErrors]
-
-export type SessionAbortResponses = {
-  /**
-   * Aborted session
-   */
-  200: boolean
-}
-
-export type SessionAbortResponse = SessionAbortResponses[keyof SessionAbortResponses]
 
 export type SessionPauseData = {
   body?: never
@@ -18840,6 +20212,7 @@ export type SessionSummarizeData = {
   body?: {
     providerID: string
     modelID: string
+    accountID?: string
     auto?: boolean
   }
   path: {
@@ -18930,6 +20303,7 @@ export type SessionCommandData = {
     messageID?: string
     agent?: string
     model?: string
+    accountID?: string
     arguments: string
     command: string
     variant?: string
@@ -19105,43 +20479,6 @@ export type SessionUnrevertResponses = {
 }
 
 export type SessionUnrevertResponse = SessionUnrevertResponses[keyof SessionUnrevertResponses]
-
-export type PermissionRespondData = {
-  body?: {
-    response: "once" | "always" | "reject"
-  }
-  path: {
-    sessionID: string
-    permissionID: string
-  }
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/session/{sessionID}/permissions/{permissionID}"
-}
-
-export type PermissionRespondErrors = {
-  /**
-   * BadRequest | InvalidRequestError
-   */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
-  /**
-   * NotFoundError | PermissionNotFoundError
-   */
-  404: NotFoundError | PermissionNotFoundError
-}
-
-export type PermissionRespondError = PermissionRespondErrors[keyof PermissionRespondErrors]
-
-export type PermissionRespondResponses = {
-  /**
-   * Permission processed successfully
-   */
-  200: boolean
-}
-
-export type PermissionRespondResponse = PermissionRespondResponses[keyof PermissionRespondResponses]
 
 export type PartDeleteData = {
   body?: never
@@ -19938,7 +21275,6 @@ export type GoalCreateData = {
       title: string
       description?: string
     }>
-    continuationPolicy?: GoalContinuationPolicy
     auditorPolicy?: GoalAuditorPolicy
   }
   path?: never
@@ -20018,7 +21354,6 @@ export type GoalUpdateData = {
       title: string
       description?: string
     }>
-    continuationPolicy?: GoalContinuationPolicy
     auditorPolicy?: GoalAuditorPolicy
   }
   path: {
@@ -20452,7 +21787,6 @@ export type GoalPrepareData = {
       title: string
       description?: string
     }>
-    continuationPolicy?: GoalContinuationPolicy
     auditorPolicy?: GoalAuditorPolicy
     start?: boolean
   }
@@ -20579,37 +21913,6 @@ export type SystemOneInferResponses = {
 }
 
 export type SystemOneInferResponse = SystemOneInferResponses[keyof SystemOneInferResponses]
-
-export type SyncCapabilitiesData = {
-  body?: never
-  path?: never
-  query?: {
-    directory?: string
-    workspace?: string
-  }
-  url: "/sync/capabilities"
-}
-
-export type SyncCapabilitiesErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type SyncCapabilitiesError = SyncCapabilitiesErrors[keyof SyncCapabilitiesErrors]
-
-export type SyncCapabilitiesResponses = {
-  /**
-   * Sync protocol capabilities
-   */
-  200: {
-    version: 1
-    features: Array<string>
-  }
-}
-
-export type SyncCapabilitiesResponse = SyncCapabilitiesResponses[keyof SyncCapabilitiesResponses]
 
 export type SyncStartData = {
   body?: never
@@ -21857,6 +23160,9 @@ export type V2SessionTelemetryResponses = {
             turnStartedAt?: number | null
             phaseStartedAt?: number | null
             updatedAt: number
+            turnElapsedMs?: number | null
+            phaseElapsedMs?: number | null
+            sampledAt?: number | null
             model?: {
               providerID: string
               modelID: string
@@ -25023,6 +26329,26 @@ export type V2PushSubscriptionCreateResponses = {
 
 export type V2PushSubscriptionCreateResponse =
   V2PushSubscriptionCreateResponses[keyof V2PushSubscriptionCreateResponses]
+
+export type PtyShellsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/pty/shells"
+}
+
+export type PtyShellsResponses = {
+  /**
+   * List of shells
+   */
+  200: Array<{
+    path: string
+    name: string
+    acceptable: boolean
+  }>
+}
+
+export type PtyShellsResponse = PtyShellsResponses[keyof PtyShellsResponses]
 
 export type PtyConnectData = {
   body?: never

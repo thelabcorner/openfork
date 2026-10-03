@@ -524,8 +524,10 @@ export type SessionsTelemetryOutput = {
     readonly [x: string]: {
       readonly sessionID: string
       readonly phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      readonly turnStartedAt?: number | undefined
       readonly phaseStartedAt?: number | undefined
       readonly updatedAt: number
+      readonly sampledAt?: number | undefined
       readonly model?:
         | {
             readonly providerID: string
@@ -1195,6 +1197,10 @@ export type SessionsHistoryOutput = {
               readonly accountID?: string
               readonly variant?: string
             }
+            readonly routeIntent?:
+              | { readonly kind: "auto" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly delivery: "steer" | "queue"
           readonly admissionClass: "host" | "automatic"
@@ -1238,6 +1244,10 @@ export type SessionsHistoryOutput = {
               readonly accountID?: string
               readonly variant?: string
             }
+            readonly routeIntent?:
+              | { readonly kind: "auto" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly delivery: "steer" | "queue"
           readonly admissionClass: "host" | "automatic"
@@ -1876,6 +1886,10 @@ export type SessionsEventsOutput =
             readonly accountID?: string
             readonly variant?: string
           }
+          readonly routeIntent?:
+            | { readonly kind: "auto" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly delivery: "steer" | "queue"
         readonly admissionClass: "host" | "automatic"
@@ -1919,6 +1933,10 @@ export type SessionsEventsOutput =
             readonly accountID?: string
             readonly variant?: string
           }
+          readonly routeIntent?:
+            | { readonly kind: "auto" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly delivery: "steer" | "queue"
         readonly admissionClass: "host" | "automatic"

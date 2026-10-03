@@ -163,7 +163,8 @@ const sseTypesPatched = sseTypesSource.replace(
   "=> Promise<ServerSentEventsResult<TData, TError>>",
   "=> Promise<ServerSentEventsResult<TData>>",
 )
-if (sseTypesPatched === sseTypesSource) {
+// Accept an already-correct generated signature; still reject an unknown shape.
+if (sseTypesPatched === sseTypesSource && !sseTypesSource.includes("=> Promise<ServerSentEventsResult<TData>>")) {
   throw new Error(`SseFn patch did not apply; @hey-api/openapi-ts output may have changed (${sseTypesPath})`)
 }
 await Bun.write(sseTypesPath, sseTypesPatched)
