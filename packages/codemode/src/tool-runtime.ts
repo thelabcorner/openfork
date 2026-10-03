@@ -140,10 +140,34 @@ export class ToolRuntimeError extends Error {
 const isDefinition = <R>(value: HostTool<R> | Definition<R> | HostTools<R>): value is Definition<R> =>
   isToolDefinition<R>(value)
 
+/**
+ * Cancellation is any cause carrying an interrupt reason, not only a cause that
+ * carries nothing else. An aborted transport or a tool racing a timeout can
+ * fail and interrupt at once, and that is still cancellation.
+ */
+const isCancellation = (cause: Cause.Cause<unknown>): boolean => cause.reasons.some(Cause.isInterruptReason)
+
+/**
+ * Runs one host tool call across the host/sandbox boundary.
+ *
+ * Only the typed error channel is a tool failure: it is sanitized into a
+ * model-safe `ToolError` and stays program-catchable.
+ *
+ * Cancellation wins over everything, including a failure that arrived with it.
+ * `Effect.catch` would recover that failure and drop the remaining interrupt,
+ * turning a cancelled call into a catchable tool refusal, so cancellation is
+ * re-asserted here and the co-arriving failure is deliberately not observable.
+ *
+ * A genuine defect re-dies behind the same safe message instead of being squashed
+ * into the failure channel, which is what would let a host bug masquerade as a
+ * recoverable refusal. The original value stays private for host diagnostics.
+ */
 const runHost = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, ToolError, R> =>
   effect.pipe(
-    Effect.catchCause((cause) => {
-      if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
+    Effect.catchCause((cause): Effect.Effect<never, ToolError, never> => {
+      if (isCancellation(cause)) return Effect.interrupt
+      if (cause.reasons.some(Cause.isDieReason))
+        return Effect.failCause(Cause.die(toolError("Tool execution failed", Cause.squash(cause))))
       const error = Cause.squash(cause)
       return Effect.fail(error instanceof ToolError ? error : toolError("Tool execution failed", error))
     }),
