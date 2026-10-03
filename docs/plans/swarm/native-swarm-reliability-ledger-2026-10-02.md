@@ -1369,8 +1369,9 @@ Final native-Swarm-focused verification:
 | Schema Swarm contract | **9 / 9 pass** |
 | Tool + OXP + HTTP Swarm surfaces | **40 / 40 pass** |
 | Registry / OXP / OFXP parity + eager/lazy policy | **38 / 38 pass** |
+| Post-flatten broker / registry / direct-create focused gate | **53 / 53 pass** |
 | Core package typecheck | **clean** |
-| OpenCode package typecheck | **clean** |
+| OpenCode package typecheck | **blocked by 1 unrelated concurrent semantic-executor test diagnostic; 0 Swarm diagnostics** |
 | Schema package typecheck | **clean** |
 | Migration replay / checksum | **28 / 28 pass** |
 | Migration generator consistency | **clean — no ungenerated schema changes** |
@@ -1380,8 +1381,10 @@ Final native-Swarm-focused verification:
 | Rejected completion-marker orphan search | **0 matches** |
 | Swarm-owned scoped `git diff --check` | **clean** |
 
-A fresh final OpenCode package-wide typecheck is clean. No `src/swarm/*`,
-`test/swarm/*`, `src/tool/swarm*`, OXP Swarm, registry/parity, or Swarm HTTP diagnostics remain.
+The fresh post-flatten OpenCode package-wide typecheck currently has one unrelated concurrent
+diagnostic in `test/tool/semantic-executor.test.ts` (a `PolicyDenied` effect typing mismatch).
+No `src/swarm/*`, `test/swarm/*`, `src/tool/swarm*`, OXP Swarm, registry/parity, or Swarm HTTP
+diagnostics remain. Core and Schema package typechecks are clean.
 
 The working tree was intentionally not committed because it contains substantial unrelated concurrent work.
 
@@ -1860,7 +1863,7 @@ The original diagnosis held: native Swarm's distributed-systems substrate was co
 This pass moved responsibility from the model into authoritative host machinery:
 
 - routine worker intent is direct and Session-derived;
-- initial coordinator creation is one direct bounded `swarm_create` intent while broad administration remains lazy;
+- initial coordinator creation is one direct bounded `swarm_create` intent with a deliberately flat provider member contract, while broad administration remains lazy;
 - invalid workers/coordinators are rejected before durable activation;
 - dependency knowledge is host-generated, bounded, and carries exact successful-run result/provenance;
 - successful worker self-reports are durable on the exact TaskRun rather than inferred from prose;
@@ -1872,5 +1875,5 @@ This pass moved responsibility from the model into authoritative host machinery:
 - crash anti-replay is bound to the exact completed SessionInput rather than inferred from a Session timestamp or transcript;
 - observability can now tell semantic work from operational churn.
 
-The ordinary interactive live path is now proven end-to-end: initial creation succeeds in one direct bounded `swarm_create` call; managed workers materialize and self-settle; bounded predecessor results carry exact run/member provenance without transcript hydration; and exact durable TaskRun results are auditable through the same Core projection used by HTTP. V2 demonstrated honest truncation at 512 B; V3 transferred an 837-byte three-fact result completely under the final 1 KiB result budget; the direct-creation smoke reduced coordinator setup from three attempts to one. The remaining proof obligation is longitudinal: gather enough real workload telemetry to establish that the historical supersession/replay distribution has collapsed under sustained use, without weakening the fixed authority, compressed-tool, or bounded-context model.
+The ordinary interactive live path is now proven end-to-end: initial creation succeeds in one direct bounded `swarm_create` call using a flat member projection; managed workers materialize and self-settle; bounded predecessor results carry exact run/member provenance without transcript hydration; and exact durable TaskRun results are auditable through the same Core projection used by HTTP. V2 demonstrated honest truncation at 512 B; V3 transferred an 837-byte three-fact result completely under the final 1 KiB result budget. Creation telemetry progressed from three lazy-broker attempts, through one zero-write nested-facade rejection, to one successful flat-facade call with zero broker calls before creation and zero retries. The remaining proof obligation is longitudinal: gather enough real workload telemetry to establish that the historical supersession/replay distribution has collapsed under sustained use, without weakening the fixed authority, compressed-tool, or bounded-context model.
 
