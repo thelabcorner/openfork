@@ -132,5 +132,5 @@ function endpoint(url: string | undefined) {
   return { url, hostname: parsed.hostname, port: parsed.port }
 }
 function executableName() {
-  return process.platform === "win32" ? "opencode-cli.exe" : "opencode-cli"
+  return process.platform === "win32" ? "openfork-cli.exe" : "openfork-cli"
 }

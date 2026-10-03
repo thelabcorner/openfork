@@ -7,6 +7,9 @@ export function createUpdaterSubscriptions() {
   }
 
   return {
+    get(id: number) {
+      return subscriptions.get(id)
+    },
     set(id: number, unsubscribe: () => void) {
       remove(id)
       subscriptions.set(id, unsubscribe)

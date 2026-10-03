@@ -16,6 +16,7 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(types).not.toMatch(/(?:get|read|resolve)(?:Oxp)?Credential/i)
     expect(types).not.toMatch(/metadataUrl|endpointUrl|localMcpUrl/i)
     expect(preloadSource).not.toMatch(/oxp-get-secret|oxp-get-endpoint/i)
+    expect(preloadSource).not.toMatch(/oxp-runtime-(?:trial|accept)/i)
     expect(preloadSource).not.toMatch(/oxp-(?:get|read|resolve)-credential/i)
     expect(types).not.toMatch(/CredentialAPI|credentialRef|saveCredential|removeCredential/)
     expect(preloadSource).not.toMatch(/credential-prompt|credentials:\s*\{/)
@@ -64,8 +65,13 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(source).not.toMatch(/tunnel\.stop\(\)\.catch/)
   })
 
-  test("live endpoint identity changes invalidate and reconverge the bound tunnel", async () => {
-    const source = await fs.readFile(path.join(import.meta.dir, "controller.ts"), "utf8")
+  test("live endpoint or schema identity changes invalidate and reconverge the bound tunnel", async () => {
+    const [source, generation] = await Promise.all([
+      fs.readFile(path.join(import.meta.dir, "controller.ts"), "utf8"),
+      fs.readFile(path.join(import.meta.dir, "generation.ts"), "utf8"),
+    ])
+    expect(generation).toContain("endpoint.schemaFingerprint")
+    expect(generation).toMatch(/identity\s*=.*schemaFingerprint/s)
     expect(source).toContain("observed.endpointChanged && (this.tunnel !== undefined || activeTunnel(this.tunnelReport.state))")
     expect(source).toContain("this.connectionGeneration += 1")
     expect(source).toContain("await this.stopTunnelOnly()")
@@ -125,7 +131,9 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(english).not.toContain('"settings.oxp.policyOnly"')
     expect(english).toContain('"settings.oxp.capability.automation.title": "Scheduled automation"')
     expect(english).toMatch(/Scheduled Tasks inside approved folders.*disabled by default/)
-    expect(english).toMatch(/Configure live OXP supervision, request mediation, and delegated-worker authority/)
+    expect(english).toContain('"settings.oxp.agentSupport.defaultModel.title": "Default delegated-worker model"')
+    expect(english).toContain("This is a preference, not an allowlist; explicit valid selections still win.")
+    expect(english).toContain("Defaults are scoped per folder.")
   })
 
   test("scheduled automation grant is one default-off authority from OXP schema through desktop Settings", async () => {
@@ -182,13 +190,17 @@ describe("OXP Gate D/E/F boundaries", () => {
     expect(key).toContain("await this.connectNow().catch")
   })
 
-  test("replacement sidecar remains observable when old tunnel retirement fails closed", async () => {
+  test("startup auto-connect is scheduled as soon as enabled state is known and survives later sync failures", async () => {
     const source = await fs.readFile(path.join(import.meta.dir, "controller.ts"), "utf8")
     const attach = source.slice(source.indexOf("async attachSidecar"), source.indexOf("private enqueue"))
     expect(attach).toContain("let retirementBlocked = false")
     expect(attach).toContain("retirementBlocked = true")
     expect(attach).toContain("this.sidecarSubscription = sidecar.subscribe")
-    expect(attach).toContain("!retirementBlocked && accepted.enabled")
+    expect(attach).toContain("retirementBlocked || !this.config.get().lifecycle.autoConnect")
+    expect(attach.indexOf("if (accepted.enabled) scheduleAutoConnect()")).toBeLessThan(
+      attach.indexOf('action: "set-openai-api-key"'),
+    )
+    expect(attach).toContain("if (!initialStateRead) scheduleAutoConnect()")
   })
 
   test("sidecar request publication cleans pending ownership on synchronous IPC failure", async () => {

@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises"
 import { basename, join } from "node:path"
 import { constants, brotliCompress } from "node:zlib"
 import { promisify } from "node:util"
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron"
+import { app, BrowserWindow, clipboard, dialog, ipcMain, session as electronSession, shell } from "electron"
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import { parseDesktopNativeBundle, type DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
@@ -29,7 +29,10 @@ import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { RendererTrust } from "./browser/renderer-trust"
 import type { HostOwner, VisualApprovalExpectation } from "./browser/contracts"
+import type { SidecarLivenessState } from "./sidecar-status"
 import { expandHomePath, firstExistingPath } from "./path-resolution"
+import { createSidecarControlTransport } from "./sidecar-control-transport"
+import { sidecarControlLane, type SidecarControlFetchInput } from "@opencode-ai/app/sidecar-control-request"
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
   return [{ name: nativeT("desktop.dialog.files"), extensions: ext }]
@@ -63,6 +66,8 @@ type Deps = {
   killSidecar: () => Promise<void> | void
   relaunch: () => void
   awaitInitialization: () => Promise<ServerReadyData>
+  getSidecarURL: () => string | null
+  rendererTrust: RendererTrust
   consumeInitialDeepLinks: () => Promise<string[]> | string[]
   getDefaultServerUrl: () => Promise<string | null> | string | null
   setDefaultServerUrl: (url: string | null) => Promise<void> | void
@@ -79,6 +84,9 @@ type Deps = {
   exportDebugLogs: () => Promise<string>
   recordFatalRendererError: (error: FatalRendererError) => Promise<void> | void
   setNativeTranslations: (bundle: DesktopNativeBundle) => void
+  sidecarStatus: {
+    subscribe: (listener: (state: SidecarLivenessState) => void) => () => void
+  }
 }
 export function registerIpcHandlers(deps: Deps) {
   // Draft persistence is not required to create or paint a window. Opening the
@@ -88,12 +96,129 @@ export function registerIpcHandlers(deps: Deps) {
   let drafts: ReturnType<typeof createDesktopDraftStore> | undefined
   const draftStore = () => (drafts ??= createDesktopDraftStore(join(app.getPath("userData"), "drafts.sqlite")))
   const updaterSubscriptions = createUpdaterSubscriptions()
+  const sidecarStatusSubscriptions = new Map<number, () => void>()
+  const sidecarControlSession = electronSession.fromPartition("openfork-control-transport-v1", { cache: false })
+  const sidecarAdmissionSession = electronSession.fromPartition("openfork-admission-transport-v1", { cache: false })
+  const sidecarControlFetch = createSidecarControlTransport({
+    sidecarURL: deps.getSidecarURL,
+    fetch: (url, init) => sidecarControlSession.fetch(url.href, init),
+    fetchAdmission: (url, init) => sidecarAdmissionSession.fetch(url.href, init),
+  })
+  const sidecarControlRequests = new Map<
+    string,
+    { senderID: number; controller: AbortController; lane: "urgent" | "admission" }
+  >()
+  app.once("will-quit", () => {
+    for (const request of sidecarControlRequests.values()) request.controller.abort()
+    sidecarControlRequests.clear()
+  })
   app.once("will-quit", updaterSubscriptions.clear)
+  app.once("will-quit", () => {
+    for (const unsubscribe of sidecarStatusSubscriptions.values()) unsubscribe()
+    sidecarStatusSubscriptions.clear()
+  })
   app.on("before-quit", () => drafts?.flush())
   app.once("will-quit", () => drafts?.close())
   app.on("browser-window-created", (_event, win) => win.on("session-end", () => drafts?.flush()))
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
   ipcMain.handle("await-initialization", () => deps.awaitInitialization())
+  ipcMain.handle(
+    "sidecar-control-fetch",
+    async (event: IpcMainInvokeEvent, requestID: string, input: SidecarControlFetchInput) => {
+      if (!deps.rendererTrust.isTrusted(event))
+        throw new Error("Untrusted sidecar control sender")
+      if (
+        typeof requestID !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestID)
+      )
+        throw new Error("Invalid sidecar control request ID")
+      if (
+        !input ||
+        typeof input !== "object" ||
+        typeof input.url !== "string" ||
+        typeof input.method !== "string" ||
+        !input.headers ||
+        typeof input.headers !== "object" ||
+        (input.body !== undefined && typeof input.body !== "string")
+      )
+        throw new Error("Invalid sidecar control request")
+      const key = `${event.sender.id}:${requestID}`
+      const lane = sidecarControlLane(input.url, { method: input.method })
+      if (!lane) throw new Error("Route is not eligible for control transport")
+      if (sidecarControlRequests.has(key)) throw new Error("Duplicate sidecar control request ID")
+      if (sidecarControlRequests.size >= 64) throw new Error("Too many active sidecar control requests")
+      const active = [...sidecarControlRequests.values()]
+      const laneCount = active.filter((request) => request.lane === lane).length
+      const senderCount = active.filter((request) => request.senderID === event.sender.id && request.lane === lane).length
+      // Six stalled runtime admissions cannot occupy cancellation/interest
+      // network sockets or the reserved IPC slots that reach those sockets.
+      if (laneCount >= (lane === "urgent" ? 16 : 48) || senderCount >= (lane === "urgent" ? 8 : 6))
+        throw new Error("Too many active sidecar control requests")
+      const controller = new AbortController()
+      const onDestroyed = () => controller.abort()
+      const state = { senderID: event.sender.id, controller, lane }
+      sidecarControlRequests.set(key, state)
+      event.sender.once("destroyed", onDestroyed)
+      try {
+        return await sidecarControlFetch(input, controller.signal)
+      } finally {
+        event.sender.removeListener("destroyed", onDestroyed)
+        if (sidecarControlRequests.get(key) === state) sidecarControlRequests.delete(key)
+      }
+    },
+  )
+  ipcMain.on("sidecar-control-fetch-abort", (event, requestID: unknown) => {
+    if (!deps.rendererTrust.isTrusted(event)) return
+    if (typeof requestID !== "string") return
+    sidecarControlRequests.get(`${event.sender.id}:${requestID}`)?.controller.abort()
+  })
+  ipcMain.handle("sidecar-liveness-subscribe", (event: IpcMainInvokeEvent) => {
+    if (!BrowserWindow.fromWebContents(event.sender) || event.senderFrame !== event.sender.mainFrame) {
+      throw new Error("Untrusted sidecar status sender")
+    }
+    const id = event.sender.id
+    if (sidecarStatusSubscriptions.has(id)) return
+    const sender = event.sender
+    let dead = false
+    let unsubscribe = () => {}
+    const remove = () => {
+      if (dead) return
+      dead = true
+      unsubscribe()
+      sender.removeListener("destroyed", remove)
+      if (sidecarStatusSubscriptions.get(id) === remove) sidecarStatusSubscriptions.delete(id)
+    }
+    // Publish ownership before subscribe(): the status store immediately
+    // replays its current value and that send may synchronously tear down.
+    sidecarStatusSubscriptions.set(id, remove)
+    const stop = deps.sidecarStatus.subscribe((state) => {
+      if (dead) return
+      if (sender.isDestroyed()) {
+        remove()
+        return
+      }
+      try {
+        sender.send("sidecar-liveness", state)
+      } catch {
+        remove()
+      }
+    })
+    unsubscribe = stop
+    // subscribe() immediately replays the current state. If that synchronous
+    // send failed, `remove()` ran before `unsubscribe` had been assigned; now
+    // that it has, finish tearing down instead of retaining a dead listener.
+    if (dead || sender.isDestroyed()) {
+      dead = true
+      stop()
+      if (sidecarStatusSubscriptions.get(id) === remove) sidecarStatusSubscriptions.delete(id)
+      return
+    }
+    sender.once("destroyed", remove)
+  })
+  ipcMain.handle("sidecar-liveness-unsubscribe", (event: IpcMainInvokeEvent) => {
+    sidecarStatusSubscriptions.get(event.sender.id)?.()
+    sidecarStatusSubscriptions.delete(event.sender.id)
+  })
   ipcMain.handle("consume-initial-deep-links", () => deps.consumeInitialDeepLinks())
   ipcMain.handle("get-default-server-url", () => deps.getDefaultServerUrl())
   ipcMain.handle("set-default-server-url", (_event: IpcMainInvokeEvent, url: string | null) =>
@@ -112,14 +237,41 @@ export function registerIpcHandlers(deps: Deps) {
   ipcMain.handle("resolve-app-path", (_event: IpcMainInvokeEvent, appName: string) => deps.resolveAppPath(appName))
   ipcMain.handle("updater-subscribe", (event) => {
     const id = event.sender.id
-    updaterSubscriptions.set(
-      id,
-      deps.updater.subscribe((state) => {
-        if (event.sender.isDestroyed()) return updaterSubscriptions.delete(id)
-        event.sender.send("updater-state", state)
-      }),
-    )
-    event.sender.once("destroyed", () => updaterSubscriptions.delete(id))
+    const sender = event.sender
+    // Dispose a previous renderer subscription before the new subscription's
+    // immediate state replay can overlap it.
+    updaterSubscriptions.delete(id)
+    let dead = false
+    let unsubscribe = () => {}
+    const remove = () => {
+      if (dead) return
+      dead = true
+      unsubscribe()
+      sender.removeListener("destroyed", remove)
+      if (updaterSubscriptions.get(id) === remove) updaterSubscriptions.delete(id)
+    }
+    updaterSubscriptions.set(id, remove)
+    const stop = deps.updater.subscribe((state) => {
+      if (dead) return
+      if (sender.isDestroyed()) {
+        remove()
+        return
+      }
+      try {
+        sender.send("updater-state", state)
+      } catch {
+        // A renderer can close between the destroyed check and send().
+        // Keep that teardown race from escaping into the updater's state
+        // transition and remove the dead observer.
+        remove()
+      }
+    })
+    unsubscribe = stop
+    if (dead) {
+      stop()
+      return
+    }
+    sender.once("destroyed", remove)
   })
   ipcMain.handle("updater-unsubscribe", (event) => updaterSubscriptions.delete(event.sender.id))
   ipcMain.handle("updater-check", () => deps.updater.check())

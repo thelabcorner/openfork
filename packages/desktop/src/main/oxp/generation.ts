@@ -2,6 +2,7 @@ export type EndpointGenerationInput = {
   state: "stopped" | "ready" | "error"
   generation?: number
   url?: string
+  schemaFingerprint?: string
 }
 
 /**
@@ -44,7 +45,12 @@ export class OxpEndpointGenerationTracker {
       this.identity = undefined
       return { accepted: true, changed }
     }
-    const identity = `${sidecarEpoch}:${endpoint.generation}:${endpoint.url}`
+    // A connector tool schema is part of endpoint identity even when the
+    // loopback route/generation is reused. Treat schema changes as endpoint
+    // replacement so the existing tunnel retirement/reconnect path forces
+    // external MCP clients to rediscover tools instead of retaining a stale
+    // materialized function signature.
+    const identity = `${sidecarEpoch}:${endpoint.generation}:${endpoint.url}:${endpoint.schemaFingerprint ?? ""}`
     const changed = identity !== this.identity
     if (changed) {
       this.identity = identity

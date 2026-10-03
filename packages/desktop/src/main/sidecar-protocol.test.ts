@@ -28,6 +28,21 @@ const state = (): SidecarOxpState => ({
     delegation: "disabled",
     nestedDelegation: false,
   },
+  workerPolicy: {
+    models: [],
+    agents: [],
+    defaultModel: {
+      providerID: "workbuddy",
+      modelID: "deepseek-v4.1-flash",
+    },
+    agentRoots: [
+      {
+        rootID: "22222222-2222-4222-8222-222222222222",
+        agents: [],
+        defaultAgent: "build",
+      },
+    ],
+  },
   endpoint: {
     state: "ready",
     generation: 1,
@@ -87,7 +102,14 @@ describe("desktop sidecar protocol", () => {
           rootID: "22222222-2222-4222-8222-222222222222",
         },
       }),
-    ).toBeUndefined()
+    ).toEqual({
+      type: "oxp-request",
+      id: 13,
+      request: {
+        action: "list-worker-agents",
+        rootID: "22222222-2222-4222-8222-222222222222",
+      },
+    })
     expect(
       parseSidecarCommand({
         type: "oxp-request",
@@ -116,8 +138,39 @@ describe("desktop sidecar protocol", () => {
           agent: "review",
         },
       }),
-    ).toBeUndefined()
+    ).toEqual({
+      type: "oxp-request",
+      id: 14,
+      request: {
+        action: "set-worker-default-agent",
+        rootID: "22222222-2222-4222-8222-222222222222",
+        agent: "review",
+      },
+    })
     expect(parseSidecarCommand({ type: "oxp-request", id: 0, request: { action: "get-state" } })).toBeUndefined()
+    expect(
+      parseSidecarCommand({
+        type: "oxp-request",
+        id: 15,
+        request: {
+          action: "set-worker-default-model",
+          model: {
+            providerID: "workbuddy",
+            modelID: "deepseek-v4.1-flash",
+          },
+        },
+      }),
+    ).toEqual({
+      type: "oxp-request",
+      id: 15,
+      request: {
+        action: "set-worker-default-model",
+        model: {
+          providerID: "workbuddy",
+          modelID: "deepseek-v4.1-flash",
+        },
+      },
+    })
     expect(
       parseSidecarCommand({
         type: "oxp-request",
@@ -192,6 +245,14 @@ describe("desktop sidecar protocol", () => {
     const value = state()
     expect(isSidecarOxpState(value)).toBe(true)
     expect(isSidecarMessage({ type: "oxp-state", state: value })).toBe(true)
+    const trialID = "11111111-1111-4111-8111-111111111111"
+    expect(isSidecarMessage({ type: "oxp-runtime-trial", trialID, state: value })).toBe(true)
+    expect(isSidecarMessage({ type: "oxp-runtime-trial", trialID: "not-a-uuid", state: value })).toBe(false)
+    expect(parseSidecarCommand({ type: "oxp-runtime-accept", trialID })).toEqual({
+      type: "oxp-runtime-accept",
+      trialID,
+    })
+    expect(parseSidecarCommand({ type: "oxp-runtime-accept", trialID: "not-a-uuid" })).toBeUndefined()
     expect(isSidecarMessage({ type: "oxp-response", id: 1, ok: true, state: value })).toBe(true)
     expect(
       isSidecarMessage({
@@ -208,9 +269,25 @@ describe("desktop sidecar protocol", () => {
           nativeDefaultAgent: "build",
         },
       }),
-    ).toBe(false)
+    ).toBe(true)
 
     expect(isSidecarMessage({ type: "oxp-state", state: { ...value, grant: { read: true } } })).toBe(false)
+    expect(isSidecarOxpState({ ...value, workerPolicy: { models: [], agents: [] } })).toBe(true)
+    expect(
+      isSidecarOxpState({
+        ...value,
+        workerPolicy: {
+          ...value.workerPolicy,
+          agentRoots: [
+            {
+              rootID: "33333333-3333-4333-8333-333333333333",
+              agents: [],
+              defaultAgent: "build",
+            },
+          ],
+        },
+      }),
+    ).toBe(false)
     expect(isSidecarMessage({ type: "oxp-state", state: { ...value, endpoint: { state: "ready", generation: 0 } } })).toBe(false)
     expect(isSidecarOxpState({ ...value, endpoint: { ...value.endpoint, url: `http://example.com:41234/mcp/${"a".repeat(43)}` } })).toBe(false)
     expect(isSidecarOxpState({ ...value, endpoint: { ...value.endpoint, url: `http://127.0.0.1:41234/mcp/${"b".repeat(43)}` } })).toBe(false)

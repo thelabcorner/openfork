@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { $ } from "bun"
 
-import { buildLocalCliToResources, downloadCliToResources, resolveChannel } from "./utils"
+import { buildLocalCliToResources, resolveChannel } from "./utils"
 import { fetchTunnelClient } from "./fetch-tunnel-client"
 import { preflightWorktreeStore, stageWorktreeStore } from "./fetch-worktree-store"
 
@@ -22,12 +22,9 @@ await fetchTunnelClient()
 // Unpinned dev builds continue without it; beta/prod fail closed so a
 // production build can never ship an unverified sidecar.
 await stageWorktreeStore({ channel })
-// Dev builds normally pull a *pinned upstream* CLI npm package
-// (`@opencode-ai/cli-*@0.0.0-next-*`, see utils.ts). A dev pre-release of this
-// fork must ship the CLI built from the current source instead, so CI sets
-// OPENCODE_DESKTOP_LOCAL_CLI=1 to build the host-platform binary from
-// ../opencode and stage it into resources/.
+// OpenFork desktop builds never source their runnable CLI from upstream OpenCode
+// packages. Dev bundles always build the host-platform OpenFork CLI from the
+// current tree so the sidecar and CLI cannot silently diverge in provenance.
 if (channel === "dev") {
-  if (process.env.OPENCODE_DESKTOP_LOCAL_CLI === "1") await buildLocalCliToResources()
-  else await downloadCliToResources()
+  await buildLocalCliToResources()
 }

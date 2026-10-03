@@ -100,7 +100,7 @@ export function getBackgroundColor(): string | undefined {
 function iconsDir() {
   return app.isPackaged ? join(process.resourcesPath, "icons") : join(root, "../../resources/icons")
 }
-function iconPath() {
+export function iconPath() {
   const ext = process.platform === "win32" ? "ico" : "png"
   return join(iconsDir(), `icon.${ext}`)
 }

@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url"
 import { app, utilityProcess } from "electron"
 import type { Details } from "electron"
 import { getLogger } from "./logging"
+import { startSidecarLiveness } from "./sidecar-liveness"
+import { sidecarInspectorExecArgv, sidecarInspectorURL } from "./sidecar-inspector"
 import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
@@ -11,12 +13,14 @@ import { resolveWorktreeStoreSidecarEnv } from "./worktree-store-env"
 import {
   isSidecarMessage,
   type OxpSidecarRequest,
+  type SidecarOxpAgentCatalog,
   type SidecarOxpState,
 } from "./sidecar-protocol"
 export type HealthCheck = { wait: Promise<void> }
 export type SidecarListener = { stop: () => Promise<void> }
 export type OxpSidecarClient = {
   request: (request: OxpSidecarRequest) => Promise<SidecarOxpState>
+  listWorkerAgents: (rootID: string) => Promise<SidecarOxpAgentCatalog>
   subscribe: (listener: (state: SidecarOxpState) => void) => () => void
   onClosed: (listener: (code: number) => void) => () => void
 }
@@ -35,6 +39,7 @@ type SpawnLocalServerOptions = {
   onStdout?: (message: string) => void
   onStderr?: (message: string) => void
   onExit?: (code: number) => void
+  onLiveness?: (state: "healthy" | "suspected-hang" | "stopped", details: { consecutiveFailures: number; checkedAt: string }) => void
 }
 export function getDefaultServerUrl(): string | null {
   const value = getStore().get(DEFAULT_SERVER_URL_KEY)
@@ -71,8 +76,13 @@ export async function spawnLocalServer(
     env: createSidecarEnv(options.env),
     serviceName: SIDECAR_SERVICE_NAME,
     stdio: "pipe",
+    // Node's inspector binds an OS-assigned loopback port; never enabled in packaged builds.
+    ...(sidecarInspectorExecArgv(app.isPackaged).length ? { execArgv: sidecarInspectorExecArgv(app.isPackaged) } : {}),
   })
   let exited = false
+  const sidecarStartedAt = new Date().toISOString()
+  let inspectorURL: string | undefined
+  let stderrRemainder = ""
   const exit = defer<number>()
   const onProcessGone = (_event: unknown, details: Details) => {
     if (details.type !== "Utility" || details.name !== SIDECAR_SERVICE_NAME) return
@@ -87,7 +97,17 @@ export async function spawnLocalServer(
   })
   child.on("error", (error) => options.onStderr?.(`utility process error: ${serializeError(error).message}`))
   child.stdout?.on("data", (chunk: Buffer) => options.onStdout?.(chunk.toString("utf8").trimEnd()))
-  child.stderr?.on("data", (chunk: Buffer) => options.onStderr?.(chunk.toString("utf8").trimEnd()))
+  child.stderr?.on("data", (chunk: Buffer) => {
+    const lines = (stderrRemainder + chunk.toString("utf8")).split(/\r?\n/)
+    stderrRemainder = lines.pop() ?? ""
+    for (const text of lines) {
+      const address = sidecarInspectorURL(text)
+      if (address) {
+        inspectorURL = address
+        options.onStderr?.(`sidecar inspector available ${JSON.stringify({ url: inspectorURL, pid: child.pid })}`)
+      } else if (text.trim()) options.onStderr?.(text)
+    }
+  })
   await new Promise<void>((resolve, reject) => {
     let done = false
     let timeout: NodeJS.Timeout
@@ -154,6 +174,11 @@ export async function spawnLocalServer(
     (signal) => checkHealth(`http://${hostname}:${port}`, password, signal),
     exit.promise,
   )
+  const stopLiveness = startSidecarLiveness({
+    probe: async () => checkHealth(`http://${hostname}:${port}`, password),
+    onState: (state, details) => options.onLiveness?.(state, details),
+  })
+  void exit.promise.then(() => stopLiveness())
   const oxp = createOxpSidecarClient(child, exit.promise)
   let stopping: Promise<void> | undefined
   return {
@@ -173,6 +198,7 @@ export async function spawnLocalServer(
     },
     health: { wait },
     oxp,
+    identity: { pid: child.pid, startedAt: sidecarStartedAt, get inspectorURL() { return inspectorURL } },
   }
 }
 
@@ -186,13 +212,37 @@ function createOxpSidecarClient(
     number,
     { resolve: (state: SidecarOxpState) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
   >()
+  const catalogPending = new Map<
+    number,
+    { resolve: (catalog: SidecarOxpAgentCatalog) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+  >()
 
   const listeners = new Set<(state: SidecarOxpState) => void>()
   const closeListeners = new Set<(code: number) => void>()
   const onMessage = (value: unknown) => {
     if (!isSidecarMessage(value)) return
-    if (value.type === "oxp-state") {
+    if (value.type === "oxp-state" || value.type === "oxp-runtime-trial") {
       for (const listener of listeners) listener(value.state)
+      if (value.type === "oxp-runtime-trial") {
+        // Acknowledge only after Electron main has consumed the exact candidate
+        // state. If this private IPC send fails, the coordinator's deadline
+        // remains authoritative and automatically rolls the candidate back.
+        try {
+          child.postMessage({
+            type: "oxp-runtime-accept",
+            trialID: value.trialID,
+          })
+        } catch {}
+      }
+      return
+    }
+    if (value.type === "oxp-agent-catalog-response") {
+      const waiter = catalogPending.get(value.id)
+      if (!waiter) return
+      catalogPending.delete(value.id)
+      clearTimeout(waiter.timer)
+      if (value.ok === true) waiter.resolve(value.catalog)
+      else waiter.reject(Object.assign(new Error(value.error.message), value.error.code ? { code: value.error.code } : {}))
       return
     }
     if (value.type !== "oxp-response") return
@@ -214,6 +264,11 @@ function createOxpSidecarClient(
       waiter.reject(error)
     }
     pending.clear()
+    for (const waiter of catalogPending.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    catalogPending.clear()
 
     listeners.clear()
     for (const listener of closeListeners) listener(code)
@@ -236,6 +291,29 @@ function createOxpSidecarClient(
         } catch (error) {
           clearTimeout(timer)
           pending.delete(id)
+          reject(error instanceof Error ? error : new Error("Failed to send OXP request to the sidecar"))
+        }
+      })
+    },
+    listWorkerAgents(rootID) {
+      if (closed) return Promise.reject(new Error("OpenFork sidecar is not running"))
+      const id = ++sequence
+      return new Promise<SidecarOxpAgentCatalog>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          catalogPending.delete(id)
+          reject(new Error(`OXP sidecar request timed out after ${OXP_REQUEST_TIMEOUT}ms`))
+        }, OXP_REQUEST_TIMEOUT)
+        timer.unref?.()
+        catalogPending.set(id, { resolve, reject, timer })
+        try {
+          child.postMessage({
+            type: "oxp-request",
+            id,
+            request: { action: "list-worker-agents", rootID },
+          })
+        } catch (error) {
+          clearTimeout(timer)
+          catalogPending.delete(id)
           reject(error instanceof Error ? error : new Error("Failed to send OXP request to the sidecar"))
         }
       })

@@ -2,7 +2,7 @@ import { dialog, ipcMain } from "electron"
 import type { IpcMainInvokeEvent } from "electron"
 import type { RendererTrust } from "../browser/renderer-trust"
 import { nativeT } from "../native-translations"
-import type { SidecarOxpGrant } from "../sidecar-protocol"
+import type { SidecarOxpGrant, SidecarOxpModelSelection } from "../sidecar-protocol"
 import type { OxpLifecycle } from "./config"
 import type { OxpController } from "./controller"
 import { projectOxpIpcError } from "./ipc-error"
@@ -66,6 +66,45 @@ function lifecyclePatch(value: unknown): Partial<OxpLifecycle> {
   return result
 }
 
+function modelSelection(value: unknown): SidecarOxpModelSelection | undefined {
+  if (value === undefined) return
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid OXP model selection")
+  }
+  const source = value as Record<string, unknown>
+  const allowed = new Set(["providerID", "modelID", "accountID", "variant"])
+  if (Object.keys(source).some((key) => !allowed.has(key))) {
+    throw new Error("Invalid OXP model selection")
+  }
+  const providerID = boundedString(source.providerID, "provider ID", 256).trim()
+  const modelID = boundedString(source.modelID, "model ID", 256).trim()
+  if (!providerID || !modelID || /[\x00-\x1f\x7f]/.test(providerID + modelID)) {
+    throw new Error("Invalid OXP model selection")
+  }
+  const accountID =
+    source.accountID === undefined
+      ? undefined
+      : boundedString(source.accountID, "account ID", 256).trim()
+  const variant =
+    source.variant === undefined
+      ? undefined
+      : boundedString(source.variant, "variant", 256).trim()
+  if (
+    (accountID !== undefined &&
+      (!accountID || /[\x00-\x1f\x7f]/.test(accountID))) ||
+    (variant !== undefined &&
+      (!variant || /[\x00-\x1f\x7f]/.test(variant)))
+  ) {
+    throw new Error("Invalid OXP model selection")
+  }
+  return {
+    providerID,
+    modelID,
+    ...(accountID ? { accountID } : {}),
+    ...(variant ? { variant } : {}),
+  }
+}
+
 export function registerOxpIpc(controller: OxpController, trust: RendererTrust) {
   const subscriptions = new Map<number, () => void>()
   const handler = <Args extends unknown[], Result>(
@@ -88,6 +127,36 @@ export function registerOxpIpc(controller: OxpController, trust: RendererTrust) 
     return controller.setEnabled(enabled)
   })
   handler("oxp-set-grant", (_event, patch: unknown) => controller.setGrant(grantPatch(patch)))
+  handler("oxp-set-worker-default-model", (_event, value: unknown) =>
+    controller.setWorkerDefaultModel(modelSelection(value)),
+  )
+  handler("oxp-list-worker-agents", (_event, rootID: unknown) =>
+    controller.listWorkerAgents(boundedString(rootID, "root ID", 128)),
+  )
+  handler(
+    "oxp-set-worker-default-agent",
+    (_event, rootID: unknown, agent: unknown) => {
+      const normalizedRootID = boundedString(rootID, "root ID", 128)
+      if (agent === undefined) {
+        return controller.setWorkerDefaultAgent(normalizedRootID)
+      }
+      const normalizedAgent = boundedString(
+        agent,
+        "worker agent",
+        256,
+      ).trim()
+      if (
+        !normalizedAgent ||
+        /[\x00-\x1f\x7f]/.test(normalizedAgent)
+      ) {
+        throw new Error("Invalid OXP worker agent")
+      }
+      return controller.setWorkerDefaultAgent(
+        normalizedRootID,
+        normalizedAgent,
+      )
+    },
+  )
   handler("oxp-add-root", async (event) => {
     const result = await dialog.showOpenDialog({
       title: nativeT("desktop.oxp.dialog.chooseFolder"),

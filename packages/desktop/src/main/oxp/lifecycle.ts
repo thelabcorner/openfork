@@ -3,18 +3,17 @@ import os from "node:os"
 import path from "node:path"
 import { app, BrowserWindow, Menu, nativeImage, Tray } from "electron"
 import { nativeT } from "../native-translations"
-import { setAppQuitting, setCloseToTray, setInitialWindowsHidden, showMainWindows } from "../windows"
+import { iconPath, setAppQuitting, setCloseToTray, setInitialWindowsHidden, showMainWindows } from "../windows"
 import type { OxpLifecycle } from "./config"
 
 export const START_HIDDEN_ARG = "--openfork-start-hidden"
 
 function trayIcon() {
-  const ext = process.platform === "win32" ? "ico" : "png"
   const candidates = app.isPackaged
-    ? [path.join(process.resourcesPath, "icons", `icon.${ext}`)]
+    ? [iconPath()]
     : [
-        path.join(app.getAppPath(), "resources", "icons", `icon.${ext}`),
-        path.join(import.meta.dirname, "../../../resources/icons", `icon.${ext}`),
+        iconPath(),
+        path.join(import.meta.dirname, "../../../resources/icons", `icon.${process.platform === "win32" ? "ico" : "png"}`),
       ]
   for (const candidate of candidates) {
     const image = nativeImage.createFromPath(candidate)

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
-import type { BrowserAPI, ElectronAPI, OxpDesktopState, WslServersEvent } from "./types"
+import type { BrowserAPI, ElectronAPI, OxpDesktopState, SidecarLivenessEvent, WslServersEvent } from "./types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 
 const updaterCallbacks = new Set<(state: UpdaterState) => void>()
@@ -15,6 +15,38 @@ let oxpRemoteSubscribed = false
 let oxpSubscriptionTransition: Promise<void> = Promise.resolve()
 const oxpHandler = (_: unknown, state: OxpDesktopState) => {
   for (const callback of oxpCallbacks) callback(state)
+}
+const sidecarLivenessCallbacks = new Set<(event: SidecarLivenessEvent) => void>()
+const sidecarLivenessHandler = (_: unknown, event: SidecarLivenessEvent) => {
+  for (const callback of sidecarLivenessCallbacks) callback(event)
+}
+let sidecarLivenessSubscribed = false
+let sidecarLivenessTransition: Promise<void> = Promise.resolve()
+
+function reconcileSidecarLivenessSubscription() {
+  const reconcile = async () => {
+    while (true) {
+      const wanted = sidecarLivenessCallbacks.size > 0
+      if (wanted === sidecarLivenessSubscribed) return
+      if (wanted) {
+        ipcRenderer.on("sidecar-liveness", sidecarLivenessHandler)
+        try {
+          await ipcRenderer.invoke("sidecar-liveness-subscribe")
+          sidecarLivenessSubscribed = true
+        } catch (error) {
+          ipcRenderer.removeListener("sidecar-liveness", sidecarLivenessHandler)
+          throw error
+        }
+        continue
+      }
+      await ipcRenderer.invoke("sidecar-liveness-unsubscribe")
+      sidecarLivenessSubscribed = false
+      ipcRenderer.removeListener("sidecar-liveness", sidecarLivenessHandler)
+    }
+  }
+  const run = sidecarLivenessTransition.then(reconcile, reconcile)
+  sidecarLivenessTransition = run.catch(() => undefined)
+  return run
 }
 
 function reconcileOxpSubscription() {
@@ -100,7 +132,26 @@ const browserApi: BrowserAPI = {
 }
 
 const api: ElectronAPI = {
+  sidecarControlFetch: (requestID, input) => ipcRenderer.invoke("sidecar-control-fetch", requestID, input),
+  cancelSidecarControlFetch: (requestID) => ipcRenderer.send("sidecar-control-fetch-abort", requestID),
   killSidecar: () => ipcRenderer.invoke("kill-sidecar"),
+  onSidecarLivenessChanged: async (cb) => {
+    sidecarLivenessCallbacks.add(cb)
+    try {
+      await reconcileSidecarLivenessSubscription()
+    } catch (error) {
+      sidecarLivenessCallbacks.delete(cb)
+      void reconcileSidecarLivenessSubscription().catch(() => undefined)
+      throw error
+    }
+    let active = true
+    return () => {
+      if (!active) return
+      active = false
+      sidecarLivenessCallbacks.delete(cb)
+      void reconcileSidecarLivenessSubscription().catch(() => undefined)
+    }
+  },
   installCli: () => ipcRenderer.invoke("install-cli"),
   awaitInitialization: () => ipcRenderer.invoke("await-initialization"),
   wslServers: {
@@ -166,6 +217,12 @@ const api: ElectronAPI = {
     },
     setEnabled: (enabled) => ipcRenderer.invoke("oxp-set-enabled", enabled),
     setGrant: (patch) => ipcRenderer.invoke("oxp-set-grant", patch),
+    setWorkerDefaultModel: (model) =>
+      ipcRenderer.invoke("oxp-set-worker-default-model", model),
+    listWorkerAgents: (rootID) =>
+      ipcRenderer.invoke("oxp-list-worker-agents", rootID),
+    setWorkerDefaultAgent: (rootID, agent) =>
+      ipcRenderer.invoke("oxp-set-worker-default-agent", rootID, agent),
     addRoot: () => ipcRenderer.invoke("oxp-add-root"),
     syncProjectRoots: (paths) => ipcRenderer.invoke("oxp-sync-project-roots", paths),
     renameRoot: (rootID, alias) => ipcRenderer.invoke("oxp-rename-root", rootID, alias),

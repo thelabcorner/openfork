@@ -6,6 +6,7 @@ import { ZipWriter, BlobWriter, BlobReader } from "@zip.js/zip.js"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
 import { createLogThrottle } from "./log-throttle"
+import { rotateLogHistory } from "./log-retention"
 const MAX_LOG_AGE_DAYS = 7
 const TAIL_LINES = 1000
 const EXPORT_WINDOW = 24 * 60 * 60 * 1000
@@ -30,6 +31,15 @@ export function netLogEnabled() {
 export function initLogging() {
   initRunDirectory()
   log.transports.file.maxSize = 5 * 1024 * 1024
+  log.transports.file.archiveLogFn = (oldLogFile) => {
+    try {
+      rotateLogHistory(oldLogFile.path)
+    } catch {
+      // Rotation must never take the logger down. Clearing is the same
+      // bounded fallback electron-log uses when an archive rename fails.
+      oldLogFile.clear()
+    }
+  }
   log.transports.file.resolvePathFn = (_vars, message) =>
     join(
       run,

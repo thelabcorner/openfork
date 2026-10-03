@@ -31,7 +31,7 @@ export class RendererTrust {
 
   /** Is `event.sender` an authorized app-renderer webContents in its MAIN
    * frame? Guests and sub-frames fail on both conditions. */
-  isTrusted(event: IpcMainInvokeEvent): boolean {
+  isTrusted(event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">): boolean {
     if (!this.ids.has(event.sender.id)) return false
     if (event.senderFrame !== event.sender.mainFrame) return false
     return true

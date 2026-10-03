@@ -8,7 +8,9 @@ import {
   handshakePath,
   legacyHandshakePaths,
   removeHandshake,
+  readHandshake,
   writeHandshake,
+  type DevHandshake,
 } from "../../../mobile/dev/handshake"
 import { agentTokenPath } from "../../../mobile/dev/agent-token"
 import { provisionAgentToken } from "../../../mobile/dev/agent-token-provision"
@@ -47,7 +49,8 @@ export type MobileHandshake = {
    * was not spawned by us (the v2 daemon path) so the file names the identity
    * that server actually reports rather than one it never received.
    */
-  publish(url: string, instanceID?: string): void
+  publish(url: string, instanceID?: string, sidecar?: { pid: number; startedAt: string; inspectorURL?: string }): void
+  previous(): DevHandshake | undefined
   /**
    * Asks a server we did not spawn who it is, so `publish` can pin to a real
    * identity. Resolves `undefined` for anything that cannot answer.
@@ -108,6 +111,9 @@ export function createMobileHandshake(options: MobileHandshakeOptions): MobileHa
       [ENV_INSTANCE_ID]: instanceID,
       ...(runID ? { [ENV_RUN_ID]: runID } : {}),
     },
+    previous() {
+      return readHandshake(file)?.handshake
+    },
     async discover(url: string) {
       if (!enabled) return undefined
       try {
@@ -122,7 +128,7 @@ export function createMobileHandshake(options: MobileHandshakeOptions): MobileHa
         return undefined
       }
     },
-    publish(url: string, discovered?: string) {
+    publish(url: string, discovered?: string, sidecar?: { pid: number; startedAt: string; inspectorURL?: string }) {
       if (!enabled) return
       purgeLegacy()
       try {
@@ -134,6 +140,13 @@ export function createMobileHandshake(options: MobileHandshakeOptions): MobileHa
           pid: process.pid,
           startedAt: new Date().toISOString(),
           channel: options.channel,
+          ...(sidecar
+            ? {
+                sidecarPID: sidecar.pid,
+                sidecarStartedAt: sidecar.startedAt,
+                ...(sidecar.inspectorURL ? { inspectorURL: sidecar.inspectorURL } : {}),
+              }
+            : {}),
         })
         published = true
         log("mobile dev handshake published", { url, instanceID: discovered ?? instanceID, runID, file })

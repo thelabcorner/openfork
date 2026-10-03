@@ -40,6 +40,7 @@ const APP_IDS = {
   beta: "ai.openfork.desktop.beta",
   prod: "ai.openfork.desktop",
 } as const
+const packagedIcons = "icons/prod"
 
 const getBase = (appId: string): Configuration => ({
   artifactName: "openfork-desktop-${os}-${arch}.${ext}",
@@ -72,17 +73,24 @@ const getBase = (appId: string): Configuration => ({
   files: [
     "out/**/*",
     "resources/**/*",
+    "!resources/openfork-cli*",
     "!resources/opencode-cli*",
     "!resources/tunnel/**/*",
     "!resources/worktree-store/**/*",
   ],
   extraResources: [
+    {
+      // Debug runs use resources/icons (the green Dev artwork). Installers
+      // deliberately ship the blue production artwork instead.
+      from: `${packagedIcons}/`,
+      to: "icons/",
+    },
     ...(channel === "dev"
       ? [
           {
             from: "resources/",
             to: "",
-            filter: ["opencode-cli*"],
+            filter: ["openfork-cli*"],
           },
         ]
       : []),
@@ -114,7 +122,7 @@ const getBase = (appId: string): Configuration => ({
   ],
   mac: {
     category: "public.app-category.developer-tools",
-    icon: `resources/icons/icon.icns`,
+    icon: `${packagedIcons}/icon.icns`,
     hardenedRuntime: true,
     gatekeeperAssess: false,
     entitlements: "resources/entitlements.plist",
@@ -132,7 +140,7 @@ const getBase = (appId: string): Configuration => ({
     schemes: ["opencode"],
   },
   win: {
-    icon: `resources/icons/icon.ico`,
+    icon: `${packagedIcons}/icon.ico`,
     signtoolOptions: {
       sign: signWindows,
     },
@@ -142,11 +150,11 @@ const getBase = (appId: string): Configuration => ({
   nsis: {
     oneClick: true,
     perMachine: false,
-    installerIcon: `resources/icons/icon.ico`,
-    installerHeaderIcon: `resources/icons/icon.ico`,
+    installerIcon: `${packagedIcons}/icon.ico`,
+    installerHeaderIcon: `${packagedIcons}/icon.ico`,
   },
   linux: {
-    icon: `resources/icons`,
+    icon: packagedIcons,
     category: "Development",
     executableName: appId,
     desktop: {

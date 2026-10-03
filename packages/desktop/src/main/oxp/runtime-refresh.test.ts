@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url"
 import {
   RuntimeRefreshCoordinator,
   type RuntimeBackendModule,
+  type RuntimeBackendTransition,
   type RuntimeRefreshControl,
 } from "./runtime-refresh"
 import type { SidecarOxpState } from "../sidecar-protocol"
@@ -73,7 +74,12 @@ function state(
 function fakeModule(
   artifact: string,
   endpoint: SidecarOxpState,
-  options: { restoreError?: Error } = {},
+  options: {
+    restoreError?: Error
+    restoreErrors?: readonly (Error | undefined)[]
+    disposeError?: Error
+    protocolVersion?: number
+  } = {},
 ) {
   let control: RuntimeRefreshControl | undefined
   const counters = {
@@ -84,6 +90,7 @@ function fakeModule(
   const module: RuntimeBackendModule = {
     runtimeModuleUrl: pathToFileURL(artifact).href,
     OxpRuntimeRefresh: {
+      PROTOCOL_VERSION: options.protocolVersion ?? 2,
       install(next) {
         control = next
       },
@@ -92,17 +99,30 @@ function fakeModule(
       getState: returnState,
       async restore() {
         counters.restore += 1
-        if (options.restoreError) throw options.restoreError
+        const restoreError =
+          options.restoreErrors?.[counters.restore - 1] ?? options.restoreError
+        if (restoreError) throw restoreError
         return endpoint
       },
       async dispose() {
         counters.dispose += 1
+        if (options.disposeError) throw options.disposeError
       },
       start: returnState,
       stop: returnState,
       revoke: returnState,
       setEnabled: returnState,
       setGrant: returnState,
+      setWorkerDefaultModel: returnState,
+      async listWorkerAgents(rootID) {
+        return {
+          rootID,
+          rootAlias: "test",
+          agents: [],
+          nativeDefaultAgent: "build",
+        }
+      },
+      setWorkerDefaultAgent: returnState,
       approveRoot: returnState,
       syncProjectRoots: returnState,
       renameRoot: returnState,
@@ -135,6 +155,25 @@ function artifactOptions(root: string, artifact: string) {
   }
 }
 
+function backendTransition(initial: RuntimeBackendModule, events: string[] = []) {
+  let current: RuntimeBackendModule | undefined = initial
+  const names = new Map<RuntimeBackendModule, string>()
+  const api: RuntimeBackendTransition & {
+    readonly name: (module: RuntimeBackendModule, name: string) => void
+  } = {
+    current: () => current,
+    name(module, name) {
+      names.set(module, name)
+    },
+    async transition(from, to) {
+      expect(current).toBe(from)
+      events.push(`${names.get(from) ?? "unknown"}->${names.get(to) ?? "unknown"}`)
+      current = to
+    },
+  }
+  return api
+}
+
 async function waitFor(
   predicate: () => boolean,
   timeoutMs = 1_000,
@@ -146,7 +185,208 @@ async function waitFor(
   }
 }
 
+async function exists(filepath: string) {
+  try {
+    await fs.access(filepath)
+    return true
+  } catch {
+    return false
+  }
+}
+
 describe("OXP transactional runtime refresh coordinator", () => {
+  test("moves the ordinary HTTP backend only after candidate OXP readiness passes", async () => {
+    const { root, artifact } = await fixture()
+    const events: string[] = []
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const transition = backendTransition(previous.module, events)
+    transition.name(previous.module, "previous")
+    transition.name(candidate.module, "candidate")
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => events.push("publish"),
+      probe: async (next) => {
+        events.push(`probe:${next.endpoint.schemaFingerprint?.slice(0, 1)}`)
+      },
+      backendTransition: transition,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 200,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+
+    expect(transition.current()).toBe(candidate.module)
+    expect(events).toEqual(["probe:2", "previous->candidate", "publish"])
+    await coordinator.acceptFromHost(staged.status.trial!.id)
+    await coordinator.dispose()
+  })
+
+  test("never moves the ordinary HTTP backend when candidate OXP readiness fails", async () => {
+    const { root, artifact } = await fixture()
+    const events: string[] = []
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const transition = backendTransition(previous.module, events)
+    transition.name(previous.module, "previous")
+    transition.name(candidate.module, "candidate")
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async (next) => {
+        if (next.endpoint.schemaFingerprint === "2".repeat(64)) throw new Error("candidate not ready")
+      },
+      backendTransition: transition,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "stable")
+
+    expect(transition.current()).toBe(previous.module)
+    expect(events).toEqual([])
+    expect(coordinator.status().runtimeID).toBe(previousID)
+    await coordinator.dispose()
+  })
+
+  test("restores previous runtime truth when HTTP candidate activation rejects but restores its source", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    let current: RuntimeBackendModule | undefined = previous.module
+    let candidatePublished = false
+    const transition: RuntimeBackendTransition = {
+      current: () => current,
+      async transition(from, to) {
+        expect(from).toBe(previous.module)
+        expect(to).toBe(candidate.module)
+        current = previous.module
+        throw new Error("candidate HTTP activation failed")
+      },
+    }
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: (next) => {
+        if (next.endpoint.schemaFingerprint === "2".repeat(64)) candidatePublished = true
+      },
+      probe: async () => {},
+      backendTransition: transition,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "stable")
+
+    expect(candidatePublished).toBe(false)
+    expect(current).toBe(previous.module)
+    expect(coordinator.status()).toMatchObject({
+      state: "stable",
+      runtimeID: previousID,
+      lastTransition: { trialID: staged.status.trial!.id, outcome: "failed" },
+    })
+    await coordinator.dispose()
+  })
+
+  test("reports degraded truth when the HTTP owner loses both candidate and previous listeners", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    let current: RuntimeBackendModule | undefined = previous.module
+    const transition: RuntimeBackendTransition = {
+      current: () => current,
+      async transition() {
+        current = undefined
+        throw new AggregateError(
+          [new Error("candidate failed"), new Error("previous failed")],
+          "HTTP backend unavailable",
+        )
+      },
+    }
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      backendTransition: transition,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "degraded")
+
+    expect(current).toBeUndefined()
+    expect(coordinator.status()).toMatchObject({
+      state: "degraded",
+      refreshable: false,
+      lastTransition: { trialID: staged.status.trial!.id, outcome: "failed" },
+    })
+    expect(coordinator.status().runtimeID).toBeUndefined()
+    await expect(coordinator.host.getState()).rejects.toMatchObject({
+      code: "OXP_DEPENDENCY_UNAVAILABLE",
+    })
+    await coordinator.dispose()
+  })
+
+  test("moves the ordinary HTTP backend back when an active candidate rolls back", async () => {
+    const { root, artifact } = await fixture()
+    const events: string[] = []
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const transition = backendTransition(previous.module, events)
+    transition.name(previous.module, "previous")
+    transition.name(candidate.module, "candidate")
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      backendTransition: transition,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 30,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+    await waitFor(() => coordinator.status().state === "stable")
+
+    expect(transition.current()).toBe(previous.module)
+    expect(events).toEqual(["previous->candidate", "candidate->previous"])
+    expect(coordinator.status().runtimeID).toBe(previousID)
+    await coordinator.dispose()
+  })
+
   test("uses artifact content as runtime identity and no-ops when the built artifact is unchanged", async () => {
     const { root, artifact } = await fixture()
     const initial = fakeModule(artifact, state("1".repeat(64), 31001))
@@ -205,6 +445,7 @@ describe("OXP transactional runtime refresh coordinator", () => {
     expect(candidate.counters.restore).toBe(0)
     expect(importedUrl).toContain("oxp-runtime-trial=")
 
+    await previous.control()!.arm(staged.status.trial!.id)
     await waitFor(() => candidate.counters.restore === 1)
     expect(coordinator.status()).toMatchObject({
       state: "trial",
@@ -227,6 +468,56 @@ describe("OXP transactional runtime refresh coordinator", () => {
     expect(accepted.status.lastTransition?.outcome).toBe("accepted")
     await Bun.sleep(225)
     expect(previous.counters.restore).toBe(0)
+
+    await coordinator.dispose()
+  })
+
+  test("accepts an active candidate through the private trusted-host acknowledgment path", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const publications: Array<{ state: SidecarOxpState; trialID?: string }> = []
+
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: (next, publication) =>
+        publications.push({
+          state: next,
+          ...(publication?.trialID ? { trialID: publication.trialID } : {}),
+        }),
+      probe: async () => {},
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 200,
+    })
+    const trialID = staged.status.trial!.id
+    await previous.control()!.arm(trialID)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+
+    expect(publications).toHaveLength(1)
+    expect(publications[0]).toMatchObject({
+      trialID,
+      state: { endpoint: { schemaFingerprint: "2".repeat(64) } },
+    })
+
+    const accepted = await coordinator.acceptFromHost(trialID)
+    expect(accepted.status).toMatchObject({
+      state: "stable",
+      runtimeID: staged.status.trial?.candidateRuntimeID,
+      lastTransition: { trialID, outcome: "accepted" },
+    })
+    await Bun.sleep(225)
+    expect(previous.counters.restore).toBe(0)
+
+    await expect(coordinator.acceptFromHost(trialID)).rejects.toMatchObject({
+      code: "OXP_HANDLE_STALE",
+    })
 
     await coordinator.dispose()
   })
@@ -263,6 +554,88 @@ describe("OXP transactional runtime refresh coordinator", () => {
     await coordinator.dispose()
   })
 
+  test("expires an unarmed v2 trial without ever replacing the live endpoint", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      armWithinMs: 20,
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 200,
+    })
+    expect(staged.status.state).toBe("scheduled")
+    expect(candidate.counters.restore).toBe(0)
+    expect(previous.counters.dispose).toBe(0)
+
+    await waitFor(() => coordinator.status().state === "stable")
+    expect(coordinator.status()).toMatchObject({
+      state: "stable",
+      runtimeID: previousID,
+      lastTransition: {
+        trialID: staged.status.trial?.id,
+        outcome: "reverted",
+        detail: "Refresh trial expired before the scheduling response completed.",
+      },
+    })
+    expect(candidate.counters.restore).toBe(0)
+    expect(previous.counters.dispose).toBe(0)
+    expect(previous.counters.restore).toBe(0)
+    expect(await fs.readFile(artifact, "utf8")).toBe("old-runtime")
+
+    await coordinator.dispose()
+  })
+
+  test("lets a legacy v1 accepted runtime cross the response-arm protocol boundary once", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(
+      artifact,
+      state("1".repeat(64), 31001),
+      { protocolVersion: 1 },
+    )
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      activationDelayMs: 1,
+      legacyResponseEgressDelayMs: 15,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 200,
+    })
+    expect(staged.status.state).toBe("scheduled")
+    expect(candidate.counters.restore).toBe(0)
+
+    // v1 has no post-response arm hook. The coordinator's compatibility bridge
+    // activates only after its conservative egress delay.
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+    expect(candidate.counters.restore).toBe(1)
+    const trialID = staged.status.trial!.id
+    const accepted = await coordinator.acceptFromHost(trialID)
+    expect(accepted.status).toMatchObject({
+      state: "stable",
+      runtimeID: staged.status.trial?.candidateRuntimeID,
+      lastTransition: { trialID, outcome: "accepted" },
+    })
+
+    await coordinator.dispose()
+  })
+
   test("automatically restores the previous runtime when the candidate is not accepted", async () => {
     const { root, artifact } = await fixture()
     const previous = fakeModule(artifact, state("1".repeat(64), 31001))
@@ -283,8 +656,10 @@ describe("OXP transactional runtime refresh coordinator", () => {
       expectedRuntimeID: previousID,
       acceptWithinMs: 30,
     })
+    await previous.control()!.arm(staged.status.trial!.id)
     await waitFor(() => candidate.counters.restore === 1)
     await waitFor(() => previous.counters.restore === 1)
+    await waitFor(() => coordinator.status().state === "stable")
 
     expect(coordinator.status()).toMatchObject({
       state: "stable",
@@ -326,9 +701,8 @@ describe("OXP transactional runtime refresh coordinator", () => {
       expectedRuntimeID: previousID,
       acceptWithinMs: 100,
     })
-    await waitFor(
-      () => coordinator.status().lastTransition?.trialID === staged.status.trial?.id,
-    )
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "stable")
 
     expect(coordinator.status()).toMatchObject({
       state: "stable",
@@ -338,6 +712,289 @@ describe("OXP transactional runtime refresh coordinator", () => {
     expect(previous.counters.restore).toBe(1)
     expect(published).toHaveLength(1)
     expect(published[0]!.endpoint.url).toContain(":31001/")
+
+    await coordinator.dispose()
+  })
+
+  test("releases the lock and reports degraded truth when candidate and previous restoration both fail", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(
+      artifact,
+      state("1".repeat(64), 31001),
+      { restoreError: new Error("previous restore failed") },
+    )
+    const candidate = fakeModule(
+      artifact,
+      state("2".repeat(64), 31002),
+      { restoreError: new Error("candidate restore failed") },
+    )
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 50,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "degraded")
+
+    expect(coordinator.status()).toMatchObject({
+      state: "degraded",
+      refreshable: false,
+      lastTransition: {
+        trialID: staged.status.trial?.id,
+        outcome: "failed",
+      },
+    })
+    expect(coordinator.status().runtimeID).toBeUndefined()
+    expect(coordinator.status().trial).toBeUndefined()
+    await expect(coordinator.host.getState()).rejects.toMatchObject({
+      code: "OXP_DEPENDENCY_UNAVAILABLE",
+    })
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
+    await expect(
+      previous.control()!.refresh({
+        expectedRuntimeID: previousID,
+        acceptWithinMs: 50,
+      }),
+    ).rejects.toMatchObject({ code: "OXP_DEPENDENCY_UNAVAILABLE" })
+
+    await coordinator.dispose()
+  })
+
+  test("bounds a failed rollback after restoring the candidate and suppresses retry livelock", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(
+      artifact,
+      state("1".repeat(64), 31001),
+      { restoreError: new Error("previous restore failed") },
+    )
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 40,
+    })
+    const trialID = staged.status.trial!.id
+    await previous.control()!.arm(trialID)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+
+    await expect(candidate.control()!.rollback(trialID)).rejects.toMatchObject({
+      code: "OXP_DEPENDENCY_UNAVAILABLE",
+    })
+    expect(candidate.counters.restore).toBe(2)
+    expect(coordinator.status()).toMatchObject({
+      state: "trial",
+      runtimeID: staged.status.trial?.candidateRuntimeID,
+      trial: { id: trialID, phase: "active" },
+    })
+    expect(coordinator.status().trial?.acceptBy).toBeGreaterThan(Date.now())
+
+    await expect(candidate.control()!.rollback(trialID)).rejects.toMatchObject({
+      code: "OXP_DEPENDENCY_UNAVAILABLE",
+    })
+    expect(candidate.counters.restore).toBe(2)
+
+    await waitFor(() => coordinator.status().state === "degraded")
+    expect(coordinator.status().runtimeID).toBeUndefined()
+    expect(coordinator.status().trial).toBeUndefined()
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
+
+    await coordinator.dispose()
+  })
+
+  test("does not claim the candidate or leak the lock when rollback recovery also fails", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(
+      artifact,
+      state("1".repeat(64), 31001),
+      { restoreError: new Error("previous restore failed") },
+    )
+    const candidate = fakeModule(
+      artifact,
+      state("2".repeat(64), 31002),
+      { restoreErrors: [undefined, new Error("candidate re-restore failed")] },
+    )
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    const trialID = staged.status.trial!.id
+    await previous.control()!.arm(trialID)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+
+    await expect(candidate.control()!.rollback(trialID)).rejects.toThrow()
+    expect(coordinator.status()).toMatchObject({
+      state: "degraded",
+      refreshable: false,
+      lastTransition: { trialID, outcome: "failed" },
+    })
+    expect(coordinator.status().runtimeID).toBeUndefined()
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
+
+    await coordinator.dispose()
+  })
+
+  test("retires candidate authority and releases the lock when candidate disposal fails", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(
+      artifact,
+      state("2".repeat(64), 31002),
+      { disposeError: new Error("candidate dispose failed") },
+    )
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    const trialID = staged.status.trial!.id
+    await previous.control()!.arm(trialID)
+    await waitFor(() => coordinator.status().trial?.phase === "active")
+
+    await expect(candidate.control()!.rollback(trialID)).rejects.toThrow(
+      "candidate dispose failed",
+    )
+    expect(candidate.control()).toBeUndefined()
+    expect(coordinator.status()).toMatchObject({
+      state: "degraded",
+      refreshable: false,
+      lastTransition: { trialID, outcome: "failed" },
+    })
+    expect(coordinator.status().runtimeID).toBeUndefined()
+    expect(coordinator.status().trial).toBeUndefined()
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
+
+    await coordinator.dispose()
+  })
+
+  test("keeps restored serving identity truthful when previous-runtime publication fails", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: (next) => {
+        if (next.endpoint.schemaFingerprint === "1".repeat(64)) {
+          throw new Error("previous publication failed")
+        }
+      },
+      probe: async (next) => {
+        if (next.endpoint.schemaFingerprint === "2".repeat(64)) {
+          throw new Error("candidate probe rejected")
+        }
+      },
+      activationDelayMs: 5,
+      importModule: async () => candidate.module,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    const staged = await previous.control()!.refresh({
+      expectedRuntimeID: previousID,
+      acceptWithinMs: 100,
+    })
+    await previous.control()!.arm(staged.status.trial!.id)
+    await waitFor(() => coordinator.status().state === "stable")
+
+    expect(coordinator.status()).toMatchObject({
+      state: "stable",
+      runtimeID: previousID,
+      refreshable: true,
+      lastTransition: {
+        trialID: staged.status.trial?.id,
+        outcome: "failed",
+      },
+    })
+    expect(coordinator.status().lastTransition?.detail).toContain(
+      "previous runtime was restored",
+    )
+    expect(coordinator.status().trial).toBeUndefined()
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
+
+    await coordinator.dispose()
+  })
+
+  test("rejects a hot-refresh candidate that omits the current host control ABI", async () => {
+    const { root, artifact } = await fixture()
+    const previous = fakeModule(artifact, state("1".repeat(64), 31001))
+    const candidate = fakeModule(artifact, state("2".repeat(64), 31002))
+    const {
+      listWorkerAgents: _listWorkerAgents,
+      ...legacyHost
+    } = candidate.module.OxpHost
+    const incompleteCandidate = {
+      ...candidate.module,
+      OxpHost: legacyHost,
+    }
+    const coordinator = await RuntimeRefreshCoordinator.create(previous.module, {
+      ...artifactOptions(root, artifact),
+      publish: () => {},
+      probe: async () => {},
+      importModule: async () => incompleteCandidate,
+    })
+    const previousID = coordinator.status().runtimeID!
+    await fs.writeFile(artifact, "candidate-runtime")
+
+    await expect(
+      previous.control()!.refresh({
+        expectedRuntimeID: previousID,
+        acceptWithinMs: 100,
+      }),
+    ).rejects.toMatchObject({ code: "OXP_DEPENDENCY_UNAVAILABLE" })
+    expect(coordinator.status()).toMatchObject({
+      state: "stable",
+      runtimeID: previousID,
+    })
+    expect(coordinator.status().trial).toBeUndefined()
+    expect(
+      await exists(path.join(root, "dist", "node", ".oxp-runtime-refresh.lock")),
+    ).toBe(false)
 
     await coordinator.dispose()
   })

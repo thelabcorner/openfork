@@ -4,7 +4,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import * as http from "node:http"
 import { createServer } from "node:net"
 import { homedir, tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { getCACertificates, setDefaultCACertificates } from "node:tls"
 import type { Event } from "electron"
@@ -31,6 +31,8 @@ import {
   type SidecarListener,
 } from "./server"
 import { createMobileHandshake } from "./mobile-handshake"
+import { reapPreviousSidecar } from "./sidecar-reaper"
+import { createSidecarStatus } from "./sidecar-status"
 import { setupAutoUpdater, showUpdaterDialog } from "./updater"
 import { safeWebContentsURL } from "./window-state"
 import { migrateLegacyUserData, USER_DATA_NAMES } from "./user-data"
@@ -77,6 +79,7 @@ let server: SidecarListener | null = null
 let readyData: ServerReadyData | null = null
 let browserEngine: BrowserEngine | null = null
 const pendingDeepLinks: string[] = []
+const sidecarStatus = createSidecarStatus()
 function useEnvProxy() {
   try {
     // Electron 41.2 runs Node 24.14.1; latest @types/node@24 is 24.12.2.
@@ -231,10 +234,6 @@ const main = Effect.gen(function* () {
     app.quit()
     return
   }
-  // Anything on disk from a previous launch names a dead instance. Clear it
-  // before the sidecar exists so the PWA proxy fails loudly for the startup
-  // window instead of proxying to whoever inherited the old port.
-  handshake.revoke()
   preferAppEnv(app.getPath("userData"))
   app.on("second-instance", (_event: Event, argv: string[]) => {
     const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
@@ -291,7 +290,15 @@ const main = Effect.gen(function* () {
   yield* Effect.promise(() => oxpController.initialize())
   if (!TEST_ONBOARDING) migrate()
   autopsyMark("migrate-done") // STARTUP-AUTOPSY
-  app.setAsDefaultProtocolClient("opencode")
+  // `opencode://` is a retained compatibility protocol, but OpenFork owns the
+  // handler. Electron's default-app mode on Windows otherwise registers bare
+  // electron.exe without the app argument, which can leave a broken handler (or
+  // stale stock OpenCode icon) after development launches.
+  if (process.defaultApp && process.argv[1]) {
+    app.setAsDefaultProtocolClient("opencode", process.execPath, [resolve(process.argv[1])])
+  } else {
+    app.setAsDefaultProtocolClient("opencode")
+  }
   registerRendererProtocol()
   wireWebviewHardening(resolveGuestPreloadPath())
   setDockIcon()
@@ -307,6 +314,12 @@ const main = Effect.gen(function* () {
     },
     relaunch,
   }
+  const rendererTrust = new RendererTrust()
+  for (const win of BrowserWindow.getAllWindows()) rendererTrust.register(win.webContents)
+  app.on("browser-window-created", (_event, win) => {
+    rendererTrust.register(win.webContents)
+    win.webContents.once("destroyed", () => rendererTrust.unregister(win.webContents.id))
+  })
   registerIpcHandlers({
     killSidecar: async () => {
       try {
@@ -325,6 +338,8 @@ const main = Effect.gen(function* () {
       },
       (e) => Effect.runPromise(e),
     ),
+    getSidecarURL: () => readyData?.url ?? null,
+    rendererTrust,
     consumeInitialDeepLinks: () => pendingDeepLinks.splice(0),
     getDefaultServerUrl: () => getDefaultServerUrl(),
     setDefaultServerUrl: (url) => setDefaultServerUrl(url),
@@ -345,6 +360,7 @@ const main = Effect.gen(function* () {
     setNativeTranslations: (bundle) => {
       if (setNativeTranslations(bundle)) createMenu(menuDeps)
     },
+    sidecarStatus,
   })
   registerWslIpcHandlers(wslServers)
   autopsyMark("ipc-registered") // STARTUP-AUTOPSY (includes draft-store sqlite open + orphan scan)
@@ -368,12 +384,6 @@ const main = Effect.gen(function* () {
       log: (message, meta) => writeLog("browser", message, meta as Record<string, unknown>),
       error: (message, meta) => writeLog("browser", message, meta as Record<string, unknown>, "error"),
     },
-  })
-  const rendererTrust = new RendererTrust()
-  for (const win of BrowserWindow.getAllWindows()) rendererTrust.register(win.webContents)
-  app.on("browser-window-created", (_event, win) => {
-    rendererTrust.register(win.webContents)
-    win.webContents.once("destroyed", () => rendererTrust.unregister(win.webContents.id))
   })
   registerBrowserIpcHandlers(browserEngine, rendererTrust)
   registerOxpIpc(oxpController, rendererTrust)
@@ -428,11 +438,22 @@ const main = Effect.gen(function* () {
   if (windows.length) createMenu(menuDeps)
   const loadingTask = yield* Effect.gen(function* () {
     logger.log("sidecar connection started", { version: SIDECAR_VERSION })
+    sidecarStatus.set({ state: "starting", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
+    const prior = handshake.previous()
+    yield* Effect.promise(() =>
+      reapPreviousSidecar(prior, process.execPath, process.platform, (message, details) =>
+        logger.warn(message, details),
+      ),
+    )
+    // A stale target is never advertised while its replacement starts; the
+    // mobile proxy separately verifies instance identity before binding.
+    handshake.revoke()
     ensureLoopbackNoProxy()
     useEnvProxy()
     if (SIDECAR_VERSION === "v2") {
       logger.log("spawning v2 sidecar")
       const sidecar = yield* Effect.promise(() => startBackgroundCli(logger))
+      sidecarStatus.set({ state: "healthy", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
       readyData = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
       // The v2 daemon may predate this launch, so it never received our
       // OPENCODE_INSTANCE_ID. Pin to the identity it actually reports; if it
@@ -515,10 +536,24 @@ const main = Effect.gen(function* () {
             onStderr: (message) => {
               for (const line of message.split("\n")) {
                 const trimmed = line.trim()
-                if (trimmed) writeLog("server", trimmed, undefined, "warn")
+                if (!trimmed) continue
+                // The server's structured stderr formatter includes its
+                // original Effect severity. Preserve it so INFO/DEBUG output
+                // remains subject to the main-process log throttle instead of
+                // turning every dev log into an unsheddable warning.
+                const level = /(?:^|\s)level=([A-Z]+)(?:\s|$)/.exec(trimmed)?.[1]
+                const severity = level === "ERROR" ? "error" : level === "WARN" ? "warn" : level ? "info" : "warn"
+                writeLog("server", trimmed, undefined, severity)
               }
             },
-            onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
+            onExit: (code) => {
+              sidecarStatus.set({ state: "stopped", consecutiveFailures: 0, checkedAt: new Date().toISOString() })
+              writeLog("utility", "sidecar exited", { code }, "warn")
+            },
+            onLiveness: (state, details) => {
+              sidecarStatus.set({ state, ...details })
+              writeLog("utility", `sidecar liveness ${state}`, details, state === "suspected-hang" ? "error" : "info")
+            },
           }),
         catch: (cause) => cause as unknown,
       })
@@ -565,7 +600,22 @@ const main = Effect.gen(function* () {
       writeLog("oxp", "failed to attach OXP sidecar bridge", undefined, "warn"),
     )
     readyData = { url, username: "opencode", password }
-    handshake.publish(url)
+    const sidecarIdentity = spawnResult!.identity
+    const sidecarPID = sidecarIdentity.pid
+    if (typeof sidecarPID === "number" && Number.isSafeInteger(sidecarPID) && sidecarPID > 0) {
+      handshake.publish(url, undefined, {
+        pid: sidecarPID,
+        startedAt: sidecarIdentity.startedAt,
+        inspectorURL: sidecarIdentity.inspectorURL,
+      })
+    } else {
+      // Keep the identity-verified dev URL usable, but never publish incomplete
+      // ownership metadata that could authorize a PID-only stale-process kill.
+      logger.warn("sidecar process id unavailable; stale-sidecar reaping metadata omitted", {
+        instanceID: handshake.instanceID,
+      })
+      handshake.publish(url)
+    }
     // Off the critical path: nothing the desktop does depends on this token.
     void handshake.ensureAgentToken(url, { username: "opencode", password })
     yield* Deferred.succeed(serverReady, readyData)

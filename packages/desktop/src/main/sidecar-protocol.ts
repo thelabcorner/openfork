@@ -14,6 +14,41 @@ export type SidecarOxpGrant = {
   nestedDelegation: boolean
 }
 
+export type SidecarOxpModelSelection = {
+  providerID: string
+  modelID: string
+  accountID?: string
+  variant?: string
+}
+
+export type SidecarOxpWorkerPolicy = {
+  /** Compatibility-only remnants of the retired selection allowlist. */
+  models: SidecarOxpModelSelection[]
+  /** Compatibility-only remnants of the retired selection allowlist. */
+  agents: string[]
+  /** Active durable OXP delegation preference. */
+  defaultModel?: SidecarOxpModelSelection
+  /** Legacy global preference; new state is root-scoped. */
+  defaultAgent?: string
+  agentRoots?: Array<{
+    rootID: string
+    /** Compatibility-only; defaults do not need to belong to this list. */
+    agents: string[]
+    defaultAgent?: string
+  }>
+}
+
+export type SidecarOxpAgentCatalog = {
+  rootID: string
+  rootAlias: string
+  agents: Array<{
+    id: string
+    description?: string
+    mode: "subagent" | "primary" | "all"
+  }>
+  nativeDefaultAgent: string
+}
+
 export type SidecarLegacyImport = {
   roots: Array<{ path: string; alias?: string }>
   grant: Partial<SidecarOxpGrant>
@@ -26,6 +61,7 @@ export type SidecarOxpState = {
   configRevision: number
   roots: Array<{ id: string; alias: string; path: string; available: boolean; managedByProject: boolean }>
   grant: SidecarOxpGrant
+  workerPolicy: SidecarOxpWorkerPolicy
   endpoint: {
     state: "stopped" | "ready" | "error"
     generation?: number
@@ -58,6 +94,9 @@ export type OxpSidecarRequest =
   | { action: "revoke" }
   | { action: "set-enabled"; enabled: boolean }
   | { action: "set-grant"; patch: Partial<SidecarOxpGrant> }
+  | { action: "set-worker-default-model"; model?: SidecarOxpModelSelection }
+  | { action: "list-worker-agents"; rootID: string }
+  | { action: "set-worker-default-agent"; rootID: string; agent?: string }
   | { action: "approve-root"; path: string; alias?: string }
   | { action: "sync-project-roots"; paths: string[] }
   | { action: "rename-root"; rootID: string; alias: string }
@@ -74,6 +113,11 @@ export type SidecarCommand =
       userDataPath: string
     }
   | { type: "stop" }
+  /**
+   * Host-only acknowledgment of a candidate publication. This never crosses
+   * renderer IPC and is not part of the public OXP control surface.
+   */
+  | { type: "oxp-runtime-accept"; trialID: string }
   | { type: "oxp-request"; id: number; request: OxpSidecarRequest }
 
 export type SidecarMessage =
@@ -81,8 +125,15 @@ export type SidecarMessage =
   | { type: "stopped" }
   | { type: "error"; error: { message: string; stack?: string } }
   | { type: "oxp-state"; state: SidecarOxpState }
+  /**
+   * Candidate state plus the exact trial nonce Electron main must acknowledge.
+   * The state remains privileged sidecar↔main data and is never renderer state.
+   */
+  | { type: "oxp-runtime-trial"; trialID: string; state: SidecarOxpState }
   | { type: "oxp-response"; id: number; ok: true; state: SidecarOxpState }
   | { type: "oxp-response"; id: number; ok: false; error: { message: string; code?: string } }
+  | { type: "oxp-agent-catalog-response"; id: number; ok: true; catalog: SidecarOxpAgentCatalog }
+  | { type: "oxp-agent-catalog-response"; id: number; ok: false; error: { message: string; code?: string } }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -93,6 +144,84 @@ const isBoundedString = (value: unknown, max: number, allowEmpty = false): value
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,31}$/
 const SCHEMA_FINGERPRINT = /^[a-f0-9]{64}$/
+
+function parseModelSelection(value: unknown): SidecarOxpModelSelection | undefined {
+  if (!isRecord(value)) return
+  const allowed = new Set(["providerID", "modelID", "accountID", "variant"])
+  if (Object.keys(value).some((key) => !allowed.has(key))) return
+  const providerID = value.providerID
+  const modelID = value.modelID
+  if (!isBoundedString(providerID, 256) || !isBoundedString(modelID, 256)) return
+  if (/[\x00-\x1f\x7f]/.test(providerID) || /[\x00-\x1f\x7f]/.test(modelID)) return
+  const accountID =
+    value.accountID === undefined
+      ? undefined
+      : isBoundedString(value.accountID, 256) && !/[\x00-\x1f\x7f]/.test(value.accountID)
+        ? value.accountID
+        : null
+  if (accountID === null) return
+  const variant =
+    value.variant === undefined
+      ? undefined
+      : isBoundedString(value.variant, 256) && !/[\x00-\x1f\x7f]/.test(value.variant)
+        ? value.variant
+        : null
+  if (variant === null) return
+  return {
+    providerID,
+    modelID,
+    ...(accountID === undefined ? {} : { accountID }),
+    ...(variant === undefined ? {} : { variant }),
+  }
+}
+
+function isWorkerPolicy(value: unknown): value is SidecarOxpWorkerPolicy {
+  if (!isRecord(value) || !Array.isArray(value.models) || !Array.isArray(value.agents)) return false
+  if (value.models.length > 64 || value.agents.length > 64) return false
+  if (!value.models.every((model) => parseModelSelection(model) !== undefined)) return false
+  if (!value.agents.every((agent) => isBoundedString(agent, 256) && !/[\x00-\x1f\x7f]/.test(agent))) return false
+  if (value.defaultModel !== undefined && !parseModelSelection(value.defaultModel)) return false
+  if (
+    value.defaultAgent !== undefined &&
+    (!isBoundedString(value.defaultAgent, 256) || /[\x00-\x1f\x7f]/.test(value.defaultAgent))
+  ) return false
+  if (value.agentRoots !== undefined) {
+    if (!Array.isArray(value.agentRoots) || value.agentRoots.length > 256) return false
+    const seen = new Set<string>()
+    for (const scoped of value.agentRoots) {
+      if (!isRecord(scoped) || !isBoundedString(scoped.rootID, 36) || !UUID.test(scoped.rootID) || seen.has(scoped.rootID)) return false
+      seen.add(scoped.rootID)
+      if (!Array.isArray(scoped.agents) || scoped.agents.length > 64) return false
+      if (!scoped.agents.every((agent) => isBoundedString(agent, 256) && !/[\x00-\x1f\x7f]/.test(agent))) return false
+      if (
+        scoped.defaultAgent !== undefined &&
+        (!isBoundedString(scoped.defaultAgent, 256) || /[\x00-\x1f\x7f]/.test(scoped.defaultAgent))
+      ) return false
+      if (Object.keys(scoped).some((key) => !["rootID", "agents", "defaultAgent"].includes(key))) return false
+    }
+  }
+  return Object.keys(value).every((key) =>
+    ["models", "agents", "defaultModel", "defaultAgent", "agentRoots"].includes(key),
+  )
+}
+
+function isAgentCatalog(value: unknown): value is SidecarOxpAgentCatalog {
+  if (
+    !isRecord(value) ||
+    !isBoundedString(value.rootID, 36) ||
+    !UUID.test(value.rootID) ||
+    !isBoundedString(value.rootAlias, 32) ||
+    !ROOT_ALIAS.test(value.rootAlias)
+  ) return false
+  if (!Array.isArray(value.agents) || value.agents.length > 256 || !isBoundedString(value.nativeDefaultAgent, 256)) return false
+  if (Object.keys(value).some((key) => !["rootID", "rootAlias", "agents", "nativeDefaultAgent"].includes(key))) return false
+  return value.agents.every((agent) => {
+    if (!isRecord(agent) || !isBoundedString(agent.id, 256) || /[\x00-\x1f\x7f]/.test(agent.id)) return false
+    if (!["subagent", "primary", "all"].includes(String(agent.mode))) return false
+    if (agent.description !== undefined && !isBoundedString(agent.description, 2048, true)) return false
+    return Object.keys(agent).every((key) => ["id", "description", "mode"].includes(key))
+  })
+}
 
 
 
@@ -203,6 +332,13 @@ export function isSidecarOxpState(value: unknown): value is SidecarOxpState {
     if (typeof root.available !== "boolean" || typeof root.managedByProject !== "boolean") return false
   }
   if (!isSidecarOxpGrant(value.grant)) return false
+  if (!isWorkerPolicy(value.workerPolicy)) return false
+  if (value.workerPolicy.agentRoots) {
+    const rootIDs = new Set(
+      value.roots.map((root) => String((root as Record<string, unknown>).id)),
+    )
+    if (value.workerPolicy.agentRoots.some((entry) => !rootIDs.has(entry.rootID))) return false
+  }
   if (!isRecord(value.endpoint) || !["stopped", "ready", "error"].includes(String(value.endpoint.state))) return false
   if (value.endpoint.generation !== undefined && (!Number.isSafeInteger(value.endpoint.generation) || Number(value.endpoint.generation) < 1)) return false
   if (
@@ -249,6 +385,10 @@ export function isSidecarOxpState(value: unknown): value is SidecarOxpState {
 export function parseSidecarCommand(value: unknown): SidecarCommand | undefined {
   if (!isRecord(value) || typeof value.type !== "string") return
   if (value.type === "stop") return { type: "stop" }
+  if (value.type === "oxp-runtime-accept") {
+    if (typeof value.trialID !== "string" || !UUID.test(value.trialID)) return
+    return { type: "oxp-runtime-accept", trialID: value.trialID }
+  }
   if (value.type === "start") {
     if (!isBoundedString(value.hostname, 255) || !Number.isSafeInteger(value.port) || Number(value.port) < 0 || Number(value.port) > 65535) return
     if (!isBoundedString(value.password, 16 * 1024, true) || !isBoundedString(value.userDataPath, 4096)) return
@@ -276,6 +416,40 @@ export function parseSidecarCommand(value: unknown): SidecarCommand | undefined 
         const patch = parseSidecarGrantPatch(request.patch)
         if (!patch) return
         return { type: "oxp-request", id: value.id as number, request: { action: request.action, patch } }
+      }
+    case "set-worker-default-model":
+      if (request.model === undefined) {
+        return { type: "oxp-request", id: value.id as number, request: { action: request.action } }
+      }
+      {
+        const model = parseModelSelection(request.model)
+        if (!model) return
+        return { type: "oxp-request", id: value.id as number, request: { action: request.action, model } }
+      }
+    case "list-worker-agents":
+      if (!isBoundedString(request.rootID, 128)) return
+      return {
+        type: "oxp-request",
+        id: value.id as number,
+        request: { action: request.action, rootID: request.rootID },
+      }
+    case "set-worker-default-agent":
+      if (!isBoundedString(request.rootID, 128)) return
+      {
+        let agent: string | undefined
+        if (request.agent !== undefined) {
+          if (!isBoundedString(request.agent, 256) || /[\x00-\x1f\x7f]/.test(request.agent)) return
+          agent = request.agent
+        }
+        return {
+          type: "oxp-request",
+          id: value.id as number,
+          request: {
+            action: request.action,
+            rootID: request.rootID,
+            ...(agent === undefined ? {} : { agent }),
+          },
+        }
       }
     case "approve-root":
       {
@@ -342,6 +516,14 @@ export function isSidecarMessage(value: unknown): value is SidecarMessage {
     return isRecord(value.error) && isBoundedString(value.error.message, 4096, true) && (value.error.stack === undefined || isBoundedString(value.error.stack, 64 * 1024, true))
   }
   if (value.type === "oxp-state") return isSidecarOxpState(value.state)
+  if (value.type === "oxp-runtime-trial") {
+    return typeof value.trialID === "string" && UUID.test(value.trialID) && isSidecarOxpState(value.state)
+  }
+  if (value.type === "oxp-agent-catalog-response") {
+    if (!Number.isSafeInteger(value.id) || Number(value.id) < 1 || typeof value.ok !== "boolean") return false
+    if (value.ok) return isAgentCatalog(value.catalog)
+    return isRecord(value.error) && isBoundedString(value.error.message, 4096, true) && (value.error.code === undefined || isBoundedString(value.error.code, 128, true))
+  }
   if (value.type !== "oxp-response" || !Number.isSafeInteger(value.id) || Number(value.id) < 1 || typeof value.ok !== "boolean") return false
   if (value.ok) return isSidecarOxpState(value.state)
   return isRecord(value.error) && isBoundedString(value.error.message, 4096, true) && (value.error.code === undefined || isBoundedString(value.error.code, 128, true))

@@ -140,8 +140,13 @@ const require = __cjs_mod__.createRequire(import.meta.url);
       // electron-vite resolves the renderer from its nested root. Keep the
       // workspace app package resolvable even when its workspace symlink has
       // not been created yet (for example after a fresh checkout on Windows).
+      // The subpath aliases must mirror the package's `exports` map: some
+      // entries (for example `./sidecar-control-request`) resolve to a file
+      // that does not sit directly under `src/`, so a naive `${APP_SRC}/$1`
+      // rewrite bypasses `exports` and tries to load a nonexistent path.
       alias: [
         { find: /^@opencode-ai\/app$/, replacement: `${APP_SRC}/index.ts` },
+        { find: /^@opencode-ai\/app\/sidecar-control-request$/, replacement: `${APP_SRC}/utils/sidecar-control-request.ts` },
         { find: /^@opencode-ai\/app\/(.+)$/, replacement: `${APP_SRC}/$1` },
       ],
     },

@@ -10,6 +10,7 @@ import pkg from "../../package.json"
 import { resetZoom, setPinchZoomEnabled, webviewZoom, zoomIn, zoomOut } from "./webview-zoom"
 import { windowFullscreen } from "./window-fullscreen"
 import { createDesktopStorage } from "./storage"
+import { createDesktopFetch } from "./control-fetch"
 
 function createLazyDesktopDraftStore(): NonNullable<Platform["draftStore"]> {
   let store: Promise<NonNullable<Platform["draftStore"]>> | undefined
@@ -79,6 +80,7 @@ if (typeof window !== "undefined" && !(window as unknown as { api?: unknown }).a
   ;(window as unknown as { api: Record<string, unknown> }).api = new Proxy(
     {
       updater: { subscribe: sub, check: noop, install: noop },
+      onSidecarLivenessChanged: sub,
       onDeepLink: sub,
       onMenuCommand: sub,
       consumeInitialDeepLinks: async () => [] as string[],
@@ -175,6 +177,12 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
 
   const wslServersApi = os === "windows" ? window.api.wslServers : undefined
   const oxpApi = isOxpPlatform(window.api.oxp) ? window.api.oxp : undefined
+  const desktopFetch = createDesktopFetch({
+    fetch: globalThis.fetch.bind(globalThis),
+    awaitInitialization: () => window.api.awaitInitialization(),
+    dispatch: (requestID, input) => window.api.sidecarControlFetch(requestID, input),
+    cancel: (requestID) => window.api.cancelSidecarControlFetch(requestID),
+  })
 
   return {
     platform: "desktop",
@@ -297,10 +305,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
       }
     },
 
-    fetch: (input, init) => {
-      if (input instanceof Request) return fetch(input)
-      return fetch(input, init)
-    },
+    fetch: desktopFetch,
 
     getDefaultServer: async () => {
       const url = await window.api.getDefaultServerUrl().catch(() => null)

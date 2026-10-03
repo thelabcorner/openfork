@@ -1,4 +1,4 @@
-import type { SidecarOxpGrant } from "../sidecar-protocol"
+import type { SidecarOxpGrant, SidecarOxpWorkerPolicy } from "../sidecar-protocol"
 import type { OxpLifecycle } from "./config"
 
 export type OxpConnectionState =
@@ -18,6 +18,7 @@ export type OxpDesktopState = {
   configRevision: number
   roots: Array<{ id: string; alias: string; path: string; available: boolean; managedByProject: boolean }>
   grant: SidecarOxpGrant
+  workerPolicy: SidecarOxpWorkerPolicy
   endpoint: {
     state: "stopped" | "starting" | "ready" | "error"
     generation?: number

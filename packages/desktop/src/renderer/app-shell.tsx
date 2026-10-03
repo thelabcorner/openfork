@@ -12,6 +12,7 @@ import { initializationData } from "./initialization"
 import { DesktopFirstLaunchOnboarding } from "./onboarding"
 import { availableStartupServer, readyWslConnections } from "./wsl/connections"
 import { startupMark } from "../../../app/src/utils/startup-perf"
+import { showToast } from "../../../app/src/utils/toast"
 
 startupMark("desktop.app-shell.module")
 
@@ -80,7 +81,40 @@ export default function DesktopAppShell(props: {
 
   function Inner() {
     const command = useCommand()
+    const language = useLanguage()
     props.setMenuTrigger((id) => command.trigger(id))
+    let sidecarWasUnresponsive = false
+    let unsubscribeSidecarLiveness: (() => void) | undefined
+    let disposed = false
+    void window.api
+      .onSidecarLivenessChanged((event) => {
+        if (event.state === "suspected-hang") {
+          sidecarWasUnresponsive = true
+          showToast({
+            variant: "error",
+            title: language.t("desktop.sidecar.unresponsive.title"),
+            description: language.t("desktop.sidecar.unresponsive.description"),
+          })
+          return
+        }
+        if (event.state === "healthy" && sidecarWasUnresponsive) {
+          sidecarWasUnresponsive = false
+          showToast({
+            variant: "success",
+            title: language.t("desktop.sidecar.recovered.title"),
+            description: language.t("desktop.sidecar.recovered.description"),
+          })
+        }
+      })
+      .then((unsubscribe) => {
+        if (disposed) unsubscribe()
+        else unsubscribeSidecarLiveness = unsubscribe
+      })
+      .catch(() => undefined)
+    onCleanup(() => {
+      disposed = true
+      unsubscribeSidecarLiveness?.()
+    })
 
     const theme = useTheme()
     createEffect(() => {

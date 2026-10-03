@@ -10,30 +10,46 @@ export function registerWslIpcHandlers(controller: WslServersController) {
     return
   }
   const subscriptions = new Map<number, () => void>()
-  const unsubscribe = (id: number) => {
-    const off = subscriptions.get(id)
-    if (!off) return
-    off()
-    subscriptions.delete(id)
-  }
+  const unsubscribe = (id: number) => subscriptions.get(id)?.()
   app.once("will-quit", () => {
-    subscriptions.forEach((off) => off())
-    subscriptions.clear()
+    for (const id of subscriptions.keys()) unsubscribe(id)
   })
   ipcMain.handle("wsl-servers-subscribe", (event) => {
     const id = event.sender.id
     if (subscriptions.has(id)) return
-    subscriptions.set(
-      id,
-      controller.subscribe((payload) => {
-        if (event.sender.isDestroyed()) {
-          unsubscribe(id)
-          return
-        }
-        event.sender.send("wsl-servers-event", payload)
-      }),
-    )
-    event.sender.once("destroyed", () => unsubscribe(id))
+    const sender = event.sender
+    let dead = false
+    let stop = () => {}
+    const remove = () => {
+      if (dead) return
+      dead = true
+      stop()
+      sender.removeListener("destroyed", remove)
+      if (subscriptions.get(id) === remove) subscriptions.delete(id)
+    }
+    subscriptions.set(id, remove)
+    stop = controller.subscribe((payload) => {
+      if (dead) return
+      if (sender.isDestroyed()) {
+        remove()
+        return
+      }
+      try {
+        sender.send("wsl-servers-event", payload)
+      } catch {
+        remove()
+      }
+    })
+    if (dead) {
+      stop()
+      if (subscriptions.get(id) === remove) subscriptions.delete(id)
+      return
+    }
+    if (sender.isDestroyed()) {
+      remove()
+      return
+    }
+    sender.once("destroyed", remove)
   })
   ipcMain.handle("wsl-servers-unsubscribe", (event) => unsubscribe(event.sender.id))
   ipcMain.handle("wsl-servers-get-state", () => controller.getState())

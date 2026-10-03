@@ -8,6 +8,7 @@ import { OxpDesktopConfigStore, type OxpLifecycle, isValidTunnelID } from "./con
 import { EMPTY_GRANT, EMPTY_METRICS, type OxpDesktopState, type OxpStateListener } from "./contracts"
 import { OxpCredentials, type SecureStorageStatus } from "./credentials"
 import { OxpEndpointGenerationTracker } from "./generation"
+import { projectOxpIpcError } from "./ipc-error"
 import { OxpLifecycleOwner } from "./lifecycle"
 import { findLocalMcpMigrationFile, readLocalMcpMigration, retireLocalMcpConfig } from "./migration"
 import { normalizeProjectRootsForHost } from "./project-roots"
@@ -114,6 +115,29 @@ export class OxpController {
       configRevision: sidecar?.configRevision ?? 0,
       roots: sidecar?.roots.map((root) => ({ ...root })) ?? [],
       grant: { ...(sidecar?.grant ?? EMPTY_GRANT) },
+      workerPolicy: sidecar
+        ? {
+            models: sidecar.workerPolicy.models.map((model) => ({ ...model })),
+            agents: [...sidecar.workerPolicy.agents],
+            ...(sidecar.workerPolicy.defaultModel
+              ? { defaultModel: { ...sidecar.workerPolicy.defaultModel } }
+              : {}),
+            ...(sidecar.workerPolicy.defaultAgent
+              ? { defaultAgent: sidecar.workerPolicy.defaultAgent }
+              : {}),
+            ...(sidecar.workerPolicy.agentRoots
+              ? {
+                  agentRoots: sidecar.workerPolicy.agentRoots.map((entry) => ({
+                    rootID: entry.rootID,
+                    agents: [...entry.agents],
+                    ...(entry.defaultAgent
+                      ? { defaultAgent: entry.defaultAgent }
+                      : {}),
+                  })),
+                }
+              : {}),
+          }
+        : { models: [], agents: [], agentRoots: [] },
       endpoint: sidecar
         ? {
             state: sidecar.endpoint.state,
@@ -240,10 +264,27 @@ export class OxpController {
         })
         .finally(() => this.refreshProjection())
     })
+    let initialStateRead = false
+    let autoConnectScheduled = false
+    const scheduleAutoConnect = () => {
+      if (autoConnectScheduled || retirementBlocked || !this.config.get().lifecycle.autoConnect) return
+      autoConnectScheduled = true
+      // Queue after attachment so credentials and desired roots have had a
+      // chance to synchronize, but do not make those optional syncs a gate for
+      // reconnecting an already enabled connector.
+      void this.connect().catch(async (error) => {
+        const detail = projectOxpIpcError(error).message
+        writeLog("oxp", "automatic tunnel connection failed", { detail }, "warn")
+        this.tunnelReport = { state: "unavailable", detail }
+        await this.refreshProjection().catch(() => undefined)
+      })
+    }
     try {
       const state = await sidecar.request({ action: "get-state" })
       if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
       const accepted = this.acceptSidecarState(sidecar, state)
+      initialStateRead = true
+      if (accepted.enabled) scheduleAutoConnect()
       this.secureStorage = await this.credentials.status()
       // Electron main is the sole durable credential owner. Every sidecar
       // attachment receives the same OXP OpenAI key (or an explicit clear), so
@@ -263,13 +304,13 @@ export class OxpController {
         this.acceptSidecarState(sidecar, synced)
       }
       await this.refreshProjection()
-      if (!retirementBlocked && accepted.enabled && this.config.get().lifecycle.autoConnect) {
-        void this.connect().catch(() => undefined)
-      }
     } catch {
       if (this.sidecarEpoch !== epoch || this.sidecar !== sidecar) return
       writeLog("oxp", "could not read OXP state from sidecar", undefined, "warn")
       await this.refreshProjection()
+      // If the first state read itself raced sidecar recovery, Connect retries
+      // that read and still checks the durable enabled flag before launching.
+      if (!initialStateRead) scheduleAutoConnect()
     }
   }
 
@@ -326,7 +367,14 @@ export class OxpController {
       }
       this.acceptSidecarState(sidecar, await sidecar.request({ action: "set-enabled", enabled: true }))
       const state = await this.refreshProjection()
-      if (this.config.get().lifecycle.autoConnect) void this.connect().catch(() => undefined)
+      if (this.config.get().lifecycle.autoConnect) {
+        void this.connect().catch(async (error) => {
+          const detail = projectOxpIpcError(error).message
+          writeLog("oxp", "automatic tunnel connection failed", { detail }, "warn")
+          this.tunnelReport = { state: "unavailable", detail }
+          await this.refreshProjection().catch(() => undefined)
+        })
+      }
       return state
     })
   }
@@ -343,6 +391,47 @@ export class OxpController {
       if (Object.keys(delta).length) {
         this.acceptSidecarState(sidecar, await sidecar.request({ action: "set-grant", patch: delta }))
       }
+      return this.refreshProjection()
+    })
+  }
+
+  async setWorkerDefaultModel(
+    model?: import("../sidecar-protocol").SidecarOxpModelSelection,
+  ) {
+    await this.initialize()
+    return this.enqueue(async () => {
+      const sidecar = this.requireSidecar()
+      this.acceptSidecarState(
+        sidecar,
+        await sidecar.request({
+          action: "set-worker-default-model",
+          ...(model ? { model } : {}),
+        }),
+      )
+      return this.refreshProjection()
+    })
+  }
+
+  async listWorkerAgents(rootID: string) {
+    await this.initialize()
+    return this.enqueue(async () => {
+      const sidecar = this.requireSidecar()
+      return sidecar.listWorkerAgents(rootID)
+    })
+  }
+
+  async setWorkerDefaultAgent(rootID: string, agent?: string) {
+    await this.initialize()
+    return this.enqueue(async () => {
+      const sidecar = this.requireSidecar()
+      this.acceptSidecarState(
+        sidecar,
+        await sidecar.request({
+          action: "set-worker-default-agent",
+          rootID,
+          ...(agent ? { agent } : {}),
+        }),
+      )
       return this.refreshProjection()
     })
   }
@@ -571,7 +660,12 @@ export class OxpController {
       }
       const state = await this.refreshProjection()
       if (patch.autoConnect === true && this.sidecarState?.enabled && !activeTunnel(this.tunnelReport.state)) {
-        void this.connect().catch(() => undefined)
+        void this.connect().catch(async (error) => {
+          const detail = projectOxpIpcError(error).message
+          writeLog("oxp", "automatic tunnel connection failed", { detail }, "warn")
+          this.tunnelReport = { state: "unavailable", detail }
+          await this.refreshProjection().catch(() => undefined)
+        })
       }
       return state
     })

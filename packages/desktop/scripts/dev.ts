@@ -115,13 +115,8 @@ if (existingPwa?.bound === true) {
 }
 await reclaimStaleOwnPwa(existingPwa)
 
-// Stale handshakes name dead instances. The desktop clears this at startup
-// too, but doing it here closes the window before Electron gets that far.
-for (const stale of [".opencode-dev-handshake.json", ".opencode-dev-url"]) {
-  try {
-    await Bun.file(join(root, "..", "mobile", stale)).delete()
-  } catch {}
-}
+// Leave the prior handshake intact until Electron validates and reaps only its
+// verified sidecar. The desktop revokes/replaces it before publishing readiness.
 
 console.log(`[opencode:dev] run ${runID}`)
 

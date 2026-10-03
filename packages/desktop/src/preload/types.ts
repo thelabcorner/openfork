@@ -19,8 +19,15 @@ import type {
 } from "../main/browser/contracts"
 import type { OxpDesktopState } from "../main/oxp/contracts"
 import type { OxpLifecycle } from "../main/oxp/config"
-import type { SidecarOxpGrant } from "../main/sidecar-protocol"
+import type {
+  SidecarOxpAgentCatalog,
+  SidecarOxpGrant,
+  SidecarOxpModelSelection,
+} from "../main/sidecar-protocol"
+import type { SidecarLivenessEvent } from "../main/sidecar-liveness"
+import type { SidecarControlFetchInput } from "@opencode-ai/app/sidecar-control-request"
 export type { BrowserAnnotationResult } from "../main/browser/contracts"
+export type { SidecarLivenessEvent } from "../main/sidecar-liveness"
 export type ChromePairingStatus = {
   installed: boolean
   hosts: Record<"chrome" | "brave" | "edge", boolean>
@@ -70,6 +77,14 @@ export type OxpAPI = {
   subscribe: (cb: (state: OxpDesktopState) => void) => Promise<() => void>
   setEnabled: (enabled: boolean) => Promise<OxpDesktopState>
   setGrant: (patch: Partial<SidecarOxpGrant>) => Promise<OxpDesktopState>
+  setWorkerDefaultModel: (
+    model?: SidecarOxpModelSelection,
+  ) => Promise<OxpDesktopState>
+  listWorkerAgents: (rootID: string) => Promise<SidecarOxpAgentCatalog>
+  setWorkerDefaultAgent: (
+    rootID: string,
+    agent?: string,
+  ) => Promise<OxpDesktopState>
   addRoot: () => Promise<OxpDesktopState>
   syncProjectRoots: (paths: string[]) => Promise<OxpDesktopState>
   renameRoot: (rootID: string, alias: string) => Promise<OxpDesktopState>
@@ -143,7 +158,13 @@ export type BrowserAPI = {
 }
 
 export type ElectronAPI = {
+  sidecarControlFetch: (
+    requestID: string,
+    input: SidecarControlFetchInput,
+  ) => Promise<{ status: number; statusText: string; headers: Record<string, string>; body?: string }>
+  cancelSidecarControlFetch: (requestID: string) => void
   killSidecar: () => Promise<void>
+  onSidecarLivenessChanged: (cb: (event: SidecarLivenessEvent) => void) => Promise<() => void>
   installCli: () => Promise<string>
   awaitInitialization: () => Promise<ServerReadyData>
   wslServers: WslServersAPI

@@ -26,7 +26,15 @@ out/
 electron.vite.config.*.mjs
 
 resources/opencode-cli*
+resources/openfork-cli*
 resources/tunnel
 resources/worktree-store
 resources/icons
 resources/*.metainfo.xml
+
+# Hermetic Electron gate scratch directories (cleaned by tests; ignore crash leftovers).
+test/.native-sidecar-gate-*
+test/.electron-markdown-gate-*
+test/.electron-gate-test-*
+test/.fg-*
+test/.full-app-startup-gate-*

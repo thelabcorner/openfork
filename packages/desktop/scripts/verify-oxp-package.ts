@@ -3,6 +3,8 @@ import { existsSync } from "node:fs"
 import { readdir, stat } from "node:fs/promises"
 import path from "node:path"
 
+import { verifyPackagedWorktreeStore } from "./verify-worktree-store-package"
+
 const VERSION = "0.0.14"
 const executableName = process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client"
 
@@ -38,3 +40,5 @@ if (probe.status !== 0 || !output.includes(VERSION)) {
   throw new Error(`Packaged tunnel-client runtime smoke failed: ${output.trim()}`)
 }
 console.log(`Packaged OXP tunnel-client ${VERSION} verified at ${path.relative(dist, executable)}`)
+
+await verifyPackagedWorktreeStore(dist)

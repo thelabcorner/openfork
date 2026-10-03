@@ -15,6 +15,11 @@ import {
   type RuntimeBackendModule,
 } from "./oxp/runtime-refresh"
 import { recoverAcceptedRuntime } from "./oxp/runtime-artifacts"
+import {
+  RuntimeHttpBackendOwner,
+  type RuntimeHttpListener,
+  type RuntimeHttpListenOptions,
+} from "./oxp/runtime-http-transition"
 
 enableCompileCache()
 
@@ -46,14 +51,11 @@ type ParentPort = {
   on(event: "message", listener: (event: { data: unknown }) => void): void
 }
 
-type Listener = {
-  stop(close?: boolean): void | Promise<void>
-}
-
 const parentPort = getParentPort()
-let listener: Listener | undefined
+let httpBackend: RuntimeHttpBackendOwner | undefined
 let oxpHost: OxpHostModule | undefined
 let runtimeRefresh: RuntimeRefreshCoordinator | undefined
+let oxpRestore: Promise<OxpHostState> | undefined
 
 autopsyMark("sidecar-module-eval") // STARTUP-AUTOPSY (utility process module graph loaded)
 
@@ -62,6 +64,17 @@ parentPort.on("message", (event) => {
   if (!command) return
   if (command.type === "stop") {
     void stop()
+    return
+  }
+  if (command.type === "oxp-runtime-accept") {
+    const coordinator = runtimeRefresh
+    if (!coordinator) return
+    void coordinator.acceptFromHost(command.trialID).catch((error) => {
+      console.error("OXP runtime host acknowledgment failed", {
+        trialID: command.trialID,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    })
     return
   }
   if (command.type === "oxp-request") {
@@ -95,9 +108,30 @@ async function start(command: StartCommand) {
     oxpHost = OxpHost
     autopsyMark("sidecar-server-imported") // STARTUP-AUTOPSY (33 MB server bundle parsed+evaluated)
 
+    const listenOptions: RuntimeHttpListenOptions = {
+      port: command.port,
+      hostname: command.hostname,
+      username: "opencode",
+      password: command.password,
+      cors: ["oc://renderer"],
+    }
+    const initialListener = (await Server.listen(listenOptions)) as RuntimeHttpListener
+    httpBackend = new RuntimeHttpBackendOwner(
+      backend,
+      initialListener,
+      listenOptions,
+      (next) => probeHttpRuntime(next, command.password),
+    )
+
     runtimeRefresh = await RuntimeRefreshCoordinator.create(backend, {
-      publish: (state) => parentPort.postMessage({ type: "oxp-state", state }),
+      publish: (state, publication) =>
+        parentPort.postMessage(
+          publication?.trialID
+            ? { type: "oxp-runtime-trial", trialID: publication.trialID, state }
+            : { type: "oxp-state", state },
+        ),
       probe: probeOxpRuntime,
+      backendTransition: httpBackend,
       artifactUrl: runtimeArtifactUrl || undefined,
       checkpointRoot: runtimeArtifactUrl
         ? runtimeCheckpointRoot
@@ -109,13 +143,6 @@ async function start(command: StartCommand) {
       },
     })
 
-    listener = await Server.listen({
-      port: command.port,
-      hostname: command.hostname,
-      username: "opencode",
-      password: command.password,
-      cors: ["oc://renderer"],
-    })
     autopsyMark("sidecar-listening") // STARTUP-AUTOPSY
     parentPort.postMessage({ type: "ready" })
     // OXP is an independent listener owned by the same sidecar process. Restore
@@ -125,8 +152,8 @@ async function start(command: StartCommand) {
     // recreates a fresh secret path/generation for this sidecar lifetime.
     const host = currentOxpHost()
     if (!host) throw new Error("OXP host unavailable after backend import")
-    void host
-      .restore()
+    oxpRestore = host.restore()
+    void oxpRestore
       .then((state: OxpHostState) => parentPort.postMessage({ type: "oxp-state", state }))
       .catch((_error: unknown) => {
         // Host errors can originate after a secret loopback URL has been
@@ -145,9 +172,9 @@ async function stop() {
   try {
     if (runtimeRefresh) await runtimeRefresh.dispose().catch(() => undefined)
     else await oxpHost?.dispose().catch(() => undefined)
-    await listener?.stop()
+    await httpBackend?.stop()
   } finally {
-    listener = undefined
+    httpBackend = undefined
     runtimeRefresh = undefined
     oxpHost = undefined
     parentPort.postMessage({ type: "stopped" })
@@ -166,12 +193,32 @@ async function publishOxpState() {
 }
 
 async function handleOxp(id: number, request: OxpSidecarRequest) {
-  const host = currentOxpHost()
-  if (!host) {
-    parentPort.postMessage({ type: "oxp-response", id, ok: false, error: { message: "OXP host is not ready" } })
-    return
-  }
   try {
+    // Primary HTTP readiness is independent of optional OXP restore, but
+    // control requests should observe its result before reading or mutating
+    // state. A failed best-effort restore must not poison this one-shot promise
+    // and permanently reject every later recovery/control request. The host
+    // methods below can retry startup or disable OXP explicitly.
+    const restoring = oxpRestore
+    if (restoring) {
+      try {
+        await restoring
+      } catch {
+        if (oxpRestore === restoring) oxpRestore = undefined
+      }
+    }
+    const host = currentOxpHost()
+    if (!host) throw new Error("OXP host is not ready")
+    if (request.action === "list-worker-agents") {
+      const catalog = await host.listWorkerAgents(request.rootID)
+      parentPort.postMessage({
+        type: "oxp-agent-catalog-response",
+        id,
+        ok: true,
+        catalog,
+      })
+      return
+    }
     const state = await (() => {
       switch (request.action) {
         case "get-state": return host.getState()
@@ -180,6 +227,8 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
         case "revoke": return host.revoke()
         case "set-enabled": return host.setEnabled(request.enabled)
         case "set-grant": return host.setGrant(request.patch)
+        case "set-worker-default-model": return host.setWorkerDefaultModel(request.model)
+        case "set-worker-default-agent": return host.setWorkerDefaultAgent(request.rootID, request.agent)
         case "approve-root": return host.approveRoot(request.path, request.alias)
         case "sync-project-roots": return host.syncProjectRoots(request.paths)
         case "rename-root": return host.renameRoot(request.rootID, request.alias)
@@ -196,7 +245,7 @@ async function handleOxp(id: number, request: OxpSidecarRequest) {
     const serialized = serializeError(error)
     const message = redactOxpControlError(serialized.message)
     parentPort.postMessage({
-      type: "oxp-response",
+      type: request.action === "list-worker-agents" ? "oxp-agent-catalog-response" : "oxp-response",
       id,
       ok: false,
       error: { message, ...((error as { _tag?: unknown })?._tag ? { code: String((error as { _tag?: unknown })._tag) } : {}) },
@@ -232,6 +281,25 @@ async function probeOxpRuntime(state: OxpHostState) {
   }
 }
 
+async function probeHttpRuntime(listener: RuntimeHttpListener, password: string) {
+  const url = new URL("/global/health", listener.url)
+  const authorization = Buffer.from(`opencode:${password}`, "utf8").toString("base64")
+  const headers: Record<string, string> = {
+    accept: "application/json",
+    authorization: `Basic ${authorization}`,
+  }
+  const instanceID = process.env.OPENCODE_INSTANCE_ID
+  if (instanceID) headers["x-opencode-expect-instance"] = instanceID
+  const response = await fetch(url, {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(3_000),
+  })
+  if (!response.ok) throw new Error("Runtime HTTP health probe failed")
+  const body = (await response.json()) as { healthy?: unknown }
+  if (body.healthy !== true) throw new Error("Runtime HTTP health probe returned an invalid payload")
+}
+
 function redactOxpControlError(message: string) {
   // The sidecar is the only process that ever sees the secret MCP route.
   // Defense in depth: never allow a thrown listener/server error containing a
@@ -245,6 +313,11 @@ function prepareSidecarEnv(password: string, userDataPath: string) {
   Object.assign(process.env, {
     OPENCODE_SERVER_USERNAME: "opencode",
     OPENCODE_SERVER_PASSWORD: password,
+    // Desktop builds bundle a server stamped from the current branch (for
+    // example `main` during a local dev run). Keep channel naming disabled when
+    // no explicit OPENCODE_DB override is provided; launchers and run configs
+    // can select a database explicitly.
+    OPENCODE_DISABLE_CHANNEL_DB: "1",
     XDG_STATE_HOME: userDataPath,
     ...childRuntimeEnvPatch(),
   })
