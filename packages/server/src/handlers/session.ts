@@ -188,11 +188,16 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.active",
         Effect.fn(function* () {
-          // A paused session has no drain, so union the durable-paused IDs with
-          // the live-drain set; paused wins in the transient overlap window.
+          // This is the renderer's one process-wide cold-start reconciliation
+          // surface. Core execution.active covers the current runner (including
+          // the small pre-provider window); SessionTelemetry also sees legacy/V1
+          // processors and current provider phases. Union both without
+          // bootstrapping any workspace. Paused IDs are durable and win in the
+          // transient overlap window.
           const paused = yield* session.paused
+          const running = new Set([...(yield* session.active), ...(yield* telemetry.active)])
           const data = new Map<string, { type: "running" | "paused" }>(
-            Array.from(yield* session.active, (sessionID) => [sessionID, { type: "running" as const }]),
+            Array.from(running, (sessionID) => [sessionID, { type: "running" as const }]),
           )
           for (const sessionID of paused) data.set(sessionID, { type: "paused" as const })
           return { data: Object.fromEntries(data) }

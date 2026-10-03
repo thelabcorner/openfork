@@ -444,7 +444,7 @@ describe("tool.apply_patch freeform", () => {
       const { ctx } = makeCtx()
       const patchText = "*** Begin Patch\n*** Frobnicate File: foo\n*** End Patch"
 
-      yield* expectFailure(execute({ patchText }, ctx), "No file operations found")
+      yield* expectFailure(execute({ patchText }, ctx), "Invalid patch line 2")
     }),
   )
 

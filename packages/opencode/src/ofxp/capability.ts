@@ -134,7 +134,7 @@ const DEFINITIONS = Object.freeze([
   }),
   Object.freeze({
     id: "patch" as const,
-    description: "Plan or atomically apply a guarded multi-file patch inside one approved remote root using the shared OpenFork patch engine.",
+    description: "Plan or apply a guarded multi-file patch inside one approved remote root using the shared OpenFork patch engine. Independent file operations may be accepted, already satisfied, or reported as conflicts; structured resolution metadata supports targeted retry and moves remain indivisible.",
     schema: OfxpPatchCapability.Parameters,
     authority: "write",
     mutation: "non-idempotent",
@@ -470,21 +470,21 @@ function success(
   }
 }
 
-  /**
-   * Every OFXP read/write/edit/patch record is produced by the shared exchange
-   * kernel, so this boundary's only job is to hand that kernel the two facts it
-   * cannot prove for itself: the granted root's canonical `rootPath` (which
-   * becomes the record's `projectFolder`) and the authenticated principal key
-   * (which becomes `sourceRef`).
-   *
-   * Both are already re-verified by the `peers.authorize` + `roots.resolve` pair
-   * that admitted this exact call, and both are derived by `OfxpAttribution`
-   * rather than spelled here. Nothing in this file constructs a CodingActivity
-   * record directly, which is what keeps every remote file operation attributed
-   * exactly once.
-   */
-  export interface Interface {
-    readonly dispatch: (
+/**
+ * Every OFXP read/write/edit/patch record is produced by the shared exchange
+ * kernel, so this boundary's only job is to hand that kernel the two facts it
+ * cannot prove for itself: the granted root's canonical `rootPath` (which
+ * becomes the record's `projectFolder`) and the authenticated principal key
+ * (which becomes `sourceRef`).
+ *
+ * Both are already re-verified by the `peers.authorize` + `roots.resolve` pair
+ * that admitted this exact call, and both are derived by `OfxpAttribution`
+ * rather than spelled here. Nothing in this file constructs a CodingActivity
+ * record directly, which is what keeps every remote file operation attributed
+ * exactly once.
+ */
+export interface Interface {
+  readonly dispatch: (
     peer: PeerCertificateIdentity,
     method: string,
     body: unknown,

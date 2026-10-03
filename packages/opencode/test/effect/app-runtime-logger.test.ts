@@ -99,3 +99,41 @@ it.instance(
     }).pipe(Effect.provide(observabilityLayer)),
   { git: true },
 )
+
+
+it.instance(
+  "EffectBridge promise propagates AbortSignal interruption through the detached root",
+  () =>
+    Effect.gen(function* () {
+      const bridge = yield* EffectBridge.make()
+      const started = yield* Deferred.make<void>()
+      const controller = new AbortController()
+      let finalized = false
+
+      const pending = bridge
+        .promise(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            return yield* Effect.never
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                finalized = true
+              }),
+            ),
+          ),
+          { signal: controller.signal },
+        )
+        .then(
+          () => "resolved" as const,
+          () => "rejected" as const,
+        )
+
+      yield* Deferred.await(started)
+      controller.abort()
+
+      expect(yield* Effect.promise(() => pending)).toBe("rejected")
+      expect(finalized).toBe(true)
+    }),
+  { git: true },
+)

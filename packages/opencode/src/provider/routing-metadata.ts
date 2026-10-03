@@ -45,3 +45,57 @@ export function routedAccountFromResponse(response: unknown) {
   }
   return undefined
 }
+
+
+export type RoutedAccountExpectation = {
+  readonly routeKind: "public" | "account"
+  readonly accountID?: string
+}
+
+export type RoutedAccountMismatch =
+  | {
+      readonly kind: "public-observed-account"
+      readonly observedAccountIDs: readonly string[]
+    }
+  | {
+      readonly kind: "account-observed-different"
+      readonly expectedAccountID: string | undefined
+      readonly observedAccountIDs: readonly string[]
+    }
+
+/**
+ * Validate provider-observed routing metadata against already-committed route
+ * authority. This is diagnostics only: callers must never use the result to
+ * replace or reselect the committed route.
+ *
+ * Missing response metadata is intentionally not a mismatch. Providers are not
+ * required to echo routing identity, and its absence cannot erase authority.
+ */
+export function routedAccountMismatch(
+  observed: Iterable<string>,
+  expected: RoutedAccountExpectation,
+): RoutedAccountMismatch | undefined {
+  const observedAccountIDs = [...new Set(observed)].sort()
+  if (observedAccountIDs.length === 0) return undefined
+
+  if (expected.routeKind === "public") {
+    return {
+      kind: "public-observed-account",
+      observedAccountIDs,
+    }
+  }
+
+  if (
+    expected.accountID !== undefined &&
+    observedAccountIDs.length === 1 &&
+    observedAccountIDs[0] === expected.accountID
+  ) {
+    return undefined
+  }
+
+  return {
+    kind: "account-observed-different",
+    expectedAccountID: expected.accountID,
+    observedAccountIDs,
+  }
+}

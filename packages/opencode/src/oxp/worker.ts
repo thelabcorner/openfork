@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import fs from "node:fs/promises"
 import { Context, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -8,8 +9,10 @@ import { OxpAuthority } from "./authority"
 import { OxpAgentCatalog } from "./agent-catalog"
 import { OxpConfig } from "./config"
 import { OxpError } from "./error"
+import { OxpModelCatalog } from "./model-catalog"
 import { OxpModelSelection } from "./model-selection"
 import { OxpResult } from "./result"
+import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
 import { OxpWorkerControl } from "./worker-control"
 
@@ -25,6 +28,7 @@ const Text = Schema.String.check(
   Schema.isMaxLength(MAX_PROMPT_BYTES),
 )
 const Name = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256))
+const Workdir = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096))
 
 const WorkerStart = Schema.Struct({
   title: Schema.optional(Name),
@@ -43,7 +47,13 @@ const WorkerContinue = Schema.Struct({
 
 export const Parameters = Schema.Struct({
   action: Schema.Literals([
+    "model_policy",
+    "model_catalog",
     "agent_catalog",
+    "set_default_model",
+    "clear_default_model",
+    "set_default_agent",
+    "clear_default_agent",
     "start",
     "list",
     "get",
@@ -60,6 +70,9 @@ export const Parameters = Schema.Struct({
     "batch_continue",
   ]),
   rootID: Schema.optional(OxpSchema.RootID),
+  workdir: Schema.optional(Workdir),
+  providerID: Schema.optional(Name),
+  modelID: Schema.optional(Name),
   workerID: Schema.optional(ID),
   batchID: Schema.optional(ID),
   title: Schema.optional(Name),
@@ -96,9 +109,12 @@ export class Service extends Context.Service<Service, Interface>()(
 ) {}
 export const use = serviceUse(Service)
 
-const workerHandleMetadata = (workerIDs: readonly string[]) =>
+const workerHandleMetadata = (
+  workerIDs: readonly string[],
+  prefix = "workerID",
+) =>
   Object.fromEntries(
-    workerIDs.map((workerID, index) => ["workerID" + index, workerID]),
+    workerIDs.map((workerID, index) => [prefix + index, workerID]),
   )
 
 const nativeDependency = (error: unknown) => {
@@ -181,6 +197,13 @@ export const mapControlError = (
         committed: error.workerIDs.length > 0 || error.batchID !== undefined,
         workersCommitted: error.workerIDs.length,
         ...workerHandleMetadata(error.workerIDs),
+        workersResidual: error.residualWorkerIDs.length,
+        ...workerHandleMetadata(error.residualWorkerIDs, "residualWorkerID"),
+        workersCompensated: error.compensatedWorkerIDs.length,
+        ...workerHandleMetadata(
+          error.compensatedWorkerIDs,
+          "compensatedWorkerID",
+        ),
         ...(error.batchID ? { batchID: error.batchID } : {}),
         ...dependencyMetadata,
       },
@@ -213,7 +236,9 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const authority = yield* OxpAuthority.Service
     const agentCatalog = yield* OxpAgentCatalog.Service
+    const modelCatalog = yield* OxpModelCatalog.Service
     const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
     const delegation = yield* SessionDelegationInspection.Service
     const control = yield* OxpWorkerControl.Service
 
@@ -236,6 +261,64 @@ const layer = Layer.effect(
                 detail: "Invalid delegated-worker model selection",
               }),
       })
+
+    const rootAgentPreference = (
+      policy: OxpSchema.WorkerPolicy,
+      rootID: OxpSchema.RootID,
+    ) =>
+      policy.agentRoots !== undefined
+        ? policy.agentRoots.find((entry) => entry.rootID === rootID)?.defaultAgent
+        : policy.defaultAgent
+
+    /**
+     * OXP owns omission semantics. By the time selection reaches the native
+     * DelegatedWorker resolver both agent and model are explicit, so that lower
+     * layer can validate availability without ever consulting
+     * Provider.defaultModel()/recent-model state on OXP's behalf.
+     */
+    const resolveConfiguredSelection = Effect.fnUntraced(function* (
+      target: OxpWorkerControl.Target,
+      rootID: OxpSchema.RootID,
+      requested: {
+        readonly agent?: string
+        readonly model?: OxpSchema.ModelSelection
+      },
+      signal?: AbortSignal,
+    ) {
+      const state = yield* config.get()
+      const policy = state.workerPolicy ?? {
+        models: [],
+        agents: [],
+        agentRoots: [],
+      }
+      const model = requested.model
+        ? yield* normalizeModel(requested.model)
+        : policy.defaultModel
+          ? yield* normalizeModel(policy.defaultModel)
+          : undefined
+      if (!model) {
+        return yield* new OxpError.InvalidArgument({
+          detail:
+            "No OXP delegated-worker default model is configured; specify model explicitly or configure the delegation default in Settings",
+        })
+      }
+      const agent = requested.agent ?? rootAgentPreference(policy, rootID)
+      if (!agent) {
+        return yield* new OxpError.InvalidArgument({
+          detail:
+            "No OXP delegated-worker default agent is configured for this approved root; specify agent explicitly or configure the root delegation default in Settings",
+        })
+      }
+      return yield* control
+        .resolveSelection(target, { agent, model })
+        .pipe(
+          Effect.mapError((error) =>
+            signal?.aborted
+              ? new OxpError.Cancelled({ detail: "OXP worker request was cancelled" })
+              : mapControlError(error, model.accountID),
+          ),
+        )
+    })
 
 
     const workerAdmission = Effect.fnUntraced(function* (
@@ -302,11 +385,13 @@ const layer = Layer.effect(
       row: SessionDelegationInspection.WorkerRow,
       admission: OxpAuthority.Admission,
       nested?: OxpAuthority.Admission,
+      signal?: AbortSignal,
     ): OxpWorkerControl.Target => ({
       directory: row.directory,
       ...(row.workspaceID
         ? { workspaceID: row.workspaceID }
         : {}),
+      ...(signal ? { signal } : {}),
       commitGuard: () =>
         Effect.runPromise(
           Effect.gen(function* () {
@@ -324,6 +409,8 @@ const layer = Layer.effect(
     const rootRuntimeTarget = (
       admission: OxpAuthority.Admission,
       nested?: OxpAuthority.Admission,
+      directory?: string,
+      signal?: AbortSignal,
     ): OxpWorkerControl.Target => {
       const root = admission.root
       if (!root) {
@@ -332,16 +419,71 @@ const layer = Layer.effect(
         })
       }
       return {
-        directory: root.canonicalPath,
+        directory: directory ?? root.canonicalPath,
+        ...(signal ? { signal } : {}),
         commitGuard: () =>
           Effect.runPromise(
             Effect.gen(function* () {
               yield* authority.revalidate(admission, "commit")
               if (nested) yield* authority.revalidate(nested, "commit")
+              if (directory) {
+                const current = yield* roots
+                  .resolvePath(directory, {
+                    rootID: root.root.id,
+                  })
+                  .pipe(
+                    Effect.catchTag(
+                      "OXP_NOT_FOUND",
+                      () =>
+                        Effect.fail(
+                          new OxpError.Conflict({
+                            detail: "Delegated worker workdir disappeared before commit",
+                          }),
+                        ),
+                    ),
+                  )
+                if (current.path !== directory) {
+                  return yield* new OxpError.Conflict({
+                    detail: "Delegated worker workdir changed before commit",
+                  })
+                }
+                const info = yield* Effect.tryPromise({
+                  try: () => fs.stat(current.path),
+                  catch: () =>
+                    new OxpError.Conflict({
+                      detail: "Delegated worker workdir disappeared before commit",
+                    }),
+                })
+                if (!info.isDirectory()) {
+                  return yield* new OxpError.Conflict({
+                    detail: "Delegated worker workdir ceased to be a directory before commit",
+                  })
+                }
+              }
             }),
           ),
       }
     }
+
+    const resolveWorkdir = Effect.fnUntraced(function* (
+      rootID: OxpSchema.RootID,
+      workdir?: string,
+    ) {
+      const resolved = yield* roots.resolvePath(workdir ?? ".", { rootID })
+      const info = yield* Effect.tryPromise({
+        try: () => fs.stat(resolved.path),
+        catch: () =>
+          new OxpError.DependencyUnavailable({
+            detail: "Unable to inspect delegated worker workdir",
+          }),
+      })
+      if (!info.isDirectory()) {
+        return yield* new OxpError.InvalidArgument({
+          detail: "Delegated worker workdir must be a directory",
+        })
+      }
+      return resolved
+    })
 
     const projectWorker = (
       row: SessionDelegationInspection.WorkerRow,
@@ -417,6 +559,184 @@ const layer = Layer.effect(
       yield* cancelled(signal)
       const operation = "worker." + input.action
 
+      if (
+        input.action === "model_policy" ||
+        input.action === "set_default_model" ||
+        input.action === "clear_default_model" ||
+        input.action === "set_default_agent" ||
+        input.action === "clear_default_agent"
+      ) {
+        if (
+          (input.action === "set_default_agent" ||
+            input.action === "clear_default_agent") &&
+          !input.rootID
+        ) {
+          return yield* new OxpError.InvalidArgument({
+            detail: `worker.${input.action} requires rootID`,
+          })
+        }
+        const admission = yield* authority.authorize({
+          plane: "delegation",
+          operation,
+          phase: input.action === "model_policy" ? "read" : "delegate",
+          ...(input.rootID ? { rootID: input.rootID } : {}),
+        })
+        if (input.action === "model_policy") {
+          const state = yield* config.get()
+          yield* authority.revalidate(admission, "egress")
+          const policy = state.workerPolicy ?? {
+            models: [],
+            agents: [],
+            agentRoots: [],
+          }
+          const result = {
+            defaultModel: policy.defaultModel ?? null,
+            agentRoots: (policy.agentRoots ?? []).map((entry) => ({
+              rootID: entry.rootID,
+              defaultAgent: entry.defaultAgent ?? null,
+            })),
+          }
+          return {
+            title: "OpenFork delegated-worker preferences",
+            output: JSON.stringify(result),
+            structured: result,
+          } satisfies OxpResult.CapabilityResult
+        }
+        if (
+          input.action === "set_default_agent" ||
+          input.action === "clear_default_agent"
+        ) {
+          const root = admission.root
+          if (!root || !input.rootID) {
+            return yield* new OxpError.RootRequired({
+              detail: "Delegated-worker default agent requires an approved root",
+            })
+          }
+          const agent =
+            input.action === "set_default_agent" ? input.agent : undefined
+          if (input.action === "set_default_agent" && !agent) {
+            return yield* new OxpError.InvalidArgument({
+              detail: "set_default_agent requires agent",
+            })
+          }
+          if (agent) {
+            const catalog = yield* agentCatalog.list({
+              directory: root.canonicalPath,
+            })
+            if (!catalog.agents.some((candidate) => candidate.id === agent)) {
+              return yield* new OxpError.InvalidArgument({
+                detail:
+                  "Requested delegated-worker default agent is unavailable in the approved root",
+              })
+            }
+          }
+          yield* authority.revalidate(admission, "commit")
+          yield* config.setWorkerDefaultAgent(input.rootID, agent)
+          const state = yield* config.get()
+          const result = {
+            rootID: input.rootID,
+            defaultAgent:
+              rootAgentPreference(
+                state.workerPolicy ?? {
+                  models: [],
+                  agents: [],
+                  agentRoots: [],
+                },
+                input.rootID,
+              ) ?? null,
+          }
+          return {
+            title: "OpenFork delegated-worker default agent updated",
+            output: JSON.stringify(result),
+            structured: result,
+            mutation: { attempted: true, committed: true },
+          } satisfies OxpResult.CapabilityResult
+        }
+
+        yield* authority.revalidate(admission, "commit")
+        if (input.action === "clear_default_model") {
+          yield* config.setWorkerDefaultModel(undefined)
+        } else {
+          if (!input.model) {
+            return yield* new OxpError.InvalidArgument({
+              detail: "set_default_model requires model",
+            })
+          }
+          yield* config.setWorkerDefaultModel(
+            yield* normalizeModel(input.model),
+          )
+        }
+        const state = yield* config.get()
+        const result = {
+          defaultModel: state.workerPolicy?.defaultModel ?? null,
+        }
+        return {
+          title: "OpenFork delegated-worker default model updated",
+          output: JSON.stringify(result),
+          structured: result,
+          mutation: { attempted: true, committed: true },
+        } satisfies OxpResult.CapabilityResult
+      }
+
+      if (input.action === "model_catalog") {
+        if (!input.rootID) {
+          return yield* new OxpError.InvalidArgument({
+            detail: "worker.model_catalog requires rootID",
+          })
+        }
+        const admission = yield* authority.authorize({
+          plane: "delegation",
+          operation,
+          phase: "read",
+          rootID: input.rootID,
+        })
+        const root = admission.root
+        if (!root) {
+          return yield* new OxpError.RootRequired({
+            detail: "Delegated-worker model catalog requires an approved root",
+          })
+        }
+        const workdir = yield* resolveWorkdir(input.rootID, input.workdir)
+        const snapshot = yield* modelCatalog.list({
+          directory: workdir.path,
+          ...(signal ? { signal } : {}),
+        })
+        const providerID = input.providerID?.trim()
+        const modelID = input.modelID?.trim()
+        const matched = snapshot.models.filter(
+          (model) =>
+            (!providerID || model.providerID === providerID) &&
+            (!modelID || model.modelID === modelID),
+        )
+        if ((providerID || modelID) && matched.length === 0) {
+          return yield* new OxpError.NotFound({
+            detail:
+              "No delegated-worker model catalog entry matched the requested provider/model; do not substitute another model",
+          })
+        }
+        const requested = input.limit ?? 100
+        const models = matched.slice(0, requested)
+        const state = yield* config.get()
+        yield* authority.revalidate(admission, "egress")
+        const result = {
+          rootID: root.root.id,
+          rootAlias: root.root.alias,
+          workdir: workdir.virtualPath,
+          ...(providerID ? { providerID } : {}),
+          ...(modelID ? { modelID } : {}),
+          configuredDefaultModel: state.workerPolicy?.defaultModel ?? null,
+          total: matched.length,
+          returned: models.length,
+          truncated: matched.length > models.length,
+          models,
+        }
+        return {
+          title: "OpenFork delegated-worker model catalog",
+          output: JSON.stringify(result),
+          structured: result,
+        } satisfies OxpResult.CapabilityResult
+      }
+
       if (input.action === "agent_catalog") {
         if (!input.rootID) {
           return yield* new OxpError.InvalidArgument({
@@ -435,15 +755,25 @@ const layer = Layer.effect(
             detail: "Delegated-worker agent catalog requires an approved root",
           })
         }
+        const workdir = yield* resolveWorkdir(input.rootID, input.workdir)
         const catalog = yield* agentCatalog.list({
-          directory: root.canonicalPath,
+          directory: workdir.path,
         })
+        const state = yield* config.get()
+        const policy = state.workerPolicy ?? {
+          models: [],
+          agents: [],
+          agentRoots: [],
+        }
         yield* authority.revalidate(admission, "egress")
         const result = {
           rootID: root.root.id,
           rootAlias: root.root.alias,
+          workdir: workdir.virtualPath,
           agents: catalog.agents,
           nativeDefaultAgent: catalog.nativeDefaultAgent,
+          configuredDefaultAgent:
+            rootAgentPreference(policy, root.root.id) ?? null,
         }
         return {
           title: "OpenFork delegated-worker agent catalog",
@@ -469,19 +799,17 @@ const layer = Layer.effect(
             detail: "Delegated-worker start requires an approved root",
           })
         }
+        const workdir = yield* resolveWorkdir(input.rootID, input.workdir)
         const identity = yield* currentIdentity()
-        const selected = yield* control
-          .resolveSelection(rootRuntimeTarget(admission), {
+        const selected = yield* resolveConfiguredSelection(
+          rootRuntimeTarget(admission, undefined, workdir.path, signal),
+          input.rootID,
+          {
             ...(input.agent ? { agent: input.agent } : {}),
-            ...(input.model
-              ? { model: yield* normalizeModel(input.model) }
-              : {}),
-          })
-          .pipe(
-            Effect.mapError((error) =>
-              mapControlError(error, input.model?.accountID),
-            ),
-          )
+            ...(input.model ? { model: input.model } : {}),
+          },
+          signal,
+        )
         const nestedRequested = input.nestedDelegation === true
         const nested = nestedRequested
           ? yield* authority.authorize({
@@ -494,7 +822,7 @@ const layer = Layer.effect(
         const invocationRef = "oxp-inv:" + randomUUID()
         const started = yield* control
           .start(
-            rootRuntimeTarget(admission, nested),
+            rootRuntimeTarget(admission, nested, workdir.path),
             {
               title: input.title ?? "OXP delegated worker",
               prompt: input.prompt,
@@ -526,6 +854,7 @@ const layer = Layer.effect(
         const result = {
           workerID: started.workerID,
           invocationRef,
+          workdir: workdir.virtualPath,
         }
         return {
           title: "OpenFork delegated worker started",
@@ -744,13 +1073,16 @@ const layer = Layer.effect(
         }
         const call =
           input.action === "wait"
-            ? control.wait(runtimeTarget(target.row, target.admission), {
-                workerID: input.workerID,
-                identity,
-                ...(input.timeoutMs !== undefined
-                  ? { timeoutMs: input.timeoutMs }
-                  : {}),
-              })
+            ? control.wait(
+                runtimeTarget(target.row, target.admission, undefined, signal),
+                {
+                  workerID: input.workerID,
+                  identity,
+                  ...(input.timeoutMs !== undefined
+                    ? { timeoutMs: input.timeoutMs }
+                    : {}),
+                },
+              )
             : input.action === "result"
               ? control.result(runtimeTarget(target.row, target.admission), {
                   workerID: input.workerID,
@@ -761,7 +1093,11 @@ const layer = Layer.effect(
                   identity,
                 })
         const result = yield* call.pipe(
-          Effect.mapError((error) => mapControlError(error)),
+          Effect.mapError((error) =>
+            input.action === "wait" && signal?.aborted
+              ? new OxpError.Cancelled({ detail: "OXP worker request was cancelled" })
+              : mapControlError(error),
+          ),
         )
         if (input.action === "cancel" && signal?.aborted) {
           return yield* new OxpError.Cancelled({
@@ -800,22 +1136,20 @@ const layer = Layer.effect(
             detail: "Delegated-worker batch start requires an approved root",
           })
         }
+        const workdir = yield* resolveWorkdir(input.rootID, input.workdir)
         const identity = yield* currentIdentity()
         const selected = []
         let needsNested = false
         for (const worker of input.workers) {
-          const selection = yield* control
-            .resolveSelection(rootRuntimeTarget(admission), {
+          const selection = yield* resolveConfiguredSelection(
+            rootRuntimeTarget(admission, undefined, workdir.path, signal),
+            input.rootID,
+            {
               ...(worker.agent ? { agent: worker.agent } : {}),
-              ...(worker.model
-                ? { model: yield* normalizeModel(worker.model) }
-                : {}),
-            })
-            .pipe(
-              Effect.mapError((error) =>
-                mapControlError(error, worker.model?.accountID),
-              ),
-            )
+              ...(worker.model ? { model: worker.model } : {}),
+            },
+            signal,
+          )
           const nestedDelegation = worker.nestedDelegation === true
           if (nestedDelegation) needsNested = true
           selected.push({ worker, selection, nestedDelegation })
@@ -839,10 +1173,14 @@ const layer = Layer.effect(
           batchInvocationID
         const result = yield* control
           .batchStart(
-            rootRuntimeTarget(admission, nested),
+            rootRuntimeTarget(admission, nested, workdir.path),
             {
               name: input.title ?? "OXP delegated batch",
               ownerRef: batchOwnerRef,
+              identity: {
+                producer: "oxp",
+                principalRef: identity.principalRef,
+              },
               workers: selected.map(({ worker, selection, nestedDelegation }) => ({
                 title: worker.title ?? "OXP delegated worker",
                 prompt: worker.prompt,
@@ -875,8 +1213,8 @@ const layer = Layer.effect(
         }
         return {
           title: "OpenFork delegated batch started",
-          output: JSON.stringify({ ...result, batchRef }),
-          structured: { ...result, batchRef },
+          output: JSON.stringify({ ...result, batchRef, workdir: workdir.virtualPath }),
+          structured: { ...result, batchRef, workdir: workdir.virtualPath },
           mutation: { attempted: true, committed: true },
         } satisfies OxpResult.CapabilityResult
       }
@@ -946,7 +1284,12 @@ const layer = Layer.effect(
         }
         const target = owned.workers[0]!
         const workerIDs = batch.memberIDs.map(String)
-        const runtime = runtimeTarget(target.row, target.admission)
+        const runtime = runtimeTarget(
+          target.row,
+          target.admission,
+          undefined,
+          input.action === "batch_wait" ? signal : undefined,
+        )
         const controlIdentity: OxpWorkerControl.Identity = {
           producer: "oxp",
           principalRef: identity.principalRef,
@@ -961,7 +1304,13 @@ const layer = Layer.effect(
                     ? { timeoutMs: input.timeoutMs }
                     : {}),
                 })
-                .pipe(Effect.mapError(mapControlError))
+                .pipe(
+                  Effect.mapError((error) =>
+                    signal?.aborted
+                      ? new OxpError.Cancelled({ detail: "OXP worker request was cancelled" })
+                      : mapControlError(error),
+                  ),
+                )
             : input.action === "batch_cancel"
               ? yield* control
                   .batchCancel(runtime, {
@@ -1118,6 +1467,8 @@ export const node = makeGlobalNode({
     OxpAuthority.node,
     OxpAgentCatalog.node,
     OxpConfig.node,
+    OxpModelCatalog.node,
+    OxpRoot.node,
     SessionDelegationInspection.node,
     OxpWorkerControl.node,
   ],

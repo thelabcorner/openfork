@@ -69,6 +69,15 @@ export interface Result<A> {
   readonly committed: boolean
 }
 
+export interface SkippedConflict {
+  readonly change: Change
+  readonly detail: string
+}
+
+export interface IndependentResult<A> extends Result<A> {
+  readonly conflicts: readonly SkippedConflict[]
+}
+
 function sameBytes(left: Uint8Array, right: Uint8Array) {
   if (left.length !== right.length) return false
   for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false
@@ -142,24 +151,26 @@ function read(fs: FSUtil.Interface, filePath: string) {
   return fs.readFile(filePath).pipe(Effect.mapError(() => dependency("Unable to inspect file mutation bytes")))
 }
 
-function cas(fs: FSUtil.Interface, changes: readonly Change[]) {
+function casChange(fs: FSUtil.Interface, change: Change) {
   return Effect.gen(function* () {
-    for (const change of changes) {
-      const sourceExists = yield* exists(fs, change.path)
-      if (sourceExists !== change.beforeExists) {
+    const sourceExists = yield* exists(fs, change.path)
+    if (sourceExists !== change.beforeExists) {
+      return yield* new ExchangeError.Conflict({ detail: `${change.displayPath} changed before commit` })
+    }
+    if (sourceExists) {
+      const current = yield* read(fs, change.path)
+      if (!sameBytes(current, change.before)) {
         return yield* new ExchangeError.Conflict({ detail: `${change.displayPath} changed before commit` })
       }
-      if (sourceExists) {
-        const current = yield* read(fs, change.path)
-        if (!sameBytes(current, change.before)) {
-          return yield* new ExchangeError.Conflict({ detail: `${change.displayPath} changed before commit` })
-        }
-      }
-      if (change.type === "move" && (yield* exists(fs, change.movePath))) {
-        return yield* new ExchangeError.Conflict({ detail: `${change.moveDisplayPath} appeared before commit` })
-      }
+    }
+    if (change.type === "move" && (yield* exists(fs, change.movePath))) {
+      return yield* new ExchangeError.Conflict({ detail: `${change.moveDisplayPath} appeared before commit` })
     }
   })
+}
+
+function cas(fs: FSUtil.Interface, changes: readonly Change[]) {
+  return Effect.forEach(changes, (change) => casChange(fs, change), { discard: true })
 }
 
 function rollback(fs: FSUtil.Interface, attempted: readonly Change[], cause: unknown) {
@@ -285,13 +296,34 @@ function rollback(fs: FSUtil.Interface, attempted: readonly Change[], cause: unk
   })
 }
 
+function applyChanges(fs: FSUtil.Interface, changes: readonly Change[], signal?: AbortSignal) {
+  const attempted: Change[] = []
+  return Effect.gen(function* () {
+    for (const change of changes) {
+      yield* ensureNotCancelled(signal)
+      // Journal before dispatch. A filesystem operation can become visible
+      // and still report failure, so recording only successful calls is not
+      // sufficient to prove rollback after an uncertain OS result.
+      attempted.push(change)
+      if (change.type === "delete") {
+        yield* fs.remove(change.path)
+        continue
+      }
+      const target = change.type === "move" ? change.movePath : change.path
+      yield* atomicWrite(fs, target, change.after)
+      if (change.type === "move") yield* fs.remove(change.path)
+    }
+  }).pipe(Effect.catch((cause) => rollback(fs, attempted, cause)))
+}
+
 /**
  * Protocol-neutral file transaction kernel shared by edit and patch.
  *
  * `lockPaths` must conservatively include every possible source/destination the
- * planner can return. The kernel does a second whole-plan CAS after authority
- * revalidation, so an external writer racing the in-process lock is still
- * detected before the first write.
+ * planner can return. The strict kernel does a second whole-plan CAS after
+ * authority revalidation, so an external writer racing the in-process lock is
+ * still detected before the first write. Patch callers that explicitly support
+ * independently accepted file operations use commitIndependent below instead.
  */
 export function commit<E, A>(
   fs: FSUtil.Interface,
@@ -319,27 +351,71 @@ export function commit<E, A>(
       yield* ensureNotCancelled(signal)
       yield* hooks.beforeCommit()
 
-      const attempted: Change[] = []
-      yield* Effect.gen(function* () {
-        for (const change of prepared.changes) {
-          yield* ensureNotCancelled(signal)
-          // Journal before dispatch. A filesystem operation can become visible
-          // and still report failure, so recording only successful calls is not
-          // sufficient to prove rollback after an uncertain OS result.
-          attempted.push(change)
-          if (change.type === "delete") {
-            yield* fs.remove(change.path)
-            continue
-          }
-          const target = change.type === "move" ? change.movePath : change.path
-          yield* atomicWrite(fs, target, change.after)
-          if (change.type === "move") yield* fs.remove(change.path)
-        }
-      }).pipe(
-        Effect.catch((cause) => rollback(fs, attempted, cause)),
-      )
+      yield* applyChanges(fs, prepared.changes, signal)
 
       return { value: prepared.value, changes: prepared.changes, committed: true }
+    }),
+  ).pipe(Effect.tap((result) => recordChanges(result.changes, attribution)))
+}
+
+/**
+ * Commit independently verifiable file operations under one shared lock set.
+ *
+ * State conflicts discovered by the final CAS skip only that operation. Hard
+ * failures (authority, cancellation, filesystem errors, ambiguous writes)
+ * still fail the call, and any accepted writes are rolled back together.
+ * A move remains one indivisible Change, so source/destination coupling is
+ * never weakened by partial acceptance.
+ */
+export function commitIndependent<E, A>(
+  fs: FSUtil.Interface,
+  lockPaths: readonly string[],
+  hooks: Hooks<E, A>,
+  signal?: AbortSignal,
+  attribution?: ExchangeAttribution.Attribution,
+): Effect.Effect<IndependentResult<A>, ExchangeError.Error | E> {
+  return withFileLocks(
+    lockPaths,
+    Effect.gen(function* () {
+      yield* ensureNotCancelled(signal)
+      const prepared = yield* hooks.prepare()
+      if (prepared.changes.length === 0) {
+        return { value: prepared.value, changes: [], conflicts: [], committed: false }
+      }
+      const actualTargets = new Set(targets(prepared.changes).map(FSUtil.normalizePath))
+      const lockedTargets = new Set(lockPaths.map(FSUtil.normalizePath))
+      if ([...actualTargets].some((target) => !lockedTargets.has(target))) {
+        return yield* new ExchangeError.DependencyUnavailable({ detail: "Mutation planner returned a target outside its lock set" })
+      }
+
+      yield* hooks.revalidate()
+      const accepted: Change[] = []
+      const conflicts: SkippedConflict[] = []
+      for (const change of prepared.changes) {
+        const outcome = yield* casChange(fs, change).pipe(
+          Effect.match({
+            onFailure: (error) => ({ ok: false as const, error }),
+            onSuccess: () => ({ ok: true as const }),
+          }),
+        )
+        if (outcome.ok) {
+          accepted.push(change)
+          continue
+        }
+        if (outcome.error instanceof ExchangeError.Conflict) {
+          conflicts.push({ change, detail: outcome.error.detail })
+          continue
+        }
+        return yield* Effect.fail(outcome.error)
+      }
+
+      yield* ensureNotCancelled(signal)
+      if (accepted.length === 0) {
+        return { value: prepared.value, changes: [], conflicts, committed: false }
+      }
+      yield* hooks.beforeCommit()
+      yield* applyChanges(fs, accepted, signal)
+      return { value: prepared.value, changes: accepted, conflicts, committed: true }
     }),
   ).pipe(Effect.tap((result) => recordChanges(result.changes, attribution)))
 }

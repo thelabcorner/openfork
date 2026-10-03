@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test"
 import type { PluginInput } from "@opencode-ai/plugin"
 import { MULTI_ACCOUNT_PROVIDERS } from "@opencode-ai/schema/model-select/multi-account-providers"
 import { WorkBuddyPlugin } from "@/plugin/workbuddy"
-import { VerdentPlugin } from "@/plugin/verdent"
 import { ZenGoPlugin, ZenPlugin, resetZenPoolForTest, setTestZenVaultCredentials } from "@/plugin/zen"
 
 const input = { serverUrl: new URL("http://127.0.0.1:1") } as PluginInput
@@ -18,7 +17,6 @@ describe("multi-account provider hook coverage", () => {
 
     const hooks = await Promise.all([
       WorkBuddyPlugin(input),
-      VerdentPlugin(input),
       ZenPlugin(input),
       ZenGoPlugin(input),
     ])

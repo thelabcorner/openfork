@@ -7,9 +7,9 @@
 //   a) watcher — subscribe to the core FileWatcher "file.watcher.updated" stream and filter
 //      by path + instance location (primary; active wherever OPENCODE_EXPERIMENTAL_FILEWATCHER
 //      is on, e.g. desktop).
-//   b) poll — fingerprint (size + content hash) every watched file across ALL config dirs
-//      every ~2s. Covers the global config dir, which the core watcher does not watch, and
-//      CLI where the watcher flag is off.
+//   b) poll — fingerprint watched files across ALL config dirs every 10s only when native
+//      watcher coverage is unavailable or incomplete. In Node, hot reload is unsupported,
+//      so ToolReload does not initialize watchers or polling at all.
 //   c) manual — reload(reason: "manual") from the V1 POST /tool/reload endpoint.
 //
 // Safety invariants:
@@ -82,6 +82,16 @@ type ReloadState = {
   readonly run: (reason: ReloadReason) => Effect.Effect<ReloadResult>
 }
 
+function unavailableReloadResult(): ReloadResult {
+  return {
+    ok: true,
+    added: [],
+    updated: [],
+    removed: [],
+    warnings: ["tool hot-reload unavailable in Node; existing tool registry preserved"],
+  }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -146,15 +156,7 @@ const layer = Layer.effect(
           // reload must preserve the currently registered custom slice. A
           // partial rebuild here could change the model-visible tool set
           // mid-session and destabilize provider prefix/context caching.
-          if (typeof Bun === "undefined") {
-            return {
-              ok: true,
-              added: [],
-              updated: [],
-              removed: [],
-              warnings: ["tool hot-reload unavailable in Node; existing tool registry preserved"],
-            }
-          }
+          if (typeof Bun === "undefined") return unavailableReloadResult()
           const changed = yield* Ref.getAndSet(dirty, new Set<string>())
           const warnings: string[] = []
           if ([...changed].some((file) => isPluginFile(dirs, file))) {
@@ -299,7 +301,7 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() => unsubscribe)
 
         // Seed the polling baseline once. The old empty baseline treated every
-        // existing file as "changed" on the first 2s poll, forcing one needless
+        // existing file as "changed" on the first poll, forcing one needless
         // full custom-tool rebuild in every OpenCode host after startup.
         yield* Ref.set(fingerprints, yield* scanFingerprints(dirs))
 
@@ -416,10 +418,15 @@ const layer = Layer.effect(
     )
 
     const start: Interface["start"] = Effect.fn("ToolReload.start")(function* () {
+      // The Node sidecar cannot transpile custom TypeScript tool/plugin files.
+      // Do not materialize per-instance directory scans, native subscriptions,
+      // or fallback pollers for a capability this runtime cannot execute.
+      if (typeof Bun === "undefined") return
       yield* InstanceState.get(state).pipe(Effect.forkIn(scope))
     })
 
     const reload: Interface["reload"] = Effect.fn("ToolReload.reload")(function* (reason: ReloadReason) {
+      if (typeof Bun === "undefined") return unavailableReloadResult()
       return yield* InstanceState.useEffect(state, (s) => s.run(reason))
     })
 
@@ -438,7 +445,7 @@ export const node = LayerNode.make({
 /**
  * Polling is permitted only when native watcher coverage is unavailable or
  * incomplete. Keep this decision pure so a regression cannot accidentally
- * restore the old "native + permanent 2s poll" behavior.
+ * restore an always-on poll alongside healthy native coverage.
  */
 export function toolReloadNeedsPolling(nativeAvailable: boolean, attempted: number, subscribed: number): boolean {
   if (!nativeAvailable) return true

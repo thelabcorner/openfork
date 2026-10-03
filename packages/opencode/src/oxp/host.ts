@@ -5,6 +5,8 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { OxpConfig } from "./config"
 import { OxpAgentCatalog } from "./agent-catalog"
 import { OxpAgentCatalogV1 } from "./agent-catalog-v1"
+import { OxpModelCatalog } from "./model-catalog"
+import { OxpModelCatalogV1 } from "./model-catalog-v1"
 import { OxpError } from "./error"
 import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
@@ -35,6 +37,13 @@ export interface TrustedRootState {
   readonly managedByProject: boolean
 }
 
+export interface WorkerAgentCatalog {
+  readonly rootID: OxpSchema.RootID
+  readonly rootAlias: OxpSchema.RootAlias
+  readonly agents: readonly OxpAgentCatalog.Agent[]
+  readonly nativeDefaultAgent: string
+}
+
 export interface TrustedState {
   readonly version: 1
   readonly enabled: boolean
@@ -42,6 +51,7 @@ export interface TrustedState {
   readonly configRevision: number
   readonly roots: readonly TrustedRootState[]
   readonly grant: OxpSchema.Grant
+  readonly workerPolicy: OxpSchema.WorkerPolicy
   readonly endpoint: {
     readonly state: "stopped" | "ready" | "error"
     readonly generation?: number
@@ -80,6 +90,7 @@ const activeLayer = AppNodeBuilder.build(
     OxpConfig.node,
     OxpRoot.node,
     OxpAgentCatalog.node,
+    OxpModelCatalog.node,
     OxpServer.node,
   ]),
   [
@@ -89,6 +100,7 @@ const activeLayer = AppNodeBuilder.build(
     [OxpMcpControl.node, OxpMcpControlV1.layer],
     [OxpSystemOneControl.node, OxpSystemOneControlV1.layer],
     [OxpAgentCatalog.node, OxpAgentCatalogV1.layer],
+    [OxpModelCatalog.node, OxpModelCatalogV1.layer],
   ],
 )
 
@@ -178,6 +190,11 @@ async function stateNow(): Promise<TrustedState> {
     configRevision: current.revision,
     roots: Object.freeze(projected),
     grant: current.grant,
+    workerPolicy: current.workerPolicy ?? {
+      models: [],
+      agents: [],
+      agentRoots: [],
+    },
     endpoint: Object.freeze(
       endpoint
         ? {
@@ -290,6 +307,86 @@ export function setEnabled(enabled: boolean): Promise<TrustedState> {
 export function setGrant(patch: Partial<OxpSchema.Grant>): Promise<TrustedState> {
   return enqueue(async () => {
     await runControl(OxpConfig.Service.use((config) => config.setGrant(patch)))
+    return stateNow()
+  })
+}
+
+export function setWorkerDefaultModel(
+  model: OxpSchema.ModelSelection | undefined,
+): Promise<TrustedState> {
+  return enqueue(async () => {
+    await runControl(
+      OxpConfig.Service.use((config) => config.setWorkerDefaultModel(model)),
+    )
+    return stateNow()
+  })
+}
+
+export function listWorkerAgents(id: string): Promise<WorkerAgentCatalog> {
+  return enqueue(async () => {
+    if (!activeRuntime) {
+      throw new OxpError.AuthDenied({
+        detail:
+          "Enable OXP before loading the workspace delegated-worker agent catalog",
+      })
+    }
+    return runActive(
+      Effect.gen(function* () {
+        const roots = yield* OxpRoot.Service
+        const catalog = yield* OxpAgentCatalog.Service
+        const resolved = yield* roots.resolveRoot(OxpSchema.RootID.make(id))
+        const snapshot = yield* catalog.list({
+          directory: resolved.canonicalPath,
+        })
+        return {
+          rootID: resolved.root.id,
+          rootAlias: resolved.root.alias,
+          agents: snapshot.agents,
+          nativeDefaultAgent: snapshot.nativeDefaultAgent,
+        } satisfies WorkerAgentCatalog
+      }),
+    )
+  })
+}
+
+export function setWorkerDefaultAgent(
+  id: string,
+  agent: string | undefined,
+): Promise<TrustedState> {
+  return enqueue(async () => {
+    const rootID = OxpSchema.RootID.make(id)
+    if (agent) {
+      if (!activeRuntime) {
+        throw new OxpError.AuthDenied({
+          detail:
+            "Enable OXP before selecting a workspace delegated-worker agent",
+        })
+      }
+      await runActive(
+        Effect.gen(function* () {
+          const roots = yield* OxpRoot.Service
+          const catalog = yield* OxpAgentCatalog.Service
+          const config = yield* OxpConfig.Service
+          const resolved = yield* roots.resolveRoot(rootID)
+          const snapshot = yield* catalog.list({
+            directory: resolved.canonicalPath,
+          })
+          if (!snapshot.agents.some((candidate) => candidate.id === agent)) {
+            return yield* new OxpError.InvalidArgument({
+              detail:
+                "Requested delegated-worker agent is unavailable in the approved root",
+            })
+          }
+          yield* config.setWorkerDefaultAgent(rootID, agent)
+        }),
+      )
+    } else {
+      await runControl(
+        OxpConfig.Service.use((config) =>
+          config.setWorkerDefaultAgent(rootID, undefined),
+        ),
+      )
+    }
     return stateNow()
   })
 }

@@ -89,7 +89,7 @@ const activityModel = (extra: Tool.Context["extra"]): CodingActivity.Model | und
  *
  * This is deliberately a value the instance already proved, never one re-derived
  * from a read path or a project display name, and it is never resolved against
- * the host cwd - an instance holding neither real root reports no folder at all
+ * the host cwd — an instance holding neither real root reports no folder at all
  * rather than an invented one.
  *
  * Stamping it is pure O(1) metadata on a value already in memory: this performs
@@ -309,6 +309,7 @@ export const ReadTool = Tool.define<
           ...(model ? { model } : {}),
           source: "session",
           sourceRef: ctx.callID || ctx.messageID,
+          ...(ctx.callID ? { replayToken: ctx.callID } : {}),
         }).pipe(Effect.ignore)
       }
 

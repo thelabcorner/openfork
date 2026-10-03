@@ -1,6 +1,7 @@
 import { Context, Effect } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Node } from "@opencode-ai/core/effect/app-node"
+import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import type { OxpRuntimeV1 } from "./runtime-v1"
 
 export type Target = OxpRuntimeV1.Target
@@ -10,6 +11,7 @@ export interface ModelSelection {
   readonly modelID: string
   readonly accountID?: string
   readonly variant?: string
+  readonly routeIntent?: ProviderRouteIntent.Info
 }
 
 export interface Identity {
@@ -32,6 +34,8 @@ export interface StartInput {
   readonly agent: string
   readonly model: ModelSelection
   readonly origin: Origin
+  /** Durable navigation owner for OXP workers; supplied by the native adapter. */
+  readonly groupID?: string
 }
 
 export interface ContinueInput {
@@ -53,21 +57,41 @@ export interface SetSelectionInput {
 
 export type State =
   | "running"
+  | "blocked"
   | "completed"
   | "error"
   | "cancelled"
   | "recoverable"
   | "idle"
 
+export type Blocker =
+  | {
+      readonly type: "permission"
+      readonly id: string
+      readonly sessionID: string
+      readonly permission: string
+      readonly externalDirectory: boolean
+    }
+  | {
+      readonly type: "question"
+      readonly id: string
+      readonly sessionID: string
+      readonly questionCount: number
+    }
+
+export type Activity = "queued" | "awaiting_provider" | "streaming" | "stepping"
+
 export interface Snapshot {
   readonly workerID: string
   readonly state: State
+  readonly blockedBy?: readonly Blocker[]
   readonly generation?: number
   readonly result?: string
   readonly error?: string
   readonly startedAt?: number
   readonly completedAt?: number
   readonly recovered: boolean
+  readonly activity?: Activity
 }
 
 export interface SelectionChange {
@@ -82,6 +106,7 @@ export interface SelectionChange {
 export interface BatchStartInput {
   readonly name: string
   readonly ownerRef: string
+  readonly identity: Identity
   readonly workers: readonly StartInput[]
 }
 
@@ -136,6 +161,8 @@ export class BatchCommitted extends Error {
     readonly batchID?: string,
     message = "Delegated batch mutation partially committed before failure",
     cause?: unknown,
+    readonly residualWorkerIDs: readonly string[] = workerIDs,
+    readonly compensatedWorkerIDs: readonly string[] = [],
   ) {
     super(message, cause === undefined ? undefined : { cause })
   }

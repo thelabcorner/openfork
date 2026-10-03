@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { Effect } from "effect"
+import { Effect, PlatformError } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ExchangeError } from "../../src/exchange/error"
@@ -11,8 +11,13 @@ import { testEffect } from "../lib/effect"
 
 const it = testEffect(AppNodeBuilder.build(FSUtil.node))
 
-function failure(method: string) {
-  return new FSUtil.FileSystemError({ method, cause: new Error("injected uncertain filesystem result") })
+function failure(method: string): PlatformError.PlatformError {
+  return PlatformError.systemError({
+    _tag: "Unknown",
+    module: "FSUtil",
+    method,
+    description: "injected uncertain filesystem result",
+  })
 }
 
 function update(pathname: string, before: string, after: string): ExchangeFileMutation.Change {
@@ -35,6 +40,77 @@ function commit(fs: FSUtil.Interface, change: ExchangeFileMutation.Change) {
 }
 
 describe("ExchangeFileMutation", () => {
+  it.live("commits independent siblings when one file drifts before final CAS", Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+    const a = path.join(tmp.path, "a.txt")
+    const b = path.join(tmp.path, "b.txt")
+    const c = path.join(tmp.path, "c.txt")
+    yield* Effect.promise(() => Promise.all([
+      fs.writeFile(a, "alpha\n"),
+      fs.writeFile(b, "bravo\n"),
+      fs.writeFile(c, "charlie\n"),
+    ]))
+    const actual = yield* FSUtil.Service
+    const changes = [
+      update(a, "alpha\n", "ALPHA\n"),
+      { ...update(b, "bravo\n", "BRAVO\n"), displayPath: "/repo/b.txt" },
+      { ...update(c, "charlie\n", "CHARLIE\n"), displayPath: "/repo/c.txt" },
+    ]
+    yield* Effect.promise(() => fs.writeFile(b, "bravo-raced\n"))
+
+    const result = yield* ExchangeFileMutation.commitIndependent(actual, [a, b, c], {
+      prepare: () => Effect.succeed({ changes, value: undefined }),
+      revalidate: () => Effect.void,
+      beforeCommit: () => Effect.void,
+    })
+
+    expect(result.committed).toBe(true)
+    expect(result.changes.map((change) => change.displayPath)).toEqual(["/repo/a.txt", "/repo/c.txt"])
+    expect(result.conflicts.map((conflict) => conflict.change.displayPath)).toEqual(["/repo/b.txt"])
+    expect(yield* Effect.promise(() => fs.readFile(a, "utf8"))).toBe("ALPHA\n")
+    expect(yield* Effect.promise(() => fs.readFile(b, "utf8"))).toBe("bravo-raced\n")
+    expect(yield* Effect.promise(() => fs.readFile(c, "utf8"))).toBe("CHARLIE\n")
+  }))
+
+  it.live("rolls back accepted independent siblings when a real write fails", Effect.gen(function* () {
+    const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
+    const a = path.join(tmp.path, "a.txt")
+    const b = path.join(tmp.path, "b.txt")
+    const c = path.join(tmp.path, "c.txt")
+    yield* Effect.promise(() => Promise.all([
+      fs.writeFile(a, "alpha\n"),
+      fs.writeFile(b, "bravo\n"),
+      fs.writeFile(c, "charlie\n"),
+    ]))
+    const actual = yield* FSUtil.Service
+    let failed = false
+    const uncertain = FSUtil.Service.of({
+      ...actual,
+      rename: (from, to) => {
+        if (to !== c || failed) return actual.rename(from, to)
+        failed = true
+        return Effect.fail(failure("rename-c"))
+      },
+    })
+    const changes = [
+      update(a, "alpha\n", "ALPHA\n"),
+      { ...update(b, "bravo\n", "BRAVO\n"), displayPath: "/repo/b.txt" },
+      { ...update(c, "charlie\n", "CHARLIE\n"), displayPath: "/repo/c.txt" },
+    ]
+    yield* Effect.promise(() => fs.writeFile(b, "bravo-raced\n"))
+
+    const error = yield* ExchangeFileMutation.commitIndependent(uncertain, [a, b, c], {
+      prepare: () => Effect.succeed({ changes, value: undefined }),
+      revalidate: () => Effect.void,
+      beforeCommit: () => Effect.void,
+    }).pipe(Effect.flip)
+
+    expect(error).toBeInstanceOf(ExchangeError.DependencyUnavailable)
+    expect(yield* Effect.promise(() => fs.readFile(a, "utf8"))).toBe("alpha\n")
+    expect(yield* Effect.promise(() => fs.readFile(b, "utf8"))).toBe("bravo-raced\n")
+    expect(yield* Effect.promise(() => fs.readFile(c, "utf8"))).toBe("charlie\n")
+  }))
+
   it.live("restores an update when rename became visible before reporting failure", Effect.gen(function* () {
     const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
     const target = path.join(tmp.path, "a.txt")

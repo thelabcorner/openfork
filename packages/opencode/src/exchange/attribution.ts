@@ -49,6 +49,12 @@ export interface Attribution {
    * may legitimately use it to group activity from one actor.
    */
   readonly sourceRef?: string
+  /**
+   * Per-invocation identity proving that a CodingActivity observation is a
+   * replay of the same logical operation. Unlike `sourceRef`, this identifies
+   * one invocation/observation rather than the acting principal.
+   */
+  readonly replayToken?: string
 }
 
 export interface Identity {
@@ -56,6 +62,7 @@ export interface Identity {
   readonly project: string
   readonly projectFolder?: string
   readonly sourceRef?: string
+  readonly replayToken?: string
 }
 
 /**
@@ -77,5 +84,6 @@ export function apply(
     project: attribution.project,
     ...(attribution.projectFolder === undefined ? {} : { projectFolder: attribution.projectFolder }),
     ...(attribution.sourceRef === undefined ? {} : { sourceRef: attribution.sourceRef }),
+    ...(attribution.replayToken === undefined ? {} : { replayToken: attribution.replayToken }),
   }
 }

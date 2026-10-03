@@ -47,6 +47,11 @@ export type DevHandshake = {
   startedAt: string
   /** `dev` | `beta` | `prod` — surfaced in errors so mixed channels are obvious. */
   channel?: string
+  /** Electron utility-process identity; absent on old handshake generations. */
+  sidecarPID?: number
+  sidecarStartedAt?: string
+  /** Loopback-only utility inspector, emitted only by a development desktop. */
+  inspectorURL?: string
 }
 
 export type InstanceIdentity = {
@@ -98,6 +103,12 @@ export function parseHandshake(raw: string): DevHandshake | undefined {
     pid: typeof value.pid === "number" ? value.pid : 0,
     startedAt: typeof value.startedAt === "string" ? value.startedAt : "",
     channel: typeof value.channel === "string" && value.channel ? value.channel : undefined,
+    sidecarPID: Number.isSafeInteger(value.sidecarPID) && Number(value.sidecarPID) > 0 ? Number(value.sidecarPID) : undefined,
+    sidecarStartedAt: typeof value.sidecarStartedAt === "string" ? value.sidecarStartedAt : undefined,
+    inspectorURL:
+      typeof value.inspectorURL === "string" && /^ws:\/\/127\.0\.0\.1:\d+\//.test(value.inspectorURL)
+        ? value.inspectorURL
+        : undefined,
   }
 }
 

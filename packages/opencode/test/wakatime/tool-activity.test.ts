@@ -77,6 +77,7 @@ describe("tool.execute.after producer truthfulness", () => {
       kind: "write",
       aiSession: "ses_1",
       sourceRef: "call_1",
+      replayToken: "call_1",
       source: "session",
       project: "demo",
       projectFolder: FOLDER,
@@ -97,6 +98,7 @@ describe("tool.execute.after producer truthfulness", () => {
         kind: "write",
         aiSession: "ses_1",
         sourceRef: "call_1",
+        replayToken: "call_1",
         source: "session",
         project: "demo",
         projectFolder: FOLDER,
@@ -199,7 +201,7 @@ describe("tool.execute.after canonical context and dedupe", () => {
       CONTEXT,
     )
     expect(planned.map((item) => item.entity)).toEqual([abs("src", "rel.ts")])
-    expect(planned[0]).toMatchObject({ aiSession: "ses_2", sourceRef: "call_2" })
+    expect(planned[0]).toMatchObject({ aiSession: "ses_2", sourceRef: "call_2", replayToken: "call_2" })
   })
 
   test("paths that canonicalize to the same file are recorded once", () => {

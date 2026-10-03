@@ -70,6 +70,24 @@ describe("OxpRoot", () => {
   )
 
   it.live(
+    "treats dot as the explicit approved root instead of a path escape",
+    Effect.gen(function* () {
+      const roots = yield* OxpRoot.Service
+      const rootDir = path.join(suite, "workspace")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      const root = yield* roots.approve(rootDir)
+
+      const dot = yield* roots.resolvePath(".", { rootID: root.id })
+      const dotted = yield* roots.resolvePath("././", { rootID: root.id })
+
+      expect(dot.path).toBe(rootDir)
+      expect(dot.virtualPath).toBe(`/${root.alias}`)
+      expect(dotted.path).toBe(rootDir)
+      expect(dotted.virtualPath).toBe(`/${root.alias}`)
+    }),
+  )
+
+  it.live(
     "requires explicit root identity for a relative path when root choice is ambiguous",
     Effect.gen(function* () {
       const roots = yield* OxpRoot.Service
@@ -320,7 +338,7 @@ describe("OxpRoot", () => {
   )
 
   it.live(
-    "root lifecycle never creates or carries delegation selection policy",
+    "keeps delegation agent preferences root-scoped and removes stale preferences with the root",
     Effect.gen(function* () {
       const roots = yield* OxpRoot.Service
       const config = yield* OxpConfig.Service
@@ -333,12 +351,24 @@ describe("OxpRoot", () => {
         ]),
       )
       const first = yield* roots.approve(firstDir)
+      yield* config.setWorkerDefaultAgent(first.id, "review")
       const second = yield* roots.approve(secondDir)
-      expect((yield* config.get()).workerPolicy).toBeUndefined()
       expect(second.id).not.toBe(first.id)
+      let policy = (yield* config.get()).workerPolicy
+      expect(
+        policy?.agentRoots?.find((entry) => entry.rootID === first.id)
+          ?.defaultAgent,
+      ).toBe("review")
+      expect(
+        policy?.agentRoots?.find((entry) => entry.rootID === second.id)
+          ?.defaultAgent,
+      ).toBeUndefined()
 
       yield* roots.remove(first.id)
-      expect((yield* config.get()).workerPolicy).toBeUndefined()
+      policy = (yield* config.get()).workerPolicy
+      expect(
+        policy?.agentRoots?.some((entry) => entry.rootID === first.id),
+      ).toBe(false)
     }),
   )
 

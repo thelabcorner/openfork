@@ -41,16 +41,6 @@ export const PtyApi = HttpApi.make("pty")
   .add(
     HttpApiGroup.make("pty")
       .add(
-        HttpApiEndpoint.get("shells", PtyPaths.shells, {
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.Array(ShellItem), "List of shells"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "pty.shells",
-            summary: "List available shells",
-            description: "Get a list of available shells on the system.",
-          }),
-        ),
         HttpApiEndpoint.get("list", PtyPaths.list, {
           query: WorkspaceRoutingQuery,
           success: described(Schema.Array(Pty.Info), "List of sessions"),
@@ -135,6 +125,25 @@ export const PtyApi = HttpApi.make("pty")
       description: "Experimental HttpApi surface for selected instance routes.",
     }),
   )
+
+// Shell discovery only inspects executables available to this process. Keep
+// it on the process-level API so settings can list shells without a workspace
+// directory and without constructing a workspace Instance.
+export const PtyShellApi = HttpApi.make("pty-shell").add(
+  HttpApiGroup.make("pty-shell")
+    .add(
+      HttpApiEndpoint.get("shells", PtyPaths.shells, {
+        success: described(Schema.Array(ShellItem), "List of shells"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "pty.shells",
+          summary: "List available shells",
+          description: "Get a list of shells available to the OpenFork process.",
+        }),
+      ),
+    )
+    .annotateMerge(OpenApi.annotations({ title: "pty-shell", description: "Process-level shell discovery." })),
+)
 
 export const PtyConnectApi = HttpApi.make("pty-connect").add(
   HttpApiGroup.make("pty-connect")

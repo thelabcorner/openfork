@@ -399,6 +399,58 @@ it.effect("updates global config and omits empty shell key in jsonc", () =>
   ),
 )
 
+for (const name of ["openfork.json", "openfork.jsonc"]) {
+  it.effect(`replaces and deletes one global agent atomically in ${name}`, () =>
+    withGlobalConfig(
+      {
+        name,
+        config: {
+          username: "keep-user",
+          agent: {
+            reviewer: {
+              prompt: "old prompt",
+              temperature: 0.7,
+              permission: { bash: "deny" },
+            },
+            sibling: {
+              prompt: "keep sibling",
+            },
+          },
+        },
+      },
+      ({ dir }) =>
+        Effect.gen(function* () {
+          const file = path.join(dir, name)
+          const replaced = yield* Config.use.updateGlobalAgent({
+            id: "reviewer",
+            value: {
+              mode: "subagent",
+              permission: { bash: "deny" },
+            },
+          })
+
+          expect(replaced.info.agent?.reviewer).toMatchObject({
+            mode: "subagent",
+            permission: { bash: "deny" },
+          })
+          expect(replaced.info.agent?.reviewer).not.toHaveProperty("prompt")
+          expect(replaced.info.agent?.reviewer).not.toHaveProperty("temperature")
+          expect(replaced.info.agent?.sibling?.prompt).toBe("keep sibling")
+          expect(replaced.info.username).toBe("keep-user")
+
+          yield* Config.use.updateGlobalAgent({ id: "reviewer", value: null })
+          const raw = ConfigParse.jsonc(yield* FSUtil.use.readFileString(file), file) as {
+            username?: string
+            agent?: Record<string, unknown>
+          }
+          expect(raw.username).toBe("keep-user")
+          expect(raw.agent).not.toHaveProperty("reviewer")
+          expect(raw.agent).toHaveProperty("sibling")
+        }),
+    ),
+  )
+}
+
 it.effect("logs global update diagnostics once without exposing values", () =>
   withGlobalConfig(
     {

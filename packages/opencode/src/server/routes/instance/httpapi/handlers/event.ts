@@ -1,5 +1,4 @@
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
 import { estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -17,6 +16,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { EventApi } from "../groups/event"
+import { WorkspaceRouteContext } from "../middleware/workspace-routing"
 
 import { adaptLegacyEvent, serializeLegacyEvent } from "@/server/event-serialization"
 
@@ -87,11 +87,22 @@ function eventID() {
   return EventV2.ID.create()
 }
 
+function routeDirectory(input: string) {
+  try {
+    // Preserve the directory decoding that InstanceContextMiddleware applied
+    // before this transport switched to the explicit routing context.
+    return decodeURIComponent(input)
+  } catch {
+    return input
+  }
+}
+
 function eventResponse(events: EventV2Bridge.Interface) {
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    const instance = yield* InstanceState.context
-    const workspaceID = yield* InstanceState.workspaceID
+    const route = yield* WorkspaceRouteContext
+    const directory = routeDirectory(route.directory)
+    const workspaceID = route.workspaceID
     const lastEventID = request.headers["last-event-id"]
     // Request-derived context must be read here, not inside the stream: the
     // body stream runs after this effect returns and no longer has access to
@@ -134,7 +145,7 @@ function eventResponse(events: EventV2Bridge.Interface) {
           coalescer.offer(item)
         }
         const matches = (event: EventV2.Payload) =>
-          event.location?.directory === instance.directory &&
+          event.location?.directory === directory &&
           (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID)
         let replaying = true
         const pendingLive: SequencedEvent[] = []
@@ -147,7 +158,7 @@ function eventResponse(events: EventV2Bridge.Interface) {
         // invoke this callback only to fail matches(), and each loopback SSE
         // connection inflated the global EventV2 listener count. Route by
         // directory first; retain the workspace check below for exactness.
-        const unsubscribe = yield* events.listenDirectoryAll(instance.directory, (event) =>
+        const unsubscribe = yield* events.listenDirectoryAll(directory, (event) =>
           Effect.sync(() => {
             if (!matches(event)) return
             const sequence = events.sequenceOf(event)
@@ -189,7 +200,7 @@ function eventResponse(events: EventV2Bridge.Interface) {
                 requested: replay.kind === "gap" ? replay.requested : cursor ?? 0,
                 oldest: replay.kind === "gap" ? replay.oldest : undefined,
                 latest: replay.latest,
-                directory: instance.directory,
+                directory,
               },
             },
           }]
@@ -214,7 +225,7 @@ function eventResponse(events: EventV2Bridge.Interface) {
         replaying = false
         coalescer.flush()
         const disposed = (event: { directory?: string; payload: { id?: string; type?: string; properties?: unknown } }) => {
-          if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
+          if (event.directory !== directory || event.payload.type !== "server.instance.disposed") return
           coalescer.flush()
           // Deliberately sequence-free. `events.replayLatest()` returns the last
           // sequence already assigned to a real event, so using it here emitted a

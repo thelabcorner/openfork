@@ -464,6 +464,19 @@ describe("Runner", () => {
   )
 
   it.live(
+    "onBusy fires when ensureRunning starts a run",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const count = yield* Ref.make(0)
+      const runner = Runner.make<string>(s, {
+        onBusy: Ref.update(count, (n) => n + 1),
+      })
+      yield* runner.ensureRunning(Effect.succeed("done"))
+      expect(yield* Ref.get(count)).toBe(1)
+    }),
+  )
+
+  it.live(
     "onBusy fires when shell starts",
     Effect.gen(function* () {
       const s = yield* Scope.Scope

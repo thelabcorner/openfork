@@ -54,7 +54,10 @@ const layer = Layer.effect(
       const key = (value: string) => FSUtil.normalizePath(value)
       const resolve = (operation: "json.read" | "json.write", inputPath: string) =>
         Effect.gen(function* () {
-          OxpLocation.requireExplicit({ rootID: input.rootID, path: inputPath }, "json")
+          yield* OxpLocation.requireExplicit(
+            { rootID: input.rootID, path: inputPath },
+            "json",
+          )
           const admission = yield* authority.authorize({
             plane: "augmentation",
             operation,

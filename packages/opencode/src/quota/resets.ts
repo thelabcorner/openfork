@@ -30,7 +30,7 @@ function finiteReset(value: number | null | undefined, from: number, to: number)
 }
 
 function windowSource(providerId: string): ResetSource {
-  if (providerId === "opencode-zen" || providerId === "verdent") return "inferred"
+  if (providerId === "opencode-zen") return "inferred"
   if (providerId === "nvidia") return "local"
   return "provider"
 }
@@ -178,7 +178,7 @@ function addProviderResult(
     }
   }
 
-  for (const account of [...(usage.workbuddyAccounts ?? []), ...(usage.verdentAccounts ?? [])]) {
+  for (const account of usage.workbuddyAccounts ?? []) {
     for (const model of account.models) {
       if (!finiteReset(model.resetAt, from, to)) continue
       addOccurrence(map, {

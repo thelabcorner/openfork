@@ -850,9 +850,14 @@ const currentParentBefore = Effect.fnUntraced(function* (
   return row ? currentMessageID(row.id) : undefined
 })
 
-export const currentAll = Effect.fn("MessageV2.currentAll")(function* (input: {
+/**
+ * Decode the authoritative current/V2 transcript without lowering it through
+ * V1 parent/turn semantics. Host-owned special agents may legitimately contain
+ * assistant-only turns, so observability/read-only consumers must not lose
+ * those rows merely because there is no conversational user parent.
+ */
+export const currentMessages = Effect.fn("MessageV2.currentMessages")(function* (input: {
   sessionID: SessionID
-  execution?: CurrentV1Execution
 }) {
   const { db } = yield* Database.Service
   const rows = yield* db
@@ -867,7 +872,14 @@ export const currentAll = Effect.fn("MessageV2.currentAll")(function* (input: {
     .orderBy(SessionMessageTable.seq)
     .all()
     .pipe(Effect.orDie)
-  const decoded = yield* SessionMessageProjection.decodeRows(db, rows).pipe(Effect.orDie)
+  return yield* SessionMessageProjection.decodeRows(db, rows).pipe(Effect.orDie)
+})
+
+export const currentAll = Effect.fn("MessageV2.currentAll")(function* (input: {
+  sessionID: SessionID
+  execution?: CurrentV1Execution
+}) {
+  const decoded = yield* currentMessages({ sessionID: input.sessionID })
   return projectCurrentToV1(input.sessionID, decoded, { execution: input.execution })
 })
 

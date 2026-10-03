@@ -34,7 +34,7 @@ export const layer = Layer.effect(
     const started = yield* Ref.make(false)
     const startLock = Semaphore.makeUnsafe(1)
 
-    const settle = Effect.fn("SwarmTaskRetirement.settle")(function* (
+    const settleOperational = Effect.fn("SwarmTaskRetirement.settle")(function* (
       target: SwarmV2.RetirementTarget,
       runID?: Swarm.TaskRunID,
     ) {
@@ -50,11 +50,79 @@ export const layer = Layer.effect(
       })
     })
 
+    /**
+     * Only automatic recovery/replay reasons are eligible for exact-input
+     * anti-replay closure. `human_focus`, `member_rebind`, `operator_release`,
+     * `member_stop`, and `swarm_freeze` are explicit operator/lifecycle
+     * semantics whose redispatch behavior this patch must not redesign.
+     */
+    const antiReplayRetireReasons: ReadonlySet<string> = new Set<SwarmV2.RetirementReason>([
+      "lease_owner_lost",
+      "lease_expired",
+      "recovery",
+    ])
+
+    /**
+     * Anti-replay proof for one exact assignment.
+     *
+     * A completion marker on this run's own `session_input` row is durable
+     * execution-ended truth for that assignment and nothing else: the Session
+     * reached a successful provider cycle for that exact input. It is never
+     * semantic success, and because the marker lives on the row itself, a later
+     * peer turn or a new execution generation can never make it retroactively
+     * cover an earlier failed assignment.
+     *
+     * Unresolved external tool effects keep their stronger fence. Without a
+     * hazard-free proof this returns `undefined`, and the caller keeps today's
+     * operational settlement instead of review-closing a run whose external
+     * effects nobody observed.
+     */
+    const provenEndedByInputCompletion = Effect.fn("SwarmTaskRetirement.provenEndedByInputCompletion")(function* (
+      target: SwarmV2.RetirementTarget,
+      input: { readonly completedSeq?: number } | undefined,
+    ) {
+      const reason = target.lease.retireReason
+      // An unrecognized or absent reason keeps today's operational settlement.
+      if (reason === undefined || !antiReplayRetireReasons.has(reason)) return undefined
+      if (input?.completedSeq === undefined) return undefined
+      const hazards = yield* SessionRecovery.executionHazards(db, target.token.sessionID)
+      if (hazards.currentTool || hazards.legacyTool) {
+        yield* Effect.logWarning("Swarm retirement keeps a completed assignment fenced by unresolved execution effects", {
+          taskID: target.token.taskID,
+          leaseGeneration: target.token.generation,
+          sessionID: target.token.sessionID,
+          completedSeq: input.completedSeq,
+          hazards,
+        })
+        return undefined
+      }
+      return input.completedSeq
+    })
+
+    const settleEnded = Effect.fn("SwarmTaskRetirement.settleEnded")(function* (
+      target: SwarmV2.RetirementTarget,
+      runID: Swarm.TaskRunID,
+      endedSeq: number | undefined,
+    ) {
+      if (endedSeq === undefined) return yield* settleOperational(target, runID)
+      yield* swarm.settleTask({
+        token: target.token,
+        runID,
+        // Retirement's explicit anti-replay capability: this branch has proven
+        // execution-end truth for the run's exact SessionInput.
+        retirementOwnerUnsettled: true,
+        settlement: {
+          type: "unsettled",
+          detail: `assignment execution completed (input ${endedSeq}) and ended without a semantic settlement`,
+        },
+      })
+    })
+
     const reconcileTarget = Effect.fn("SwarmTaskRetirement.reconcileTarget")(function* (
       target: SwarmV2.RetirementTarget,
     ) {
       if (target.runs.length === 0) {
-        yield* settle(target)
+        yield* settleOperational(target)
         return
       }
       if (target.runs.length !== 1) {
@@ -86,7 +154,7 @@ export const layer = Layer.effect(
           ) {
             // SwarmSessionProjector normally settles this in the same revocation
             // transaction. Exact settle is a safe idempotent/race fallback.
-            yield* settle(target, current.run.id).pipe(Effect.ignore)
+            yield* settleOperational(target, current.run.id).pipe(Effect.ignore)
             return
           } else {
             yield* Effect.logWarning("Swarm pending retirement could not prove revocation", {
@@ -96,14 +164,22 @@ export const layer = Layer.effect(
             })
           }
         } else {
-          yield* settle(target, current.run.id).pipe(Effect.ignore)
+          yield* settleOperational(target, current.run.id).pipe(Effect.ignore)
           return
         }
       }
 
+      // Owner-loss / recovery race. A retirement that wins the race after the
+      // assignment already produced its result must not hand that result back
+      // out as `ready`. Inspect this run's exact input before settling
+      // operationally, so the task becomes `review_pending` instead of
+      // redispatching work that already ran.
+      const endedSeq = yield* provenEndedByInputCompletion(target, current.input)
+      const settleRun = settleEnded(target, current.run.id, endedSeq)
+
       const snapshot = yield* execution.snapshot(target.token.sessionID)
       if (snapshot.ownerID === undefined) {
-        yield* settle(target, current.run.id)
+        yield* settleRun
         return
       }
 
@@ -116,7 +192,10 @@ export const layer = Layer.effect(
 
       const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, execution, target.token.sessionID)
       if (recovery.state === "recovered" || recovery.state === "idle") {
-        yield* settle(target, current.run.id)
+        // `recovered` is only reachable when the dead owner had NO unresolved
+        // tool effects, so this cannot weaken effect-unknown safety: a fenced
+        // generation returns `effect-unknown` and never reaches this branch.
+        yield* settleRun
         return
       }
       if (recovery.state === "effect-unknown") {
@@ -124,6 +203,13 @@ export const layer = Layer.effect(
         // explicit operator acknowledgement exists, those rows are the durable
         // evidence preventing a later recovery process from mistaking the
         // generation for quiescent after this recovery owner itself crashes.
+        //
+        // This loop is level-triggered and unattended, so acknowledgement must
+        // never originate here: sealing here would resolve mutating effects whose
+        // OS-level outcome nobody observed, and would erase the only evidence
+        // that distinguishes them. There is deliberately no containment call on
+        // this path. An operator acknowledgement needs its own privileged,
+        // audited entry point before it can exist; see the lane-9 contract note.
         const newlyClaimed = snapshot.recoveryOwnerID !== recovery.token.recoveryOwnerID
         if (newlyClaimed)
           yield* Effect.logWarning("Swarm retirement recovery is blocked by unresolved execution effects", {

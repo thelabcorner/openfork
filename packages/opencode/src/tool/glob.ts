@@ -69,8 +69,11 @@ export const GlobTool = Tool.define(
               truncated,
             },
             output: output.join("\n"),
+            // Structured owner: an internal caller composes over `data` instead of
+            // reparsing the model-facing rendering.
+            data: { files: final, count: final.length, truncated },
           }
-        }).pipe(Effect.orDie),
+        }),
     }
   }),
 )

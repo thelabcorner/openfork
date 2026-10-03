@@ -111,6 +111,50 @@ describe("Patch namespace", () => {
         expect(hunk.chunks[0]?.new_lines).toEqual(["after"])
       }
     })
+
+    test("rejects unrecognized top-level material instead of silently dropping it", () => {
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: a.txt",
+        "+alpha",
+        "this line would previously be ignored",
+        "*** End Patch",
+      ].join("\n")
+
+      expect(() => Patch.parsePatch(patchText)).toThrow("Add File content lines must start with '+'")
+    })
+
+    test("rejects malformed update-body lines with their patch line number", () => {
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: a.txt",
+        "@@",
+        "-alpha",
+        "BROKEN",
+        "+ALPHA",
+        "*** End Patch",
+      ].join("\n")
+
+      expect(() => Patch.parsePatch(patchText)).toThrow("Invalid patch line 5 in a.txt")
+    })
+
+    test("rejects update sections that contain no hunks", () => {
+      const patchText = "*** Begin Patch\n*** Update File: a.txt\n\n*** End Patch"
+      expect(() => Patch.parsePatch(patchText)).toThrow("expected at least one @@ hunk")
+    })
+
+    test("allows intentional blank separators between file operations", () => {
+      const patchText = [
+        "*** Begin Patch",
+        "*** Add File: a.txt",
+        "+alpha",
+        "",
+        "*** Delete File: b.txt",
+        "*** End Patch",
+      ].join("\n")
+
+      expect(Patch.parsePatch(patchText).hunks).toHaveLength(2)
+    })
   })
 
   describe("maybeParseApplyPatch", () => {

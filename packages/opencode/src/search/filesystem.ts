@@ -18,6 +18,7 @@ export interface GlobInput {
   readonly path: string
   readonly pattern: string
   readonly limit?: number
+  readonly offset?: number
   readonly signal?: AbortSignal
 }
 
@@ -30,6 +31,7 @@ export interface GlobResult {
 export interface GrepInput {
   readonly path: string
   readonly pattern: string
+  readonly offset?: number
   readonly include?: string
   readonly literal?: boolean
   readonly limit?: number
@@ -62,6 +64,7 @@ export const glob = Effect.fn("FileSearch.glob")(function* (deps: Dependencies, 
     cwd: input.path,
     pattern: input.pattern,
     limit: limit + 1,
+    offset: input.offset,
     hidden: true,
     signal: input.signal,
   })
@@ -95,6 +98,7 @@ export const grep = Effect.fn("FileSearch.grep")(function* (deps: Dependencies, 
   const matches = yield* deps.ripgrep.grep({
     cwd,
     pattern: input.pattern,
+    offset: input.offset,
     file: requestedInfo.type === "File" ? path.basename(search) : undefined,
     include: input.include,
     literal: input.literal,

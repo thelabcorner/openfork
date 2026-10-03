@@ -12,6 +12,7 @@ import type { ParentCorrelation } from "./parent-tool-epoch"
 const KEY_BYTES = 32
 const MAX_CORRELATION_BYTES = 1024
 const KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/
+const MAX_DIGEST_CACHE = 1024
 
 export interface Correlation {
   readonly scheme: ParentCorrelation["scheme"]
@@ -39,6 +40,20 @@ const layer = Layer.effect(
     const filepath = path.join(global.config, "oxp-activity.key")
     const lockKey = `oxp-activity-identity:${filepath}`
     let cached: Buffer | undefined
+    const digests = new Map<string, string>()
+
+    const rememberDigest = (key: string, digest: string) => {
+      if (digests.delete(key)) {
+        digests.set(key, digest)
+        return digest
+      }
+      if (digests.size >= MAX_DIGEST_CACHE) {
+        const oldest = digests.keys().next().value
+        if (oldest !== undefined) digests.delete(oldest)
+      }
+      digests.set(key, digest)
+      return digest
+    }
 
     const unavailable = (detail: string) =>
       new OxpError.DependencyUnavailable({ detail })
@@ -140,14 +155,31 @@ const layer = Layer.effect(
             detail: "Invalid OXP parent correlation identifier",
           })
         }
+        const cacheKey = correlation.scheme + "\0" + raw
+        const cachedDigest = digests.get(cacheKey)
+        if (cachedDigest !== undefined) {
+          // Refresh recency without caching scope: scope remains call-local
+          // metadata while the HMAC is deterministic for scheme + raw value.
+          digests.delete(cacheKey)
+          digests.set(cacheKey, cachedDigest)
+          return {
+            scheme: correlation.scheme,
+            digest: cachedDigest,
+            scope: correlation.scope,
+          }
+        }
         const key = yield* load()
-        return {
-          scheme: correlation.scheme,
-          digest: createHmac("sha256", key)
+        const digest = rememberDigest(
+          cacheKey,
+          createHmac("sha256", key)
             .update(correlation.scheme, "utf8")
             .update("\0")
             .update(raw, "utf8")
             .digest("base64url"),
+        )
+        return {
+          scheme: correlation.scheme,
+          digest,
           scope: correlation.scope,
         }
       },

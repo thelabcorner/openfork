@@ -1,4 +1,5 @@
-import { Effect, Layer } from "effect"
+import { Cause, Clock, Effect, Exit, Layer } from "effect"
+import { createHash } from "node:crypto"
 import { OxpRuntimeV1 } from "./runtime-v1"
 import { OxpWorkerControl } from "./worker-control"
 
@@ -14,6 +15,7 @@ async function runtimeModules() {
   ])
   return { DelegatedWorker, SessionGroup, SessionID }
 }
+type RuntimeModules = Awaited<ReturnType<typeof runtimeModules>>
 
 const guard = (target: OxpWorkerControl.Target) =>
   OxpRuntimeV1.commitGuard(
@@ -34,7 +36,7 @@ const enter = <A>(
   )
 
 export function mapWorkerError(
-  runtime: Awaited<ReturnType<typeof runtimeModules>>,
+  runtime: RuntimeModules,
   error: unknown,
 ): Error {
   if (error instanceof runtime.DelegatedWorker.InvalidWorker) {
@@ -71,6 +73,14 @@ function snapshot(
   return {
     workerID: String(value.sessionID),
     state: value.state,
+    ...(value.blockedBy?.length
+      ? {
+          blockedBy: value.blockedBy.map((blocker) => ({
+            ...blocker,
+            sessionID: String(blocker.sessionID),
+          })),
+        }
+      : {}),
     ...(value.generation !== undefined
       ? { generation: value.generation }
       : {}),
@@ -80,6 +90,7 @@ function snapshot(
     ...(value.completedAt !== undefined
       ? { completedAt: value.completedAt }
       : {}),
+    ...(value.activity ? { activity: value.activity } : {}),
     recovered: value.recovered,
   }
 }
@@ -90,18 +101,45 @@ const start: OxpWorkerControl.Interface["start"] = (target, input) =>
     (runtime) =>
       Effect.gen(function* () {
         const worker = yield* runtime.DelegatedWorker.make
-        const session = yield* worker
-          .start({
-            title: input.title,
-            prompt: input.prompt,
-            agent: input.agent,
-            model: input.model,
-            origin: input.origin,
-            beforeCommit: guard(target),
+        const groups = yield* runtime.SessionGroup.Service
+        const ownerRef = `${input.origin.principalRef}:${input.origin.rootRef}`
+        const group = yield* groups.resolveOrCreate({
+          id: runtime.SessionGroup.ID.make("grp_oxp_" + createHash("sha256").update(ownerRef).digest("hex")),
+          name: "OXP delegated workers",
+          kind: "delegation",
+          ownerRef,
+          policy: {
+            autoAddDescendants: false,
+            lockAdded: true,
+            autoDeleteWhenEmpty: true,
+          },
+        })
+        const addMember = (sessionID: string) =>
+          groups.addSession({
+            groupId: group.id,
+            sessionId: sessionID,
+            locked: true,
+            origin: "delegation",
+            originRef: input.origin.invocationRef,
           })
+        const session = yield* worker.start({
+          title: input.title,
+          prompt: input.prompt,
+          agent: input.agent,
+          model: input.model,
+          origin: input.origin,
+          groupID: String(group.id),
+          beforeCommit: guard(target),
+        })
           .pipe(
-            Effect.mapError((error) => mapWorkerError(runtime, error)),
+            Effect.catch((error) =>
+              error instanceof runtime.DelegatedWorker.StartCommitted
+                ? addMember(String(error.sessionID)).pipe(Effect.andThen(Effect.fail(error)))
+                : Effect.fail(error),
+            ),
           )
+          .pipe(Effect.mapError((error) => mapWorkerError(runtime, error)))
+        // DelegatedWorker.start linked membership before admitting execution.
         return { workerID: String(session.id) }
       }),
   )
@@ -242,103 +280,190 @@ const cancel: OxpWorkerControl.Interface["cancel"] = (target, input) =>
       }),
   )
 
-const batchStart: OxpWorkerControl.Interface["batchStart"] = (
-  target,
-  input,
-) =>
-  enter(
-    target,
-    (runtime) =>
-      Effect.gen(function* () {
-        const worker = yield* runtime.DelegatedWorker.make
-        const groups = yield* runtime.SessionGroup.Service
-        const workerIDs: string[] = []
+export const batchStartInRuntime = Effect.fnUntraced(function* (
+  runtime: RuntimeModules,
+  target: OxpWorkerControl.Target,
+  input: OxpWorkerControl.BatchStartInput,
+) {
+  const worker = yield* runtime.DelegatedWorker.make
+  const groups = yield* runtime.SessionGroup.Service
+  const committedWorkerIDs: string[] = []
+  const residualWorkerIDs: string[] = []
+  const compensatedWorkerIDs: string[] = []
 
-        for (const item of input.workers) {
-          const started = yield* worker
-            .start({
-              title: item.title,
-              prompt: item.prompt,
-              agent: item.agent,
-              model: item.model,
-              origin: item.origin,
-              beforeCommit: guard(target),
-            })
-            .pipe(
-              Effect.mapError((error) => {
-                const mapped = mapWorkerError(runtime, error)
-                if (mapped instanceof OxpWorkerControl.StartCommitted) {
-                  return new OxpWorkerControl.BatchCommitted(
-                    [...workerIDs, mapped.workerID],
-                    undefined,
-                    undefined,
-                    mapped.cause,
-                  )
-                }
-                return new OxpWorkerControl.BatchCommitted(
-                  workerIDs,
-                  undefined,
-                  mapped.message,
-                  mapped,
-                )
-              }),
-            )
-          workerIDs.push(String(started.id))
-        }
+  // Durable batch ownership exists before any worker Session can commit.
+  // Therefore group creation failure cannot strand delegated work.
+  yield* guard(target)
+  const group = yield* groups.create({
+    name: input.name,
+    kind: "delegation",
+    ownerRef: input.ownerRef,
+    policy: {
+      autoAddDescendants: false,
+      lockAdded: true,
+      autoDeleteWhenEmpty: true,
+    },
+  })
+  const batchID = String(group.id)
 
-        const group = yield* Effect.gen(function* () {
-          yield* guard(target)
-          return yield* groups.create({
-            name: input.name,
-            kind: "delegation",
-            ownerRef: input.ownerRef,
-            policy: {
-              autoAddDescendants: false,
-              lockAdded: true,
-              autoDeleteWhenEmpty: true,
-            },
-          })
-        }).pipe(
-          Effect.mapError(
-            (error) =>
-              new OxpWorkerControl.BatchCommitted(
-                workerIDs,
-                undefined,
-                error instanceof Error ? error.message : String(error),
-                error,
-              ),
-          ),
-        )
+  const removeEmptyGroup = () =>
+    groups.remove(group.id).pipe(
+      Effect.as(true),
+      Effect.catch(() => Effect.succeed(false)),
+    )
 
-        for (const workerID of workerIDs) {
-          yield* Effect.gen(function* () {
-            yield* guard(target)
-            yield* groups.addSession({
-              groupId: group.id,
-              sessionId: workerID,
-              locked: true,
-              origin: "delegation",
-              originRef: input.ownerRef,
-            })
-          }).pipe(
-            Effect.mapError(
-              (error) =>
-                new OxpWorkerControl.BatchCommitted(
-                  workerIDs,
-                  String(group.id),
-                  error instanceof Error ? error.message : String(error),
-                  error,
-                ),
+  for (const item of input.workers) {
+    const started = yield* worker
+      .start({
+        title: item.title,
+        prompt: item.prompt,
+        agent: item.agent,
+        model: item.model,
+        origin: item.origin,
+        groupID: batchID,
+        beforeCommit: guard(target),
+      })
+      .pipe(Effect.exit)
+
+    let workerID: string
+    let startFailure: OxpWorkerControl.StartCommitted | undefined
+    if (Exit.isFailure(started)) {
+      const mapped = mapWorkerError(runtime, Cause.squash(started.cause))
+      if (mapped instanceof OxpWorkerControl.StartCommitted) {
+        workerID = mapped.workerID
+        startFailure = mapped
+        committedWorkerIDs.push(workerID)
+      } else {
+        if (committedWorkerIDs.length === 0) {
+          if (yield* removeEmptyGroup()) return yield* Effect.fail(mapped)
+          return yield* Effect.fail(
+            new OxpWorkerControl.BatchCommitted(
+              [],
+              batchID,
+              mapped.message + "; empty delegated batch cleanup failed",
+              mapped,
+              [],
             ),
           )
         }
+        return yield* Effect.fail(
+          new OxpWorkerControl.BatchCommitted(
+            [...committedWorkerIDs],
+            batchID,
+            mapped.message,
+            mapped,
+            [...residualWorkerIDs],
+            [...compensatedWorkerIDs],
+          ),
+        )
+      }
+    } else {
+      workerID = String(started.value.id)
+      committedWorkerIDs.push(workerID)
+    }
 
-        return {
-          batchID: String(group.id),
-          workerIDs,
-        }
-      }),
-  )
+    const attached = yield* Effect.gen(function* () {
+      yield* guard(target)
+      yield* groups.addSession({
+        groupId: group.id,
+        sessionId: workerID,
+        locked: true,
+        origin: "delegation",
+        originRef: input.ownerRef,
+      })
+    }).pipe(Effect.exit)
+
+    if (Exit.isFailure(attached)) {
+      // addSession can fail after its durable write (for example, while
+      // publishing a follow-up event). Reconcile against SessionGroup truth
+      // before treating the worker as unowned.
+      const isMember = yield* groups
+        .getWithSessions(group.id)
+        .pipe(
+          Effect.map((detail) =>
+            detail.sessions.some((member) => String(member.id) === workerID),
+          ),
+          Effect.catch(() => Effect.succeed(false)),
+        )
+      const attachCause = Cause.squash(attached.cause)
+      const attachError =
+        attachCause instanceof Error
+          ? attachCause
+          : new Error(String(attachCause))
+
+      if (isMember) {
+        residualWorkerIDs.push(workerID)
+        return yield* Effect.fail(
+          new OxpWorkerControl.BatchCommitted(
+            [...committedWorkerIDs],
+            batchID,
+            attachError.message,
+            attachError,
+            [...residualWorkerIDs],
+            [...compensatedWorkerIDs],
+          ),
+        )
+      }
+
+      // This committed worker is provably outside batch ownership. Compensate
+      // only that worker; prior members remain controlled by batchID.
+      const compensated = yield* worker
+        .cancel({
+          sessionID: runtime.SessionID.make(workerID),
+          identity: input.identity,
+        })
+        .pipe(
+          Effect.as(true),
+          Effect.catch(() => Effect.succeed(false)),
+        )
+      if (compensated) compensatedWorkerIDs.push(workerID)
+      else residualWorkerIDs.push(workerID)
+
+      let residualBatchID: string | undefined = batchID
+      if (residualWorkerIDs.length === 0 && (yield* removeEmptyGroup())) {
+        residualBatchID = undefined
+      }
+      return yield* Effect.fail(
+        new OxpWorkerControl.BatchCommitted(
+          [...committedWorkerIDs],
+          residualBatchID,
+          attachError.message +
+            (compensated
+              ? "; unowned worker was cancelled"
+              : "; compensating worker cancellation failed"),
+          attachError,
+          [...residualWorkerIDs],
+          [...compensatedWorkerIDs],
+        ),
+      )
+    }
+
+    residualWorkerIDs.push(workerID)
+    if (startFailure) {
+      // The worker Session committed before execution setup failed. It is now
+      // durably attached to this batch, so the caller can reconcile/cancel it
+      // through the batch handle instead of receiving an orphaned Session.
+      return yield* Effect.fail(
+        new OxpWorkerControl.BatchCommitted(
+          [...committedWorkerIDs],
+          batchID,
+          startFailure.message,
+          startFailure.cause ?? startFailure,
+          [...residualWorkerIDs],
+          [...compensatedWorkerIDs],
+        ),
+      )
+    }
+  }
+
+  return {
+    batchID,
+    workerIDs: committedWorkerIDs,
+  }
+})
+
+const batchStart: OxpWorkerControl.Interface["batchStart"] = (target, input) =>
+  enter(target, (runtime) => batchStartInRuntime(runtime, target, input))
 
 const batchContinue: OxpWorkerControl.Interface["batchContinue"] = (
   target,
@@ -381,17 +506,17 @@ const batchWait: OxpWorkerControl.Interface["batchWait"] = (
   target,
   input,
 ) =>
-  Effect.forEach(
-    input.workerIDs,
-    (workerID) =>
-      wait(target, {
-        workerID,
-        identity: input.identity,
-        ...(input.timeoutMs !== undefined
-          ? { timeoutMs: input.timeoutMs }
-          : {}),
+  enter(
+    target,
+    (runtime) =>
+      Effect.gen(function* () {
+        const worker = yield* runtime.DelegatedWorker.make
+        return (yield* worker.waitMany({
+          sessionIDs: input.workerIDs.map((workerID) => runtime.SessionID.make(workerID)),
+          identity: input.identity,
+          ...(input.timeoutMs === undefined ? {} : { timeout: input.timeoutMs }),
+        }).pipe(Effect.mapError((error) => mapWorkerError(runtime, error)))).map(snapshot)
       }),
-    { concurrency: 4 },
   )
 
 const batchCancel: OxpWorkerControl.Interface["batchCancel"] = (

@@ -5,6 +5,7 @@ import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { RuntimeOwner } from "@opencode-ai/core/runtime-owner"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmRuntimePolicy } from "@opencode-ai/core/swarm/runtime-policy"
+import { SwarmContainment } from "./containment"
 
 /** Heartbeat age is only a cheap candidate gate. It never proves death. */
 export const OWNER_SUSPECT_MS = RuntimeOwner.HEARTBEAT_INTERVAL_MS * 3
@@ -14,17 +15,27 @@ export const OWNER_SCAN_BATCH = 32
 export interface ReconcileResult {
   readonly scannedOwners: number
   readonly retiredLeases: number
+  /** Abandoned `creating` aggregates closed during this sweep. */
+  readonly closedAggregates: number
+  /** Idle `active` aggregates surfaced for an operator; never auto-closed. */
+  readonly staleAggregates: number
   /** Earliest time this reconciler should be called again. */
   readonly nextProbeAt?: number
 }
 
 export interface Interface {
   /**
-   * Reconcile scheduler owners from fresh durable Swarm rows.
+   * Reconcile scheduler owners from fresh durable Swarm rows, then converge
+   * abandoned aggregates.
    *
    * This service owns no timer. The returned deadline is consumed by the one
    * global Swarm deadline owner. RuntimeOwner alone decides whether local death
    * is actually proven.
+   *
+   * Aggregate closure is level-triggered and idempotent, so it converges on the
+   * first sweep after a restart without any persisted "pending" marker: the
+   * candidate set is reconstructed from durable rows on every call. It never
+   * resolves `effect-unknown`, which stays a fail-closed operator decision.
    */
   readonly reconcile: (input?: { readonly now?: number }) => Effect.Effect<ReconcileResult>
 }
@@ -44,6 +55,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const swarm = yield* SwarmV2.Service
     const runtime = yield* RuntimeOwner.Service
+    const containment = yield* SwarmContainment.Service
     const state = yield* Ref.make<ScanState>({})
     const lock = Semaphore.makeUnsafe(1)
 
@@ -51,6 +63,9 @@ export const layer = Layer.effect(
       return yield* lock.withPermit(
         Effect.gen(function* () {
           const now = input?.now ?? Date.now()
+          // Converge provably inert aggregates first. A crash mid-closure simply
+          // re-derives the same candidate set on the next sweep.
+          const aggregates = yield* containment.reconcile()
           const previous = yield* Ref.get(state)
           const owners = yield* swarm.activeLeaseOwnerProcessIDs({
             excludeProcessOwner: runtime.id,
@@ -132,6 +147,8 @@ export const layer = Layer.effect(
             return {
               scannedOwners: owners.length,
               retiredLeases,
+              closedAggregates: aggregates.closedCreating,
+              staleAggregates: aggregates.staleActive,
               nextProbeAt: now,
             } satisfies ReconcileResult
           }
@@ -145,6 +162,8 @@ export const layer = Layer.effect(
             return {
               scannedOwners: owners.length,
               retiredLeases,
+              closedAggregates: aggregates.closedCreating,
+              staleAggregates: aggregates.staleActive,
               nextProbeAt: now,
             } satisfies ReconcileResult
           }
@@ -155,6 +174,8 @@ export const layer = Layer.effect(
           return {
             scannedOwners: owners.length,
             retiredLeases,
+            closedAggregates: aggregates.closedCreating,
+            staleAggregates: aggregates.staleActive,
             ...(nextProbeAt === undefined ? {} : { nextProbeAt }),
           } satisfies ReconcileResult
         }),
@@ -168,5 +189,5 @@ export const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SwarmV2.node, RuntimeOwner.node],
+  deps: [SwarmV2.node, RuntimeOwner.node, SwarmContainment.node],
 })

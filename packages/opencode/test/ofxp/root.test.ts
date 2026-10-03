@@ -124,7 +124,7 @@ describe("OFXP root resolution", () => {
       expect(stale._tag).toBe("OfxpPeer.StaleRevisionError")
 
       const approved = yield* roots.approve(remote.key.peerID, repo, "Repo", "manual", revised.info.grantRevision)
-      expect(approved.alias).toBe("repo")
+      expect(approved.alias).toBe(Ofxp.RootAlias.make("repo"))
     }),
   )
 

@@ -49,20 +49,13 @@ export const SyncPaths = {
   history: `${root}/history`,
 } as const
 
+// Capabilities is a process-wide protocol constant. It accepts the legacy
+// location query for client compatibility but must not route through workspace
+// resolution or InstanceContext bootstrap.
 export const SyncApi = HttpApi.make("sync")
   .add(
     HttpApiGroup.make("sync")
       .add(
-        HttpApiEndpoint.get("capabilities", SyncPaths.capabilities, {
-          query: WorkspaceRoutingQuery,
-          success: described(SyncCapabilities, "Sync protocol capabilities"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "sync.capabilities",
-            summary: "Get sync capabilities",
-            description: "Get versioned durable-history representations supported by this sync peer.",
-          }),
-        ),
         HttpApiEndpoint.post("start", SyncPaths.start, {
           query: WorkspaceRoutingQuery,
           success: described(Schema.Boolean, "Workspace sync started"),

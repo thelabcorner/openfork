@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { jsonSchema } from "ai"
 import { LLMRequestPrep } from "@/session/llm/request"
+import { InstallationUserAgent, OpenCodeHostedUserAgent } from "@opencode-ai/core/installation/version"
 import { it } from "../lib/effect"
 
 const sessionID = "ses_1a2b3c4d5e6f7a8b9c0d1e2f3a"
@@ -64,8 +65,10 @@ describe("LLM provider request identity", () => {
 
       const headers = prepared.headers as Record<string, string>
 
-      // The Console free-tier gate requires `opencode/<channel>/<version>/<client>`.
-      expect(headers["User-Agent"]).toMatch(/^opencode\/[^/]+\/[^/]+\/desktop$/)
+      // Match the current official OpenCode hosted-service identity exactly:
+      // upstream request.ts emits `opencode/<InstallationVersion>`.
+      expect(headers["User-Agent"]).toBe(OpenCodeHostedUserAgent())
+      expect(headers["User-Agent"]).toMatch(/^opencode\/[^/]+$/)
       expect(headers["x-opencode-session"]).toBe(sessionID)
       expect(headers["x-opencode-request"]).toBe(requestID)
       expect(headers["x-opencode-client"]).toBe("desktop")
@@ -107,7 +110,7 @@ describe("LLM provider request identity", () => {
 
       const headers = prepared.headers as Record<string, string>
 
-      expect(headers["User-Agent"]).toMatch(/^opencode\/[^/]+\/[^/]+\/desktop$/)
+      expect(headers["User-Agent"]).toBe(InstallationUserAgent("desktop"))
       expect(headers["x-opencode-session"]).toBeUndefined()
       expect(headers["x-opencode-project"]).toBeUndefined()
       expect(headers["X-Session-Id"]).toBe(sessionID)

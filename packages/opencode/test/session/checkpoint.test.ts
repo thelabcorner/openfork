@@ -17,9 +17,9 @@ import {
   testInstanceStoreLayer,
   TestInstance,
 } from "../fixture/fixture"
-import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 import { pollWithTimeout, testEffect } from "../lib/effect"
 import { seedSessionRow } from "./checkpoint-seed"
+import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 
 const it = testEffect(
   Layer.mergeAll(

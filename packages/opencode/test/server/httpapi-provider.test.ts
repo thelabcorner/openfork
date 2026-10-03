@@ -2,11 +2,13 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Layer } from "effect"
+import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import path from "path"
 import { resetDatabase } from "../fixture/db"
 import { TestInstance } from "../fixture/fixture"
 import { markPluginDependenciesReady } from "../fixture/plugin"
 import { testEffect } from "../lib/effect"
+import * as ProviderCatalog from "../../src/provider/catalog"
 import { httpApiLayer, request } from "./httpapi-layer"
 
 const testStateLayer = Layer.effectDiscard(
@@ -16,7 +18,14 @@ const testStateLayer = Layer.effectDiscard(
   ),
 )
 
-const it = testEffect(Layer.mergeAll(testStateLayer, LayerNode.compile(FSUtil.node), httpApiLayer))
+const it = testEffect(
+  Layer.mergeAll(
+    testStateLayer,
+    LayerNode.compile(FSUtil.node),
+    LayerNode.compile(ProviderCatalog.node),
+    httpApiLayer,
+  ),
+)
 const projectOptions = { config: { formatter: false, lsp: false } }
 const providerID = "test-oauth-parity"
 const oauthURL = "https://example.com/oauth"
@@ -261,6 +270,72 @@ function setEnvScoped(key: string, value: string) {
 }
 
 describe("provider HttpApi", () => {
+  it.effect("builds a global provider catalog baseline", () =>
+    Effect.gen(function* () {
+      const service = yield* ProviderCatalog.Service
+      const result = yield* service.list({ config: {} })
+      expect(["pending", "partial", "ready"]).toContain(result.catalog.status)
+      expect(Number.isInteger(result.catalog.revision)).toBe(true)
+    }),
+    30000,
+  )
+
+  it.effect(
+    "keeps T3 account aliases behind the shared account projection",
+    Effect.gen(function* () {
+      yield* setEnvScoped("OPENFORK_COMPAT_PROFILE", "t3code-opencode-v1")
+      const service = yield* ProviderCatalog.Service
+      const result = yield* service.list({ config: {} })
+      // No account capability projection has been published by this clean
+      // fixture. The Tier-2 baseline remains useful, but must not claim that
+      // the legacy account rows are complete.
+      expect(result.catalog.status).toBe("partial")
+      expect(result.all.every((provider) => Object.keys(provider.models).every((id) => !id.includes("@ofacct:")))).toBe(
+        true,
+      )
+    }),
+    30000,
+  )
+
+  it.instance(
+    "serves the provider catalog without executing provider plugin hooks",
+    Effect.gen(function* () {
+      const directory = (yield* TestInstance).directory
+      yield* writeFunctionOptionsPlugin(directory)
+
+      const response = yield* request("/provider")
+      const responseBody = yield* response.text
+      if (response.status !== 200) throw new Error(responseBody)
+      const body = JSON.parse(responseBody)
+      expect(isRecord(body)).toBe(true)
+      if (!isRecord(body)) return
+      expect(isRecord(body.catalog)).toBe(true)
+      if (!isRecord(body.catalog) || typeof body.catalog.status !== "string") return
+      expect(["pending", "partial"]).toContain(body.catalog.status)
+      expect(providerListHasFetch(body.all)).toBe(false)
+
+      const locationResponse = yield* request(`/provider?directory=${encodeURIComponent(directory)}`)
+      expect(locationResponse.status).toBe(200)
+      const locationBody = yield* locationResponse.json
+      expect(isRecord(locationBody)).toBe(true)
+      if (!isRecord(locationBody)) return
+      expect(isRecord(locationBody.catalog)).toBe(true)
+      expect(providerListHasFetch(locationBody.all)).toBe(false)
+
+      // Workspace is a distinct durable identity and cannot be silently
+      // interpreted as the global catalog when no matching row exists.
+      const missingWorkspaceID = WorkspaceV2.ID.ascending()
+      const workspaceOnly = yield* request(`/provider?workspace=${encodeURIComponent(missingWorkspaceID)}`)
+      expect(workspaceOnly.status).toBe(400)
+      const workspaceWithDirectory = yield* request(
+        `/provider?workspace=${encodeURIComponent(missingWorkspaceID)}&directory=${encodeURIComponent(directory)}`,
+      )
+      expect(workspaceWithDirectory.status).toBe(400)
+    }),
+    projectOptions,
+    30000,
+  )
+
   it.instance.skip(
     "returns public v2 provider not found errors",
     Effect.gen(function* () {

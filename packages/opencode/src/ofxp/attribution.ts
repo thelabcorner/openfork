@@ -29,6 +29,10 @@ import type { OfxpRoot } from "./root"
  *   The invocation ID is deliberately not used: it is a per-call receipt token,
  *   not a principal identity, and encoding it here would fragment the consuming
  *   activity stream one group per call.
+ * - `replayToken` is deliberately the invocation ID for the opposite reason: it
+ *   is the durable idempotency identity for this exact OFXP call. Keeping it in a
+ *   separate field lets consumers suppress a replay without ever confusing the
+ *   principal key with a per-event identity.
  *
  * The root ID is likewise omitted: it is authorization scope, already carried by
  * the receipt, and not an actor or a project.
@@ -46,5 +50,6 @@ export function attribution(
     project: name.length > 0 ? name : root.alias,
     projectFolder: root.rootPath,
     sourceRef: OfxpPrincipal.key(peer.peerID, call.context),
+    replayToken: call.context.invocationID,
   }
 }

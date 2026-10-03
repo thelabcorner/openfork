@@ -17,6 +17,7 @@ export const ModelRef = Schema.Struct({
   modelID: ModelV2.ID,
   accountID: Schema.optional(Schema.String),
 })
+export type ModelRef = Schema.Schema.Type<typeof ModelRef>
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
@@ -84,6 +85,30 @@ export interface SessionPromptOps {
     input: PromptInput,
     options?: { wait?: boolean; provenance?: HostPromptProvenance },
   ): Effect.Effect<{ admitted: SessionV1.WithParts; paused: boolean; result?: SessionV1.WithParts }>
+  /**
+   * Safe-boundary supervisory steering for a running host-owned worker Session.
+   *
+   * This is materially different from a post-turn queued continuation
+   * (`BackgroundJob.extend`): the guidance is durably admitted into the child's
+   * SessionInput inbox in the trusted `host`+`steer` lane, so the *next* provider
+   * cycle promotes it at a safe reconciliation boundary instead of waiting for the
+   * child's whole turn to terminate. It never creates a second child Session, a
+   * duplicate execution generation, or an unsafe tool interrupt.
+   *
+   * `parts` must already be resolved (the caller uses `resolvePromptParts`);
+   * this seam never re-resolves template parts. Required so a supervisor call
+   * site cannot silently degrade into queued background continuation.
+   */
+  steer(
+    input: {
+      sessionID: SessionID
+      agent?: string
+      model?: ModelRef
+      variant?: string
+      parts: PromptInput["parts"]
+    },
+    provenance?: HostPromptProvenance,
+  ): Effect.Effect<SessionV1.WithParts>
 }
 
 export * as SessionPromptContract from "./prompt-contract"

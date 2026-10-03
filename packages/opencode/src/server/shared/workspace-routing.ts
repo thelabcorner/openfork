@@ -5,7 +5,9 @@ type Rule = { method?: string; path: string; exact?: boolean; action: "local" | 
 const RULES: Array<Rule> = [
   { path: "/experimental/workspace", action: "local" },
   { method: "GET", path: "/experimental/openrouter-endpoints", exact: true, action: "local" },
-  { path: "/session/status", action: "forward" },
+  // Global execution ownership is process-wide; never proxy it into a selected
+  // workspace or let workspace routing supply an implicit cwd.
+  { path: "/session/status", action: "local" },
   { method: "GET", path: "/session", action: "local" },
 ]
 

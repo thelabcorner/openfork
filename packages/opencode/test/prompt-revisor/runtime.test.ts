@@ -4,7 +4,9 @@ import { Agent } from "@/agent/agent"
 import { Provider } from "@/provider/provider"
 import { LLM as SessionLLM } from "@/session/llm"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { LLMEvent, Message } from "@opencode-ai/llm"
 import { Effect, Stream } from "effect"
 
@@ -127,6 +129,237 @@ describe("Prompt Revisor production runtime", () => {
 
     expect(calls).toEqual([{ providerID: "opencode", modelID: "gpt-5-nano", accountID: "zen-account-42" }])
     expect(result.ref).toEqual(selectedRef)
+  })
+
+  test("Session-owned revision keeps one committed account route through model resolution and transport", async () => {
+    const stableAccountID = "stable-account"
+    const selectedRef = ModelV2.Ref.make({
+      providerID: ProviderV2.ID.make("opencode-go"),
+      id: ModelV2.ID.make("deepseek-v4.1-flash"),
+      accountID: stableAccountID,
+      variant: ModelV2.VariantID.make("max"),
+    })
+    const selected = providerModel("opencode-go", "deepseek-v4.1-flash")
+    const sessionID = SessionSchema.ID.make("ses_prompt_revisor_route")
+    const routedCalls: Array<{ providerID: string; modelID: string; accountID?: string }> = []
+    let directCalls = 0
+    let request: SessionLLM.StreamInput | undefined
+    const attribution = {
+      sessionID,
+      affinityDomain: "opencode-provider/opencode-go",
+      providerID: selectedRef.providerID,
+      routeRevision: 4,
+      routeKind: "account" as const,
+      accountID: stableAccountID,
+    } satisfies ProviderRouteResolution.RouteAttribution
+    const provider = {
+      resolveRoutedModel(input: {
+        sessionID: SessionSchema.ID
+        providerID: ProviderV2.ID
+        modelID: ModelV2.ID
+        accountID?: string
+      }) {
+        routedCalls.push({
+          providerID: input.providerID,
+          modelID: input.modelID,
+          ...(input.accountID ? { accountID: input.accountID } : {}),
+        })
+        return Effect.succeed({ model: selected, route: { attribution } as never })
+      },
+      getModel() {
+        directCalls++
+        return Effect.die("direct model lookup must not run after routed resolution")
+      },
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const llm = {
+      stream(input: SessionLLM.StreamInput) {
+        request = input
+        return Stream.fromIterable([
+          LLMEvent.toolCall({
+            id: "revision-route",
+            name: "revised_prompt",
+            input: { content: "Routed revision", references: [] },
+          }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ])
+      },
+    } as SessionLLM.Interface
+    const runtime = makeRuntime(provider, llm, agents)
+    const session = { id: sessionID, model: selectedRef } as SessionSchema.Info
+
+    const resolved = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef], session }))
+    expect(resolved.route).toEqual({ routeKind: "account", accountID: stableAccountID })
+    expect(resolved.ref.accountID).toBe(stableAccountID)
+    expect(routedCalls).toEqual([
+      { providerID: "opencode-go", modelID: "deepseek-v4.1-flash", accountID: stableAccountID },
+    ])
+    expect(directCalls).toBe(0)
+
+    const response = await Effect.runPromise(
+      runtime.generate({
+        model: resolved,
+        sessionID,
+        specialAgent: "prompt_revisor",
+        system: "PROMPT REVISOR SYSTEM",
+        messages: [Message.user("Improve this")],
+        tools: [],
+        toolChoice: "required",
+        generation: {},
+      }),
+    )
+
+    expect(response.toolCalls[0]?.name).toBe("revised_prompt")
+    expect(request?.route).toEqual({ routeKind: "account", accountID: stableAccountID })
+    expect(request?.user.model.accountID).toBe(stableAccountID)
+  })
+
+  test("same-provider automatic fallback inherits the Session route without hard-pinning stale account metadata", async () => {
+    const stableAccountID = "stable-parent-account"
+    const sessionRef = ModelV2.Ref.make({
+      providerID: ProviderV2.ID.make("parent"),
+      id: ModelV2.ID.make("chat"),
+      accountID: stableAccountID,
+    })
+    const fallbackRef = ModelV2.Ref.make({
+      providerID: sessionRef.providerID,
+      id: ModelV2.ID.make("small"),
+      accountID: "stale-fallback-account",
+    })
+    const fallbackModel = providerModel("parent", "small")
+    const sessionID = SessionSchema.ID.make("ses_prompt_revisor_same_provider_fallback")
+    const routedCalls: Array<{ modelID: string; accountID?: string }> = []
+    const attribution = {
+      sessionID,
+      affinityDomain: "opencode-provider/parent",
+      providerID: sessionRef.providerID,
+      routeRevision: 7,
+      routeKind: "account" as const,
+      accountID: stableAccountID,
+    } satisfies ProviderRouteResolution.RouteAttribution
+    const provider = {
+      resolveRoutedModel(input: {
+        sessionID: SessionSchema.ID
+        providerID: ProviderV2.ID
+        modelID: ModelV2.ID
+        accountID?: string
+      }) {
+        routedCalls.push({
+          modelID: input.modelID,
+          ...(input.accountID ? { accountID: input.accountID } : {}),
+        })
+        return Effect.succeed({ model: fallbackModel, route: { attribution } as never })
+      },
+      getModel: () => Effect.die("routed fallback should not use direct lookup"),
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const runtime = makeRuntime(provider, { stream: () => Stream.empty } as SessionLLM.Interface, agents)
+    const session = { id: sessionID, model: sessionRef } as SessionSchema.Info
+
+    const resolved = await Effect.runPromise(
+      runtime.resolveModel({
+        candidates: [fallbackRef, sessionRef],
+        explicitCandidates: [],
+        session,
+      }),
+    )
+
+    expect(routedCalls).toEqual([{ modelID: "small" }])
+    expect(resolved.ref.accountID).toBe(stableAccountID)
+    expect(resolved.route).toEqual({ routeKind: "account", accountID: stableAccountID })
+  })
+
+  test("automatic cross-provider fallback cannot create a second Session route", async () => {
+    const parentRef = ref("parent", "chat")
+    const fallbackRef = ref("other", "small")
+    const parentModel = providerModel("parent", "chat")
+    const sessionID = SessionSchema.ID.make("ses_prompt_revisor_parent_route")
+    const routedCalls: Array<{ providerID: string; modelID: string }> = []
+    const attribution = {
+      sessionID,
+      affinityDomain: "opencode-provider/parent",
+      providerID: parentRef.providerID,
+      routeRevision: 2,
+      routeKind: "public" as const,
+    } satisfies ProviderRouteResolution.RouteAttribution
+    const provider = {
+      resolveRoutedModel(input: {
+        sessionID: SessionSchema.ID
+        providerID: ProviderV2.ID
+        modelID: ModelV2.ID
+      }) {
+        routedCalls.push({ providerID: input.providerID, modelID: input.modelID })
+        if (input.providerID !== parentRef.providerID) {
+          return Effect.die("automatic cross-provider fallback must be skipped before route resolution")
+        }
+        return Effect.succeed({ model: parentModel, route: { attribution } as never })
+      },
+      getModel: () => Effect.die("routed parent model should resolve without direct lookup"),
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const runtime = makeRuntime(provider, { stream: () => Stream.empty } as SessionLLM.Interface, agents)
+    const session = { id: sessionID, model: parentRef } as SessionSchema.Info
+
+    const resolved = await Effect.runPromise(
+      runtime.resolveModel({
+        candidates: [fallbackRef, parentRef],
+        explicitCandidates: [],
+        session,
+      }),
+    )
+
+    expect(resolved.ref.providerID).toBe(parentRef.providerID)
+    expect(resolved.route).toEqual({ routeKind: "public" })
+    expect(routedCalls).toEqual([{ providerID: "parent", modelID: "chat" }])
+  })
+
+  test("explicit cross-provider Prompt Revisor override may own its own committed route", async () => {
+    const parentRef = ref("parent", "chat")
+    const overrideRef = ref("other", "revisor", "high")
+    const overrideModel = providerModel("other", "revisor")
+    const sessionID = SessionSchema.ID.make("ses_prompt_revisor_explicit_override")
+    const routedCalls: Array<{ providerID: string; modelID: string }> = []
+    const attribution = {
+      sessionID,
+      affinityDomain: "opencode-provider/other",
+      providerID: overrideRef.providerID,
+      routeRevision: 1,
+      routeKind: "account" as const,
+      accountID: "override-account",
+    } satisfies ProviderRouteResolution.RouteAttribution
+    const provider = {
+      resolveRoutedModel(input: {
+        sessionID: SessionSchema.ID
+        providerID: ProviderV2.ID
+        modelID: ModelV2.ID
+      }) {
+        routedCalls.push({ providerID: input.providerID, modelID: input.modelID })
+        return Effect.succeed({ model: overrideModel, route: { attribution } as never })
+      },
+      getModel: () => Effect.die("explicit routed override should not use direct lookup"),
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const runtime = makeRuntime(provider, { stream: () => Stream.empty } as SessionLLM.Interface, agents)
+    const session = { id: sessionID, model: parentRef } as SessionSchema.Info
+
+    const resolved = await Effect.runPromise(
+      runtime.resolveModel({
+        candidates: [overrideRef, parentRef],
+        explicitCandidates: [overrideRef],
+        session,
+      }),
+    )
+
+    expect(resolved.ref).toEqual(
+      ModelV2.Ref.make({
+        providerID: overrideRef.providerID,
+        id: overrideRef.id,
+        accountID: "override-account",
+        variant: overrideRef.variant,
+      }),
+    )
+    expect(resolved.route).toEqual({ routeKind: "account", accountID: "override-account" })
+    expect(routedCalls).toEqual([{ providerID: "other", modelID: "revisor" }])
   })
 
   test("executes revisions through Session LLM without persisting a session and forwards the output cap", async () => {

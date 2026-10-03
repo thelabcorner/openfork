@@ -1,7 +1,10 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Model } from "@opencode-ai/sdk/v2"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
+import { Global } from "@opencode-ai/core/global"
 import { Effect } from "effect"
+import * as fs from "node:fs"
+import * as path from "node:path"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { makeRuntime } from "@/effect/run-service"
 import { ForkCredentials } from "@/fork/credentials"
@@ -27,8 +30,9 @@ import { ZenAccountPool, stableZenIdentity, type ZenVaultCredential } from "./ze
  * `${baseModelID}@${account.id}` with `${baseName} (${label})` display names,
  * for both provider ids; the bare catalog models remain the default-account
  * entries. There is deliberately no session binding, governor, persistence,
- * or fork-active precedence — this mirrors how verdent/workbuddy bind one key
- * per session, except here the "session" is the model's account suffix.
+   * or fork-active precedence — unlike WorkBuddy's session binding, the
+   * "session" here is the model's account suffix.
+
  *
  * Failures and completions are still observed through the "event" hook as a
  * secondary path: an APIError on a persisted assistant message is attributed
@@ -50,7 +54,12 @@ const VAULT_SYNC_TTL_MS = 15_000
 const DEFAULT_RETRY_AFTER_MS = 30_000
 const ZEN_MODELS_URL = "https://opencode.ai/zen/v1/models"
 const ZEN_MODEL_DISCOVERY_TTL_MS = 5 * 60_000
+const ZEN_MODEL_DISCOVERY_STALE_GRACE_MS = 6 * 60 * 60_000
 const ZEN_MODEL_DISCOVERY_TIMEOUT_MS = 3_000
+const ZEN_MODEL_DISCOVERY_CACHE_VERSION = 1
+const ZEN_MODEL_DISCOVERY_CACHE_FILE = "zen-public-models.json"
+const ZEN_MODEL_DISCOVERY_MAX_MODELS = 2_048
+const ZEN_MODEL_DISCOVERY_MAX_ID_LENGTH = 256
 
 export type ZenSystemOneModel = {
   readonly id: string
@@ -65,13 +74,29 @@ export type ZenSystemOneModel = {
 let pool = new ZenAccountPool()
 let testFetch: ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) | undefined
 let testVaultCredentials: ZenVaultCredential[] | undefined
-let zenAdvertisedModelsCache:
-  | {
-      readonly fetchedAt: number
-      readonly ids: ReadonlySet<string>
-    }
-  | undefined
-let zenAdvertisedModelsInFlight: Promise<ReadonlySet<string>> | undefined
+type ZenAdvertisedModelsCache = {
+  readonly fetchedAt: number
+  readonly ids: ReadonlySet<string>
+}
+
+export type ZenHostedCatalogState = "fresh" | "stale" | "expired" | "unavailable"
+
+export type ZenHostedCatalog = {
+  readonly state: ZenHostedCatalogState
+  readonly fetchedAt?: number
+  readonly ids: ReadonlySet<string>
+}
+
+type PersistedZenHostedCatalog = {
+  readonly version: number
+  readonly fetchedAt: number
+  readonly ids: readonly string[]
+}
+
+let zenAdvertisedModelsCache: ZenAdvertisedModelsCache | undefined
+let zenAdvertisedModelsCacheLoaded = false
+let zenAdvertisedModelsInFlight: Promise<ZenAdvertisedModelsCache> | undefined
+let testZenCatalogCacheFile: string | undefined
 
 // Vault sync ------------------------------------------------------------------
 
@@ -256,6 +281,19 @@ export async function resolveZenRequest(
     return { modelID: split.baseModelID, accountID: account.id, apiKey: account.apiKey }
   }
 
+  // Public is a real credential-free route, not an invitation to pick the
+  // current account-pool default. Once the provider deliberately selects the
+  // upstream public sentinel, preserve it all the way to transport.
+  //
+  // Explicit account-qualified models above remain stronger. Go does not expose
+  // a public route, so its existing direct/default-account behavior is unchanged.
+  if (providerID === PROVIDER_ID && preferredApiKey === ZEN_PUBLIC_API_KEY) {
+    return {
+      modelID: split?.baseModelID ?? modelID,
+      apiKey: ZEN_PUBLIC_API_KEY,
+    }
+  }
+
   const account = pool.defaultAccount()
   const preferredPoolAccount =
     preferredApiKey && preferredApiKey !== ZEN_PUBLIC_API_KEY
@@ -274,9 +312,10 @@ export async function resolveZenRequest(
     }
   }
 
-  // Any populated pool owns bare Zen routing. This also prevents stale legacy
-  // auth.json state from shadowing the user-selected vault account. The
-  // "public" SDK bootstrap sentinel follows the same rule.
+  // Any populated pool owns ordinary bare authenticated Zen routing. This also
+  // prevents stale legacy auth.json state from shadowing the user-selected vault
+  // account. The explicit public sentinel was handled above and never enters the
+  // account pool.
   if (account) {
     return {
       modelID: split?.baseModelID ?? modelID,
@@ -293,10 +332,102 @@ export async function resolveZenRequest(
   }
 }
 
-async function advertisedZenModelIDs(): Promise<ReadonlySet<string>> {
-  const now = Date.now()
-  if (zenAdvertisedModelsCache && now - zenAdvertisedModelsCache.fetchedAt < ZEN_MODEL_DISCOVERY_TTL_MS) {
-    return zenAdvertisedModelsCache.ids
+function isTestEnv() {
+  return process.env.NODE_ENV === "test" || !!process.env.BUN_TEST || !!process.env.OPENCODE_TEST_HOME || !!process.env.VITEST
+}
+
+function zenCatalogCacheFile() {
+  return testZenCatalogCacheFile ?? path.join(Global.Path.cache, ZEN_MODEL_DISCOVERY_CACHE_FILE)
+}
+
+function persistenceEnabled() {
+  return !isTestEnv() || testZenCatalogCacheFile !== undefined
+}
+
+function validZenModelID(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= ZEN_MODEL_DISCOVERY_MAX_ID_LENGTH &&
+    !/[\x00-\x1f\x7f]/.test(value)
+  )
+}
+
+function catalogState(cache: ZenAdvertisedModelsCache, now = Date.now()): ZenHostedCatalogState {
+  const age = Math.max(0, now - cache.fetchedAt)
+  if (age < ZEN_MODEL_DISCOVERY_TTL_MS) return "fresh"
+  if (age <= ZEN_MODEL_DISCOVERY_STALE_GRACE_MS) return "stale"
+  return "expired"
+}
+
+function loadPersistedZenCatalog() {
+  if (zenAdvertisedModelsCacheLoaded) return
+  zenAdvertisedModelsCacheLoaded = true
+  if (!persistenceEnabled()) return
+  try {
+    const parsed = JSON.parse(fs.readFileSync(zenCatalogCacheFile(), "utf8")) as PersistedZenHostedCatalog
+    if (parsed.version !== ZEN_MODEL_DISCOVERY_CACHE_VERSION) return
+    if (!Number.isFinite(parsed.fetchedAt) || parsed.fetchedAt < 0) return
+    // Reject implausibly future cache timestamps instead of letting corruption
+    // make a snapshot appear fresh for an unbounded period.
+    if (parsed.fetchedAt > Date.now() + ZEN_MODEL_DISCOVERY_TTL_MS) return
+    if (!Array.isArray(parsed.ids) || parsed.ids.length === 0 || parsed.ids.length > ZEN_MODEL_DISCOVERY_MAX_MODELS) return
+    if (!parsed.ids.every(validZenModelID)) return
+    zenAdvertisedModelsCache = {
+      fetchedAt: parsed.fetchedAt,
+      ids: new Set(parsed.ids),
+    }
+  } catch {
+    // Cache miss/corruption is non-fatal. The next live refresh owns recovery.
+  }
+}
+
+function persistZenCatalog(cache: ZenAdvertisedModelsCache) {
+  if (!persistenceEnabled()) return
+  try {
+    const file = zenCatalogCacheFile()
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const payload = JSON.stringify({
+      version: ZEN_MODEL_DISCOVERY_CACHE_VERSION,
+      fetchedAt: cache.fetchedAt,
+      ids: [...cache.ids],
+    } satisfies PersistedZenHostedCatalog)
+    const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(tmp, payload, { mode: 0o600 })
+    try {
+      fs.renameSync(tmp, file)
+    } catch {
+      // Windows cannot always replace an existing target atomically.
+      fs.writeFileSync(file, payload, { mode: 0o600 })
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
+    }
+  } catch {
+    // This is a cache only. Live discovery remains the correctness source.
+  }
+}
+
+function validateAdvertisedZenModels(body: unknown): ReadonlySet<string> {
+  if (!body || typeof body !== "object" || !("data" in body) || !Array.isArray(body.data)) {
+    throw new Error("Zen model discovery returned an invalid model list")
+  }
+  if (body.data.length === 0 || body.data.length > ZEN_MODEL_DISCOVERY_MAX_MODELS) {
+    throw new Error("Zen model discovery returned an implausible model count")
+  }
+  const ids = new Set<string>()
+  for (const item of body.data) {
+    if (!item || typeof item !== "object" || !("id" in item) || !validZenModelID(item.id)) {
+      throw new Error("Zen model discovery returned an invalid model entry")
+    }
+    ids.add(item.id)
+  }
+  return ids
+}
+
+async function refreshAdvertisedZenModels(): Promise<ZenAdvertisedModelsCache> {
+  if (isTestEnv() && testFetch === undefined && testZenCatalogCacheFile === undefined) {
+    throw new Error("Zen model discovery is disabled in tests without an explicit test fetch")
   }
   zenAdvertisedModelsInFlight ??= (async () => {
     const response = await (testFetch ?? fetch)(ZEN_MODELS_URL, {
@@ -304,21 +435,50 @@ async function advertisedZenModelIDs(): Promise<ReadonlySet<string>> {
       signal: AbortSignal.timeout(ZEN_MODEL_DISCOVERY_TIMEOUT_MS),
     })
     if (!response.ok) throw new Error("Zen model discovery failed with HTTP " + response.status)
-    const body = (await response.json()) as unknown
-    if (!body || typeof body !== "object" || !("data" in body) || !Array.isArray(body.data)) {
-      throw new Error("Zen model discovery returned an invalid model list")
-    }
-    const ids = new Set<string>()
-    for (const item of body.data) {
-      if (!item || typeof item !== "object" || !("id" in item) || typeof item.id !== "string") continue
-      ids.add(item.id)
-    }
-    zenAdvertisedModelsCache = { fetchedAt: Date.now(), ids }
-    return ids
+    const ids = validateAdvertisedZenModels((await response.json()) as unknown)
+    const cache = { fetchedAt: Date.now(), ids } satisfies ZenAdvertisedModelsCache
+    zenAdvertisedModelsCache = cache
+    zenAdvertisedModelsCacheLoaded = true
+    persistZenCatalog(cache)
+    return cache
   })().finally(() => {
     zenAdvertisedModelsInFlight = undefined
   })
   return zenAdvertisedModelsInFlight
+}
+
+/**
+ * Current hosted Zen catalog with explicit freshness semantics.
+ *
+ * Fresh data is returned directly. Stale-but-bounded data remains usable while
+ * one background refresh runs. Expired data gets one synchronous refresh attempt
+ * and remains observable as expired if the gateway is unavailable.
+ */
+export async function zenHostedCatalog(): Promise<ZenHostedCatalog> {
+  loadPersistedZenCatalog()
+  const cached = zenAdvertisedModelsCache
+  if (cached) {
+    const state = catalogState(cached)
+    if (state === "fresh") return { state, fetchedAt: cached.fetchedAt, ids: cached.ids }
+    if (state === "stale") {
+      void refreshAdvertisedZenModels().catch(() => undefined)
+      return { state, fetchedAt: cached.fetchedAt, ids: cached.ids }
+    }
+  }
+
+  try {
+    const refreshed = await refreshAdvertisedZenModels()
+    return { state: "fresh", fetchedAt: refreshed.fetchedAt, ids: refreshed.ids }
+  } catch {
+    if (cached) return { state: "expired", fetchedAt: cached.fetchedAt, ids: cached.ids }
+    return { state: "unavailable", ids: new Set() }
+  }
+}
+
+async function advertisedZenModelIDs(): Promise<ReadonlySet<string>> {
+  const catalog = await zenHostedCatalog()
+  if (catalog.state === "fresh" || catalog.state === "stale") return catalog.ids
+  throw new Error("Zen hosted model catalog is not currently usable")
 }
 
 /**
@@ -400,6 +560,71 @@ export function zenProviderFetch(url: RequestInfo | URL, init?: RequestInit): Pr
 
 export function zenGoProviderFetch(url: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   return routedZenProviderFetch(GO_PROVIDER_ID, url, init)
+}
+
+/**
+ * Transport for an already-committed hosted account route.
+ *
+ * Unlike `zenProviderFetch`, this never selects: it reuses the bearer the
+ * committed route binding already injected, refuses a request that carries a
+ * different explicit `@zen-` account, keeps model de-qualification and
+ * rate-limit observation, and reports the committed account back through
+ * `withRoutedAccount`. A committed route can therefore never be replaced by
+ * the pool default at the physical boundary.
+ */
+export function committedZenProviderFetch(
+  accountID: string,
+): (url: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+  return async (url: RequestInfo | URL, init?: RequestInit) => {
+    const baseFetch = testFetch ?? fetch
+    const headers = new Headers(init?.headers)
+    if (!bearerApiKey(headers)) {
+      throw new Error("Committed OpenCode route is missing its selected credential")
+    }
+    const { body, model: requestedModel } = parseBodyModel(init)
+    const split = typeof requestedModel === "string" ? resolveZenModelParts(requestedModel) : undefined
+    if (split?.accountID && split.accountID !== accountID) {
+      throw new Error(
+        `Requested OpenCode account ${split.accountID} does not match the committed route account ${accountID}`,
+      )
+    }
+
+    const dequalified = split?.accountID && body && split.baseModelID !== requestedModel
+    const nextInit = dequalified ? { ...init, body: JSON.stringify({ ...body, model: split!.baseModelID }) } : init
+    const response = await baseFetch(url, nextInit)
+    if (!response.ok) pool.observe(accountID, response.status, retryAfterMs(response))
+    return withRoutedAccount(response, accountID)
+  }
+}
+
+/**
+ * Transport for an already-committed Public hosted route.
+ *
+ * A committed Public route is credential-free and account-free, so this never
+ * consults `resolveZenRequest`, the pool default, env, or configured provider
+ * credentials: it pins the public sentinel the committed route already
+ * selected. Model de-qualification is preserved, and an explicit `@zen-`
+ * account suffix fails closed because Public has no account to authorize.
+ */
+export function committedPublicZenProviderFetch(
+  url: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  const baseFetch = testFetch ?? fetch
+  const headers = new Headers(init?.headers)
+  if (bearerApiKey(headers) !== ZEN_PUBLIC_API_KEY) {
+    throw new Error("Committed Public OpenCode route is missing its public credential")
+  }
+  const { body, model: requestedModel } = parseBodyModel(init)
+  const split = typeof requestedModel === "string" ? resolveZenModelParts(requestedModel) : undefined
+  if (split?.accountID) {
+    throw new Error(`Requested OpenCode account ${split.accountID} cannot be authorized by a committed Public route`)
+  }
+  const dequalified = split && body && split.baseModelID !== requestedModel
+  const nextInit = dequalified ? { ...init, body: JSON.stringify({ ...body, model: split!.baseModelID }) } : init
+  // Public route health is owned by the shared route-health owner, and a Public
+  // route has no account, so there is deliberately no pool observation here.
+  return baseFetch(url, nextInit)
 }
 
 // Observation (event hook) -----------------------------------------------------
@@ -562,6 +787,15 @@ export async function ZenGoPlugin(_input: PluginInput): Promise<Hooks> {
 export function setTestZenFetch(value: ((input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) | undefined) {
   testFetch = value
   zenAdvertisedModelsCache = undefined
+  zenAdvertisedModelsCacheLoaded = false
+  zenAdvertisedModelsInFlight = undefined
+}
+
+/** Test-only: redirect durable hosted-catalog cache I/O to an isolated file. */
+export function setTestZenCatalogCacheFile(value: string | undefined) {
+  testZenCatalogCacheFile = value
+  zenAdvertisedModelsCache = undefined
+  zenAdvertisedModelsCacheLoaded = false
   zenAdvertisedModelsInFlight = undefined
 }
 
@@ -583,6 +817,8 @@ export function resetZenPoolForTest() {
   lastVaultSyncAt = 0
   vaultSyncInFlight = undefined
   zenAdvertisedModelsCache = undefined
+  zenAdvertisedModelsCacheLoaded = false
   zenAdvertisedModelsInFlight = undefined
+  testZenCatalogCacheFile = undefined
   pool = new ZenAccountPool()
 }

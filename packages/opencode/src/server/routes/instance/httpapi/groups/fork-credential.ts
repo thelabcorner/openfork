@@ -2,6 +2,7 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { described } from "./metadata"
 import { Capacity } from "@/capacity/capacity"
+import * as GeneralUsage from "@/capacity/general-usage"
 
 const DirectoryQuery = Schema.Struct({
   directory: Schema.optional(Schema.String),
@@ -18,6 +19,11 @@ export const ForkWindowUsage = Schema.Struct({
   label: Schema.Literals(["5h", "week", "month"]),
   spentUSD: Schema.Finite,
   limitUSD: Schema.Finite,
+  // The official provider's own used-percentage for this window, preserved
+  // verbatim from the merged official snapshot. Additive for old clients;
+  // prefer it over `spentUSD / limitUSD`, whose denominator is a local dollar
+  // budget rather than this window's own meter.
+  officialPercent: Schema.optional(Schema.Finite),
   estimatedPercent: Schema.optional(Schema.Finite),
   resetsAt: Schema.Finite,
   clearsAt: Schema.Finite,
@@ -111,6 +117,18 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
       HttpApiEndpoint.get("usage", "/fork/usage", {
         success: described(ForkUsageResult, "Aggregate and per-credential OpenCode Go usage"),
       }).annotateMerge(OpenApi.annotations({ identifier: "fork.usage.get", summary: "Get OpenCode Go usage" })),
+    )
+    .add(
+      HttpApiEndpoint.get("generalUsage", "/fork/general-usage", {
+        success: described(GeneralUsage.Snapshot, "Generalized workload projection"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "fork.generalUsage.get",
+          summary: "Get generalized model usage",
+          description:
+            "Returns the local process-global workload projection used to estimate target-model cost/yield. This endpoint performs no provider quota I/O and never fabricates requests-left.",
+        }),
+      ),
     )
     .add(
       HttpApiEndpoint.get("capacity", "/fork/capacity", {

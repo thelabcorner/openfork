@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Result, Schema } from "effect"
 import { ToolJsonSchema } from "../../src/tool/json-schema"
+import type { Def as ToolDef } from "../../src/tool/tool"
 import { Goal } from "@opencode-ai/schema/goal"
 
 // Each tool exports its parameters schema at module scope so this test can
@@ -71,12 +72,54 @@ describe("tool parameters", () => {
         $defs: document.definitions,
       })
       expect(schema.type).toBe("object")
+      expect(schema.properties).toEqual({})
       expect(schema).not.toHaveProperty("$ref")
       expect(schema).not.toHaveProperty("$defs")
       expect(schema.anyOf).toHaveLength(3)
       for (const branch of schema.anyOf ?? []) {
         expect(branch).toMatchObject({ type: "object", properties: { decision: { type: "string" } } })
       }
+    })
+
+    test("normalizes pre-materialized object-union tool schemas before provider exposure", () => {
+      const definition = {
+        id: "union-test",
+        description: "test",
+        parameters: Schema.Unknown,
+        jsonSchema: {
+          anyOf: [
+            {
+              type: "object",
+              properties: { alpha: { type: "string" } },
+              required: ["alpha"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: { beta: { type: "number" } },
+              required: ["beta"],
+              additionalProperties: false,
+            },
+          ],
+        },
+      } as unknown as ToolDef
+
+      const schema = ToolJsonSchema.fromTool(definition)
+      expect(schema).toMatchObject({
+        type: "object",
+        properties: {},
+      })
+      expect(schema.anyOf).toHaveLength(2)
+      expect(schema.anyOf?.[0]).toMatchObject({
+        type: "object",
+        properties: { alpha: { type: "string" } },
+        required: ["alpha"],
+      })
+      expect(schema.anyOf?.[1]).toMatchObject({
+        type: "object",
+        properties: { beta: { type: "number" } },
+        required: ["beta"],
+      })
     })
 
     test("preserves required nullable fields", () => {

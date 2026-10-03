@@ -266,6 +266,7 @@ export function plan(
     kind: "write",
     aiSession: input.sessionID,
     sourceRef: input.callID,
+    replayToken: input.callID,
     source: "session",
     ...(project === undefined ? {} : { project }),
     ...(folder === undefined ? {} : { projectFolder: folder }),

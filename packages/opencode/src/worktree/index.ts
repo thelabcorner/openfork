@@ -11,12 +11,14 @@ import { Slug } from "@opencode-ai/core/util/slug"
 import { errorMessage } from "../util/error"
 import { GlobalBus } from "@/bus/global"
 import { Git } from "@/git"
-import { Effect, Layer, Path, Schema, Scope, Context } from "effect"
+import { Effect, Layer, Path, Schema, Scope, Context, Option } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
 import { WorktreeEvent } from "@opencode-ai/schema/worktree-event"
+import { ManagedWorktreeBridge } from "./managed/bridge"
+import type { ManagedCreateInitializeInput } from "./managed/request"
 
 export const Event = WorktreeEvent
 
@@ -60,6 +62,21 @@ export class CreateFailedError extends Schema.TaggedErrorClass<CreateFailedError
   message: Schema.String,
 }) {}
 
+/**
+ * A managed creation attempt began and did not complete with an exact activated
+ * binding. This is never a fallback signal: the caller explicitly opted into the
+ * managed path, so a failed or ambiguous managed outcome is surfaced as a hard
+ * failure while the durable binding keeps its recorded
+ * `reconcile_required`/`quarantined` state.
+ */
+export class ManagedCreateFailedError extends Schema.TaggedErrorClass<ManagedCreateFailedError>()(
+  "WorktreeManagedCreateFailedError",
+  {
+    reason: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
 export class StartCommandFailedError extends Schema.TaggedErrorClass<StartCommandFailedError>()(
   "WorktreeStartCommandFailedError",
   {
@@ -87,6 +104,61 @@ export type Error =
   | RemoveFailedError
   | ResetFailedError
   | ListFailedError
+  | ManagedCreateFailedError
+
+/**
+ * Explicit caller opt-in for the managed worktree path (G5 seam).
+ *
+ * Supplying this object is the only way `create` may attempt managed creation;
+ * omitting it keeps the historical unmanaged behavior. The caller owns every
+ * product fact (worktree-store identity, storage policy, helper paths); this
+ * seam invents none of it. `targetPath` and `branchName` default to the
+ * computed unmanaged candidate when omitted.
+ *
+ * The managed path is additionally gated on readiness: it runs only when the
+ * `ManagedWorktreeBridge` service is provided to the caller's layer and its
+ * activation resolves ready (packaged sidecar, wired fence adapter, discovery
+ * directory, control-plane root, per-launch fence config). An unavailable
+ * readiness falls back to the unmanaged path. Once the managed attempt has
+ * begun, every failure or ambiguous outcome throws and never falls back.
+ */
+export interface ManagedCreateOptions {
+  /** Explicit readiness inputs; omitted fields resolve from the environment. */
+  readonly activation?: ManagedWorktreeBridge.ActivationOptions
+  /** Exact managed request facts. `targetPath`/`branchName` default to the candidate. */
+  readonly request: {
+    readonly worktreeId: string
+    readonly repositoryId: string
+    readonly repositoryPath?: string
+    readonly storageVolumeId: string
+    readonly commitish: string
+    readonly storagePolicy: ManagedCreateInitializeInput["storagePolicy"]
+    readonly storageProbe: ManagedCreateInitializeInput["storageProbe"]
+    readonly dedupe: ManagedCreateInitializeInput["dedupe"]
+    readonly targetPath?: string
+    readonly branchName?: string
+  }
+  /** Durable binding identity supplied by the caller. */
+  readonly binding: {
+    readonly installationId: string
+    readonly projectId: string
+    readonly workspaceId?: string | null
+  }
+}
+
+/**
+ * Readiness-only activation reasons. Each one is positively proven before any
+ * durable intent, manager invocation, or physical side effect, so the caller
+ * may keep the historical unmanaged path. Any other reason — including a future
+ * one — fails closed instead.
+ */
+const FALLBACK_ACTIVATION_REASONS: ReadonlySet<ManagedWorktreeBridge.ActivationReason> = new Set([
+  "capability-unavailable",
+  "fence-adapter-not-wired",
+  "discovery-directory-missing",
+  "control-plane-root-missing",
+  "fence-config-unavailable",
+])
 
 function slugify(input: string) {
   return input
@@ -119,7 +191,7 @@ function failedRemoves(...chunks: string[]) {
 export interface Interface {
   readonly makeWorktreeInfo: (options?: { name?: string; detached?: boolean }) => Effect.Effect<Info, Error>
   readonly createFromInfo: (info: Info, startCommand?: string) => Effect.Effect<void, Error>
-  readonly create: (input?: CreateInput) => Effect.Effect<Info, Error>
+  readonly create: (input?: CreateInput, managed?: ManagedCreateOptions) => Effect.Effect<Info, Error>
   readonly list: () => Effect.Effect<(Omit<Info, "branch"> & { branch?: string })[], Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<boolean, Error>
   readonly reset: (input: ResetInput) => Effect.Effect<boolean, Error>
@@ -203,6 +275,11 @@ const layer: Layer.Layer<
       return yield* candidate({ root, name: input?.name ? slugify(input.name) : "", detached: input?.detached })
     })
 
+    const registerSandbox = Effect.fnUntraced(function* (directory: string) {
+      const ctx = yield* InstanceState.context
+      yield* project.addSandbox(ctx.project.id, directory).pipe(Effect.catch(() => Effect.void))
+    })
+
     const setup = Effect.fnUntraced(function* (info: Info) {
       const ctx = yield* InstanceState.context
       const created = yield* git(
@@ -217,7 +294,7 @@ const layer: Layer.Layer<
         })
       }
 
-      yield* project.addSandbox(ctx.project.id, info.directory).pipe(Effect.catch(() => Effect.void))
+      yield* registerSandbox(info.directory)
     })
 
     const boot = Effect.fnUntraced(function* (info: Info, startCommand?: string) {
@@ -278,7 +355,90 @@ const layer: Layer.Layer<
       )
     })
 
-    const create = Effect.fn("Worktree.create")(function* (input?: CreateInput) {
+    const createManaged = Effect.fn("Worktree.createManaged")(function* (
+      input: CreateInput | undefined,
+      managed: ManagedCreateOptions,
+    ) {
+      const ctx = yield* InstanceState.context
+      if (ctx.project.vcs !== "git") {
+        return yield* new NotGitError({ message: "Worktrees are only supported for git projects" })
+      }
+
+      // The candidate stays the unmanaged fallback layout and the default
+      // managed target/branch when the caller does not override them.
+      const info = yield* makeWorktreeInfo({ name: input?.name })
+
+      const bridge = Option.getOrUndefined(yield* Effect.serviceOption(ManagedWorktreeBridge.Service))
+      if (bridge === undefined) {
+        yield* createFromInfo(info, input?.startCommand)
+        return info
+      }
+
+      const branchName = managed.request.branchName ?? info.branch
+      if (branchName === undefined) {
+        return yield* new CreateFailedError({ message: "Managed worktree creation requires a branch name." })
+      }
+      const targetPath = managed.request.targetPath ?? info.directory
+
+      const outcome = yield* bridge
+        .createManagedWorktree({
+          ...(managed.activation ?? {}),
+          request: {
+            worktreeId: managed.request.worktreeId,
+            repositoryId: managed.request.repositoryId,
+            ...(managed.request.repositoryPath === undefined ? {} : { repositoryPath: managed.request.repositoryPath }),
+            storageVolumeId: managed.request.storageVolumeId,
+            targetPath,
+            branchName,
+            commitish: managed.request.commitish,
+            storagePolicy: managed.request.storagePolicy,
+            storageProbe: managed.request.storageProbe,
+            dedupe: managed.request.dedupe,
+          },
+          binding: {
+            directory: targetPath,
+            installationId: managed.binding.installationId,
+            projectId: managed.binding.projectId,
+            ...(managed.binding.workspaceId === undefined ? {} : { workspaceId: managed.binding.workspaceId }),
+          },
+        })
+        .pipe(
+          Effect.catch((error) =>
+            Effect.fail(
+              new ManagedCreateFailedError({
+                reason: error._tag,
+                message: `Managed worktree creation failed (${error.message.length === 0 ? error._tag : `${error._tag}: ${error.message}`}).`,
+              }),
+            ),
+          ),
+        )
+
+      if (outcome.state === "created") {
+        // The manager already materialized the worktree, so the unmanaged
+        // `git worktree add` is skipped; sandbox registration and the boot
+        // order continue exactly as in the unmanaged path.
+        const managedInfo: Info = { name: info.name, branch: branchName, directory: outcome.result.targetPath }
+        yield* registerSandbox(outcome.result.targetPath)
+        yield* boot(managedInfo, input?.startCommand).pipe(
+          Effect.catchCause((cause) => Effect.logError("worktree bootstrap failed", { cause })),
+          Effect.forkIn(scope),
+        )
+        return managedInfo
+      }
+
+      if (FALLBACK_ACTIVATION_REASONS.has(outcome.reason)) {
+        yield* createFromInfo(info, input?.startCommand)
+        return info
+      }
+
+      return yield* new ManagedCreateFailedError({
+        reason: outcome.reason,
+        message: `Managed worktree creation did not complete (${outcome.reason}): ${outcome.detail}`,
+      })
+    })
+
+    const create = Effect.fn("Worktree.create")(function* (input?: CreateInput, managed?: ManagedCreateOptions) {
+      if (managed !== undefined) return yield* createManaged(input, managed)
       const info = yield* makeWorktreeInfo({ name: input?.name })
       yield* createFromInfo(info, input?.startCommand)
       return info

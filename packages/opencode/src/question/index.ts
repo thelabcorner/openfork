@@ -7,6 +7,9 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import type { ExternalActor } from "@/session/external-actor"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { PendingResponseRegistry } from "@/server/pending-response-registry"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -40,6 +43,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Que
 interface PendingEntry {
   info: Request
   deferred: Deferred.Deferred<Resolved, RejectedError>
+  settling?: boolean
 }
 
 interface State {
@@ -78,6 +82,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const responses = yield* PendingResponseRegistry.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Question.state")(function* () {
         const state = {
@@ -114,14 +119,36 @@ const layer = Layer.effect(
         questions: input.questions,
         tool: input.tool,
       }
-      pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
+      const entry = { info, deferred }
+      pending.set(id, entry)
+      const context = yield* InstanceState.context
+      const unregister = yield* responses.register({
+        kind: "question",
+        requestID: id,
+        sessionID: info.sessionID,
+        directory: FSUtil.resolve(context.directory),
+        snapshot: info,
+        settle: (payload) => {
+          const action = payload as
+            | { type: "reply"; input: Parameters<Interface["reply"]>[0] }
+            | { type: "reject"; actor?: ExternalActor.Ref }
+          return (action.type === "reply"
+            ? reply(action.input)
+            : reject(id, action.actor)
+          ).pipe(
+            Effect.provideService(InstanceRef, context),
+            Effect.catchTag("Question.NotFoundError", () =>
+              Effect.fail(new PendingResponseRegistry.NotFoundError({ requestID: id })),
+            ),
+          )
+        },
+      })
 
       return yield* Effect.ensuring(
-        Deferred.await(deferred),
+        events.publish(Event.Asked, info).pipe(Effect.andThen(Deferred.await(deferred))),
         Effect.sync(() => {
-          pending.delete(id)
-        }),
+            if (pending.get(id) === entry) pending.delete(id)
+          }).pipe(Effect.andThen(unregister)),
       )
     })
 
@@ -138,21 +165,31 @@ const layer = Layer.effect(
       actor?: ExternalActor.Ref
     }) {
       const pending = (yield* InstanceState.get(state)).pending
+      const context = yield* InstanceState.context
+      const workspaceID = yield* WorkspaceRef
+      const notify = (effect: Effect.Effect<void, unknown>) =>
+        responses.notify(
+          effect.pipe(Effect.provideService(InstanceRef, context), Effect.provideService(WorkspaceRef, workspaceID)),
+          FSUtil.resolve(context.directory),
+        )
       const existing = pending.get(input.requestID)
       if (!existing) {
         yield* Effect.logWarning("reply for unknown request", { requestID: input.requestID })
         return yield* new NotFoundError({ requestID: input.requestID })
       }
-      pending.delete(input.requestID)
+      if (existing.settling) return yield* new NotFoundError({ requestID: input.requestID })
+      existing.settling = true
       const resolved = QuestionV2.normalizeReply(existing.info.questions, input)
       yield* Effect.logInfo("replied", { requestID: input.requestID, answers: resolved.answers, details: resolved.details })
-      yield* events.publish(Event.Replied, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
-        answers: QuestionV2.flattenResolved(resolved).map((answer) => [...answer]),
-        details: [...resolved.details],
-      }, input.actor ? { metadata: { actor: input.actor } } : undefined)
+      pending.delete(input.requestID)
       yield* Deferred.succeed(existing.deferred, resolved)
+      yield* notify(events
+        .publish(Event.Replied, {
+          sessionID: existing.info.sessionID,
+          requestID: existing.info.id,
+          answers: QuestionV2.flattenResolved(resolved).map((answer) => [...answer]),
+          details: [...resolved.details],
+        }, input.actor ? { metadata: { actor: input.actor } } : undefined))
     })
 
     const reject = Effect.fn("Question.reject")(function* (
@@ -160,18 +197,28 @@ const layer = Layer.effect(
       actor?: ExternalActor.Ref,
     ) {
       const pending = (yield* InstanceState.get(state)).pending
+      const context = yield* InstanceState.context
+      const workspaceID = yield* WorkspaceRef
+      const notify = (effect: Effect.Effect<void, unknown>) =>
+        responses.notify(
+          effect.pipe(Effect.provideService(InstanceRef, context), Effect.provideService(WorkspaceRef, workspaceID)),
+          FSUtil.resolve(context.directory),
+        )
       const existing = pending.get(requestID)
       if (!existing) {
         yield* Effect.logWarning("reject for unknown request", { requestID })
         return yield* new NotFoundError({ requestID })
       }
-      pending.delete(requestID)
+      if (existing.settling) return yield* new NotFoundError({ requestID })
+      existing.settling = true
       yield* Effect.logInfo("rejected", { requestID })
-      yield* events.publish(Event.Rejected, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
-      }, actor ? { metadata: { actor } } : undefined)
+      pending.delete(requestID)
       yield* Deferred.fail(existing.deferred, new RejectedError())
+      yield* notify(events
+        .publish(Event.Rejected, {
+          sessionID: existing.info.sessionID,
+          requestID: existing.info.id,
+        }, actor ? { metadata: { actor } } : undefined))
     })
 
     const list = Effect.fn("Question.list")(function* () {
@@ -183,6 +230,10 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [EventV2Bridge.node, PendingResponseRegistry.node],
+})
 
 export * as Question from "."

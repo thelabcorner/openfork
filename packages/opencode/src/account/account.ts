@@ -1,14 +1,18 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Cache, Clock, Duration, Effect, Layer, Option, Schema, SchemaGetter, Context } from "effect"
+import { Cache, Clock, Duration, Effect, Layer, Option, Schema, Context } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import {
-  FetchHttpClient,
-  HttpClient,
-  HttpClientError,
-  HttpClientRequest,
-  HttpClientResponse,
-} from "effect/unstable/http"
+  getOrganizations,
+  getProviderConfig,
+  getUser,
+  pollDeviceToken,
+  refreshToken as refreshDeviceToken,
+  resolveVerificationUrl,
+  startDeviceAuthorization,
+} from "@opencode-ai/core/plugin/provider/opencode-console"
+import type { PollResult as DevicePollResult } from "@opencode-ai/core/plugin/provider/opencode-console"
+import { HttpClient, HttpClientError } from "effect/unstable/http"
 
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { AccountRepo, type AccountRow } from "./repo"
@@ -68,83 +72,26 @@ export type ActiveOrg = {
   org: Org
 }
 
-class RemoteConfig extends Schema.Class<RemoteConfig>("RemoteConfig")({
-  config: Schema.Record(Schema.String, Schema.Json),
-}) {}
-
-const DurationFromSeconds = Schema.Number.pipe(
-  Schema.decodeTo(Schema.Duration, {
-    decode: SchemaGetter.transform((n) => Duration.seconds(n)),
-    encode: SchemaGetter.transform((d) => Duration.toSeconds(d)),
-  }),
-)
-
-class TokenRefresh extends Schema.Class<TokenRefresh>("TokenRefresh")({
-  access_token: AccessToken,
-  refresh_token: RefreshToken,
-  expires_in: DurationFromSeconds,
-}) {}
-
-class DeviceAuth extends Schema.Class<DeviceAuth>("DeviceAuth")({
-  device_code: DeviceCode,
-  user_code: UserCode,
-  verification_uri_complete: Schema.String,
-  expires_in: DurationFromSeconds,
-  interval: DurationFromSeconds,
-}) {}
-
-class DeviceTokenSuccess extends Schema.Class<DeviceTokenSuccess>("DeviceTokenSuccess")({
-  access_token: AccessToken,
-  refresh_token: RefreshToken,
-  token_type: Schema.Literal("Bearer"),
-  expires_in: DurationFromSeconds,
-}) {}
-
-class DeviceTokenError extends Schema.Class<DeviceTokenError>("DeviceTokenError")({
-  error: Schema.String,
-  error_description: Schema.String,
-}) {
-  toPollResult(): PollResult {
-    if (this.error === "authorization_pending") return new PollPending()
-    if (this.error === "slow_down") return new PollSlow()
-    if (this.error === "expired_token") return new PollExpired()
-    if (this.error === "access_denied") return new PollDenied()
-    return new PollError({ cause: this.error })
-  }
-}
-
-const DeviceToken = Schema.Union([DeviceTokenSuccess, DeviceTokenError])
-
 class User extends Schema.Class<User>("User")({
   id: AccountID,
   email: Schema.String,
 }) {}
 
-class ClientId extends Schema.Class<ClientId>("ClientId")({ client_id: Schema.String }) {}
-
-class DeviceTokenRequest extends Schema.Class<DeviceTokenRequest>("DeviceTokenRequest")({
-  grant_type: Schema.String,
-  device_code: DeviceCode,
-  client_id: Schema.String,
-}) {}
-
-class TokenRefreshRequest extends Schema.Class<TokenRefreshRequest>("TokenRefreshRequest")({
-  grant_type: Schema.String,
-  refresh_token: RefreshToken,
-  client_id: Schema.String,
-}) {}
-
-const clientId = "opencode-cli"
 const eagerRefreshThreshold = Duration.minutes(5)
 const eagerRefreshThresholdMs = Duration.toMillis(eagerRefreshThreshold)
 
 const isTokenFresh = (tokenExpiry: number | null, now: number) =>
   tokenExpiry != null && tokenExpiry > now + eagerRefreshThresholdMs
 
-const mapAccountServiceError =
-  (message = "Account service operation failed") =>
-  <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, AccountError, R> =>
-    effect.pipe(Effect.mapError((cause) => accountErrorFromCause(cause, message)))
+const mapSharedAccountError = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, AccountError, R> =>
+  effect.pipe(
+    Effect.mapError((cause) =>
+      accountErrorFromCause(
+        cause,
+        HttpClientError.isHttpClientError(cause) ? "HTTP request failed" : "Failed to decode response",
+      ),
+    ),
+  )
 
 const accountErrorFromCause = (cause: unknown, message: string): AccountError => {
   if (cause instanceof AccountServiceError || cause instanceof AccountTransportError) {
@@ -163,6 +110,21 @@ const accountErrorFromCause = (cause: unknown, message: string): AccountError =>
   }
 
   return new AccountServiceError({ message, cause })
+}
+
+const toPollResult = (result: Exclude<DevicePollResult, { _tag: "success" }>): PollResult => {
+  switch (result._tag) {
+    case "pending":
+      return new PollPending()
+    case "slow_down":
+      return new PollSlow()
+    case "expired":
+      return new PollExpired()
+    case "access_denied":
+      return new PollDenied()
+    case "error":
+      return new PollError({ cause: result.error })
+  }
 }
 
 export interface Interface {
@@ -192,57 +154,23 @@ const layer: Layer.Layer<Service, never, AccountRepo.Service | HttpClient.HttpCl
     const repo = yield* AccountRepo.Service
     const http = yield* HttpClient.HttpClient
     const httpRead = withTransientReadRetry(http)
-    const httpOk = HttpClient.filterStatusOk(http)
-    const httpReadOk = HttpClient.filterStatusOk(httpRead)
-
-    const executeRead = (request: HttpClientRequest.HttpClientRequest) =>
-      httpRead.execute(request).pipe(mapAccountServiceError("HTTP request failed"))
-
-    const executeReadOk = (request: HttpClientRequest.HttpClientRequest) =>
-      httpReadOk.execute(request).pipe(mapAccountServiceError("HTTP request failed"))
-
-    const executeEffectOk = <E>(request: Effect.Effect<HttpClientRequest.HttpClientRequest, E>) =>
-      request.pipe(
-        Effect.flatMap((req) => httpOk.execute(req)),
-        mapAccountServiceError("HTTP request failed"),
-      )
-
-    const executeEffect = <E>(request: Effect.Effect<HttpClientRequest.HttpClientRequest, E>) =>
-      request.pipe(
-        Effect.flatMap((req) => http.execute(req)),
-        mapAccountServiceError("HTTP request failed"),
-      )
 
     const refreshToken = Effect.fnUntraced(function* (row: AccountRow) {
       const now = yield* Clock.currentTimeMillis
 
-      const response = yield* executeEffectOk(
-        HttpClientRequest.post(`${row.url}/auth/device/token`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.schemaBodyJson(TokenRefreshRequest)(
-            new TokenRefreshRequest({
-              grant_type: "refresh_token",
-              refresh_token: row.refresh_token,
-              client_id: clientId,
-            }),
-          ),
-        ),
-      )
+      const parsed = yield* refreshDeviceToken(http, row.url, row.refresh_token).pipe(mapSharedAccountError)
 
-      const parsed = yield* HttpClientResponse.schemaBodyJson(TokenRefresh)(response).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
-
-      const expiry = Option.some(now + Duration.toMillis(parsed.expires_in))
+      const expiry = Option.some(now + parsed.expires_in * 1000)
+      const accessToken = AccessToken.make(parsed.access_token)
 
       yield* repo.persistToken({
         accountID: row.id,
-        accessToken: parsed.access_token,
-        refreshToken: parsed.refresh_token,
+        accessToken,
+        refreshToken: RefreshToken.make(parsed.refresh_token),
         expiry,
       })
 
-      return parsed.access_token
+      return accessToken
     })
 
     const refreshTokenCache = yield* Cache.make<AccountID, AccessToken, AccountError>({
@@ -283,29 +211,15 @@ const layer: Layer.Layer<Service, never, AccountRepo.Service | HttpClient.HttpCl
     })
 
     const fetchOrgs = Effect.fnUntraced(function* (url: string, accessToken: AccessToken) {
-      const response = yield* executeReadOk(
-        HttpClientRequest.get(`${url}/api/orgs`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.bearerToken(accessToken),
-        ),
-      )
+      const orgs = yield* getOrganizations(httpRead, url, accessToken).pipe(mapSharedAccountError)
 
-      return yield* HttpClientResponse.schemaBodyJson(Schema.Array(Org))(response).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
+      return orgs.map((org) => new Org({ id: OrgID.make(org.id), name: org.name }))
     })
 
     const fetchUser = Effect.fnUntraced(function* (url: string, accessToken: AccessToken) {
-      const response = yield* executeReadOk(
-        HttpClientRequest.get(`${url}/api/user`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.bearerToken(accessToken),
-        ),
-      )
+      const user = yield* getUser(httpRead, url, accessToken).pipe(mapSharedAccountError)
 
-      return yield* HttpClientResponse.schemaBodyJson(User)(response).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
+      return new User({ id: AccountID.make(user.id), email: user.email })
     })
 
     const token = Effect.fn("Account.token")((accountID: AccountID) =>
@@ -366,75 +280,34 @@ const layer: Layer.Layer<Service, never, AccountRepo.Service | HttpClient.HttpCl
 
       const { account, accessToken } = resolved.value
 
-      const response = yield* executeRead(
-        HttpClientRequest.get(`${account.url}/api/config`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.bearerToken(accessToken),
-          HttpClientRequest.setHeaders({ "x-org-id": orgID }),
-        ),
-      )
-
-      if (response.status === 404) return Option.none()
-
-      const ok = yield* HttpClientResponse.filterStatusOk(response).pipe(mapAccountServiceError())
-
-      const parsed = yield* HttpClientResponse.schemaBodyJson(RemoteConfig)(ok).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
-      return Option.some(parsed.config)
+      const remote = yield* getProviderConfig(httpRead, account.url, accessToken, orgID).pipe(mapSharedAccountError)
+      return remote === undefined ? Option.none() : Option.some(remote)
     })
 
     const login = Effect.fn("Account.login")(function* (server: string) {
       const normalizedServer = normalizeServerUrl(server)
-      const response = yield* executeEffectOk(
-        HttpClientRequest.post(`${normalizedServer}/auth/device/code`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.schemaBodyJson(ClientId)(new ClientId({ client_id: clientId })),
-        ),
-      )
+      const parsed = yield* startDeviceAuthorization(http, normalizedServer).pipe(mapSharedAccountError)
 
-      const parsed = yield* HttpClientResponse.schemaBodyJson(DeviceAuth)(response).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
       const verification = yield* Effect.try({
-        try: () => {
-          const url = new URL(parsed.verification_uri_complete, `${normalizedServer}/`)
-          if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("expected HTTP(S)")
-          return url.href
-        },
+        try: () => resolveVerificationUrl(normalizedServer, parsed.verification_uri_complete),
         catch: (cause) => new AccountServiceError({ message: "Invalid device verification URL", cause }),
       })
       return new Login({
-        code: parsed.device_code,
-        user: parsed.user_code,
+        code: DeviceCode.make(parsed.device_code),
+        user: UserCode.make(parsed.user_code),
         url: verification,
         server: normalizedServer,
-        expiry: parsed.expires_in,
-        interval: parsed.interval,
+        expiry: Duration.seconds(parsed.expires_in),
+        interval: Duration.seconds(parsed.interval),
       })
     })
 
     const poll = Effect.fn("Account.poll")(function* (input: Login) {
-      const response = yield* executeEffect(
-        HttpClientRequest.post(`${input.server}/auth/device/token`).pipe(
-          HttpClientRequest.acceptJson,
-          HttpClientRequest.schemaBodyJson(DeviceTokenRequest)(
-            new DeviceTokenRequest({
-              grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-              device_code: input.code,
-              client_id: clientId,
-            }),
-          ),
-        ),
-      )
+      const result = yield* pollDeviceToken(http, input.server, input.code).pipe(mapSharedAccountError)
 
-      const parsed = yield* HttpClientResponse.schemaBodyJson(DeviceToken)(response).pipe(
-        mapAccountServiceError("Failed to decode response"),
-      )
+      if (result._tag !== "success") return toPollResult(result)
 
-      if (parsed instanceof DeviceTokenError) return parsed.toPollResult()
-      const accessToken = parsed.access_token
-
+      const accessToken = AccessToken.make(result.accessToken)
       const user = fetchUser(input.server, accessToken)
       const orgs = fetchOrgs(input.server, accessToken)
 
@@ -444,8 +317,8 @@ const layer: Layer.Layer<Service, never, AccountRepo.Service | HttpClient.HttpCl
       const firstOrgID = remoteOrgs.length > 0 ? Option.some(remoteOrgs[0].id) : Option.none<OrgID>()
 
       const now = yield* Clock.currentTimeMillis
-      const expiry = now + Duration.toMillis(parsed.expires_in)
-      const refreshToken = parsed.refresh_token
+      const expiry = now + result.expiresIn * 1000
+      const refreshToken = RefreshToken.make(result.refreshToken)
 
       yield* repo.persistAccount({
         id: account.id,

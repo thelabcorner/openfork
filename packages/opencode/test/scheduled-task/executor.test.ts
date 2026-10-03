@@ -309,7 +309,6 @@ const goalMock = Layer.mock(Goal.Service, {
           status: "active",
           revision: 1,
           auditorRuns: 0,
-          continuationPolicy: input.continuationPolicy ?? {},
           auditorPolicy: input.auditorPolicy ?? {},
           time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
         }),
@@ -516,7 +515,6 @@ describe("ScheduledTaskExecutor", () => {
         criteria: ["the objective is complete"],
         start: true,
         actor: "system",
-        continuationPolicy: {},
       })
       expect(hostPromptProvenance).toMatchObject({
         runID: "str_executor_goal",
@@ -541,7 +539,6 @@ describe("ScheduledTaskExecutor", () => {
             constraints: [],
             status: "active",
             revision: 1,
-            continuationPolicy: {},
             auditorPolicy: {},
             time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
           },
@@ -586,7 +583,6 @@ describe("ScheduledTaskExecutor", () => {
             constraints: [],
             status: "completed",
             revision: 4,
-            continuationPolicy: {},
             auditorPolicy: {},
             time: { created: DateTime.makeUnsafe(T0), updated: DateTime.makeUnsafe(T0) },
           },
@@ -998,6 +994,7 @@ describe("ScheduledTaskExecutor", () => {
           accountID: "account-42",
           variant: ModelV2.VariantID.make("high"),
         },
+        routeIntent: { kind: "account", accountID: "account-42", pin: "hard" },
       })
       expect(sessionRegistry.get("ses_scheduled_executor")?.model).toMatchObject({
         id: "explicit-model",

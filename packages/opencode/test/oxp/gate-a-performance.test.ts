@@ -146,6 +146,10 @@ describe("OXP Gate A performance proof", () => {
       // canonicalization remains intentionally uncached for authority safety.
       expect(authorize32.medianMs).toBeLessThan(authorize1.medianMs * 8 + 2)
     }),
-    { timeout: 30_000 },
+    // The contract is enforced by the measured medians above, not by whole-test
+    // wall time. The 32-root setup/canonicalization loop is deliberately IO
+    // heavy and can exceed 30s when the full OXP matrix is contending for the
+    // Windows filesystem even while every measured hot-path threshold is green.
+    { timeout: 60_000 },
   )
 })

@@ -5,7 +5,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { OxpConfig } from "./config"
+import { OxpConfig, scopeLegacyWorkerAgentPolicy } from "./config"
 import { OxpError } from "./error"
 import { OxpSchema } from "./schema"
 
@@ -290,6 +290,7 @@ const layer = Layer.effect(
       let created: OxpSchema.Root | undefined
 
       yield* config.update((current) => {
+        const workerPolicy = scopeLegacyWorkerAgentPolicy(current)
         const exact = current.roots.find((root) => samePath(root.path, canonical))
         if (exact) {
           if (hasSource(exact, "project")) {
@@ -301,6 +302,7 @@ const layer = Layer.effect(
           return {
             ...current,
             roots: current.roots.map((root) => root.id === exact.id ? created! : root),
+            workerPolicy,
           }
         }
         for (const other of current.roots) {
@@ -318,6 +320,7 @@ const layer = Layer.effect(
         return {
           ...current,
           roots: [...current.roots, created],
+          workerPolicy,
         }
       })
       if (!created) return yield* new OxpError.Conflict({ detail: "Approved root was not committed" })
@@ -339,7 +342,9 @@ const layer = Layer.effect(
       let reconciled: readonly OxpSchema.Root[] = []
 
       yield* config.update((current) => {
+        const workerPolicy = scopeLegacyWorkerAgentPolicy(current)
         const desired = new Set(prepared.map((item) => pathIdentity(item.canonical)))
+        const removed = new Set<OxpSchema.RootID>()
         const next: OxpSchema.Root[] = []
 
         for (const root of current.roots) {
@@ -349,6 +354,7 @@ const layer = Layer.effect(
           }
           const retained = removeSource(root, "project")
           if (retained) next.push(retained)
+          else removed.add(root.id)
         }
 
         for (const item of prepared) {
@@ -382,6 +388,12 @@ const layer = Layer.effect(
         return {
           ...current,
           roots: next,
+          workerPolicy: {
+            ...workerPolicy,
+            agentRoots: (workerPolicy.agentRoots ?? []).filter(
+              (entry) => !removed.has(entry.rootID),
+            ),
+          },
         }
       })
       return reconciled
@@ -413,6 +425,7 @@ const layer = Layer.effect(
 
       let imported: readonly OxpSchema.Root[] = []
       yield* config.update((current) => {
+        const workerPolicy = scopeLegacyWorkerAgentPolicy(current)
         const next = [...current.roots]
         for (const item of prepared) {
           const exactIndex = next.findIndex((root) =>
@@ -460,7 +473,7 @@ const layer = Layer.effect(
           throw new OxpError.InvalidArgument({ detail: "Legacy import would exceed the approved-root limit" })
         }
         imported = next
-        return { ...current, roots: next }
+        return { ...current, roots: next, workerPolicy }
       })
       return imported
     })
@@ -492,7 +505,17 @@ const layer = Layer.effect(
         }
         const roots = current.roots.filter((root) => root.id !== id)
         if (roots.length === current.roots.length) throw new OxpError.RootNotFound({ detail: "Approved root does not exist" })
-        return { ...current, roots }
+        const workerPolicy = scopeLegacyWorkerAgentPolicy(current)
+        return {
+          ...current,
+          roots,
+          workerPolicy: {
+            ...workerPolicy,
+            agentRoots: (workerPolicy.agentRoots ?? []).filter(
+              (entry) => entry.rootID !== id,
+            ),
+          },
+        }
       })
     })
 

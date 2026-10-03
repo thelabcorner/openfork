@@ -3,31 +3,57 @@ import * as Tool from "./tool"
 import DESCRIPTION from "./session.txt"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
+import { BackgroundJob } from "@/background/job"
+import { Question } from "@/question"
+import { SubagentSupervisionMetadata } from "@/session/subagent-supervision-metadata"
+import {
+  classifyWorker,
+  type RuntimeOwnership,
+  type WorkerRuntime,
+  type WorkerState,
+} from "@/session/subagent-supervision"
 import { InstanceState } from "@/effect/instance-state"
 import { InstanceRef } from "@/effect/instance-ref"
 import { Project } from "@/project/project"
 import { SessionID } from "@/session/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { ExchangeSessionSearch } from "@/exchange/session-search"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionSearch } from "@opencode-ai/core/session/search"
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["list", "get", "status", "messages"]).annotate({
+  action: Schema.Literals(["list", "search", "get", "status", "messages", "children"]).annotate({
     description: "Action to perform",
   }),
   sessionId: Schema.optional(Schema.String).annotate({ description: "Target session ID for get/status/messages" }),
   scope: Schema.optional(Schema.Literals(["current", "project", "global"])).annotate({
-    description: "list: current (default), project, or global",
+    description: "list/search: current (default), project, or global",
   }),
   limit: Schema.optional(Schema.Number).annotate({
     description: "Max items to return (default 10, max 100)",
   }),
   search: Schema.optional(Schema.String).annotate({ description: "list: title search substring" }),
-  roots: Schema.optional(Schema.Boolean).annotate({ description: "list: only root sessions (parentID null)" }),
+  query: Schema.optional(Schema.String).annotate({
+    description: "search: full-text query across Session titles and indexed conversation content",
+  }),
+  tool: Schema.optional(Schema.String).annotate({
+    description: "search: exact tool name; returns structurally verified tool-call hits (may be combined with query)",
+  }),
+  repairIndex: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "search: process one bounded historical-index repair chunk before searching. Use when coverage.complete is false; normal search does not perform maintenance.",
+  }),
+  roots: Schema.optional(Schema.Boolean).annotate({ description: "list/search: only root sessions (parentID null)" }),
   parentId: Schema.optional(Schema.String).annotate({
     description:
-      "list: only sessions with this parent — finds subagent/task child sessions (e.g. to recover a failed task)",
+      "list/search/children: only sessions with this parent — finds subagent/task child sessions (e.g. to recover a failed task). children defaults to the current session (the calling supervisor) when omitted.",
   }),
-  includeArchived: Schema.optional(Schema.Boolean).annotate({ description: "list: include archived sessions" }),
+  groupId: Schema.optional(Schema.String).annotate({
+    description:
+      "children: only supervised workers in this supervision cohort (assistant-turn-derived group id)",
+  }),
+  includeArchived: Schema.optional(Schema.Boolean).annotate({ description: "list/search: include archived sessions" }),
   withStatus: Schema.optional(Schema.Boolean).annotate({ description: "list: attach live status per session" }),
   role: Schema.optional(Schema.Literals(["all", "user", "assistant"])).annotate({
     description: "messages: filter by role (default all)",
@@ -146,6 +172,152 @@ type AgentSessionMessage = {
 // scan ceiling prevented proving completeness.
 export const MESSAGE_SCAN_LIMIT = 2_000
 
+// ---------------------------------------------------------------------------
+// Aggregated child/worker inspection (`action: "children"`)
+//
+// A supervisor must be able to audit 4+ supervised workers in ONE tool call
+// instead of issuing N status + N messages calls. The projection below is
+// deliberately bounded and evidence-oriented: it never returns transcripts, it
+// hydrates at most one tiny message window per worker, and every worker row is
+// capped. Full history remains available through `messages`.
+// ---------------------------------------------------------------------------
+
+/** Hard bound on the number of worker rows returned in one snapshot. */
+export const CHILDREN_MAX_WORKERS = 50
+/** Default bound when the caller does not pass `limit`. */
+export const CHILDREN_DEFAULT_WORKERS = 25
+/** Upper bound for the compact `latestActivity` excerpt. */
+export const CHILDREN_ACTIVITY_LIMIT = 600
+/** Bounded history window inspected per worker to derive latest activity/tool. */
+export const CHILDREN_MESSAGE_WINDOW = 6
+
+export type WorkerMode = "foreground" | "background" | "supervisor" | "unknown"
+
+export type WorkerBlocked = WorkerState
+
+export type WorkerSnapshot = {
+  sessionId: string
+  mode: WorkerMode
+  agent?: string
+  description?: string
+  status: string
+  blocked: WorkerBlocked
+  latestActivity?: string
+  lastTool?: string
+  pendingPermission?: string
+  pendingQuestion?: string
+  tokens: {
+    input: number
+    output: number
+    reasoning: number
+    cacheRead: number
+    cacheWrite: number
+  }
+  cost: number
+  updatedAt: number
+  terminal?: {
+    state: "completed" | "failed" | "cancelled"
+    summary?: string
+    error?: string
+  }
+}
+
+export type ChildrenOutput = {
+  parentId: string
+  groupId?: string
+  workers: WorkerSnapshot[]
+  truncated?: boolean
+}
+
+function truncateActivity(text: string): string {
+  const clean = text.trim()
+  if (clean.length <= CHILDREN_ACTIVITY_LIMIT) return clean
+  return `${clean.slice(0, CHILDREN_ACTIVITY_LIMIT)}… [truncated]`
+}
+
+/** Best-effort short textual argument for a tool call, e.g. "read src/x.ts". */
+function describeToolInput(tool: string, input: Record<string, unknown> | undefined): string {
+  if (!input) return tool
+  const candidate =
+    (typeof input.filePath === "string" && input.filePath) ||
+    (typeof input.file_path === "string" && input.file_path) ||
+    (typeof input.path === "string" && input.path) ||
+    (typeof input.command === "string" && input.command) ||
+    (typeof input.pattern === "string" && input.pattern) ||
+    (typeof input.query === "string" && input.query) ||
+    (typeof input.description === "string" && input.description) ||
+    (typeof input.glob === "string" && input.glob) ||
+    (typeof input.sessionId === "string" && input.sessionId) ||
+    (typeof input.action === "string" && input.action) ||
+    ""
+  const shortened = candidate.length > 120 ? `${candidate.slice(0, 120)}…` : candidate
+  return shortened ? `${tool} ${shortened}` : tool
+}
+
+/** Latest meaningful assistant text part, bounded, skipping synthetic-only text. */
+function latestMeaningfulText(message: SessionV1.WithParts | undefined): string | undefined {
+  if (!message || message.info.role !== "assistant") return undefined
+  for (let i = message.parts.length - 1; i >= 0; i--) {
+    const part = message.parts[i]
+    if (part?.type !== "text") continue
+    if ((part as any).synthetic === true) continue
+    const text = typeof (part as any).text === "string" ? (part as any).text : ""
+    if (text.trim() === "") continue
+    return text
+  }
+  return undefined
+}
+
+function lastToolActivity(message: SessionV1.WithParts | undefined): string | undefined {
+  if (!message) return undefined
+  for (let i = message.parts.length - 1; i >= 0; i--) {
+    const part = message.parts[i]
+    if (part?.type !== "tool") continue
+    const toolPart = part as SessionV1.ToolPart
+    const input = toolPart.state.status === "pending" ? undefined : toolPart.state.input
+    const label = describeToolInput(toolPart.tool, input)
+    if (toolPart.state.status === "error") return `${label} (error)`
+    return label
+  }
+  return undefined
+}
+
+function assistantTerminal(message: SessionV1.WithParts | undefined): { error?: string } | undefined {
+  if (!message || message.info.role !== "assistant") return undefined
+  const info = message.info as SessionV1.Assistant
+  if (!info.error) return undefined
+  const data: any = info.error.data
+  if (data && typeof data.message === "string") return { error: data.message }
+  return { error: info.error.name }
+}
+
+function activityFromMessages(messages: ReadonlyArray<SessionV1.WithParts>) {
+  const recent: string[] = []
+  let consecutiveToolFailures = 0
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part?.type !== "tool") continue
+      const toolPart = part as SessionV1.ToolPart
+      recent.push(toolPart.tool)
+      consecutiveToolFailures = toolPart.state.status === "error" ? consecutiveToolFailures + 1 : 0
+    }
+  }
+  if (recent.length === 0) return undefined
+  return { recent, consecutiveToolFailures }
+}
+
+function resolveWorkerMode(input: {
+  taskDelegation: SubagentSupervisionMetadata.TaskDelegation | undefined
+  job: BackgroundJob.Info | undefined
+  sessionMetadata: Record<string, unknown> | undefined
+}): WorkerMode {
+  if (input.taskDelegation) return "supervisor"
+  if (input.job?.metadata?.background === true) return "background"
+  if (input.sessionMetadata?.background === true) return "background"
+  if (input.job) return "foreground"
+  return "unknown"
+}
+
 function extractAgentMessage(message: SessionV1.WithParts, includeSynthetic: boolean): AgentSessionMessage | undefined {
   const info = message.info as any
   if (info.role !== "user" && info.role !== "assistant") return undefined
@@ -205,12 +377,16 @@ function titleFor(action: string): string {
   switch (action) {
     case "list":
       return "List sessions"
+    case "search":
+      return "Search sessions"
     case "get":
       return "View session"
     case "status":
       return "Check session status"
     case "messages":
       return "Read session messages"
+    case "children":
+      return "Inspect supervised workers"
     default:
       return "Session"
   }
@@ -229,26 +405,41 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
   if (params.timeout !== undefined && params.wait !== true) {
     return yield* Effect.fail(new Error("timeout requires wait"))
   }
-  if (params.scope !== undefined && action !== "list") {
-    return yield* Effect.fail(new Error("scope is only valid for list"))
+  if (params.scope !== undefined && action !== "list" && action !== "search") {
+    return yield* Effect.fail(new Error("scope is only valid for list or search"))
   }
   if (params.withStatus !== undefined && action !== "list") {
     return yield* Effect.fail(new Error("withStatus is only valid for list"))
   }
   if (params.search !== undefined && action !== "list") {
-    return yield* Effect.fail(new Error("search is only valid for list"))
+    return yield* Effect.fail(new Error("search is only valid for list; use query for full session search"))
   }
-  if (params.roots !== undefined && action !== "list") {
-    return yield* Effect.fail(new Error("roots is only valid for list"))
+  if (params.query !== undefined && action !== "search") {
+    return yield* Effect.fail(new Error("query is only valid for search"))
   }
-  if (params.includeArchived !== undefined && action !== "list") {
-    return yield* Effect.fail(new Error("includeArchived is only valid for list"))
+  if (params.tool !== undefined && action !== "search") {
+    return yield* Effect.fail(new Error("tool is only valid for search"))
   }
-  if (params.parentId !== undefined && action !== "list") {
-    return yield* Effect.fail(new Error("parentId is only valid for list"))
+  if (params.repairIndex !== undefined && action !== "search") {
+    return yield* Effect.fail(new Error("repairIndex is only valid for search"))
   }
-  if (params.parentId !== undefined && params.roots === true) {
+  if (action === "search" && !(params.query?.trim() || params.tool?.trim())) {
+    return yield* Effect.fail(new Error("search requires query or tool"))
+  }
+  if (params.roots !== undefined && action !== "list" && action !== "search") {
+    return yield* Effect.fail(new Error("roots is only valid for list or search"))
+  }
+  if (params.includeArchived !== undefined && action !== "list" && action !== "search") {
+    return yield* Effect.fail(new Error("includeArchived is only valid for list or search"))
+  }
+  if (params.parentId !== undefined && action !== "list" && action !== "search" && action !== "children") {
+    return yield* Effect.fail(new Error("parentId is only valid for list, search, or children"))
+  }
+  if (params.parentId !== undefined && (action === "list" || action === "search") && params.roots === true) {
     return yield* Effect.fail(new Error("parentId cannot be combined with roots"))
+  }
+  if (params.groupId !== undefined && action !== "children") {
+    return yield* Effect.fail(new Error("groupId is only valid for children"))
   }
   if (params.role !== undefined && action !== "messages") {
     return yield* Effect.fail(new Error("role is only valid for messages"))
@@ -263,12 +454,17 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
   }
 })
 
-export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Service | SessionStatus.Service | Project.Service>(
-  "session",
-  Effect.gen(function* () {
+export const SessionTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Session.Service | SessionStatus.Service | Project.Service | BackgroundJob.Service | Question.Service | Database.Service
+>("session", Effect.gen(function* () {
     const sessions = yield* Session.Service
     const statuses = yield* SessionStatus.Service
     const projects = yield* Project.Service
+    const background = yield* BackgroundJob.Service
+    const questions = yield* Question.Service
+    const { readDb, filename } = yield* Database.Service
 
     const inDirectory = <A, E, R>(directory: string, effect: Effect.Effect<A, E, R>) =>
       Effect.gen(function* () {
@@ -395,6 +591,40 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
       }
     })
 
+    const searchSessions = Effect.fn("SessionTool.search")(function* (params: Schema.Schema.Type<typeof Parameters>) {
+      const current = yield* InstanceState.context
+      const scopeVal = params.scope ?? "current"
+      const parentID = params.parentId !== undefined ? SessionID.make(params.parentId) : undefined
+      const result = yield* ExchangeSessionSearch.execute(readDb, {
+        ...(params.query?.trim() ? { query: params.query.trim() } : {}),
+        ...(params.tool?.trim() ? { tool: params.tool.trim() } : {}),
+        ...(scopeVal === "current"
+          ? { directory: current.directory }
+          : scopeVal === "project"
+            ? { project: current.project.id }
+            : {}),
+        ...(parentID ? { parentID } : {}),
+        ...(params.roots !== undefined ? { roots: params.roots } : {}),
+        includeArchived: params.includeArchived === true,
+        limit: normalizeLimit(params.limit, 20),
+        scopeLabel: scopeVal,
+        ...(params.repairIndex === true ? { repairIndex: true } : {}),
+      }, {
+        repairIndex: () => SessionSearch.repairOnOwnConnection(filename, { maxRows: 128, timeoutMs: 2_000 }),
+      }).pipe(Effect.mapError((error) => new Error(error instanceof Error ? error.message : String(error))))
+
+      return {
+        title: result.title,
+        output: result.output,
+        metadata: {
+          action: "search",
+          count: result.metadata.count,
+          scope: scopeVal,
+          ...(result.metadata.truncated ? { truncated: true } : {}),
+        } as Metadata,
+      }
+    })
+
     const status = Effect.fn("SessionTool.status")(function* (params: Schema.Schema.Type<typeof Parameters>) {
       const id = SessionID.make(params.sessionId!)
       const session = yield* sessions.get(id).pipe(
@@ -498,6 +728,183 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
       }
     })
 
+    const children = Effect.fn("SessionTool.children")(function* (
+      params: Schema.Schema.Type<typeof Parameters>,
+      ctx: Tool.Context<Metadata>,
+    ) {
+      const parentId = params.parentId !== undefined ? SessionID.make(params.parentId) : ctx.sessionID
+      const groupId = params.groupId?.trim() || undefined
+      const limit = Math.max(1, Math.min(CHILDREN_MAX_WORKERS, Math.floor(params.limit ?? CHILDREN_DEFAULT_WORKERS)))
+
+      // Tier 1 durable location read: children rows come straight from the
+      // Session table. We do not materialize child instances; live status and
+      // binding-request sets are resolved per-directory below.
+      const rows = yield* sessions.children(parentId).pipe(Effect.orDie)
+
+      // Supervision envelope is the authoritative supervised/cohort signal.
+      const decorated = rows.map((session) => ({
+        session,
+        delegation: SubagentSupervisionMetadata.taskDelegation(session.metadata),
+      }))
+      const scoped = groupId
+        ? decorated.filter((entry) => entry.delegation?.supervisionGroupID === groupId)
+        : decorated
+
+      // Stable order for a supervisor: most recently updated first, bounded.
+      const ordered = scoped
+        .slice()
+        .sort((a, b) => (b.session.time.updated ?? 0) - (a.session.time.updated ?? 0))
+      const truncated = ordered.length > limit
+      const selected = ordered.slice(0, limit)
+
+      // Live BackgroundJob registry is single-instance scoped; the Session tool
+      // runs in the caller's instance, which is also where its children run.
+      const jobs = yield* background.list().pipe(Effect.catch(() => Effect.succeed([] as BackgroundJob.Info[])))
+      const jobById = new Map(jobs.map((job) => [job.id, job]))
+
+      // Pending binding requests are in-memory/instance-local. The Question
+      // service exposes the open question set for this instance, so index it
+      // per session once rather than probing per worker.
+      //
+      // Pending *permission* state is NOT cheaply reachable from this tool: the
+      // Permission service is not part of the Session tool's layer context, and
+      // materializing an instance just to read an in-memory request set would
+      // violate the instance-routing rules. We therefore surface
+      // `pendingPermission` only from the live BackgroundJob metadata when the
+      // owning runtime stamped it, and otherwise deliberately omit it rather
+      // than inventing a blocker. The authoritative permission blocker snapshot
+      // remains available through the delegated-worker/task result surface.
+      const questionRows = yield* questions
+        .list()
+        .pipe(Effect.catch(() => Effect.succeed([] as ReadonlyArray<any>)))
+      const questionBySession = new Map<string, number>()
+      for (const request of questionRows) {
+        const key = String(request.sessionID)
+        questionBySession.set(key, (questionBySession.get(key) ?? 0) + 1)
+      }
+
+      const workers: WorkerSnapshot[] = []
+      for (const { session, delegation } of selected) {
+        const id = session.id as SessionID
+        const job = jobById.get(String(id))
+
+        // One bounded history window per worker. Never a transcript.
+        const window = yield* sessions
+          .messages({ sessionID: id, limit: CHILDREN_MESSAGE_WINDOW })
+          .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
+        const orderedMessages = window.slice().sort((a, b) => (a.info.time.created ?? 0) - (b.info.time.created ?? 0))
+        const latestAssistant = [...orderedMessages].reverse().find((m) => m.info.role === "assistant")
+        const latestText = latestMeaningfulText(latestAssistant)
+        const tool = lastToolActivity(latestAssistant)
+        const terminalError = assistantTerminal(latestAssistant)
+
+        const statusInfo = yield* inDirectory(
+          session.directory,
+          statuses.get(id).pipe(Effect.catch(() => Effect.succeed({ type: "unknown" as const }))),
+        ).pipe(Effect.catch(() => Effect.succeed({ type: "unknown" as const })))
+        const statusType = statusInfo.type as string
+
+        const pendingPermission =
+          typeof job?.metadata?.pendingPermission === "string" ? job.metadata.pendingPermission : undefined
+        const questionCount = questionBySession.get(String(id))
+        const pendingQuestion = questionCount ? `${questionCount} pending` : undefined
+
+        const runtime: RuntimeOwnership = job?.status === "running" ? "live" : "unknown_runtime"
+        const sessionStatus: WorkerRuntime =
+          statusInfo.type === "unknown"
+            ? { type: "none" }
+            : statusInfo.type === "retry"
+              ? { type: "retry", attempt: statusInfo.attempt }
+              : statusInfo.type === "busy"
+                ? { type: "busy" }
+                : { type: "idle" }
+        const classified = classifyWorker({
+          runtime,
+          sessionStatus,
+          backgroundStatus: job?.status,
+          hasPermission: pendingPermission !== undefined,
+          hasQuestion: pendingQuestion !== undefined,
+          activity: activityFromMessages(window),
+        })
+        const blocked = classified.state
+
+        const mode = resolveWorkerMode({
+          taskDelegation: delegation,
+          job,
+          sessionMetadata: session.metadata,
+        })
+
+        // Terminal envelope is only emitted when the conservative
+        // classification actually reached a terminal state. A busy worker whose
+        // last visible assistant text carried an error is not "failed" yet.
+        const terminalState =
+          blocked === "completed"
+            ? ("completed" as const)
+            : blocked === "failed"
+              ? ("failed" as const)
+              : blocked === "cancelled"
+                ? ("cancelled" as const)
+                : undefined
+
+        const summarySource = job?.output ?? latestText
+        const snapshot: WorkerSnapshot = {
+          sessionId: String(id),
+          mode,
+          ...(session.agent ? { agent: session.agent } : {}),
+          ...(delegation?.description
+            ? { description: delegation.description }
+            : job?.title
+              ? { description: job.title }
+              : session.title
+                ? { description: session.title }
+                : {}),
+          status: statusType,
+          blocked,
+          ...(latestText ? { latestActivity: truncateActivity(latestText) } : {}),
+          ...(tool ? { lastTool: truncateActivity(tool) } : {}),
+          ...(pendingPermission ? { pendingPermission } : {}),
+          ...(pendingQuestion ? { pendingQuestion } : {}),
+          tokens: {
+            input: session.tokens?.input ?? 0,
+            output: session.tokens?.output ?? 0,
+            reasoning: session.tokens?.reasoning ?? 0,
+            cacheRead: session.tokens?.cache?.read ?? 0,
+            cacheWrite: session.tokens?.cache?.write ?? 0,
+          },
+          cost: session.cost ?? 0,
+          updatedAt: session.time.updated,
+          ...(terminalState
+            ? {
+                terminal: {
+                  state: terminalState,
+                  ...(summarySource ? { summary: truncateActivity(summarySource) } : {}),
+                  ...(terminalError?.error ? { error: truncateActivity(terminalError.error) } : {}),
+                },
+              }
+            : {}),
+        }
+        workers.push(snapshot)
+      }
+
+      const output: ChildrenOutput = {
+        parentId: String(parentId),
+        ...(groupId ? { groupId } : {}),
+        workers,
+        ...(truncated ? { truncated: true } : {}),
+      }
+
+      return {
+        title: "Inspect supervised workers",
+        output: JSON.stringify(output),
+        metadata: {
+          action: "children",
+          sessionId: String(parentId),
+          count: workers.length,
+          ...(truncated ? { truncated: true } : {}),
+        } as Metadata,
+      }
+    })
+
     const execute = Effect.fn("SessionTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
       ctx: Tool.Context<Metadata>,
@@ -508,6 +915,8 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
       switch (params.action) {
         case "list":
           return yield* list(params)
+        case "search":
+          return yield* searchSessions(params)
         case "get": {
           const id = SessionID.make(params.sessionId!)
           const sess = yield* sessions.get(id).pipe(
@@ -541,6 +950,8 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
           return yield* status(params)
         case "messages":
           return yield* messages(params, ctx)
+        case "children":
+          return yield* children(params, ctx)
         default:
           return yield* Effect.fail(new Error(`Unknown action: ${(params as any).action}`))
       }

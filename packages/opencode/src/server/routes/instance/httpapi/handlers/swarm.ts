@@ -4,6 +4,7 @@ import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { SwarmCommand } from "@/swarm/command"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { RootHttpApi } from "../api"
 import * as ApiError from "../errors"
 import {
@@ -141,8 +142,31 @@ export const swarmHandlers = HttpApiBuilder.group(RootHttpApi, "swarm", (handler
   Effect.gen(function* () {
     const swarms = yield* SwarmV2.Service
     const memberWake = yield* SwarmMemberSessionWake.Service
+    const profilePreflight = yield* SwarmProfilePreflight.Service
 
     const ensure = (swarmID: Swarm.ID) => mapError(swarms.info(swarmID))
+
+    /**
+     * Admission gate for every durable managed-worker execution profile.
+     *
+     * The Swarm row owns the authoritative workspace directory, so an incoming
+     * profile is proven against *that* catalog rather than the caller's payload
+     * or a cwd fallback. This gate is strictly read-only: it never mutates
+     * Swarm state, so an unrunnable profile can neither become a durable member
+     * row nor replace a previously good profile.
+     *
+     * Core remains the sole authority on member lifecycle/binding fences. In
+     * particular this does not weaken the stopped/unbound precondition of
+     * memberConfigure, and it deliberately does not inspect a member's *stored*
+     * profile, so reconfiguring a member quarantined by a legacy
+     * unprovable requirement stays a working operator escape hatch.
+     */
+    const preflightMemberProfile = Effect.fn("SwarmHttpApi.preflightMemberProfile")(function* (
+      info: Swarm.Info,
+      profile: Swarm.MemberExecutionProfile,
+    ) {
+      return yield* mapError(profilePreflight.check({ directory: info.directory, profile }))
+    })
 
     const list = Effect.fn("SwarmHttpApi.list")((ctx: { query: typeof SwarmListQuery.Type }) =>
       swarms.summaries({
@@ -261,7 +285,7 @@ export const swarmHandlers = HttpApiBuilder.group(RootHttpApi, "swarm", (handler
       payload: typeof SwarmDelegatePayload.Type
     }) {
       return yield* mapError(
-        SwarmCommand.delegate(swarms, {
+        SwarmCommand.delegate(swarms, profilePreflight, {
           projectID: ctx.payload.projectID,
           ...(ctx.payload.workspaceID === undefined ? {} : { workspaceID: ctx.payload.workspaceID }),
           directory: ctx.payload.directory,
@@ -294,7 +318,8 @@ export const swarmHandlers = HttpApiBuilder.group(RootHttpApi, "swarm", (handler
       params: { swarmID: Swarm.ID }
       payload: typeof SwarmMemberAddPayload.Type
     }) {
-      yield* ensure(ctx.params.swarmID)
+      const info = yield* ensure(ctx.params.swarmID)
+      yield* preflightMemberProfile(info, ctx.payload.desiredProfile)
       return yield* mapError(
         swarms.addMember({
           swarmID: ctx.params.swarmID,
@@ -332,6 +357,10 @@ export const swarmHandlers = HttpApiBuilder.group(RootHttpApi, "swarm", (handler
       params: { swarmID: Swarm.ID; memberID: Swarm.MemberID }
       payload: typeof SwarmMemberConfigurePayload.Type
     }) {
+      const info = yield* ensure(ctx.params.swarmID)
+      // Admission runs before the durable write; Core's exact stopped/unbound
+      // fence then re-checks and owns that transition as before.
+      yield* preflightMemberProfile(info, ctx.payload.desiredProfile)
       return yield* mapError(
         swarms.configureMember({
           swarmID: ctx.params.swarmID,

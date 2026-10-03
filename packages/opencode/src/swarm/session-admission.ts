@@ -79,6 +79,7 @@ export const layer = Layer.effect(
     const sessions = yield* SessionStore.Service
     const prompt = yield* SessionPrompt.Service
     const instances = yield* InstanceStore.Service
+    const swarm = yield* SwarmV2.Service
 
     const targetDirectory = Effect.fn("SwarmSessionAdmission.targetDirectory")(function* (sessionID: string) {
       const session = yield* sessions.get(sessionID as never)
@@ -132,6 +133,10 @@ export const layer = Layer.effect(
       const directory = yield* targetDirectory(input.token.sessionID)
       const expectedLatestUserSeq = yield* latestFence(input.token.sessionID)
       const admittedAt = input.admittedAt ?? Date.now()
+      // Bounded host-generated predecessor handoff. Reads Swarm collaboration
+      // rows only; predecessor Session history is never hydrated. A task with
+      // no declared dependencies renders exactly as before.
+      const handoff = yield* swarm.taskHandoff(input.task.id)
       const origin = SessionSynthetic.Origin.make({
         producer: SessionTurnProvenance.Source.SwarmAssignment,
         actor: { type: "host" },
@@ -143,7 +148,7 @@ export const layer = Layer.effect(
           prompt.admitSynthetic({
             id: input.sessionInputID,
             sessionID: input.token.sessionID as never,
-            content: { text: SwarmRender.assignment(input.task) },
+            content: { text: SwarmRender.assignment(input.task, handoff) },
             origin,
             admissionClass: "host",
             delivery: "queue",
@@ -209,5 +214,12 @@ export const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Database.node, SessionStore.node, SessionPrompt.node, InstanceStore.node, SwarmSessionProjector.node],
+  deps: [
+    Database.node,
+    SessionStore.node,
+    SessionPrompt.node,
+    InstanceStore.node,
+    SwarmV2.node,
+    SwarmSessionProjector.node,
+  ],
 })

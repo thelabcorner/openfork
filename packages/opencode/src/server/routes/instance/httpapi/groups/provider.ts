@@ -35,16 +35,6 @@ export const ProviderApi = HttpApi.make("provider")
   .add(
     HttpApiGroup.make("provider")
       .add(
-        HttpApiEndpoint.get("list", root, {
-          query: WorkspaceRoutingQuery,
-          success: described(Provider.ListResult, "List of providers"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "provider.list",
-            summary: "List providers",
-            description: "Get a list of all available AI providers, including both available and connected ones.",
-          }),
-        ),
         HttpApiEndpoint.get("auth", `${root}/auth`, {
           query: WorkspaceRoutingQuery,
           success: described(ProviderAuth.Methods, "Provider auth methods"),

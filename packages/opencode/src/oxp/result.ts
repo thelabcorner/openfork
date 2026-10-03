@@ -18,6 +18,11 @@ export interface CapabilityResult {
   readonly attachments?: readonly Attachment[]
   readonly metadata?: Readonly<Record<string, unknown>>
   readonly mutation?: MutationResult
+  /**
+   * Internal transport completion hook. OXP server runs this only after the
+   * enclosing HTTP response finishes; toolResult() never serializes it.
+   */
+  readonly afterResponse?: () => void | Promise<void>
 }
 
 export interface ErrorProjection {
@@ -32,7 +37,6 @@ const retryable = new Set([
   "OXP_TIMEOUT",
   "OXP_DEPENDENCY_UNAVAILABLE",
   "OXP_INTEGRATION_OFFLINE",
-  "OXP_AMBIGUOUS_EXTERNAL_RESULT",
 ])
 
 export function projectError(error: import("./error").OxpError.Error): ErrorProjection {

@@ -1305,11 +1305,49 @@ function mergeCatalog(staticCatalog: CatalogEntry[], live: CatalogEntry[]): Cata
   return out
 }
 
-/** live -> cached -> static fallback. */
+function staticCatalogFor(account: WorkBuddyAccount | undefined): CatalogEntry[] {
+  const cred = account?.credential
+  return cred && /codebuddy\.cn|workbuddy\.cn/.test(cred.domain) ? CN_CATALOG : GLOBAL_CATALOG
+}
+
+function unknownCatalogEntry(id: string): CatalogEntry {
+  return {
+    id,
+    name: id,
+    family: "unknown",
+    context: 0,
+    output: 0,
+    reasoning: false,
+    release: "",
+    attachment: false,
+    credits: 0,
+    creditsFree: false,
+    creditsLabel: "",
+  }
+}
+
+/**
+ * Passive catalog projection. This must stay local-only: Provider.list() can
+ * inspect every provider, so network discovery here would make one unavailable
+ * WorkBuddy account block unrelated provider/catalog reads.
+ */
+function catalogForLocal(account: WorkBuddyAccount | undefined): CatalogEntry[] {
+  const staticCatalog = staticCatalogFor(account)
+  const cred = account?.credential
+  const key = account?.id ?? `anonymous:${cred?.domain ?? "global"}`
+  const cached = discoveryCache.get(key)
+  if (cached) return cached.catalog
+  if (!account?.catalog) return staticCatalog
+
+  const staticByID = new Map(staticCatalog.map((entry) => [entry.id, entry]))
+  return [...account.catalog.ids].map((id) => staticByID.get(id) ?? unknownCatalogEntry(id))
+}
+
+/** live -> cached -> static fallback. Selected-provider demand only. */
 async function catalogFor(account: WorkBuddyAccount | undefined): Promise<CatalogEntry[]> {
   const _catStart = WB_PROFILE ? performance.now() : 0
   const cred = account?.credential
-  const staticCatalog = cred && /codebuddy\.cn|workbuddy\.cn/.test(cred.domain) ? CN_CATALOG : GLOBAL_CATALOG
+  const staticCatalog = staticCatalogFor(account)
   const key = account?.id ?? `anonymous:${cred?.domain ?? "global"}`
   const cached = discoveryCache.get(key)
   const now = Date.now()
@@ -1339,23 +1377,7 @@ async function catalogFor(account: WorkBuddyAccount | undefined): Promise<Catalo
       }
     }
   }
-  if (cached) return cached.catalog // last-known-good for THIS account
-  if (account?.catalog) {
-    return [...account.catalog.ids].map((id) => ({
-      id,
-      name: id,
-      family: "unknown",
-      context: 0,
-      output: 0,
-      reasoning: false,
-      release: "",
-      attachment: false,
-      credits: 0,
-      creditsFree: false,
-      creditsLabel: "",
-    }))
-  }
-  return staticCatalog
+  return catalogForLocal(account)
 }
 
 // --- priority (issue #9: tool-continuation jumps titles) ----------------------
@@ -1827,6 +1849,65 @@ function exposedModels(baseURL: string, entry: CatalogEntry, accountId?: string,
   return models
 }
 
+async function materializeWorkBuddyModels(
+  provider: { models: Record<string, Model> },
+  mode: "local" | "live",
+): Promise<Record<string, Model>> {
+  const accounts = accountRegistry.all()
+  if (accounts.length === 0) return mode === "local" ? provider.models : {}
+
+  const proxy = await ensureProxy().catch(() => undefined)
+  if (!proxy) return mode === "local" ? provider.models : {}
+
+  // Heal stale cached models (e.g. an old ephemeral 59731 from before the
+  // stable-port fix). Reviving the old listener makes the immediate retry
+  // succeed even before the provider database is overwritten with the new
+  // stable URL.
+  const stale = new Set<number>()
+  for (const model of Object.values(provider.models as Record<string, any>)) {
+    const url = model?.api?.url as string | undefined
+    if (!url || !url.includes("127.0.0.1")) continue
+    const match = url.match(/http:\/\/127\.0\.0\.1:(\d+)\/v1/)
+    if (!match) continue
+    const port = Number(match[1])
+    if (Number.isSafeInteger(port) && port !== proxy.port) stale.add(port)
+  }
+  for (const port of stale) void ensureExtraServer(port, proxy.token).catch(() => {})
+
+  const baseURL = `http://127.0.0.1:${proxy.port}/v1`
+  const headers = { Authorization: `Bearer ${proxy.token}` }
+  const labels = accountLabels(accounts)
+  const catalogs = new Map<string, CatalogEntry[]>(
+    mode === "live"
+      ? await Promise.all(accounts.map(async (account) => [account.id, await catalogFor(account)] as const))
+      : accounts.map((account) => [account.id, catalogForLocal(account)] as const),
+  )
+  const merged: Record<string, Model> = mode === "local" ? { ...provider.models } : {}
+
+  for (const account of accounts) {
+    const catalog = catalogs.get(account.id) ?? []
+    for (const entry of catalog) {
+      for (const item of exposedModels(baseURL, entry, account.id, labels.get(account.id), {
+        ...headers,
+        "X-WorkBuddy-Account": account.id,
+      })) {
+        merged[item.id] = item
+      }
+    }
+  }
+
+  // Preserve the ergonomic automatic-assignment model ids. They route to
+  // whichever account the session router binds, never by per-turn rotation.
+  const first = accounts[0]
+  if (first) {
+    for (const entry of catalogs.get(first.id) ?? []) {
+      if (merged[entry.id]) continue
+      for (const item of exposedModels(baseURL, entry, undefined, undefined, headers)) merged[item.id] = item
+    }
+  }
+  return merged
+}
+
 function oauthMethod(realm: WorkBuddyOAuthRealm, label: string) {
   return {
     type: "oauth" as const,
@@ -1868,54 +1949,12 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
         return workBuddyProviderAccounts(accountRegistry.all())
       },
       async models(provider) {
-        const proxy = await ensureProxy().catch(() => undefined)
-        if (!proxy) return provider.models
-
-        // Heal stale cached models (e.g. an old ephemeral 59731 from before
-        // the stable-port fix). Reviving the old listener makes the immediate
-        // retry succeed even before the provider database is overwritten with
-        // the new stable URL.
-        {
-          const stale = new Set<number>()
-          for (const m of Object.values(provider.models as Record<string, any>)) {
-            const url = m?.api?.url as string | undefined
-            if (!url || !url.includes("127.0.0.1")) continue
-            const mm = url.match(/http:\/\/127\.0\.0\.1:(\d+)\/v1/)
-            if (!mm) continue
-            const p = Number(mm[1])
-            if (Number.isSafeInteger(p) && p !== proxy.port) stale.add(p)
-          }
-          for (const p of stale) void ensureExtraServer(p, proxy.token).catch(() => {})
-        }
-
-        const baseURL = `http://127.0.0.1:${proxy.port}/v1`
-        // The per-process token keeps unrelated local processes off this proxy.
-            const headers = { Authorization: `Bearer ${proxy.token}` }
-        const accounts = accountRegistry.all()
-        const labels = accountLabels(accounts)
-        const merged: Record<string, Model> = { ...provider.models }
-        for (const account of accounts) {
-          const catalog = await catalogFor(account)
-          for (const entry of catalog) {
-            for (const item of exposedModels(baseURL, entry, account.id, labels.get(account.id), { ...headers, "X-WorkBuddy-Account": account.id })) {
-              merged[item.id] = item
-            }
-          }
-        }
-
-        // Preserve the ergonomic automatic-assignment model ids. They route to
-        // whichever account the session router binds, never by per-turn rotation.
-        const first = accounts[0]
-        if (first) {
-          const catalog = await catalogFor(first)
-          for (const entry of catalog) {
-            if (!merged[entry.id]) {
-              for (const item of exposedModels(baseURL, entry, undefined, undefined, headers)) merged[item.id] = item
-            }
-          }
-        }
-        return merged
+        return materializeWorkBuddyModels(provider as { models: Record<string, Model> }, "local")
       },
+      async discoverModels(provider) {
+        return materializeWorkBuddyModels(provider as { models: Record<string, Model> }, "live")
+      },
+      discoveryMode: "replace",
     },
 
     "chat.headers": async (input, output) => {

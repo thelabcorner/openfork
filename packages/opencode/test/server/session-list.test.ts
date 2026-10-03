@@ -12,9 +12,10 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 import { testEffect } from "../lib/effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { SessionGroup } from "@/session/group"
 
 const layer = (experimentalWorkspaces: boolean) =>
-  AppNodeBuilder.build(LayerNode.group([Database.node, SessionNs.node, SessionProjector.node]), [
+  AppNodeBuilder.build(LayerNode.group([Database.node, SessionNs.node, SessionProjector.node, SessionGroup.node]), [
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces })],
   ])
 const it = testEffect(layer(false))
@@ -239,6 +240,63 @@ describe("session.list", () => {
 
         expect(ids).toContain(root.id)
         expect(ids).not.toContain(child.id)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "does not project OXP workers as unrelated navigation roots",
+    () =>
+      Effect.gen(function* () {
+        const ordinary = yield* withSession({ title: "ordinary-root" })
+        const worker = yield* withSession({ title: "oxp-worker-root" })
+        const { db } = yield* Database.Service
+        yield* db
+          .update(SessionTable)
+          .set({
+            metadata: {
+              workerDelegation: {
+                producer: "oxp",
+                principalRef: "oxp:principal",
+                invocationRef: "oxp-inv:invocation",
+                rootRef: "root_test",
+                agent: "general",
+                model: { providerID: "test", modelID: "model" },
+                nestedDelegation: false,
+              },
+            },
+          })
+          .where(eq(SessionTable.id, worker.id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const roots = yield* SessionNs.use.list({ roots: true })
+        const ids = roots.map((session) => session.id)
+        // Older/unlinked OXP rows retain the pre-group root fallback.
+        expect(ids).toContain(worker.id)
+
+        const groups = yield* SessionGroup.Service
+        const group = yield* groups.create({
+          name: "OXP principal · invocation",
+          kind: "delegation",
+          ownerRef: "oxp:principal:root_test",
+          policy: { autoAddDescendants: false, lockAdded: true, autoDeleteWhenEmpty: true },
+        })
+        yield* groups.addSession({
+          groupId: group.id,
+          sessionId: worker.id,
+          locked: true,
+          origin: "delegation",
+          originRef: "oxp-inv:invocation",
+        })
+
+        const groupedRoots = yield* SessionNs.use.list({ roots: true })
+        expect(groupedRoots.map((session) => session.id)).not.toContain(worker.id)
+        const detail = yield* groups.getWithSessions(group.id)
+        expect(detail.group.ownerRef).toBe("oxp:principal:root_test")
+        expect(detail.sessions.map((session) => session.id)).toContain(worker.id)
+        expect(ids).toContain(ordinary.id)
+        expect((yield* SessionNs.use.get(worker.id)).parentID).toBeUndefined()
       }),
     { git: true },
   )

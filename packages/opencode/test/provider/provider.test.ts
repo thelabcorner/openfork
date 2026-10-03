@@ -1,9 +1,11 @@
-import { afterEach, expect, test } from "bun:test"
+import { afterAll, afterEach, expect, spyOn, test } from "bun:test"
+import { mkdtempSync, rmSync } from "fs"
 import { mkdir, unlink } from "fs/promises"
+import { tmpdir as osTmpdir } from "os"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -23,13 +25,20 @@ import { InstanceStore } from "@/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { MODEL_SONNET } from "@/claude/models"
+import {
+  recordClaudeSubscriptionModels,
+  resetClaudeSubscriptionModelCacheForTest,
+} from "@/claude/models"
 import {
   resetZenPoolForTest,
   setTestZenFetch,
   setTestZenVaultCredentials,
   zenLimitSnapshot,
 } from "@/plugin/zen"
+import { setTestAccountStore } from "@/plugin/workbuddy"
+
+const workBuddyTestRoot = mkdtempSync(path.join(osTmpdir(), "openfork-provider-workbuddy-"))
+setTestAccountStore(workBuddyTestRoot)
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -60,12 +69,17 @@ const remove = (k: string) =>
 afterEach(async () => {
   setTestZenFetch(undefined)
   resetZenPoolForTest()
+  resetClaudeSubscriptionModelCacheForTest()
   for (const [key, value] of originalEnv) {
     if (value === undefined) delete process.env[key]
     else process.env[key] = value
   }
   originalEnv.clear()
   await disposeAllInstances()
+})
+
+afterAll(() => {
+  rmSync(workBuddyTestRoot, { recursive: true, force: true })
 })
 
 const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -91,10 +105,489 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
   return Object.values(item.models).filter((model) => model.cost.input > 0).length
 }
 
+// Anonymous `opencode` models now require an exact hosted-catalog witness plus
+// trusted zero-cost models.dev pricing. Tests that only need the anonymous
+// provider to exist must stub the hosted /models surface with one trusted
+// free model.
+const stubHostedFreeCatalog = () =>
+  setTestZenFetch(
+    async () =>
+      new Response(
+        JSON.stringify({ object: "list", data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+  )
+
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
+const fullProvider = testEffect(providerLayer())
+
+fullProvider.instance(
+  "TypeSafe metadata is demanded only by its selected decision provider",
+  Effect.gen(function* () {
+    const metadata = yield* ModelsDev.Service
+    const plugin = yield* Plugin.Service
+    yield* set("TYPESAFE_API_KEY", "typesafe-test-key")
+    let decisionReads = 0
+    const cached = spyOn(metadata, "getCached").mockImplementation(() => Effect.succeed({}))
+    const general = spyOn(metadata, "getForSelectedProvider").mockImplementation(() =>
+      Effect.die(new Error("TypeSafe selection must not populate the language catalog")),
+    )
+    const decisions = spyOn(metadata, "getDecisionModels").mockImplementation(() => Effect.sync(() => {
+      decisionReads++
+      return { "typesafe/decide": {
+        id: "typesafe/decide", type: "decision" as const, name: "Decide", release_date: "2026-10-01",
+        attachment: false, reasoning: false, temperature: false, tool_call: false,
+        limit: { context: 128, output: 32 },
+      } }
+    }))
+    const plugins = spyOn(plugin, "list").mockImplementation(() => Effect.succeed([]))
+    yield* Effect.gen(function* () {
+      yield* Provider.use.getModel(ProviderV2.ID.make("selected-a"), ModelV2.ID.make("active-model"))
+      expect(decisionReads).toBe(0)
+      for (const count of [1, 3, 6]) {
+        const selected = yield* Effect.all(Array.from({ length: count }, () =>
+          Provider.use.getProvider(ProviderV2.ID.make("typesafe")),
+        ), { concurrency: "unbounded" })
+        expect(selected).toHaveLength(count)
+        expect(selected.every((provider) => provider?.models.decide?.primitive === "system-one")).toBe(true)
+        expect(decisionReads).toBe(1)
+      }
+      expect(general).toHaveBeenCalledTimes(0)
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      cached.mockRestore()
+      general.mockRestore()
+      decisions.mockRestore()
+      plugins.mockRestore()
+    })))
+  }),
+  { config: { provider: { "selected-a": {
+    npm: "@ai-sdk/openai-compatible", options: { apiKey: "selected-a-key" },
+    models: { "active-model": { name: "Selected model" } },
+  } } } },
+  15_000,
+)
+
+fullProvider.instance(
+  "cold selected metadata is shared without fetching for a disabled provider",
+  Effect.gen(function* () {
+    const metadata = yield* ModelsDev.Service
+    const plugin = yield* Plugin.Service
+    yield* set("COLD_SELECTED_API_KEY", "cold-selected-key")
+    let fetches = 0
+    const provider: ModelsDev.Provider = {
+      id: "selected-cold", name: "Selected cold", env: ["COLD_SELECTED_API_KEY"],
+      npm: "@ai-sdk/openai-compatible", api: "https://selected-cold.example/v1",
+      models: { active: {
+        id: "active", name: "Cold model", release_date: "2026-10-01",
+        attachment: false, reasoning: false, temperature: true, tool_call: true,
+        limit: { context: 128, output: 32 },
+      } },
+    }
+    const cached = spyOn(metadata, "getCached").mockImplementation(() => Effect.succeed({}))
+    const fetch = spyOn(metadata, "getForSelectedProvider").mockImplementation(() => Effect.sync(() => {
+      fetches++
+      return { "selected-cold": provider }
+    }))
+    const plugins = spyOn(plugin, "list").mockImplementation(() => Effect.succeed([]))
+    yield* Effect.gen(function* () {
+      const disabled = yield* Provider.use.getModel(
+        ProviderV2.ID.make("disabled-cold"), ModelV2.ID.make("active"),
+      ).pipe(Effect.exit)
+      expect(disabled._tag).toBe("Failure")
+      expect(fetches).toBe(0)
+      for (const count of [6, 3, 1]) {
+        const models = yield* Effect.all(Array.from({ length: count }, () =>
+          Provider.use.getModel(ProviderV2.ID.make("selected-cold"), ModelV2.ID.make("active")),
+        ), { concurrency: "unbounded" })
+        expect(models).toHaveLength(count)
+        expect(models.every((model) => model.api.url === "https://selected-cold.example/v1")).toBe(true)
+        expect(fetches).toBe(1)
+      }
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      cached.mockRestore()
+      fetch.mockRestore()
+      plugins.mockRestore()
+    })))
+  }),
+  { config: { disabled_providers: ["disabled-cold"] } },
+  15_000,
+)
+
+fullProvider.instance(
+  "selected execution does not reconstruct unrelated cached model catalogs",
+  Effect.gen(function* () {
+    const metadata = yield* ModelsDev.Service
+    const plugin = yield* Plugin.Service
+    let unrelatedReads = 0
+    const unrelated = {
+      id: "unrelated-catalog",
+      name: "Unrelated catalog",
+      env: [],
+      npm: "@ai-sdk/openai-compatible",
+      get models(): Record<string, ModelsDev.Model> {
+        unrelatedReads++
+        throw new Error("unselected model metadata must remain unmaterialized")
+      },
+    } satisfies ModelsDev.Provider
+    const cached = spyOn(metadata, "getCached").mockImplementation(() => Effect.succeed({
+      "unrelated-catalog": unrelated,
+    }))
+    const plugins = spyOn(plugin, "list").mockImplementation(() => Effect.succeed([]))
+    yield* Effect.gen(function* () {
+      for (const count of [1, 3, 6]) {
+        const selected = yield* Effect.all(Array.from({ length: count }, () =>
+          Provider.use.getModel(ProviderV2.ID.make("selected-a"), ModelV2.ID.make("active-model")),
+        ), { concurrency: "unbounded" })
+        expect(selected).toHaveLength(count)
+        expect(unrelatedReads).toBe(0)
+      }
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      cached.mockRestore()
+      plugins.mockRestore()
+    })))
+  }),
+  { config: { provider: { "selected-a": {
+    npm: "@ai-sdk/openai-compatible",
+    options: { apiKey: "selected-a-key" },
+    models: { "active-model": { name: "Selected model" } },
+  } } } },
+  15_000,
+)
+
+fullProvider.instance(
+  "selected provider initialization coalesces concurrent callers and retries after interruption",
+  Effect.gen(function* () {
+    const providerID = ProviderV2.ID.make("selected-a")
+    const modelID = ModelV2.ID.make("active-model")
+    const plugin = yield* Plugin.Service
+    let releaseHook!: () => void
+    const hookGate = new Promise<void>((resolve) => (releaseHook = resolve))
+    let notifyHookStarted!: () => void
+    const hookStarted = new Promise<void>((resolve) => (notifyHookStarted = resolve))
+    let hookCalls = 0
+    const pluginList = spyOn(plugin, "list").mockImplementation(() =>
+      Effect.succeed([
+        {
+          provider: {
+            id: providerID,
+            models: async () => {
+              hookCalls++
+              notifyHookStarted()
+              await hookGate
+              return {}
+            },
+          },
+        } as any,
+      ]),
+    )
+
+    const selected = () => Provider.use.getModel(providerID, modelID)
+    const run = Effect.gen(function* () {
+      const interrupted = yield* selected().pipe(Effect.exit, Effect.forkScoped)
+      yield* Effect.promise(() => hookStarted)
+      yield* Fiber.interrupt(interrupted)
+      releaseHook()
+
+      const afterInterruption = yield* selected()
+      expect(afterInterruption.id).toBe(modelID)
+
+      for (const count of [1, 3, 6]) {
+        const requests = yield* Effect.all(
+          Array.from({ length: count }, () => selected()),
+          { concurrency: "unbounded" },
+        )
+        expect(requests).toHaveLength(count)
+      }
+      // The canceled first owner is retried once; subsequent 1/3/6 caller
+      // groups share that successful selected-provider initialization.
+      expect(hookCalls).toBe(2)
+      expect(pluginList).toHaveBeenCalledTimes(1)
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          releaseHook()
+          pluginList.mockRestore()
+        }),
+      ),
+    )
+
+    yield* run
+  }),
+  {
+    config: {
+      provider: {
+        "selected-a": {
+          name: "Selected A",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://selected-a.example/v1",
+          options: { apiKey: "selected-a-key" },
+          models: { "active-model": { name: "Configured A model" } },
+        },
+      },
+    },
+  },
+  15_000,
+)
+
+fullProvider.instance(
+  "one, three, and six selected callers share a held provider hook",
+  Effect.gen(function* () {
+    const plugin = yield* Plugin.Service
+    const scenarios = [1, 3, 6].map((count) => ({
+      count,
+      providerID: ProviderV2.ID.make(`selected-${count}`),
+      calls: 0,
+      release: undefined as (() => void) | undefined,
+      started: undefined as (() => void) | undefined,
+      startedPromise: undefined as Promise<void> | undefined,
+    }))
+    for (const scenario of scenarios) {
+      scenario.startedPromise = new Promise<void>((resolve) => (scenario.started = resolve))
+    }
+    const pluginList = spyOn(plugin, "list").mockImplementation(() =>
+      Effect.succeed(
+        scenarios.map((scenario) => ({
+          provider: {
+            id: scenario.providerID,
+            models: async () => {
+              scenario.calls++
+              scenario.started?.()
+              await new Promise<void>((resolve) => (scenario.release = resolve))
+              return {}
+            },
+          },
+        })) as any,
+      ),
+    )
+    const run = Effect.gen(function* () {
+      for (const scenario of scenarios) {
+        const selected = () => Provider.use.getModel(scenario.providerID, ModelV2.ID.make("active-model"))
+        const callers = yield* Effect.all(
+          Array.from({ length: scenario.count }, selected),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkScoped)
+        yield* Effect.promise(() => scenario.startedPromise!)
+        expect(scenario.calls).toBe(1)
+        scenario.release?.()
+        expect(yield* Fiber.join(callers)).toHaveLength(scenario.count)
+        expect(scenario.calls).toBe(1)
+      }
+      expect(pluginList).toHaveBeenCalledTimes(1)
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          for (const scenario of scenarios) scenario.release?.()
+          pluginList.mockRestore()
+        }),
+      ),
+    )
+
+    yield* run
+  }),
+  {
+    config: {
+      provider: Object.fromEntries(
+        [1, 3, 6].map((count) => [
+          `selected-${count}`,
+          {
+            npm: "@ai-sdk/openai-compatible",
+            api: `https://selected-${count}.example/v1`,
+            models: { "active-model": { name: `Selected ${count}` } },
+          },
+        ]),
+      ),
+    },
+  },
+  15_000,
+)
+
+test("trusted public cost requires explicit pricing with every billable component zero", () => {
+  const base = { input: 0, output: 0, cache_read: 0, cache_write: 0 }
+  expect(Provider.isTrustedZeroCostCatalogModel(undefined)).toBe(false)
+  expect(Provider.isTrustedZeroCostCatalogModel({ cost: undefined } as any)).toBe(false)
+  expect(Provider.isTrustedZeroCostCatalogModel({ cost: base } as any)).toBe(true)
+  expect(Provider.isTrustedZeroCostCatalogModel({ cost: { ...base, output: 1 } } as any)).toBe(false)
+  expect(Provider.isTrustedZeroCostCatalogModel({ cost: { ...base, cache_read: 0.01 } } as any)).toBe(false)
+  expect(
+    Provider.isTrustedZeroCostCatalogModel({
+      cost: {
+        ...base,
+        tiers: [
+          {
+            ...base,
+            output: 0.1,
+            tier: { type: "context", size: 200_000 },
+          },
+        ],
+      },
+    } as any),
+  ).toBe(false)
+  expect(
+    Provider.isTrustedZeroCostCatalogModel({
+      cost: { ...base, context_over_200k: { ...base, output: 0.1 } },
+    } as any),
+  ).toBe(false)
+})
+
+fullProvider.instance(
+  "selected model and language resolution does not wait for unrelated provider setup",
+  Effect.gen(function* () {
+    // This exercises execution lookup only. Provider.list remains the explicit
+    // all-provider catalog operation and is intentionally not part of this path.
+    const providerID = ProviderV2.ID.make("selected-a")
+    const modelID = ModelV2.ID.make("active-model")
+    const plugin = yield* Plugin.Service
+    const auth = yield* Auth.Service
+
+    let releaseBackground!: () => void
+    const backgroundGate = new Promise<void>((resolve) => (releaseBackground = resolve))
+    let notifyBackground!: (name: string) => void
+    const backgroundStarted = new Promise<string>((resolve) => (notifyBackground = resolve))
+    const entered = new Set<string>()
+    const holdBackground = async (name: string) => {
+      if (!entered.has(name)) {
+        entered.add(name)
+        notifyBackground(name)
+      }
+      await backgroundGate
+    }
+
+    let providerModelCalls = 0
+    let authLoaderCalls = 0
+    let customDiscoveryCalls = 0
+    setTestZenVaultCredentials([])
+    setTestZenFetch(async () => {
+      customDiscoveryCalls++
+      await holdBackground("custom-discovery")
+      return new Response(
+        JSON.stringify({ object: "list", data: [{ id: "big-pickle", object: "model", owned_by: "opencode" }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    })
+
+    const unrelatedHooks = [
+      {
+        provider: {
+          id: "opencode",
+          models: async () => {
+            providerModelCalls++
+            await holdBackground("provider-models")
+            return {}
+          },
+        },
+      },
+      {
+        auth: {
+          provider: "held-auth-provider",
+          methods: [],
+          loader: async () => {
+            authLoaderCalls++
+            await holdBackground("auth-loader")
+            return { apiKey: "background-provider-key" }
+          },
+        },
+      },
+    ] as any
+
+    const pluginList = spyOn(plugin, "list").mockImplementation(() => Effect.succeed(unrelatedHooks))
+    const heldAuth = { type: "api", key: "background-provider-key" } as Auth.Info
+    const authGet = spyOn(auth, "get").mockImplementation((id) =>
+      Effect.succeed(id === "held-auth-provider" ? heldAuth : undefined),
+    )
+    const authAll = spyOn(auth, "all").mockImplementation(() => Effect.succeed({ "held-auth-provider": heldAuth }))
+
+    const selectedRound = (count: number) =>
+      Effect.all(
+        Array.from({ length: count }, () =>
+          Effect.gen(function* () {
+            const model = yield* Provider.use.getModel(providerID, modelID)
+            const language = yield* Provider.use.getLanguage(model)
+            return { model, language }
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+    const run = Effect.gen(function* () {
+      const first = yield* Effect.race(
+        selectedRound(1).pipe(Effect.as("selected-ready" as const)),
+        Effect.promise(() => backgroundStarted),
+      )
+      expect(first).toBe("selected-ready")
+
+      const three = yield* selectedRound(3)
+      const six = yield* selectedRound(6)
+      expect(pluginList).toHaveBeenCalledTimes(1)
+      expect(providerModelCalls).toBe(0)
+      expect(authLoaderCalls).toBe(0)
+      expect(customDiscoveryCalls).toBe(0)
+
+      for (const { model } of [...three, ...six]) {
+        expect(model.name).toBe("Configured A model")
+        expect(model.options.temperature).toBe(0.7)
+        expect(model.variants?.balanced).toEqual({ temperature: 0.25 })
+        expect(model.variants?.hidden).toBeUndefined()
+      }
+      expect(three[0]!.model.api.url).toBe("https://selected-a.example/v1")
+      expect(three[0]!.language.specificationVersion).toBe("v3")
+
+      const hidden = yield* Provider.use
+        .getModel(providerID, ModelV2.ID.make("blocked-model"))
+        .pipe(Effect.flip)
+      expect(hidden).toBeInstanceOf(Provider.ModelNotFoundError)
+      expect(pluginList).toHaveBeenCalledTimes(1)
+      expect(providerModelCalls).toBe(0)
+      expect(authLoaderCalls).toBe(0)
+      expect(customDiscoveryCalls).toBe(0)
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          releaseBackground()
+          pluginList.mockRestore()
+          authGet.mockRestore()
+          authAll.mockRestore()
+        }),
+      ),
+    )
+
+    yield* run
+  }),
+  {
+    config: {
+      provider: {
+        "selected-a": {
+          name: "Selected A",
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://selected-a.example/v1",
+          options: { apiKey: "selected-a-key" },
+          whitelist: ["active-model", "blocked-model"],
+          blacklist: ["blocked-model"],
+          models: {
+            "active-model": {
+              name: "Configured A model",
+              options: { temperature: 0.7 },
+              variants: { balanced: { temperature: 0.25 }, hidden: { disabled: true } },
+            },
+            "blocked-model": { name: "Blocked model" },
+          },
+        },
+        opencode: {
+          models: {
+            "big-pickle": {
+              name: "Unrelated hosted model",
+              cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+              limit: { context: 16_384, output: 4_096 },
+            },
+          },
+        },
+      },
+    },
+  },
+  15_000,
+)
 
 it.instance(
   "discovers upstream-advertised free Jev during provider catalog assembly when models.dev lags Zen",
@@ -301,31 +794,64 @@ it.instance("provider loaded from env variable", () =>
 
 it.instance("registers Claude Subscription separately from Claude API Key", () =>
   Effect.gen(function* () {
+    stubHostedFreeCatalog()
     const providers = yield* list
     const subscription = providers[ProviderV2.ID.make("claude")]
     const api = providers[ProviderV2.ID.make("claude-api")]
 
     expect(subscription?.name).toBe("Claude Subscription")
-    expect(subscription?.models[MODEL_SONNET]?.providerID).toBe(ProviderV2.ID.make("claude"))
     expect(api?.name).toBe("Claude API Key")
     expect(Object.values(api?.models ?? {})[0]?.providerID).toBe(ProviderV2.ID.make("claude-api"))
-    // first-party port must expose the full opencode-claude catalog (fable, sonnet 5, pinned, etc.)
-    expect(subscription?.models["fable"]).toBeDefined()
-    expect(subscription?.models["sonnet"]).toBeDefined()
-    expect(subscription?.models["opus"]).toBeDefined()
-    expect(subscription?.models["haiku"]).toBeDefined()
-    expect(subscription?.models["claude-opus-4-8"]).toBeDefined()
-    expect(subscription?.models["claude-sonnet-4-6"]).toBeDefined()
-    expect(subscription?.models["claude-haiku-4-5"]).toBeDefined()
-    expect(subscription?.models["sonnet"]?.api.npm).toBe("@ai-sdk/openai-compatible")
+    const subscriptionModels = Object.values(subscription?.models ?? {})
+    expect(subscriptionModels.length).toBeGreaterThan(0)
+    expect(subscriptionModels.every((model) => String(model.id).startsWith("claude-"))).toBe(true)
+    expect(subscriptionModels.some((model) => String(model.id).includes("sonnet"))).toBe(true)
+    expect(subscriptionModels.every((model) => model.providerID === ProviderV2.ID.make("claude"))).toBe(true)
+    expect(subscriptionModels.every((model) => model.api.npm === "@ai-sdk/openai-compatible")).toBe(true)
+    for (const model of subscriptionModels.filter((model) => model.limit.context >= 1_000_000)) {
+      expect(model.limit.input).toBe(900_000)
+    }
+  }),
+)
+
+it.instance("refreshes a materialized Claude provider when the account model catalog changes", () =>
+  Effect.gen(function* () {
+    stubHostedFreeCatalog()
+    resetClaudeSubscriptionModelCacheForTest()
+    recordClaudeSubscriptionModels([
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        supportedEffortLevels: ["high"],
+      },
+    ])
+
+    const svc = yield* Provider.Service
+    const first = yield* svc.list()
+    expect(first[ProviderV2.ID.make("claude")]?.models["claude-sonnet-5"]).toBeDefined()
+    expect(first[ProviderV2.ID.make("claude")]?.models["claude-opus-5-5[1m]"]).toBeUndefined()
+
+    recordClaudeSubscriptionModels([
+      {
+        value: "opus",
+        resolvedModel: "claude-opus-5-5",
+        supportedEffortLevels: ["high"],
+      },
+    ])
+
+    const second = yield* svc.list()
+    expect(second[ProviderV2.ID.make("claude")]?.models["claude-opus-5-5[1m]"]).toBeDefined()
+    expect(second[ProviderV2.ID.make("claude")]?.models["claude-sonnet-5"]).toBeUndefined()
   }),
 )
 
 it.instance("claude subscription getLanguage does not InitError", () =>
   Effect.gen(function* () {
+    stubHostedFreeCatalog()
     const svc = yield* Provider.Service
     const model = yield* svc.getModel(ProviderV2.ID.make("claude"), ModelV2.ID.make("sonnet"))
     expect(model.api.npm).toBe("@ai-sdk/openai-compatible")
+    expect(String(model.id)).toMatch(/^claude-sonnet-/)
     const language = yield* svc.getLanguage(model)
     expect(language).toBeDefined()
     expect(language.specificationVersion).toBe("v3")
@@ -2521,12 +3047,60 @@ it.instance(
   }),
 )
 
+it.effect("opencode anonymous loader intersects hosted availability with trusted source pricing", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({
+      config: {
+        provider: {
+          opencode: {
+            models: {
+              "p0f-config-only-hosted": {
+                name: "P0F Config Only Hosted",
+                cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+                limit: { context: 16_384, output: 4_096 },
+              },
+            },
+          },
+        },
+      },
+    })
+
+    setTestZenVaultCredentials([])
+    setTestZenFetch(async (input) => {
+      expect(String(input)).toBe("https://opencode.ai/zen/v1/models")
+      return new Response(
+        JSON.stringify({
+          object: "list",
+          data: [
+            { id: "big-pickle", object: "model", owned_by: "opencode" },
+            { id: "p0f-config-only-hosted", object: "model", owned_by: "opencode" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    })
+
+    const providers = yield* Provider.use
+      .list()
+      .pipe(provideInstanceEffect(dir))
+      .pipe(Effect.provide(instanceStoreLayer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)))
+    const item = providers[ProviderV2.ID.make("opencode")]
+    expect(item).toBeDefined()
+    expect(item.models["big-pickle"]).toBeDefined()
+    expect(item.models["mimo-v2.5-free"]).toBeUndefined()
+    expect(item.models["p0f-config-only-hosted"]).toBeUndefined()
+    expect(item.options.apiKey).toBe("public")
+  }).pipe(provideMultiInstance),
+)
+
 it.effect("opencode loader keeps paid models when config apiKey is present", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped({
       config: { provider: { opencode: { options: { apiKey: "test-key" } } } },
     })
+
+    stubHostedFreeCatalog()
 
     const listIn = (directory: string) =>
       Provider.use
@@ -2546,6 +3120,8 @@ it.effect("opencode loader keeps paid models when auth exists", () =>
   Effect.gen(function* () {
     const noneDir = yield* tmpdirScoped()
     const keyedDir = yield* tmpdirScoped()
+
+    stubHostedFreeCatalog()
 
     const listIn = (directory: string) =>
       Provider.use

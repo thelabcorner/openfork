@@ -5,7 +5,7 @@ import { OxpResult } from "./result"
 export const MIN_ACCEPT_WITHIN_MS = 15_000
 export const DEFAULT_ACCEPT_WITHIN_MS = 120_000
 export const MAX_ACCEPT_WITHIN_MS = 300_000
-export const PROTOCOL_VERSION = 1 as const
+export const PROTOCOL_VERSION = 2 as const
 
 const RuntimeID = Schema.String.check(
   Schema.isPattern(/^sha256:[a-f0-9]{64}$/),
@@ -51,7 +51,7 @@ export interface RuntimeTrial {
 
 export interface RuntimeStatus {
   readonly refreshable: boolean
-  readonly state: "stable" | "scheduled" | "trial"
+  readonly state: "stable" | "scheduled" | "trial" | "degraded" | "disposed"
   readonly runtimeID?: string
   readonly activationGeneration?: number
   readonly activatedAt?: number
@@ -72,6 +72,8 @@ export interface Control {
     readonly expectedRuntimeID: string
     readonly acceptWithinMs: number
   }) => Promise<RuntimeMutationResult>
+  /** Host-only response-egress barrier for changed scheduled refreshes. */
+  readonly arm: (trialID: string) => Promise<void>
   readonly accept: (trialID: string) => Promise<RuntimeMutationResult>
   readonly rollback: (trialID: string) => Promise<RuntimeMutationResult>
 }
@@ -186,6 +188,13 @@ export const execute = Effect.fn("OxpRuntimeRefresh.execute")(function* (
     try: () => operation,
     catch: mappedError,
   })
+  const scheduledTrial =
+    input.action === "refresh" &&
+    result.changed &&
+    result.status.trial?.phase === "scheduled"
+      ? result.status.trial.id
+      : undefined
+
   return {
     title: `OXP runtime ${input.action}`,
     output: JSON.stringify(result),
@@ -194,6 +203,11 @@ export const execute = Effect.fn("OxpRuntimeRefresh.execute")(function* (
       attempted: true,
       committed: result.changed,
     },
+    ...(scheduledTrial
+      ? {
+          afterResponse: () => current.arm(scheduledTrial),
+        }
+      : {}),
   } satisfies OxpResult.CapabilityResult
 })
 

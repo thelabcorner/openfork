@@ -13,6 +13,7 @@ import { HttpClient, HttpServerRequest, HttpServerResponse } from "effect/unstab
 import { HttpApiMiddleware } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
 import { InvalidRequestError } from "../errors"
+import { isAbsolute } from "node:path"
 
 // Query fields this middleware reads from the URL. Spread into every
 // endpoint query schema in groups that apply WorkspaceRoutingMiddleware,
@@ -31,6 +32,8 @@ type RemoteTarget = Extract<Target, { type: "remote" }>
 type RequestPlan = Data.TaggedEnum<{
   InvalidWorkspace: {}
   MissingWorkspace: { readonly workspaceID: WorkspaceV2.ID }
+  MissingDirectory: {}
+  InvalidDirectory: {}
   Local: { readonly directory: string; readonly workspaceID?: WorkspaceV2.ID }
   Remote: {
     readonly request: HttpServerRequest.HttpServerRequest
@@ -83,12 +86,20 @@ function selectedV2WorkspaceID(
   return workspaceID.value
 }
 
-function defaultDirectory(request: HttpServerRequest.HttpServerRequest, url: URL): string {
+function explicitDirectory(request: HttpServerRequest.HttpServerRequest, url: URL): string | undefined {
   const query = url.searchParams.get("directory")
-  if (query) return query
+  if (query?.trim()) return query
   const header = request.headers["x-opencode-directory"]
-  if (header) return header
-  return process.cwd()
+  if (header?.trim()) {
+    // SDK directory headers are URI-encoded; query parameters are already
+    // decoded by URLSearchParams. Durable/adapter locations need no decoding.
+    try {
+      return decodeURIComponent(header)
+    } catch {
+      return header
+    }
+  }
+  return undefined
 }
 
 function shouldStayOnControlPlane(request: HttpServerRequest.HttpServerRequest, url: URL): boolean {
@@ -157,6 +168,7 @@ function planWorkspaceRequest(
   return Effect.gen(function* () {
     const target = yield* resolveTarget(workspace)
     if (target.type === "remote") return RequestPlan.Remote({ request, workspace, target, url })
+    if (!isAbsolute(target.directory)) return RequestPlan.InvalidDirectory()
     return RequestPlan.Local({ directory: target.directory, workspaceID: workspace.id })
   })
 }
@@ -182,8 +194,11 @@ function planRequest(
       return yield* planWorkspaceRequest(request, url, workspace)
     }
 
+    const directory = session?.directory || explicitDirectory(request, url)
+    if (!directory) return RequestPlan.MissingDirectory()
+    if (!isAbsolute(directory)) return RequestPlan.InvalidDirectory()
     return RequestPlan.Local({
-      directory: session?.directory || defaultDirectory(request, url),
+      directory,
       workspaceID: envWorkspaceID ?? workspaceID,
     })
   })
@@ -207,6 +222,20 @@ function routeWorkspace<E>(
         ),
       ),
     MissingWorkspace: ({ workspaceID }) => Effect.succeed(missingWorkspaceResponse(workspaceID)),
+    MissingDirectory: () =>
+      Effect.succeed(
+        HttpServerResponse.text("An explicit directory or session-derived location is required", {
+          status: 400,
+          contentType: "text/plain; charset=utf-8",
+        }),
+      ),
+    InvalidDirectory: () =>
+      Effect.succeed(
+        HttpServerResponse.text("An absolute directory is required", {
+          status: 400,
+          contentType: "text/plain; charset=utf-8",
+        }),
+      ),
     Remote: ({ request, workspace, target, url }) => proxyRemote(client, request, workspace, target, url),
     Local: ({ directory, workspaceID }) =>
       effect.pipe(Effect.provideService(WorkspaceRouteContext, WorkspaceRouteContext.of({ directory, workspaceID }))),

@@ -1,15 +1,19 @@
 import { Context, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionInspection } from "@opencode-ai/core/session/inspection"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import { SessionTodo } from "@opencode-ai/schema/session-todo"
 import { Parameters as CheckpointParameters } from "@/tool/checkpoint"
+import { ExchangeError } from "@/exchange/error"
+import { ExchangeSessionSearch } from "@/exchange/session-search"
 import { OxpAuthority } from "./authority"
 import { OxpError } from "./error"
 import { OxpModelSelection } from "./model-selection"
 import { OxpResult } from "./result"
+import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
 import { OxpSessionControl } from "./session-control"
 import { OxpSupervision } from "./supervision"
@@ -17,6 +21,7 @@ import { OxpSupervision } from "./supervision"
 const MAX_LIST = 100
 const MAX_SCAN = 1_000
 const SCAN_PAGE = 100
+const MAX_DELETE_TREE = 10_000
 const MAX_MESSAGES = 20
 const MAX_MESSAGE_TEXT_BYTES = 4 * 1024
 const MAX_PROMPT_TEXT_BYTES = 64 * 1024
@@ -29,6 +34,7 @@ const PromptTextInput = Schema.String.check(
 
 export const ACTIONS = [
     "list",
+    "search",
     "get",
     "messages",
     "children",
@@ -44,10 +50,14 @@ export const ACTIONS = [
     "pause",
     "resume",
     "abort",
+    "archive",
+    "unarchive",
+    "delete",
 ] as const
 
 export const DIRECT_ACTIONS = [
     "list",
+    "search",
     "get",
     "messages",
     "children",
@@ -62,6 +72,9 @@ export const DIRECT_ACTIONS = [
     "pause",
     "resume",
     "abort",
+    "archive",
+    "unarchive",
+    "delete",
 ] as const
 
 /**
@@ -84,7 +97,8 @@ export const Parameters = Schema.Struct({
   rootID: Schema.optional(OxpSchema.RootID),
   parentID: Schema.optional(SessionIDInput),
   limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_LIST }))),
-  search: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
+  search: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
+  tool: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
   beforeMessageID: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),
@@ -102,7 +116,7 @@ export const DirectParameters = Schema.Struct({
   rootID: Schema.optional(OxpSchema.RootID),
   parentID: Schema.optional(SessionIDInput),
   limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_LIST }))),
-  search: Schema.optional(Schema.String.check(Schema.isMaxLength(256))),
+  search: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
   beforeMessageID: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),
@@ -136,6 +150,19 @@ function truncateUtf8(text: string, maxBytes: number) {
   return { text: bytes.subarray(0, maxBytes).toString("utf8"), truncated: true }
 }
 
+function parseSearchOperand(value?: string) {
+  const search = value?.trim()
+  if (!search) return { query: undefined, tool: undefined }
+  const marker = /^tool:([^\s]+)(?:\s+([\s\S]*))?$/.exec(search)
+  if (!marker) return { query: search, tool: undefined }
+  const tool = marker[1]!
+  if (tool.length > 128) {
+    throw new OxpError.InvalidArgument({ detail: "session.search tool name exceeds 128 characters" })
+  }
+  const query = marker[2]?.trim()
+  return { query: query || undefined, tool }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -143,6 +170,8 @@ const layer = Layer.effect(
     const inspection = yield* SessionInspection.Service
     const control = yield* OxpSessionControl.Service
     const supervision = yield* OxpSupervision.Service
+    const roots = yield* OxpRoot.Service
+    const { readDb } = yield* Database.Service
 
     const requirePlane = Effect.fnUntraced(function* (operation: string) {
       const allowed = yield* authority.discover({ plane: "supervision", operation })
@@ -225,6 +254,39 @@ const layer = Layer.effect(
         }
         return new OxpError.InvalidArgument({ detail: OxpError.boundDetail(error.message) })
       }
+      if (error instanceof OxpSessionControl.GoalRevisionConflict) {
+        return new OxpError.Conflict({
+          detail: OxpError.boundDetail(error.message),
+          metadata: {
+            goalID: error.goalID.slice(0, 256),
+            expectedRevision: error.expectedRevision,
+            actualRevision: error.actualRevision,
+          },
+        })
+      }
+      if (error instanceof OxpSessionControl.GoalVerificationUnavailable) {
+        return new OxpError.InvalidArgument({
+          detail: OxpError.boundDetail(error.message),
+          metadata: {
+            goalID: error.goalID.slice(0, 256),
+            status: error.status.slice(0, 256),
+          },
+        })
+      }
+      if (error instanceof OxpSessionControl.HostOwned) {
+        const delegated = error.kind === "delegated_worker"
+        return new OxpError.Conflict({
+          detail: delegated
+            ? "This Session is an OXP delegated worker; use openfork_worker continue with this Session ID instead of openfork_session send/turn"
+            : `This Session is host-owned by ${error.kind}; use the producer-specific control surface instead of openfork_session send/turn`,
+          metadata: {
+            sessionID: error.sessionID.slice(0, 256),
+            parentID: error.parentID.slice(0, 256),
+            ownerKind: error.kind.slice(0, 128),
+            ...(delegated ? { ownerSurface: "openfork_worker" } : {}),
+          },
+        })
+      }
       const service = error.message.match(/Service not found:\s*([^\s)]+)/i)?.[1]
       if (service) {
         return new OxpError.DependencyUnavailable({
@@ -251,6 +313,24 @@ const layer = Layer.effect(
       })
     }
 
+    const mapSearchError = (error: unknown): OxpError.Error => {
+      if (OxpError.isError(error)) return error
+      if (error instanceof ExchangeError.InvalidArgument) {
+        return new OxpError.InvalidArgument({ detail: OxpError.boundDetail(error.detail) })
+      }
+      if (error instanceof ExchangeError.PathEscape) {
+        return new OxpError.PathEscape({ detail: "Session search result escaped approved-root projection" })
+      }
+      if (error instanceof ExchangeError.Cancelled) {
+        return new OxpError.Cancelled({ detail: "OXP Session search was cancelled" })
+      }
+      return new OxpError.DependencyUnavailable({
+        detail: error instanceof ExchangeError.DependencyUnavailable
+          ? OxpError.boundDetail(error.detail)
+          : "OXP Session search failed",
+      })
+    }
+
     const projectSafe = Effect.fnUntraced(function* (
       row: SessionInspection.SessionRow,
       admission: OxpAuthority.Admission,
@@ -262,6 +342,86 @@ const layer = Layer.effect(
             ? cause
             : new OxpError.DependencyUnavailable({ detail: "Unable to project supervised Session state" }),
       })
+    })
+
+    const authorizeDeleteTree = Effect.fnUntraced(function* (
+      root: SessionInspection.SessionRow,
+      operation: string,
+      rootID?: OxpSchema.RootID,
+    ) {
+      const admissions: OxpAuthority.Admission[] = []
+      const queue: SessionSchema.ID[] = [root.id]
+      const seen = new Set<string>(queue)
+
+      for (let cursor = 0; cursor < queue.length; cursor++) {
+        const parentID = queue[cursor]!
+        let before: SessionInspection.ListInput["before"]
+
+        while (true) {
+          const page = yield* inspection.list({
+            parentID,
+            includeArchived: true,
+            limit: SCAN_PAGE,
+            ...(before ? { before } : {}),
+          })
+          if (page.length === 0) break
+
+          for (const child of page) {
+            if (seen.has(child.id)) continue
+            if (seen.size >= MAX_DELETE_TREE) {
+              return yield* new OxpError.InvalidArgument({
+                detail: `Session delete tree exceeds the supervised safety limit of ${MAX_DELETE_TREE} Sessions`,
+              })
+            }
+
+            const admission = yield* supervision.authorizeRow(child, operation, rootID).pipe(
+              Effect.mapError((error): OxpError.Error =>
+                error._tag === "OXP_DEPENDENCY_UNAVAILABLE"
+                  ? error
+                  : new OxpError.NotFound({
+                      detail: "Session tree is not fully available to OXP supervision",
+                    }),
+              ),
+            )
+            seen.add(child.id)
+            queue.push(child.id)
+            admissions.push(admission)
+          }
+
+          if (page.length < SCAN_PAGE) break
+          const tail = page.at(-1)
+          if (!tail) break
+          before = { updatedAt: tail.updatedAt, id: tail.id }
+        }
+      }
+
+      return admissions
+    })
+
+    const authorizeSearchRoots = Effect.fnUntraced(function* (
+      operation: string,
+      rootID?: OxpSchema.RootID,
+    ) {
+      const rootIDs = rootID ? [rootID] : (yield* roots.list()).map((root) => root.id)
+      const admitted = yield* Effect.forEach(rootIDs, (id) =>
+        authority
+          .authorize({
+            plane: "supervision",
+            operation,
+            phase: "supervise",
+            rootID: id,
+          })
+          .pipe(
+            Effect.map((admission) => admission as OxpAuthority.Admission | undefined),
+            Effect.catch((error) => {
+              if (!rootID && (error._tag === "OXP_ROOT_CHANGED" || error._tag === "OXP_NOT_FOUND")) {
+                return Effect.succeed(undefined)
+              }
+              return Effect.fail(error)
+            }),
+          ),
+      )
+      return admitted.filter((item): item is OxpAuthority.Admission => item !== undefined)
     })
 
     const executeRaw = Effect.fn("OxpSession.execute")(function* (input: Input, signal?: AbortSignal) {
@@ -317,6 +477,68 @@ const layer = Layer.effect(
           output: JSON.stringify(result),
           structured: result,
           metadata: { count: rows.length, scanned, truncated: result.truncated },
+        } satisfies OxpResult.CapabilityResult
+      }
+
+      if (input.action === "search") {
+        const parsed = yield* Effect.try({
+          try: () => parseSearchOperand(input.search),
+          catch: (cause) =>
+            OxpError.isError(cause)
+              ? cause
+              : new OxpError.InvalidArgument({ detail: "session.search expression is invalid" }),
+        })
+        const query = parsed.query
+        const tool = input.tool?.trim() || parsed.tool
+        if (!query && !tool) {
+          return yield* new OxpError.InvalidArgument({
+            detail: "session.search requires query or tool",
+          })
+        }
+
+        const admissions = yield* authorizeSearchRoots(operation, input.rootID)
+        yield* cancelled(signal)
+        const admittedRoots = admissions
+          .flatMap((admission) => admission.root ? [admission.root] : [])
+          .sort((a, b) => b.canonicalPath.length - a.canonicalPath.length)
+
+        const result = yield* ExchangeSessionSearch.execute(
+          readDb,
+          {
+            ...(query ? { query } : {}),
+            ...(tool ? { tool } : {}),
+            directoryPrefixes: admittedRoots.map((entry) => entry.canonicalPath),
+            ...(input.parentID ? { parentID: SessionSchema.ID.make(input.parentID) } : {}),
+            ...(input.roots !== undefined ? { roots: input.roots } : {}),
+            includeArchived: input.includeArchived === true,
+            limit: Math.min(input.limit ?? 20, MAX_LIST),
+            scopeLabel: input.rootID ? "root:" + input.rootID : "approved-roots",
+          },
+          {
+            revalidate: () =>
+              Effect.gen(function* () {
+                yield* cancelled(signal)
+                for (const admission of admissions) {
+                  yield* authority.revalidate(admission, "supervise")
+                }
+              }),
+            projectDirectory: (directory) => {
+              const entry = admittedRoots.find((root) => OxpRoot.isContained(root.canonicalPath, directory))
+              if (!entry) throw new Error("Session search result is outside every admitted OXP root")
+              return roots.toVirtualPath(entry.root, directory)
+            },
+          },
+        ).pipe(Effect.mapError(mapSearchError))
+
+        return {
+          title: result.title,
+          output: result.output,
+          structured: result.structured,
+          metadata: {
+            ...result.metadata,
+            authorizedRoots: admissions.length,
+          },
+          mutation: result.mutation,
         } satisfies OxpResult.CapabilityResult
       }
 
@@ -480,7 +702,13 @@ const layer = Layer.effect(
             input.goal,
           )
           .pipe(Effect.mapError((error) => mapControlError(error)))
-        const structured = { sessionID, ...result }
+        const structured = {
+          sessionID,
+          ...result,
+          ...(input.goal.action === "request_verification"
+            ? { verificationDispatch: "scheduled" as const }
+            : {}),
+        }
         return {
           title: "OpenFork Session Goal " + input.goal.action,
           output: JSON.stringify(structured),
@@ -588,17 +816,44 @@ const layer = Layer.effect(
       }
 
       yield* cancelled(signal)
+      if (input.action === "delete") {
+        // Preflight the complete native recursive delete scope before entering
+        // runtime control. The commit guard below repeats this walk after the
+        // active prompt has been quiesced to narrow the mutation race window.
+        yield* authorizeDeleteTree(target.row, operation, input.rootID)
+      }
       const controlAdmission = yield* authority.revalidate(
         target.admission,
         "control",
       )
-      const targetRuntime = supervision.runtimeTarget({ row: target.row, admission: controlAdmission })
+      const baseTargetRuntime = supervision.runtimeTarget({ row: target.row, admission: controlAdmission })
+      const targetRuntime =
+        input.action === "delete"
+          ? {
+              ...baseTargetRuntime,
+              commitGuard: async () => {
+                if (baseTargetRuntime.commitGuard) await baseTargetRuntime.commitGuard()
+                const descendants = await Effect.runPromise(
+                  authorizeDeleteTree(target.row, operation, input.rootID),
+                )
+                for (const admission of descendants) {
+                  await Effect.runPromise(authority.revalidate(admission, "commit").pipe(Effect.asVoid))
+                }
+              },
+            }
+          : baseTargetRuntime
       const controlEffect =
         input.action === "pause"
           ? control.pause(targetRuntime)
           : input.action === "resume"
             ? control.resume(targetRuntime)
-            : control.abort(targetRuntime)
+            : input.action === "abort"
+              ? control.abort(targetRuntime)
+              : input.action === "archive"
+                ? control.archive(targetRuntime)
+                : input.action === "unarchive"
+                  ? control.unarchive(targetRuntime)
+                  : control.delete(targetRuntime)
       yield* controlEffect.pipe(
         Effect.mapError((error) => mapControlError(error)),
       )
@@ -631,7 +886,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [OxpAuthority.node, SessionInspection.node, OxpSessionControl.node, OxpSupervision.node],
+  deps: [OxpAuthority.node, SessionInspection.node, OxpSessionControl.node, OxpSupervision.node, OxpRoot.node, Database.node],
 })
 
 export * as OxpSession from "./session"

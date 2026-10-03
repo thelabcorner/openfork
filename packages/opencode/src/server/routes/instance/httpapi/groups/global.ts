@@ -1,4 +1,5 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
 import { EventV2 } from "@opencode-ai/core/event"
 import {
   STREAM_INTEREST_MAX_SESSION_CHARS,
@@ -11,6 +12,7 @@ import { SessionID } from "@/session/schema"
 import { Project } from "@/project/project"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionTelemetry } from "@opencode-ai/schema/session-telemetry"
+import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { OxpActivitySchema } from "@opencode-ai/core/oxp-activity/schema"
 import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
@@ -19,6 +21,8 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import semver from "semver"
 import { described } from "./metadata"
+import { SyncCapabilities, SyncPaths } from "./sync"
+import { WorkspaceRoutingQuery } from "../middleware/workspace-routing"
 
 const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
@@ -57,7 +61,11 @@ const SyncEventSchemas = EventManifest.Latest.values()
   })
   .toArray()
 
-const ManifestEventTypes = new Set(EventManifest.Latest.values().map((definition) => definition.type).toArray())
+const ManifestEventTypes = new Set(
+  EventManifest.Latest.values()
+    .map((definition) => definition.type)
+    .toArray(),
+)
 const GlobalTransportControlSchemas = [
   {
     type: "server.heartbeat",
@@ -138,11 +146,48 @@ const GlobalResetLocalDataResult = Schema.Struct({
 })
 
 export const GlobalSessionRootsQuery = Schema.Struct({
-  directory: Schema.String,
+  directory: Schema.String.check(Schema.isMinLength(1)),
   projectID: Schema.optional(ProjectV2.ID),
   limit: Schema.optional(
     Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(500)),
   ),
+})
+
+export const GlobalSessionMetadataInput = Schema.Struct({
+  // Exact durable session identities only. Bounded independently at the API
+  // boundary so startup metadata reads cannot turn into an unbounded scan.
+  sessions: Schema.Array(SessionID).check(Schema.isMaxLength(500)),
+}).annotate({ identifier: "GlobalSessionMetadataInput" })
+
+const GlobalArchivedSessionRootsCursor = Schema.Struct({
+  archivedAt: Schema.Finite,
+  id: SessionID,
+}).annotate({ identifier: "GlobalArchivedSessionRootsCursor" })
+
+export const GlobalArchivedSessionRootsInput = Schema.Struct({
+  // A bounded explicit location set keeps this Tier 0 projection independent
+  // of Instance bootstrap while allowing one request for the sidebar's dirs.
+  directories: Schema.Array(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096))).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(500),
+  ),
+  limit: Schema.optional(
+    Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(100)),
+  ),
+  before: Schema.optional(GlobalArchivedSessionRootsCursor),
+}).annotate({ identifier: "GlobalArchivedSessionRootsInput" })
+
+const GlobalArchivedSessionRootsPage = Schema.Struct({
+  items: Schema.Array(Session.Info),
+  more: Schema.Boolean,
+  before: Schema.optional(GlobalArchivedSessionRootsCursor),
+}).annotate({ identifier: "GlobalArchivedSessionRootsPage" })
+
+export const GlobalSessionStatusQuery = Schema.Struct({
+  directory: Schema.optional(Schema.String.check(Schema.isMinLength(1))),
+  // Retain the existing V1/TUI query key while first-party bootstrap moves to
+  // the explicit directory name used by the global projection.
+  workspace: Schema.optional(Schema.String.check(Schema.isMinLength(1))),
 })
 
 export const GlobalSessionTelemetryInput = Schema.Struct({
@@ -199,11 +244,7 @@ const OxpInvocationInfo = Schema.Struct({
 
 export const GlobalOxpActivityListQuery = Schema.Struct({
   limit: Schema.optional(
-    Schema.NumberFromString.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(1),
-      Schema.isLessThanOrEqualTo(100),
-    ),
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(100)),
   ),
   includeArchived: Schema.optional(Schema.Literals(["true", "false"])),
   beforeLastSeenAt: Schema.optional(Schema.NumberFromString),
@@ -212,11 +253,7 @@ export const GlobalOxpActivityListQuery = Schema.Struct({
 
 export const GlobalOxpInvocationQuery = Schema.Struct({
   limit: Schema.optional(
-    Schema.NumberFromString.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(1),
-      Schema.isLessThanOrEqualTo(200),
-    ),
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(200)),
   ),
   beforeStartedAt: Schema.optional(Schema.NumberFromString),
   beforeID: Schema.optional(OxpActivitySchema.InvocationID),
@@ -226,13 +263,155 @@ export const GlobalOxpResourceQuery = Schema.Struct({
   kind: OxpActivitySchema.LinkKind,
   ref: Schema.String.check(Schema.isMaxLength(2048)),
   limit: Schema.optional(
-    Schema.NumberFromString.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(1),
-      Schema.isLessThanOrEqualTo(50),
-    ),
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(50)),
   ),
 })
+
+export const GlobalOxpAttributionQuery = Schema.Struct({
+  activityID: Schema.optional(OxpActivitySchema.ActivityID),
+  since: Schema.optional(Schema.NumberFromString),
+  until: Schema.optional(Schema.NumberFromString),
+})
+
+const OxpAttributionSource = Schema.Literals([
+  "observed_boundary",
+  "historical_detail",
+  "calibrated_surrogate",
+  "calibrated_donor",
+]).annotate({ identifier: "OxpAttributionSource" })
+
+const OxpAttributionTool = Schema.Struct({
+  tool: Schema.String,
+  calls: Schema.Number,
+  uniqueRequestChars: Schema.Finite,
+  uniqueResultChars: Schema.Finite,
+  uniqueChars: Schema.Finite,
+  uniqueTokens: Schema.Finite,
+  requestChars: Schema.Finite,
+  resultChars: Schema.Finite,
+  chars: Schema.Finite,
+  requestTokens: Schema.Finite,
+  resultTokens: Schema.Finite,
+  tokens: Schema.Finite,
+}).annotate({ identifier: "OxpAttributionTool" })
+
+const OxpAttributionSourceBreakdown = Schema.Struct({
+  source: OxpAttributionSource,
+  requestCalls: Schema.Number,
+  resultCalls: Schema.Number,
+  uniqueChars: Schema.Finite,
+  requestChars: Schema.Finite,
+  resultChars: Schema.Finite,
+  chars: Schema.Finite,
+  requestTokens: Schema.Finite,
+  resultTokens: Schema.Finite,
+  tokens: Schema.Finite,
+}).annotate({ identifier: "OxpAttributionSourceBreakdown" })
+
+const OxpAttributionTotals = Schema.Struct({
+  calls: Schema.Number,
+  activities: Schema.Number,
+  inferredRounds: Schema.Number,
+  uniqueRequestChars: Schema.Finite,
+  uniqueResultChars: Schema.Finite,
+  uniqueChars: Schema.Finite,
+  uniqueTokens: Schema.Finite,
+  amplification: Schema.NullOr(Schema.Finite),
+  requestChars: Schema.Finite,
+  resultChars: Schema.Finite,
+  chars: Schema.Finite,
+  requestTokens: Schema.Finite,
+  resultTokens: Schema.Finite,
+  tokens: Schema.Finite,
+  byTool: Schema.Array(OxpAttributionTool),
+  bySource: Schema.Array(OxpAttributionSourceBreakdown),
+}).annotate({ identifier: "OxpAttributionTotals" })
+
+const OxpAttributionCoverage = Schema.Struct({
+  request: Schema.Struct({
+    observed_boundary: Schema.Number,
+    historical_detail: Schema.Number,
+    calibrated_surrogate: Schema.Number,
+    calibrated_donor: Schema.Number,
+    unavailable: Schema.Number,
+  }),
+  result: Schema.Struct({
+    observed_boundary: Schema.Number,
+    historical_detail: Schema.Number,
+    calibrated_surrogate: Schema.Number,
+    calibrated_donor: Schema.Number,
+    unavailable: Schema.Number,
+    not_applicable: Schema.Number,
+  }),
+  invalidPersistedMeasurements: Schema.Number,
+  complete: Schema.Boolean,
+}).annotate({ identifier: "OxpAttributionCoverage" })
+
+const OxpAttributionCalibration = Schema.Struct({
+  productionDigest: Schema.String,
+  sourceDigest: Schema.String,
+  calibratedAt: Schema.String,
+  observations: Schema.Number,
+  corpus: Schema.Struct({
+    observations: Schema.Number,
+    activities: Schema.Number,
+    tools: Schema.Number,
+    toolStatusGroups: Schema.Number,
+    minStartedAt: Schema.Finite,
+    maxStartedAt: Schema.Finite,
+    maxCompletedAt: Schema.Finite,
+  }),
+  validation: Schema.Struct({
+    toolPriorChars: Schema.Finite,
+    statusPriorChars: Schema.Finite,
+    statusSpecialization: Schema.String,
+    exposureAggregateBiasRMSE: Schema.Finite,
+    exposureWAPE: Schema.Finite,
+  }),
+}).annotate({ identifier: "OxpAttributionCalibration" })
+
+const OxpAttributionSnapshot = Schema.Struct({
+  generatedAt: Schema.Finite,
+  scope: Schema.Struct({
+    since: Schema.optional(Schema.Finite),
+    until: Schema.optional(Schema.Finite),
+    activityID: Schema.optional(OxpActivitySchema.ActivityID),
+  }),
+  totals: OxpAttributionTotals,
+  sensitivity: Schema.Struct({
+    low: Schema.Struct({
+      rho: Schema.Literal(0.75),
+      tokens: Schema.Finite,
+    }),
+    calibrated: Schema.Struct({
+      rho: Schema.Finite,
+      tokens: Schema.Finite,
+    }),
+    high: Schema.Struct({
+      rho: Schema.Literal(0.99),
+      tokens: Schema.Finite,
+    }),
+  }),
+  coverage: OxpAttributionCoverage,
+  model: Schema.Struct({
+    kind: Schema.Literal("geometric-context-residency"),
+    rho: Schema.Finite,
+    gapThresholdMs: Schema.Finite,
+    requestCharsPerToken: Schema.Finite,
+    resultCharsPerToken: Schema.Finite,
+    components: Schema.Struct({
+      callTranscript: Schema.Literal(true),
+      returnedContent: Schema.Literal(true),
+      repeatedContextExposure: Schema.Literal(true),
+      availabilitySchema: Schema.Literal(false),
+    }),
+    calibration: OxpAttributionCalibration,
+  }),
+  causalAttribution: Schema.Struct({
+    available: Schema.Literal(false),
+    reason: Schema.Literal("trace-chain-unavailable"),
+  }),
+}).annotate({ identifier: "OxpAttributionSnapshot" })
 
 const OxpResourceProvenanceInfo = Schema.Struct({
   activityID: OxpActivitySchema.ActivityID,
@@ -275,12 +454,22 @@ const GlobalOxpActivityDeleteResult = Schema.Struct({
 
 export const GlobalEventInterestInput = Schema.Struct({
   subscriber: Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SUBSCRIBER_CHARS)),
-  sessions: Schema.Array(
-    Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SESSION_CHARS)),
-  ).check(Schema.isMaxLength(STREAM_INTEREST_MAX_SESSIONS)),
+  sessions: Schema.Array(Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SESSION_CHARS))).check(
+    Schema.isMaxLength(STREAM_INTEREST_MAX_SESSIONS),
+  ),
+  generation: Schema.optional(
+    Schema.Number.check(
+      Schema.isInt(),
+      Schema.isGreaterThanOrEqualTo(0),
+      Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+    ),
+  ),
 }).annotate({ identifier: "GlobalEventInterestInput" })
 
-const GlobalEventInterestResult = Schema.Struct({ updated: Schema.Boolean }).annotate({
+const GlobalEventInterestResult = Schema.Struct({
+  updated: Schema.Boolean,
+  generation: Schema.optional(Schema.Number),
+}).annotate({
   identifier: "GlobalEventInterestResult",
 })
 
@@ -332,20 +521,28 @@ export const ModelPreferencesPatch = Schema.Struct({
   ),
 }).annotate({ identifier: "ModelPreferencesPatch" })
 
+const GlobalAgentID = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9._-]*$/), Schema.isMaxLength(128))
+
 export const GlobalPaths = {
   health: "/global/health",
+  syncCapabilities: SyncPaths.capabilities,
   event: "/global/event",
   eventInterest: "/global/event/interest",
   sessionRoots: "/global/session/roots",
+  sessionMetadata: "/global/session/metadata",
+  archivedSessionRoots: "/global/session/archived-roots",
   sessionGet: "/global/session/:sessionID",
   sessionTelemetry: "/global/session/telemetry",
+  sessionStatus: "/session/status",
   oxpActivities: "/global/oxp/activity",
   oxpActivity: "/global/oxp/activity/:activityID",
   oxpInvocations: "/global/oxp/activity/:activityID/invocations",
   oxpInvocationDetail: "/global/oxp/invocation/:invocationID/detail",
   oxpResource: "/global/oxp/resource",
+  oxpAttribution: "/global/oxp/attribution",
   projects: "/global/project",
   config: "/global/config",
+  configAgent: "/global/config/agent/:agentID",
   preferences: "/global/preferences",
   dispose: "/global/dispose",
   resetLocalData: "/global/reset-local-data",
@@ -355,6 +552,17 @@ export const GlobalPaths = {
 export const GlobalApi = HttpApi.make("global").add(
   HttpApiGroup.make("global")
     .add(
+      HttpApiEndpoint.get("syncCapabilities", GlobalPaths.syncCapabilities, {
+        query: WorkspaceRoutingQuery,
+        success: described(SyncCapabilities, "Sync protocol capabilities"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "sync.capabilities",
+          summary: "Get sync capabilities",
+          description:
+            "Get process-wide versioned durable-history representations supported by this sync peer, without workspace bootstrap.",
+        }),
+      ),
       HttpApiEndpoint.get("health", GlobalPaths.health, {
         success: described(GlobalHealth, "Health information"),
       }).annotateMerge(
@@ -376,14 +584,14 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.post("eventInterest", GlobalPaths.eventInterest, {
         payload: GlobalEventInterestInput,
         success: GlobalEventInterestResult,
-        }).annotateMerge(
-          OpenApi.annotations({
-            // Keep this operation flat under `global` in generated SDKs. A
-            // dotted `global.event.interest` identifier creates a nested Event
-            // client that collides with the existing event clients and causes
-            // generator renumbering (`Event2`, `Event3`).
-            identifier: "global.eventInterest",
-            summary: "Update event stream interest",
+      }).annotateMerge(
+        OpenApi.annotations({
+          // Keep this operation flat under `global` in generated SDKs. A
+          // dotted `global.event.interest` identifier creates a nested Event
+          // client that collides with the existing event clients and causes
+          // generator renumbering (`Event2`, `Event3`).
+          identifier: "global.eventInterest",
+          summary: "Update event stream interest",
           description:
             "Update the foreground session set for one SSE subscriber so reconstructible background content can be suppressed upstream.",
         }),
@@ -397,6 +605,28 @@ export const GlobalApi = HttpApi.make("global").add(
           summary: "List recent root sessions without instance bootstrap",
           description:
             "List recent non-archived root sessions directly from durable session storage. When projectID is supplied it is authoritative and the directory is retained only as the caller's canonical cache location; otherwise the read is directory-scoped. This startup surface never materializes directory config, plugins, providers, or tools.",
+        }),
+      ),
+      HttpApiEndpoint.post("sessionMetadata", GlobalPaths.sessionMetadata, {
+        payload: GlobalSessionMetadataInput,
+        success: described(Schema.Array(Session.Info), "Durable session metadata for explicit session IDs"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.sessionMetadata",
+          summary: "Read bounded session metadata without workspace bootstrap",
+          description:
+            "Read durable session records for up to 500 explicit IDs in one bootstrap-free query. Missing IDs are omitted. This Tier 1 projection never materializes directory config, plugins, providers, tools, or a workspace runtime.",
+        }),
+      ),
+      HttpApiEndpoint.post("archivedSessionRoots", GlobalPaths.archivedSessionRoots, {
+        payload: GlobalArchivedSessionRootsInput,
+        success: described(GlobalArchivedSessionRootsPage, "A page of archived root session metadata"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.archivedSessionRoots",
+          summary: "Page archived root sessions without instance bootstrap",
+          description:
+            "Read a bounded page of archived root metadata across explicit directories. The route queries durable session storage directly and never materializes workspace config, plugins, providers, tools, or runtime state.",
         }),
       ),
       HttpApiEndpoint.get("sessionGet", GlobalPaths.sessionGet, {
@@ -421,12 +651,25 @@ export const GlobalApi = HttpApi.make("global").add(
             "Read bounded live/settled session telemetry directly from global memory and durable telemetry storage. This endpoint never materializes directory config, plugins, providers, tools, or a workspace runtime.",
         }),
       ),
+      HttpApiEndpoint.get("sessionStatus", GlobalPaths.sessionStatus, {
+        query: GlobalSessionStatusQuery,
+        success: described(
+          Schema.Record(Schema.String, SessionStatusEvent.Info),
+          "Working-session status optionally scoped to one explicit directory",
+        ),
+      }).annotateMerge(
+        OpenApi.annotations({
+          // Preserve the established local SDK operation identity even though
+          // the route is now assembled on the global, bootstrap-free surface.
+          identifier: "session.status",
+          summary: "Get working-session status",
+          description:
+            "Read active execution ownership without workspace bootstrap; pass a directory to scope the result.",
+        }),
+      ),
       HttpApiEndpoint.get("oxpActivities", GlobalPaths.oxpActivities, {
         query: GlobalOxpActivityListQuery,
-        success: described(
-          Schema.Array(OxpActivitySummary),
-          "OXP parent activity summaries",
-        ),
+        success: described(Schema.Array(OxpActivitySummary), "OXP parent activity summaries"),
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpActivities",
@@ -437,10 +680,7 @@ export const GlobalApi = HttpApi.make("global").add(
       ),
       HttpApiEndpoint.get("oxpActivityGet", GlobalPaths.oxpActivity, {
         params: { activityID: OxpActivitySchema.ActivityID },
-        success: described(
-          Schema.NullOr(OxpActivitySummary),
-          "OXP parent activity summary",
-        ),
+        success: described(Schema.NullOr(OxpActivitySummary), "OXP parent activity summary"),
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpActivityGet",
@@ -452,10 +692,7 @@ export const GlobalApi = HttpApi.make("global").add(
       HttpApiEndpoint.get("oxpInvocations", GlobalPaths.oxpInvocations, {
         params: { activityID: OxpActivitySchema.ActivityID },
         query: GlobalOxpInvocationQuery,
-        success: described(
-          OxpInvocationPage,
-          "Paginated OXP invocation history",
-        ),
+        success: described(OxpInvocationPage, "Paginated OXP invocation history"),
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpInvocations",
@@ -466,10 +703,7 @@ export const GlobalApi = HttpApi.make("global").add(
       ),
       HttpApiEndpoint.get("oxpInvocationDetail", GlobalPaths.oxpInvocationDetail, {
         params: { invocationID: OxpActivitySchema.InvocationID },
-        success: described(
-          Schema.NullOr(OxpInvocationDetailInfo),
-          "Lazy OXP invocation request/outcome detail",
-        ),
+        success: described(Schema.NullOr(OxpInvocationDetailInfo), "Lazy OXP invocation request/outcome detail"),
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpInvocationDetail",
@@ -492,6 +726,17 @@ export const GlobalApi = HttpApi.make("global").add(
             "Reverse lookup over durable OXP causal links. This is observability-only history and never grants authority over the referenced resource.",
         }),
       ),
+      HttpApiEndpoint.get("oxpAttribution", GlobalPaths.oxpAttribution, {
+        query: GlobalOxpAttributionQuery,
+        success: described(OxpAttributionSnapshot, "Modeled OXP context footprint and exposure"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.oxpAttribution",
+          summary: "Estimate OXP context exposure without workspace bootstrap",
+          description:
+            "Read a compact Core-owned OXP context-footprint projection. Exact boundary and retained historical observations remain provenance-labelled; missing historical mass may use calibrated donors. Repeated exposure is a geometric context-residency sensitivity model, not provider-reported usage or trace-conserved causal attribution.",
+        }),
+      ),
       HttpApiEndpoint.patch("oxpActivityUpdate", GlobalPaths.oxpActivity, {
         params: { activityID: OxpActivitySchema.ActivityID },
         payload: GlobalOxpActivityPatch,
@@ -506,10 +751,7 @@ export const GlobalApi = HttpApi.make("global").add(
       ),
       HttpApiEndpoint.delete("oxpActivityDelete", GlobalPaths.oxpActivity, {
         params: { activityID: OxpActivitySchema.ActivityID },
-        success: described(
-          GlobalOxpActivityDeleteResult,
-          "OXP activity deletion result",
-        ),
+        success: described(GlobalOxpActivityDeleteResult, "OXP activity deletion result"),
       }).annotateMerge(
         OpenApi.annotations({
           identifier: "global.oxpActivityDelete",
@@ -546,6 +788,31 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.config.update",
           summary: "Update global configuration",
           description: "Update global OpenFork configuration settings and preferences.",
+        }),
+      ),
+      HttpApiEndpoint.put("configAgentSet", GlobalPaths.configAgent, {
+        params: { agentID: GlobalAgentID },
+        payload: ConfigAgentV1.Info,
+        success: described(ConfigV1.Info, "Global config after exact agent replacement"),
+        error: HttpApiError.BadRequest,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.configAgentSet",
+          summary: "Create or replace one global agent",
+          description:
+            "Atomically replace one named global agent definition without deep-merging stale fields. This is a Tier-0 config mutation and never requires workspace instance routing.",
+        }),
+      ),
+      HttpApiEndpoint.delete("configAgentDelete", GlobalPaths.configAgent, {
+        params: { agentID: GlobalAgentID },
+        success: described(ConfigV1.Info, "Global config after exact agent deletion"),
+        error: HttpApiError.BadRequest,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.configAgentDelete",
+          summary: "Delete one global agent",
+          description:
+            "Atomically remove one named global agent definition. This is a Tier-0 config mutation and never requires workspace instance routing.",
         }),
       ),
       HttpApiEndpoint.get("preferencesGet", GlobalPaths.preferences, {

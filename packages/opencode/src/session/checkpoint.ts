@@ -158,7 +158,7 @@ const lock = (key: string) => {
  * it is the only directory these records may name. The `"/"` sentinel a
  * non-git instance carries names no directory and is never reported as one.
  * Nothing here consults cwd or the project display name, and stamping it is pure
- * O(1) metadata on a value already in memory - no filesystem discovery, no Git
+ * O(1) metadata on a value already in memory — no filesystem discovery, no Git
  * call, and no per-turn cache.
  */
 const checkpointRoot = (ctx: InstanceContext): string | undefined => {
@@ -747,6 +747,7 @@ const layer = Layer.effect(
                     branch,
                     source: "session",
                     sourceRef: turn.checkpointID,
+                    replayToken: turn.checkpointID,
                   })
                 : Effect.void,
             { discard: true },

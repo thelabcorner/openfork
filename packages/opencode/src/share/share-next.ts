@@ -47,6 +47,8 @@ type State = {
   queue: Map<SessionID, Map<string, Data>>
   scope: Scope.Closeable
   shared: Map<SessionID, Share | null>
+  flushing: Set<SessionID>
+  closed: boolean
 }
 
 type Data =
@@ -69,6 +71,10 @@ type Data =
   | {
       type: "model"
       data: SDK.Model[]
+    }
+  | {
+      type: "model_request"
+      data: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
     }
 
 export interface Interface {
@@ -106,6 +112,7 @@ function key(item: Data) {
     case "session_diff":
       return "session_diff"
     case "model":
+    case "model_request":
       return "model"
   }
 }
@@ -122,41 +129,63 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const session = yield* Session.Service
 
-    function sync(sessionID: SessionID, data: Data[]) {
+    function sync(sessionID: SessionID, data: Data[] | (() => Data[])) {
       return Effect.gen(function* () {
         if (disabled) return
         const share = yield* getCached(sessionID)
         if (!share) return
+        // Optional sharing must not copy live content for unshared sessions.
+        const items = typeof data === "function" ? data() : data
 
         const s = yield* InstanceState.get(state)
         const existing = s.queue.get(sessionID)
         if (existing) {
-          for (const item of data) {
+          for (const item of items) {
             existing.set(key(item), item)
           }
           return
         }
 
-        const next = new Map(data.map((item) => [key(item), item]))
+        const next = new Map(items.map((item) => [key(item), item]))
         s.queue.set(sessionID, next)
-        yield* flush(sessionID).pipe(
-          Effect.delay(1000),
-          Effect.catchCause((cause) => Effect.logError("share flush failed", { sessionID: sessionID, cause: cause })),
-          Effect.forkIn(s.scope),
-        )
+        yield* scheduleFlush(sessionID, s)
       })
+    }
+
+    function scheduleFlush(sessionID: SessionID, s: State): Effect.Effect<void> {
+      return Effect.sync(() => {
+        if (s.closed || s.flushing.has(sessionID) || !s.queue.has(sessionID)) return false
+        s.flushing.add(sessionID)
+        return true
+      }).pipe(Effect.flatMap((start) => start
+        ? Effect.gen(function* () {
+            while (!s.closed && s.queue.has(sessionID)) yield* flush(sessionID)
+          }).pipe(
+            Effect.delay(1000),
+            Effect.catchCause((cause) => Effect.logError("share flush failed", { sessionID, cause })),
+            Effect.ensuring(Effect.sync(() => s.flushing.delete(sessionID)).pipe(
+              Effect.andThen(Effect.suspend(() => scheduleFlush(sessionID, s))),
+            )),
+            Effect.forkIn(s.scope),
+            Effect.asVoid,
+          )
+        : Effect.void))
     }
 
     const state: InstanceState.InstanceState<State> = yield* InstanceState.make<State>(
       Effect.fn("ShareNext.state")(function* (_ctx) {
-        const cache: State = { queue: new Map(), scope: yield* Scope.make(), shared: new Map() }
+        const cache: State = {
+          queue: new Map(), scope: yield* Scope.make(), shared: new Map(), flushing: new Set(), closed: false,
+        }
 
         yield* Effect.addFinalizer(() =>
-          Scope.close(cache.scope, Exit.void).pipe(
+          Effect.sync(() => { cache.closed = true; cache.queue.clear() }).pipe(
+            Effect.andThen(Scope.close(cache.scope, Exit.void)),
             Effect.andThen(
               Effect.sync(() => {
                 cache.queue.clear()
                 cache.shared.clear()
+                cache.flushing.clear()
               }),
             ),
           ),
@@ -187,28 +216,32 @@ const layer = Layer.effect(
         yield* watch(Session.Event.Updated, (data) =>
           Effect.gen(function* () {
             const info = data.info
-            yield* sync(info.id, [{ type: "session", data: structuredClone(info) as SDK.Session }])
+            yield* sync(info.id, () => [{ type: "session", data: structuredClone(info) as SDK.Session }])
           }),
         )
         yield* watch(MessageV2.Event.Updated, (data) =>
           Effect.gen(function* () {
             const info = data.info
-            yield* sync(info.sessionID, [{ type: "message", data: structuredClone(info) as SDK.Message }])
+            yield* sync(info.sessionID, () => [{ type: "message", data: structuredClone(info) as SDK.Message }])
             // A V1 provider-user message is not necessarily a worker prompt.
             // Goal/compaction/recovery continuations still sync as messages, but
             // they must not trigger redundant Provider model resolution/model
             // sync. Keep incremental behavior aligned with full(), which uses
             // the same V2-backed worker-prompt provenance contract.
             if (!SessionTurnProvenance.isWorkerPromptInfo(info) || info.role !== "user") return
-            const model = yield* provider.getModel(info.model.providerID, info.model.modelID)
-            yield* sync(info.sessionID, [{ type: "model", data: [model] }])
+            // Model projection belongs to an existing share. An ordinary
+            // prompt must not initialize providers for optional sharing.
+            if (!(yield* getCached(info.sessionID))) return
+            // Resolve optional share model metadata in the existing background
+            // flush owner, never in the session's publication path.
+            yield* sync(info.sessionID, [{ type: "model_request", data: info.model }])
           }),
         )
         yield* watch(MessageV2.Event.PartUpdated, (data) =>
-          sync(data.part.sessionID, [{ type: "part", data: structuredClone(data.part) as SDK.Part }]),
+          sync(data.part.sessionID, () => [{ type: "part", data: structuredClone(data.part) as SDK.Part }]),
         )
         yield* watch(Session.Event.Diff, (data) =>
-          sync(data.sessionID, [{ type: "session_diff", data: structuredClone(data.diff) as SDK.SnapshotFileDiff[] }]),
+          sync(data.sessionID, () => [{ type: "session_diff", data: structuredClone(data.diff) as SDK.SnapshotFileDiff[] }]),
         )
         yield* watch(Session.Event.Deleted, (data) => remove(data.sessionID))
 
@@ -268,10 +301,15 @@ const layer = Layer.effect(
       const share = yield* getCached(sessionID)
       if (!share) return
 
+      const data = yield* Effect.forEach([...queued.values()], (item) => item.type === "model_request"
+        ? provider.getModel(item.data.providerID, item.data.modelID).pipe(
+            Effect.map((model) => ({ type: "model" as const, data: [model] })),
+          )
+        : Effect.succeed(item))
       const req = yield* request()
       const res = yield* HttpClientRequest.post(`${req.baseUrl}${req.api.sync(share.id)}`).pipe(
         HttpClientRequest.setHeaders(req.headers),
-        HttpClientRequest.bodyJson({ secret: share.secret, data: Array.from(queued.values()) }),
+        HttpClientRequest.bodyJson({ secret: share.secret, data }),
         Effect.flatMap((r) => http.execute(r)),
       )
 

@@ -151,6 +151,16 @@ const parseProgram = (code: string): ProgramNode => {
 const publicErrorMessage = (message: string): string =>
   message.replace(/\/(?:Users|home|private|tmp|var\/folders)\/[^\s"'`]+/g, "<redacted-path>")
 
+/**
+ * Cancellation is any cause carrying an interrupt reason, not only a cause that
+ * carries nothing else. A failure that arrived together with an interruption
+ * (an aborted transport, a tool racing a timeout) is still cancellation, so it
+ * must stay cancellation at the host boundary instead of being normalized into a
+ * `ToolFailure`/`ExecutionFailure` diagnostic the agent would read as a
+ * recoverable tool problem.
+ */
+const isCancellation = <E>(cause: Cause.Cause<E>): boolean => cause.reasons.some(Cause.isInterruptReason)
+
 const normalizeError = (error: unknown): Diagnostic => {
   if (error instanceof InterpreterRuntimeError) {
     return {
@@ -707,7 +717,7 @@ class Interpreter<R> {
     return Effect.gen(function* () {
       for (const promise of [...self.pendingSettlements]) {
         const exit = yield* self.observePromise(promise)
-        if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) continue
+        if (Exit.isSuccess(exit) || isCancellation(exit.cause)) continue
         const failure = normalizeError(Cause.squash(exit.cause))
         throw new InterpreterRuntimeError(
           `Unhandled rejection from an un-awaited tool call: ${failure.message}`,
@@ -3393,7 +3403,7 @@ export const executeWithLimits = <const Tools extends Record<string, unknown>>(
 
   return operation.pipe(
     Effect.catchCause((cause) =>
-      Cause.hasInterruptsOnly(cause)
+      isCancellation(cause)
         ? Effect.interrupt
         : Effect.succeed({
             ok: false,

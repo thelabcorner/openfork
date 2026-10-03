@@ -13,11 +13,11 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
   "file.transfer":
     "Save a ChatGPT-provided native file into an approved root. This path does not perform OpenAI API auth; authenticated OpenAI Files use direct openai_files.",
   read:
-    "Read bounded files/directories inside approved roots. Inspection only; paths stay root-confined.",
+    "Read bounded files/directories inside approved roots. Batches isolate ordinary item errors; authority, path-escape, cancel, and system failures abort the batch.",
   edit:
-    "Apply one strategy-shaped, verified text edit in an approved root. Exact, line/range, batch, insert, append, and anchored edits cannot be mixed.",
+    "Surgically edit text. For create/full-replace, pass content here or prefer write; missing-file empty-oldString, prepend, and append shapes self-heal through atomic write.",
   git:
-    "Typed Git inspection plus guarded stage/restore/commit in approved repos. Prefer over raw shell Git.",
+    "Typed Git inspection plus guarded stage/restore/commit. For a parent approved root, pass workdir to select the nested repository. Prefer over raw shell Git.",
   json:
     "Analyze JSON/JSONC/JSONL/BSON by validate, query, search, schema, diff, or stats. Format/patch stays dry-run unless write authority permits commit.",
   lsp:
@@ -34,12 +34,14 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
     "Coordinate durable OpenFork Swarms in an approved root without inventing a Session. Worker-only settlement requires an explicitly supervised real Session.",
   "openfork_session.checkpoint":
     "Inspect or restore checkpoints through supervision of an existing authorized Session. Restore remains independently write-gated and commit-revalidated.",
+  openfork_worker:
+    "Create/manage durable workers with workdir support. list/get report ownership only; use result/wait for live state/blockers. model_catalog lists models; agent_catalog lists agents.",
   patch:
-    "Plan or atomically apply a multi-file patch in one approved root; rejects stale or escaping paths.",
+    "Plan/apply verified multi-file patches. Default if-clean preserves safe/already-satisfied files and reports conflicts for targeted retry; apply:true stays atomic.",
   find:
-    "Find files by glob or bounded text search inside approved roots. Text search is literal by default; opt into regex explicitly.",
+    "Find files by glob or bounded text search inside approved roots. Literal by default; use offset/limit metadata for resumable pages or opt into regex.",
   process:
-    "Run workspace processes in approved roots. Prefer argv. Upstream may reject model-authored authentication before OXP receives it; use a purpose-specific direct tool.",
+    "Run commands; process remains unrestricted. Start via argv/command; use opaque handle (never PID) for lifecycle. Upstream may reject model-authored authentication before OXP.",
   "runtime.refresh":
     "Transactionally activate a rebuilt OXP backend with content-addressed identity, bounded trial acceptance, and automatic runtime rollback without touching source or Git.",
   project:
@@ -59,7 +61,7 @@ export const CAPABILITY_DESCRIPTIONS = Object.freeze({
   web:
     "Fetch known HTTP(S) URLs or search the web through OpenFork's shared network executors. Requires the explicit OXP integrations grant.",
   write:
-    "Create or replace a text file atomically inside an approved root, preserving BOM and line endings.",
+    "Create or fully replace text files atomically. Prefer for exact Markdown/code/config content; edit.content is a compatible self-healing route.",
   schedule:
     "Manage durable scheduled tasks in an approved root: create/edit, enable/disable, run now, inspect history/inbox, acknowledge results, preview, or remove.",
   "schedule.create":
@@ -81,11 +83,11 @@ export const DIRECT_TOOL_DESCRIPTIONS = Object.freeze({
   openfork_info:
     "Inspect OXP status, roots, grants, schema fingerprint, or compact capability catalog. Read-only.",
   openfork_session:
-    "Supervise OpenFork Sessions: messages, children, selection, pause/resume, abort. Never creates a Session.",
+    "Session: root-scoped search (`tool:read term`); list/get/messages/checkpoints; send/turn; todos/goals; no hydration.",
   openfork_request:
-    "Answer/list supervised Session permissions/questions. External paths remain inside approved roots.",
+    "List/reply supervised Session permissions and questions. Resolve each blocked worker by sessionID, then wait again. External paths are reject-only; approved roots bound authority.",
   openfork_worker:
-    "Create/manage worker Sessions for parallel work, including explicit provider/model/account/reasoning-variant rebinding for future turns. Explicit roots/policy; may outlive parent epoch.",
+    "Manage durable workers. list/get show ownership, not liveness; use result/wait for live state and blockers via openfork_request. Use model_catalog/agent_catalog for choices.",
 } as const)
 
 export function capabilityDescription(id: keyof typeof CAPABILITY_DESCRIPTIONS) {

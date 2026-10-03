@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm"
 import { Context, Effect, Layer, Semaphore } from "effect"
-import { Database, withBackfillDb } from "@opencode-ai/core/database/database"
+import { Database } from "@opencode-ai/core/database/database"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 
 export const ZEN_FREE_DAY_MS = 86_400_000
@@ -153,7 +153,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Us
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, filename } = yield* Database.Service
+    const { db, scanDb } = yield* Database.Service
     const queryPermit = yield* Semaphore.make(1)
     let cache: { at: number; value: ZenFreeSnapshot } | undefined
 
@@ -168,69 +168,72 @@ const layer = Layer.effect(
       const since = zenUtcDayStart(now - ZEN_FREE_HISTORY_MS)
 
       const value = yield* queryPermit.withPermits(1)(
-        withBackfillDb(filename, (conn) =>
-          Effect.gen(function* () {
-            const [requests, limitErrors] = yield* Effect.all(
-              [
-                conn
-                  .all<ZenRequestRow>(sql`
-                    SELECT
-                      p.time_created AS at,
-                      json_extract(m.data, '$.modelID') AS model_id
-                    FROM part p
-                    JOIN message m ON m.id = p.message_id
-                    WHERE p.time_created >= ${since}
-                      AND p.time_created < ${now}
-                      AND json_extract(p.data, '$.type') = 'step-finish'
-                      AND json_extract(m.data, '$.role') = 'assistant'
-                      AND json_extract(m.data, '$.providerID') = 'opencode'
-                    ORDER BY p.time_created ASC
-                  `)
-                  .pipe(Effect.orDie),
-                conn
-                  .all<ZenLimitErrorRow>(sql`
-                    SELECT
-                      COALESCE(
-                        json_extract(m.data, '$.time.completed'),
-                        m.time_updated,
-                        m.time_created
-                      ) AS at,
-                      json_extract(m.data, '$.modelID') AS model_id
-                    FROM message m
-                    WHERE COALESCE(
-                        json_extract(m.data, '$.time.completed'),
-                        m.time_updated,
-                        m.time_created
-                      ) >= ${since}
-                      AND json_extract(m.data, '$.role') = 'assistant'
-                      AND json_extract(m.data, '$.providerID') = 'opencode'
-                      AND json_extract(m.data, '$.error.name') = 'APIError'
-                      AND instr(
-                        COALESCE(json_extract(m.data, '$.error.data.responseBody'), ''),
-                        'FreeUsageLimitError'
-                      ) > 0
-                    ORDER BY at ASC
-                  `)
-                  .pipe(Effect.orDie),
-              ],
-              { concurrency: 2 },
-            )
+        Effect.gen(function* () {
+          const conn = yield* scanDb()
+          const [requests, limitErrors] = yield* Effect.all(
+            [
+              conn
+                .all<ZenRequestRow>(sql`
+                  SELECT
+                    p.time_created AS at,
+                    json_extract(m.data, '$.modelID') AS model_id
+                  FROM part p
+                  JOIN message m ON m.id = p.message_id
+                  JOIN usage_record u ON u.message_id = m.id
+                  WHERE p.time_created >= ${since}
+                    AND p.time_created < ${now}
+                    AND json_extract(p.data, '$.type') = 'step-finish'
+                    AND json_extract(m.data, '$.role') = 'assistant'
+                    AND json_extract(m.data, '$.providerID') = 'opencode'
+                    AND u.route_kind = 'public'
+                  ORDER BY p.time_created ASC
+                `)
+                .pipe(Effect.orDie),
+              conn
+                .all<ZenLimitErrorRow>(sql`
+                  SELECT
+                    COALESCE(
+                      json_extract(m.data, '$.time.completed'),
+                      m.time_updated,
+                      m.time_created
+                    ) AS at,
+                    json_extract(m.data, '$.modelID') AS model_id
+                  FROM message m
+                  JOIN usage_record u ON u.message_id = m.id
+                  WHERE COALESCE(
+                      json_extract(m.data, '$.time.completed'),
+                      m.time_updated,
+                      m.time_created
+                    ) >= ${since}
+                    AND json_extract(m.data, '$.role') = 'assistant'
+                    AND json_extract(m.data, '$.providerID') = 'opencode'
+                    AND u.route_kind = 'public'
+                    AND json_extract(m.data, '$.error.name') = 'APIError'
+                    AND instr(
+                      COALESCE(json_extract(m.data, '$.error.data.responseBody'), ''),
+                      'FreeUsageLimitError'
+                    ) > 0
+                  ORDER BY at ASC
+                `)
+                .pipe(Effect.orDie),
+            ],
+            { concurrency: 2 },
+          )
 
-            return buildZenFreeSnapshot({
-              now,
-              requests: requests.flatMap((row) =>
-                typeof row.at === "number" && typeof row.model_id === "string"
-                  ? [{ at: row.at, modelID: row.model_id }]
-                  : [],
-              ),
-              limitErrors: limitErrors.flatMap((row) =>
-                typeof row.at === "number" && typeof row.model_id === "string"
-                  ? [{ at: row.at, modelID: row.model_id }]
-                  : [],
-              ),
-            })
-          }),
-        ).pipe(Effect.orDie),
+          return buildZenFreeSnapshot({
+            now,
+            requests: requests.flatMap((row) =>
+              typeof row.at === "number" && typeof row.model_id === "string"
+                ? [{ at: row.at, modelID: row.model_id }]
+                : [],
+            ),
+            limitErrors: limitErrors.flatMap((row) =>
+              typeof row.at === "number" && typeof row.model_id === "string"
+                ? [{ at: row.at, modelID: row.model_id }]
+                : [],
+            ),
+          })
+        }),
       )
 
       cache = { at: now, value }

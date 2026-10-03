@@ -1,5 +1,4 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "./schema"
 import { Effect, Layer, Context } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -14,6 +13,7 @@ export const Event = SessionStatusEvent
 export interface Interface {
   readonly get: (sessionID: SessionID) => Effect.Effect<Info>
   readonly list: () => Effect.Effect<Map<SessionID, Info>>
+  readonly listForSessionIDs: (sessionIDs: readonly SessionID[]) => Effect.Effect<Map<SessionID, Info>>
   readonly set: (sessionID: SessionID, status: Info, reason?: "aborted") => Effect.Effect<void>
 }
 
@@ -25,33 +25,41 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const telemetry = yield* SessionTelemetry.Service
 
-    const state = yield* InstanceState.make(
-      Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
-    )
+    // Session IDs are process-global durable identities. Keeping this map in
+    // InstanceState split delegated sessions across their caller's directory
+    // and made a directory-scoped status endpoint miss active workers.
+    const state = new Map<SessionID, Info>()
 
     const get = Effect.fn("SessionStatus.get")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      return data.get(sessionID) ?? { type: "idle" as const }
+      return state.get(sessionID) ?? { type: "idle" as const }
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
-      return new Map(yield* InstanceState.get(state))
+      return new Map(state)
+    })
+
+    const listForSessionIDs = Effect.fn("SessionStatus.listForSessionIDs")(function* (sessionIDs: readonly SessionID[]) {
+      const result = new Map<SessionID, Info>()
+      for (const sessionID of sessionIDs) {
+        const status = state.get(sessionID)
+        if (status) result.set(sessionID, status)
+      }
+      return result
     })
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info, reason?: "aborted") {
-      const data = yield* InstanceState.get(state)
       yield* events.publish(Event.Status, { sessionID, status })
       if (status.type === "retry") yield* telemetry.retry(sessionID)
       if (status.type === "idle") {
         yield* telemetry.idle(sessionID)
         yield* events.publish(Event.Idle, reason ? { sessionID, reason } : { sessionID })
-        data.delete(sessionID)
+        state.delete(sessionID)
         return
       }
-      data.set(sessionID, status)
+      state.set(sessionID, status)
     })
 
-    return Service.of({ get, list, set })
+    return Service.of({ get, list, listForSessionIDs, set })
   }),
 )
 

@@ -62,6 +62,12 @@ const replacements = [
 ] as const
 
 const it = testEffect(LayerNode.compile(root, replacements))
+const withoutCodeMode = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalCodeMode: false })],
+  ]),
+)
 const withCodeMode = testEffect(
   LayerNode.compile(root, [
     [Config.node, configLayer],
@@ -139,7 +145,7 @@ describe("tool.registry", () => {
     Effect.sync(() => {
       const report = ExternalToolCoverage.ofxpExecutionReport(EXECUTABLE_CAPABILITY_IDS)
       expect(report.unmappedExecutable).toEqual([])
-      expect(report.executableSurfaces).toEqual(["archive", "browser", "edit", "find", "git", "json", "lsp", "memory", "patch", "process", "project", "read", "skill", "sqlite", "symbols", "sympy", "test", "typecheck", "web", "write"])
+      expect(report.executableSurfaces).toEqual(["archive", "browser", "edit", "find", "git", "json", "lsp", "memory", "patch", "process", "project", "read", "refactor", "skill", "sqlite", "symbols", "sympy", "test", "typecheck", "web", "write"])
       expect(report.pendingSurfaces).not.toContain("archive")
       expect(report.pendingSurfaces).not.toContain("json")
       expect(report.pendingSurfaces).not.toContain("sqlite")
@@ -171,6 +177,116 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
 
       expect(ids).toContain("checkpoint")
+    }),
+  )
+
+  it.instance("exposes narrow Swarm creation/worker facades eagerly and leaves coordinator breadth lazy", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const agent = yield* agents.defaultInfo()
+
+      expect(ids).toContain("swarm_create")
+      expect(ids).toContain("swarm_member")
+      expect(ids).toContain("swarm")
+
+      const providerTools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test/model"),
+        agent,
+      })
+      const exposed = providerTools.map((tool) => tool.id)
+      // Common creation and worker completion are direct intents; broad
+      // coordinator/admin/recovery breadth stays behind the stable lazy broker.
+      expect(exposed).toContain("swarm_create")
+      expect(exposed).toContain("swarm_member")
+      expect(exposed).not.toContain("swarm")
+
+      const create = providerTools.find((tool) => tool.id === "swarm_create")!
+      const createSchema = ToolJsonSchema.fromTool(create) as Record<string, any>
+      const createProperties = Object.keys(createSchema.properties ?? {})
+      expect(createProperties).toContain("name")
+      for (const brokerOrOpaque of [
+        "action",
+        "swarmId",
+        "contract",
+        "memberId",
+        "taskId",
+        "runId",
+        "leaseToken",
+        "coordinatorSessionID",
+        "coordinatorCapabilities",
+        "projectID",
+        "workspaceID",
+        "directory",
+      ]) {
+        expect(createProperties).not.toContain(brokerOrOpaque)
+      }
+      const createBytes = JSON.stringify(createSchema).length
+      expect(createBytes).toBeLessThan(5_000)
+
+      const allTools = yield* registry.all()
+      const lazySwarm = allTools.find((tool) => tool.id === "swarm")!
+      const lazySchema = ToolJsonSchema.fromTool(lazySwarm) as Record<string, any>
+
+      // Tasks/dependencies stay one shared schema. Creation members are
+      // intentionally flatter than the compatibility admin/OXP shape because
+      // live agents repeatedly misplaced desiredProfile/workspacePolicy wrappers.
+      expect(createSchema.properties?.tasks?.items).toEqual(lazySchema.properties?.tasks?.items)
+      const directMember = createSchema.properties?.members?.items as Record<string, any>
+      const directMemberProperties = Object.keys(directMember?.properties ?? {})
+      for (const field of ["name", "role", "agent", "providerID", "modelID", "permissionBoundary", "workspace"]) {
+        expect(directMemberProperties).toContain(field)
+      }
+      expect(directMemberProperties).not.toContain("desiredProfile")
+      expect(directMemberProperties).not.toContain("workspacePolicy")
+      expect(directMember.required ?? []).not.toContain("workspace")
+      expect(directMember).not.toEqual(lazySchema.properties?.members?.items)
+
+      const facade = providerTools.find((tool) => tool.id === "swarm_member")!
+      const facadeSchema = ToolJsonSchema.fromSchema(facade.parameters as never) as Record<string, any>
+      expect(createBytes + JSON.stringify(facadeSchema).length).toBeLessThan(7_000)
+      const properties = Object.keys(facadeSchema.properties ?? {})
+      for (const opaque of ["swarmId", "memberId", "taskId", "runId", "leaseToken"]) {
+        expect(properties).not.toContain(opaque)
+      }
+    }),
+  )
+
+  it.instance("a broad swarm deny also denies the direct creation alias without changing manifest visibility", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test/model"),
+        agent: yield* agents.defaultInfo(),
+        permission: Permission.fromConfig({
+          swarm: "deny",
+          swarm_create: "allow",
+        }),
+      })
+      const create = tools.find((tool) => tool.id === "swarm_create")
+      expect(create).toBeDefined()
+
+      const denied = yield* Effect.exit(
+        create!.execute(
+          { name: "must remain denied" },
+          {
+            sessionID: SessionID.descending(),
+            messageID: MessageID.ascending(),
+            callID: "call_swarm_create_alias_deny",
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        ),
+      )
+      expect(Exit.isFailure(denied)).toBe(true)
+      if (Exit.isFailure(denied)) expect(Cause.pretty(denied.cause)).toContain("swarm")
     }),
   )
 
@@ -447,7 +563,16 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("does not expose execute unless code mode is enabled", () =>
+  it.instance("exposes execute by default", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+
+      expect(ids).toContain("execute")
+    }),
+  )
+
+  withoutCodeMode.instance("removes execute when code mode is explicitly disabled", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
@@ -456,7 +581,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  withCodeMode.instance("exposes execute when code mode is enabled", () =>
+  withCodeMode.instance("keeps the upstream enable flag compatible and exposes the MCP catalog through execute", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agents = yield* Agent.Service
@@ -973,7 +1098,7 @@ describe("toolMayMutateWorkspace policy", () => {
   })
 
   test("delegators are classified read-only; their nested tools are guarded separately", () => {
-    for (const id of ["task", "session", "goal", "invalid", "question"]) {
+    for (const id of ["task", "session", "goal", "swarm_create", "invalid", "question"]) {
       expect(`${id}=${toolMayMutateWorkspace(id, {})}`).toBe(`${id}=false`)
     }
   })

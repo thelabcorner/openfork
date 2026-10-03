@@ -8,7 +8,7 @@ afterEach(() => {
 
 describe("OXP runtime-refresh bridge", () => {
   test("publishes a stable host-bridge protocol version", () => {
-    expect(OxpRuntimeRefresh.PROTOCOL_VERSION).toBe(1)
+    expect(OxpRuntimeRefresh.PROTOCOL_VERSION).toBe(2)
   })
 
   test("reports a safe non-refreshable status without a Desktop host bridge", async () => {
@@ -23,6 +23,9 @@ describe("OXP runtime-refresh bridge", () => {
     OxpRuntimeRefresh.install({
       status: async () => ({ refreshable: true, state: "stable" }),
       refresh: async () => {
+        throw new Error("must not run")
+      },
+      arm: async () => {
         throw new Error("must not run")
       },
       accept: async () => {
@@ -47,6 +50,9 @@ describe("OXP runtime-refresh bridge", () => {
           code: "OXP_CONFLICT",
         })
       },
+      arm: async () => {
+        throw new Error("must not run")
+      },
       accept: async () => {
         throw new Error("must not run")
       },
@@ -65,6 +71,60 @@ describe("OXP runtime-refresh bridge", () => {
       _tag: "OXP_CONFLICT",
       detail: "stale runtime",
     })
+  })
+
+  test("arms a changed scheduled refresh only through the internal post-response hook", async () => {
+    const previousID = `sha256:${"a".repeat(64)}`
+    const candidateID = `sha256:${"b".repeat(64)}`
+    let armCalls = 0
+    OxpRuntimeRefresh.install({
+      status: async () => ({
+        refreshable: true,
+        state: "stable",
+        runtimeID: previousID,
+      }),
+      refresh: async () => ({
+        action: "refresh",
+        changed: true,
+        status: {
+          refreshable: true,
+          state: "scheduled",
+          runtimeID: previousID,
+          trial: {
+            id: "trial-response-barrier",
+            previousRuntimeID: previousID,
+            candidateRuntimeID: candidateID,
+            phase: "scheduled",
+          },
+        },
+      }),
+      arm: async (trialID) => {
+        expect(trialID).toBe("trial-response-barrier")
+        armCalls += 1
+      },
+      accept: async () => {
+        throw new Error("must not run")
+      },
+      rollback: async () => {
+        throw new Error("must not run")
+      },
+    })
+
+    const result = await Effect.runPromise(
+      OxpRuntimeRefresh.execute({
+        action: "refresh",
+        expectedRuntimeID: previousID,
+      }),
+    )
+    expect(armCalls).toBe(0)
+    expect(result.afterResponse).toBeFunction()
+    expect(result.structured).toMatchObject({
+      action: "refresh",
+      changed: true,
+      status: { state: "scheduled" },
+    })
+    await result.afterResponse?.()
+    expect(armCalls).toBe(1)
   })
 
   test("marks unchanged host refreshes as attempted but uncommitted", async () => {
@@ -88,6 +148,9 @@ describe("OXP runtime-refresh bridge", () => {
           },
         },
       }),
+      arm: async () => {
+        throw new Error("must not run")
+      },
       accept: async () => {
         throw new Error("must not run")
       },

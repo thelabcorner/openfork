@@ -24,7 +24,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
 
     const update = Effect.fn("Todo.update")(function* (input: { sessionID: SessionID; todos: ReadonlyArray<Info> }) {
       yield* db
@@ -51,7 +51,7 @@ const layer = Layer.effect(
     })
 
     const get = Effect.fn("Todo.get")(function* (sessionID: SessionID) {
-      const rows = yield* db
+      const rows = yield* readDb
         .select()
         .from(TodoTable)
         .where(eq(TodoTable.session_id, sessionID))

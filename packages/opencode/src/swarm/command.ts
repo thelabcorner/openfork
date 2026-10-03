@@ -6,6 +6,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Swarm } from "@opencode-ai/schema/swarm"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 
 export interface DelegateMember {
   readonly name: string
@@ -125,19 +126,55 @@ const validate = Effect.fn("SwarmCommand.validateDelegate")(function* (input: De
 })
 
 /**
+ * Managed members must be runnable before a single durable Swarm row exists.
+ *
+ * Without this, `create` commits a `creating` Swarm and the coordinator/member
+ * rows before agent, provider/model/account, variant, or model-requirement
+ * resolution is ever attempted. The first durable artifact of an invalid
+ * request is therefore a permanently stranded Swarm with zero task runs.
+ *
+ * The check itself is owned by SwarmProfilePreflight, which the managed-member
+ * materialization path also uses; this only orders it ahead of the first write.
+ */
+const preflightProfiles = Effect.fn("SwarmCommand.preflightProfiles")(function* (
+  preflight: SwarmProfilePreflight.Interface,
+  input: DelegateInput,
+) {
+  for (const member of input.members ?? []) {
+    yield* preflight.check({ directory: input.directory, profile: member.desiredProfile })
+  }
+})
+
+/**
  * Fail-closed high-level Swarm creation workflow.
  *
  * EventV2 deliberately has no multi-event batch publish. The durable
  * `creating` status is therefore the transaction boundary between incomplete
  * setup and runnable work: member Session materialization and scheduling both
- * require `active`. Every avoidable cross-reference error is validated before
- * the first write, and activation is the final exact-revision mutation.
+ * require `active`. Every avoidable cross-reference error — names, task keys,
+ * reservations, dependency cycles, and each managed member's runnable execution
+ * profile — is validated before the first write, and activation is the final
+ * exact-revision mutation.
  */
 export const delegate = Effect.fn("SwarmCommand.delegate")(function* (
   service: SwarmV2.Interface,
+  preflight: SwarmProfilePreflight.Interface,
   input: DelegateInput,
 ) {
   yield* validate(input)
+  yield* preflightProfiles(preflight, input)
+
+  // The coordinator binding is deterministic authority input, not setup state.
+  // Prove it before the first Swarm write so producer-owned/child/cross-scope
+  // callers cannot strand an empty `creating` aggregate. addMember re-runs the
+  // same Core validator transactionally, so a concurrent Session change still
+  // fails closed; abandoned-creating recovery remains the crash/race fallback.
+  if (input.coordinatorSessionID !== undefined)
+    yield* service.preflightMemberSession({
+      projectID: input.projectID,
+      ...(input.workspaceID === undefined ? {} : { workspaceID: input.workspaceID }),
+      sessionID: input.coordinatorSessionID,
+    })
 
   const created = yield* service.create({
     projectID: input.projectID,

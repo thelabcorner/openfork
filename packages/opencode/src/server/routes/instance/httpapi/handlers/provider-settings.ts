@@ -2,11 +2,13 @@ import { Auth } from "@/auth"
 import { Config } from "@/config/config"
 import { Credential } from "@opencode-ai/core/credential"
 import { EventV2 } from "@opencode-ai/core/event"
+import { GlobalIntegrationAuth } from "@opencode-ai/core/integration/global-auth"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Integration } from "@opencode-ai/schema/integration"
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { RootHttpApi } from "../api"
+import { InvalidRequestError } from "../errors"
 
 const configSource = (
   value: { npm?: string; models?: Record<string, unknown> } | undefined,
@@ -163,6 +165,76 @@ export const providerSettingsHandlers = HttpApiBuilder.group(RootHttpApi, "provi
       return HttpApiSchema.NoContent.make()
     })
 
+    const auth = Effect.fn("ProviderSettingsHttpApi.auth")(function* (ctx: {
+      params: { providerID: Integration.ID }
+    }) {
+      const service = yield* GlobalIntegrationAuth.Service
+      return { methods: yield* service.methods(ctx.params.providerID) }
+    })
+
+    const connectOauth = Effect.fn("ProviderSettingsHttpApi.connectOauth")(function* (ctx: {
+      params: { providerID: Integration.ID }
+      payload: { methodID: Integration.MethodID; inputs: Integration.Inputs; label?: string }
+    }) {
+      const service = yield* GlobalIntegrationAuth.Service
+      return yield* service
+        .oauth({
+          integrationID: ctx.params.providerID,
+          methodID: ctx.payload.methodID,
+          inputs: ctx.payload.inputs,
+          label: ctx.payload.label,
+        })
+        .pipe(
+          Effect.mapError(
+            () =>
+              new InvalidRequestError({
+                message: "Authentication failed",
+                kind: "integration_authorization",
+              }),
+          ),
+        )
+    })
+
+    const oauthStatus = Effect.fn("ProviderSettingsHttpApi.oauthStatus")(function* (ctx: {
+      params: { attemptID: Integration.AttemptID }
+    }) {
+      const service = yield* GlobalIntegrationAuth.Service
+      return yield* service.attempt.status(ctx.params.attemptID)
+    })
+
+    const oauthComplete = Effect.fn("ProviderSettingsHttpApi.oauthComplete")(function* (ctx: {
+      params: { attemptID: Integration.AttemptID }
+      payload: { code?: string }
+    }) {
+      const service = yield* GlobalIntegrationAuth.Service
+      yield* service.attempt
+        .complete({ attemptID: ctx.params.attemptID, code: ctx.payload.code })
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new InvalidRequestError({
+                message:
+                  error._tag === "Integration.CodeRequired"
+                    ? "Authorization code is required"
+                    : "Authentication failed",
+                kind:
+                  error._tag === "Integration.CodeRequired"
+                    ? "integration_code_required"
+                    : "integration_authorization",
+              }),
+          ),
+        )
+      return HttpApiSchema.NoContent.make()
+    })
+
+    const oauthCancel = Effect.fn("ProviderSettingsHttpApi.oauthCancel")(function* (ctx: {
+      params: { attemptID: Integration.AttemptID }
+    }) {
+      const service = yield* GlobalIntegrationAuth.Service
+      yield* service.attempt.cancel(ctx.params.attemptID)
+      return HttpApiSchema.NoContent.make()
+    })
+
     const credentialUpdate = Effect.fn("ProviderSettingsHttpApi.credentialUpdate")(function* (ctx: {
       params: { credentialID: Credential.ID }
       payload: { label: string }
@@ -201,6 +273,11 @@ export const providerSettingsHandlers = HttpApiBuilder.group(RootHttpApi, "provi
       .handle("list", list)
       .handle("models", modelList)
       .handle("connectKey", connectKey)
+      .handle("auth", auth)
+      .handle("connectOauth", connectOauth)
+      .handle("oauthStatus", oauthStatus)
+      .handle("oauthComplete", oauthComplete)
+      .handle("oauthCancel", oauthCancel)
       .handle("credentialUpdate", credentialUpdate)
       .handle("credentialRemove", credentialRemove)
       .handle("credentialSelect", credentialSelect)

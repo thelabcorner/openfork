@@ -6,18 +6,59 @@ import {
   eventStreamInterestFromHeaders,
   eventStreamInterestRegistrySize,
   markEventStreamSessionSuppressed,
+  eventStreamInterestGeneration,
   registerEventStreamInterest,
   unregisterEventStreamInterest,
   updateEventStreamInterest,
 } from "./event-interest"
 import {
   STREAM_INTEREST_SESSIONS_HEADER,
+  STREAM_INTEREST_GENERATION_HEADER,
   STREAM_INTEREST_SUBSCRIBER_HEADER,
 } from "@opencode-ai/core/session-stream-content"
 
 afterEach(clearEventStreamInterestRegistry)
 
 describe("event stream interest registry", () => {
+  test("out-of-order control cannot overwrite the newest desired state", () => {
+    const state = registerEventStreamInterest("sub", ["a"], 0)!
+    expect(updateEventStreamInterest("sub", ["c"], 2)).toBe(true)
+    expect(updateEventStreamInterest("sub", ["b"], 1)).toBe(false)
+    expect(updateEventStreamInterest("sub", ["a"])).toBe(false)
+    expect(eventStreamAllowsSession(state, "c")).toBe(true)
+    expect(eventStreamAllowsSession(state, "b")).toBe(false)
+    expect(eventStreamInterestGeneration("sub")).toBe(2)
+  })
+
+  test("a reconnect header fences older outstanding control requests", () => {
+    const parsed = eventStreamInterestFromHeaders({
+      [STREAM_INTEREST_SUBSCRIBER_HEADER]: "sub",
+      [STREAM_INTEREST_SESSIONS_HEADER]: '["c"]',
+      [STREAM_INTEREST_GENERATION_HEADER]: "3",
+    })!
+    const state = registerEventStreamInterest(parsed.subscriber, parsed.sessions, parsed.generation)!
+    expect(updateEventStreamInterest("sub", ["b"], 2)).toBe(false)
+    expect(eventStreamAllowsSession(state, "c")).toBe(true)
+    expect(updateEventStreamInterest("sub", ["c"], 3)).toBe(true)
+    expect(updateEventStreamInterest("sub", [], 3)).toBe(false)
+    expect(updateEventStreamInterest("sub", [], 4)).toBe(true)
+    expect(eventStreamAllowsSession(state, "c")).toBe(false)
+  })
+
+  test("invalid revisions cannot mutate registered interest", () => {
+    const state = registerEventStreamInterest("sub", ["a"], 0)!
+    for (const generation of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(updateEventStreamInterest("sub", ["b"], generation)).toBe(false)
+    }
+    expect(eventStreamAllowsSession(state, "a")).toBe(true)
+  })
+
+  test("idempotent retries preserve background dirty latches", () => {
+    const state = registerEventStreamInterest("sub", ["a"], 1)!
+    expect(markEventStreamSessionSuppressed(state, "b")).toBe(true)
+    expect(updateEventStreamInterest("sub", ["a"], 1)).toBe(true)
+    expect(markEventStreamSessionSuppressed(state, "b")).toBe(false)
+  })
   test("old clients without a subscriber remain pass-through", () => {
     expect(eventStreamInterestFromHeaders({})).toBeUndefined()
     expect(eventStreamAllowsSession(undefined, "ses_1")).toBe(true)

@@ -27,25 +27,24 @@ describe("claude provider discovery", () => {
     expect(MODEL_IDS).toContain("claude-sonnet-4-5-20251101")
     expect(MODEL_IDS).toContain("claude-opus-4-6")
     expect(MODEL_IDS).toContain("claude-haiku-4-5-20251001")
-    // first-party port of opencode-claude exposes the same subscription models
-    expect(MODEL_IDS).toContain("fable")
-    expect(MODEL_IDS).toContain("sonnet")
-    expect(MODEL_IDS).toContain("opus")
-    expect(MODEL_IDS).toContain("haiku")
+    // Moving subscription aliases are migration inputs, not catalog rows.
+    expect(MODEL_IDS).not.toContain("fable")
+    expect(MODEL_IDS).not.toContain("sonnet")
+    expect(MODEL_IDS).not.toContain("opus")
+    expect(MODEL_IDS).not.toContain("haiku")
     expect(MODEL_IDS).toContain("claude-opus-4-8")
     expect(MODEL_IDS).toContain("claude-sonnet-4-6")
     expect(MODEL_IDS).toContain("claude-haiku-4-5")
   })
 
   it("aliases resolve to canonical IDs", () => {
-    expect(resolveAlias("claude/sonnet")).toBe("claude-sonnet-4-5-20251101")
-    expect(resolveAlias("claude/opus")).toBe("claude-opus-4-6")
-    expect(resolveAlias("claude/haiku")).toBe("claude-haiku-4-5-20251001")
+    expect(resolveAlias("claude/sonnet")).toMatch(/^claude-sonnet-/)
+    expect(resolveAlias("claude/opus")).toMatch(/^claude-opus-/)
+    expect(resolveAlias("claude/haiku")).toMatch(/^claude-haiku-/)
     expect(resolveAlias("unknown-alias")).toBeUndefined()
-    // short forms resolve to themselves (valid model IDs for subscription)
-    expect(resolveAlias("sonnet")).toBe("sonnet")
-    expect(resolveAlias("fable")).toBe("fable")
-    expect(resolveAlias("opus")).toBe("opus")
+    // Moving subscription aliases resolve to a concrete discovered/fallback ID.
+    expect(resolveAlias("sonnet")).toMatch(/^claude-sonnet-/)
+    expect(resolveAlias("opus")).toMatch(/^claude-opus-/)
   })
 
   it("isClaudeModel recognizes canonical and family IDs", () => {
@@ -59,12 +58,10 @@ describe("claude provider discovery", () => {
   })
 
   it("migrateLegacyReference handles canonical IDs and aliases", () => {
-    expect(migrateLegacyReference("claude/sonnet")).toBe("claude-sonnet-4-5-20251101")
+    expect(migrateLegacyReference("claude/sonnet")).toMatch(/^claude-sonnet-/)
     expect(migrateLegacyReference("claude-sonnet-4-5-20251101")).toBe("claude-sonnet-4-5-20251101")
     expect(migrateLegacyReference("unknown")).toBeUndefined()
-    // new short forms for first-party
-    expect(migrateLegacyReference("sonnet")).toBe("sonnet")
-    expect(migrateLegacyReference("fable")).toBe("fable")
+    expect(migrateLegacyReference("sonnet")).toMatch(/^claude-sonnet-/)
   })
 
   it("model metadata has capabilities and variants", () => {

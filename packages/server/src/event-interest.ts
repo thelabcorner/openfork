@@ -3,6 +3,7 @@ import {
   STREAM_INTEREST_MAX_SESSIONS,
   STREAM_INTEREST_MAX_SUBSCRIBER_CHARS,
   STREAM_INTEREST_SESSIONS_HEADER,
+  STREAM_INTEREST_GENERATION_HEADER,
   STREAM_INTEREST_SUBSCRIBER_HEADER,
   normalizeStreamInterestSessions,
 } from "@opencode-ai/core/session-stream-content"
@@ -11,6 +12,8 @@ export type EventStreamInterest = {
   readonly subscriber: string
   /** undefined means compatibility/pass-through mode. */
   sessions: Set<string> | undefined
+  /** Monotonic desired-state revision, shared with reconnect headers. */
+  generation: number | undefined
   /** Sessions for which this connection already emitted a stale marker. */
   readonly suppressed: Set<string>
 }
@@ -46,7 +49,19 @@ export function eventStreamInterestFromHeaders(headers: Record<string, string | 
   return {
     subscriber,
     sessions: parseSessionsHeader(headers[STREAM_INTEREST_SESSIONS_HEADER]),
+    ...(headers[STREAM_INTEREST_GENERATION_HEADER] === undefined
+      ? {}
+      : { generation: parseGeneration(headers[STREAM_INTEREST_GENERATION_HEADER]) }),
   }
+}
+
+const validGeneration = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+
+function parseGeneration(raw: string | undefined) {
+  if (raw === undefined || !/^\d+$/.test(raw)) return undefined
+  const value = Number(raw)
+  return validGeneration(value) ? value : undefined
 }
 
 /**
@@ -57,11 +72,13 @@ export function eventStreamInterestFromHeaders(headers: Record<string, string | 
 export function registerEventStreamInterest(
   subscriber: string | undefined,
   sessions: readonly string[] | undefined,
+  generation?: number,
 ): EventStreamInterest | undefined {
   if (!validSubscriber(subscriber)) return undefined
   const state: EventStreamInterest = {
     subscriber,
     sessions: sessions === undefined ? undefined : new Set(normalizeStreamInterestSessions(sessions)),
+    generation: validGeneration(generation) ? generation : undefined,
     suppressed: new Set(),
   }
   registry.set(subscriber, state)
@@ -74,7 +91,7 @@ export function unregisterEventStreamInterest(state: EventStreamInterest | undef
 }
 
 /** Update a live subscriber. False means the stream is no longer registered. */
-export function updateEventStreamInterest(subscriber: string, sessions: readonly string[]) {
+export function updateEventStreamInterest(subscriber: string, sessions: readonly string[], generation?: number) {
   if (!validSubscriber(subscriber) || sessions.length > STREAM_INTEREST_MAX_SESSIONS) return false
   const state = registry.get(subscriber)
   if (!state) return false
@@ -83,13 +100,28 @@ export function updateEventStreamInterest(subscriber: string, sessions: readonly
   // request rather than interpreting a malformed caller as an empty interest
   // set. The initial header parser remains fail-open for compatibility.
   if (normalized.length !== new Set(sessions).size) return false
+  if (generation !== undefined && !validGeneration(generation)) return false
+  // Once versioned, a legacy or stale control request cannot overwrite newer
+  // interest from a reconnect header or a subsequent desired-state update.
+  if (state.generation !== undefined && (generation === undefined || generation < state.generation)) return false
+  if (generation !== undefined && generation === state.generation) {
+    // Idempotent retry is allowed; conflicting content at the same revision is
+    // not a new desired state and must not change suppression latches.
+    return state.sessions !== undefined && normalized.length === state.sessions.size &&
+      normalized.every((sessionID) => state.sessions!.has(sessionID))
+  }
   const next = new Set(normalized)
   // Once a session is admitted again, the client will repair/hydrate it before
   // consuming content. Clear the dirty latch so a later background period can
   // emit exactly one fresh stale marker.
   for (const sessionID of next) state.suppressed.delete(sessionID)
   state.sessions = next
+  state.generation = generation
   return true
+}
+
+export function eventStreamInterestGeneration(subscriber: string) {
+  return registry.get(subscriber)?.generation
 }
 
 export function eventStreamAllowsSession(state: EventStreamInterest | undefined, sessionID: string) {

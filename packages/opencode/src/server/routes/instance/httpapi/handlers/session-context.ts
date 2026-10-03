@@ -8,6 +8,7 @@ import { SessionContextState } from "@/session/context/state"
 import { SessionLedger } from "@/session/context/ledger"
 import { EffectiveContextCompiler } from "@/session/context/compiler"
 import { ApiNotFoundError } from "../errors"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 
 /**
  * Translate any non-declared domain failure to the group's declared error
@@ -42,7 +43,13 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
     const applyOps = translateHandler(Effect.fn("session-context.applyOps")(function* ({ params, payload }: any) {
       const { sessionID } = params as { sessionID: string }
       // Validate session exists
-      yield* session.get(sessionID as any)
+      const current = yield* session.get(sessionID as any)
+      // Special-agent transcripts are host-owned inspection surfaces. Context
+      // overlays are interactive-session mutations and do not alter the
+      // privileged/current transcript that an auditor or revisor actually saw.
+      if (SessionMetadataOwnership.isSpecialAgent(current.metadata)) {
+        return yield* Effect.fail(new HttpApiError.BadRequest())
+      }
       // Validate ops at admission. The compiler repeats these guards for old
       // persisted rows, but invalid operations must not enter the durable event
       // log/projector in the first place.
@@ -85,20 +92,41 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
 
     const ledger = translateHandler(Effect.fn("session-context.ledger")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
-      yield* session.get(sessionID as any)
+      const current = yield* session.get(sessionID as any)
+      if (SessionMetadataOwnership.isSpecialAgent(current.metadata)) {
+        const messages = yield* MessageV2.currentMessages({ sessionID: sessionID as any }).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        return yield* SessionLedger.buildCurrentReadOnly({ sessionID, messages })
+      }
+
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
         Effect.catch(() => Effect.succeed([] as never)),
       )
       const filtered = MessageV2.filterCompacted(all as any)
-      const result = yield* SessionLedger.build({ sessionID, messages: filtered as any })
-      return result
+      return yield* SessionLedger.build({ sessionID, messages: filtered as any })
     }),
   )
 
     const preview = translateHandler(Effect.fn("session-context.preview")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
-      yield* session.get(sessionID as any)
+      const current = yield* session.get(sessionID as any)
+      if (SessionMetadataOwnership.isSpecialAgent(current.metadata)) {
+        const messages = yield* MessageV2.currentMessages({ sessionID: sessionID as any }).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        const ledgerData = yield* SessionLedger.buildCurrentReadOnly({ sessionID, messages })
+        return {
+          beforeTokens: ledgerData.totals.estimatedTokens,
+          afterTokens: ledgerData.totals.estimatedTokens,
+          removedTokens: 0,
+          messageCount: ledgerData.totals.messageCount,
+          effectiveCount: ledgerData.totals.messageCount,
+          earliestMutationIndex: undefined,
+        }
+      }
+
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
         Effect.catch(() => Effect.succeed([] as never)),

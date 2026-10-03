@@ -185,15 +185,18 @@ describe("HttpApi instance context middleware", () => {
     { timeout: 30_000 },
   )
 
-  it.live("falls back to the raw directory when URI decoding fails", () =>
+  it.live("preserves literal URI-like directory names without a second decode", () =>
     Effect.gen(function* () {
+      const root = yield* tmpdirScoped()
+      const directory = path.join(root, "%2F-target-%E0%A4%A")
+      yield* Effect.promise(() => mkdir(directory, { recursive: true }))
       yield* serveProbe()
 
-      const response = yield* HttpClient.get("/probe?directory=%25E0%25A4%25A")
+      const response = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(directory)}`)
 
       expect(response.status).toBe(200)
       expect(yield* response.json).toMatchObject({
-        directory: path.join(process.cwd(), "%E0%A4%A"),
+        directory,
       })
     }),
   )

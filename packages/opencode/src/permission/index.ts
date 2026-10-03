@@ -7,7 +7,10 @@ import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Plugin } from "@/plugin"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import type { ExternalActor } from "@/session/external-actor"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { PendingResponseRegistry } from "@/server/pending-response-registry"
 
 export const Event = PermissionV1.Event
 
@@ -22,6 +25,7 @@ export interface Interface {
 interface PendingEntry {
   info: PermissionV1.Request
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+  settling?: boolean
 }
 
 interface State {
@@ -47,6 +51,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const responses = yield* PendingResponseRegistry.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         void ctx
@@ -105,13 +110,28 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
+      const entry = { info, deferred }
+      pending.set(id, entry)
+      const context = yield* InstanceState.context
+      const unregister = yield* responses.register({
+        kind: "permission",
+        requestID: id,
+        sessionID: info.sessionID,
+        directory: FSUtil.resolve(context.directory),
+        snapshot: info,
+        settle: (payload) =>
+          reply(payload as PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref }).pipe(
+            Effect.provideService(InstanceRef, context),
+            Effect.catchTag("Permission.NotFoundError", () =>
+              Effect.fail(new PendingResponseRegistry.NotFoundError({ requestID: id })),
+            ),
+          ),
+      })
       return yield* Effect.ensuring(
-        Deferred.await(deferred),
+        events.publish(Event.Asked, info).pipe(Effect.andThen(Deferred.await(deferred))),
         Effect.sync(() => {
-          pending.delete(id)
-        }),
+            if (pending.get(id) === entry) pending.delete(id)
+          }).pipe(Effect.andThen(unregister)),
       )
     })
 
@@ -119,47 +139,62 @@ const layer = Layer.effect(
       input: PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref },
     ) {
       const { approved, pending } = yield* InstanceState.get(state)
+      const context = yield* InstanceState.context
+      const workspaceID = yield* WorkspaceRef
+      const notify = (effect: Effect.Effect<void, unknown>) =>
+        responses.notify(
+          effect.pipe(Effect.provideService(InstanceRef, context), Effect.provideService(WorkspaceRef, workspaceID)),
+          FSUtil.resolve(context.directory),
+        )
       const existing = pending.get(input.requestID)
       if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+      if (existing.settling) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
 
-      pending.delete(input.requestID)
-      yield* events.publish(Event.Replied, {
-        sessionID: existing.info.sessionID,
-        requestID: existing.info.id,
-        reply: input.reply,
-      }, input.actor ? { metadata: { actor: input.actor } } : undefined)
+      existing.settling = true
+      const event = () => events.publish(
+        Event.Replied,
+        { sessionID: existing.info.sessionID, requestID: existing.info.id, reply: input.reply },
+        input.actor ? { metadata: { actor: input.actor } } : undefined,
+      )
 
       if (input.reply === "reject") {
+        pending.delete(input.requestID)
         yield* Deferred.fail(
           existing.deferred,
           input.message
             ? new PermissionV1.CorrectedError({ feedback: input.message })
             : new PermissionV1.RejectedError(),
         )
+        yield* notify(event())
 
         for (const [id, item] of pending.entries()) {
           if (item.info.sessionID !== existing.info.sessionID) continue
+          if (item.settling) continue
+          item.settling = true
           pending.delete(id)
-          yield* events.publish(Event.Replied, {
-            sessionID: item.info.sessionID,
-            requestID: item.info.id,
-            reply: "reject",
-          }, input.actor ? { metadata: { actor: input.actor } } : undefined)
           yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+          yield* notify(events.publish(
+            Event.Replied,
+            { sessionID: item.info.sessionID, requestID: item.info.id, reply: "reject" },
+            input.actor ? { metadata: { actor: input.actor } } : undefined,
+          ))
         }
         return
       }
 
-      yield* Deferred.succeed(existing.deferred, undefined)
-      if (input.reply === "once") return
-
-      for (const pattern of existing.info.always) {
-        approved.push({
-          permission: existing.info.permission,
-          pattern,
-          action: "allow",
-        })
+      if (input.reply !== "once") {
+        for (const pattern of existing.info.always) {
+          approved.push({
+            permission: existing.info.permission,
+            pattern,
+            action: "allow",
+          })
+        }
       }
+      pending.delete(input.requestID)
+      yield* Deferred.succeed(existing.deferred, undefined)
+      yield* notify(event())
+      if (input.reply === "once") return
 
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
@@ -167,13 +202,15 @@ const layer = Layer.effect(
           (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
         )
         if (!ok) continue
+        if (item.settling) continue
+        item.settling = true
         pending.delete(id)
-        yield* events.publish(Event.Replied, {
-          sessionID: item.info.sessionID,
-          requestID: item.info.id,
-          reply: "always",
-        }, input.actor ? { metadata: { actor: input.actor } } : undefined)
         yield* Deferred.succeed(item.deferred, undefined)
+        yield* notify(events.publish(
+          Event.Replied,
+          { sessionID: item.info.sessionID, requestID: item.info.id, reply: "always" },
+          input.actor ? { metadata: { actor: input.actor } } : undefined,
+        ))
       }
     })
 
@@ -245,7 +282,11 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [EventV2Bridge.node, PendingResponseRegistry.node],
+})
 
 export * as Permission from "."
 

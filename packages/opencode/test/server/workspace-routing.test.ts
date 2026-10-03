@@ -25,9 +25,9 @@ describe("isLocalWorkspaceRoute", () => {
     expect(isLocalWorkspaceRoute("POST", "/session")).toBe(false)
   })
 
-  test("/session/status is forwarded regardless of method", () => {
-    expect(isLocalWorkspaceRoute("GET", "/session/status")).toBe(false)
-    expect(isLocalWorkspaceRoute("POST", "/session/status")).toBe(false)
+  test("global /session/status stays on this process regardless of workspace selection", () => {
+    expect(isLocalWorkspaceRoute("GET", "/session/status")).toBe(true)
+    expect(isLocalWorkspaceRoute("POST", "/session/status")).toBe(true)
   })
 
   test("unrecognized paths are not local", () => {

@@ -131,7 +131,12 @@ const replyPermission: OxpRequestControl.Interface["replyPermission"] = (
           reply: input.reply,
           ...(input.message ? { message: input.message } : {}),
           actor: actor(input.actorRef),
-        })
+        }).pipe(
+          Effect.catchIf(
+            (error) => error instanceof runtime.PermissionV1.NotFoundError,
+            () => Effect.fail(new OxpRequestControl.RequestNotFound()),
+          ),
+        )
       }),
   )
 
@@ -160,7 +165,12 @@ const answerQuestion: OxpRequestControl.Interface["answerQuestion"] = (
           answers: input.answers.map((answer) => [...answer]),
           ...(input.details ? { details: [...input.details] } : {}),
           actor: actor(input.actorRef),
-        })
+        }).pipe(
+          Effect.catchIf(
+            (error) => error instanceof runtime.Question.NotFoundError,
+            () => Effect.fail(new OxpRequestControl.RequestNotFound()),
+          ),
+        )
       }),
   )
 
@@ -187,6 +197,11 @@ const rejectQuestion: OxpRequestControl.Interface["rejectQuestion"] = (
         yield* question.reject(
           runtime.QuestionID.ascending(input.requestID),
           actor(input.actorRef),
+        ).pipe(
+          Effect.catchIf(
+            (error) => error instanceof runtime.Question.NotFoundError,
+            () => Effect.fail(new OxpRequestControl.RequestNotFound()),
+          ),
         )
       }),
   )

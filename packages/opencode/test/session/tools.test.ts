@@ -18,7 +18,7 @@ import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Snapshot } from "@/snapshot"
 import { isCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
-import { Effect, Layer, Schema } from "effect"
+import { Deferred, Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
 
 const callID = "call-test"
@@ -200,13 +200,16 @@ function findDef(label: string): Tool.Def {
   }
 }
 
-function findLayer(defs: Tool.Def[]) {
+function findLayer(
+  defs: Tool.Def[],
+  overrides?: { permission?: Permission.Interface; interrupt?: ToolInterrupt.Interface },
+) {
   return Layer.mergeAll(
     Layer.succeed(Plugin.Service, fakePlugin),
-    Layer.succeed(Permission.Service, fakePermission),
+    Layer.succeed(Permission.Service, overrides?.permission ?? fakePermission),
     Layer.succeed(MCP.Service, fakeMcp()),
     Layer.succeed(Truncate.Service, fakeTruncate),
-    Layer.succeed(ToolInterrupt.Service, fakeInterrupt),
+    Layer.succeed(ToolInterrupt.Service, overrides?.interrupt ?? fakeInterrupt),
     Layer.succeed(Snapshot.Service, fakeSnapshot),
     RuntimeFlags.layer(),
     Layer.succeed(
@@ -220,6 +223,44 @@ function findLayer(defs: Tool.Def[]) {
       }),
     ),
   )
+}
+
+const permissionGateDef = {
+  id: "permission-gate",
+  description: "waits on a permission request before completing",
+  parameters: Schema.Struct({}),
+  jsonSchema: { type: "object", properties: {} },
+  execute: (_args, ctx) =>
+    Effect.gen(function* () {
+      yield* ctx.ask({
+        permission: "external_directory",
+        patterns: ["/outside"],
+        always: [],
+        metadata: {},
+      })
+      return { title: "permission-gate", metadata: {}, output: "ok" }
+    }),
+} satisfies Tool.Def
+
+function processorStub(): Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall"> {
+  return {
+    message: {
+      id: MessageID.ascending(),
+      sessionID,
+      role: "assistant",
+      parentID: MessageID.ascending(),
+      agent: "build",
+      mode: "build",
+      path: { cwd: "/tmp", root: "/tmp" },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ModelV2.ID.make("test-model"),
+      providerID: ProviderV2.ID.make("test"),
+      time: { created: 1 },
+    },
+    updateToolCall: () => Effect.die("unused"),
+    completeToolCall: () => Effect.void,
+  }
 }
 
 const canonicalFindDef = findDef("canonical find")
@@ -501,5 +542,132 @@ it.effect("coalesces rapid tool progress metadata updates", () =>
     // publishes; the leading update always goes through immediately.
     expect(seen.length).toBeLessThan(20)
     expect(seen[0]).toBe(JSON.stringify({ output: "chunk-0" }))
+  }),
+)
+
+
+it.effect("propagates the parent tool AbortSignal into the detached Effect root", () =>
+  Effect.gen(function* () {
+    const started = yield* Deferred.make<void>()
+    const controller = new AbortController()
+    let finalized = false
+    const blockingDef = {
+      id: "blocking",
+      description: "blocks until the tool root is interrupted",
+      parameters: Schema.Struct({}),
+      jsonSchema: { type: "object", properties: {} },
+      execute: () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined)
+          return yield* Effect.never
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              finalized = true
+            }),
+          ),
+        ),
+    } satisfies Tool.Def
+
+    yield* Effect.gen(function* () {
+      const tools = yield* SessionTools.resolve({
+        agent,
+        model,
+        session: { id: sessionID, permission: [] } as unknown as Session.Info,
+        processor: processorStub(),
+        authorizedAgentNames: new Set(),
+        messages: [],
+        promptOps: {} as never,
+      })
+      const execute = tools.blocking.execute
+      if (!execute) throw new Error("blocking tool is missing execute")
+
+      const pending = execute(
+        {},
+        {
+          toolCallId: "blocking-call",
+          abortSignal: controller.signal,
+          messages: [],
+        },
+      ).then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      )
+
+      yield* Deferred.await(started)
+      controller.abort()
+
+      expect(yield* Effect.promise(() => pending)).toBe("rejected")
+      expect(finalized).toBe(true)
+    }).pipe(Effect.provide(findLayer([blockingDef])))
+  }),
+)
+
+it.effect("per-tool kill interrupts a pending permission wait without aborting the parent turn", () =>
+  Effect.gen(function* () {
+    const asked = yield* Deferred.make<void>()
+    const parent = new AbortController()
+    const child = new AbortController()
+    let permissionFinalized = false
+
+    const permission = Permission.Service.of({
+      ask: () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(asked, undefined)
+          return yield* Effect.never
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              permissionFinalized = true
+            }),
+          ),
+        ),
+      reply: () => Effect.void,
+      list: () => Effect.succeed([]),
+    } satisfies Permission.Interface)
+    const interrupt = ToolInterrupt.Service.of({
+      track: () => Effect.succeed(child.signal),
+      kill: () =>
+        Effect.sync(() => {
+          if (child.signal.aborted) return false
+          child.abort()
+          return true
+        }),
+      release: () => Effect.void,
+    } satisfies ToolInterrupt.Interface)
+
+    yield* Effect.gen(function* () {
+      const tools = yield* SessionTools.resolve({
+        agent,
+        model,
+        session: { id: sessionID, permission: [] } as unknown as Session.Info,
+        processor: processorStub(),
+        authorizedAgentNames: new Set(),
+        messages: [],
+        promptOps: {} as never,
+      })
+      const execute = tools[permissionGateDef.id].execute
+      if (!execute) throw new Error("permission-gate tool is missing execute")
+
+      const pending = execute(
+        {},
+        {
+          toolCallId: "permission-call",
+          abortSignal: parent.signal,
+          messages: [],
+        },
+      ).then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      )
+
+      yield* Deferred.await(asked)
+      expect(parent.signal.aborted).toBe(false)
+      expect(yield* interrupt.kill({ sessionID, callID: "permission-call" })).toBe(true)
+
+      expect(yield* Effect.promise(() => pending)).toBe("rejected")
+      expect(permissionFinalized).toBe(true)
+      expect(parent.signal.aborted).toBe(false)
+    }).pipe(Effect.provide(findLayer([permissionGateDef], { permission, interrupt })))
   }),
 )

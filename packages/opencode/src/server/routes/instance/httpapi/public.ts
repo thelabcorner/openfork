@@ -162,6 +162,14 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
           if (content.schema) content.schema = stripOptionalNull(structuredClone(content.schema))
         }
       }
+      if (path === "/fork/capacity" && method === "get") {
+        // `/fork/capacity` Estimate fields are genuinely `Schema.NullOr`: `null`
+        // means "not yet known / not measurable", not "field absent". Re-add the
+        // null arms that the strip above removed for this one response so the
+        // generated SDK keeps `number | null` for them.
+        const success = operation.responses?.["200"]?.content?.["application/json"]?.schema
+        if (success) applyCapacityEstimateNullability(success, spec)
+      }
       if (!isV2Api) {
         // Auth is still runtime middleware outside the legacy public OpenAPI
         // metadata, so the legacy SDK should not expose auth schemes or
@@ -325,6 +333,54 @@ function makePropertiesNullable(properties: Record<string, OpenApiSchema>) {
 function nullable(schema: OpenApiSchema): OpenApiSchema {
   if (flattenOptions(schema.anyOf ?? schema.oneOf)?.some((item) => item.type === "null")) return schema
   return { anyOf: [schema, { type: "null" }] }
+}
+
+/** Required `Estimate` fields that are genuinely nullable on the wire. */
+const CapacityNullableEstimateFields = ["estimatedRequests", "remainingPercent", "resetAt"] as const
+
+/**
+ * Recognize the cross-provider `Estimate` record by shape rather than by
+ * component name: `status`/`source` are what separate it from the Go-specific
+ * `GoEstimate` rows in `routed`/`accounts`, whose three fields are always
+ * finite numbers and must stay non-nullable.
+ */
+function isCapacityEstimateSchema(schema: OpenApiSchema) {
+  const properties = schema.properties
+  if (!properties?.status || !properties.source) return false
+  return CapacityNullableEstimateFields.every((field) => properties[field] !== undefined)
+}
+
+/**
+ * Re-add `null` to the three `NullOr` Estimate fields at every provider/account
+ * estimate location in the `/fork/capacity` response: `providers[].defaultEstimates`,
+ * `providers[].estimates`, `providers[].accounts[].defaultEstimate`, and
+ * `providers[].accounts[].estimates`.
+ */
+function applyCapacityEstimateNullability(schema: OpenApiSchema, spec: OpenApiSpec, visited: Set<string> = new Set()) {
+  if (schema.$ref) {
+    const name = schema.$ref.replace("#/components/schemas/", "")
+    if (visited.has(name)) return
+    visited.add(name)
+    const component = spec.components?.schemas?.[name]
+    if (component) applyCapacityEstimateNullability(component, spec, visited)
+    return
+  }
+  if (isCapacityEstimateSchema(schema)) {
+    for (const field of CapacityNullableEstimateFields) {
+      schema.properties![field] = nullable(schema.properties![field]!)
+    }
+    return
+  }
+  for (const nested of Object.values(schema.properties ?? {})) applyCapacityEstimateNullability(nested, spec, visited)
+  for (const nested of [schema.items, ...(schema.prefixItems ?? [])]) {
+    if (nested) applyCapacityEstimateNullability(nested, spec, visited)
+  }
+  if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+    applyCapacityEstimateNullability(schema.additionalProperties, spec, visited)
+  }
+  for (const nested of [...(schema.anyOf ?? []), ...(schema.oneOf ?? []), ...(schema.allOf ?? [])]) {
+    applyCapacityEstimateNullability(nested, spec, visited)
+  }
 }
 
 function stableSchema(input: unknown, schemas: Record<string, OpenApiSchema>): string {

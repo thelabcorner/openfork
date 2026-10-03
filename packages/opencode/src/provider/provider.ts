@@ -19,9 +19,11 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types, Stream } from "effect"
+import { Effect, Layer, Context, Schema, Types, Semaphore } from "effect"
+import { HttpClient } from "effect/unstable/http"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
+import * as ProviderCatalogContributions from "./catalog-contributions"
 import { EffectPromise } from "@/effect/promise"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { isRecord } from "@/util/record"
@@ -30,6 +32,7 @@ import { ProviderTransform } from "./transform"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { PRODUCT_NAME, PRODUCT_REPOSITORY_URL, PRODUCT_SLUG } from "@opencode-ai/core/brand"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionSchema as CoreSessionSchema } from "@opencode-ai/core/session/schema"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { trackNvidiaRequest } from "@/quota/providers/nvidia-usage"
@@ -37,19 +40,27 @@ import { ProviderError } from "./error"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
 import {
   discoverZenSystemOneModel,
+  zenHostedCatalog,
   zenAccountModelAliases,
   zenGoProviderFetch,
   zenProviderFetch,
   syncZenAccountPool,
   zenQuotaAccounts,
+  zenLimitSnapshot,
+  committedZenProviderFetch,
+  committedPublicZenProviderFetch,
   ZEN_PUBLIC_API_KEY,
 } from "@/plugin/zen"
+import { stableZenIdentity } from "@/plugin/zen-accounts"
 import {
   MODEL_IDS,
   MODEL_METADATA,
+  claudeSubscriptionCatalogRevision,
+  getClaudeSubscriptionModelMetadata,
   modelApi,
   PROXY_API_KEY,
   PROXY_BASE_URL,
+  resolveAlias as resolveClaudeAlias,
 } from "@/claude/models"
 import {
   MODEL_IDS as GENSPARK_MODEL_IDS,
@@ -61,9 +72,32 @@ import {
   resolveApiKey as resolveGensparkApiKey,
 } from "@/genspark/models"
 import { GensparkCatalog } from "@/genspark/catalog"
-import { Integration } from "@opencode-ai/core/integration"
-import { EventV2 } from "@opencode-ai/core/event"
+import { Credential } from "@opencode-ai/core/credential"
+import * as CredentialResolver from "@opencode-ai/core/credential/resolver"
+import { ProviderRoute } from "@opencode-ai/core/provider-route"
+import { ProviderRouteHealth } from "@opencode-ai/core/provider-route-health"
+import { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import { ProviderRouteIntentRuntime } from "@opencode-ai/core/provider-route-intent"
+import { ProviderAccountPolicy } from "@opencode-ai/core/provider-account-policy"
+import { OpencodeProviderRoute } from "@opencode-ai/core/plugin/provider/opencode-provider-route"
+import { OpencodeRouteCandidates } from "@opencode-ai/core/plugin/provider/opencode-route-candidates"
+import { projectCredential as projectOpencodeCredential } from "@opencode-ai/core/plugin/provider/opencode-provider-account"
+import { httpClient as httpClientNode } from "@opencode-ai/core/effect/app-node-platform"
+import { integrationID as opencodeIntegrationID } from "@opencode-ai/core/plugin/provider/opencode-auth"
+import type { AccountProviderCapability } from "@opencode-ai/core/plugin/provider/opencode-account-capability"
+import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
+import { ProviderAccount } from "@opencode-ai/schema/provider-account"
+import { withTransientReadRetry } from "@/util/effect-http-client"
+import { serviceRealmID } from "@/server/shared/instance-identity"
+import {
+  consoleClientIdentity,
+  isConsoleAccountProvider,
+  makeConsoleAccountExecutionResolver,
+  type ConsoleAccountExecution,
+  type ConsoleClientIdentity,
+} from "./console-account-execution"
 import { providerModelID, splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
+
 import {
   resolveProviderAccountSelector,
   type ProviderAccountIdentity,
@@ -203,6 +237,10 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>
 type CustomVarsLoader = (options: Record<string, any>) => Record<string, string>
 type CustomDiscoverModels = () => Promise<Record<string, Model>>
+type DiscoveryLoader = {
+  readonly load: CustomDiscoverModels
+  readonly mode: "merge" | "replace"
+}
 type CustomLoader = (provider: Info) => Effect.Effect<{
   autoload: boolean
   getModel?: CustomModelLoader
@@ -216,6 +254,7 @@ type CustomDep = {
   config: () => Effect.Effect<ConfigV1.Info>
   env: () => Effect.Effect<Record<string, string | undefined>>
   get: (key: string) => Effect.Effect<string | undefined>
+  modelsDev: () => Record<string, ModelsDev.Provider>
   gensparkCatalog: (apiKey: string | undefined) => Effect.Effect<GensparkCatalog.Catalog, never, never>
 }
 
@@ -272,8 +311,15 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         Boolean((yield* dep.config()).provider?.["opencode"]?.options?.apiKey)
 
       if (!ok) {
+        const hosted = yield* Effect.promise(() => zenHostedCatalog())
+        const advertised =
+          hosted.state === "fresh" || hosted.state === "stale"
+            ? hosted.ids
+            : new Set<string>()
+        const catalog = dep.modelsDev()[input.id]?.models
         for (const [key, value] of Object.entries(input.models)) {
-          if (value.cost.input === 0) continue
+          const hostedModelID = value.api.id
+          if (advertised.has(hostedModelID) && isTrustedZeroCostCatalogModel(catalog?.[hostedModelID])) continue
           delete input.models[key]
         }
       }
@@ -1060,10 +1106,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
             migrateLegacyReference: m.ClaudeProvider.migrateLegacyReference,
           })),
         )
-        const { MODEL_IDS, MODEL_METADATA, PROVIDER_ID, modelApi } = yield* Effect.promise(() =>
+        const { getClaudeSubscriptionModelMetadata, PROVIDER_ID, modelApi } = yield* Effect.promise(() =>
           import("../claude/models").then((m) => ({
-            MODEL_IDS: m.MODEL_IDS,
-            MODEL_METADATA: m.MODEL_METADATA,
+            getClaudeSubscriptionModelMetadata: m.getClaudeSubscriptionModelMetadata,
             PROVIDER_ID: m.PROVIDER_ID,
             modelApi: m.modelApi,
           })),
@@ -1091,8 +1136,8 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           },
           async discoverModels(): Promise<Record<string, Model>> {
             const result: Record<string, Model> = {}
-            for (const [id, meta] of Object.entries(MODEL_METADATA)) {
-              if (!MODEL_IDS.includes(id)) continue
+            const metadata = getClaudeSubscriptionModelMetadata(dep.modelsDev()["anthropic"])
+            for (const [id, meta] of Object.entries(metadata)) {
               result[id] = {
                 id: ModelV2.ID.make(id),
                 providerID: PROVIDER_ID,
@@ -1105,7 +1150,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
                 cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
                 limit: {
                   context: meta.contextLimit,
-                  input: undefined,
+                  input: meta.contextLimit >= 1_000_000 ? Math.round(meta.contextLimit * 0.9) : undefined,
                   output: meta.outputLimit,
                 },
                 capabilities: meta.capabilities,
@@ -1408,6 +1453,12 @@ export const ListResult = Schema.Struct({
   all: Schema.Array(Info),
   default: DefaultModelIDs,
   connected: Schema.Array(Schema.String),
+  catalog: Schema.optional(
+    Schema.Struct({
+      status: Schema.Literals(["pending", "partial", "ready"]),
+      revision: Schema.Int,
+    }),
+  ),
 })
 export type ListResult = Types.DeepMutable<Schema.Schema.Type<typeof ListResult>>
 
@@ -1541,6 +1592,19 @@ export class AccountResolutionError extends Schema.TaggedErrorClass<AccountResol
   }
 }
 
+export class RouteResolutionError extends Schema.TaggedErrorClass<RouteResolutionError>()(
+  "ProviderRouteResolutionError",
+  {
+    providerID: ProviderV2.ID,
+    modelID: ModelV2.ID,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return `Provider route unavailable: ${this.providerID}/${this.modelID}`
+  }
+}
+
 export type DefaultModelError = ModelNotFoundError | NoProvidersError | NoModelsError
 export type Error =
   | ModelNotFoundError
@@ -1549,6 +1613,96 @@ export type Error =
   | NoModelsError
   | UnsupportedModelPrimitiveError
   | AccountResolutionError
+  | RouteResolutionError
+
+export interface RoutedModel {
+  readonly model: Model
+  readonly route: OpencodeProviderRoute.Resolution
+}
+
+export interface TransientRoutedModel {
+  readonly model: Model
+  readonly route: OpencodeProviderRoute.TransientResolution
+  /**
+   * Exact physical transport of this same resolution, produced where the
+   * selected credential is already in hand.
+   *
+   * `apiKey` is the live credential of the selected route: the account secret
+   * for an account route, or the hosted public sentinel for a Public route. It
+   * exists only in process, alongside the route that selected it, and must
+   * never be persisted, logged, settled, or copied into route or usage
+   * attribution. Consuming it is transport materialization of an already-made
+   * decision, never a second authorization surface.
+   */
+  readonly transport: RouteTransport
+}
+
+/**
+ * Exact physical transport of one already-resolved route.
+ *
+ * `apiKey` is the live credential of the selected route: the account secret for
+ * an account route, or the hosted public sentinel for a Public route. It is
+ * returned only to the in-process caller that already holds the committed
+ * route and must never be persisted, logged, settled, or copied into route or
+ * usage attribution. This materializes a decision that has already been made;
+ * it is never a second authorization surface.
+ */
+export interface RouteTransport {
+  readonly baseURL: string
+  readonly apiKey: string
+  readonly headers: Readonly<Record<string, string>>
+}
+
+/**
+ * OpenCode-operated hosted providers.
+ *
+ * Their credentials and routing belong to the account/Public route authority,
+ * so "this provider/model has no authoritative route" must fail closed instead
+ * of degrading to ambient provider options, provider env values, a legacy
+ * default pool account, or a direct catalog key. Third-party providers keep
+ * their mature direct path.
+ */
+const HOSTED_ZEN_PROVIDERS: ReadonlySet<string> = new Set(["opencode", "opencode-go"])
+
+export function isHostedZenProvider(providerID: string): boolean {
+  return HOSTED_ZEN_PROVIDERS.has(providerID)
+}
+
+const noHostedRouteError = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
+  Effect.fail(
+    new RouteResolutionError({
+      providerID,
+      modelID,
+      cause: new Error(
+        "No authoritative OpenCode route resolved for this hosted provider; refusing ambient credential fallback",
+      ),
+    }),
+  )
+
+/**
+ * Transitional Zen/Go API-key compatibility inside the same route authority.
+ *
+ * Plan 7.5/12.1 keep existing Zen/Go API-key accounts working, and plan 7.5
+ * already derives their secret-free identity from the key
+ * (`zen-accounts.stableZenIdentity`). Those keys never become a durable
+ * ProviderAccount row here: they are projected as opaque, secret-free
+ * compatibility candidates so the existing ProviderAccountPolicy and
+ * ProviderRoute own selection, Public/account semantics, and attribution.
+ *
+ * The handle carries no secret and no key material. A key change produces a
+ * different `zen-*` identity, and therefore a different handle, so a stable
+ * revision of 1 is exact: revision 1 means "this compatibility identity".
+ */
+const ZEN_COMPAT_HANDLE_PREFIX = "zen-compat:"
+const ZEN_COMPAT_REVISION = 1
+
+const isZenCompatHandle = (handle: string) => handle.startsWith(ZEN_COMPAT_HANDLE_PREFIX)
+const zenCompatHandle = (accountID: string) => `${ZEN_COMPAT_HANDLE_PREFIX}${accountID}`
+
+export interface ZenCompatExecution {
+  readonly accountID: string
+  readonly apiKey: string
+}
 
 /**
  * Secret-free account-scoped discovery row used by compatibility/inspection
@@ -1562,10 +1716,15 @@ export interface AccountModelProjection {
   readonly model: Model
 }
 
+const zenCompatSourceName = (source: string): ProviderAccount.Source =>
+  source === "env" ? "env" : source === "vault" ? "fork-vault" : "legacy"
+
+
+
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly listAccountModelProjections: () => Effect.Effect<readonly AccountModelProjection[]>
-  readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
+  readonly getProvider: (providerID: ProviderV2.ID, model?: Model) => Effect.Effect<Info>
   /**
    * Resolve a stable provider account id from either that exact id or one
    * unique human-facing label/alias published by the live provider.
@@ -1584,6 +1743,41 @@ export interface Interface {
     modelID: ModelV2.ID,
     accountID?: string,
   ) => Effect.Effect<Model, ModelNotFoundError>
+  /**
+   * Resolve one committed OpenCode ProviderRoute and materialize the exact model
+   * transport for that lease. Returns undefined only for intentionally legacy
+   * provider/account surfaces that have not entered P5A routing yet.
+   */
+  readonly resolveRoutedModel: (input: {
+    readonly sessionID: CoreSessionSchema.ID
+    readonly providerID: ProviderV2.ID
+    readonly modelID: ModelV2.ID
+    readonly accountID?: string
+    readonly routeIntent?: ProviderRouteIntent.Info
+    readonly allowPublic?: boolean
+  }) => Effect.Effect<RoutedModel | undefined, ModelNotFoundError | RouteResolutionError>
+  /**
+   * Materialize a maintenance/special-agent model from the exact parent route
+   * generation. This path never selects, binds, rebinds, or fails over.
+   */
+  readonly resolveInheritedRoutedModel: (input: {
+    readonly sessionID: CoreSessionSchema.ID
+    readonly providerID: ProviderV2.ID
+    readonly modelID: ModelV2.ID
+    readonly route: ProviderRouteResolution.RouteAttribution
+    readonly allowPublic?: boolean
+  }) => Effect.Effect<RoutedModel, ModelNotFoundError | RouteResolutionError>
+  /**
+   * Resolve one non-persistent provider route for a standalone primitive.
+   * No Session/ProviderRoute row is created and no affinity is promised across calls.
+   */
+  readonly resolveTransientRoutedModel: (input: {
+    readonly providerID: ProviderV2.ID
+    readonly modelID: ModelV2.ID
+    readonly accountID?: string
+    readonly routeIntent?: ProviderRouteIntent.Info
+    readonly allowPublic?: boolean
+  }) => Effect.Effect<TransientRoutedModel | undefined, ModelNotFoundError | RouteResolutionError>
   readonly getLanguage: (
     model: Model,
   ) => Effect.Effect<LanguageModelV3, ModelNotFoundError | UnsupportedModelPrimitiveError>
@@ -1595,14 +1789,86 @@ export interface Interface {
   readonly defaultModel: () => Effect.Effect<{ providerID: ProviderV2.ID; modelID: ModelV2.ID }, DefaultModelError>
 }
 
+interface ConsoleBinding {
+  readonly account: ConsoleAccountExecution
+  readonly provider: AccountProviderCapability
+  readonly providerInfo: Info
+  readonly client: ConsoleClientIdentity
+}
+
+function stringHeaderRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  )
+}
+
+/**
+ * Physical transport of one already-selected route.
+ *
+ * `info` must be the bound provider info of that exact route, never an ambient
+ * provider record: a Public route passes the stripped catalog clone and an
+ * account route passes the account capability projection. `apiKey` is supplied
+ * by the route owner and is never derived from configuration here.
+ */
+function routeTransport(info: Info, model: Model, apiKey: string): RouteTransport {
+  const options = { ...info.options, ...model.options }
+  const baseURL =
+    (typeof options.baseURL === "string" && options.baseURL.trim() ? options.baseURL : undefined) ?? model.api.url
+  return {
+    baseURL,
+    apiKey,
+    headers: { ...stringHeaderRecord(options.headers), ...model.headers },
+  }
+}
+
+interface PublicBinding {
+  readonly providerInfo: Info
+}
+
+/**
+ * A committed transitional Zen/Go account route.
+ *
+ * `providerInfo` is secret-free and carries only the route-locked hosted fetch,
+ * so any consumer that reads the provider view still cannot obtain the key.
+ * `secret` exists only in process, for the exact transport constructor.
+ */
+interface ZenCompatBinding {
+  readonly providerInfo: Info
+  readonly accountID: string
+  readonly secret: string
+}
+
+interface ConsoleGenerationSlot {
+  generation: string
+  credentialRevision: number
+  configVersion: number
+  lastUsed: number
+  sdkKeys: Set<string>
+  modelKeys: Set<string>
+}
+
 interface State {
   models: Map<string, LanguageModelV3>
   providers: Record<ProviderV2.ID, Info>
   catalog: Record<ProviderV2.ID, Info>
+  readonly modelsDev: Record<string, ModelsDev.Provider>
+  claudeCatalogRevision: number
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  discoveryLoaders: Record<string, DiscoveryLoader>
+  discoveryPromises: Map<string, Promise<void>>
+  initializeProvider: (providerID: ProviderV2.ID) => Effect.Effect<void>
+  ensureSelectedCatalogProvider: (providerID: ProviderV2.ID) => Effect.Effect<void>
+  initializerIDs: readonly ProviderV2.ID[]
+  materializationRevision: () => number
+  config: ConfigV1.Info
   accountLoaders: Record<string, () => Promise<readonly ProviderAccountIdentity[]>>
+  consoleBindings: WeakMap<Model, ConsoleBinding>
+  publicBindings: WeakMap<Model, PublicBinding>
+  zenCompatBindings: WeakMap<Model, ZenCompatBinding>
+  consoleGenerations: Map<string, ConsoleGenerationSlot>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1640,6 +1906,32 @@ function cost(c: ModelsDev.Model["cost"]): Model["cost"] {
     }
   }
   return result
+}
+
+function zeroCostEntry(input: {
+  input: number
+  output: number
+  cache: { read: number; write: number }
+}) {
+  return input.input === 0 && input.output === 0 && input.cache.read === 0 && input.cache.write === 0
+}
+
+/**
+ * Trusted anonymous/public eligibility from the raw Models.dev pricing record.
+ *
+ * Missing pricing is unknown, not free. When pricing exists, a zero input rate
+ * alone is still insufficient: output, cache, and every published context tier
+ * must also be zero. Explicit source-backed promotional overrides, when needed,
+ * belong in a separate exact-model compatibility layer rather than weakening
+ * this predicate.
+ */
+export function isTrustedZeroCostCatalogModel(model: Pick<ModelsDev.Model, "cost"> | undefined) {
+  if (!model?.cost) return false
+  const normalized = cost(model.cost)
+  if (!zeroCostEntry(normalized)) return false
+  if (normalized.tiers?.some((tier) => !zeroCostEntry(tier))) return false
+  if (normalized.experimentalOver200K && !zeroCostEntry(normalized.experimentalOver200K)) return false
+  return true
 }
 
 // Cloudflare AI Gateway routes OpenAI and Anthropic models through their native
@@ -1738,6 +2030,120 @@ export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
   }
 }
 
+/**
+ * Apply one explicit V1 provider config to the materialized catalog provider.
+ * Both the execution state and the bootstrap-free provider catalog use this
+ * projection so custom models, aliases, model defaults, and variants have one
+ * authoritative transform.
+ */
+export function fromConfigProvider(
+  providerID: string,
+  provider: NonNullable<ConfigV1.Info["provider"]>[string],
+  existing: Info | undefined,
+  modelsDev: Record<string, ModelsDev.Provider>,
+): Info {
+  const parsed: Info = {
+    id: ProviderV2.ID.make(providerID),
+    name: provider.name ?? existing?.name ?? providerID,
+    env: provider.env ?? existing?.env ?? [],
+    options: mergeDeep(existing?.options ?? {}, provider.options ?? {}),
+    source: "config",
+    models: existing?.models ?? {},
+  }
+
+  for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+    const existingModel = parsed.models[model.id ?? modelID]
+    const apiID = model.id ?? existingModel?.api.id ?? modelID
+    const apiNpm =
+      model.provider?.npm ??
+      provider.npm ??
+      existingModel?.api.npm ??
+      cloudflareGatewayNpm(providerID, apiID) ??
+      modelsDev[providerID]?.npm ??
+      "@ai-sdk/openai-compatible"
+    const name = iife(() => {
+      if (model.name) return model.name
+      if (model.id && model.id !== modelID) return modelID
+      return existingModel?.name ?? modelID
+    })
+    const parsedModel: Model = {
+      id: ModelV2.ID.make(modelID),
+      api: {
+        id: apiID,
+        npm: apiNpm,
+        url:
+          model.provider?.api ??
+          provider.api ??
+          existingModel?.api.url ??
+          (typeof provider.options?.baseURL === "string" && provider.options.baseURL.trim() !== ""
+            ? provider.options.baseURL
+            : undefined) ??
+          modelsDev[providerID]?.api ??
+          "",
+      },
+      status: model.status ?? existingModel?.status ?? "active",
+      name,
+      providerID: ProviderV2.ID.make(providerID),
+      primitive: model.primitive ?? existingModel?.primitive ?? ModelsDev.modelPrimitive(providerID, { id: apiID }),
+      capabilities: {
+        temperature: model.temperature ?? existingModel?.capabilities.temperature ?? false,
+        reasoning: model.reasoning ?? existingModel?.capabilities.reasoning ?? false,
+        attachment: model.attachment ?? existingModel?.capabilities.attachment ?? false,
+        toolcall: model.tool_call ?? existingModel?.capabilities.toolcall ?? true,
+        input: {
+          text: model.modalities?.input?.includes("text") ?? existingModel?.capabilities.input.text ?? true,
+          audio: model.modalities?.input?.includes("audio") ?? existingModel?.capabilities.input.audio ?? false,
+          image: model.modalities?.input?.includes("image") ?? existingModel?.capabilities.input.image ?? false,
+          video: model.modalities?.input?.includes("video") ?? existingModel?.capabilities.input.video ?? false,
+          pdf: model.modalities?.input?.includes("pdf") ?? existingModel?.capabilities.input.pdf ?? false,
+        },
+        output: {
+          text: model.modalities?.output?.includes("text") ?? existingModel?.capabilities.output.text ?? true,
+          audio: model.modalities?.output?.includes("audio") ?? existingModel?.capabilities.output.audio ?? false,
+          image: model.modalities?.output?.includes("image") ?? existingModel?.capabilities.output.image ?? false,
+          video: model.modalities?.output?.includes("video") ?? existingModel?.capabilities.output.video ?? false,
+          pdf: model.modalities?.output?.includes("pdf") ?? existingModel?.capabilities.output.pdf ?? false,
+        },
+        interleaved:
+          (typeof model.interleaved === "string" ? { field: model.interleaved } : model.interleaved) ??
+          existingModel?.capabilities.interleaved ??
+          (!existingModel && apiNpm === "@ai-sdk/openai-compatible" && apiID.includes("deepseek")
+            ? { field: "reasoning_content" }
+            : false),
+      },
+      cost: {
+        input: model.cost?.input ?? existingModel?.cost.input ?? 0,
+        output: model.cost?.output ?? existingModel?.cost.output ?? 0,
+        cache: {
+          read: model.cost?.cache_read ?? existingModel?.cost.cache.read ?? 0,
+          write: model.cost?.cache_write ?? existingModel?.cost.cache.write ?? 0,
+        },
+      },
+      options: mergeDeep(existingModel?.options ?? {}, model.options ?? {}),
+      limit: {
+        context: model.limit?.context ?? existingModel?.limit.context ?? 0,
+        input: model.limit?.input ?? existingModel?.limit.input,
+        output: model.limit?.output ?? existingModel?.limit.output ?? 0,
+      },
+      headers: mergeDeep(existingModel?.headers ?? {}, model.headers ?? {}),
+      family: model.family ?? existingModel?.family ?? "",
+      release_date: model.release_date ?? existingModel?.release_date ?? "",
+      variants: {},
+    }
+    const variants =
+      existingModel?.api.npm === parsedModel.api.npm
+        ? (existingModel.variants ?? ProviderTransform.variants(parsedModel))
+        : ProviderTransform.variants(parsedModel)
+    const merged = mergeDeep(variants, model.variants ?? {})
+    parsedModel.variants = mapValues(
+      pickBy(merged, (v) => !v.disabled),
+      (v) => omit(v, ["disabled"]),
+    )
+    parsed.models[modelID] = parsedModel
+  }
+  return parsed
+}
+
 function modeOptions(model: Model, body: Record<string, unknown> | undefined) {
   if (!body) return model.options
   const options = Object.fromEntries(
@@ -1778,56 +2184,427 @@ function modelSuggestions(provider: Info | undefined, modelID: ModelV2.ID, enabl
     .map((item) => item.id)
 }
 
+const consoleRecord = (value: unknown): Record<string, unknown> => (isRecord(value) ? value : {})
+const consoleString = (value: unknown) => (typeof value === "string" && value.length > 0 ? value : undefined)
+const consoleFinite = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined)
+const consoleBoolean = (value: unknown) => (typeof value === "boolean" ? value : undefined)
+
+export function consoleModel(
+  providerID: ProviderV2.ID,
+  modelID: ModelV2.ID,
+  capability: AccountProviderCapability,
+  base?: Model,
+): Model | undefined {
+  const accountModel = capability.models[modelID]
+  if (!accountModel) return undefined
+  const raw = accountModel.config
+  const rawProvider = consoleRecord(raw.provider)
+  const rawCost = consoleRecord(raw.cost)
+  const rawLimit = consoleRecord(raw.limit)
+  const rawModalities = consoleRecord(raw.modalities)
+  const rawInput = Array.isArray(rawModalities.input) ? rawModalities.input : undefined
+  const rawOutput = Array.isArray(rawModalities.output) ? rawModalities.output : undefined
+  const rawOver200K = consoleRecord(rawCost.context_over_200k)
+  const providerBaseURL = consoleString(capability.options.baseURL)
+
+  const apiNpm =
+    consoleString(rawProvider.npm) ??
+    capability.npm ??
+    base?.api.npm ??
+    "@ai-sdk/openai-compatible"
+  const apiURL =
+    consoleString(rawProvider.api) ??
+    capability.api ??
+    providerBaseURL ??
+    base?.api.url ??
+    ""
+
+  const accountCost = Object.keys(rawCost).length
+    ? {
+        input: consoleFinite(rawCost.input) ?? base?.cost.input ?? 0,
+        output: consoleFinite(rawCost.output) ?? base?.cost.output ?? 0,
+        cache: {
+          read: consoleFinite(rawCost.cache_read) ?? base?.cost.cache.read ?? 0,
+          write: consoleFinite(rawCost.cache_write) ?? base?.cost.cache.write ?? 0,
+        },
+        ...(Object.keys(rawOver200K).length
+          ? {
+              experimentalOver200K: {
+                input: consoleFinite(rawOver200K.input) ?? 0,
+                output: consoleFinite(rawOver200K.output) ?? 0,
+                cache: {
+                  read: consoleFinite(rawOver200K.cache_read) ?? 0,
+                  write: consoleFinite(rawOver200K.cache_write) ?? 0,
+                },
+              },
+            }
+          : {}),
+      }
+    : base?.cost ?? { input: 0, output: 0, cache: { read: 0, write: 0 } }
+
+  const accountLimit = Object.keys(rawLimit).length
+    ? {
+        context: consoleFinite(rawLimit.context) ?? base?.limit.context ?? 0,
+        input: consoleFinite(rawLimit.input) ?? base?.limit.input,
+        output: consoleFinite(rawLimit.output) ?? base?.limit.output ?? 0,
+      }
+    : base?.limit ?? { context: 0, input: undefined, output: 0 }
+
+  const interleaved = raw.interleaved
+  const status = consoleString(raw.status)
+  const primitive = consoleString(raw.primitive)
+  const parsed: Model = {
+    id: modelID,
+    providerID,
+    api: { id: accountModel.apiID, npm: apiNpm, url: apiURL },
+    name: consoleString(raw.name) ?? base?.name ?? modelID,
+    family: consoleString(raw.family) ?? base?.family ?? "",
+    primitive: (primitive as ModelV2.Primitive | undefined) ?? base?.primitive ?? "language",
+    status:
+      status === "alpha" || status === "beta" || status === "deprecated" || status === "active"
+        ? status
+        : (base?.status ?? "active"),
+    capabilities: {
+      temperature: consoleBoolean(raw.temperature) ?? base?.capabilities.temperature ?? false,
+      reasoning: consoleBoolean(raw.reasoning) ?? base?.capabilities.reasoning ?? false,
+      attachment: consoleBoolean(raw.attachment) ?? base?.capabilities.attachment ?? false,
+      toolcall: consoleBoolean(raw.tool_call) ?? base?.capabilities.toolcall ?? true,
+      input: {
+        text: rawInput?.includes("text") ?? base?.capabilities.input.text ?? true,
+        audio: rawInput?.includes("audio") ?? base?.capabilities.input.audio ?? false,
+        image: rawInput?.includes("image") ?? base?.capabilities.input.image ?? false,
+        video: rawInput?.includes("video") ?? base?.capabilities.input.video ?? false,
+        pdf: rawInput?.includes("pdf") ?? base?.capabilities.input.pdf ?? false,
+      },
+      output: {
+        text: rawOutput?.includes("text") ?? base?.capabilities.output.text ?? true,
+        audio: rawOutput?.includes("audio") ?? base?.capabilities.output.audio ?? false,
+        image: rawOutput?.includes("image") ?? base?.capabilities.output.image ?? false,
+        video: rawOutput?.includes("video") ?? base?.capabilities.output.video ?? false,
+        pdf: rawOutput?.includes("pdf") ?? base?.capabilities.output.pdf ?? false,
+      },
+      interleaved:
+        typeof interleaved === "string"
+          ? { field: interleaved as any }
+          : typeof interleaved === "boolean" || isRecord(interleaved)
+            ? (interleaved as Model["capabilities"]["interleaved"])
+            : (base?.capabilities.interleaved ?? false),
+    },
+    cost: accountCost,
+    limit: accountLimit,
+    // Account-bound execution never inherits local/config auth-bearing
+    // options or headers. Console config is authoritative for transport state.
+    options: consoleRecord(raw.options),
+    headers: mergeDeep(capability.headers ?? {}, consoleRecord(raw.headers) as Record<string, string>),
+    release_date: consoleString(raw.release_date) ?? base?.release_date ?? "",
+    variants: base?.variants ?? {},
+  }
+
+  const configuredVariants = consoleRecord(raw.variants)
+  if (Object.keys(configuredVariants).length > 0) {
+    const merged = mergeDeep(parsed.variants ?? ProviderTransform.variants(parsed), configuredVariants)
+    parsed.variants = mapValues(
+      pickBy(merged, (value) => !isRecord(value) || value.disabled !== true),
+      (value) => (isRecord(value) ? omit(value, ["disabled"]) : value) as Record<string, any>,
+    )
+  }
+  return parsed
+}
+
+export function consoleProviderInfo(
+  providerID: ProviderV2.ID,
+  capability: AccountProviderCapability,
+  model: Model,
+  base?: Info,
+): Info {
+  return {
+    id: providerID,
+    name: capability.name ?? base?.name ?? providerID,
+    source: "config",
+    env: [],
+    options: { ...capability.options },
+    models: { [model.id]: model },
+  }
+}
+
+const MAX_CONSOLE_CLIENT_SLOTS = 64
+
+function activateConsoleGeneration(state: State, binding: ConsoleBinding) {
+  const current = state.consoleGenerations.get(binding.client.slot)
+  const incomingRevision = binding.account.credentialRevision
+  const incomingConfigVersion = binding.account.configVersion
+  if (
+    current &&
+    (current.credentialRevision > incomingRevision ||
+      (current.credentialRevision === incomingRevision && current.configVersion > incomingConfigVersion))
+  ) {
+    return { cacheable: false as const, slot: undefined }
+  }
+
+  if (!current || current.generation !== binding.client.generation) {
+    if (current) {
+      for (const key of current.sdkKeys) state.sdk.delete(key)
+      for (const key of current.modelKeys) state.models.delete(key)
+    }
+    state.consoleGenerations.set(binding.client.slot, {
+      generation: binding.client.generation,
+      credentialRevision: incomingRevision,
+      configVersion: incomingConfigVersion,
+      lastUsed: Date.now(),
+      sdkKeys: new Set(),
+      modelKeys: new Set(),
+    })
+  }
+
+  const slot = state.consoleGenerations.get(binding.client.slot)!
+  slot.lastUsed = Date.now()
+  if (state.consoleGenerations.size > MAX_CONSOLE_CLIENT_SLOTS) {
+    const evicted = [...state.consoleGenerations.entries()]
+      .filter(([key]) => key !== binding.client.slot)
+      .sort(([, left], [, right]) => left.lastUsed - right.lastUsed)[0]
+    if (evicted) {
+      for (const key of evicted[1].sdkKeys) state.sdk.delete(key)
+      for (const key of evicted[1].modelKeys) state.models.delete(key)
+      state.consoleGenerations.delete(evicted[0])
+    }
+  }
+  return { cacheable: true as const, slot }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const config = yield* Config.Service
     const auth = yield* Auth.Service
+
+    /**
+     * Current Zen/Go key inventory: the unified env + fork-vault pool plus the
+     * supported legacy `auth.json` and configured hosted `options.apiKey`
+     * surfaces. This is an inventory read, never a selection: no
+     * `defaultAccount()`, no `resolveZenRequest`, no ambient provider fallback.
+     * The returned key is consumed in-process by the exact materializer only,
+     * and identity always comes from the canonical `zen-*` derivation, so a
+     * key is never a route, handle, or durable identity on its own.
+     */
+    const zenCompatInventory = Effect.fn("Provider.zenCompatInventory")(function* (providerID: string) {
+      yield* Effect.promise(() => syncZenAccountPool())
+      const states = new Map(zenLimitSnapshot().map((entry) => [entry.accountId, entry]))
+      const inventory = new Map<
+        string,
+        {
+          readonly accountID: string
+          readonly label: string
+          readonly apiKey: string
+          readonly source: "env" | "vault" | "legacy"
+          readonly state: "READY" | "COOLING_DOWN" | "QUOTA_EXHAUSTED"
+          readonly resetAt?: number
+        }
+      >()
+
+      for (const entry of zenQuotaAccounts()) {
+        const state = states.get(entry.accountId)
+        inventory.set(entry.accountId, {
+          accountID: entry.accountId,
+          label: entry.label,
+          apiKey: entry.apiKey,
+          source: state?.source ?? "vault",
+          state: state?.state ?? "READY",
+          ...(state?.resetAt ? { resetAt: state.resetAt } : {}),
+        })
+      }
+
+      // Supported legacy surfaces for the same provider. Pool/Core entries keep
+      // precedence, so one physical key can never become two candidates.
+      const legacy: string[] = []
+      const stored = yield* auth.get(providerID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      if (stored?.type === "api" && stored.key) legacy.push(stored.key)
+      const configured = yield* config.get()
+      const configuredKey = configured.provider?.[providerID]?.options?.apiKey
+      if (typeof configuredKey === "string" && configuredKey.trim()) legacy.push(configuredKey.trim())
+
+      for (const apiKey of legacy) {
+        const accountID = stableZenIdentity(apiKey)
+        if (inventory.has(accountID)) continue
+        inventory.set(accountID, { accountID, label: `key-${accountID.slice(4, 12)}`, apiKey, source: "legacy", state: "READY" })
+      }
+
+      return [...inventory.values()]
+    })
     const env = yield* Env.Service
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
     const gensparkCatalog = yield* GensparkCatalog.Service
+    const credentials = yield* Credential.Service
+    const credentialResolver = yield* CredentialResolver.Service
+    const routes = yield* ProviderRoute.Service
+    const routeHealth = yield* ProviderRouteHealth.Service
+    const catalogContributions = yield* ProviderCatalogContributions.Service
+    const rawConsoleHttp = yield* HttpClient.HttpClient
+    const realm = serviceRealmID()
+    const configHttp = withTransientReadRetry(rawConsoleHttp)
+    const consoleAccounts = makeConsoleAccountExecutionResolver({
+      realm,
+      credentials,
+      resolver: credentialResolver,
+      http: rawConsoleHttp,
+      configHttp,
+    })
+    const coreRouteSource = OpencodeRouteCandidates.make({
+      realm,
+      credentials,
+      resolver: credentialResolver,
+      http: rawConsoleHttp,
+      configHttp,
+      assessHealth: (input) =>
+        routeHealth
+          .assessAccount({
+            providerID: input.providerID,
+            accountID: input.account.accountID,
+            modelID: input.modelID,
+            credentialRevision: input.credentialRevision,
+          })
+          .pipe(
+            Effect.map((health) => ({
+              admissible: health.admissible,
+              healthRank: health.healthRank,
+              ...(health.ineligibleReason ? { ineligibleReason: health.ineligibleReason } : {}),
+              ...(health.resetAt === undefined ? {} : { resetAt: health.resetAt }),
+            })),
+          ),
+    })
+
+    /**
+     * Merge canonical Core credential candidates with the transitional
+     * Zen/Go API-key inventory. Selection stays entirely inside
+     * ProviderAccountPolicy/ProviderRoute; this source only projects.
+     */
+    const compatSource: OpencodeProviderRoute.CandidateSource = {
+      list: (input) =>
+        Effect.gen(function* () {
+          const core = yield* coreRouteSource.list(input)
+          if (!isHostedZenProvider(input.providerID)) return core
+
+          const seen = new Set(core.candidates.map((entry) => entry.candidate.accountID))
+          const compat = (yield* zenCompatInventory(input.providerID))
+            .filter((entry) => !seen.has(entry.accountID))
+            .map((entry) => {
+              const accountID = ProviderAccount.ID.make(entry.accountID)
+              const handle = Credential.ID.make(zenCompatHandle(entry.accountID))
+              const ready = entry.state === "READY"
+              const cooling = entry.state === "COOLING_DOWN"
+              return {
+                account: {
+                  providerID: ProviderV2.ID.make(input.providerID),
+                  credentialID: handle,
+                  accountID,
+                  label: entry.label,
+                  active: true,
+                  authType: "key",
+                  source: zenCompatSourceName(entry.source),
+                } satisfies ProviderAccount.Info,
+                credentialRevision: ZEN_COMPAT_REVISION,
+                configVersion: ZEN_COMPAT_REVISION,
+                candidate: {
+                  providerID: ProviderV2.ID.make(input.providerID),
+                  accountID,
+                  credentialHandle: handle,
+                  admissible: ready,
+                  healthRank: ready ? 0 : cooling ? 1 : 2,
+                  ...(cooling ? { ineligibleReason: "cooldown" as const } : {}),
+                  ...(!ready && !cooling ? { ineligibleReason: "quota-exhausted" as const } : {}),
+                  ...(entry.resetAt === undefined ? {} : { resetAt: entry.resetAt }),
+                } satisfies ProviderAccountPolicy.Candidate,
+              } satisfies OpencodeRouteCandidates.CandidateSnapshot
+            })
+
+          const candidates = [...core.candidates, ...compat].sort((left, right) =>
+            left.candidate.accountID === right.candidate.accountID
+              ? left.candidate.credentialHandle.localeCompare(right.candidate.credentialHandle)
+              : left.candidate.accountID.localeCompare(right.candidate.accountID),
+          )
+          return { candidates, issues: core.issues }
+        }),
+      resolveCredentialRevision: (input) =>
+        isZenCompatHandle(input.credentialHandle)
+          ? Effect.gen(function* () {
+              if (!isHostedZenProvider(input.providerID)) return undefined
+              if (input.credentialHandle !== zenCompatHandle(input.accountID)) return undefined
+              const inventory = yield* zenCompatInventory(input.providerID)
+              return inventory.some(
+                (entry) => entry.accountID === input.accountID && input.credentialHandle === zenCompatHandle(entry.accountID),
+              )
+                ? ZEN_COMPAT_REVISION
+                : undefined
+            })
+          : coreRouteSource.resolveCredentialRevision(input),
+      invalidate: (credentialID) => coreRouteSource.invalidate?.(credentialID),
+      cacheSize: () => coreRouteSource.cacheSize?.(),
+    }
+
+    const providerRoutes = {
+      ...OpencodeProviderRoute.compose({ routes, source: compatSource }),
+      /** Final transport-only exact-handle materialization for Console OAuth. */
+      resolveExecution: coreRouteSource.resolveExecution,
+    }
+
+    /**
+     * Exact in-process materialization of a selected Zen/Go compatibility
+     * account. Re-reads the current inventory and requires the committed
+     * account identity, opaque handle, and revision to still match; anything
+     * else fails closed instead of substituting another key.
+     */
+    const resolveZenCompatExecution = (
+      input: {
+        readonly providerID: string
+        readonly accountID: string
+        readonly credentialHandle: string
+        readonly expectedCredentialRevision: number
+      },
+    ) =>
+      Effect.gen(function* () {
+        if (!isHostedZenProvider(input.providerID)) return undefined
+        if (!isZenCompatHandle(input.credentialHandle)) return undefined
+        if (input.expectedCredentialRevision !== ZEN_COMPAT_REVISION) return undefined
+        const match = (yield* zenCompatInventory(input.providerID)).find(
+          (entry) =>
+            entry.accountID === input.accountID && zenCompatHandle(entry.accountID) === input.credentialHandle,
+        )
+        if (!match) return undefined
+        return { accountID: match.accountID, apiKey: match.apiKey } satisfies ZenCompatExecution
+      })
 
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
-        const modelsDev = yield* modelsDevSvc.get()
-        const decisionModels = yield* modelsDevSvc.getDecisionModels()
-        const catalog = mapValues(modelsDev, fromModelsDevProvider)
-        const database = mapValues(catalog, toPublicInfo)
+        // Keep the owner snapshot untouched when a selected cold-cache miss
+        // adds metadata to this location. Model projection/copying belongs to
+        // the provider being materialized, not every provider in the snapshot.
+        const modelsDev = { ...(yield* modelsDevSvc.getCached()) }
+        function lazyProviders(create: (providerID: string) => Info): Record<string, Info> {
+          const result: Record<string, Info> = {}
+          for (const id of Object.keys(modelsDev)) {
+            Object.defineProperty(result, id, {
+              enumerable: true,
+              configurable: true,
+              get() {
+                const value = create(id)
+                Object.defineProperty(result, id, { value, writable: true, enumerable: true, configurable: true })
+                return value
+              },
+              set(value: Info) {
+                Object.defineProperty(result, id, { value, writable: true, enumerable: true, configurable: true })
+              },
+            })
+          }
+          return result
+        }
+        const catalog = lazyProviders((id) => fromModelsDevProvider(modelsDev[id]))
+        const database = lazyProviders((id) => toPublicInfo(catalog[ProviderV2.ID.make(id)]))
         const typeSafeProviderID = ProviderV2.ID.make("typesafe")
         const typeSafePrefix = "typesafe/"
-        const typeSafeMetadata = Object.values(decisionModels).filter(
-          (model) => model.type === "decision" && model.id.startsWith(typeSafePrefix),
-        )
-        if (typeSafeMetadata.length > 0 && !database[typeSafeProviderID]) {
-          const typeSafeBaseURL = (yield* env.get("TYPESAFE_BASE_URL"))?.trim() || "https://api.typesafe.ai/v1"
-          const directProvider = {
-            id: "typesafe",
-            name: "TypeSafe",
-            env: ["TYPESAFE_API_KEY"],
-            api: typeSafeBaseURL,
-            npm: "@ai-sdk/openai-compatible",
-            models: {},
-          } satisfies ModelsDev.Provider
-          database[typeSafeProviderID] = {
-            id: typeSafeProviderID,
-            source: "custom",
-            name: directProvider.name,
-            env: directProvider.env,
-            options: {},
-            models: Object.fromEntries(
-              typeSafeMetadata.map((metadata) => {
-                const directModelID = metadata.id.slice(typeSafePrefix.length)
-                const model = fromModelsDevModel(directProvider, { ...metadata, id: directModelID })
-                return [model.id, model]
-              }),
-            ),
-          }
-        }
         // Keep the API-key Anthropic transport under its own provider ID so it
         // cannot collide with either the first-party CLI runtime (`claude`) or
         // the external plugin (`claude-code`).
@@ -1875,6 +2652,7 @@ const layer = Layer.effect(
           ),
         }
         const claudeID = ProviderV2.ID.make("claude")
+        const claudeSubscriptionModels = getClaudeSubscriptionModelMetadata(modelsDev["anthropic"])
         database[claudeID] ??= {
           id: claudeID,
           source: "custom",
@@ -1882,8 +2660,7 @@ const layer = Layer.effect(
           env: [],
           options: { apiKey: PROXY_API_KEY, includeUsage: true, baseURL: PROXY_BASE_URL },
           models: Object.fromEntries(
-            MODEL_IDS.map((id) => {
-              const meta = MODEL_METADATA[id]
+            Object.entries(claudeSubscriptionModels).map(([id, meta]) => {
               return [
                 id,
                 {
@@ -1896,7 +2673,11 @@ const layer = Layer.effect(
                   headers: {},
                   options: { includeUsage: true },
                   cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-                  limit: { context: meta.contextLimit, input: undefined, output: meta.outputLimit },
+                  limit: {
+                    context: meta.contextLimit,
+                    input: meta.contextLimit >= 1_000_000 ? Math.round(meta.contextLimit * 0.9) : undefined,
+                    output: meta.outputLimit,
+                  },
                   capabilities: meta.capabilities,
                   release_date: meta.releaseDate,
                   variants: meta.variants,
@@ -1947,14 +2728,13 @@ const layer = Layer.effect(
         } = {}
         const accountLoaders: Record<string, () => Promise<readonly ProviderAccountIdentity[]>> = {}
         const sdk = new Map<string, BundledSDK>()
-        const discoveryLoaders: {
-          [providerID: string]: CustomDiscoverModels
-        } = {}
+        const discoveryLoaders: Record<string, DiscoveryLoader> = {}
         const dep = {
           auth: (id: string) => auth.get(id).pipe(Effect.orDie),
           config: () => config.get(),
           env: () => env.all(),
           get: (key: string) => env.get(key),
+          modelsDev: () => modelsDev,
           gensparkCatalog: (apiKey: string | undefined) => gensparkCatalog.get(apiKey),
         }
 
@@ -1969,6 +2749,26 @@ const layer = Layer.effect(
           if (!match) return
           // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
+        }
+
+        const providerTasks = new Map<ProviderV2.ID, Effect.Effect<void>[]>()
+        function registerProviderTask(providerID: ProviderV2.ID, task: Effect.Effect<void>) {
+          const tasks = providerTasks.get(providerID) ?? []
+          tasks.push(task)
+          providerTasks.set(providerID, tasks)
+        }
+
+        function normalizePluginModels(providerID: ProviderV2.ID, models: Record<string, any>): Record<string, Model> {
+          return Object.fromEntries(
+            Object.entries(models).map(([id, model]) => [
+              id,
+              {
+                ...model,
+                id: ModelV2.ID.make(id),
+                providerID,
+              } satisfies Model,
+            ]),
+          )
         }
 
         // load plugins first so config() hook runs before reading cfg.provider
@@ -2001,7 +2801,8 @@ const layer = Layer.effect(
           }
 
           const models = p.models
-          if (!models) continue
+          const discoverModels = p.discoverModels
+          if (!models && !discoverModels) continue
 
           const provider =
             database[providerID] ??
@@ -2015,146 +2816,55 @@ const layer = Layer.effect(
             } satisfies Info)
           database[providerID] ??= provider
 
-          provider.models = yield* Effect.promise(async () => {
-            const next = await models(toPublicInfo(provider), { auth: pluginAuth })
-            return Object.fromEntries(
-              Object.entries(next).map(([id, model]) => [
-                id,
-                {
-                  ...model,
-                  id: ModelV2.ID.make(id),
+          if (discoverModels) {
+            discoveryLoaders[providerID] = {
+              mode: p.discoveryMode ?? "merge",
+              load: async () => {
+                const current = providers[providerID] ?? database[providerID] ?? provider
+                return normalizePluginModels(
                   providerID,
-                },
-              ]),
-            )
-          })
+                  await discoverModels(toPublicInfo(current), { auth: pluginAuth }),
+                )
+              },
+            }
+          }
+
+          registerProviderTask(providerID, Effect.gen(function* () {
+          const discovered = models
+            ? yield* Effect.promise(async () =>
+                normalizePluginModels(providerID, await models(toPublicInfo(provider), { auth: pluginAuth })),
+              )
+            : {}
           // A provider hook can create a provider from scratch (`source:
           // "custom"`) without requiring an API-key entry or config stanza.
           // Register the freshly discovered model set now; otherwise the data
           // lands in `database` but never enters the public `providers` map.
-          mergeProvider(providerID, { source: "custom" })
+          // Apply the same configured model projection after the hook supplies
+          // its metadata; configured overrides remain authoritative.
+          const resolved = { ...provider, models: discovered }
+          database[providerID] = cfg.provider?.[providerID]
+            ? fromConfigProvider(providerID, cfg.provider[providerID], resolved, modelsDev)
+            : resolved
+          mergeProvider(providerID, { source: "custom", models: database[providerID].models })
+          }))
         }
 
-        // extend database from config
+        // Reuse the V1 config projection used by the bootstrap-free catalog.
         for (const [providerID, provider] of configProviders) {
-          const existing = database[providerID]
-          const parsed: Info = {
-            id: ProviderV2.ID.make(providerID),
-            name: provider.name ?? existing?.name ?? providerID,
-            env: provider.env ?? existing?.env ?? [],
-            options: mergeDeep(existing?.options ?? {}, provider.options ?? {}),
-            source: "config",
-            models: existing?.models ?? {},
-          }
-
-          for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-            const existingModel = parsed.models[model.id ?? modelID]
-            const apiID = model.id ?? existingModel?.api.id ?? modelID
-            const apiNpm =
-              model.provider?.npm ??
-              provider.npm ??
-              existingModel?.api.npm ??
-              // Config-defined gateway models bypass fromModelsDevModel, so resolve the
-              // native passthrough npm here before falling back to the catalog default.
-              cloudflareGatewayNpm(providerID, apiID) ??
-              modelsDev[providerID]?.npm ??
-              "@ai-sdk/openai-compatible"
-            const name = iife(() => {
-              if (model.name) return model.name
-              if (model.id && model.id !== modelID) return modelID
-              return existingModel?.name ?? modelID
-            })
-            const parsedModel: Model = {
-              id: ModelV2.ID.make(modelID),
-              api: {
-                id: apiID,
-                npm: apiNpm,
-                url:
-                  model.provider?.api ??
-                  provider?.api ??
-                  existingModel?.api.url ??
-                  (typeof provider.options?.baseURL === "string" && provider.options.baseURL.trim() !== ""
-                    ? provider.options.baseURL
-                    : undefined) ??
-                  modelsDev[providerID]?.api ??
-                  "",
-              },
-              status: model.status ?? existingModel?.status ?? "active",
-              name,
-              providerID: ProviderV2.ID.make(providerID),
-              primitive: model.primitive ?? existingModel?.primitive ?? ModelsDev.modelPrimitive(providerID, { id: apiID }),
-              capabilities: {
-                temperature: model.temperature ?? existingModel?.capabilities.temperature ?? false,
-                reasoning: model.reasoning ?? existingModel?.capabilities.reasoning ?? false,
-                attachment: model.attachment ?? existingModel?.capabilities.attachment ?? false,
-                toolcall: model.tool_call ?? existingModel?.capabilities.toolcall ?? true,
-                input: {
-                  text: model.modalities?.input?.includes("text") ?? existingModel?.capabilities.input.text ?? true,
-                  audio: model.modalities?.input?.includes("audio") ?? existingModel?.capabilities.input.audio ?? false,
-                  image: model.modalities?.input?.includes("image") ?? existingModel?.capabilities.input.image ?? false,
-                  video: model.modalities?.input?.includes("video") ?? existingModel?.capabilities.input.video ?? false,
-                  pdf: model.modalities?.input?.includes("pdf") ?? existingModel?.capabilities.input.pdf ?? false,
-                },
-                output: {
-                  text: model.modalities?.output?.includes("text") ?? existingModel?.capabilities.output.text ?? true,
-                  audio:
-                    model.modalities?.output?.includes("audio") ?? existingModel?.capabilities.output.audio ?? false,
-                  image:
-                    model.modalities?.output?.includes("image") ?? existingModel?.capabilities.output.image ?? false,
-                  video:
-                    model.modalities?.output?.includes("video") ?? existingModel?.capabilities.output.video ?? false,
-                  pdf: model.modalities?.output?.includes("pdf") ?? existingModel?.capabilities.output.pdf ?? false,
-                },
-                interleaved:
-                  (typeof model.interleaved === "string" ? { field: model.interleaved } : model.interleaved) ??
-                  existingModel?.capabilities.interleaved ??
-                  (!existingModel && apiNpm === "@ai-sdk/openai-compatible" && apiID.includes("deepseek")
-                    ? { field: "reasoning_content" }
-                    : false),
-              },
-              cost: {
-                input: model?.cost?.input ?? existingModel?.cost?.input ?? 0,
-                output: model?.cost?.output ?? existingModel?.cost?.output ?? 0,
-                cache: {
-                  read: model?.cost?.cache_read ?? existingModel?.cost?.cache.read ?? 0,
-                  write: model?.cost?.cache_write ?? existingModel?.cost?.cache.write ?? 0,
-                },
-              },
-              options: mergeDeep(existingModel?.options ?? {}, model.options ?? {}),
-              limit: {
-                context: model.limit?.context ?? existingModel?.limit?.context ?? 0,
-                input: model.limit?.input ?? existingModel?.limit?.input,
-                output: model.limit?.output ?? existingModel?.limit?.output ?? 0,
-              },
-              headers: mergeDeep(existingModel?.headers ?? {}, model.headers ?? {}),
-              family: model.family ?? existingModel?.family ?? "",
-              release_date: model.release_date ?? existingModel?.release_date ?? "",
-              variants: {},
-            }
-            const variants =
-              existingModel?.api.npm === parsedModel.api.npm
-                ? (existingModel.variants ?? ProviderTransform.variants(parsedModel))
-                : ProviderTransform.variants(parsedModel)
-            const merged = mergeDeep(variants, model.variants ?? {})
-            parsedModel.variants = mapValues(
-              pickBy(merged, (v) => !v.disabled),
-              (v) => omit(v, ["disabled"]),
-            )
-            parsed.models[modelID] = parsedModel
-          }
-          database[providerID] = parsed
+          database[providerID] = fromConfigProvider(providerID, provider, database[providerID], modelsDev)
         }
 
         // load env
         const envs = yield* env.all()
-        for (const [id, provider] of Object.entries(database)) {
+        for (const id of Object.keys(database)) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
+          const providerEnv = cfg.provider?.[id]?.env ?? modelsDev[id]?.env ?? database[providerID].env
+          const apiKey = providerEnv.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
           mergeProvider(providerID, {
             source: "env",
-            key: provider.env.length === 1 ? apiKey : undefined,
+            key: providerEnv.length === 1 ? apiKey : undefined,
           })
         }
 
@@ -2172,6 +2882,30 @@ const layer = Layer.effect(
         }
 
         // plugin auth loader - database now has entries for config providers
+        registerProviderTask(typeSafeProviderID, Effect.gen(function* () {
+          if (database[typeSafeProviderID]) return
+          if (!envs.TYPESAFE_API_KEY && !auths.typesafe) return
+          const metadata = Object.values(yield* modelsDevSvc.getDecisionModels()).filter(
+            (model) => model.type === "decision" && model.id.startsWith(typeSafePrefix),
+          )
+          if (metadata.length === 0) return
+          const directProvider = {
+            id: "typesafe", name: "TypeSafe", env: ["TYPESAFE_API_KEY"],
+            api: envs.TYPESAFE_BASE_URL?.trim() || "https://api.typesafe.ai/v1",
+            npm: "@ai-sdk/openai-compatible", models: {},
+          } satisfies ModelsDev.Provider
+          database[typeSafeProviderID] = {
+            id: typeSafeProviderID, source: "custom", name: directProvider.name,
+            env: directProvider.env, options: {},
+            models: Object.fromEntries(metadata.map((model) => {
+              const id = model.id.slice(typeSafePrefix.length)
+              const projected = fromModelsDevModel(directProvider, { ...model, id })
+              return [projected.id, projected]
+            })),
+          }
+          const key = envs.TYPESAFE_API_KEY || (auths.typesafe?.type === "api" ? auths.typesafe.key : undefined)
+          if (key) mergeProvider(typeSafeProviderID, { source: envs.TYPESAFE_API_KEY ? "env" : "api", key })
+        }))
         for (const plugin of plugins) {
           if (!plugin.auth) continue
           const providerID = ProviderV2.ID.make(plugin.auth.provider)
@@ -2181,6 +2915,8 @@ const layer = Layer.effect(
           if (!stored) continue
           if (!plugin.auth.loader) continue
 
+          registerProviderTask(providerID, Effect.gen(function* () {
+          if (!database[providerID]) return
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
@@ -2190,24 +2926,28 @@ const layer = Layer.effect(
           const opts = options ?? {}
           const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
           mergeProvider(providerID, patch)
+          }))
         }
 
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database[providerID]
-          if (!data) {
-            continue
-          }
-          const result = yield* fn(data)
+          registerProviderTask(providerID, Effect.gen(function* () {
+          // Custom loaders may narrow the available models in place (for
+          // example, anonymous Zen must withdraw paid rows). Operate on the
+          // connected projection rather than a detached catalog copy.
+          const input = providers[providerID] ?? database[providerID]
+          if (!input) return
+          const result = yield* fn(input)
           if (result && (result.autoload || providers[providerID])) {
             if (result.getModel) modelLoaders[providerID] = result.getModel
             if (result.vars) varsLoaders[providerID] = result.vars
-            if (result.discoverModels) discoveryLoaders[providerID] = result.discoverModels
+            if (result.discoverModels) discoveryLoaders[providerID] = { load: result.discoverModels, mode: "merge" }
             const opts = result.options ?? {}
             const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
             mergeProvider(providerID, patch)
           }
+          }))
         }
 
         // load config - re-apply with updated data
@@ -2220,26 +2960,12 @@ const layer = Layer.effect(
           mergeProvider(providerID, partial)
         }
 
-        for (const [id, loader] of Object.entries(discoveryLoaders)) {
-          const providerID = ProviderV2.ID.make(id)
-          if (!providers[providerID] || !isProviderAllowed(providerID)) continue
-          yield* Effect.promise(async () => {
-            try {
-              const discovered = await loader()
-              for (const [modelID, model] of Object.entries(discovered)) {
-                if (!providers[providerID].models[modelID]) {
-                  providers[providerID].models[modelID] = model
-                }
-              }
-            } catch (e) {}
-          })
-        }
-
-        for (const [id, provider] of Object.entries(providers)) {
-          const providerID = ProviderV2.ID.make(id)
+        function finalizeProvider(providerID: ProviderV2.ID) {
+          const provider = providers[providerID]
+          if (!provider) return
           if (!isProviderAllowed(providerID)) {
             delete providers[providerID]
-            continue
+            return
           }
 
           const configProvider = cfg.provider?.[providerID]
@@ -2279,11 +3005,104 @@ const layer = Layer.effect(
             }
           }
 
-          if (Object.keys(provider.models).length === 0) {
+          // Providers whose model set is supplied by a discoverModels hook
+          // remain selectable by identity; that hook is awaited only if this
+          // provider is actually selected for execution.
+          if (Object.keys(provider.models).length === 0 && !discoveryLoaders[providerID]) {
             delete providers[providerID]
-            continue
+            return
           }
         }
+        for (const id of Object.keys(providers)) {
+          const providerID = ProviderV2.ID.make(id)
+          if (!isProviderAllowed(providerID) || !providerTasks.has(providerID)) finalizeProvider(providerID)
+        }
+
+        let materializationRevision = 0
+        const initializers = new Map<ProviderV2.ID, Effect.Effect<void>>()
+        for (const [providerID, tasks] of providerTasks) {
+          if (!isProviderAllowed(providerID)) continue
+          const admission = yield* Semaphore.make(1)
+          let initialized = false
+          initializers.set(providerID, admission.withPermits(1)(Effect.gen(function* () {
+            if (initialized) return
+            for (const task of tasks) yield* task
+            const configured = cfg.provider?.[providerID]
+            if (configured) {
+              mergeProvider(providerID, {
+                source: "config",
+                ...(configured.env ? { env: configured.env } : {}),
+                ...(configured.name ? { name: configured.name } : {}),
+                ...(configured.options ? { options: configured.options } : {}),
+              })
+            }
+            finalizeProvider(providerID)
+            if (providerID === "claude" && providers[providerID]) providers[providerID].name = "Claude Subscription"
+            if (providerID === "claude-api" && providers[providerID]) providers[providerID].name = "Claude API Key"
+            materializationRevision++
+            initialized = true
+          })))
+        }
+
+        const selectedCatalogAdmission = yield* Semaphore.make(1)
+        const ensureSelectedCatalogProvider = Effect.fn("Provider.ensureSelectedCatalogProvider")(
+          function* (providerID: ProviderV2.ID) {
+            yield* selectedCatalogAdmission.withPermits(1)(
+              Effect.gen(function* () {
+                if (!isProviderAllowed(providerID)) return
+                // TypeSafe owns a separate decision-model source. Its selected
+                // initializer must not first populate the unrelated language catalog.
+                if (providerID === typeSafeProviderID) return
+                // Config/plugin-created providers already own their metadata.
+                // Only a truly cold models.dev miss may demand the shared
+                // catalog; a miss in a nonempty catalog remains a normal
+                // not-found result and never fetches for a typo.
+                if (database[providerID] || providers[providerID]) return
+                let source = modelsDev[providerID]
+                if (!source && Object.keys(modelsDev).length === 0 && Object.keys(catalog).length === 0) {
+                  const fetched = yield* modelsDevSvc.getForSelectedProvider(providerID)
+                  Object.assign(modelsDev, fetched)
+                  source = modelsDev[providerID]
+                }
+                if (!source || !isProviderAllowed(providerID)) return
+
+                const catalogProvider = fromModelsDevProvider(source)
+                catalog[providerID] = catalogProvider
+                const entry = toPublicInfo(catalogProvider)
+                for (const [modelID, model] of Object.entries(entry.models)) {
+                  if (
+                    (modelID === "gpt-5-chat-latest" &&
+                      (providerID === ProviderV2.ID.openai ||
+                        providerID === ProviderV2.ID.githubCopilot ||
+                        providerID === ProviderV2.ID.openrouter)) ||
+                    (providerID === ProviderV2.ID.openrouter && modelID === "openai/gpt-5-chat") ||
+                    model.status === "deprecated" ||
+                    (model.status === "alpha" && !runtimeFlags.enableExperimentalModels)
+                  ) {
+                    delete entry.models[modelID]
+                  }
+                }
+                database[providerID] = entry
+
+                const key = entry.env.map((name) => envs[name]).find(Boolean)
+                if (key) {
+                  providers[providerID] = {
+                    ...toPublicInfo(entry),
+                    source: "env",
+                    key: entry.env.length === 1 ? key : undefined,
+                  }
+                } else if (auths[providerID]?.type === "api") {
+                  providers[providerID] = {
+                    ...toPublicInfo(entry),
+                    source: "api",
+                    key: auths[providerID].key,
+                  }
+                }
+                if (providers[providerID]) materializationRevision++
+              }),
+            )
+          },
+        )
 
         // Final identity normalization: these providers must never inherit a
         // name from the Anthropic catalog or an old plugin/config entry.
@@ -2298,22 +3117,119 @@ const layer = Layer.effect(
           models: languages,
           providers,
           catalog,
+          modelsDev,
+          claudeCatalogRevision: claudeSubscriptionCatalogRevision(),
           sdk,
           modelLoaders,
           varsLoaders,
+          discoveryLoaders,
+          discoveryPromises: new Map(),
+          initializeProvider: (providerID) => initializers.get(providerID) ?? Effect.void,
+          ensureSelectedCatalogProvider,
+          initializerIDs: [...initializers.keys()],
+          materializationRevision: () => materializationRevision,
+          config: cfg,
           accountLoaders,
+          consoleBindings: new WeakMap(),
+          publicBindings: new WeakMap(),
+          zenCompatBindings: new WeakMap(),
+          consoleGenerations: new Map(),
         }
       }),
     )
 
-    const events = yield* EventV2.Service
-    yield* events.subscribe(Integration.Event.ConnectionUpdated).pipe(
-      Stream.filter((event) => event.data.integrationID === Integration.ID.make("verdent")),
-      Stream.runForEach(() => InstanceState.invalidate(state).pipe(Effect.asVoid)),
-      Effect.forkScoped({ startImmediately: true }),
-    )
+    /**
+     * The Claude subscription catalog is refreshed by the explicit login/live
+     * Agent SDK boundaries, never by passive provider listing. If that
+     * account-authoritative cache changed after this per-instance Provider
+     * snapshot was materialized, rebuild the snapshot on the next provider
+     * read. This is the fork-owned equivalent of opencode-claude's
+     * ctx.provider.reload(), while preserving all normal config/filter assembly.
+     */
+    const publishedCatalogStates = new WeakMap<State, number>()
+    const currentState = Effect.fnUntraced(function* (providerID?: ProviderV2.ID) {
+      let current = yield* InstanceState.get(state)
+      // Provider snapshots embed the exact effective Config object they were
+      // materialized from. Config.get() is a scoped-cache lookup on the hot
+      // path, so identity gives us an O(1) invalidation fence without file
+      // stats/parsing on every model lookup.
+      const currentConfig = yield* config.get()
+      if (
+        current.config !== currentConfig ||
+        current.claudeCatalogRevision !== claudeSubscriptionCatalogRevision()
+      ) {
+        yield* InstanceState.invalidate(state)
+        current = yield* InstanceState.get(state)
+      }
+      if (providerID) {
+        yield* current.ensureSelectedCatalogProvider(providerID)
+        yield* current.initializeProvider(providerID)
+      }
+      else yield* Effect.forEach(current.initializerIDs, current.initializeProvider, { concurrency: 4, discard: true })
+      const revision = current.materializationRevision()
+      const directory = yield* InstanceState.directory
+      if (publishedCatalogStates.get(current) !== revision || !catalogContributions.get(directory)) {
+        publishedCatalogStates.set(current, revision)
+        yield* catalogContributions.publish({
+          directory,
+          providers: current.providers,
+        })
+      }
+      return current
+    })
 
-    const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
+    const ensureProviderDiscovery = Effect.fn("Provider.ensureProviderDiscovery")(function* (
+      current: State,
+      providerID: ProviderV2.ID,
+    ) {
+      const loader = current.discoveryLoaders[providerID]
+      const provider = current.providers[providerID]
+      if (!loader || !provider) return
+
+      let pending = current.discoveryPromises.get(providerID)
+      if (!pending) {
+        pending = Promise.resolve()
+          .then(() => loader.load())
+          .then((discovered) => {
+            const configured = current.config.provider?.[providerID]
+            const next: Record<string, Model> = {}
+            for (const [modelID, model] of Object.entries(discovered)) {
+              if (loader.mode === "merge" && provider.models[modelID]) continue
+              if (model.status === "deprecated") continue
+              if (model.status === "alpha" && !runtimeFlags.enableExperimentalModels) continue
+              if (configured?.blacklist?.includes(modelID)) continue
+              if (configured?.whitelist && !configured.whitelist.includes(modelID)) continue
+              if (model.variants === undefined) model.variants = mapValues(ProviderTransform.variants(model), (v) => v)
+              const variants = configured?.models?.[modelID]?.variants
+              if (variants && model.variants) {
+                const merged = mergeDeep(model.variants, variants)
+                model.variants = mapValues(pickBy(merged, (v) => !v.disabled), (v) => omit(v, ["disabled"]))
+              }
+              next[modelID] = model
+            }
+            if (loader.mode === "replace") {
+              const replacement = { ...provider, models: next }
+              provider.models = configured
+                ? fromConfigProvider(providerID, configured, replacement, current.modelsDev).models
+                : replacement.models
+            } else {
+              Object.assign(provider.models, next)
+            }
+          })
+          .catch(() => {})
+        current.discoveryPromises.set(providerID, pending)
+      }
+
+      yield* Effect.promise(() => pending!)
+      yield* catalogContributions.publish({
+        directory: yield* InstanceState.directory,
+        providers: current.providers,
+      })
+    })
+
+    const list = Effect.fn("Provider.list")(function* () {
+      return (yield* currentState()).providers
+    })
 
     const listAccountModelProjections = Effect.fn("Provider.listAccountModelProjections")(function* () {
       const s = yield* currentState()
@@ -2384,7 +3300,12 @@ const layer = Layer.effect(
 
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
-        const provider = s.providers[model.providerID]
+        const binding = s.consoleBindings.get(model)
+        const publicBinding = s.publicBindings.get(model)
+        const compatBinding = s.zenCompatBindings.get(model)
+        const provider =
+          binding?.providerInfo ?? publicBinding?.providerInfo ?? compatBinding?.providerInfo ?? s.providers[model.providerID]
+        if (!provider) throw new Error(`Provider unavailable: ${model.providerID}`)
         const options = { ...provider.options }
 
         if (
@@ -2412,38 +3333,77 @@ const layer = Layer.effect(
             typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
           if (!url) return
 
-          const loader = s.varsLoaders[model.providerID]
-          if (loader) {
-            const vars = loader(options)
-            for (const [key, value] of Object.entries(vars)) {
-              const field = "${" + key + "}"
-              url = url.replaceAll(field, value)
+          if (!binding && !publicBinding && !compatBinding) {
+            const loader = s.varsLoaders[model.providerID]
+            if (loader) {
+              const vars = loader(options)
+              for (const [key, value] of Object.entries(vars)) {
+                const field = "${" + key + "}"
+                url = url.replaceAll(field, value)
+              }
             }
-          }
 
-          url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
-            const val = envs[String(key)]
-            return val ?? item
-          })
+            url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
+              const val = envs[String(key)]
+              return val ?? item
+            })
+          }
           return url
         })
 
         if (baseURL !== undefined) options["baseURL"] = baseURL
-        if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
         if (model.headers)
           options["headers"] = {
             ...options["headers"],
             ...model.headers,
           }
 
-        const key = Hash.fast(
-          JSON.stringify({
-            providerID: model.providerID,
-            npm: model.api.npm,
-            options,
-          }),
-        )
-        const existing = s.sdk.get(key)
+        const activation = binding ? activateConsoleGeneration(s, binding) : undefined
+        if (!binding && !publicBinding && !compatBinding && options["apiKey"] === undefined && provider.key)
+          options["apiKey"] = provider.key
+        const key = binding
+          ? Hash.fast(
+              JSON.stringify({
+                generation: binding.client.generation,
+                providerID: model.providerID,
+                npm: model.api.npm,
+                options,
+              }),
+            )
+          : publicBinding
+            ? Hash.fast(
+                JSON.stringify({
+                  route: "public",
+                  providerID: model.providerID,
+                  npm: model.api.npm,
+                  options,
+                }),
+              )
+            : compatBinding
+              ? Hash.fast(
+                  JSON.stringify({
+                    route: "zen-compat",
+                    accountID: compatBinding.accountID,
+                    providerID: model.providerID,
+                    npm: model.api.npm,
+                    options,
+                  }),
+                )
+            : Hash.fast(
+                JSON.stringify({
+                  providerID: model.providerID,
+                  npm: model.api.npm,
+                  options,
+                }),
+              )
+
+        if (binding) options["apiKey"] = binding.account.secret
+        if (publicBinding) options["apiKey"] = ZEN_PUBLIC_API_KEY
+        // Injected only after the secret-free cache identity exists, and only
+        // for the exact committed compatibility account.
+        if (compatBinding) options["apiKey"] = compatBinding.secret
+
+        const existing = !activation || activation.cacheable ? s.sdk.get(key) : undefined
         if (existing) return existing
 
         const customFetch = options["fetch"]
@@ -2488,7 +3448,10 @@ const layer = Layer.effect(
             name: model.providerID,
             ...options,
           })
-          s.sdk.set(key, loaded)
+          if (!activation || activation.cacheable) {
+            s.sdk.set(key, loaded)
+            activation?.slot?.sdkKeys.add(key)
+          }
           return loaded as SDK
         }
 
@@ -2511,42 +3474,65 @@ const layer = Layer.effect(
           name: model.providerID,
           ...options,
         })
-        s.sdk.set(key, loaded)
+        if (!activation || activation.cacheable) {
+          s.sdk.set(key, loaded)
+          activation?.slot?.sdkKeys.add(key)
+        }
         return loaded as SDK
       } catch (e) {
         throw new InitError({ providerID: model.providerID, cause: e })
       }
     }
 
-    const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderV2.ID) =>
-      InstanceState.use(state, (s) => s.providers[providerID]),
-    )
+    const getProvider = Effect.fn("Provider.getProvider")(function* (providerID: ProviderV2.ID, model?: Model) {
+      const s = yield* currentState(providerID)
+      return (
+        (model ? s.consoleBindings.get(model)?.providerInfo ?? s.publicBindings.get(model)?.providerInfo : undefined) ??
+        (model ? s.zenCompatBindings.get(model)?.providerInfo : undefined) ??
+        s.providers[providerID]
+      )
+    })
 
     const resolveAccountID = Effect.fn("Provider.resolveAccountID")(function* (
       providerID: ProviderV2.ID,
       selector: string,
     ) {
       const requested = selector.trim()
-      const s = yield* InstanceState.get(state)
+      const s = yield* currentState(providerID)
       const load = s.accountLoaders[providerID]
-      if (!load) {
-        return yield* new AccountResolutionError({
-          providerID,
-          selector: requested,
-          reason: "unsupported",
-        })
-      }
+      const accounts: readonly ProviderAccountIdentity[] = load
+        ? yield* Effect.tryPromise({
+            try: () => load(),
+            catch: (cause) =>
+              new AccountResolutionError({
+                providerID,
+                selector: requested,
+                reason: "unavailable",
+                cause,
+              }),
+          })
+        : isConsoleAccountProvider(providerID)
+          ? (yield* credentials.list(opencodeIntegrationID)).flatMap((credential) => {
+              const projected = projectOpencodeCredential(credential)
+              if (!projected) return []
+              const metadata = credential.value.metadata
+              const aliases = [
+                credential.id,
+                typeof metadata?.email === "string" ? metadata.email : undefined,
+                typeof metadata?.accountID === "string" ? metadata.accountID : undefined,
+              ].filter((value): value is string => Boolean(value))
+              return [{
+                id: projected.accountID,
+                label: credential.label,
+                ...(aliases.length > 0 ? { aliases } : {}),
+              }]
+            })
+          : yield* new AccountResolutionError({
+              providerID,
+              selector: requested,
+              reason: "unsupported",
+            })
 
-      const accounts = yield* Effect.tryPromise({
-        try: () => load(),
-        catch: (cause) =>
-          new AccountResolutionError({
-            providerID,
-            selector: requested,
-            reason: "unavailable",
-            cause,
-          }),
-      })
       const resolved = resolveProviderAccountSelector(requested, accounts)
       if (resolved.kind === "resolved") return resolved.accountID
       if (resolved.kind === "ambiguous") {
@@ -2569,9 +3555,57 @@ const layer = Layer.effect(
       modelID: ModelV2.ID,
       accountID?: string,
     ) {
-      const s = yield* InstanceState.get(state)
+      const s = yield* currentState(providerID)
+      const consoleSelection =
+        accountID !== undefined && accountID.startsWith("cred_") && isConsoleAccountProvider(providerID)
+
+      if (consoleSelection) {
+        const account = yield* consoleAccounts.resolve(accountID).pipe(Effect.orDie)
+        if (!account) {
+          return yield* new ModelNotFoundError({
+            providerID,
+            modelID,
+            cause: new Error("Selected OpenCode Console credential is unavailable"),
+          })
+        }
+
+        const capability = account.capabilities.providers[providerID]
+        const accountModelID = ModelV2.ID.make(splitModelIDForProvider(modelID, providerID).baseModelID)
+        // Trusted catalog metadata is the only fallback. Local provider
+        // state may contain unrelated env/config credentials and must not bleed
+        // into an explicitly selected Console account transport.
+        const baseProvider = s.catalog[providerID]
+        const materialized = capability
+          ? consoleModel(providerID, accountModelID, capability, baseProvider?.models[accountModelID])
+          : undefined
+
+        if (
+          materialized &&
+          materialized.status !== "deprecated" &&
+          (materialized.status !== "alpha" || runtimeFlags.enableExperimentalModels)
+        ) {
+          const providerInfo = consoleProviderInfo(providerID, capability!, materialized, baseProvider)
+          const client = consoleClientIdentity(account, providerID, capability!)
+          const binding = { account, provider: capability!, providerInfo, client } satisfies ConsoleBinding
+          s.consoleBindings.set(materialized, binding)
+          activateConsoleGeneration(s, binding)
+          return materialized
+        }
+
+        const suggestions = capability
+          ? fuzzysort.go(accountModelID, Object.keys(capability.models), { limit: 3, threshold: -10000 }).map((m) => m.target)
+          : []
+        return yield* new ModelNotFoundError({ providerID, modelID: accountModelID, suggestions })
+      }
+
+      yield* ensureProviderDiscovery(s, providerID)
+
       const provider = s.providers[providerID]
-      const runtimeModelID = ModelV2.ID.make(providerModelID(modelID, providerID, accountID))
+      const requestedModelID = ModelV2.ID.make(providerModelID(modelID, providerID, accountID))
+      const runtimeModelID =
+        providerID === ProviderV2.ID.make("claude")
+          ? ModelV2.ID.make(resolveClaudeAlias(requestedModelID) ?? requestedModelID)
+          : requestedModelID
       if (!provider) {
         const catalogProvider = s.catalog[providerID]
         const suggestions = catalogProvider
@@ -2593,6 +3627,671 @@ const layer = Layer.effect(
       return info
     })
 
+    const routedAvailability = Effect.fn("Provider.routedAvailability")(function* (input: {
+      readonly state: State
+      readonly providerID: ProviderV2.ID
+      readonly modelID: ModelV2.ID
+      readonly allowPublic?: boolean
+    }) {
+      const allowPublic = input.allowPublic !== false && input.providerID === ProviderV2.ID.make("opencode")
+      let publicEligible = false
+      if (allowPublic) {
+        const base = input.state.catalog[input.providerID]?.models[input.modelID]
+        if (base) {
+          const hosted = yield* Effect.promise(() => zenHostedCatalog())
+          const advertised =
+            hosted.state === "fresh" || hosted.state === "stale"
+              ? hosted.ids.has(base.api.id) || hosted.ids.has(base.id)
+              : false
+           if (advertised) {
+            const raw = (yield* modelsDevSvc.get())[input.providerID]?.models
+            publicEligible = isTrustedZeroCostCatalogModel(raw?.[base.api.id] ?? raw?.[base.id])
+            if (publicEligible) {
+              publicEligible = yield* routeHealth
+                .assessPublic({
+                  providerID: input.providerID,
+                  modelID: input.modelID,
+                })
+                .pipe(
+                  Effect.map((health) => health.available),
+                  Effect.orDie,
+                )
+            }
+          }
+        }
+      }
+      return { allowPublic, publicEligible }
+    })
+
+    const materializeRoutedResolution = Effect.fn("Provider.materializeRoutedResolution")(function* (input: {
+      readonly state: State
+      readonly sessionID: CoreSessionSchema.ID
+      readonly providerID: ProviderV2.ID
+      readonly modelID: ModelV2.ID
+      readonly affinityDomain: string
+      readonly allowPublic: boolean
+      readonly publicEligible: boolean
+      readonly resolution: OpencodeProviderRoute.Resolution
+    }) {
+      let resolution = input.resolution
+      if (resolution.lease.route.kind === "public") {
+        const baseProvider = input.state.catalog[input.providerID]
+        const base = baseProvider?.models[input.modelID]
+        if (!base || !input.publicEligible) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Committed Public route is not eligible for this hosted model"),
+          })
+        }
+
+        // Clone from the trusted account-neutral catalog so local/env/provider
+        // auth state can never bleed into a committed Public transport.
+        const providerInfo = toPublicInfo(baseProvider)
+        providerInfo.env = []
+        delete providerInfo.key
+        delete providerInfo.options.apiKey
+        // toPublicInfo deliberately strips functions. Reinstall only the
+        // provider-owned hosted transport wrapper for the committed Public
+        // lease so the explicit "public" sentinel reaches the wire without
+        // consulting env/auth/default-account state.
+        providerInfo.options.fetch = committedPublicZenProviderFetch
+        const materialized = providerInfo.models[input.modelID]
+        if (!materialized) {
+          return yield* new ModelNotFoundError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+          })
+        }
+        input.state.publicBindings.set(materialized, { providerInfo })
+        return { model: materialized, route: resolution } satisfies RoutedModel
+      }
+
+      const lease = resolution.lease.route
+
+      // A committed transitional Zen/Go API-key route materializes only the
+      // exact selected key. It never reaches the Console capability path, and a
+      // missing/changed compatibility execution fails closed instead of
+      // reselecting, recompiling, or falling back to ambient auth.
+      if (isZenCompatHandle(lease.credentialHandle)) {
+        const compat = yield* resolveZenCompatExecution({
+          providerID: lease.providerID,
+          accountID: lease.accountID,
+          credentialHandle: lease.credentialHandle,
+          expectedCredentialRevision: lease.credentialRevision,
+        })
+        if (!compat) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Committed OpenCode compatibility account is no longer available"),
+          })
+        }
+        const materialized = yield* materializeZenCompatModel({
+          state: input.state,
+          providerID: input.providerID,
+          modelID: input.modelID,
+          execution: compat,
+        })
+        if (!materialized) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Committed OpenCode compatibility account has no hosted catalog model"),
+          })
+        }
+        input.state.zenCompatBindings.set(materialized.model, {
+          providerInfo: materialized.providerInfo,
+          accountID: compat.accountID,
+          secret: compat.apiKey,
+        })
+        return { model: materialized.model, route: resolution } satisfies RoutedModel
+      }
+
+      let execution = yield* providerRoutes
+        .resolveExecution({
+          providerID: lease.providerID,
+          accountID: lease.accountID,
+          credentialHandle: lease.credentialHandle,
+          modelID: input.modelID,
+          expectedCredentialRevision: lease.credentialRevision,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RouteResolutionError({
+                providerID: input.providerID,
+                modelID: input.modelID,
+                cause,
+              }),
+          ),
+        )
+      // P2 may advance credentialRevision without changing durable route
+      // identity. Recompile that exact binding once; never re-enter selection,
+      // failover, or explicit rebind logic downstream of the committed route.
+      if (!execution) {
+        const refreshed = yield* providerRoutes
+          .compileExisting({
+            sessionID: input.sessionID,
+            providerID: input.providerID,
+            modelID: input.modelID,
+            affinityDomain: input.affinityDomain,
+            routeIntent: { kind: "auto" },
+            mode: "concentrate",
+            freeRoutePreference: "public-first-for-free",
+            allowPublic: input.allowPublic,
+            publicEligible: input.publicEligible,
+            expected: resolution.attribution,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new RouteResolutionError({
+                  providerID: input.providerID,
+                  modelID: input.modelID,
+                  cause,
+                }),
+            ),
+          )
+        if (refreshed.lease.route.kind !== "account") {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Committed account route changed kind during exact transport materialization"),
+          })
+        }
+        resolution = refreshed
+        execution = yield* providerRoutes
+          .resolveExecution({
+            providerID: refreshed.lease.route.providerID,
+            accountID: refreshed.lease.route.accountID,
+            credentialHandle: refreshed.lease.route.credentialHandle,
+            modelID: input.modelID,
+            expectedCredentialRevision: refreshed.lease.route.credentialRevision,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new RouteResolutionError({
+                  providerID: input.providerID,
+                  modelID: input.modelID,
+                  cause,
+                }),
+            ),
+          )
+      }
+      if (!execution) {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+          cause: new Error("Committed account lease changed before exact transport materialization"),
+        })
+      }
+
+      const capability = execution.capabilities.providers[input.providerID]
+      const baseProvider = input.state.catalog[input.providerID]
+      const materialized = capability
+        ? consoleModel(input.providerID, input.modelID, capability, baseProvider?.models[input.modelID])
+        : undefined
+      if (
+        !capability ||
+        !materialized ||
+        materialized.status === "deprecated" ||
+        (materialized.status === "alpha" && !runtimeFlags.enableExperimentalModels)
+      ) {
+        return yield* new ModelNotFoundError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+        })
+      }
+
+      const secret = execution.credential.type === "oauth" ? execution.credential.access : execution.credential.key
+      const account = {
+        realm,
+        credentialID: execution.account.credentialID,
+        credentialRevision: execution.credentialRevision,
+        server: execution.snapshot.server,
+        ...(execution.snapshot.orgID ? { orgID: execution.snapshot.orgID } : {}),
+        configVersion: execution.snapshot.version,
+        secret,
+        snapshot: execution.snapshot,
+        capabilities: execution.capabilities,
+      } satisfies ConsoleAccountExecution
+      const providerInfo = consoleProviderInfo(input.providerID, capability, materialized, baseProvider)
+      const client = consoleClientIdentity(account, input.providerID, capability)
+      const binding = { account, provider: capability, providerInfo, client } satisfies ConsoleBinding
+      input.state.consoleBindings.set(materialized, binding)
+      activateConsoleGeneration(input.state, binding)
+      return { model: materialized, route: resolution } satisfies RoutedModel
+    })
+
+    /**
+     * Materialize one already-selected Zen/Go compatibility account from the
+     * trusted account-neutral catalog.
+     *
+     * The clone carries no key, no env values, and no configured api key; the
+     * only transport authority is the route-locked fetch for the exact selected
+     * account, so no second account choice is possible at the wire.
+     */
+    const materializeZenCompatModel = Effect.fn("Provider.materializeZenCompatModel")(function* (input: {
+      readonly state: State
+      readonly providerID: ProviderV2.ID
+      readonly modelID: ModelV2.ID
+      readonly execution: ZenCompatExecution
+    }) {
+      const baseProvider = input.state.catalog[input.providerID]
+      const base = baseProvider?.models[input.modelID]
+      if (!base) return undefined
+      if (base.status === "deprecated") return undefined
+      if (base.status === "alpha" && !runtimeFlags.enableExperimentalModels) return undefined
+
+      const providerInfo = toPublicInfo(baseProvider)
+      providerInfo.env = []
+      delete providerInfo.key
+      delete providerInfo.options.apiKey
+      providerInfo.options.fetch = committedZenProviderFetch(input.execution.accountID)
+      const model = providerInfo.models[input.modelID]
+      if (!model) return undefined
+      return { model, providerInfo }
+    })
+
+
+    const materializeTransientResolution = Effect.fn("Provider.materializeTransientResolution")(function* (input: {
+      readonly state: State
+      readonly providerID: ProviderV2.ID
+      readonly modelID: ModelV2.ID
+      readonly publicEligible: boolean
+      readonly resolution: OpencodeProviderRoute.TransientResolution
+    }) {
+      const route = input.resolution.route
+      if (route.kind === "public") {
+        const baseProvider = input.state.catalog[input.providerID]
+        const base = baseProvider?.models[input.modelID]
+        if (!base || !input.publicEligible) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Transient Public route is not eligible for this hosted model"),
+          })
+        }
+
+        const providerInfo = toPublicInfo(baseProvider)
+        providerInfo.env = []
+        delete providerInfo.key
+        delete providerInfo.options.apiKey
+        providerInfo.options.fetch = committedPublicZenProviderFetch
+        const materialized = providerInfo.models[input.modelID]
+        if (!materialized) {
+          return yield* new ModelNotFoundError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+          })
+        }
+        input.state.publicBindings.set(materialized, { providerInfo })
+        // A Public route is credential-free by construction: the provider info
+        // above has no key, no env values, and no configured api key, so the
+        // only bearer it can carry is the hosted public sentinel.
+        return {
+          model: materialized,
+          route: input.resolution,
+          transport: routeTransport(providerInfo, materialized, ZEN_PUBLIC_API_KEY),
+        } satisfies TransientRoutedModel
+      }
+
+      // Same exact-key rule as the durable path: a committed compatibility
+      // route materializes only its own selected key, with no Core capability
+      // path, no reselection, and no ambient fallback.
+      if (isZenCompatHandle(route.credentialHandle)) {
+        const compat = yield* resolveZenCompatExecution({
+          providerID: route.providerID,
+          accountID: route.accountID,
+          credentialHandle: route.credentialHandle,
+          expectedCredentialRevision: route.credentialRevision,
+        })
+        if (!compat) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Transient OpenCode compatibility account is no longer available"),
+          })
+        }
+        const materialized = yield* materializeZenCompatModel({
+          state: input.state,
+          providerID: input.providerID,
+          modelID: input.modelID,
+          execution: compat,
+        })
+        if (!materialized) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: input.modelID,
+            cause: new Error("Transient OpenCode compatibility account has no hosted catalog model"),
+          })
+        }
+        return {
+          model: materialized.model,
+          route: input.resolution,
+          transport: routeTransport(materialized.providerInfo, materialized.model, compat.apiKey),
+        } satisfies TransientRoutedModel
+      }
+
+      const execution = yield* providerRoutes
+        .resolveExecution({
+          providerID: route.providerID,
+          accountID: route.accountID,
+          credentialHandle: route.credentialHandle,
+          modelID: input.modelID,
+          expectedCredentialRevision: route.credentialRevision,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RouteResolutionError({
+                providerID: input.providerID,
+                modelID: input.modelID,
+                cause,
+              }),
+          ),
+        )
+      if (!execution) {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+          cause: new Error("Transient account route changed before exact transport materialization"),
+        })
+      }
+
+      const capability = execution.capabilities.providers[input.providerID]
+      const baseProvider = input.state.catalog[input.providerID]
+      const materialized = capability
+        ? consoleModel(input.providerID, input.modelID, capability, baseProvider?.models[input.modelID])
+        : undefined
+      if (
+        !capability ||
+        !materialized ||
+        materialized.status === "deprecated" ||
+        (materialized.status === "alpha" && !runtimeFlags.enableExperimentalModels)
+      ) {
+        return yield* new ModelNotFoundError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+        })
+      }
+
+      const secret = execution.credential.type === "oauth" ? execution.credential.access : execution.credential.key
+      const account = {
+        realm,
+        credentialID: execution.account.credentialID,
+        credentialRevision: execution.credentialRevision,
+        server: execution.snapshot.server,
+        ...(execution.snapshot.orgID ? { orgID: execution.snapshot.orgID } : {}),
+        configVersion: execution.snapshot.version,
+        secret,
+        snapshot: execution.snapshot,
+        capabilities: execution.capabilities,
+      } satisfies ConsoleAccountExecution
+      const providerInfo = consoleProviderInfo(input.providerID, capability, materialized, baseProvider)
+      const client = consoleClientIdentity(account, input.providerID, capability)
+      const binding = { account, provider: capability, providerInfo, client } satisfies ConsoleBinding
+      input.state.consoleBindings.set(materialized, binding)
+      activateConsoleGeneration(input.state, binding)
+      // Only the selected binding secret may reach the wire. Configured
+      // provider keys, provider env values, and default-account credentials are
+      // never consulted for an account route.
+      return {
+        model: materialized,
+        route: input.resolution,
+        transport: routeTransport(providerInfo, materialized, secret),
+      } satisfies TransientRoutedModel
+    })
+
+    const resolveInheritedRoutedModel = Effect.fn("Provider.resolveInheritedRoutedModel")(function* (
+      input: {
+        readonly sessionID: CoreSessionSchema.ID
+        readonly providerID: ProviderV2.ID
+        readonly modelID: ModelV2.ID
+        readonly route: ProviderRouteResolution.RouteAttribution
+        readonly allowPublic?: boolean
+      },
+    ) {
+      const s = yield* currentState(input.providerID)
+      const accountModelID = ModelV2.ID.make(
+        splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
+      )
+      const affinityDomain = OpencodeProviderRoute.affinityDomain(input.providerID)
+      const { allowPublic, publicEligible } = yield* routedAvailability({
+        state: s,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        allowPublic: input.allowPublic,
+      })
+
+      // The parent attribution is the authority here. compileExisting validates
+      // that the durable row is still that exact route generation, prepares only
+      // the already-bound account when needed, and can refresh P2 credential
+      // revision without selecting/rebinding/failing over.
+      const resolution = yield* providerRoutes
+        .compileExisting({
+          sessionID: input.sessionID,
+          providerID: input.providerID,
+          modelID: accountModelID,
+          affinityDomain,
+          routeIntent: { kind: "auto" },
+          mode: "concentrate",
+          freeRoutePreference: "public-first-for-free",
+          allowPublic,
+          publicEligible,
+          expected: input.route,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RouteResolutionError({
+                providerID: input.providerID,
+                modelID: accountModelID,
+                cause,
+              }),
+          ),
+        )
+
+      return yield* materializeRoutedResolution({
+        state: s,
+        sessionID: input.sessionID,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        affinityDomain,
+        allowPublic,
+        publicEligible,
+        resolution,
+      })
+    })
+
+    const resolveRoutedModel = Effect.fn("Provider.resolveRoutedModel")(function* (
+      input: {
+        readonly sessionID: CoreSessionSchema.ID
+        readonly providerID: ProviderV2.ID
+        readonly modelID: ModelV2.ID
+        readonly accountID?: string
+        readonly routeIntent?: ProviderRouteIntent.Info
+        readonly allowPublic?: boolean
+      },
+    ) {
+      const s = yield* currentState(input.providerID)
+      const accountModelID = ModelV2.ID.make(
+        splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
+      )
+      const affinityDomain = OpencodeProviderRoute.affinityDomain(input.providerID)
+
+      // Migration-window V1 selections used Credential.ID as model.accountID for
+      // Console accounts. Translate that local handle into the stable remote
+      // ProviderAccount identity before route intent normalization. Never let the
+      // opaque credential handle become the durable account identity.
+      let legacyAccountID = input.accountID
+      if (legacyAccountID?.startsWith("cred_")) {
+        const stored = yield* credentials.get(Credential.ID.make(legacyAccountID))
+        const projected = stored ? projectOpencodeCredential(stored) : undefined
+        if (!projected) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: accountModelID,
+            cause: new Error("Selected OpenCode credential cannot be projected to a stable ProviderAccount identity"),
+          })
+        }
+        legacyAccountID = projected.accountID
+      }
+
+      const routeIntent = yield* ProviderRouteIntentRuntime.normalize({
+        routeIntent: input.routeIntent,
+        ...(legacyAccountID ? { legacyAccountID } : {}),
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new RouteResolutionError({
+              providerID: input.providerID,
+              modelID: accountModelID,
+              cause,
+            }),
+        ),
+      )
+
+      // Public is only an OpenCode-hosted route. Its eligibility requires both
+      // the live hosted-model witness and trusted all-zero pricing metadata.
+      const { allowPublic, publicEligible } = yield* routedAvailability({
+        state: s,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        allowPublic: input.allowPublic,
+      })
+
+      let resolution = yield* providerRoutes
+        .resolveIfApplicable({
+          sessionID: input.sessionID,
+          providerID: input.providerID,
+          modelID: accountModelID,
+          affinityDomain,
+          routeIntent,
+          mode: "concentrate",
+          freeRoutePreference: "public-first-for-free",
+          allowPublic,
+          publicEligible,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RouteResolutionError({
+                providerID: input.providerID,
+                modelID: accountModelID,
+                cause,
+              }),
+          ),
+        )
+
+      // No durable route, no explicit OpenCode intent, and no account/public
+      // ownership evidence: preserve the mature direct-provider path for
+      // third-party providers only. A hosted OpenCode provider may never
+      // return undefined, because callers would then spend an ambient
+      // credential outside the route authority and without route attribution.
+      if (!resolution) {
+        if (!isHostedZenProvider(input.providerID)) return undefined
+        return yield* noHostedRouteError(input.providerID, accountModelID)
+      }
+
+      return yield* materializeRoutedResolution({
+        state: s,
+        sessionID: input.sessionID,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        affinityDomain,
+        allowPublic,
+        publicEligible,
+        resolution,
+      })
+    })
+
+    const resolveTransientRoutedModel = Effect.fn("Provider.resolveTransientRoutedModel")(function* (
+      input: {
+        readonly providerID: ProviderV2.ID
+        readonly modelID: ModelV2.ID
+        readonly accountID?: string
+        readonly routeIntent?: ProviderRouteIntent.Info
+        readonly allowPublic?: boolean
+      },
+    ) {
+      const s = yield* currentState(input.providerID)
+      const accountModelID = ModelV2.ID.make(
+        splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
+      )
+
+      let legacyAccountID = input.accountID
+      if (legacyAccountID?.startsWith("cred_")) {
+        const stored = yield* credentials.get(Credential.ID.make(legacyAccountID))
+        const projected = stored ? projectOpencodeCredential(stored) : undefined
+        if (!projected) {
+          return yield* new RouteResolutionError({
+            providerID: input.providerID,
+            modelID: accountModelID,
+            cause: new Error("Selected OpenCode credential cannot be projected to a stable ProviderAccount identity"),
+          })
+        }
+        legacyAccountID = projected.accountID
+      }
+
+      const routeIntent = yield* ProviderRouteIntentRuntime.normalize({
+        routeIntent: input.routeIntent,
+        ...(legacyAccountID ? { legacyAccountID } : {}),
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new RouteResolutionError({
+              providerID: input.providerID,
+              modelID: accountModelID,
+              cause,
+            }),
+        ),
+      )
+
+      const { allowPublic, publicEligible } = yield* routedAvailability({
+        state: s,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        allowPublic: input.allowPublic,
+      })
+
+      const resolution = yield* providerRoutes
+        .resolveTransient({
+          providerID: input.providerID,
+          modelID: accountModelID,
+          routeIntent,
+          mode: "concentrate",
+          freeRoutePreference: "public-first-for-free",
+          allowPublic,
+          publicEligible,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new RouteResolutionError({
+                providerID: input.providerID,
+                modelID: accountModelID,
+                cause,
+              }),
+          ),
+        )
+
+      if (!resolution) {
+        if (!isHostedZenProvider(input.providerID)) return undefined
+        return yield* noHostedRouteError(input.providerID, accountModelID)
+      }
+
+      return yield* materializeTransientResolution({
+        state: s,
+        providerID: input.providerID,
+        modelID: accountModelID,
+        publicEligible,
+        resolution,
+      })
+    })
+
     const getLanguage = Effect.fn("Provider.getLanguage")(function* (model: Model) {
       const primitive = modelPrimitive(model)
       if (primitive !== "language") {
@@ -2603,12 +4302,27 @@ const layer = Layer.effect(
           required: "language",
         })
       }
-      const s = yield* InstanceState.get(state)
-      const envs = yield* env.all()
-      const key = `${model.providerID}/${model.id}`
-      if (s.models.has(key)) return s.models.get(key)!
+      // Language-model construction is a provider read just like getModel/getProvider.
+      // Revalidate the per-instance provider snapshot so Config.invalidate() cannot
+      // leave execution bound to stale transport options after a local config mutation.
+      const s = yield* currentState(model.providerID)
+      const binding = s.consoleBindings.get(model)
+      const publicBinding = s.publicBindings.get(model)
+      const compatBinding = s.zenCompatBindings.get(model)
+      const activation = binding ? activateConsoleGeneration(s, binding) : undefined
+      const envs = binding || publicBinding || compatBinding ? {} : yield* env.all()
+      const key = binding
+        ? `console/${binding.client.generation}/${model.providerID}/${model.id}/${model.api.id}`
+        : publicBinding
+          ? `public/${model.providerID}/${model.id}/${model.api.id}`
+          : compatBinding
+            ? `zen-compat/${compatBinding.accountID}/${model.providerID}/${model.id}/${model.api.id}`
+            : `${model.providerID}/${model.id}`
+      const existing = !activation || activation.cacheable ? s.models.get(key) : undefined
+      if (existing) return existing
 
-      const provider = s.providers[model.providerID]
+      const provider =
+        binding?.providerInfo ?? publicBinding?.providerInfo ?? compatBinding?.providerInfo ?? s.providers[model.providerID]
       return yield* EffectPromise.refineRejection(
         async () => {
           const sdk = await resolveSDK(model, s, envs)
@@ -2619,11 +4333,17 @@ const layer = Layer.effect(
                 {
                   ...provider.options,
                   ...model.options,
+                  ...(binding ? { apiKey: binding.account.secret } : {}),
+                  ...(publicBinding ? { apiKey: ZEN_PUBLIC_API_KEY } : {}),
+                  ...(compatBinding ? { apiKey: compatBinding.secret } : {}),
                 },
                 model,
               )
             : sdk.languageModel(model.api.id)
-          s.models.set(key, language)
+          if (!activation || activation.cacheable) {
+            s.models.set(key, language)
+            activation?.slot?.modelKeys.add(key)
+          }
           return language
         },
         (cause) =>
@@ -2634,7 +4354,7 @@ const layer = Layer.effect(
     })
 
     const closest = Effect.fn("Provider.closest")(function* (providerID: ProviderV2.ID, query: string[]) {
-      const s = yield* InstanceState.get(state)
+      const s = yield* currentState(providerID)
       const provider = s.providers[providerID]
       if (!provider) return undefined
       for (const item of query) {
@@ -2657,7 +4377,7 @@ const layer = Layer.effect(
         return configured && isLanguageModel(configured) ? configured : undefined
       }
 
-      const s = yield* InstanceState.get(state)
+      const s = yield* currentState(providerID)
       const provider = s.providers[providerID]
       if (!provider) return undefined
 
@@ -2724,7 +4444,7 @@ const layer = Layer.effect(
 
     const defaultModel = Effect.fn("Provider.defaultModel")(function* () {
       const cfg = yield* config.get()
-      const s = yield* InstanceState.get(state)
+      const s = yield* currentState(cfg.model ? parseModel(cfg.model).providerID : undefined)
       if (cfg.model) {
         const configured = parseModel(cfg.model)
         const model =
@@ -2777,6 +4497,9 @@ const layer = Layer.effect(
       getProvider,
       resolveAccountID,
       getModel,
+      resolveRoutedModel,
+      resolveInheritedRoutedModel,
+      resolveTransientRoutedModel,
       getLanguage,
       closest,
       getSmallModel,
@@ -2818,7 +4541,12 @@ export const node = LayerNode.make({
     ModelsDev.node,
     RuntimeFlags.node,
     GensparkCatalog.node,
-    EventV2.node,
+    Credential.node,
+    CredentialResolver.node,
+    ProviderRoute.node,
+    ProviderRouteHealth.node,
+    ProviderCatalogContributions.node,
+    httpClientNode,
   ],
 })
 

@@ -223,8 +223,8 @@ const layer: Layer.Layer<Service, never, Auth.Service | Plugin.Service | EventV2
       }
 
       // Legacy provider auth hooks can maintain additional credential state
-      // (for example Verdent's multi-account vault) outside Auth. Publish the
-      // shared update event so cached provider models and clients refresh too.
+      // outside Auth. Publish the shared update event so cached provider models
+      // and clients refresh too.
       yield* events.publish(Integration.Event.ConnectionUpdated, {
         integrationID: Integration.ID.make(input.providerID),
       })

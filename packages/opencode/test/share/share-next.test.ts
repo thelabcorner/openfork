@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect } from "bun:test"
-import { Effect, Exit, Layer, Option } from "effect"
+import { Deferred, Effect, Exit, Layer, Option } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -85,6 +85,84 @@ beforeEach(async () => {
 })
 
 describe("ShareNext", () => {
+  it.live("shared prompts publish while background model metadata is blocked", () =>
+    provideTmpdirInstance(() => Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let modelCalls = 0
+      const seen: Array<{ data: Array<{ type: string; data: { id?: string } | unknown[] }> }> = []
+      const client = HttpClient.make((request) => {
+        if (request.url.endsWith("/sync") && request.body._tag === "Uint8Array") {
+          seen.push(JSON.parse(new TextDecoder().decode(request.body.body)))
+        }
+        return Effect.succeed(json(request, { ok: true }))
+      })
+      const fakeProvider = ProviderTest.fake({
+        getModel: Effect.fn("ShareNextTest.blockedModel")(function* (providerID, modelID) {
+          modelCalls++
+          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.await(release)
+          return ProviderTest.model({ id: modelID, providerID })
+        }),
+      })
+      yield* Effect.gen(function* () {
+        const sharing = yield* ShareNext.Service
+        const sessions = yield* Session.Service
+        const info = yield* sessions.create({ title: "shared publication" })
+        const { db } = yield* Database.Service
+        yield* db.insert(SessionShareTable).values({
+          session_id: info.id, id: "shr_blocked_model", secret: "sec_blocked_model",
+          url: "https://legacy-share.example.com/share/blocked",
+        }).run().pipe(Effect.orDie)
+        yield* sharing.init()
+        const publish = () => sessions.updateMessage({
+          id: MessageID.ascending(), role: "user", sessionID: info.id,
+          provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+          agent: "build", time: { created: Date.now() },
+          model: { providerID: fakeProvider.model.providerID, modelID: fakeProvider.model.id },
+        })
+        const first = yield* publish()
+        yield* Deferred.await(started)
+        const second = yield* publish()
+        expect(modelCalls).toBe(1)
+        expect(seen).toHaveLength(0)
+        yield* Deferred.succeed(release, undefined)
+        yield* pollWithTimeout(Effect.sync(() => seen.length === 2 ? true : undefined),
+          "background sharing did not drain", "5 seconds")
+        expect(modelCalls).toBe(2)
+        expect(seen.flatMap((batch) => batch.data.filter((item) => item.type === "message")
+          .map((item) => (item.data as { id: string }).id))).toEqual([first.id, second.id])
+        expect(seen.flatMap((batch) => batch.data).some((item) => item.type === "model_request")).toBe(false)
+      }).pipe(Effect.provide(integrationLayer(client, fakeProvider.layer)))
+    }), { config: { enterprise: { url: "https://legacy-share.example.com" } } }),
+  )
+
+  it.live("unshared worker prompts never resolve models for share projection", () =>
+    provideTmpdirInstance(() => {
+      let modelCalls = 0
+      const fakeProvider = ProviderTest.fake({
+        getModel: () => {
+          modelCalls++
+          return Effect.die("unshared prompt resolved a sharing model")
+        },
+      })
+      return Effect.gen(function* () {
+        const sharing = yield* ShareNext.Service
+        const sessions = yield* Session.Service
+        const info = yield* sessions.create({ title: "unshared prompt" })
+        yield* sharing.init()
+        yield* sessions.updateMessage({
+          id: MessageID.ascending(), role: "user", sessionID: info.id,
+          provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+          agent: "build", time: { created: Date.now() },
+          model: { providerID: fakeProvider.model.providerID, modelID: fakeProvider.model.id },
+        })
+        expect(modelCalls).toBe(0)
+        expect(yield* share(info.id)).toBeUndefined()
+      }).pipe(Effect.provide(integrationLayer(none, fakeProvider.layer)))
+    }, { config: { enterprise: { url: "https://legacy-share.example.com" } } }),
+  )
+
   it.live("request uses legacy share API without active org account", () =>
     provideTmpdirInstance(
       () =>

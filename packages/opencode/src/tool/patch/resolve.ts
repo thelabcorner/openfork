@@ -110,12 +110,13 @@ function resolveOne(
     if (eof && eof.start >= lower && (upper >= content.length || eof.end <= upper)) return eof
   }
   const scope = upper < content.length ? content.slice(0, upper) : content
-  return resolveMatch(scope, needle, { from: lower, label: `hunk ${index + 1}` }).match
+  return resolveMatch(scope, needle, { from: lower, label: `hunk ${index + 1}`, expectedLine: chunk.old_start }).match
 }
 
 export function resolveChunks(content: string, chunks: readonly UpdateFileChunk[], filePath: string): ResolvedChunk[] {
   const resolved = new Array<ResolvedChunk | undefined>(chunks.length)
   const deferred: Array<{ index: number; error: MatchError }> = []
+  const failed = new Map<number, unknown>()
 
   // Pass 1 — file-wide unique resolution.
   chunks.forEach((chunk, index) => {
@@ -142,7 +143,10 @@ export function resolveChunks(content: string, chunks: readonly UpdateFileChunk[
         deferred.push({ index, error })
         return
       }
-      throw error
+      // A bad hunk must not prevent us from diagnosing its independent
+      // siblings. Same-file application remains atomic: failures are only
+      // accumulated for one complete repair receipt, never partially applied.
+      failed.set(index, error)
     }
   })
 
@@ -169,8 +173,11 @@ export function resolveChunks(content: string, chunks: readonly UpdateFileChunk[
     if (!progressed) break
     pending = still
   }
-  if (pending.length > 0) {
-    const index = pending[0]!
+  const unresolved = new Map<number, string>()
+  for (const [index, error] of failed) {
+    unresolved.set(index, error instanceof Error ? error.message : String(error))
+  }
+  for (const index of pending) {
     const error = errors.get(index)!
     const at = error.candidates.join(", ")
     const hint = candidateConflictHint({
@@ -178,11 +185,20 @@ export function resolveChunks(content: string, chunks: readonly UpdateFileChunk[
       candidates: error.candidates,
       matchedLines: Math.max(1, chunks[index]!.old_lines.length),
     })
-    throw new Error(
+    unresolved.set(
+      index,
       `${filePath}: hunk ${index + 1} matches ${error.candidates.length} locations (lines ${at}) and ` +
         `neighbouring hunks do not narrow it to one. Add surrounding context lines that are unique to the ` +
         `location you mean — the tool will not guess between identical candidates.` +
         (hint ? `\n\n${hint}` : ""),
+    )
+  }
+  if (unresolved.size > 0) {
+    const ordered = [...unresolved.entries()].sort(([left], [right]) => left - right)
+    if (ordered.length === 1) throw new Error(ordered[0]![1])
+    throw new Error(
+      `${filePath}: ${ordered.length} patch hunks could not be resolved safely. Fix all listed hunks before retrying:\n\n` +
+        ordered.map(([index, detail]) => `--- hunk ${index + 1} ---\n${detail}`).join("\n\n"),
     )
   }
 

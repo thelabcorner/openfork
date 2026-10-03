@@ -99,9 +99,10 @@ describe("OXP Gate J delegation architecture boundary", () => {
       'from "@opencode-ai/core/session/execution-owner"',
     )
     expect(worker).toContain("execution.snapshot(sessionID)")
-    expect(worker).toContain('ownership.ownerID')
+    expect(worker).toContain("ownership.generation > 0")
+    expect(worker).toContain('latest?.info.role === "user"')
     expect(worker).toContain('"recoverable"')
-    expect(worker).toContain('while (current.state === "running")')
+    expect(worker).not.toMatch(/ownership\.ownerID\s*\?\s*["']running["']/)
   })
 
   test("keeps provider account identity first-class and never persists model@account", async () => {
@@ -150,6 +151,11 @@ describe("OXP Gate J delegation architecture boundary", () => {
     expect(OxpSurface.TOOLS.map((tool) => tool.name)).toContain(
       "openfork_worker",
     )
+    const worker = OxpSurface.TOOLS.find((tool) => tool.name === "openfork_worker")
+    expect(
+      (worker?.inputSchema as { properties?: Record<string, unknown> } | undefined)
+        ?.properties,
+    ).toHaveProperty("workdir")
     expect(OxpSurface.TOOLS.length).toBeLessThanOrEqual(14)
   })
 })

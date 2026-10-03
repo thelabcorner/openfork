@@ -13,8 +13,8 @@ describe("provider-wiring: claude integration", () => {
   })
 
   it("legacy aliases resolve through migrateLegacyReference", () => {
-    expect(migrateLegacyReference("claude/sonnet")).toBe("claude-sonnet-4-5-20251101")
-    expect(migrateLegacyReference("claude/opus")).toBe("claude-opus-4-6")
+    expect(migrateLegacyReference("claude/sonnet")).toMatch(/^claude-sonnet-/)
+    expect(migrateLegacyReference("claude/opus")).toMatch(/^claude-opus-/)
     expect(migrateLegacyReference("claude-sonnet-4-5-20251101")).toBe("claude-sonnet-4-5-20251101")
     expect(migrateLegacyReference("unknown")).toBeUndefined()
   })

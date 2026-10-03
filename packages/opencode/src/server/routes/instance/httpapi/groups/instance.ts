@@ -1,4 +1,3 @@
-import { Agent } from "@/agent/agent"
 import { Command } from "@/command"
 import { Format } from "@/format"
 import { LSP } from "@/lsp/lsp"
@@ -144,16 +143,6 @@ export const InstanceApi = HttpApi.make("instance")
             identifier: "command.list",
             summary: "List commands",
             description: "Get a list of all available commands in the OpenFork system.",
-          }),
-        ),
-        HttpApiEndpoint.get("agent", InstancePaths.agent, {
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.Array(Agent.Info), "List of agents"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "app.agents",
-            summary: "List agents",
-            description: "Get a list of all available AI agents in the OpenFork system.",
           }),
         ),
         HttpApiEndpoint.get("skill", InstancePaths.skill, {

@@ -44,11 +44,7 @@ const layer = Layer.effect(
     const ripgrep = yield* Ripgrep.Service
 
     const execute = Effect.fn("OxpProject.execute")(function* (input: Input, signal?: AbortSignal) {
-      yield* Effect.try({
-        try: () => OxpLocation.requireExplicit(input, "project"),
-        catch: (cause) =>
-          OxpError.isError(cause) ? cause : new OxpError.InvalidArgument({ detail: "Invalid OXP project request" }),
-      })
+      yield* OxpLocation.requireExplicit(input, "project")
       const action = input.action ?? "summary"
       if (action !== "summary" && action !== "structure" && action !== "recent") {
         return yield* new OxpError.InvalidArgument({ detail: "Unknown OXP project action" })

@@ -27,6 +27,8 @@ export interface UpdateFileChunk {
   new_lines: string[]
   change_context?: string
   is_end_of_file?: boolean
+  /** 1-based original-file line from a unified-diff @@ header; hint only. */
+  old_start?: number
 }
 
 export interface ApplyPatchAction {
@@ -101,7 +103,7 @@ function parsePatchHeader(
   return null
 }
 
-function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: UpdateFileChunk[]; nextIdx: number } {
+function parseUpdateFileChunks(lines: string[], startIdx: number, filePath: string): { chunks: UpdateFileChunk[]; nextIdx: number } {
   const chunks: UpdateFileChunk[] = []
   let i = startIdx
 
@@ -116,7 +118,11 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
       let isEndOfFile = false
 
       // Parse change lines
-      while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("***")) {
+      while (
+        i < lines.length &&
+        !lines[i].startsWith("@@") &&
+        (!lines[i].startsWith("***") || lines[i] === "*** End of File")
+      ) {
         const changeLine = lines[i]
 
         if (changeLine === "*** End of File") {
@@ -136,6 +142,12 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
         } else if (changeLine.startsWith("+")) {
           // Add line - only in new
           newLines.push(changeLine.substring(1))
+        } else if (changeLine === "\\ No newline at end of file") {
+          // Standard diff marker carries no file-content bytes.
+        } else if (changeLine.trim() !== "") {
+          throw new Error(
+            `Invalid patch line ${i + 1} in ${filePath}: expected a context (' '), removal ('-'), or addition ('+') line`,
+          )
         }
 
         i++
@@ -148,20 +160,26 @@ function parseUpdateFileChunks(lines: string[], startIdx: number): { chunks: Upd
         is_end_of_file: isEndOfFile || undefined,
       })
     } else {
-      i++
+      if (lines[i].trim() !== "") {
+        throw new Error(`Invalid patch line ${i + 1} in ${filePath}: expected an @@ hunk header`)
+      }
+      i++ // intentional blank separator
     }
   }
+  if (chunks.length === 0) throw new Error(`Invalid update for ${filePath}: expected at least one @@ hunk`)
 
   return { chunks, nextIdx: i }
 }
 
-function parseAddFileContent(lines: string[], startIdx: number): { content: string; nextIdx: number } {
+function parseAddFileContent(lines: string[], startIdx: number, filePath: string): { content: string; nextIdx: number } {
   let content = ""
   let i = startIdx
 
   while (i < lines.length && !lines[i].startsWith("***")) {
     if (lines[i].startsWith("+")) {
       content += lines[i].substring(1) + "\n"
+    } else if (lines[i].trim() !== "") {
+      throw new Error(`Invalid patch line ${i + 1} in ${filePath}: Add File content lines must start with '+'`)
     }
     i++
   }
@@ -216,12 +234,15 @@ export function parsePatch(patchText: string): { hunks: Hunk[] } {
   while (i < endIdx) {
     const header = parsePatchHeader(lines, i)
     if (!header) {
-      i++
+      if (lines[i].trim() !== "") {
+        throw new Error(`Invalid patch line ${i + 1}: unrecognized content between file operations: ${lines[i]}`)
+      }
+      i++ // intentional blank separator
       continue
     }
 
     if (lines[i].startsWith("*** Add File:")) {
-      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx)
+      const { content, nextIdx } = parseAddFileContent(lines, header.nextIdx, header.filePath)
       hunks.push({
         type: "add",
         path: header.filePath,
@@ -235,7 +256,7 @@ export function parsePatch(patchText: string): { hunks: Hunk[] } {
       })
       i = header.nextIdx
     } else if (lines[i].startsWith("*** Update File:")) {
-      const { chunks, nextIdx } = parseUpdateFileChunks(lines, header.nextIdx)
+      const { chunks, nextIdx } = parseUpdateFileChunks(lines, header.nextIdx, header.filePath)
       hunks.push({
         type: "update",
         path: header.filePath,

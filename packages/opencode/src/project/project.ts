@@ -239,7 +239,14 @@ const layer = Layer.effect(
 
       const result: Info = {
         ...existing,
-        worktree: projectID === ProjectV2.ID.global || isChat ? worktree : existing.worktree,
+        // Existing rows may predate canonical project discovery and retain a
+        // junction, short-path, or case-drifted spelling. Repair that durable
+        // root once when the project loads; linked worktrees remain distinct
+        // physical roots and are still tracked in `sandboxes` below.
+        worktree:
+          projectID === ProjectV2.ID.global || isChat
+            ? worktree
+            : AbsolutePath.make(FSUtil.resolve(existing.worktree)),
         name: isChat ? CHAT_PROJECT_NAME : existing.name,
         vcs: data.vcs?.type ?? fakeVcs,
         time: { ...existing.time, updated: Date.now() },

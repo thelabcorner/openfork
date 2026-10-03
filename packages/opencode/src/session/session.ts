@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Slug } from "@opencode-ai/core/util/slug"
@@ -35,6 +36,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
 import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -292,6 +294,11 @@ export const CreateInput = Schema.optional(
 )
 export type CreateInput = Types.DeepMutable<Schema.Schema.Type<typeof CreateInput>>
 
+/** Durable workspace identity needed to create a Session without constructing an execution Instance. */
+export type ResolvedLocation = Pick<InstanceContext, "project" | "directory" | "worktree"> & {
+  readonly workspaceID?: WorkspaceV2.ID
+}
+
 export const ForkInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
@@ -466,6 +473,8 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
   }) => Effect.Effect<Info>
+  /** Trusted server adapter for durable creation from explicitly resolved location metadata. */
+  readonly createForLocation: (input: CreateInput | undefined, location: ResolvedLocation) => Effect.Effect<Info>
   /** Trusted host-only stable root creation for crash/retry-safe runtime principals. */
   readonly createManagedRoot: (input: {
     id: SessionID
@@ -502,6 +511,8 @@ export interface Interface {
     sessionID: SessionID
     principalRef: string
     expectedModel: SessionMetadataOwnership.WorkerDelegationModel
+    /** Canonical protected delegation selection committed with the Session model. */
+    delegationModel: SessionMetadataOwnership.WorkerDelegationModel
     model: NonNullable<Info["model"]>
     time: number
   }) => Effect.Effect<void, DelegatedWorkerSelectionConflictError>
@@ -534,6 +545,7 @@ export interface Interface {
     partID: PartID
     field: string
     delta: string
+    offset?: number
   }) => Effect.Effect<void>
   /** Finds the first message matching the predicate, searching newest-first. */
   readonly findMessage: (
@@ -703,6 +715,9 @@ const layer: Layer.Layer<
     })
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
+      projectID: ProjectV2.ID
+      worktree: string
+      project: InstanceContext["project"]
       id?: SessionID
       title?: string
       agent?: string
@@ -714,12 +729,11 @@ const layer: Layer.Layer<
       metadata?: typeof Metadata.Type
       permission?: PermissionV1.Ruleset
     }) {
-      const ctx = yield* InstanceState.context
       const result: Info = {
         id: SessionID.descending(input.id),
         slug: Slug.create(),
         version: InstallationVersion,
-        projectID: ctx.project.id,
+        projectID: input.projectID,
         directory: input.directory,
         path: input.path,
         workspaceID: input.workspaceID,
@@ -738,8 +752,10 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* publishCreated(result, ctx.worktree)
-      yield* groupSession(result).pipe(Effect.forkIn(scope, { startImmediately: true }))
+      yield* publishCreated(result, input.worktree)
+      yield* groupSession(result)
+        .pipe(Effect.provideService(InstanceRef, { directory: input.directory, worktree: input.worktree, project: input.project }))
+        .pipe(Effect.forkIn(scope, { startImmediately: true }))
 
       return result
     })
@@ -773,7 +789,12 @@ const layer: Layer.Layer<
       if (input?.directory) conditions.push(eq(SessionTable.directory, input.directory))
       if (input?.projectID) conditions.push(eq(SessionTable.project_id, input.projectID))
       if (input?.parentID) conditions.push(eq(SessionTable.parent_id, input.parentID))
-      if (input?.roots) conditions.push(isNull(SessionTable.parent_id))
+      if (input?.roots) {
+        conditions.push(isNull(SessionTable.parent_id))
+        conditions.push(
+          sql`json_extract(${SessionTable.metadata}, '$.workerDelegation.producer') IS NOT 'oxp' OR ${SessionTable.group_id} IS NULL`,
+        )
+      }
       if (input?.start) conditions.push(gte(SessionTable.time_updated, input.start))
       if (input?.cursor) conditions.push(lt(SessionTable.time_updated, input.cursor))
       if (input?.search) conditions.push(like(SessionTable.title, `%${input.search}%`))
@@ -906,6 +927,39 @@ const layer: Layer.Layer<
       } as SessionV1.Part
     })
 
+    const createForLocation = Effect.fn("Session.createForLocation")(function* (
+      input: CreateInput | undefined,
+      location: ResolvedLocation,
+    ) {
+      const directory =
+        location.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) && !input?.parentID
+          ? yield* Effect.promise(() => generateChatSessionDirectory(location.worktree))
+          : FSUtil.resolve(location.directory)
+      const allocatedChatDirectory =
+        location.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) &&
+        chatSessionDirectoryKey(directory, location.worktree) !== undefined &&
+        directory !== location.directory
+      let completed = false
+      const created = createNext({
+        ...input,
+        projectID: location.project.id,
+        project: location.project,
+        worktree: location.worktree,
+        directory,
+        path: sessionPath(location.worktree, directory),
+        workspaceID: input?.workspaceID ?? location.workspaceID,
+      })
+      if (!allocatedChatDirectory) return yield* created
+      return yield* created.pipe(
+        Effect.tap(() => Effect.sync(() => (completed = true))),
+        Effect.ensuring(
+          Effect.suspend(() =>
+            completed ? Effect.void : cleanupChatDirectoryIfUnused({ directory, projectID: location.project.id }),
+          ),
+        ),
+      )
+    })
+
     const create = Effect.fn("Session.create")(function* (input?: {
       parentID?: SessionID
       title?: string
@@ -917,45 +971,19 @@ const layer: Layer.Layer<
     }) {
       const ctx = yield* InstanceState.context
       const workspace = yield* InstanceState.workspaceID
-      // Projectless chats run in an isolated scratch directory per root
-      // session. The server owns this allocation so web clients never have to
-      // guess HOME/USERPROFILE or fabricate a path that may not exist on the
-      // machine actually hosting OpenCode. Child/subagent sessions deliberately
-      // stay in their parent's current directory.
-      const directory =
-        ctx.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) && !input?.parentID
-          ? yield* Effect.promise(() => generateChatSessionDirectory(ctx.worktree))
-          : ctx.directory
-      const allocatedChatDirectory =
-        ctx.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) &&
-        chatSessionDirectoryKey(directory, ctx.worktree) !== undefined &&
-        directory !== ctx.directory
-      let completed = false
-      const created = createNext({
-        parentID: input?.parentID,
-        directory,
-        path: sessionPath(ctx.worktree, directory),
-        title: input?.title,
-        agent: input?.agent,
-        model: input?.model,
-        metadata: input?.metadata,
-        permission: input?.permission,
+      return yield* createForLocation(
+        input
+          ? {
+              ...input,
+              permission: input.permission ? [...input.permission] : undefined,
+            }
+          : undefined,
+        {
+        project: ctx.project,
+        directory: ctx.directory,
+        worktree: ctx.worktree,
         workspaceID: input?.workspaceID ?? workspace,
-      })
-      if (!allocatedChatDirectory) return yield* created
-      return yield* created.pipe(
-        Effect.tap(() => Effect.sync(() => (completed = true))),
-        // If allocation succeeded but durable session creation did not, reclaim
-        // the brand-new scratch directory. cleanupChatDirectoryIfUnused also
-        // rechecks the database, so a partially committed create can never lose
-        // a directory that is already referenced by a surviving session.
-        Effect.ensuring(
-          Effect.suspend(() =>
-            completed
-              ? Effect.void
-              : cleanupChatDirectoryIfUnused({ directory, projectID: ctx.project.id }),
-          ),
-        ),
+        },
       )
     })
 
@@ -998,6 +1026,9 @@ const layer: Layer.Layer<
 
       return yield* createNext({
         id: input.id,
+        projectID: ctx.project.id,
+        project: ctx.project,
+        worktree: ctx.worktree,
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
         title: input.title,
@@ -1030,6 +1061,9 @@ const layer: Layer.Layer<
       // but for backward compat with existing tests/clients, default to "before" when edge is undefined.
       const edge = input.edge ?? "before"
       const session = yield* createNext({
+        projectID: ctx.project.id,
+        project: ctx.project,
+        worktree: ctx.worktree,
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
@@ -1304,6 +1338,7 @@ const layer: Layer.Layer<
       sessionID: SessionID
       principalRef: string
       expectedModel: SessionMetadataOwnership.WorkerDelegationModel
+      delegationModel: SessionMetadataOwnership.WorkerDelegationModel
       model: NonNullable<Info["model"]>
       time: number
     }) {
@@ -1311,23 +1346,13 @@ const layer: Layer.Layer<
         Effect.gen(function* () {
           const current = yield* getForMutation(input.sessionID).pipe(Effect.orDie)
           const origin = SessionMetadataOwnership.workerDelegation(current.metadata)
-          const sameModel = (
-            left: SessionMetadataOwnership.WorkerDelegationModel,
-            right: SessionMetadataOwnership.WorkerDelegationModel,
-          ) =>
-            left.providerID === right.providerID &&
-            left.modelID === right.modelID &&
-            left.accountID === right.accountID &&
-            (left.variant && left.variant !== "default" ? left.variant : undefined) ===
-              (right.variant && right.variant !== "default" ? right.variant : undefined)
-
           if (!origin || origin.principalRef !== input.principalRef) {
             return yield* new DelegatedWorkerSelectionConflictError({
               sessionID: input.sessionID,
               reason: "Delegated worker ownership changed before selection commit",
             })
           }
-          if (!sameModel(origin.model, input.expectedModel)) {
+          if (!SessionMetadataOwnership.sameWorkerDelegationModel(origin.model, input.expectedModel)) {
             return yield* new DelegatedWorkerSelectionConflictError({
               sessionID: input.sessionID,
               reason: "Delegated worker model selection changed before selection commit",
@@ -1336,14 +1361,7 @@ const layer: Layer.Layer<
 
           const metadata = SessionMetadataOwnership.rebindDelegatedWorkerModel(
             current.metadata,
-            {
-              providerID: input.model.providerID,
-              modelID: input.model.id,
-              ...(input.model.accountID ? { accountID: input.model.accountID } : {}),
-              ...(input.model.variant && input.model.variant !== "default"
-                ? { variant: input.model.variant }
-                : {}),
-            },
+            input.delegationModel,
           )
           if (!metadata) {
             return yield* new DelegatedWorkerSelectionConflictError({
@@ -1471,6 +1489,7 @@ const layer: Layer.Layer<
       partID: PartID
       field: string
       delta: string
+      offset?: number
     }) {
       yield* events.publish(MessageV2.Event.PartDelta, input)
     })
@@ -1498,6 +1517,7 @@ const layer: Layer.Layer<
       list,
       listGlobal,
       create,
+      createForLocation,
       createManagedRoot,
       fork: fork as Interface["fork"],
       touch,
@@ -1581,6 +1601,11 @@ function listByProject(
   }
   if (input.roots) {
     conditions.push(isNull(SessionTable.parent_id))
+    // Grouped OXP workers are reachable through their delegation group rather
+    // than duplicated as unrelated roots. Legacy/unlinked workers remain roots.
+    conditions.push(
+      sql`json_extract(${SessionTable.metadata}, '$.workerDelegation.producer') IS NOT 'oxp' OR ${SessionTable.group_id} IS NULL`,
+    )
   }
   if (input.start) {
     conditions.push(gte(SessionTable.time_updated, input.start))

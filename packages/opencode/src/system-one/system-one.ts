@@ -4,24 +4,22 @@ import { Context, Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { requestExecutor as requestExecutorNode } from "@opencode-ai/core/effect/app-node-platform"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { InstallationUserAgent } from "@opencode-ai/core/installation/version"
+import { OpenCodeHostedUserAgent } from "@opencode-ai/core/installation/version"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { SystemOne as Contract } from "@opencode-ai/schema/system-one"
-import { InvalidRequestReason, LLMError } from "@opencode-ai/llm"
+import { LLMError } from "@opencode-ai/llm"
 import { RequestExecutor } from "@opencode-ai/llm/route"
 import { SystemOneClient } from "@opencode-ai/llm/system-one"
 import { Provider } from "@/provider/provider"
-import { observeZenRequest, resolveZenRequest } from "@/plugin/zen"
 import { MessageID } from "@/session/schema"
 import { InstanceRef } from "@/effect/instance-ref"
-
-const ZEN_PROVIDERS = new Set(["opencode", "opencode-go"])
 
 export type Error =
   | Provider.ModelNotFoundError
   | Provider.AccountResolutionError
+  | Provider.RouteResolutionError
   | Provider.UnsupportedModelPrimitiveError
   | LLMError
 
@@ -44,10 +42,6 @@ function cost(model: Provider.Model, usage: Contract.Usage): Contract.Cost {
   const input = (usage.input_tokens * rate.input) / 1_000_000
   const output = (usage.output_tokens * rate.output) / 1_000_000
   return { input, output, total: input + output }
-}
-
-function errorHttp(error: LLMError) {
-  return "http" in error.reason ? error.reason.http : undefined
 }
 
 /**
@@ -75,10 +69,35 @@ export const layer = Layer.effect(
     const requestExecutor = yield* RequestExecutor.Service
 
     const infer = Effect.fn("SystemOne.infer")(function* (input: Contract.InferInput) {
+      // One authoritative transient route decision for a standalone semantic
+      // inference. `affinityID` stays a caller-owned remote/cache affinity key
+      // and never participates in route authority.
       const accountID = input.accountID
         ? yield* provider.resolveAccountID(input.providerID, input.accountID)
         : undefined
-      const model = yield* provider.getModel(input.providerID, input.modelID, accountID)
+      const routed = yield* provider.resolveTransientRoutedModel({
+        providerID: input.providerID,
+        modelID: input.modelID,
+        ...(accountID ? { accountID } : {}),
+        ...(input.routeIntent ? { routeIntent: input.routeIntent } : {}),
+      })
+
+      // Hosted OpenCode providers are owned by the transient resolver, so an
+      // unresolved hosted request fails closed. Falling back to ambient
+      // provider config, env credentials, or the default Zen account here would
+      // create exactly the second authorization surface this cutover removes.
+      if (Provider.isHostedZenProvider(input.providerID) && !routed) {
+        return yield* new Provider.RouteResolutionError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+          cause: new Error("No authoritative OpenCode route resolved for this hosted System One request"),
+        })
+      }
+
+      // A resolved route is final authority for model, provider, and transport.
+      // For providers the OpenCode routing domain does not own, the mature
+      // direct-provider path still applies unchanged.
+      const model = routed?.model ?? (yield* provider.getModel(input.providerID, input.modelID, accountID))
       const primitive = Provider.modelPrimitive(model)
       if (primitive !== "system-one") {
         return yield* new Provider.UnsupportedModelPrimitiveError({
@@ -89,40 +108,34 @@ export const layer = Layer.effect(
         })
       }
 
-      const info = yield* provider.getProvider(model.providerID)
-      const options = { ...info.options, ...model.options }
-      const baseURL =
-        (typeof options.baseURL === "string" && options.baseURL.trim() ? options.baseURL : undefined) ?? model.api.url
-      const headers = {
-        ...stringHeaders(options.headers),
-        ...model.headers,
+      let wireModelID: string
+      let baseURL: string
+      let headers: Record<string, string>
+      let apiKey: string | undefined
+      if (routed) {
+        wireModelID = model.api.id
+        baseURL = routed.transport.baseURL
+        headers = { ...routed.transport.headers }
+        apiKey = routed.transport.apiKey
+      } else {
+        const info = yield* provider.getProvider(model.providerID)
+        const options = { ...info.options, ...model.options }
+        wireModelID = model.api.id
+        baseURL =
+          (typeof options.baseURL === "string" && options.baseURL.trim() ? options.baseURL : undefined) ?? model.api.url
+        headers = {
+          ...stringHeaders(options.headers),
+          ...model.headers,
+        }
+        apiKey =
+          (typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined) ??
+          (typeof info.key === "string" && info.key ? info.key : undefined)
       }
 
-      let wireModelID = model.api.id
-      let zenAccountID: string | undefined
-      let apiKey =
-        (typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined) ??
-        (typeof info.key === "string" && info.key ? info.key : undefined)
-
-      if (ZEN_PROVIDERS.has(model.providerID)) {
-        const route = yield* Effect.promise(() => resolveZenRequest(model.api.id, apiKey, model.providerID))
-        if (route.missingAccountID) {
-          return yield* new LLMError({
-            module: "SystemOne",
-            method: "infer",
-            reason: new InvalidRequestReason({
-              message: `Selected OpenCode account ${route.missingAccountID} is no longer available`,
-              parameter: "accountID",
-            }),
-          })
-        }
-        wireModelID = route.modelID ?? wireModelID
-        zenAccountID = route.accountID
-        apiKey = route.apiKey ?? apiKey
-
+      if (Provider.isHostedZenProvider(model.providerID)) {
         const client = Flag.OPENCODE_CLIENT
         const instance = yield* InstanceRef
-        headers["User-Agent"] = InstallationUserAgent(client)
+        headers["User-Agent"] = OpenCodeHostedUserAgent()
         headers["x-opencode-client"] = client
         headers["x-opencode-session"] = semanticSessionID(input.affinityID)
         headers["x-opencode-request"] = MessageID.ascending()
@@ -130,7 +143,7 @@ export const layer = Layer.effect(
       }
 
       if (apiKey) {
-        if (ZEN_PROVIDERS.has(model.providerID) || headers.authorization === undefined) {
+        if (Provider.isHostedZenProvider(model.providerID) || headers.authorization === undefined) {
           headers.authorization = `Bearer ${apiKey}`
         }
       }
@@ -145,14 +158,30 @@ export const layer = Layer.effect(
       }).pipe(
         Effect.provideService(RequestExecutor.Service, requestExecutor),
         Effect.tapError((error) => {
-          if (!zenAccountID) return Effect.void
-          const http = errorHttp(error)
-          if (!http?.response) return Effect.void
-          return Effect.sync(() => observeZenRequest(zenAccountID, http.response!.status, http.response!.headers))
+          if (!routed) return Effect.void
+          const http = "http" in error.reason ? error.reason.http : undefined
+          return Effect.logDebug("system-one routed request failed", {
+            providerID: model.providerID,
+            modelID: model.id,
+            routeKind: routed.route.route.kind,
+            ...(routed.route.route.kind === "account" ? { accountID: routed.route.route.accountID } : {}),
+            status: http?.response?.status,
+          })
         }),
       )
 
-      if (zenAccountID) observeZenRequest(zenAccountID, 200)
+      if (routed) {
+        // Secret-free validation evidence only. Durable route health requires a
+        // committed ProviderRouteLease, and a standalone semantic inference has
+        // none: fabricating one would invent route/Session authority.
+        yield* Effect.logDebug("system-one routed request completed", {
+          providerID: model.providerID,
+          modelID: model.id,
+          routeKind: routed.route.route.kind,
+          ...(routed.route.route.kind === "account" ? { accountID: routed.route.route.accountID } : {}),
+          status: 200,
+        })
+      }
       const result: Contract.InferResult = {
         ...output,
         cost: cost(model, output.usage),
@@ -160,6 +189,12 @@ export const layer = Layer.effect(
       yield* Effect.logDebug("system-one inference", {
         providerID: model.providerID,
         modelID: model.id,
+        ...(routed
+          ? {
+              routeKind: routed.route.route.kind,
+              ...(routed.route.route.kind === "account" ? { accountID: routed.route.route.accountID } : {}),
+            }
+          : {}),
         questions: Object.keys(input.questions).length,
         inputTokens: result.usage.input_tokens,
         outputTokens: result.usage.output_tokens,

@@ -8,6 +8,7 @@ import { OxpConfig } from "./config"
 import { OxpError } from "./error"
 import type { OxpResult } from "./result"
 import type { ParentCorrelation } from "./parent-tool-epoch"
+import { BOUNDARY_CONTEXT_SCHEMA, requestContextChars } from "./context-footprint"
 
 export interface Handle {
   readonly activityID: OxpActivitySchema.ActivityID
@@ -28,49 +29,33 @@ export interface Interface {
     handle: Handle | undefined,
     input: BeginInput,
     result: OxpResult.CapabilityResult,
+    resultContextChars?: number,
   ) => Effect.Effect<void>
   readonly failure: (
     handle: Handle | undefined,
     input: BeginInput,
     error: OxpError.Error,
+    resultContextChars?: number,
   ) => Effect.Effect<void>
 }
 
-export class Service extends Context.Service<Service, Interface>()(
-  "@opencode/OxpActivityRecorder",
-) {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/OxpActivityRecorder") {}
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
 }
 
-function text(
-  source: Record<string, unknown> | undefined,
-  key: string,
-  max = 512,
-) {
+function text(source: Record<string, unknown> | undefined, key: string, max = 512) {
   const value = source?.[key]
-  return typeof value === "string" &&
-    value.length > 0 &&
-    Buffer.byteLength(value, "utf8") <= max
-    ? value
-    : undefined
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= max ? value : undefined
 }
 
-function finite(
-  source: Record<string, unknown> | undefined,
-  key: string,
-) {
+function finite(source: Record<string, unknown> | undefined, key: string) {
   const value = source?.[key]
   return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
-function flag(
-  source: Record<string, unknown> | undefined,
-  key: string,
-) {
+function flag(source: Record<string, unknown> | undefined, key: string) {
   const value = source?.[key]
   return typeof value === "boolean" ? value : undefined
 }
@@ -95,30 +80,35 @@ function safePatchFiles(value: unknown) {
     if (!path) return []
     const type = text(row, "type", 32)
     const movePath = text(row, "movePath", 4096)
-    return [{
-      path,
-      ...(type ? { type } : {}),
-      ...(movePath ? { movePath } : {}),
-      ...(finite(row, "additions") === undefined ? {} : { additions: finite(row, "additions") }),
-      ...(finite(row, "deletions") === undefined ? {} : { deletions: finite(row, "deletions") }),
-    }]
+    return [
+      {
+        path,
+        ...(type ? { type } : {}),
+        ...(movePath ? { movePath } : {}),
+        ...(finite(row, "additions") === undefined ? {} : { additions: finite(row, "additions") }),
+        ...(finite(row, "deletions") === undefined ? {} : { deletions: finite(row, "deletions") }),
+      },
+    ]
   })
   return files.length ? files : undefined
 }
 
 const SAFE_SUMMARY_TARGET_BYTES = 7 * 1024
-const DETAIL_TARGET_BYTES = 384 * 1024
-const DETAIL_MAX_STRING_BYTES = 128 * 1024
-const DETAIL_MAX_DEPTH = 12
-const DETAIL_MAX_ARRAY_ITEMS = 256
-const DETAIL_MAX_OBJECT_KEYS = 256
-const SECRET_KEY = /(?:pass(?:word)?|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key|access[_-]?key|refresh[_-]?token)/i
+const DETAIL_TARGET_BYTES = 3 * 1024
+const DETAIL_MAX_STRING_BYTES = 2 * 1024
+const DETAIL_MAX_DEPTH = 6
+const DETAIL_MAX_ARRAY_ITEMS = 32
+const DETAIL_MAX_OBJECT_KEYS = 64
+const SECRET_KEY =
+  /(?:pass(?:word)?|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key|access[_-]?key|refresh[_-]?token)/i
 
 function truncateUtf8(value: string, maxBytes: number) {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return { value, truncated: false }
   const suffix = "\n… [truncated]"
   const suffixBytes = Buffer.byteLength(suffix, "utf8")
-  const body = Buffer.from(value, "utf8").subarray(0, Math.max(0, maxBytes - suffixBytes)).toString("utf8")
+  const body = Buffer.from(value, "utf8")
+    .subarray(0, Math.max(0, maxBytes - suffixBytes))
+    .toString("utf8")
   return { value: body + suffix, truncated: true }
 }
 
@@ -126,7 +116,10 @@ function redactInlineSecrets(value: string) {
   return value
     .replace(/(authorization\s*:\s*bearer\s+)[^\s"';]+/gi, "$1[redacted]")
     .replace(/(^|\s)((?:--?)(?:token|api[-_]?key|password|secret)(?:=|\s+))[^\s"';]+/gi, "$1$2[redacted]")
-    .replace(/\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*=)[^\s"';]+/g, "$1[redacted]")
+    .replace(
+      /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*=)[^\s"';]+/g,
+      "$1[redacted]",
+    )
 }
 
 function invocationDetail(value: unknown): OxpActivitySchema.InvocationDetail | undefined {
@@ -193,9 +186,7 @@ function invocationDetail(value: unknown): OxpActivitySchema.InvocationDetail | 
     if (entries.length > DETAIL_MAX_OBJECT_KEYS) truncated = true
     for (const [childKey, child] of entries.slice(0, DETAIL_MAX_OBJECT_KEYS)) {
       spend(Buffer.byteLength(childKey, "utf8"))
-      const next = SECRET_KEY.test(childKey)
-        ? "[redacted]"
-        : visit(child, depth + 1, childKey)
+      const next = SECRET_KEY.test(childKey) ? "[redacted]" : visit(child, depth + 1, childKey)
       if (next !== undefined) result[childKey] = next
       if (remaining <= 0) break
     }
@@ -208,12 +199,106 @@ function invocationDetail(value: unknown): OxpActivitySchema.InvocationDetail | 
   return truncated ? { ...detail, detailTruncated: true } : detail
 }
 
-function finishSummary(
-  value: Record<string, unknown>,
-): OxpActivitySchema.SafeSummary | undefined {
+const REQUEST_DETAIL_KEYS: Readonly<Record<string, readonly string[]>> = {
+  read: ["action", "rootID", "path", "offset", "limit", "reads"],
+  find: ["action", "rootID", "path", "glob", "grep", "include", "syntax", "maxResults"],
+  edit: ["action", "rootID", "path"],
+  write: ["action", "rootID", "path"],
+  patch: ["action", "rootID", "format", "apply", "showDiff"],
+  process: [
+    "action",
+    "rootID",
+    "workdir",
+    "command",
+    "argv",
+    "mode",
+    "handle",
+    "yieldMs",
+    "timeoutMs",
+    "offset",
+    "maxBytes",
+  ],
+  git: [
+    "action",
+    "rootID",
+    "workdir",
+    "mode",
+    "paths",
+    "ref",
+    "staged",
+    "maxBytes",
+    "maxCount",
+    "contextLines",
+    "dryRun",
+  ],
+  openfork_worker: [
+    "action",
+    "rootID",
+    "workerID",
+    "batchID",
+    "title",
+    "agent",
+    "model",
+    "expectedModel",
+    "timeoutMs",
+    "limit",
+    "includeArchived",
+    "nestedDelegation",
+  ],
+  openfork_session: [
+    "action",
+    "sessionID",
+    "rootID",
+    "parentID",
+    "limit",
+    "search",
+    "roots",
+    "includeArchived",
+    "beforeMessageID",
+    "model",
+  ],
+  openfork_request: ["action", "sessionID", "rootID", "requestID", "reply"],
+  capability: ["action", "namespace", "rootID", "capability"],
+  openfork_info: ["action"],
+  openai_files: ["action", "rootID", "path", "fileID", "purpose", "limit"],
+}
+
+/**
+ * Rich activity detail is a tiny presentation projection, never a generic copy
+ * of tool arguments. Large/sensitive fields such as prompts, message text,
+ * patch/write bodies, capability args and Goal payloads are intentionally absent.
+ */
+function requestDetail(input: BeginInput): OxpActivitySchema.InvocationDetail | undefined {
+  const args = record(input.args)
+  const keys = REQUEST_DETAIL_KEYS[input.tool]
+  if (!args || !keys) return
+  const projected: Record<string, unknown> = {}
+  for (const key of keys) {
+    const value = args[key]
+    if (value !== undefined) projected[key] = value
+  }
+  if (Object.keys(projected).length === 0) return
+  return invocationDetail({ args: projected })
+}
+
+/**
+ * Successful results are already represented by safe_summary + typed resource
+ * links (and often by the native resource itself). Persisting raw output or
+ * structured result bodies here duplicates high-volume data into SQLite.
+ */
+function failureDetail(error: OxpError.Error): OxpActivitySchema.InvocationDetail | undefined {
+  return invocationDetail({
+    error: {
+      code: error._tag,
+      message: truncateUtf8(redactInlineSecrets(error.message), 1024).value,
+      committed: error.metadata?.committed === true,
+    },
+  })
+}
+
+function finishSummary(value: Record<string, unknown>): OxpActivitySchema.SafeSummary | undefined {
   if (Object.keys(value).length === 0) return undefined
-  const bytes = (candidate: Record<string, unknown>) =>
-    Buffer.byteLength(JSON.stringify(candidate), "utf8")
+  const bytes = (candidate: Record<string, unknown>) => Buffer.byteLength(JSON.stringify(candidate), "utf8")
   if (bytes(value) <= SAFE_SUMMARY_TARGET_BYTES) return value
 
   // Large multi-file operations can naturally exceed the durable 8 KiB
@@ -269,9 +354,7 @@ function safeSummary(
   const args = record(input.args)
   const metadata = record(result?.metadata)
   const structured = record(result?.structured)
-  const base: Record<string, unknown> = input.continuityMarker
-    ? { continuityMarker: input.continuityMarker }
-    : {}
+  const base: Record<string, unknown> = input.continuityMarker ? { continuityMarker: input.continuityMarker } : {}
   const action = text(args, "action", 256)
   if (action) base.action = action
 
@@ -303,11 +386,13 @@ function safeSummary(
     const path = text(metadata, "path", 4096)
     if (path) {
       const counts = diffCounts(metadata?.diff)
-      base.files = [{
-        path,
-        type: input.tool === "write" && flag(metadata, "exists") === false ? "add" : "update",
-        ...counts,
-      }]
+      base.files = [
+        {
+          path,
+          type: input.tool === "write" && flag(metadata, "exists") === false ? "add" : "update",
+          ...counts,
+        },
+      ]
     }
     const strategy = text(metadata, "strategy", 64)
     if (strategy) base.strategy = strategy
@@ -388,11 +473,7 @@ function safeSummary(
       // capability broker's canonical server/tool identity after execution.
       base.namespace = canonicalNamespace
       base.capability = canonicalCapability
-    } else if (
-      namespace === "openfork" &&
-      capability &&
-      /^[A-Za-z0-9_.-]{1,128}$/.test(capability)
-    ) {
+    } else if (namespace === "openfork" && capability && /^[A-Za-z0-9_.-]{1,128}$/.test(capability)) {
       // OpenFork capability identifiers are a closed structural namespace;
       // arguments/results remain excluded from the durable activity record.
       base.namespace = namespace
@@ -411,33 +492,19 @@ function safeSummary(
 }
 
 export function plane(tool: string): OxpActivitySchema.Plane {
-  if (tool === "openfork_session" || tool === "openfork_request")
-    return "supervision"
+  if (tool === "openfork_session" || tool === "openfork_request") return "supervision"
   if (tool === "openfork_worker") return "delegation"
   return "augmentation"
 }
 
-function status(
-  error: OxpError.Error,
-): Exclude<OxpActivitySchema.Status, "running"> {
+function status(error: OxpError.Error): Exclude<OxpActivitySchema.Status, "running"> {
   if (error._tag === "OXP_CANCELLED") {
-    return error.metadata?.committed === true
-      ? "cancelled_after_commit"
-      : "cancelled_before_commit"
+    return error.metadata?.committed === true ? "cancelled_after_commit" : "cancelled_before_commit"
   }
-  if (
-    error._tag === "OXP_AUTH_DENIED" ||
-    error._tag === "OXP_AUTH_REVOKED" ||
-    error._tag === "OXP_PATH_ESCAPE"
-  )
+  if (error._tag === "OXP_AUTH_DENIED" || error._tag === "OXP_AUTH_REVOKED" || error._tag === "OXP_PATH_ESCAPE")
     return "denied"
-  if (
-    error._tag === "OXP_CONFLICT" ||
-    error._tag === "OXP_ROOT_CHANGED"
-  )
-    return "conflict"
-  if (error._tag === "OXP_AMBIGUOUS_EXTERNAL_RESULT")
-    return "ambiguous_external_result"
+  if (error._tag === "OXP_CONFLICT" || error._tag === "OXP_ROOT_CHANGED") return "conflict"
+  if (error._tag === "OXP_AMBIGUOUS_EXTERNAL_RESULT") return "ambiguous_external_result"
   return "failed"
 }
 
@@ -461,10 +528,7 @@ function inputLinks(tool: string, args: unknown, rootAlias?: string): Link[] {
       ...(rootAlias ? { label: rootAlias } : {}),
     })
   const sessionID = text(source, "sessionID")
-  if (
-    sessionID &&
-    (tool === "openfork_session" || tool === "openfork_request")
-  ) {
+  if (sessionID && (tool === "openfork_session" || tool === "openfork_request")) {
     links.push({ kind: "session", ref: sessionID, relation: "target" })
   }
   if (tool === "openfork_worker") {
@@ -485,8 +549,7 @@ function inputLinks(tool: string, args: unknown, rootAlias?: string): Link[] {
   }
   if (tool === "process") {
     const handle = text(source, "handle")
-    if (handle)
-      links.push({ kind: "process", ref: handle, relation: "target" })
+    if (handle) links.push({ kind: "process", ref: handle, relation: "target" })
   }
   return links
 }
@@ -504,17 +567,9 @@ function resultLinks(
   const namespace = text(input, "namespace", 64) ?? "openfork"
   const capability = text(input, "capability", 512)
 
-  if (
-    tool === "capability" &&
-    action === "call" &&
-    namespace === "mcp" &&
-    metadata?.namespace === "mcp"
-  ) {
+  if (tool === "capability" && action === "call" && namespace === "mcp" && metadata?.namespace === "mcp") {
     const canonical = text(metadata, "capability", 512)
-    if (
-      canonical &&
-      /^[^/\s]{1,255}\/[^/\s]{1,255}$/.test(canonical)
-    )
+    if (canonical && /^[^/\s]{1,255}\/[^/\s]{1,255}$/.test(canonical))
       links.push({
         kind: "external_mcp",
         ref: canonical,
@@ -541,21 +596,12 @@ function resultLinks(
   if (
     source &&
     (tool === "openai_files" ||
-      (tool === "capability" &&
-        action === "call" &&
-        namespace === "openfork" &&
-        capability === "file.transfer"))
+      (tool === "capability" && action === "call" && namespace === "openfork" && capability === "file.transfer"))
   ) {
     const transferAction = text(source, "action", 64)
     const file = record(source.file)
-    const fileRef =
-      text(source, "source_file_id", 512) ??
-      text(file, "id", 512)
-    if (
-      fileRef &&
-      transferAction &&
-      transferAction !== "list_openai_files"
-    ) {
+    const fileRef = text(source, "source_file_id", 512) ?? text(file, "id", 512)
+    if (fileRef && transferAction && transferAction !== "list_openai_files") {
       const relation =
         transferAction === "upload_openai_file"
           ? "created"
@@ -572,8 +618,7 @@ function resultLinks(
 
   if (source && tool === "openfork_session") {
     const sessionID = text(source, "sessionID")
-    if (sessionID)
-      links.push({ kind: "session", ref: sessionID, relation: "observed" })
+    if (sessionID) links.push({ kind: "session", ref: sessionID, relation: "observed" })
   }
   if (source && tool === "openfork_worker") {
     const workerID = text(source, "workerID")
@@ -640,9 +685,7 @@ function errorLinks(tool: string, error: OxpError.Error): Link[] {
 }
 
 function recoverableHostRun(value: string): RuntimeOwner.ID | undefined {
-  return value.startsWith("runtime-owner:")
-    ? (value as RuntimeOwner.ID)
-    : undefined
+  return value.startsWith("runtime-owner:") ? (value as RuntimeOwner.ID) : undefined
 }
 
 const layer = Layer.effect(
@@ -676,11 +719,7 @@ const layer = Layer.effect(
         if ((yield* runtime.proveLocalDeath(ownerID)) !== "dead") continue
         yield* activity.interruptHostRun(candidate)
       }
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Effect.logWarning("OXP activity dead-host recovery failed", { cause }),
-      ),
-    )
+    }).pipe(Effect.catchCause((cause) => Effect.logWarning("OXP activity dead-host recovery failed", { cause })))
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
@@ -699,34 +738,25 @@ const layer = Layer.effect(
       ),
     )
 
-    const linkAll = (
-      invocationID: OxpActivitySchema.InvocationID,
-      links: readonly Link[],
-    ) => {
+    const linkAll = (invocationID: OxpActivitySchema.InvocationID, links: readonly Link[]) => {
       if (links.length === 0) return Effect.void
       return Effect.forEach(
         links,
-        (link) =>
-          activity
-            .link({ invocationID, ...link })
-            .pipe(Effect.catchCause(() => Effect.void)),
+        (link) => activity.link({ invocationID, ...link }).pipe(Effect.catchCause(() => Effect.void)),
         { discard: true, concurrency: "unbounded" },
       )
     }
 
-    const beginRaw = Effect.fn("OxpActivityRecorder.beginRaw")(function* (
-      input: BeginInput,
-    ) {
+    const beginRaw = Effect.fn("OxpActivityRecorder.beginRaw")(function* (input: BeginInput) {
       if (!input.parentCorrelation) return undefined
       const correlation = yield* identity.pseudonymize(input.parentCorrelation)
       const args = record(input.args)
       const rootID = text(args, "rootID", 128)
       const action = text(args, "action", 256)
-      const rootAlias = rootID
-        ? (yield* config.get()).roots.find((root) => root.id === rootID)?.alias
-        : undefined
+      const rootAlias = rootID ? (yield* config.get()).roots.find((root) => root.id === rootID)?.alias : undefined
       const summary = safeSummary(input)
-      const detail = invocationDetail({ args: input.args })
+      const detail = requestDetail(input)
+      const requestChars = requestContextChars(input.args)
       const started = yield* activity.begin({
         correlation,
         hostRunID,
@@ -738,11 +768,17 @@ const layer = Layer.effect(
         rootAlias,
         ...(summary ? { summary } : {}),
         ...(detail ? { detail } : {}),
+        ...(requestChars === undefined
+          ? {}
+          : {
+              contextRequest: {
+                chars: requestChars,
+                source: "observed_boundary" as const,
+                schema: BOUNDARY_CONTEXT_SCHEMA,
+              },
+            }),
       })
-      yield* linkAll(
-        started.invocationID,
-        inputLinks(input.tool, input.args, rootAlias),
-      )
+      yield* linkAll(started.invocationID, inputLinks(input.tool, input.args, rootAlias))
       return {
         activityID: started.activityID,
         invocationID: started.invocationID,
@@ -752,33 +788,32 @@ const layer = Layer.effect(
     const begin: Interface["begin"] = (input) =>
       beginRaw(input).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
 
-    const success: Interface["success"] = (handle, input, result) => {
+    const success: Interface["success"] = (handle, input, result, resultContextChars) => {
       if (!handle) return Effect.void
       const args = record(input.args)
       const action = text(args, "action", 256)
       return Effect.gen(function* () {
-        yield* linkAll(
-          handle.invocationID,
-          resultLinks(input.tool, action, input.args, result),
-        )
+        yield* linkAll(handle.invocationID, resultLinks(input.tool, action, input.args, result))
         yield* activity.settle({
           invocationID: handle.invocationID,
           status: result.mutation?.committed ? "committed" : "success",
           mutationAttempted: result.mutation?.attempted ?? false,
           mutationCommitted: result.mutation?.committed ?? false,
           summary: safeSummary(input, result),
-          detail: invocationDetail({
-            title: result.title,
-            output: result.output,
-            structured: result.structured,
-            metadata: result.metadata,
-            mutation: result.mutation,
-          }),
+          ...(resultContextChars === undefined
+            ? {}
+            : {
+                contextResult: {
+                  chars: resultContextChars,
+                  source: "observed_boundary" as const,
+                  schema: BOUNDARY_CONTEXT_SCHEMA,
+                },
+              }),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }
 
-    const failure: Interface["failure"] = (handle, input, error) => {
+    const failure: Interface["failure"] = (handle, input, error, resultContextChars) => {
       if (!handle) return Effect.void
       return Effect.gen(function* () {
         yield* linkAll(handle.invocationID, errorLinks(input.tool, error))
@@ -790,13 +825,16 @@ const layer = Layer.effect(
           mutationAttempted: committed,
           mutationCommitted: committed,
           summary: safeSummary(input),
-          detail: invocationDetail({
-            error: {
-              code: error._tag,
-              message: error.message,
-              metadata: error.metadata,
-            },
-          }),
+          detail: failureDetail(error),
+          ...(resultContextChars === undefined
+            ? {}
+            : {
+                contextResult: {
+                  chars: resultContextChars,
+                  source: "observed_boundary" as const,
+                  schema: BOUNDARY_CONTEXT_SCHEMA,
+                },
+              }),
         })
       }).pipe(Effect.catchCause(() => Effect.void))
     }
@@ -808,12 +846,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [
-    OxpActivity.node,
-    OxpActivityIdentity.node,
-    OxpConfig.node,
-    RuntimeOwner.node,
-  ],
+  deps: [OxpActivity.node, OxpActivityIdentity.node, OxpConfig.node, RuntimeOwner.node],
 })
 
 export * as OxpActivityRecorder from "./activity-recorder"

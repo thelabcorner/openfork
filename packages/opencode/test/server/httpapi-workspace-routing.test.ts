@@ -472,10 +472,10 @@ describe("HttpApi workspace routing middleware", () => {
       // process and should not be redirected into the selected workspace target.
       yield* serveProbe
 
-      const response = yield* HttpClient.get(`/session?workspace=${workspace.id}`)
+      const response = yield* HttpClient.get(`/session?workspace=${workspace.id}&directory=${encodeURIComponent(dir)}`)
 
       expect(response.status).toBe(200)
-      expect(yield* response.json).toEqual({ directory: process.cwd(), workspaceID: workspace.id })
+      expect(yield* response.json).toEqual({ directory: dir, workspaceID: workspace.id })
     }),
   )
 
@@ -495,25 +495,26 @@ describe("HttpApi workspace routing middleware", () => {
       // swap the route context to the workspace target directory.
       yield* serveProbe
 
-      const response = yield* HttpClient.get(`${WorkspacePaths.list}?workspace=${workspace.id}`)
+      const response = yield* HttpClient.get(
+        `${WorkspacePaths.list}?workspace=${workspace.id}&directory=${encodeURIComponent(dir)}`,
+      )
 
       expect(response.status).toBe(200)
-      expect(yield* response.json).toEqual({ directory: process.cwd(), workspaceID: workspace.id })
+      expect(yield* response.json).toEqual({ directory: dir, workspaceID: workspace.id })
     }),
   )
 
   it.live("uses directory query/header fallback when no workspace is selected", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
-      const queryDir = path.join(dir, "query-target")
-      const headerDir = path.join(dir, "header-target")
+      const queryDir = path.join(dir, "%2F-query-target")
+      const headerDir = path.join(dir, "%2F-header-target")
       yield* serveProbe
 
-      // Without a selected workspace, the middleware falls back to request
-      // directory hints before using the process cwd.
+      // Query decoding and the SDK header codec each run exactly once.
       const queryResponse = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(queryDir)}`)
       const headerResponse = yield* HttpClientRequest.get("/probe").pipe(
-        HttpClientRequest.setHeader("x-opencode-directory", headerDir),
+        HttpClientRequest.setHeader("x-opencode-directory", encodeURIComponent(headerDir)),
         HttpClient.execute,
       )
 
@@ -521,6 +522,32 @@ describe("HttpApi workspace routing middleware", () => {
       expect(yield* queryResponse.json).toEqual({ directory: queryDir, workspaceID: null })
       expect(headerResponse.status).toBe(200)
       expect(yield* headerResponse.json).toEqual({ directory: headerDir, workspaceID: null })
+    }),
+  )
+
+  it.live("rejects relative query/header locations instead of resolving them against cwd", () =>
+    Effect.gen(function* () {
+      yield* serveProbe
+      for (const directory of [".", "..", "relative-project"]) {
+        const query = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(directory)}`)
+        const header = yield* HttpClientRequest.get("/probe").pipe(
+          HttpClientRequest.setHeader("x-opencode-directory", encodeURIComponent(directory)),
+          HttpClient.execute,
+        )
+        expect(query.status).toBe(400)
+        expect(header.status).toBe(400)
+      }
+    }),
+  )
+
+  it.live("fails closed without an explicit directory instead of routing to cwd", () =>
+    Effect.gen(function* () {
+      yield* serveProbe
+
+      const response = yield* HttpClient.get("/probe")
+
+      expect(response.status).toBe(400)
+      expect(yield* response.text).toContain("explicit directory or session-derived location")
     }),
   )
 

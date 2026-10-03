@@ -185,11 +185,7 @@ const layer = Layer.effect(
 
     const execute = Effect.fn("OxpSchedule.execute")(function* (input: Input, signal?: AbortSignal) {
       yield* cancelled(signal)
-      yield* Effect.try({
-        try: () => OxpLocation.requireExplicit(input, "schedule.create"),
-        catch: (cause) =>
-          OxpError.isError(cause) ? cause : new OxpError.InvalidArgument({ detail: "Invalid OXP schedule location" }),
-      })
+      yield* OxpLocation.requireExplicit(input, "schedule.create")
 
       const admission = yield* authority.authorize({
         plane: "augmentation",

@@ -23,6 +23,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { ConfigAgentV1 } from "@opencode-ai/core/v1/config/agent"
 import { RemoteAuthError } from "@opencode-ai/core/v1/config/error"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
@@ -31,7 +32,11 @@ import { ConfigCommand } from "./command"
 import { ConfigManaged } from "./managed"
 import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
-import { CONFIG_BASENAME } from "@opencode-ai/core/storage-identity"
+import {
+  CONFIG_BASENAME,
+  CONFIG_BASENAMES,
+  PROJECT_CONFIG_DIRNAMES,
+} from "@opencode-ai/core/storage-identity"
 import { ConfigPlugin } from "./plugin"
 import { ConfigVariable } from "./variable"
 import { ConfigV2Compat } from "./v2-compat"
@@ -126,9 +131,15 @@ type State = {
 export interface Interface {
   readonly get: () => Effect.Effect<Info>
   readonly getGlobal: () => Effect.Effect<Info>
+  /** Read only the effective share policy for an explicit location without creating an execution Instance. */
+  readonly sharePolicyForLocation: (input: { directory: string; worktree?: string }) => Effect.Effect<"auto" | "disabled" | undefined>
   readonly getConsoleState: () => Effect.Effect<ConsoleState>
   readonly update: (config: Info) => Effect.Effect<void>
   readonly updateGlobal: (config: Info) => Effect.Effect<{ info: Info; changed: boolean }>
+  readonly updateGlobalAgent: (input: {
+    readonly id: string
+    readonly value: ConfigAgentV1.Info | null
+  }) => Effect.Effect<{ info: Info; changed: boolean }>
   readonly invalidate: () => Effect.Effect<void>
   readonly directories: () => Effect.Effect<string[]>
   readonly waitForDependencies: () => Effect.Effect<void>
@@ -160,6 +171,18 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
   }
 
   return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
+}
+
+function replaceJsoncValue(input: string, path: string[], value: unknown): string {
+  return applyEdits(
+    input,
+    modify(input, path, value, {
+      formattingOptions: {
+        insertSpaces: true,
+        tabSize: 2,
+      },
+    }),
+  )
 }
 
 function writable(info: Info) {
@@ -306,6 +329,90 @@ const layer = Layer.effect(
 
     const getGlobal = Effect.fn("Config.getGlobal")(function* () {
       return yield* cachedGlobal
+    })
+
+    const sharePolicyForLocation = Effect.fn("Config.sharePolicyForLocation")(function* (input: {
+      directory: string
+      worktree?: string
+    }) {
+      let share: Info["share"]
+      let autoshare = false
+      const apply = (value: unknown) => {
+        if (!isRecord(value)) return
+        if (value.share === "auto" || value.share === "disabled") share = value.share
+        if (typeof value.autoshare === "boolean") autoshare = value.autoshare
+      }
+      const read = (filepath: string) =>
+        Effect.gen(function* () {
+          const text = yield* readConfigFile(filepath)
+          if (!text) return
+          const parsed = ConfigParse.jsonc(text, filepath)
+          apply(normalizeLoadedConfig(parsed))
+        })
+
+      // This is the Tier-2 projection needed by session admission. It follows
+      // global then explicit workspace file precedence while deliberately
+      // avoiding plugin resolution, dependency installation, remote config,
+      // and the execution Instance graph.
+      const targets = [
+        `${CONFIG_BASENAME}.jsonc`,
+        `${CONFIG_BASENAME}.json`,
+        ...CONFIG_BASENAMES.filter((name) => name !== CONFIG_BASENAME).flatMap((name) => [
+          `${name}.jsonc`,
+          `${name}.json`,
+        ]),
+      ]
+      const globalFiles = [path.join(Global.Path.config, "config.json"), ...ConfigPaths.serverFilesInDirectory(Global.Path.config)]
+      for (const file of globalFiles) yield* read(file)
+      if (Flag.OPENCODE_CONFIG) yield* read(Flag.OPENCODE_CONFIG)
+      if (!Flag.OPENCODE_DISABLE_PROJECT_CONFIG) {
+        const files = (
+          yield* fs
+            .up({ targets, start: input.directory, stop: input.worktree })
+            .pipe(Effect.orDie)
+        ).toReversed()
+        for (const file of files) yield* read(file)
+      }
+      const projectConfigDirs = yield* fs
+        .up({ targets: [...PROJECT_CONFIG_DIRNAMES], start: input.directory, stop: input.worktree })
+        .pipe(Effect.orDie)
+      const homeConfigDirs = yield* fs
+        .up({ targets: [...PROJECT_CONFIG_DIRNAMES], start: Global.Path.home, stop: Global.Path.home })
+        .pipe(Effect.orDie)
+      const configDirs = new Set([
+        Global.Path.config,
+        ...projectConfigDirs,
+        ...homeConfigDirs,
+        ...(Flag.OPENCODE_CONFIG_DIR ? [Flag.OPENCODE_CONFIG_DIR] : []),
+      ])
+      for (const directory of configDirs) {
+        if (!ConfigPaths.isServerConfigDirectory(directory) && directory !== Flag.OPENCODE_CONFIG_DIR) continue
+        for (const file of ConfigPaths.serverFilesInDirectory(directory)) yield* read(file)
+      }
+      if (process.env.OPENCODE_CONFIG_CONTENT) {
+        apply(ConfigParse.jsonc(process.env.OPENCODE_CONFIG_CONTENT, "OPENCODE_CONFIG_CONTENT"))
+      }
+
+      // Account configuration is already materialized in the local account
+      // store. Project only its share fields here; do not fetch well-known
+      // remote configuration as part of Tier-1 session admission.
+      const activeAccount = Option.getOrUndefined(
+        yield* accountSvc.active().pipe(Effect.catch(() => Effect.succeed(Option.none()))),
+      )
+      if (activeAccount?.active_org_id) {
+        const config = yield* accountSvc
+          .config(activeAccount.id, activeAccount.active_org_id)
+          .pipe(Effect.catch(() => Effect.succeed(Option.none())))
+        if (Option.isSome(config)) apply(config.value)
+      }
+      for (const directory of ConfigManaged.managedConfigDirs()) {
+        if (!existsSync(directory)) continue
+        for (const file of ConfigPaths.serverFilesInDirectory(directory)) yield* read(file)
+      }
+      const managed = yield* Effect.promise(() => ConfigManaged.readManagedPreferences())
+      if (managed) apply(ConfigParse.jsonc(managed.text, managed.source))
+      if (autoshare && !share) share = "auto"
+      return share === "auto" || share === "disabled" ? share : undefined
     })
 
     const ensureGitignore = Effect.fn("Config.ensureGitignore")(function* (dir: string) {
@@ -649,10 +756,15 @@ const layer = Layer.effect(
           JSON.stringify(mergeDeep(isRecord(original) ? original : writable(existing), writable(config)), null, 2),
         )
         .pipe(Effect.orDie)
+      yield* invalidate()
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
       yield* invalidateGlobal
+      // Config is location-scoped. Invalidating only the process-global config
+      // cache leaves this directory's already-materialized InstanceState stale
+      // after a local config write.
+      yield* InstanceState.invalidate(state)
     })
 
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
@@ -681,12 +793,47 @@ const layer = Layer.effect(
       return { info: next, changed }
     })
 
+    const updateGlobalAgent = Effect.fn("Config.updateGlobalAgent")(function* (input: {
+      readonly id: string
+      readonly value: ConfigAgentV1.Info | null
+    }) {
+      const file = globalConfigFile()
+      const before = (yield* readConfigFile(file)) ?? "{}"
+
+      let next: Info
+      let changed: boolean
+      if (!file.endsWith(".jsonc")) {
+        const parsed = ConfigParse.jsonc(before, file)
+        ConfigParse.schema(ConfigV1.Info, ConfigV2Compat.lower(normalizeLoadedConfig(parsed), file).value, file)
+        const existing = isRecord(parsed) ? { ...parsed } : {}
+        const currentAgents = isRecord(existing.agent) ? { ...existing.agent } : {}
+        if (input.value === null) delete currentAgents[input.id]
+        else currentAgents[input.id] = input.value
+        if (Object.keys(currentAgents).length === 0) delete existing.agent
+        else existing.agent = currentAgents
+        const serialized = JSON.stringify(existing, null, 2)
+        next = yield* decodeConfig(existing, file)
+        changed = serialized !== before
+        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
+      } else {
+        const updated = replaceJsoncValue(before, ["agent", input.id], input.value === null ? undefined : input.value)
+        next = yield* decodeConfig(ConfigParse.jsonc(updated, file), file)
+        changed = updated !== before
+        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
+      }
+
+      if (changed) yield* invalidate()
+      return { info: next, changed }
+    })
+
     return Service.of({
       get,
       getGlobal,
+      sharePolicyForLocation,
       getConsoleState,
       update,
       updateGlobal,
+      updateGlobalAgent,
       invalidate,
       directories,
       waitForDependencies,

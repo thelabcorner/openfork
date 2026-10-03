@@ -26,8 +26,8 @@ import {
   TestInstance,
   tmpdirScoped,
 } from "../fixture/fixture"
-import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 import { testEffect } from "../lib/effect"
+import { drainCodingActivity, subscribeCodingActivity } from "../lib/coding-activity"
 
 const FIXTURES_DIR = path.join(import.meta.dir, "fixtures")
 

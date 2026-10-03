@@ -15,9 +15,16 @@ import { OxpSchema } from "./schema"
 import { OxpTypecheck } from "./typecheck"
 
 export const Parameters = Schema.Struct({
-  rootID: OxpSchema.RootID,
-  path: Schema.String,
-  content: Schema.String,
+  rootID: OxpSchema.RootID.annotate({
+    description: "Approved root that owns the target file.",
+  }),
+  path: Schema.String.annotate({
+    description: "Target path inside rootID. The file may be missing: write creates it; existing files are fully replaced.",
+  }),
+  content: Schema.String.annotate({
+    description:
+      "Complete desired text content for the file. Prefer this direct field for file-authoring intent; process remains available for general scripts and commands.",
+  }),
   runTypecheck: Schema.optional(Schema.Boolean),
 })
 export type Input = Schema.Schema.Type<typeof Parameters>

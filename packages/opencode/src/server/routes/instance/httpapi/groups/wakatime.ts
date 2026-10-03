@@ -30,8 +30,9 @@ export const WakaTimeUpdatePayload = Schema.Struct({
 }).annotate({ identifier: "WakaTimeUpdatePayload" })
 
 /**
- * Core owns the opt-in mutation. The failure mode is a persistence failure, so
- * it is a 500: the request was well-formed and nothing about it was invalid.
+ * Core owns the opt-in mutation. Enabling can fail while Core transactionally
+ * prepares a usable CLI or while it persists the opt-in, so either failure is a
+ * 500: the request was well-formed and the requested enablement was not applied.
  * The message is Core's own and never carries settings content.
  */
 export class ApiWakaTimeSettingsError extends Schema.ErrorClass<ApiWakaTimeSettingsError>("WakaTimeSettingsError")(
@@ -65,7 +66,7 @@ export const WakaTimeApi = HttpApi.make("wakatime").add(
           identifier: "wakatime.update",
           summary: "Update WakaTime opt-in",
           description:
-            "Persist the WakaTime opt-in preference through the Core exporter that owns it and return the updated status. Tier-0 global operation; never requires a workspace instance.",
+            "Update the WakaTime opt-in through the Core exporter that owns it. Unless an operator override forces WakaTime off, enabling first prepares or reuses a usable CLI and persists the opt-in only after that succeeds; disabling requires no CLI preparation. Returns the resulting effective status. Tier-0 global operation; never requires a workspace instance.",
         }),
       ),
     )

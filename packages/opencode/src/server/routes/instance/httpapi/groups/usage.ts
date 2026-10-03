@@ -3,11 +3,13 @@ import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable
 import { Usage } from "@/usage/usage"
 import { described } from "./metadata"
 import { Authorization } from "../middleware/authorization"
+import { ApiNotFoundError } from "../errors"
 
 export const UsagePaths = {
   summary: "/usage/summary",
   modelProfile: "/usage/model-profile",
   pricingCatalog: "/usage/pricing-catalog",
+  sessionContext: "/usage/session/:sessionID/context",
 } as const
 
 export const UsageSummaryQuery = Schema.Struct({
@@ -53,6 +55,20 @@ export const UsageApi = HttpApi.make("usage").add(
           summary: "Get the global usage pricing catalog",
           description:
             "Return model display metadata and base rate cards for usage valuation without loading workspace provider configuration.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("sessionContext", UsagePaths.sessionContext, {
+        params: { sessionID: Schema.String },
+        success: described(Usage.SessionContextSnapshot, "Session context projection"),
+        error: [ApiNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "usage.sessionContext",
+          summary: "Get authoritative session context analytics",
+          description:
+            "Return a bootstrap-free session context snapshot from durable scalar projections plus the bounded live telemetry overlay. Never hydrates conversation history into the client.",
         }),
       ),
     )

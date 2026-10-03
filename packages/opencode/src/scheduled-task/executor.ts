@@ -3,7 +3,6 @@ import { ChildProcess } from "effect/unstable/process"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Goal } from "@opencode-ai/core/goal"
-import { Goal as GoalModel } from "@opencode-ai/schema/goal"
 import { AppProcess } from "@opencode-ai/core/process"
 import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
@@ -25,6 +24,7 @@ import { InstanceRef } from "@/effect/instance-ref"
 import { Worktree } from "@/worktree"
 import { ToolRegistry } from "@/tool/registry"
 import { ScheduledTaskSessionAdmission } from "./session-admission"
+import { ScheduledTaskRouteIntent } from "./route-intent"
 import { fileURLToPath } from "node:url"
 
 /**
@@ -61,21 +61,6 @@ export interface Interface {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ScheduledTaskExecutor") {}
-
-/**
- * ScheduledTask owns scheduling/attempt policy; Goal Mode itself has no
- * scheduled/manual/unattended variant. Preserve only explicitly configured Goal
- * execution bounds and otherwise let the Goal run its normal audit/continue
- * cycle.
- */
-export function scheduledGoalPolicy(policy: GoalModel.ContinuationPolicy | undefined): GoalModel.ContinuationPolicy {
-  return {
-    ...(policy?.maxConsecutiveTurns !== undefined ? { maxConsecutiveTurns: policy.maxConsecutiveTurns } : {}),
-    ...(policy?.maxNoProgressTurns !== undefined ? { maxNoProgressTurns: policy.maxNoProgressTurns } : {}),
-    ...(policy?.maxDurationMs !== undefined ? { maxDurationMs: policy.maxDurationMs } : {}),
-    ...(policy?.tokenBudget !== undefined ? { tokenBudget: policy.tokenBudget } : {}),
-  }
-}
 
 class ScheduledConfigError extends Error {
   constructor(reason: string) {
@@ -304,6 +289,12 @@ export const layer = Layer.effect(
           return yield* Effect.die(new ScheduledConfigError(`agent not found: ${task.action.agent ?? "<default>"}`))
         }
 
+        const routeIntent = yield* ScheduledTaskRouteIntent.normalizeAction(task.action).pipe(
+          Effect.catch((error) =>
+            Effect.die(new ScheduledConfigError(`route intent: ${ScheduledTaskRouteIntent.errorMessage(error)}`)),
+          ),
+        )
+
         const base: ExecutionModelRef | undefined = task.action.model
           ? {
               id: task.action.model.id,
@@ -369,7 +360,11 @@ export const layer = Layer.effect(
         return {
           agent: agent.name,
           model,
-          execution: { agent: agent.name, model },
+          execution: {
+            agent: agent.name,
+            model,
+            ...(routeIntent === undefined ? {} : { routeIntent }),
+          },
           providerModel: resolved,
         } satisfies ExecutionProfile
       })
@@ -692,7 +687,6 @@ export const layer = Layer.effect(
                 title: task.action.goal.title,
                 objective: task.action.goal.objective,
                 criteria: task.action.goal.criteria ?? [],
-                continuationPolicy: scheduledGoalPolicy(task.action.goal.continuationPolicy),
                 start: true,
                 actor: "system",
                 requireFresh: true,

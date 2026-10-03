@@ -8,6 +8,7 @@ import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
@@ -43,6 +44,7 @@ import { SessionPrompt } from "../../src/session/prompt"
 import { clearPersistedMotifs } from "../../src/session/spad/pattern-store"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
+import { TurnCheckpoint } from "../../src/session/checkpoint"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -63,7 +65,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -75,6 +77,8 @@ import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { Model } from "@opencode-ai/llm"
 import * as OpenAICompatibleChat from "@opencode-ai/llm/protocols/openai-compatible-chat"
+import { ProviderTest } from "../fake/provider"
+import { CONFIG_BASENAME } from "@opencode-ai/core/storage-identity"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -184,6 +188,51 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
+const capturedGoalWorkerInputs: Array<Record<string, unknown>> = []
+
+const noCheckpoint = Layer.succeed(
+  TurnCheckpoint.Service,
+  TurnCheckpoint.Service.of({
+    begin: () => Effect.succeed(undefined),
+    finish: () => Effect.void,
+    finishAborted: () => Effect.void,
+    fail: () => Effect.void,
+    safetyPoint: () => Effect.succeed(undefined),
+    quiesce: () => Effect.void,
+    reconcileRetention: () => Effect.succeed({ scanned: 0, released: 0 }),
+  }),
+)
+
+function fixedProcessor(result: SessionProcessor.Result, options?: { capture?: boolean; finish?: SessionV1.Assistant["finish"] }) {
+  return Layer.succeed(
+    SessionProcessor.Service,
+    SessionProcessor.Service.of({
+      create: Effect.fn("TestSessionProcessor.create")((input) =>
+        Effect.succeed({
+          get message() {
+            return input.assistantMessage
+          },
+          get hasNonProviderToolCalls() {
+            return false
+          },
+          updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
+          completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+          process: Effect.fn("TestSessionProcessor.process")((streamInput) =>
+            Effect.sync(() => {
+              if (options?.capture) capturedGoalWorkerInputs.push(streamInput as unknown as Record<string, unknown>)
+              if (options?.finish) {
+                input.assistantMessage.finish = options.finish
+                input.assistantMessage.time.completed = Date.now()
+              }
+              return result
+            }),
+          ),
+        } satisfies SessionProcessor.Handle),
+      ),
+    }),
+  )
+}
+
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 let goalAuditorBaseURL = "http://127.0.0.1:1/v1"
@@ -266,8 +315,10 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
-  const root = LayerNode.group([promptRoot, testLLMServerNode])
+function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; executionOwner?: boolean }) {
+  const root = input?.executionOwner
+    ? LayerNode.group([promptRoot, testLLMServerNode, SessionExecutionOwner.node])
+    : LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
@@ -284,8 +335,29 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
   return makePrompt(input)
 }
 
-function makeGoalHttp() {
+function makeGoalHttp(input?: { processor?: "compact" | "capture" }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
+  if (input?.processor === "compact") {
+    return LayerNode.compile(root, [
+      [SessionSummary.node, summary],
+      [LSP.node, lsp],
+      [MCP.node, makeMcp()],
+      [RuntimeFlags.node, runtimeFlags],
+      [locationServiceMapNode, testLocationServiceMap],
+      [SessionProcessor.node, fixedProcessor("compact")],
+    ] as const)
+  }
+  if (input?.processor === "capture") {
+    return LayerNode.compile(root, [
+      [SessionSummary.node, summary],
+      [LSP.node, lsp],
+      [MCP.node, makeMcp()],
+      [RuntimeFlags.node, runtimeFlags],
+      [locationServiceMapNode, testLocationServiceMap],
+      [SessionProcessor.node, fixedProcessor("stop", { capture: true })],
+      [TurnCheckpoint.node, noCheckpoint],
+    ] as const)
+  }
   return LayerNode.compile(root, [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
@@ -296,9 +368,38 @@ function makeGoalHttp() {
 }
 
 const it = testEffect(makeHttp())
+const orphanIt = testEffect(makeHttp({ executionOwner: true }))
 const goalIt = testEffect(makeGoalHttp())
+const goalCompactionFailureIt = testEffect(makeGoalHttp({ processor: "compact" }))
+const goalCompactionResetIt = testEffect(makeGoalHttp({ processor: "capture" }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+
+const delegatedRouteInputs: Array<Record<string, unknown>> = []
+const delegatedRouteProvider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: ref.providerID,
+    id: ref.modelID,
+  }),
+  resolveRoutedModel: Effect.fn("TestProvider.resolveRoutedModel.capture")((input) =>
+    Effect.sync(() => {
+      delegatedRouteInputs.push(input as unknown as Record<string, unknown>)
+      return undefined
+    }),
+  ),
+})
+const delegatedRouteIt = testEffect(
+  LayerNode.compile(promptRoot, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [ProviderSvc.node, delegatedRouteProvider.layer],
+    [SessionProcessor.node, fixedProcessor("stop", { finish: "stop" })],
+    [TurnCheckpoint.node, noCheckpoint],
+  ]),
+)
+
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -397,7 +498,7 @@ const writeText = Effect.fn("test.writeText")(function* (file: string, text: str
 
 const writeConfig = Effect.fn("test.writeConfig")(function* (dir: string, config: Partial<ConfigV1.Info>) {
   yield* writeText(
-    path.join(dir, "opencode.json"),
+    path.join(dir, `${CONFIG_BASENAME}.json`),
     JSON.stringify({ $schema: "https://opencode.ai/config.json", ...config }),
   )
 })
@@ -406,6 +507,10 @@ const useServerConfig = Effect.fn("test.useServerConfig")(function* (config: (ur
   const { directory: dir } = yield* TestInstance
   const llm = yield* TestLLMServer
   yield* writeConfig(dir, config(llm.url))
+  // This helper intentionally writes the fixture file directly instead of
+  // going through Config.update(). Mirror the real mutation boundary so any
+  // already-materialized Config/Provider state observes the fixture.
+  yield* (yield* Config.Service).invalidate()
   return { dir, llm }
 })
 
@@ -420,6 +525,17 @@ const waitForBusy = (sessionID: SessionID, duration: Duration.Input = "2 seconds
       return s.type === "busy" ? (true as const) : undefined
     }),
     `session ${sessionID} never became busy`,
+    duration,
+  )
+
+const waitForRetry = (sessionID: SessionID, duration: Duration.Input = "10 seconds") =>
+  pollWithTimeout(
+    Effect.gen(function* () {
+      const status = yield* SessionStatus.Service
+      const s = yield* status.get(sessionID)
+      return s.type === "retry" ? s : undefined
+    }),
+    `session ${sessionID} never entered retry recovery`,
     duration,
   )
 
@@ -648,6 +764,61 @@ noLLMServer.instance(
         source: SessionTurnProvenance.Source.Prompt,
       })
       expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(2)
+    }),
+  { config: cfg },
+)
+
+delegatedRouteIt.instance(
+  "delegated worker execution inherits protected Public route intent when hostPrompt has no execution envelope",
+  () =>
+    Effect.gen(function* () {
+      delegatedRouteInputs.length = 0
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:connector-route-test",
+        invocationRef: "oxp-inv:route-test",
+        rootRef: "root-route-test",
+        agent: "build",
+        model: {
+          providerID: String(ref.providerID),
+          modelID: String(ref.modelID),
+          routeIntent: { kind: "public" as const },
+        },
+        nestedDelegation: false,
+      }
+      const chat = yield* sessions.create({
+        title: "Delegated Public route handoff",
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+
+      yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          noReply: true,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "execute on the protected Public route" }],
+        },
+        {
+          source: SessionTurnProvenance.Source.OxpDelegation,
+          ref: origin.invocationRef,
+          principalRef: origin.principalRef,
+        },
+      )
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(delegatedRouteInputs).toHaveLength(1)
+      const routed = delegatedRouteInputs[0]!
+      expect(routed).toMatchObject({
+        sessionID: chat.id,
+        providerID: ref.providerID,
+        modelID: ref.modelID,
+        routeIntent: { kind: "public" },
+      })
+      expect(Object.prototype.hasOwnProperty.call(routed, "accountID")).toBe(false)
     }),
   { config: cfg },
 )
@@ -999,7 +1170,6 @@ noLLMServer.instance(
           title: "Retry reactivation",
           objective: "Repair blocked Goal state on idempotent user-action admission",
           criteria: ["The blocked Goal is reactivated"],
-          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -1172,7 +1342,6 @@ goalIt.instance(
           title: "Reactivate from user prompt",
           objective: "Continue when the user provides new input",
           criteria: ["the blocked Goal becomes active on admission"],
-          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -1209,6 +1378,7 @@ goalIt.instance(
       const prompt = yield* SessionPrompt.Service
       const sessions = yield* Session.Service
       const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
       const { llm } = yield* useServerConfig(providerCfg)
       goalAuditorBaseURL = llm.url
 
@@ -1222,7 +1392,6 @@ goalIt.instance(
           title: "Goal loop proof",
           objective: "Prove worker -> auditor -> worker until complete",
           criteria: ["the auditor re-drives the session"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1291,6 +1460,39 @@ goalIt.instance(
           parts: [{ type: "text", text: "start the goal" }],
         })
         .pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
+      if ((run as { _tag?: string })._tag === "None") {
+        const diagnosticHits = yield* llm.hits
+        const diagnosticGoal = yield* goals.get(created.goal.id)
+        const diagnosticRuntime = yield* automation.runtime(chat.id)
+        const diagnosticTranscript = yield* sessions.messages({ sessionID: chat.id, limit: 30 }).pipe(Effect.orDie)
+        console.error(
+          "GOAL_LOOP_TIMEOUT_DIAGNOSTIC",
+          JSON.stringify(
+            {
+              hits: diagnosticHits.map((hit) => ({
+                auditor: isAuditorRequest(hit),
+                body: hit.body,
+              })),
+              goal: diagnosticGoal.goal,
+              runtime: diagnosticRuntime,
+              transcript: diagnosticTranscript.map((message) => ({
+                id: message.info.id,
+                role: message.info.role,
+                provenance: message.info.role === "user" ? message.info.provenance : undefined,
+                finish: message.info.role === "assistant" ? message.info.finish : undefined,
+                error: message.info.role === "assistant" ? message.info.error : undefined,
+                parts: message.parts.map((part) => ({
+                  type: part.type,
+                  ...(part.type === "text" ? { text: part.text.slice(0, 240) } : {}),
+                  ...(part.type === "tool" ? { tool: part.tool, status: part.state.status } : {}),
+                })),
+              })),
+            },
+            null,
+            2,
+          ),
+        )
+      }
       expect((run as { _tag?: string })._tag).not.toBe("None")
 
       const hits = yield* llm.hits
@@ -1438,7 +1640,6 @@ goalIt.instance(
           title: "Repair partial continuation publication",
           objective: "Recover exactly one complete continuation after a crash between message and part publication",
           criteria: ["the continuation is complete and not duplicated"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1563,6 +1764,152 @@ goalIt.instance(
   30_000,
 )
 
+goalCompactionResetIt.instance(
+  "Goal Mode: an active auditor continuation is republished after a compaction reset without creating a new reservation",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+
+      const chat = yield* sessions.create({
+        title: "Goal compaction continuation reset",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      capturedGoalWorkerInputs.length = 0
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const source = { info: seeded.user, parts: [] } as SessionV1.WithParts
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Survive compaction",
+          objective: "Preserve the exact auditor-authorized continuation across a compaction boundary",
+          criteria: ["the same logical continuation resumes after compaction"],
+          auditorPolicy: { maxAttempts: 1 },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const marker = "POST-COMPACTION-GOAL-CONTINUATION: resume this exact auditor handoff"
+      const decision = yield* automation.afterTurn({
+        sessionID: chat.id,
+        origin: "user",
+        sourceMessageID: source.info.id,
+        audit: {
+          ok: true,
+          verdict: {
+            decision: "continue",
+            rationale: "One additional worker cycle is required.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "pending", evidence: "continuation has not resumed yet" }],
+            continuationPrompt: marker,
+          },
+        },
+      })
+      const reservation = decision.reservation
+      if (!reservation) throw new Error("Expected a Goal continuation reservation")
+
+      // Materialize the reservation in the pre-compaction epoch, then return its
+      // execution claim to pending. This is the exact state that used to lose the
+      // auditor handoff once compaction made the old synthetic turn historical.
+      expect((yield* automation.claim(chat.id))?.id).toBe(reservation.id)
+      const originalContinuationID = MessageID.make(`msg_goal_continuation_${reservation.id}`)
+      yield* sessions.updateMessage({
+        ...source.info,
+        id: originalContinuationID,
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.GoalContinuation, source.info, {
+          ref: reservation.id,
+        }),
+        time: { created: reservation.createdAt },
+      })
+      yield* sessions.updatePart({
+        id: PartID.make(`prt_goal_continuation_${reservation.id}`),
+        messageID: originalContinuationID,
+        sessionID: chat.id,
+        type: "text",
+        text: reservation.prompt,
+        synthetic: true,
+      })
+      yield* automation.release({ sessionID: chat.id, reservationID: reservation.id })
+
+      const compactionID = MessageID.ascending()
+      const compactionAt = Math.max(Date.now(), reservation.createdAt + 1)
+      yield* sessions.updateMessage({
+        ...source.info,
+        id: compactionID,
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.Compaction, source.info),
+        time: { created: compactionAt },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: compactionID,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+      })
+      const summaryID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        ...seeded.assistant,
+        id: summaryID,
+        parentID: compactionID,
+        mode: "compaction",
+        agent: "compaction",
+        summary: true,
+        finish: "stop",
+        error: undefined,
+        time: { created: compactionAt + 1 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: summaryID,
+        sessionID: chat.id,
+        type: "text",
+        text: "compacted history; active Goal continuation must be restored from durable automation state",
+      })
+
+      const run = yield* prompt
+        .loop({ sessionID: chat.id })
+        .pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
+
+      expect(capturedGoalWorkerInputs).toHaveLength(1)
+      expect(JSON.stringify(capturedGoalWorkerInputs[0])).toContain(marker)
+      expect((run as { _tag?: string })._tag).not.toBe("None")
+
+      const transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const correlated = transcript.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.GoalContinuation &&
+          message.info.provenance.ref === reservation.id,
+      )
+      expect(correlated).toHaveLength(2)
+      const resetContinuationID = MessageID.make(`msg_goal_continuation_${reservation.id}_after_${compactionID}`)
+      const resetContinuation = correlated.find((message) => message.info.id === resetContinuationID)
+      expect(resetContinuation).toBeDefined()
+      expect(
+        resetContinuation?.parts.some(
+          (part) => part.type === "text" && part.synthetic === true && part.text === reservation.prompt,
+        ),
+      ).toBe(true)
+      expect(
+        resetContinuation ? SessionTurnProvenance.goalContinuationSourceMessageID(resetContinuation) : undefined,
+      ).toBe(source.info.id)
+      // The capturing processor deliberately stops after proving the reset
+      // handoff reached the worker. That operator/error-style stop cancels only
+      // automation ownership; it must not manufacture Goal completion/blocking.
+      expect((yield* goals.focused(chat.id))?.detail.goal.status).toBe("active")
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
 goalIt.instance(
   "Goal Mode: a completed compaction resets effective state and reprojects unchanged Goal snapshots without another provider turn",
   () =>
@@ -1670,8 +2017,92 @@ goalIt.instance(
   30_000,
 )
 
+goalCompactionFailureIt.instance(
+  "Goal Mode: a failed compaction requeues the exact claimed continuation instead of stranding it as working",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const compaction = yield* SessionCompaction.Service
+
+      const chat = yield* sessions.create({
+        title: "Goal failed compaction recovery",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const created = yield* goals
+        .create({
+          projectID: chat.projectID,
+          title: "Requeue after failed compaction",
+          objective: "Keep the durable Goal continuation runnable when compaction itself fails",
+          criteria: ["the exact reservation returns to pending"],
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+
+      const criterionID = active.criteria[0]!.id
+      const decision = yield* automation.afterTurn({
+        sessionID: chat.id,
+        origin: "user",
+        sourceMessageID: seeded.user.id,
+        audit: {
+          ok: true,
+          verdict: {
+            decision: "continue",
+            rationale: "The worker still has one concrete step.",
+            progressMade: true,
+            criteria: [{ criterionID, status: "pending", evidence: "not complete" }],
+            continuationPrompt: "FAILED-COMPACTION-RECOVERY-MARKER: keep this exact reservation runnable",
+          },
+        },
+      })
+      const reservation = decision.reservation
+      if (!reservation) throw new Error("Expected a Goal continuation reservation")
+
+      // Put compaction after the last finished assistant. The test processor is
+      // deterministic and returns "compact" for the compaction summary itself,
+      // forcing SessionCompaction.process -> "stop".
+      yield* compaction.create({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        sourceMessageID: seeded.user.id,
+        auto: true,
+      })
+
+      yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)))
+
+      const runtime = yield* automation.runtime(chat.id)
+      expect(runtime?.phase).toBe("continuation_pending")
+      expect(yield* automation.pendingSessions()).toContain(chat.id)
+
+      // The failure boundary must preserve identity, not manufacture a second
+      // auditor decision. Prove the same durable reservation can be claimed again.
+      const reclaimed = yield* automation.claim(chat.id)
+      expect(reclaimed?.id).toBe(reservation.id)
+      expect(reclaimed?.sourceMessageID).toBe(seeded.user.id)
+      expect(reclaimed?.prompt).toBe(reservation.prompt)
+      if (reclaimed) yield* automation.release({ sessionID: chat.id, reservationID: reclaimed.id })
+
+      const transcript = yield* sessions.messages({ sessionID: chat.id, limit: 100 }).pipe(Effect.orDie)
+      const failedSummary = transcript.find(
+        (message) => message.info.role === "assistant" && message.info.summary === true && message.info.error,
+      )
+      expect(failedSummary?.info.role).toBe("assistant")
+      if (failedSummary?.info.role === "assistant") expect(failedSummary.info.finish).toBe("error")
+      expect((yield* goals.focused(chat.id))?.detail.goal.status).toBe("active")
+    }),
+  { config: cfg },
+  30_000,
+)
+
 goalIt.instance(
-  "Goal Mode: an orphaned verifying Goal can run the auditor directly without another worker turn",
+  "Goal Mode: an orphaned verifying Goal recovers through canonical verification ingress without another worker turn",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -1724,7 +2155,6 @@ goalIt.instance(
           title: "Recover verifier",
           objective: "Audit the existing worker result without another worker turn",
           criteria: ["the existing worker result is independently verified"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1753,7 +2183,7 @@ goalIt.instance(
       )
 
       const before = (yield* llm.hits).length
-      yield* prompt.auditGoal(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
+      yield* prompt.requestGoalAudit(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
       const hits = (yield* llm.hits).slice(before)
 
       expect(hits).toHaveLength(1)
@@ -1805,7 +2235,6 @@ goalIt.instance(
           title: "Quiescence proof",
           objective: "Do not overlap parent worker execution with independent Goal auditing.",
           criteria: ["the parent generation is released before auditor admission"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1866,7 +2295,6 @@ goalIt.instance(
           title: "Preempt worker for verification",
           objective: "Stop active worker generation when the user requests independent verification",
           criteria: ["the independent auditor verifies the interrupted worker transcript"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -1992,7 +2420,6 @@ goalIt.instance(
           title: "Preempt worker tool for verification",
           objective: "Stop an active worker tool when the user requests independent verification",
           criteria: ["the independent auditor sees a finalized interrupted tool state"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -2108,7 +2535,6 @@ goalIt.instance(
           title: "Preempt automatic continuation",
           objective: "Manual verification supersedes an already-running automatic Goal continuation",
           criteria: ["the stale automatic continuation cannot resurrect after user verification"],
-          continuationPolicy: {},
           auditorPolicy: { maxAttempts: 1 },
         })
         .pipe(Effect.orDie)
@@ -2314,6 +2740,319 @@ withMcpInstructions.instance(
       yield* Fiber.interrupt(fiber)
     }),
   15_000,
+)
+
+it.instance(
+  "new user input preempts a first provider attempt that has not produced any event",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, void 0).pipe(Effect.asVoid))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.push(raw({ head: [], wait: deferredAsPromise(gate), hang: true }))
+      yield* llm.text("fresh-answer")
+
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first request" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // The first physical request has been sent but has emitted no LLM event.
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const secondID = MessageID.ascending()
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "superseding request" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // The replacement provider request must start while gate remains closed.
+      // Releasing gate here would hide the exact head-of-line blocking bug.
+      yield* llm.wait(2)
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)])
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(secondExit)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+
+      const inputs = yield* llm.inputs
+      const latest = inputs.at(-1)?.messages
+      if (!Array.isArray(latest)) throw new Error("expected latest LLM messages")
+      expect(latest.at(-1)).toEqual({ role: "user", content: "superseding request" })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const stale = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
+      )
+      expect(stale?.info.role).toBe("assistant")
+      if (stale?.info.role === "assistant") {
+        expect(stale.info.time.completed).toBeDefined()
+        expect(stale.info.error).toBeDefined()
+      }
+    }),
+  30_000,
+)
+
+it.instance(
+  "hostPrompt noReply followed by loop preempts a superseded zero-event provider attempt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, void 0).pipe(Effect.asVoid))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.push(raw({ head: [], wait: deferredAsPromise(gate), hang: true }))
+      yield* llm.text("recovered-host-answer")
+
+      yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "first supervised request" }],
+        },
+        { source: SessionTurnProvenance.Source.OxpSupervisor, ref: "supervisor-first" },
+      )
+      const first = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const secondID = MessageID.ascending()
+      yield* prompt.hostPrompt(
+        {
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "superseding supervised request" }],
+        },
+        { source: SessionTurnProvenance.Source.OxpSupervisor, ref: "supervisor-second" },
+      )
+      const second = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+
+      // This is the OXP session-control shape: admission is intentionally
+      // separate from activation. The second loop must not join the stalled
+      // zero-event generation.
+      yield* llm.wait(2)
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)])
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(secondExit)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+
+      const inputs = yield* llm.inputs
+      const latest = inputs.at(-1)?.messages
+      if (!Array.isArray(latest)) throw new Error("expected latest LLM messages")
+      expect(latest.at(-1)).toEqual({ role: "user", content: "superseding supervised request" })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const stale = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
+      )
+      expect(stale?.info.role).toBe("assistant")
+      if (stale?.info.role === "assistant") {
+        expect(stale.info.time.completed).toBeDefined()
+        expect(stale.info.error).toBeDefined()
+      }
+    }),
+  30_000,
+)
+
+it.instance(
+  "new user input preempts a provider retry that has not produced forward progress",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, void 0).pipe(Effect.asVoid))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      yield* llm.error(503, { error: "transient upstream failure" })
+      yield* llm.push(raw({ head: [], wait: deferredAsPromise(gate), hang: true }))
+      yield* llm.text("fresh-answer")
+
+      const first = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first request" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // The second physical request is live but has emitted zero LLM events.
+      yield* llm.wait(2)
+      const retry = yield* waitForRetry(chat.id)
+      expect(retry.attempt).toBe(1)
+
+      const secondID = MessageID.ascending()
+      const second = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: secondID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "superseding request" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // This must reach a fresh provider generation without releasing gate.
+      // Waiting for gate would reproduce the production session brick.
+      yield* llm.wait(3)
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)])
+      expect(Exit.isSuccess(firstExit)).toBe(true)
+      expect(Exit.isSuccess(secondExit)).toBe(true)
+      expect(yield* llm.calls).toBe(3)
+
+      const inputs = yield* llm.inputs
+      const latest = inputs.at(-1)?.messages
+      if (!Array.isArray(latest)) throw new Error("expected latest LLM messages")
+      expect(latest.at(-1)).toEqual({ role: "user", content: "superseding request" })
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const stale = messages.find(
+        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
+      )
+      expect(stale?.info.role).toBe("assistant")
+      if (stale?.info.role === "assistant") {
+        expect(stale.info.time.completed).toBeDefined()
+        expect(stale.info.error).toBeDefined()
+      }
+    }),
+  30_000,
+)
+
+orphanIt.instance(
+  "new user input repairs an orphaned unfinished assistant before starting the replacement generation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const ownership = yield* SessionExecutionOwner.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      const stale = yield* seed(chat.id)
+      const toolStarted = Date.now()
+      const staleToolID = PartID.ascending()
+      yield* sessions.updatePart({
+        id: staleToolID,
+        messageID: stale.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        tool: "bash",
+        callID: "call-orphaned-turn",
+        state: {
+          status: "running",
+          input: { command: "echo orphaned" },
+          time: { start: toolStarted },
+        },
+      })
+
+      // Reproduce the production brick: this runtime durably owns the Session,
+      // but no SessionRunState activation/Runner exists to finish or release it.
+      const orphan = yield* ownership.tryAcquire(chat.id)
+      expect(orphan.state).toBe("acquired")
+      if (orphan.state !== "acquired") return
+
+      yield* llm.text("fresh-answer")
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "superseding request" }],
+      })
+
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.hits).toHaveLength(1)
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const repaired = messages.find((message) => message.info.id === stale.assistant.id)
+      expect(repaired?.info.role).toBe("assistant")
+      if (repaired?.info.role === "assistant") {
+        expect(repaired.info.time.completed).toBeDefined()
+        expect(repaired.info.error).toBeDefined()
+        const tool = repaired.parts.find(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.id === staleToolID,
+        )
+        expect(tool?.state.status).toBe("error")
+        if (tool?.state.status === "error") {
+          expect(tool.state.metadata?.interrupted).toBe(true)
+          expect(tool.state.time.start).toBe(toolStarted)
+          expect(tool.state.time.end).toBeGreaterThanOrEqual(toolStarted)
+        }
+      }
+
+      const hit = (yield* llm.hits)[0]
+      if (!hit) throw new Error("expected replacement provider request")
+      expect(providerRoleTexts(hit.body, "user").at(-1)).toBe("superseding request")
+      expect((yield* ownership.snapshot(chat.id)).ownerID).toBeUndefined()
+    }),
+  30_000,
+)
+
+orphanIt.instance(
+  "fresh activation resumes the current orphaned turn through the durable unknown-finish continuation",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const ownership = yield* SessionExecutionOwner.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+
+      const stale = yield* seed(chat.id)
+      const orphan = yield* ownership.tryAcquire(chat.id)
+      expect(orphan.state).toBe("acquired")
+      if (orphan.state !== "acquired") return
+
+      yield* llm.text("resumed-answer")
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.hits).toHaveLength(1)
+
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const repaired = messages.find((message) => message.info.id === stale.assistant.id)
+      expect(repaired?.info.role).toBe("assistant")
+      if (repaired?.info.role === "assistant") {
+        expect(repaired.info.time.completed).toBeDefined()
+        expect(repaired.info.finish).toBe("unknown")
+        expect(repaired.info.error).toBeUndefined()
+      }
+
+      const continuations = messages.filter(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.UnknownFinishContinuation,
+      )
+      expect(continuations).toHaveLength(1)
+      const hit = (yield* llm.hits)[0]
+      if (!hit) throw new Error("expected resumed provider request")
+      expect(providerRoleTexts(hit.body, "user").at(-1)).toContain("AUTOMATIC CONTINUATION")
+      expect((yield* ownership.snapshot(chat.id)).ownerID).toBeUndefined()
+    }),
+  30_000,
 )
 
 it.instance("legacy prompt emits message events without session.next events", () =>

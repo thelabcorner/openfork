@@ -21,6 +21,7 @@ import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection
 import { Global } from "@opencode-ai/core/global"
 import { OxpConfig } from "@/oxp/config"
 import { OxpAgentCatalog } from "@/oxp/agent-catalog"
+import { OxpModelCatalog } from "@/oxp/model-catalog"
 import { OxpRoot } from "@/oxp/root"
 import { OxpRequestControl } from "@/oxp/request-control"
 import {
@@ -47,6 +48,9 @@ const noSessionControl = Layer.succeed(
     pause: () => Effect.die("server test must not enter Session runtime control"),
     resume: () => Effect.die("server test must not enter Session runtime control"),
     abort: () => Effect.die("server test must not enter Session runtime control"),
+    archive: () => Effect.die("server test must not enter Session runtime control"),
+    unarchive: () => Effect.die("server test must not enter Session runtime control"),
+    delete: () => Effect.die("server test must not enter Session runtime control"),
     setSelection: () => Effect.die("server test must not enter Session runtime control"),
     send: () => Effect.die("server test must not enter Session runtime control"),
     turn: () => Effect.die("server test must not enter Session runtime control"),
@@ -95,6 +99,12 @@ const noAgentCatalog = Layer.succeed(
     list: () => Effect.die("server test must not enter workspace agent catalog"),
   }),
 )
+const noModelCatalog = Layer.succeed(
+  OxpModelCatalog.Service,
+  OxpModelCatalog.Service.of({
+    list: () => Effect.die("server test must not enter workspace model catalog"),
+  }),
+)
 const noSystemOneControl = Layer.succeed(
   OxpSystemOneControl.Service,
   OxpSystemOneControl.Service.of({
@@ -116,6 +126,7 @@ const layer = AppNodeBuilder.build(
     [OxpWorkerControl.node, noWorkerControl],
     [OxpMcpControl.node, noMcpControl],
     [OxpAgentCatalog.node, noAgentCatalog],
+    [OxpModelCatalog.node, noModelCatalog],
     [OxpSystemOneControl.node, noSystemOneControl],
   ],
 )
@@ -289,10 +300,18 @@ describe("OxpServer", () => {
         expect(endpoint.surfaceFingerprint).toMatch(/^[a-f0-9]{64}$/)
         yield* Effect.promise(() => client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))))
         expect(client.getProtocolEra()).toBe("modern")
+        expect(client.getServerVersion()?.version).toBe(
+          `0.1.0+schema.${OxpSurface.FINGERPRINT.slice(0, 12)}`,
+        )
         const listed = yield* Effect.promise(() => client.listTools())
         expect(listed.tools.map((tool) => tool.name)).toEqual(
           OxpSurface.TOOLS.map((tool) => tool.name).sort(),
         )
+        const workerTool = listed.tools.find((tool) => tool.name === "openfork_worker")
+        expect(
+          (workerTool?.inputSchema as { properties?: Record<string, unknown> } | undefined)
+            ?.properties,
+        ).toHaveProperty("workdir")
 
         const result = yield* Effect.promise(() =>
           client.callTool({ name: "read", arguments: { rootID: root.id, path: "hello.txt" } }),
@@ -473,6 +492,7 @@ describe("OxpServer", () => {
         expect(denied.isError).toBe(true)
         expect(denied.content.find((item) => item.type === "text")?.text).toContain("OXP_AUTH_DENIED")
         expect(denied.structuredContent).toMatchObject({
+          output: expect.stringContaining("OXP_AUTH_DENIED"),
           error: {
             code: "OXP_AUTH_DENIED",
             retryable: false,
@@ -488,12 +508,14 @@ describe("OxpServer", () => {
 
 
   it.live(
-    "exposes transactional runtime status and broker mutation over real MCP transport",
+    "arms a changed runtime trial only after the real MCP response finishes",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service
       const server = yield* OxpServer.Service
       const runtimeID = `sha256:${"a".repeat(64)}`
+      const candidateID = `sha256:${"b".repeat(64)}`
       let refreshCalls = 0
+      let armCalls = 0
 
       yield* config.setEnabled(true)
       yield* config.setGrant({ read: true, process: true })
@@ -508,22 +530,28 @@ describe("OxpServer", () => {
         refresh: async (input) => {
           refreshCalls += 1
           expect(input.expectedRuntimeID).toBe(runtimeID)
+          expect(armCalls).toBe(0)
           return {
             action: "refresh",
-            changed: false,
+            changed: true,
             status: {
               refreshable: true,
-              state: "stable",
+              state: "scheduled",
               runtimeID,
               activationGeneration: 7,
               activatedAt: 123,
-              lastTransition: {
-                trialID: "unchanged-e2e",
-                outcome: "unchanged",
-                at: 124,
+              trial: {
+                id: "response-barrier-e2e",
+                previousRuntimeID: runtimeID,
+                candidateRuntimeID: candidateID,
+                phase: "scheduled",
               },
             },
           }
+        },
+        arm: async (trialID) => {
+          expect(trialID).toBe("response-barrier-e2e")
+          armCalls += 1
         },
         accept: async () => {
           throw new Error("accept must not run")
@@ -607,20 +635,27 @@ describe("OxpServer", () => {
         )
         expect(refreshed.isError).not.toBe(true)
         expect(refreshCalls).toBe(1)
+        expect(armCalls).toBe(1)
         expect(refreshed.structuredContent).toMatchObject({
           data: {
             action: "refresh",
-            changed: false,
+            changed: true,
             status: {
               runtimeID,
-              state: "stable",
+              state: "scheduled",
+              trial: {
+                id: "response-barrier-e2e",
+                candidateRuntimeID: candidateID,
+                phase: "scheduled",
+              },
             },
           },
           mutation: {
             attempted: true,
-            committed: false,
+            committed: true,
           },
         })
+        expect(JSON.stringify(refreshed.structuredContent)).not.toContain("afterResponse")
       } finally {
         OxpRuntimeRefresh.install(undefined)
         yield* Effect.promise(() => client.close().catch(() => undefined))

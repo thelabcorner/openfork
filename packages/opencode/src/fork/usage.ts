@@ -200,6 +200,10 @@ function mergeOfficial(local: LocalWindow[], official: OfficialUsage): LocalWind
     return {
       ...window,
       spentUSD: window.limitUSD * (Math.max(0, Math.min(100, next.percent)) / 100),
+      // Keep the provider's own percentage alongside the dollar restatement so
+      // Capacity never has to reconstruct a window fraction from a universal
+      // dollar budget that this window does not actually meter.
+      officialPercent: Math.max(0, Math.min(100, next.percent)),
       estimatedPercent: estimatePercent(window, next.percent),
       resetsAt: next.resetsAt,
       clearsAt: next.resetsAt,
@@ -207,6 +211,27 @@ function mergeOfficial(local: LocalWindow[], official: OfficialUsage): LocalWind
       status: next.status,
     }
   })
+}
+
+/**
+ * The provider's own used-percentage for one merged window.
+ *
+ * `officialPercent` is the verbatim official value preserved by `mergeOfficial`
+ * and is always preferred. The fallback re-derives it from
+ * `spentUSD / limitUSD`, which `mergeOfficial` itself wrote from that same
+ * percentage; it exists only for windows produced before `officialPercent`
+ * existed. `estimatedPercent` is never used here: it may locally refine an
+ * integer percentage through the old universal dollar budget, whose
+ * denominator is not this window's meter.
+ *
+ * Callers must already have established that the window came from the official
+ * API (`source === "api"`). A local-only window has no official percentage, and
+ * a locally estimated spend fraction must never be presented as one.
+ */
+export function officialUsedPercent(window: LocalWindow): number | undefined {
+  if (window.officialPercent !== undefined) return Math.max(0, Math.min(100, window.officialPercent))
+  if (!(window.limitUSD > 0)) return undefined
+  return Math.max(0, Math.min(100, (window.spentUSD / window.limitUSD) * 100))
 }
 
 function estimatePercent(window: LocalWindow, officialPercent: number) {

@@ -8,8 +8,14 @@ import { SkillV2 } from "@opencode-ai/core/skill"
 import { InstanceDisposed } from "@/server/event"
 import { Question } from "@/question"
 import { ConfigApi } from "./groups/config"
+import { AgentCatalogApi } from "./groups/agent-catalog"
+import { ProviderCatalogApi } from "./groups/provider-catalog"
+import { OpenRouterReferenceApi } from "./groups/openrouter-reference"
+import { OpenRouterFreeUsageApi } from "./groups/openrouter-free-usage"
+import { SessionCreateApi } from "./groups/session-create"
 import { ControlApi } from "./groups/control"
 import { ControlPlaneApi } from "./groups/control-plane"
+import { DirectoryActivityFenceApi } from "./groups/directory-activity-fence"
 import { DeviceApi } from "./groups/device"
 import { ForkCredentialApi } from "./groups/fork-credential"
 import { EventApi } from "./groups/event"
@@ -20,14 +26,18 @@ import { McpApi } from "./groups/mcp"
 import { OfxpApi } from "./groups/ofxp"
 import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { PermissionApi } from "./groups/permission"
+import { PermissionControlApi } from "./groups/permission"
 import { ProjectApi } from "./groups/project"
 import { ProjectCopyApi } from "./groups/project-copy"
 import { ProviderApi } from "./groups/provider"
 import { ProviderSettingsApi } from "./groups/provider-settings"
-import { PtyApi, PtyConnectApi } from "./groups/pty"
+import { PtyApi, PtyConnectApi, PtyShellApi } from "./groups/pty"
 import { QuotaApi } from "./groups/quota"
 import { QuestionApi } from "./groups/question"
+import { QuestionControlApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
+import { SessionReadApi } from "./groups/session-read"
+import { SessionControlApi } from "./groups/session-control"
 import { SessionContextApi } from "./groups/session-context"
 import { SessionGroupApi } from "./groups/session-group"
 import { GoalApi } from "./groups/goal"
@@ -71,6 +81,7 @@ export const ServerApi = makeApi({
 export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(ControlApi)
   .addHttpApi(ControlPlaneApi)
+  .addHttpApi(DirectoryActivityFenceApi)
   .addHttpApi(ForkCredentialApi)
   .addHttpApi(GlobalApi)
   .addHttpApi(ProviderSettingsApi)
@@ -118,12 +129,33 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
 
 export const OpenCodeHttpApi = HttpApi.make("opencode")
   .addHttpApi(RootHttpApi)
+  .addHttpApi(AgentCatalogApi)
+  .addHttpApi(ProviderCatalogApi)
+  // Tier-0 public reference metadata. Keep this out of RootHttpApi as well as
+  // InstanceHttpApi: narrow root/control test graphs should not acquire an
+  // unrelated OpenRouter transport dependency.
+  .addHttpApi(OpenRouterReferenceApi)
+  // Tier-0 account-global OpenRouter quota report. Runtime mounting alone does
+  // not publish an operation to PublicApi/SDK generation, so keep the dedicated
+  // group in the same public aggregate as its reference-data sibling.
+  .addHttpApi(OpenRouterFreeUsageApi)
+  .addHttpApi(SessionCreateApi)
+  // Active V1 user-response controls dispatch through process-local handles;
+  // they never initialize the workspace execution Instance.
+  .addHttpApi(PermissionControlApi)
+  .addHttpApi(QuestionControlApi)
   .addHttpApi(EventApi)
+  // Tier 1 session/history reads use durable storage and workspace routing, but
+  // do not materialize a workspace execution Instance.
+  .addHttpApi(SessionReadApi)
+  .addHttpApi(SessionControlApi)
   .addHttpApi(PairBeginApi)
   .addHttpApi(PairClaimApi)
   .addHttpApi(DeviceApi)
   .addHttpApi(InstanceHttpApi)
   .addHttpApi(ServerApi)
+  // Tier 0 shell discovery has process ownership and no workspace middleware.
+  .addHttpApi(PtyShellApi)
   .addHttpApi(PtyConnectApi)
   .annotate(HttpApi.AdditionalSchemas, [
     EventSchema,

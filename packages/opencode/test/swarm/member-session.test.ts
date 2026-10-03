@@ -19,6 +19,7 @@ import { Session } from "@/session/session"
 import { Worktree } from "@/worktree"
 import { Git } from "@/git"
 import { SwarmMemberSession } from "@/swarm/member-session"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { testEffect } from "../lib/effect"
 
 const projectID = ProjectV2.ID.make("swarm-member-session-project")
@@ -32,7 +33,7 @@ const profile = Swarm.MemberExecutionProfile.make({
     variant: ModelV2.VariantID.make("high"),
   },
   permissionBoundary: [{ action: "webfetch", resource: "*", effect: "ask" }],
-  requestedCapabilities: ["tools", "image"],
+  modelRequirements: ["toolcall", "input_image"],
 })
 
 let member: Swarm.Member
@@ -117,7 +118,10 @@ const instanceStoreMock = Layer.mock(InstanceStore.Service, {
     ),
 })
 
-const fsMock = Layer.mock(FSUtil.Service, { isDir: () => Effect.succeed(true) } as never)
+const fsMock = Layer.mock(FSUtil.Service, {
+  isDir: () => Effect.succeed(true),
+  resolve: (path: string) => Effect.succeed(path),
+} as never)
 const agentMock = Layer.mock(Agent.Service, {
   get: (name: string) => Effect.succeed(name === "build" ? ({ name: "build" } as never) : undefined),
 } as never)
@@ -206,6 +210,9 @@ const it = testEffect(
       legacySessionMock,
       worktreeMock,
       gitMock,
+      // The real preflight runs against the same mocked catalog so the
+      // create-time and materialize-time answers cannot drift apart.
+      Layer.provide(SwarmProfilePreflight.layer, Layer.mergeAll(instanceStoreMock, fsMock, agentMock, providerMock)),
     ),
   ),
 )
@@ -235,6 +242,82 @@ describe("SwarmMemberSession", () => {
       expect(retried.status).toBe("already_bound")
       expect(retried.sessionID).toBe(first.sessionID)
       expect(order).toEqual([])
+    }),
+  )
+})
+
+describe("SwarmMemberSession legacy execution profiles", () => {
+  // These members are hydrated from raw `desired_profile` JSON written before
+  // Swarm.ModelRequirement existed, so they carry no `modelRequirements` key and
+  // only the compatibility report from Swarm.normalizeLegacyExecutionProfile.
+  const setLegacyMember = (
+    storedProfile: Record<string, unknown>,
+    capabilities: Record<string, unknown> | undefined,
+  ) => {
+    reset()
+    member = Swarm.Member.make({
+      ...member,
+      desiredProfile: Swarm.normalizeLegacyExecutionProfile(storedProfile).profile,
+      ...(capabilities === undefined ? {} : { capabilities: capabilities as never }),
+    })
+  }
+
+  it.effect("binds a member whose recognized legacy aliases map onto supported requirements", () =>
+    Effect.gen(function* () {
+      const stored = {
+        agent: profile.agent,
+        model: profile.model,
+        permissionBoundary: profile.permissionBoundary,
+        requestedCapabilities: ["tools", "input:image", "output:text"],
+      }
+      const normalized = Swarm.normalizeLegacyExecutionProfile(stored)
+      expect(normalized.unproven).toEqual([])
+      expect([...normalized.profile.modelRequirements!].sort()).toEqual(["input_image", "output_text", "toolcall"])
+      setLegacyMember(stored, { tags: [] })
+
+      const service = yield* SwarmMemberSession.Service
+      const result = yield* service.materialize({ swarmID, memberID })
+      expect(result.status).toBe("bound")
+    }),
+  )
+
+  it.effect("does not strand a member whose legacy values were only semantic routing tags", () =>
+    Effect.gen(function* () {
+      const stored = {
+        agent: profile.agent,
+        model: profile.model,
+        permissionBoundary: profile.permissionBoundary,
+        requestedCapabilities: ["research", "audit", "preregistration", "adversarial"],
+      }
+      const normalized = Swarm.normalizeLegacyExecutionProfile(stored)
+      expect([...normalized.routingTags].sort()).toEqual(["adversarial", "audit", "preregistration", "research"])
+      expect(normalized.unproven).toEqual([])
+      setLegacyMember(stored, { tags: [], legacyRoutingTags: normalized.routingTags })
+
+      const service = yield* SwarmMemberSession.Service
+      const result = yield* service.materialize({ swarmID, memberID })
+      expect(result.status).toBe("bound")
+    }),
+  )
+
+  it.effect("refuses to bind a member whose legacy requirement cannot be proven", () =>
+    Effect.gen(function* () {
+      const stored = {
+        agent: profile.agent,
+        model: profile.model,
+        permissionBoundary: profile.permissionBoundary,
+        requestedCapabilities: ["tools", "retina-vision"],
+      }
+      const normalized = Swarm.normalizeLegacyExecutionProfile(stored)
+      expect(normalized.unproven).toHaveLength(1)
+      setLegacyMember(stored, { tags: [], legacyUnprovenRequirements: normalized.unproven })
+
+      const service = yield* SwarmMemberSession.Service
+      const result = yield* service.materialize({ swarmID, memberID }).pipe(Effect.exit)
+      expect(result._tag).toBe("Failure")
+      // Fail closed *before* any Session, boundary, or binding exists.
+      expect(order).toEqual([])
+      expect(sessions.size).toBe(0)
     }),
   )
 })

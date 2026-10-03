@@ -151,7 +151,7 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
         const initialInterest = eventStreamInterestFromHeaders(request.headers)
         const output = Stream.unwrap(
           Effect.gen(function* () {
-            const interest = registerEventStreamInterest(initialInterest?.subscriber, initialInterest?.sessions)
+            const interest = registerEventStreamInterest(initialInterest?.subscriber, initialInterest?.sessions, initialInterest?.generation)
             yield* Effect.addFinalizer(() => Effect.sync(() => unregisterEventStreamInterest(interest)))
             const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedWireEvent>({
               capacity: subscriberCapacity,

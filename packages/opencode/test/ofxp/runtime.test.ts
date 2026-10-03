@@ -248,6 +248,9 @@ describe("OFXP process-global runtime", () => {
         identityStore: new MemoryStore(),
       })
       expect(started.discovery).toBe("disabled")
+      if (started.peerID === undefined || started.port === undefined) {
+        throw new Error("OFXP runtime start did not report its bound listener identity")
+      }
       const bootstrap = yield* runtime.bootstrap()
       expect(bootstrap.enabled).toBe(true)
       if (!bootstrap.enabled) throw new Error("OFXP bootstrap unexpectedly disabled")

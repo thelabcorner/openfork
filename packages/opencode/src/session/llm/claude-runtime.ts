@@ -14,25 +14,37 @@
 // fake loader/runtime/store/bindings for deterministic tests.
 
 import type { ModelMessage, Tool } from "ai"
+import { createHash, randomUUID } from "node:crypto"
 import z from "zod"
 import * as Stream from "effect/Stream"
 import { Effect } from "effect"
 import { LLMEvent, ToolResultValue } from "@opencode-ai/llm"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { PRODUCT_NAME, PRODUCT_SLUG } from "@opencode-ai/core/brand"
 import { SessionID } from "@/session/schema"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
 import { ClaudeAgentRuntime, type RuntimeTimeouts, type SdkMcpToolDefinition, type TurnOutcome } from "@/claude/runtime"
 import { defaultSdkLoader } from "@/claude/availability"
 import type { AssistantEvent, ContentBlock, RuntimeEvent } from "@/claude/events"
+import {
+  apiRetryNote,
+  classifyClaudeFailure,
+  failureHintFor,
+  finishReasonForClaude,
+  refusalText,
+} from "@/claude/failure"
+import { claudeFallbackCatalogID, modelNameFromId } from "@/claude/models"
 import { BridgeStore, completeEffect, parkEffect, validateScope, type BridgeRequest, type Scope } from "@/claude/bridge"
 import { healLegacyFindCall, isCanonicalFindToolMap } from "./tool-call-heal"
 import {
+  advanceBindingLeaf,
   boundHistory,
   createBinding,
   hashSettings,
-  invalidate,
+  historyBoundary,
   makeMemoryStorage,
   modelFamilyOf,
+  rebindBindingModel,
   resolveResumeEffect,
   saveBinding,
   type BindingStorage,
@@ -125,6 +137,8 @@ export interface StreamInput {
   readonly tools: Record<string, Tool>
   readonly modelID: string
   readonly providerID: string
+  /** Whether this provider run owns resumable continuity for the host Session. */
+  readonly continuity?: "session" | "isolated"
   /** OpenCode effort variant (`low`…`max`); maps to Agent SDK `--effort`. */
   readonly effort?: string
   readonly abort: AbortSignal
@@ -143,9 +157,11 @@ export interface StreamInput {
   readonly context: { readonly projectID: string; readonly worktree: string; readonly directory: string }
   /** Production-only transcript probe; omitted fixtures preserve legacy behavior. */
   readonly transcriptExists?: (claudeSessionID: string, cwd?: string) => Promise<boolean>
+  /** Verify a pinned transcript leaf before using Agent SDK resumeSessionAt. */
+  readonly transcriptHasEntry?: (claudeSessionID: string, uuid: string, cwd?: string) => Promise<boolean>
 }
 
-const MCP_SERVER_NAME = "opencode"
+const MCP_SERVER_NAME = PRODUCT_SLUG
 const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 const MCP_CALL_CLAIM_TIMEOUT_MS = 10_000
 
@@ -256,9 +272,6 @@ function toolAliases(tools: Record<string, Tool>): Record<string, string> {
     aliases[name] = target
     aliases[name.toLowerCase()] = target
     aliases[name[0]!.toUpperCase() + name.slice(1)] = target
-    const compact = name.replace(/[-_]/g, "").toLowerCase()
-    if (compact === "todoread") aliases.TodoRead = target
-    if (compact === "todowrite") aliases.TodoWrite = target
   }
   if (isCanonicalFindToolMap(tools)) {
     const names = Object.keys(tools).map((name) => name.toLowerCase())
@@ -289,8 +302,22 @@ function canonicalToolName(name: string, tools: Record<string, Tool>): string | 
   return Object.keys(tools).find((candidate) => candidate.toLowerCase() === lower)
 }
 
+function runtimeInstructions(modelID: string, effort?: string): string {
+  const model = modelID ? `, as ${modelID}` : ""
+  const reasoning = effort ? ` with ${effort} reasoning effort` : ""
+  return `<runtime_info>In case you\'re asked: you are running in ${PRODUCT_NAME} through the Claude Code harness${model}${reasoning}. No need to mention this otherwise.</runtime_info>`
+}
+
+type SdkToolResultContent =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+  | {
+      readonly type: "resource"
+      readonly resource: { readonly uri: string; readonly mimeType: string; readonly blob: string }
+    }
+
 type SdkToolResult = {
-  readonly content: readonly [{ readonly type: "text"; readonly text: string }]
+  readonly content: readonly SdkToolResultContent[]
   readonly isError?: true
 }
 
@@ -299,6 +326,43 @@ function sdkToolResult(text: string, isError = false): SdkToolResult {
     content: [{ type: "text", text }],
     ...(isError ? { isError: true as const } : {}),
   }
+}
+
+function sdkToolResultFromOutput(raw: unknown, text: string): SdkToolResult {
+  const content: SdkToolResultContent[] = []
+  if (text.trim()) content.push({ type: "text", text })
+  const attachments = isRecord(raw) && Array.isArray(raw.attachments) ? raw.attachments : []
+  for (const [index, attachment] of attachments.entries()) {
+    if (!isRecord(attachment) || attachment.type !== "file") continue
+    const mime = typeof attachment.mime === "string" ? attachment.mime : "application/octet-stream"
+    const url = typeof attachment.url === "string" ? attachment.url : ""
+    const name = typeof attachment.name === "string" ? attachment.name : ""
+    const parsed = parseDataUrl(url)
+    if (!parsed) {
+      if (url) {
+        content.push({
+          type: "text",
+          text: `[${mediaLooksLikeImage(mime) ? "Image" : "Document"} attachment could not be relayed inline; source URL: ${url}]`,
+        })
+      }
+      continue
+    }
+    if (mediaLooksLikeImage(parsed.mediaType || mime)) {
+      content.push({ type: "image", data: parsed.data, mimeType: parsed.mediaType || mime })
+      continue
+    }
+    const mediaType = mediaLooksLikePdf(parsed.mediaType, name) ? "application/pdf" : parsed.mediaType || mime
+    content.push({
+      type: "resource",
+      resource: {
+        uri: `opencode://tool-result/attachment-${index + 1}${mediaType === "application/pdf" ? ".pdf" : ""}`,
+        mimeType: mediaType,
+        blob: parsed.data,
+      },
+    })
+  }
+  if (content.length === 0) content.push({ type: "text", text: "(no output)" })
+  return { content }
 }
 
 // A permission check can fail for two very different reasons: the policy
@@ -458,43 +522,73 @@ function messageHasAttachments(content: ModelMessage["content"]): boolean {
   return content.some((part: any) => part && (part.type === "image" || part.type === "file"))
 }
 
+const SYNTHETIC_TOOL_MEDIA_PROMPT = "Attached media from tool result:"
+const SYSTEM_REMINDER_BLOCK = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+
+function isSyntheticToolMediaMessage(
+  message: ModelMessage,
+  previous?: ModelMessage,
+): boolean {
+  if (message.role !== "user") return false
+  const text = messageText(message).trim()
+  if (text === SYNTHETIC_TOOL_MEDIA_PROMPT) return true
+  return !text && previous?.role === "tool" && messageHasAttachments(message.content)
+}
+
+/**
+ * Stable user-only history identity for branch/revert detection. Assistant
+ * messages are intentionally excluded because OpenFork may reserialize them
+ * across tool steps. Attachment bytes are excluded; only presence matters.
+ */
+export function userHistoryFingerprints(messages: readonly ModelMessage[]): string[] {
+  const fingerprints: string[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!
+    if (message.role !== "user" || isSyntheticToolMediaMessage(message, messages[i - 1])) continue
+    const text = messageText(message)
+      .replace(SYSTEM_REMINDER_BLOCK, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+    const identity = text || (messageHasAttachments(message.content) ? "\u0000attachments" : "")
+    if (!identity) continue
+    fingerprints.push(createHash("sha1").update(identity).digest("hex").slice(0, 16))
+  }
+  return fingerprints
+}
+
+/** Messages before the current queued user turn, matching Claude Code's branch semantics. */
+function priorMessagesOfCurrentTurn(messages: readonly ModelMessage[]): readonly ModelMessage[] {
+  const turn: number[] = []
+  let toolStep = false
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role === "assistant") {
+      if (turn.length > 0) break
+      toolStep = true
+    } else if (message.role === "user" && !isSyntheticToolMediaMessage(message, messages[i - 1])) {
+      turn.unshift(i)
+      if (toolStep) break
+    }
+  }
+  const start = turn[0]
+  if (start === undefined) return messages
+  const answeredAfter = messages
+    .slice(start + 1)
+    .some((message) => message.role === "assistant" || message.role === "tool")
+  return answeredAfter ? messages : messages.slice(0, start)
+}
+
+function mainChainUuid(event: RuntimeEvent): string | undefined {
+  if (event.kind !== "transport") return undefined
+  const transport = event.event
+  if (transport.type !== "assistant" && transport.type !== "user") return undefined
+  if (!("uuid" in transport)) return undefined
+  if ("parent_tool_use_id" in transport && transport.parent_tool_use_id) return undefined
+  if ("isReplay" in transport && transport.isReplay === true) return undefined
+  return typeof transport.uuid === "string" && transport.uuid ? transport.uuid : undefined
+}
+
 // ── Failure classification (slim port of plugin failure.ts for better errors) ──
-
-const RATE_LIMIT_PATTERNS = [
-  /rate.?limit/i,
-  /session limit/i,
-  /usage limit/i,
-  /resets? \d/i,
-  /too many requests/i,
-  /\b429\b/,
-]
-
-const AUTH_PATTERNS = [
-  /invalid_grant/i,
-  /refresh token/i,
-  /invalid.*api.*key/i,
-  /authentication/i,
-  /unauthorized/i,
-  /not logged in/i,
-  /not authenticated/i,
-  /please.*login/i,
-  /oauth.*(expired|invalid|revoked)/i,
-  /credentials.*(expired|invalid)/i,
-  /\b401\b/i,
-]
-
-function classifyClaudeError(message: string): "rate_limit" | "auth" | "unknown" {
-  if (!message) return "unknown"
-  if (RATE_LIMIT_PATTERNS.some((re) => re.test(message))) return "rate_limit"
-  if (AUTH_PATTERNS.some((re) => re.test(message))) return "auth"
-  return "unknown"
-}
-
-function hintFor(kind: "rate_limit" | "auth" | "unknown"): string {
-  if (kind === "rate_limit") return " Claude subscription limit active; wait for reset."
-  if (kind === "auth") return " Claude Code credentials invalid/expired. Run `claude auth login --claudeai`."
-  return ""
-}
 
 export function buildPrompt(input: {
   readonly system: readonly string[]
@@ -768,6 +862,7 @@ export function stream(input: StreamInput): Stream.Stream<LLMEvent, unknown> {
 async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<void> {
   let sdkIn: PushChannel<SdkUserPrompt> | undefined
   let cleanupStore: BridgeStore | undefined
+  let cleanupSessionID = input.sessionID
   try {
     const context = input.context
     if (!context) throw new Error("claude runtime requires an explicit instance context (never process.cwd())")
@@ -780,32 +875,51 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     const store = input.store ?? defaultStore()
     cleanupStore = store
     const bindings = input.bindings ?? defaultBindings()
+    const continuity = input.continuity ?? "session"
+    const bridgeSessionID =
+      continuity === "session" ? input.sessionID : `${input.sessionID}:claude-isolated:${randomUUID()}`
+    cleanupSessionID = bridgeSessionID
     const settings = { model: input.modelID, provider: input.providerID }
+    const priorMessages = priorMessagesOfCurrentTurn(input.messages)
+    const historyFingerprints = userHistoryFingerprints(input.messages)
+    const priorHistoryFingerprints = userHistoryFingerprints(priorMessages)
+    const currentBoundary = historyBoundary(historyFingerprints)
 
-    // Resume decision through the OpenCode-owned binding store.
-    const decision = await runPromise(
-      resolveResumeEffect({
-        storage: bindings,
-        projectID: ownerScope.projectID,
-        openCodeSessionID: input.sessionID,
-        ctx: {
-          projectID: ownerScope.projectID,
-          worktree: ownerScope.worktree,
-          directory: ownerScope.directory,
-          cwd: ownerScope.cwd,
-          modelFamily: modelFamilyOf(input.modelID),
-          settingsDigest: hashSettings(settings),
-          transcriptExists: true,
-        },
-        historyMessages: input.messages
-          .filter((message) => message.role === "user" || message.role === "assistant")
-          .map((message) => ({ role: message.role, content: messageText(message) }))
-          .filter((message) => message.content.length > 0),
-        transcriptExists: input.transcriptExists
-          ? (binding) => Effect.promise(() => input.transcriptExists!(binding.claudeSessionID, binding.cwd))
-          : undefined,
-      }).pipe(Effect.orElseSucceed((): ResumeDecision => ({ strategy: "fresh" }))),
-    )
+    // Only the primary Session lane owns a resumable Claude transcript.
+    // Maintenance/derived requests may share the host Session ID for
+    // telemetry and policy, but must never read or mutate that binding.
+    const decision: ResumeDecision =
+      continuity === "isolated"
+        ? { strategy: "fresh", reason: "isolated maintenance turn" }
+        : await runPromise(
+            resolveResumeEffect({
+              storage: bindings,
+              projectID: ownerScope.projectID,
+              openCodeSessionID: input.sessionID,
+              ctx: {
+                projectID: ownerScope.projectID,
+                worktree: ownerScope.worktree,
+                directory: ownerScope.directory,
+                cwd: ownerScope.cwd,
+                modelFamily: modelFamilyOf(input.modelID),
+                settingsDigest: hashSettings(settings),
+                transcriptExists: true,
+              },
+              historyMessages: priorMessages
+                .filter((message) => message.role === "user" || message.role === "assistant")
+                .map((message) => ({ role: message.role, content: messageText(message) }))
+                .filter((message) => message.content.length > 0),
+              historyFingerprints,
+              priorHistoryFingerprints,
+              transcriptExists: input.transcriptExists
+                ? (binding) => Effect.promise(() => input.transcriptExists!(binding.claudeSessionID, binding.cwd))
+                : undefined,
+              transcriptHasEntry: input.transcriptHasEntry
+                ? (binding, uuid) =>
+                    Effect.promise(() => input.transcriptHasEntry!(binding.claudeSessionID, uuid, binding.cwd))
+                : undefined,
+            }).pipe(Effect.orElseSucceed((): ResumeDecision => ({ strategy: "fresh" }))),
+          )
     const resumeSessionID = decision.strategy === "resume" ? decision.binding?.claudeSessionID : undefined
     const prompt = buildPrompt({
       system: input.system,
@@ -855,7 +969,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
         callID,
         tool: name,
         input: callInput,
-        sessionID: input.sessionID,
+        sessionID: bridgeSessionID,
         scope: ownerScope,
       }
       try {
@@ -909,6 +1023,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
         return failTool("scope mismatch")
       }
       let outputText: string
+      let rawToolOutput: unknown
       try {
         const tool = input.tools[name]
         if (!tool.execute) throw new Error(`tool has no execute handler: ${name}`)
@@ -917,6 +1032,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
           messages: input.messages as ModelMessage[],
           abortSignal: signal,
         })
+        rawToolOutput = raw
         outputText = toolOutput(raw)
         const completed = await runPromise(
           completeEffect(store, callID, { callID, status: "success", output: outputText }),
@@ -937,13 +1053,19 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
         LLMEvent.toolResult({
           id: callID,
           name,
-          result: ToolResultValue.make(outputText, "text"),
+          result: ToolResultValue.make(rawToolOutput),
           providerExecuted: false,
         }),
       )
-      if (!mcpRegistered)
-        sdkIn!.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, content: outputText }]))
-      return sdkToolResult(outputText)
+      const sdkResult = sdkToolResultFromOutput(rawToolOutput, outputText)
+      if (!mcpRegistered) {
+        const content =
+          sdkResult.content.length === 1 && sdkResult.content[0]?.type === "text"
+            ? sdkResult.content[0].text
+            : sdkResult.content
+        sdkIn!.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, content }]))
+      }
+      return sdkResult
     }
 
     const mcpTools: SdkMcpToolDefinition[] = Object.entries(input.tools)
@@ -1004,12 +1126,81 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       }))
 
     const partial: PartialStreamState = { blocks: new Map(), completed: [], sequence: 0 }
+    let lastLeafUuid: string | undefined
+    let effectiveModelID = input.modelID
+    const seenSystemNotes = new Set<string>()
+    const emitSystemNote = (
+      text: string,
+      key = text,
+      providerMetadata?: Parameters<typeof LLMEvent.reasoningStart>[0]["providerMetadata"],
+    ) => {
+      const note = text.trim()
+      if (!note || seenSystemNotes.has(key)) return
+      seenSystemNotes.add(key)
+      const id = `claude-system-${++partial.sequence}`
+      out.push(LLMEvent.reasoningStart({ id, ...(providerMetadata ? { providerMetadata } : {}) }))
+      out.push(LLMEvent.reasoningDelta({ id, text: note }))
+      out.push(LLMEvent.reasoningEnd({ id }))
+    }
     const sink = (event: RuntimeEvent): void => {
       if (event.kind !== "transport") return
       const transport = event.event
+      const leaf = mainChainUuid(event)
+      if (leaf) lastLeafUuid = leaf
       if (transport.type === "stream_event" && "event" in transport) {
         emitPartialStreamEvent(out, transport.event, partial)
         return
+      }
+      if (transport.type === "system" && "subtype" in transport) {
+        if (transport.subtype === "api_retry") {
+          emitSystemNote(apiRetryNote(transport), `api-retry:${transport.attempt ?? "?"}`)
+          return
+        }
+        if (transport.subtype === "model_refusal_no_fallback") {
+          emitSystemNote(refusalText(transport), "model-refusal-no-fallback")
+          return
+        }
+        if (transport.subtype === "model_refusal_fallback") {
+          const original = transport.original_model ?? input.modelID
+          const fallback = transport.fallback_model
+          if (!fallback) return
+          const target = claudeFallbackCatalogID(fallback, original)
+          const fromName = modelNameFromId(original) ?? original
+          const toName = modelNameFromId(target) ?? target
+          const why = transport.api_refusal_category ? ` (${transport.api_refusal_category})` : ""
+          const sessionScoped = transport.scope !== "local"
+          if (sessionScoped && continuity === "session") effectiveModelID = target
+          emitSystemNote(
+            sessionScoped
+              ? `${fromName} declined this request${why}; ${toName} answered, and Claude Code keeps using it in this session.`
+              : `${fromName} declined this request${why}; ${toName} answered this turn.`,
+            `model-refusal-fallback:${original}:${target}:${transport.scope ?? "session"}`,
+            sessionScoped && continuity === "session"
+              ? {
+                  claude: {
+                    event: "model_refusal_fallback",
+                    scope: transport.scope ?? "session",
+                    originalModelID: original,
+                    fallbackModelID: target,
+                    ...(transport.api_refusal_category ? { category: transport.api_refusal_category } : {}),
+                  },
+                }
+              : undefined,
+          )
+          return
+        }
+        if (transport.subtype === "notification") {
+          if (transport.priority === "high") {
+            emitSystemNote(transport.text ?? transport.message ?? "", `notification:${transport.key ?? transport.text ?? ""}`)
+          }
+          return
+        }
+        if (transport.subtype === "informational") {
+          if (transport.level === "warning") {
+            emitSystemNote(transport.text ?? transport.message ?? "", `informational:${transport.text ?? transport.message ?? ""}`)
+          }
+          return
+        }
       }
       if (transport.type !== "assistant") return
       emitAssistantBlocks(
@@ -1047,10 +1238,14 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       model: input.modelID,
       effort: input.effort,
       resume: resumeSessionID,
+      resumeSessionAt: decision.resumeSessionAt,
       signal: input.abort,
+      ...(continuity === "isolated" ? { persistSession: false } : {}),
       sink,
       mcpTools,
+      mcpServerName: MCP_SERVER_NAME,
       toolAliases: toolAliases(input.tools),
+      systemPromptAppend: runtimeInstructions(input.modelID, input.effort),
       onMcpToolsRegistered: (registered) => {
         mcpRegistered = registered
       },
@@ -1061,56 +1256,86 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     // Settle eager tool tasks before the terminal events.
     await Promise.allSettled([...pending])
 
+    // Transcript authority is independent from turn success. A provider
+    // failure can happen after Claude has already written durable main-chain
+    // state (notably an auto-compaction summary or an interrupted tool
+    // marker). The binding was validated before the turn and resumeSessionAt
+    // pins future work to our observed leaf, so terminal provider status is
+    // not a reason to invalidate it. Only transcript/history validation in
+    // resolveResumeEffect owns binding invalidation.
+    const observedLeafUuid = outcome.leafUuid ?? lastLeafUuid
+    const observedSessionID = outcome.sessionID ?? resumeSessionID
+    if (continuity === "session" && observedSessionID) {
+      const existing = decision.strategy === "resume" ? decision.binding : undefined
+      const advanced =
+        existing && existing.claudeSessionID === observedSessionID
+          ? advanceBindingLeaf(existing, observedLeafUuid)
+          : createBinding({
+              openCodeSessionID: input.sessionID,
+              claudeSessionID: observedSessionID,
+              projectID: ownerScope.projectID,
+              worktree: ownerScope.worktree,
+              directory: ownerScope.directory,
+              cwd: ownerScope.cwd,
+              modelID: effectiveModelID,
+              settings: { model: effectiveModelID, provider: input.providerID },
+              leafUuid: observedLeafUuid,
+              turnBoundary: currentBoundary,
+            })
+      const binding =
+        effectiveModelID === input.modelID
+          ? advanced
+          : rebindBindingModel(advanced, effectiveModelID, {
+              model: effectiveModelID,
+              provider: input.providerID,
+            })
+      // resolveResumeEffect already persists any start-of-turn boundary
+      // mutation. If settlement observed no new leaf/model state, preserve the
+      // upstream v1.3 invariant that the binding store is not rewritten when
+      // nothing changed.
+      if (!existing || binding !== existing) await runPromise(saveBinding(bindings, binding))
+    }
+
     if (outcome.status === "completed") {
       const usage =
         outcome.usage && (outcome.usage.input_tokens !== undefined || outcome.usage.output_tokens !== undefined)
           ? { inputTokens: outcome.usage.input_tokens, outputTokens: outcome.usage.output_tokens }
           : undefined
-      const reason = outcome.isError ? ("error" as const) : ("stop" as const)
+      const reason = outcome.isError ? ("error" as const) : finishReasonForClaude(outcome.stopReason)
       out.push(LLMEvent.stepFinish({ index: 0, reason, ...(usage ? { usage } : {}) }))
       out.push(LLMEvent.finish({ reason, ...(usage ? { usage } : {}) }))
-      if (outcome.sessionID) {
-        const existing = decision.strategy === "resume" ? decision.binding : undefined
-        const binding =
-          existing && existing.claudeSessionID === outcome.sessionID
-            ? { ...existing, updatedAt: Date.now() }
-            : createBinding({
-                openCodeSessionID: input.sessionID,
-                claudeSessionID: outcome.sessionID,
-                projectID: ownerScope.projectID,
-                worktree: ownerScope.worktree,
-                directory: ownerScope.directory,
-                cwd: ownerScope.cwd,
-                modelID: input.modelID,
-                settings,
-              })
-        await runPromise(saveBinding(bindings, binding))
-      }
     } else {
-      if (resumeSessionID && decision.binding) {
-        await runPromise(
-          saveBinding(bindings, invalidate(decision.binding, "stale", outcome.category ?? outcome.status)),
-        )
-      }
       // Cancellation ends the stream quietly, matching AI SDK abort semantics.
       if (outcome.status !== "cancelled") {
         const rawMsg = outcome.message ?? outcome.category ?? `claude turn ${outcome.status}`
-        const kind = classifyClaudeError(rawMsg)
-        const msg = rawMsg + hintFor(kind)
-        out.push(LLMEvent.providerError({ message: msg }))
+        const kind = classifyClaudeFailure(rawMsg)
+        const msg = rawMsg + failureHintFor(kind)
+        out.push(
+          LLMEvent.providerError({
+            message: msg,
+            ...(kind === "context_overflow" ? { classification: "context-overflow" as const } : {}),
+            retryable: kind === "overloaded",
+          }),
+        )
       }
     }
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error)
-    const kind = classifyClaudeError(raw)
-    out.push(LLMEvent.providerError({ message: raw + hintFor(kind) }))
+    const kind = classifyClaudeFailure(raw)
+    out.push(
+      LLMEvent.providerError({
+        message: raw + failureHintFor(kind),
+        ...(kind === "context_overflow" ? { classification: "context-overflow" as const } : {}),
+        retryable: kind === "overloaded",
+      }),
+    )
   } finally {
     sdkIn?.end()
     // Convergent teardown: never leave this session's bridge rows active.
     // Terminal rows are retained (bounded by MAX_RETAINED_ENTRIES) so outcomes
     // stay observable; the per-directory store is disposed with its instance.
     try {
-      cleanupStore?.cancelSession(input.sessionID)
+      cleanupStore?.cancelSession(cleanupSessionID)
     } catch {}
     out.end()
   }

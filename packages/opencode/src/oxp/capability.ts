@@ -17,6 +17,7 @@ import { OxpRead } from "./read"
 import { OxpResult } from "./result"
 import { OxpSchedule } from "./schedule"
 import { OxpScheduleManagement } from "./schedule-management"
+import { OxpSchemaProjection } from "./schema-projection"
 import { OxpSchema } from "./schema"
 import { OxpSkill } from "./skill"
 import { OxpSymbols } from "./symbols"
@@ -35,6 +36,7 @@ import { OxpOfxp } from "./ofxp"
 import { OxpSystemOne } from "./system-one"
 import { OxpSwarm } from "./swarm"
 import { OxpSession } from "./session"
+import { OxpWorker } from "./worker"
 import { OxpProse } from "./prose"
 import { BrokerContract } from "@/tool/broker-contract"
 import { ToolExposure } from "@/tool/exposure"
@@ -49,6 +51,15 @@ export type WorkspaceTier = 0 | 1 | 2 | 3
  * capability layer. */
 export interface CallContext {
   readonly parentConversationRef?: string
+  /**
+   * Higher-tier worker execution stays host-owned so capability discovery can
+   * expose the live worker schema without pulling Tier-3 worker ports into the
+   * lower-tier capability graph.
+   */
+  readonly workerExecute?: (
+    input: OxpWorker.Input,
+    signal?: AbortSignal,
+  ) => Effect.Effect<OxpResult.CapabilityResult, OxpError.Error>
 }
 
 export interface CatalogRow {
@@ -56,6 +67,7 @@ export interface CatalogRow {
   readonly namespace: "openfork" | "mcp"
   readonly description: string
   readonly authority: OxpSchema.AuthorityClass
+  readonly authorities?: readonly OxpSchema.AuthorityClass[]
   readonly exposure: Exposure
   readonly load: LoadPolicy
   readonly workspaceTier: WorkspaceTier
@@ -65,6 +77,7 @@ export interface CatalogRow {
 interface Definition extends Omit<CatalogRow, "load"> {
   readonly nativeToolID?: string
   readonly schema: Schema.Top
+  readonly schemaConstraints?: Readonly<Record<string, unknown>>
   readonly execute: (
     input: unknown,
     signal?: AbortSignal,
@@ -92,12 +105,13 @@ export const Parameters = Schema.Struct({
   }),
   namespace: Schema.optional(Schema.Literals(["openfork", "mcp"])),
   rootID: Schema.optional(OxpSchema.RootID).annotate({
-    description: "Approved root for namespace=mcp.",
+    description:
+      "Approved root. For OpenFork calls it may be promoted into args when the described capability accepts rootID; for MCP it scopes the server.",
   }),
   capability: Schema.optional(Schema.String),
   query: Schema.optional(Schema.String),
   load: Schema.optional(Schema.Literals(["default", "lazy", "all"])).annotate({
-    description: "List filter; defaults to lazy.",
+    description: "List filter; defaults to lazy without a query and all when a query is supplied.",
   }),
   contract: BrokerContract.Parameter,
   args: Schema.optional(Schema.Unknown).annotate({
@@ -110,13 +124,18 @@ export const Parameters = Schema.Struct({
 export type Input = Schema.Schema.Type<typeof Parameters>
 
 function catalogRow(item: Definition): CatalogRow {
-  const { schema: _schema, execute: _execute, nativeToolID, ...row } = item
+  const {
+    schema: _schema,
+    schemaConstraints: _schemaConstraints,
+    execute: _execute,
+    nativeToolID,
+    ...row
+  } = item
   return Object.freeze({ ...row, load: ToolExposure.loadPolicy(nativeToolID ?? item.id) })
 }
 
 function descriptorOf(item: Definition): Descriptor {
-  const { schema } = item
-  const inputSchema = Schema.toJsonSchemaDocument(schema, { additionalProperties: false }).schema
+  const inputSchema = OxpSchemaProjection.definitionInputSchema(item)
   return {
     ...BrokerContract.describe({
       broker: "capability",
@@ -185,6 +204,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("archive"),
           authority: "read",
+          authorities: ["read", "write", "process"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "write",
@@ -243,9 +263,16 @@ const layer = Layer.effect(
           workspaceTier: 3,
           mutation: "none",
           schema: OxpRead.Parameters,
+          schemaConstraints: OxpRead.TransportStrategyConstraints,
           execute: (input, signal) =>
-            Schema.decodeUnknownEffect(OxpRead.Parameters)(input).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP read arguments" })),
+            Schema.decodeUnknownEffect(OxpRead.Parameters)(input, { onExcessProperty: "error" }).pipe(
+              Effect.mapError(
+                () =>
+                  new OxpError.InvalidArgument({
+                    detail:
+                      "Invalid OXP read arguments. Read windows are 1-based: offset and limit must be positive integers (use offset:1 for the first line).",
+                  }),
+              ),
               Effect.flatMap((params) => read.execute(params, signal)),
             ),
         },
@@ -261,6 +288,7 @@ const layer = Layer.effect(
           workspaceTier: 3,
           mutation: "write",
           schema: OxpEdit.Parameters,
+          schemaConstraints: OxpEdit.TransportStrategyConstraints,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpEdit.Parameters)(input, { onExcessProperty: "error" }).pipe(
               Effect.mapError(
@@ -285,6 +313,7 @@ const layer = Layer.effect(
           workspaceTier: 3,
           mutation: "write",
           schema: OxpGit.Parameters,
+          schemaConstraints: OxpGit.TransportModeConstraints,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpGit.Parameters)(input, { onExcessProperty: "error" }).pipe(
               Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP Git arguments" })),
@@ -299,6 +328,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("json"),
           authority: "read",
+          authorities: ["read", "write"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "write",
@@ -335,6 +365,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("memory"),
           authority: "read",
+          authorities: ["read", "write"],
           exposure: "brokered",
           workspaceTier: 1,
           mutation: "write",
@@ -353,6 +384,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("sqlite"),
           authority: "read",
+          authorities: ["read", "write"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "write",
@@ -430,6 +462,32 @@ const layer = Layer.effect(
         },
       ],
       [
+        "openfork_worker",
+        {
+          id: "openfork_worker",
+          namespace: "openfork",
+          description: OxpProse.capabilityDescription("openfork_worker"),
+          authority: "delegation",
+          exposure: "direct",
+          workspaceTier: 3,
+          mutation: "write",
+          schema: OxpWorker.Parameters,
+          execute: (input, signal, context) =>
+            Schema.decodeUnknownEffect(OxpWorker.Parameters)(input, { onExcessProperty: "error" }).pipe(
+              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP delegated-worker arguments" })),
+              Effect.flatMap((params) =>
+                context?.workerExecute
+                  ? context.workerExecute(params, signal)
+                  : Effect.fail(
+                      new OxpError.DependencyUnavailable({
+                        detail: "Delegated-worker broker execution requires the OXP host worker dispatcher",
+                      }),
+                    ),
+              ),
+            ),
+        },
+      ],
+      [
         "openfork_swarm",
         {
           id: "openfork_swarm",
@@ -477,13 +535,14 @@ const layer = Layer.effect(
           workspaceTier: 3,
           mutation: "none",
           schema: OxpFind.Parameters,
+          schemaConstraints: OxpFind.TransportStrategyConstraints,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpFind.Parameters)(input, { onExcessProperty: "error" }).pipe(
               Effect.mapError(
                 () =>
                   new OxpError.InvalidArgument({
                     detail:
-                      'Invalid OXP find arguments. Choose exactly one search shape: {glob,...} or {grep,...}. grep is literal by default; set syntax:"regex" only when regular-expression semantics are intentional.',
+                      'Invalid OXP find arguments. find has no query/maxResults fields: use glob for path search, grep for text search, optional grep + glob to restrict files, and limit for result count. grep is literal by default; set syntax:"regex" only intentionally.',
                   }),
               ),
               Effect.flatMap((params) => find.execute(params, signal)),
@@ -507,7 +566,7 @@ const layer = Layer.effect(
                 () =>
                   new OxpError.InvalidArgument({
                     detail:
-                      "Invalid OXP process arguments. Choose one action-shaped call. For start, provide rootID plus either argv (preferred for executable calls) or command (only when shell syntax is required), never both.",
+                      "Invalid OXP process transport arguments. Use only fields published by the flat process schema; OXP normalizes known cross-action fields before execution.",
                   }),
               ),
               Effect.flatMap((params) => process.execute(params, signal)),
@@ -556,12 +615,14 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("project"),
           authority: "read",
-          exposure: "direct",
+          exposure: "brokered",
           workspaceTier: 3,
           mutation: "none",
           schema: OxpProject.Parameters,
           execute: (input, signal) =>
-            Schema.decodeUnknownEffect(OxpProject.Parameters)(input).pipe(
+            Schema.decodeUnknownEffect(OxpProject.Parameters)(input, {
+              onExcessProperty: "error",
+            }).pipe(
               Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP project arguments" })),
               Effect.flatMap((params) => project.execute(params, signal)),
             ),
@@ -574,6 +635,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("refactor"),
           authority: "read",
+          authorities: ["read", "write", "process"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "write",
@@ -628,6 +690,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("test"),
           authority: "read",
+          authorities: ["read", "process"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "write",
@@ -646,6 +709,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("typecheck"),
           authority: "read",
+          authorities: ["read", "process"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "none",
@@ -682,7 +746,8 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("write"),
           authority: "write",
-          exposure: "brokered",
+          authorities: ["write", "process"],
+          exposure: "direct",
           workspaceTier: 3,
           mutation: "write",
           schema: OxpWrite.Parameters,
@@ -756,10 +821,20 @@ const layer = Layer.effect(
 
     const list = Effect.fn("OxpCapability.list")(function* (query?: string, load: ListLoad = "all") {
       yield* authority.authorize({ plane: "augmentation", operation: "capability.list", phase: "discover" })
-      const needle = query?.trim().toLowerCase()
+      const terms = query
+        ?.trim()
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter(Boolean) ?? []
       return (yield* visible())
         .filter((item) => load === "all" || ToolExposure.loadPolicy(item.nativeToolID ?? item.id) === load)
-        .filter((item) => !needle || `${item.id} ${item.description}`.toLowerCase().includes(needle))
+        .filter((item) => {
+          if (terms.length === 0) return true
+          const haystack = `${item.id} ${item.description}`
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, " ")
+          return terms.every((term) => haystack.includes(term))
+        })
         .sort((a, b) => a.id.localeCompare(b.id))
         .map(catalogRow)
     })
@@ -820,7 +895,7 @@ const layer = Layer.effect(
             },
           } satisfies OxpResult.CapabilityResult
         }
-        const load = input.load ?? "lazy"
+        const load = input.load ?? (input.query?.trim() ? "all" : "lazy")
         const rows = yield* list(input.query, load)
         return {
           title: load === "lazy" ? "OpenFork lazy capabilities" : "OpenFork capabilities",

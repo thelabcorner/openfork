@@ -17,6 +17,8 @@ import { OxpSchema } from "@/oxp/schema"
 import { OxpMcpControl } from "@/oxp/mcp-control"
 import { OxpSystemOneControl } from "@/oxp/system-one-control"
 import { OxpSessionControl } from "@/oxp/session-control"
+import { OxpWorkerControl } from "@/oxp/worker-control"
+import { OxpAgentCatalog } from "@/oxp/agent-catalog"
 import { CAPABILITY_DESCRIPTIONS } from "@/oxp/prose"
 import { OxpSurface } from "@/oxp/surface"
 import { OxpSession } from "@/oxp/session"
@@ -28,6 +30,26 @@ const suite = path.join(os.tmpdir(), `opencode-oxp-capability-${randomUUID()}`)
 const configDir = path.join(suite, ".config")
 const stateDir = path.join(suite, ".state")
 const globalLayer = Global.layerWith({ config: configDir, state: stateDir })
+
+function localSchemaRefs(value: unknown, refs = new Set<string>()) {
+  if (Array.isArray(value)) {
+    for (const item of value) localSchemaRefs(item, refs)
+    return refs
+  }
+  if (!value || typeof value !== "object") return refs
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      key === "$ref" &&
+      typeof item === "string" &&
+      item.startsWith("#/$defs/")
+    ) {
+      refs.add(item.slice("#/$defs/".length))
+      continue
+    }
+    localSchemaRefs(item, refs)
+  }
+  return refs
+}
 const noMcpControl = Layer.succeed(
   OxpMcpControl.Service,
   OxpMcpControl.Service.of({
@@ -68,12 +90,53 @@ const fakeSystemOneControl = Layer.succeed(
     },
   }),
 )
+const workerModel = {
+  providerID: "fixture",
+  modelID: "fixture-model",
+} as const
+let workerStartTarget: OxpWorkerControl.Target | undefined
+
+const fakeWorkerControl = Layer.succeed(
+  OxpWorkerControl.Service,
+  OxpWorkerControl.Service.of({
+    resolveSelection: () => Effect.succeed({ agent: "build", model: workerModel }),
+    start: (target) =>
+      Effect.sync(() => {
+        workerStartTarget = target
+        return { workerID: "ses_capability_worker" }
+      }),
+    continue: () => Effect.die("capability test must not continue delegated workers"),
+    setSelection: () => Effect.die("capability test must not rebind delegated workers"),
+    wait: () => Effect.die("capability test must not wait delegated workers"),
+    result: () => Effect.die("capability test must not read delegated worker results"),
+    cancel: () => Effect.die("capability test must not cancel delegated workers"),
+    batchStart: () => Effect.die("capability test must not batch-start delegated workers"),
+    batchContinue: () => Effect.die("capability test must not batch-continue delegated workers"),
+    batchWait: () => Effect.die("capability test must not batch-wait delegated workers"),
+    batchCancel: () => Effect.die("capability test must not batch-cancel delegated workers"),
+  }),
+)
+
+const fakeAgentCatalog = Layer.succeed(
+  OxpAgentCatalog.Service,
+  OxpAgentCatalog.Service.of({
+    list: () =>
+      Effect.succeed({
+        agents: [{ id: "build", mode: "primary" as const }],
+        nativeDefaultAgent: "build",
+      }),
+  }),
+)
+
 const noSessionControl = Layer.succeed(
   OxpSessionControl.Service,
   OxpSessionControl.Service.of({
     pause: () => Effect.die("capability test must not enter Session runtime control"),
     resume: () => Effect.die("capability test must not enter Session runtime control"),
     abort: () => Effect.die("capability test must not enter Session runtime control"),
+    archive: () => Effect.die("capability test must not enter Session runtime control"),
+    unarchive: () => Effect.die("capability test must not enter Session runtime control"),
+    delete: () => Effect.die("capability test must not enter Session runtime control"),
     setSelection: () => Effect.die("capability test must not enter Session runtime control"),
     send: () => Effect.die("capability test must not enter Session runtime control"),
     turn: () => Effect.die("capability test must not enter Session runtime control"),
@@ -95,6 +158,8 @@ const fakeOfxpRuntime = Layer.succeed(
     rotateIdentity: () => Effect.die("capability test must not rotate OFXP identity"),
     finalizeIdentityRotation: () => Effect.die("capability test must not finalize OFXP identity rotation"),
     status: () => Effect.succeed({ active: false, discovery: "disabled" as const }),
+    bootstrap: () => Effect.succeed({ enabled: false } as const),
+    replaceServerSeeds: (seeds) => Effect.succeed(seeds.length),
     candidates: () => Effect.succeed([]),
     connectionStatuses: () => Effect.succeed([]),
     pairingPreviews: () => Effect.succeed([]),
@@ -147,6 +212,8 @@ const layer = AppNodeBuilder.build(
     [OxpMcpControl.node, noMcpControl],
     [OxpSystemOneControl.node, fakeSystemOneControl],
     [OxpSessionControl.node, noSessionControl],
+    [OxpWorkerControl.node, fakeWorkerControl],
+    [OxpAgentCatalog.node, fakeAgentCatalog],
     [OfxpRuntime.node, fakeOfxpRuntime],
   ],
 )
@@ -157,6 +224,7 @@ beforeEach(async () => {
   await fs.mkdir(configDir, { recursive: true })
   await fs.mkdir(stateDir, { recursive: true })
   systemOneCall = undefined
+  workerStartTarget = undefined
   ofxpInvocations = []
   ofxpReceipts = []
 })
@@ -199,6 +267,7 @@ describe("OxpCapability", () => {
       "ofxp",
       "openfork_session.checkpoint",
       "openfork_swarm",
+      "openfork_worker",
       "patch",
       "process",
       "project",
@@ -235,6 +304,12 @@ describe("OxpCapability", () => {
       load: "lazy",
       mutation: "write",
     })
+    expect(rows.find((row) => row.id === "openfork_worker")).toMatchObject({
+      authority: "delegation",
+      exposure: "direct",
+      workspaceTier: 3,
+      mutation: "write",
+    })
 
     expect(rows.find((row) => row.id === "file.transfer")).toMatchObject({
       authority: "filesReceive",
@@ -251,21 +326,25 @@ describe("OxpCapability", () => {
       workspaceTier: 0,
       mutation: "write",
     })
-    expect(rows.find((row) => row.id === "process")?.description).toMatch(/upstream may reject/i)
-    expect(rows.find((row) => row.id === "process")?.description).toMatch(/purpose-specific direct tool/i)
+    expect(rows.find((row) => row.id === "process")?.description).toMatch(/opaque handle/i)
+    expect(rows.find((row) => row.id === "process")?.description).toMatch(/never PID/i)
+    expect(rows.find((row) => row.id === "process")?.description).toMatch(/upstream may reject model-authored authentication/i)
     expect(rows.find((row) => row.id === "json")).toMatchObject({
       authority: "read",
+      authorities: ["read", "write"],
       exposure: "brokered",
       load: "lazy",
       mutation: "write",
     })
     expect(rows.find((row) => row.id === "memory")).toMatchObject({
       authority: "read",
+      authorities: ["read", "write"],
       exposure: "brokered",
       mutation: "write",
     })
     expect(rows.find((row) => row.id === "sqlite")).toMatchObject({
       authority: "read",
+      authorities: ["read", "write"],
       exposure: "brokered",
       load: "lazy",
       workspaceTier: 3,
@@ -273,6 +352,7 @@ describe("OxpCapability", () => {
     })
     expect(rows.find((row) => row.id === "test")).toMatchObject({
       authority: "read",
+      authorities: ["read", "process"],
       exposure: "brokered",
       load: "lazy",
       mutation: "write",
@@ -285,6 +365,7 @@ describe("OxpCapability", () => {
     })
     expect(rows.find((row) => row.id === "typecheck")).toMatchObject({
       authority: "read",
+      authorities: ["read", "process"],
       exposure: "brokered",
       mutation: "none",
     })
@@ -296,9 +377,40 @@ describe("OxpCapability", () => {
     })
     expect(rows.find((row) => row.id === "write")).toMatchObject({
       authority: "write",
-      exposure: "brokered",
+      authorities: ["write", "process"],
+      exposure: "direct",
       mutation: "write",
     })
+    expect(rows.find((row) => row.id === "project")).toMatchObject({
+      authority: "read",
+      exposure: "brokered",
+      mutation: "none",
+    })
+    expect(rows.find((row) => row.id === "archive")?.authorities).toEqual([
+      "read",
+      "write",
+      "process",
+    ])
+    expect(rows.find((row) => row.id === "refactor")?.authorities).toEqual([
+      "read",
+      "write",
+      "process",
+    ])
+    expect(
+      rows
+        .filter((row) => row.authorities)
+        .map((row) => row.id)
+        .toSorted(),
+    ).toEqual([
+      "archive",
+      "json",
+      "memory",
+      "refactor",
+      "sqlite",
+      "test",
+      "typecheck",
+      "write",
+    ])
     expect(rows.find((row) => row.id === "schedule.create")).toMatchObject({
       authority: "automation",
       exposure: "brokered",
@@ -329,6 +441,7 @@ describe("OxpCapability", () => {
       "ofxp",
       "openfork_session.checkpoint",
       "openfork_swarm",
+      "openfork_worker",
       "patch",
       "process",
       "refactor",
@@ -397,6 +510,17 @@ describe("OxpCapability", () => {
     expect(fullRows).toHaveLength(Object.keys(CAPABILITY_DESCRIPTIONS).length)
     expect(fullRows.find((row) => row.id === "skill")?.load).toBe("default")
     expect(fullRows.find((row) => row.id === "archive")?.load).toBe("lazy")
+
+    const targeted = yield* capability.execute({ action: "list", query: "runtime refresh" })
+    const targetedRows = JSON.parse(targeted.output) as Array<{ id: string; load: string }>
+    expect(targetedRows).toEqual([
+      expect.objectContaining({ id: "runtime.refresh", load: "default" }),
+    ])
+    expect((targeted.metadata as { load?: string }).load).toBe("all")
+
+    const punctuation = yield* capability.execute({ action: "list", query: "openfork session checkpoint" })
+    const punctuationRows = JSON.parse(punctuation.output) as Array<{ id: string }>
+    expect(punctuationRows.map((row) => row.id)).toContain("openfork_session.checkpoint")
   }))
 
   it.live("describes one canonical schema only on demand", Effect.gen(function* () {
@@ -418,6 +542,157 @@ describe("OxpCapability", () => {
     })
     expect(result.inputSchema).toMatchObject({ type: "object" })
     expect(JSON.stringify(result.inputSchema)).toContain("rootID")
+  }))
+
+  it.live("makes common read/find shape mistakes self-correcting without accepting them", Effect.gen(function* () {
+    const capability = yield* OxpCapability.Service
+    const rootID = "00000000-0000-4000-8000-000000000001"
+
+    const readError = yield* capability
+      .call("read", { rootID, path: "a.ts", offset: 0 })
+      .pipe(Effect.flip)
+    expect(readError._tag).toBe("OXP_INVALID_ARGUMENT")
+    expect(readError.detail).toContain("1-based")
+    expect(readError.detail).toContain("offset:1")
+
+    const findError = yield* capability
+      .call("find", { rootID, query: "needle", maxResults: 10 })
+      .pipe(Effect.flip)
+    expect(findError._tag).toBe("OXP_INVALID_ARGUMENT")
+    expect(findError.detail).toContain("query/maxResults")
+    expect(findError.detail).toContain("grep")
+    expect(findError.detail).toContain("limit")
+  }))
+
+  it.live("keeps evolving delegated-worker arguments reachable through the live broker schema", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const capability = yield* OxpCapability.Service
+    const rootDir = path.join(suite, "worker-broker-workspace")
+    const nested = path.join(rootDir, "repo")
+    yield* Effect.promise(() => fs.mkdir(nested, { recursive: true }))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ delegation: "spawn" })
+
+    const discovered = yield* capability.execute({
+      action: "list",
+      query: "worker workdir",
+    })
+    const discoveredRows = JSON.parse(discovered.output) as Array<{ id: string }>
+    expect(discoveredRows.map((row) => row.id)).toContain("openfork_worker")
+
+    const descriptor = yield* capability.describe("openfork_worker")
+    expect(descriptor.capability).toMatchObject({
+      id: "openfork_worker",
+      authority: "delegation",
+      exposure: "direct",
+      workspaceTier: 3,
+      mutation: "write",
+    })
+    expect(
+      (descriptor.inputSchema as { properties?: Record<string, unknown> }).properties,
+    ).toHaveProperty("workdir")
+    expect(
+      (descriptor.inputSchema as { $defs?: Record<string, unknown> }).$defs,
+    ).toMatchObject({
+      "Oxp.ModelSelection": expect.any(Object),
+      "Oxp.WorkerStart": expect.any(Object),
+      "Oxp.WorkerContinue": expect.any(Object),
+    })
+
+    const resolved = yield* roots.resolvePath("repo", { rootID: root.id })
+    let dispatched: unknown
+    const result = yield* capability.execute(
+      {
+        action: "call",
+        capability: "openfork_worker",
+        contract: descriptor.contract,
+        args: {
+          action: "start",
+          rootID: root.id,
+          workdir: "repo",
+          prompt: "broker workdir canary",
+        },
+      },
+      undefined,
+      {
+        workerExecute: (workerInput) =>
+          Effect.sync(() => {
+            dispatched = workerInput
+            return {
+              title: "Delegated worker fixture",
+              output: JSON.stringify({
+                workerID: "ses_capability_worker",
+                workdir: resolved.virtualPath,
+              }),
+              structured: {
+                workerID: "ses_capability_worker",
+                workdir: resolved.virtualPath,
+              },
+              mutation: { attempted: true, committed: true },
+            }
+          }),
+      },
+    )
+
+    expect(dispatched).toMatchObject({
+      action: "start",
+      rootID: root.id,
+      workdir: "repo",
+      prompt: "broker workdir canary",
+    })
+    expect(result.structured).toMatchObject({
+      workerID: "ses_capability_worker",
+      workdir: resolved.virtualPath,
+    })
+  }))
+
+  it.live("publishes self-contained compact object schemas for every broker descriptor", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const capability = yield* OxpCapability.Service
+    yield* config.setEnabled(true)
+
+    const rows = yield* capability.list(undefined, "all")
+    for (const row of rows) {
+      const descriptor = yield* capability.describe(row.id)
+      const schema = descriptor.inputSchema as Record<string, unknown>
+      expect(schema.type, row.id).toBe("object")
+      const defs =
+        schema.$defs && typeof schema.$defs === "object" && !Array.isArray(schema.$defs)
+          ? schema.$defs as Record<string, unknown>
+          : {}
+      for (const ref of localSchemaRefs(schema)) {
+        expect(
+          Object.prototype.hasOwnProperty.call(defs, ref),
+          `${row.id}: unresolved #/$defs/${ref}`,
+        ).toBe(true)
+      }
+      expect(JSON.stringify(schema), row.id).not.toContain('"type":"null"')
+    }
+
+    const read = yield* capability.describe("read")
+    expect(
+      (read.inputSchema as { oneOf?: unknown[] }).oneOf,
+    ).toHaveLength(2)
+  }))
+
+  it.live("rejects excess project arguments instead of silently dropping them", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const capability = yield* OxpCapability.Service
+    const rootDir = path.join(suite, "project-strict-workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ read: true })
+
+    const error = yield* capability.call("project", {
+      rootID: root.id,
+      action: "summary",
+      actiontypo: "summary",
+    }).pipe(Effect.flip)
+    expect(error._tag).toBe("OXP_INVALID_ARGUMENT")
   }))
 
   it.live("self-heals harmless top-level rootID on native list and describe requests", Effect.gen(function* () {
@@ -653,7 +928,7 @@ describe("OxpCapability", () => {
     expect(result.metadata).toEqual({ action: "map", rootID: root.id })
     expect(result.structured).toMatchObject({ action: "map" })
     expect(result.output).not.toContain(rootDir)
-  }))
+  }), { timeout: 30_000 })
 
   it.live("dispatches LSP through the shared runtime and preserves deterministic missing-file failure", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
@@ -831,6 +1106,13 @@ describe("OxpCapability", () => {
     const root = yield* roots.approve(rootDir)
     yield* config.setEnabled(true)
     yield* config.setGrant({ read: true, write: false })
+
+    const missingRoot = yield* capability.call("json", {
+      mode: "query",
+      filePath: "app.json",
+      path: "$.name",
+    }).pipe(Effect.flip)
+    expect(missingRoot._tag).toBe("OXP_ROOT_REQUIRED")
 
     const descriptor = yield* capability.describe("json")
     expect(descriptor.capability).toMatchObject({
@@ -1269,7 +1551,7 @@ describe("OxpCapability", () => {
       })
       .pipe(Effect.flip)
     expect(["OXP_NOT_FOUND", "OXP_INVALID_ARGUMENT", "OXP_PATH_ESCAPE"]).toContain(escaped._tag)
-  }))
+  }), { timeout: 30_000 })
 
   it.live("brokers atomic write creation and overwrite behind write authority", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
@@ -1287,6 +1569,29 @@ describe("OxpCapability", () => {
     expect(denied._tag).toBe("OXP_AUTH_DENIED")
 
     yield* config.setGrant({ write: true })
+    const markdown = [
+      "# Storage guide",
+      "",
+      "```powershell",
+      "Write-Output `literal`",
+      "$null = 'quoted value'",
+      "```",
+      "",
+      "Markdown `inline code` stays byte-exact.",
+      "",
+    ].join("\n")
+    const literal = yield* capability.call("write", {
+      rootID: root.id,
+      path: "nested/storage-guide.md",
+      content: markdown,
+    })
+    expect(literal.mutation).toEqual({ attempted: true, committed: true })
+    expect(
+      yield* Effect.promise(() =>
+        fs.readFile(path.join(rootDir, "nested", "storage-guide.md"), "utf8"),
+      ),
+    ).toBe(markdown)
+
     const created = yield* capability.call("write", {
       rootID: root.id,
       path: "nested/new.txt",

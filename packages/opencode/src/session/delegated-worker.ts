@@ -1,17 +1,27 @@
-import { Clock, Effect } from "effect"
+import { Clock, Duration, Effect, Option, Queue } from "effect"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ProviderRouteIntentRuntime } from "@opencode-ai/core/provider-route-intent"
+import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { Database } from "@opencode-ai/core/database/database"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import { SessionError } from "@opencode-ai/schema/session-error"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Agent } from "@/agent/agent"
 import { BackgroundJob } from "@/background/job"
+import { Permission } from "@/permission"
 import { Provider } from "@/provider/provider"
+import { Question } from "@/question"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import { Session } from "./session"
 import { SessionPrompt } from "./prompt"
 import { SessionID } from "./schema"
 import { DelegatedWorkerPolicy } from "./delegated-worker-policy"
+import { SessionGroup } from "./group"
 
 export const JOB_TYPE = "delegated-worker"
 const MAX_RESULT_BYTES = 256 * 1024
@@ -22,6 +32,7 @@ export interface ModelSelection {
   readonly modelID: string
   readonly accountID?: string
   readonly variant?: string
+  readonly routeIntent?: ProviderRouteIntent.Info
 }
 
 export interface Identity {
@@ -35,6 +46,7 @@ export interface StartInput {
   readonly agent: string
   readonly model: ModelSelection
   readonly origin: SessionMetadataOwnership.WorkerDelegationOrigin
+  readonly groupID?: string
   /** Caller-owned authority/CAS barrier run after validation and immediately before Session creation. */
   readonly beforeCommit?: Effect.Effect<void, Error>
 }
@@ -65,21 +77,56 @@ export interface SetSelectionInput {
 
 export type State =
   | "running"
+  | "blocked"
   | "completed"
   | "error"
   | "cancelled"
   | "recoverable"
   | "idle"
 
+export type Blocker =
+  | {
+      readonly type: "permission"
+      readonly id: string
+      readonly sessionID: SessionID
+      readonly permission: string
+      readonly externalDirectory: boolean
+    }
+  | {
+      readonly type: "question"
+      readonly id: string
+      readonly sessionID: SessionID
+      readonly questionCount: number
+    }
+
+export type Activity = "queued" | "awaiting_provider" | "streaming" | "stepping"
+
 export interface Snapshot {
   readonly sessionID: SessionID
   readonly state: State
+  readonly blockedBy?: readonly Blocker[]
   readonly generation?: number
   readonly result?: string
   readonly error?: string
   readonly startedAt?: number
   readonly completedAt?: number
   readonly recovered: boolean
+  readonly activity?: Activity
+}
+
+const DEFERRED_ACTIVITY_OWNER = Symbol("delegated-worker-deferred-activity-owner")
+type DeferredActivitySnapshot = Snapshot & { readonly [DEFERRED_ACTIVITY_OWNER]?: boolean }
+
+export function projectActivity(input: {
+  readonly phase?: SessionTelemetry.Phase
+  readonly owner: boolean
+  readonly queued: boolean
+}): Activity | undefined {
+  if (input.phase === "tool") return "stepping"
+  if (input.phase === "reasoning" || input.phase === "generating") return "streaming"
+  if (input.phase === "requesting" || input.phase === "retrying") return "awaiting_provider"
+  if (input.queued && !input.owner) return "queued"
+  if (input.owner) return "awaiting_provider"
 }
 
 export interface SelectionChange {
@@ -134,16 +181,7 @@ function sameSelection(
   left: ModelSelection,
   right: ModelSelection,
 ) {
-  const leftVariant =
-    left.variant && left.variant !== "default" ? left.variant : undefined
-  const rightVariant =
-    right.variant && right.variant !== "default" ? right.variant : undefined
-  return (
-    left.providerID === right.providerID &&
-    left.modelID === right.modelID &&
-    left.accountID === right.accountID &&
-    leftVariant === rightVariant
-  )
+  return SessionMetadataOwnership.sameWorkerDelegationModel(left, right)
 }
 
 function bounded(text: string) {
@@ -171,6 +209,175 @@ export const make = Effect.gen(function* () {
   const prompt = yield* SessionPrompt.Service
   const background = yield* BackgroundJob.Service
   const execution = yield* SessionExecutionOwner.Service
+  const permission = yield* Permission.Service
+  const question = yield* Question.Service
+  const eventsOption = yield* Effect.serviceOption(EventV2Bridge.Service)
+  const telemetryOption = yield* Effect.serviceOption(SessionTelemetry.Service)
+  const databaseOption = yield* Effect.serviceOption(Database.Service)
+  const groupOption = yield* Effect.serviceOption(SessionGroup.Service)
+
+  const activity = Effect.fnUntraced(function* (sessionID: SessionID, owner: boolean) {
+    if (Option.isNone(telemetryOption) || Option.isNone(databaseOption)) return
+    const telemetryInfo = (yield* telemetryOption.value.snapshot([String(sessionID)]))[String(sessionID)]
+    const queued = yield* SessionInput.hasPendingLane(databaseOption.value.readDb, sessionID, {
+      admissionClass: "host",
+      delivery: "queue",
+    })
+    return projectActivity({ phase: telemetryInfo?.phase, owner, queued })
+  })
+
+  const activityBatch = Effect.fnUntraced(function* (items: readonly { sessionID: SessionID; owner: boolean }[]) {
+    if (items.length === 0 || Option.isNone(telemetryOption) || Option.isNone(databaseOption)) {
+      return new Map<SessionID, Activity | undefined>()
+    }
+    const ids = [...new Set(items.map((item) => item.sessionID))]
+    const telemetry = yield* telemetryOption.value.snapshot(ids.map(String))
+    const queued = yield* SessionInput.hasPendingLaneBatch(databaseOption.value.readDb, ids, {
+      admissionClass: "host",
+      delivery: "queue",
+    })
+    const owners = new Map(items.map((item) => [item.sessionID, item.owner]))
+    return new Map(
+      ids.map((id) => [
+        id,
+        projectActivity({ phase: telemetry[String(id)]?.phase, owner: owners.get(id) ?? false, queued: queued.has(id) }),
+      ]),
+    )
+  })
+
+  const isDescendantSession = Effect.fn(
+    "DelegatedWorker.isDescendantSession",
+  )(function* (candidateID: SessionID, ancestorID: SessionID) {
+    let current: SessionID | undefined = candidateID
+    const seen = new Set<string>()
+    for (let depth = 0; current && depth < 64; depth++) {
+      const key = String(current)
+      if (key === String(ancestorID)) return true
+      if (seen.has(key)) return false
+      seen.add(key)
+      const row: Session.Info | undefined = yield* sessions
+        .get(current)
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      current = row?.parentID
+    }
+    return false
+  })
+
+  const blockingRequests = Effect.fn("DelegatedWorker.blockingRequests")(
+    function* (
+      sessionID: SessionID,
+      includeDescendants: boolean,
+    ) {
+      const [permissions, questions] = yield* Effect.all(
+        [permission.list(), question.list()],
+        { concurrency: 2 },
+      )
+      const visible = new Set<string>([String(sessionID)])
+      if (includeDescendants) {
+        const candidates = new Map<string, SessionID>()
+        for (const request of permissions) {
+          if (request.sessionID !== sessionID) {
+            candidates.set(String(request.sessionID), request.sessionID)
+          }
+        }
+        for (const request of questions) {
+          if (request.sessionID !== sessionID) {
+            candidates.set(String(request.sessionID), request.sessionID)
+          }
+        }
+        for (const candidate of candidates.values()) {
+          if (yield* isDescendantSession(candidate, sessionID)) {
+            visible.add(String(candidate))
+          }
+        }
+      }
+      const belongsToWorkerTree = (requestSessionID: SessionID) =>
+        visible.has(String(requestSessionID))
+      return [
+        ...permissions
+          .filter((request) => belongsToWorkerTree(request.sessionID))
+          .map(
+            (request): Blocker => ({
+              type: "permission",
+              id: String(request.id),
+              sessionID: request.sessionID,
+              permission: request.permission,
+              externalDirectory:
+                request.permission === "external_directory",
+            }),
+          ),
+        ...questions
+          .filter((request) => belongsToWorkerTree(request.sessionID))
+          .map(
+            (request): Blocker => ({
+              type: "question",
+              id: String(request.id),
+              sessionID: request.sessionID,
+              questionCount: request.questions.length,
+            }),
+          ),
+      ]
+    },
+  )
+
+  const blockingRequestsBatch = Effect.fn("DelegatedWorker.blockingRequestsBatch")(function* (
+    workers: readonly { readonly sessionID: SessionID; readonly nestedDelegation: boolean }[],
+  ) {
+    const result = new Map<SessionID, Blocker[]>()
+    const unique = [...new Map(workers.map((worker) => [worker.sessionID, worker])).values()]
+    for (const worker of unique) result.set(worker.sessionID, [])
+    if (unique.length === 0) return result
+
+    const [permissions, questions] = yield* Effect.all([permission.list(), question.list()], { concurrency: 2 })
+    const nested = new Set(unique.filter((worker) => worker.nestedDelegation).map((worker) => worker.sessionID))
+    const candidates = new Map<string, { readonly sessionID: SessionID; readonly blockers: Blocker[] }>()
+
+    for (const request of permissions) {
+      const key = String(request.sessionID)
+      const item = candidates.get(key) ?? { sessionID: request.sessionID, blockers: [] }
+      item.blockers.push({
+        type: "permission",
+        id: String(request.id),
+        sessionID: request.sessionID,
+        permission: request.permission,
+        externalDirectory: request.permission === "external_directory",
+      })
+      candidates.set(key, item)
+    }
+    for (const request of questions) {
+      const key = String(request.sessionID)
+      const item = candidates.get(key) ?? { sessionID: request.sessionID, blockers: [] }
+      item.blockers.push({
+        type: "question",
+        id: String(request.id),
+        sessionID: request.sessionID,
+        questionCount: request.questions.length,
+      })
+      candidates.set(key, item)
+    }
+
+    for (const candidate of candidates.values()) {
+      const directWorker = unique.find((worker) => worker.sessionID === candidate.sessionID)
+      if (directWorker && !nested.has(directWorker.sessionID)) {
+        result.get(directWorker.sessionID)!.push(...candidate.blockers)
+      }
+      if (nested.size === 0) continue
+
+      // Walk each pending request's ancestry once, matching every nested worker
+      // on that path. This replaces one ancestry walk per worker per 100ms poll.
+      let current: SessionID | undefined = candidate.sessionID
+      const seen = new Set<string>()
+      for (let depth = 0; current && depth < 64; depth++) {
+        const key = String(current)
+        if (seen.has(key)) break
+        seen.add(key)
+        if (nested.has(current)) result.get(current)!.push(...candidate.blockers)
+        const row: Session.Info | undefined = yield* sessions.get(current).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        current = row?.parentID
+      }
+    }
+    return result
+  })
 
   const validateSelection = Effect.fn("DelegatedWorker.validateSelection")(
     function* (agentName: string, selection: ModelSelection) {
@@ -184,15 +391,37 @@ export const make = Effect.gen(function* () {
       }
       const providerID = ProviderV2.ID.make(selection.providerID)
       const modelID = ModelV2.ID.make(selection.modelID)
-      const accountID = selection.accountID
+      const routeIntent = yield* ProviderRouteIntentRuntime.normalize({
+        ...(selection.routeIntent ? { routeIntent: selection.routeIntent } : {}),
+        ...(selection.accountID ? { legacyAccountID: selection.accountID } : {}),
+      }).pipe(
+        Effect.mapError(
+          (error) =>
+            new SelectionMismatch(
+              error instanceof Error ? error.message : String(error),
+              selection.accountID !== undefined || selection.routeIntent?.kind === "account",
+            ),
+        ),
+      )
+      const requestedAccountID =
+        routeIntent.kind === "account" ? routeIntent.accountID : undefined
+      const accountID = requestedAccountID
         ? yield* provider
-            .resolveAccountID(providerID, selection.accountID)
+            .resolveAccountID(providerID, requestedAccountID)
             .pipe(
               Effect.mapError(
                 (error) => new SelectionMismatch(error.message, true),
               ),
             )
         : undefined
+      const canonicalRouteIntent: ProviderRouteIntent.Info =
+        routeIntent.kind === "account"
+          ? {
+              kind: "account",
+              accountID: accountID!,
+              pin: routeIntent.pin ?? "hard",
+            }
+          : routeIntent
       const resolved = yield* provider
         .getModel(providerID, modelID, accountID)
         .pipe(
@@ -230,6 +459,7 @@ export const make = Effect.gen(function* () {
           modelID,
           ...(accountID ? { accountID } : {}),
           ...(selection.variant ? { variant: selection.variant } : {}),
+          routeIntent: canonicalRouteIntent,
         },
       }
     },
@@ -289,6 +519,7 @@ export const make = Effect.gen(function* () {
           ...(selected.model.variant
             ? { variant: selected.model.variant }
             : {}),
+          routeIntent: selected.model.routeIntent,
         },
       } satisfies { agent: string; model: ModelSelection }
     },
@@ -400,6 +631,7 @@ export const make = Effect.gen(function* () {
         modelID: String(selected.model.modelID),
         ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
         ...(selected.model.variant ? { variant: selected.model.variant } : {}),
+        routeIntent: selected.model.routeIntent,
       },
     }
     yield* ensureExecutionRuntime()
@@ -435,6 +667,21 @@ export const make = Effect.gen(function* () {
           metadata: SessionMetadataOwnership.delegatedWorker(origin),
           permission,
         })
+
+        if (input.groupID) {
+          if (Option.isNone(groupOption)) {
+            return yield* Effect.fail(new StartCommitted(session.id, new Error("Delegation group service is unavailable")))
+          }
+          yield* groupOption.value
+            .addSession({
+              groupId: SessionGroup.ID.make(input.groupID),
+              sessionId: String(session.id),
+              locked: true,
+              origin: "delegation",
+              originRef: origin.invocationRef,
+            })
+            .pipe(Effect.mapError((cause) => new StartCommitted(session.id, cause)))
+        }
 
         yield* admitPrompt({
           sessionID: session.id,
@@ -575,17 +822,18 @@ export const make = Effect.gen(function* () {
     },
   )
 
-  const durableSnapshot = Effect.fn("DelegatedWorker.durableSnapshot")(
-    function* (sessionID: SessionID, identity: Identity) {
-      yield* requireWorker(sessionID, identity)
+    const durableSnapshot = Effect.fn("DelegatedWorker.durableSnapshot")(
+    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[]) {
+      const { origin } = yield* requireWorker(sessionID, identity)
       const ownership = yield* execution.snapshot(sessionID)
+      const blockedBy = sharedBlockers ?? (yield* blockingRequests(sessionID, origin.nestedDelegation))
       const messages = yield* sessions
         .messages({ sessionID, limit: 32 })
         .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
       const ordered = messages.toSorted((a, b) => messageTime(a) - messageTime(b))
       const latest = ordered.at(-1)
       const assistant = ordered.findLast((message) => message.info.role === "assistant")
-      const result = assistant ? lastText(assistant.parts) : undefined
+      const resultText = assistant ? lastText(assistant.parts) : undefined
       const assistantError =
         assistant?.info.role === "assistant" && assistant.info.error
           ? ("message" in assistant.info.error.data &&
@@ -593,56 +841,216 @@ export const make = Effect.gen(function* () {
               ? assistant.info.error.data.message
               : assistant.info.error.name)
           : undefined
-      const state: State = ownership.ownerID
-        ? "running"
-        : latest?.info.role === "user"
-          ? "recoverable"
-          : assistantError
-            ? "error"
-            : assistant
-              ? "completed"
-              : "idle"
-      return {
+      if (assistantError) {
+        yield* Effect.logError("session.error", {
+          sessionID,
+          error: SessionError.summary(
+            assistant?.info.role === "assistant" ? assistant.info.error : undefined,
+          ),
+        })
+      }
+      const state: State =
+        blockedBy.length > 0
+          ? "blocked"
+          : latest?.info.role === "user"
+            ? "recoverable"
+            : assistantError
+              ? "error"
+              : assistant
+                ? "completed"
+                : "idle"
+      const projectedActivity = deferActivity ? undefined : yield* activity(sessionID, Boolean(ownership.ownerID))
+      const snapshotResult = {
         sessionID,
         state,
+        ...(blockedBy.length > 0 ? { blockedBy } : {}),
         ...(ownership.generation > 0
           ? { generation: ownership.generation }
           : {}),
         ...(ownership.acquiredAt !== undefined
           ? { startedAt: ownership.acquiredAt }
           : {}),
-        ...(result ? { result } : {}),
+        ...(resultText ? { result: resultText } : {}),
         ...(assistantError ? { error: assistantError } : {}),
         recovered: true,
+        ...(projectedActivity ? { activity: projectedActivity } : {}),
       } satisfies Snapshot
+      return deferActivity
+        ? Object.assign(snapshotResult, { [DEFERRED_ACTIVITY_OWNER]: Boolean(ownership.ownerID) })
+        : snapshotResult
     },
   )
 
   const snapshot = Effect.fn("DelegatedWorker.snapshot")(
-    function* (sessionID: SessionID, identity: Identity) {
-      yield* requireWorker(sessionID, identity)
+    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[]) {
+      const { origin } = yield* requireWorker(sessionID, identity)
       const live = yield* background.get(sessionID)
-      if (!live) return yield* durableSnapshot(sessionID, identity)
+      if (!live) return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers)
+      let current = live
+      let blockedBy: readonly Blocker[] = []
+      if (live.status === "running") {
+        const pending = sharedBlockers ?? (yield* blockingRequests(sessionID, origin.nestedDelegation))
+        if (pending.length > 0) {
+          // A request can be observed immediately before cancellation or
+          // completion tears it down. Re-check the job only on this uncommon
+          // path so terminal state always wins without adding a second read to
+          // ordinary running snapshots.
+          const refreshed = yield* background.get(sessionID)
+          if (!refreshed) {
+            return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers)
+          }
+          current = refreshed
+          if (refreshed.status === "running") {
+            // Confirm the request set as well as the job state. This avoids a
+            // stale blocked projection when a supervisor resolves the request
+            // during the job-state recheck.
+            blockedBy = sharedBlockers ?? (yield* blockingRequests(sessionID, origin.nestedDelegation))
+          }
+        }
+      }
+      const ownership = yield* execution.snapshot(sessionID)
       const state: State =
-        live.status === "running"
-          ? "running"
-          : live.status === "completed"
+        current.status === "running"
+          ? blockedBy.length > 0
+            ? "blocked"
+            : "running"
+          : current.status === "completed"
             ? "completed"
-            : live.status === "error"
+            : current.status === "error"
               ? "error"
               : "cancelled"
-      return {
+      const projectedActivity = live.status === "running" && !deferActivity
+        ? yield* activity(sessionID, Boolean(ownership.ownerID))
+        : undefined
+      const result = {
         sessionID,
         state,
-        ...(live.generation !== undefined ? { generation: live.generation } : {}),
-        ...(live.output ? { result: bounded(live.output) } : {}),
-        ...(live.error ? { error: live.error } : {}),
-        startedAt: live.started_at,
-        ...(live.completed_at ? { completedAt: live.completed_at } : {}),
+        ...(blockedBy.length > 0 ? { blockedBy } : {}),
+        ...(current.generation !== undefined ? { generation: current.generation } : {}),
+        ...(current.output ? { result: bounded(current.output) } : {}),
+        ...(current.error ? { error: current.error } : {}),
+        startedAt: current.started_at,
+        ...(current.completed_at ? { completedAt: current.completed_at } : {}),
         recovered: false,
+        ...(projectedActivity ? { activity: projectedActivity } : {}),
       } satisfies Snapshot
+      return deferActivity && live.status === "running"
+        ? Object.assign(result, { [DEFERRED_ACTIVITY_OWNER]: Boolean(ownership.ownerID) })
+        : result
     },
   )
+
+  const snapshotMany = Effect.fn("DelegatedWorker.snapshotMany")(function* (
+    sessionIDs: readonly SessionID[],
+    identity: Identity,
+  ) {
+    const workers = yield* Effect.forEach(
+      [...new Set(sessionIDs)],
+      (sessionID) => requireWorker(sessionID, identity).pipe(
+        Effect.map(({ origin }) => ({ sessionID, nestedDelegation: origin.nestedDelegation })),
+      ),
+      { concurrency: 4 },
+    )
+    const blockers = yield* blockingRequestsBatch(workers)
+    const rows = (yield* Effect.forEach(
+      workers,
+      (worker) => snapshot(worker.sessionID, identity, true, blockers.get(worker.sessionID) ?? []),
+      { concurrency: 4 },
+    )) as DeferredActivitySnapshot[]
+    const activityInputs = rows.flatMap((row) =>
+      row[DEFERRED_ACTIVITY_OWNER] === undefined
+        ? []
+        : [{ sessionID: row.sessionID, owner: row[DEFERRED_ACTIVITY_OWNER] }],
+    )
+    const activities = yield* activityBatch(activityInputs)
+    const project = (current: readonly DeferredActivitySnapshot[]) => current.map((row) => {
+      const owner = row[DEFERRED_ACTIVITY_OWNER]
+      const { [DEFERRED_ACTIVITY_OWNER]: _deferredOwner, ...snapshot } = row
+      const projectedActivity = owner === undefined ? undefined : activities.get(row.sessionID)
+      return { ...snapshot, ...(projectedActivity ? { activity: projectedActivity } : {}) } satisfies Snapshot
+    })
+    let projected = project(rows)
+    if (projected.some((item) => item.state === "blocked")) {
+      // Re-read the shared pending sets once if a request resolved while the
+      // worker states were being assembled. This preserves terminal/current
+      // blocker precedence without restoring per-worker blocker scans.
+      const latestBlockers = yield* blockingRequestsBatch(workers)
+      const latestRows = (yield* Effect.forEach(
+        workers,
+        (worker) => snapshot(worker.sessionID, identity, true, latestBlockers.get(worker.sessionID) ?? []),
+        { concurrency: 4 },
+      )) as DeferredActivitySnapshot[]
+      projected = project(latestRows)
+    }
+    return projected
+  })
+
+  const waitMany = Effect.fn("DelegatedWorker.waitMany")(function* (input: {
+    readonly sessionIDs: readonly SessionID[]
+    readonly identity: Identity
+    readonly timeout?: number
+  }) {
+    const sessionIDs = [...new Set(input.sessionIDs)]
+    if (sessionIDs.length === 0) return []
+
+    const startedAt = yield* Clock.currentTimeMillis
+    const deadline = input.timeout === undefined ? undefined : startedAt + Math.max(0, input.timeout)
+    const workers = yield* Effect.forEach(
+      sessionIDs,
+      (sessionID) => requireWorker(sessionID, input.identity).pipe(
+        Effect.map(({ origin }) => ({ sessionID, nestedDelegation: origin.nestedDelegation })),
+      ),
+      { concurrency: 4 },
+    )
+    if (Option.isNone(eventsOption)) return yield* snapshotMany(sessionIDs, input.identity)
+    const events = eventsOption.value
+    const workerIDs = new Set(sessionIDs)
+    const includesDescendants = workers.some((worker) => worker.nestedDelegation)
+    const wake = yield* Queue.dropping<void>(1)
+    const notify = () => Queue.offer(wake, undefined).pipe(Effect.asVoid)
+    const isRelevant = (sessionID: SessionID) => includesDescendants || workerIDs.has(sessionID)
+    const unsubscribers = yield* Effect.all([
+      events.listenType(Permission.Event.Asked, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
+      events.listenType(Permission.Event.Replied, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
+      events.listenType(Question.Event.Asked, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
+      events.listenType(Question.Event.Replied, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
+      events.listenType(Question.Event.Rejected, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
+    ])
+
+    return yield* Effect.ensuring(
+      Effect.gen(function* () {
+        let current = yield* snapshotMany(sessionIDs, input.identity)
+        while (true) {
+          // Preserve the current batchWait contract: return on the first
+          // blocker, terminal worker, or when the shared deadline expires.
+          if (current.some((item) => item.state === "blocked") || current.every((item) => item.state !== "running")) {
+            return current
+          }
+
+          const now = yield* Clock.currentTimeMillis
+          if (deadline !== undefined && now >= deadline) return yield* snapshotMany(sessionIDs, input.identity)
+          const running = current.filter((item) => item.state === "running").map((item) => item.sessionID)
+          let completion: Effect.Effect<unknown> = Effect.never
+          for (const sessionID of running) {
+            completion = Effect.raceFirst(
+              completion,
+              background.wait({ id: sessionID }).pipe(Effect.as(undefined)),
+            )
+          }
+          const change = Effect.raceFirst(completion, Queue.take(wake))
+          const wakeResult = deadline === undefined
+            ? yield* change
+            : yield* Effect.raceFirst(
+                change,
+                Effect.sleep(Duration.millis(Math.max(1, deadline - now))).pipe(Effect.as("timeout")),
+              )
+          if (wakeResult === "timeout") return yield* snapshotMany(sessionIDs, input.identity)
+          current = yield* snapshotMany(sessionIDs, input.identity)
+        }
+      }),
+      Effect.forEach(unsubscribers, (unsubscribe) => unsubscribe, { discard: true }),
+    )
+  })
 
   const setSelection = Effect.fn("DelegatedWorker.setSelection")(
     function* (input: SetSelectionInput) {
@@ -673,6 +1081,7 @@ export const make = Effect.gen(function* () {
         selected.model.variant !== "default"
           ? { variant: selected.model.variant }
           : {}),
+        routeIntent: selected.model.routeIntent,
       }
       if (sameSelection(nextModel, origin.model)) {
         return {
@@ -705,6 +1114,7 @@ export const make = Effect.gen(function* () {
               sessionID: session.id,
               principalRef: origin.principalRef,
               expectedModel: origin.model,
+              delegationModel: nextModel,
               model: {
                 providerID: selected.model.providerID,
                 id: selected.model.modelID,
@@ -740,38 +1150,67 @@ export const make = Effect.gen(function* () {
     sessionID: SessionID
     identity: Identity
     timeout?: number
+    deferActivity?: boolean
   }) {
-    yield* requireWorker(input.sessionID, input.identity)
+    const { origin } = yield* requireWorker(
+      input.sessionID,
+      input.identity,
+    )
     const live = yield* background.get(input.sessionID)
-    if (live) {
-      if (live.status === "running") {
-        yield* background.wait({
-          id: input.sessionID,
-          ...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
-        })
-      }
-      return yield* snapshot(input.sessionID, input.identity)
-    }
-
-    let current = yield* durableSnapshot(input.sessionID, input.identity)
-    if (current.state !== "running") return current
-
     const startedAt = yield* Clock.currentTimeMillis
     const deadline =
       input.timeout === undefined
         ? undefined
         : startedAt + Math.max(0, input.timeout)
-    while (current.state === "running") {
-      if (deadline !== undefined) {
-        const now = yield* Clock.currentTimeMillis
-        if (now >= deadline) return current
-        yield* Effect.sleep(Math.min(100, deadline - now))
-      } else {
-        yield* Effect.sleep(100)
+    const deferActivity = input.deferActivity === true
+
+    // Live delegated work has an efficient completion Deferred in BackgroundJob.
+    // Keep using that primitive rather than polling the Session row. Permission
+    // and Question pending sets are instance-local/in-memory, so a short bounded
+    // probe between Deferred waits makes external decision points observable
+    // without turning worker waits into a 10 Hz database workload.
+    if (live) {
+      if (live.status !== "running") {
+        return yield* snapshot(input.sessionID, input.identity, deferActivity)
       }
-      current = yield* durableSnapshot(input.sessionID, input.identity)
+      while (true) {
+        const blockedBy = yield* blockingRequests(
+          input.sessionID,
+          origin.nestedDelegation,
+        )
+        if (blockedBy.length > 0) {
+          // Re-read the authoritative snapshot so a completion racing the
+          // blocker probe cannot be misreported as blocked. If the request
+          // disappeared during that re-check, keep waiting instead of leaking
+          // a transient `running` result to callers that asked us to wait.
+          const current = yield* snapshot(input.sessionID, input.identity, deferActivity)
+          if (current.state !== "running") return current
+          continue
+        }
+
+        const now = yield* Clock.currentTimeMillis
+        if (deadline !== undefined && now >= deadline) {
+          return yield* snapshot(input.sessionID, input.identity, deferActivity)
+        }
+        const timeout =
+          deadline === undefined
+            ? 100
+            : Math.min(100, Math.max(1, deadline - now))
+        const waited = yield* background.wait({
+          id: input.sessionID,
+          timeout,
+        })
+        if (!waited.info || waited.info.status !== "running") {
+          return yield* snapshot(input.sessionID, input.identity, deferActivity)
+        }
+      }
     }
-    return current
+
+    // Without a process-local delegated BackgroundJob there is nothing useful
+    // to wait on. Durable state is therefore terminal/recoverable/blocked at
+    // this observation point; returning it immediately prevents a stale
+    // persisted execution-owner row from masquerading as live progress.
+    return yield* durableSnapshot(input.sessionID, input.identity, deferActivity)
   })
 
   const cancel = Effect.fn("DelegatedWorker.cancel")(function* (input: {
@@ -812,6 +1251,8 @@ export const make = Effect.gen(function* () {
     continue: continueWorker,
     setSelection,
     snapshot,
+    snapshotMany,
+    waitMany,
     wait,
     cancel,
     result,

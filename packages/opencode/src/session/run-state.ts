@@ -3,7 +3,7 @@ import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
-import { BackgroundJob } from "@/background/job"
+import * as BackgroundJobOwner from "@opencode-ai/core/background-job"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
@@ -26,9 +26,41 @@ type Entry = {
   stopping: boolean
 }
 
+type ActiveHandle = {
+  readonly generation: number
+  readonly cancel: (afterJobs: Effect.Effect<void>) => Effect.Effect<boolean>
+}
+
+// Session IDs and execution generations are process-global identities. The
+// runner itself remains owned by its InstanceState, while this tiny index lets
+// a Tier-0/1 control route signal that exact existing runner without waiting for
+// InstanceStore/bootstrap. It never admits work or owns a second Runner.
+const activeHandles = new Map<SessionID, ActiveHandle>()
+
+function forgetActiveHandle(sessionID: SessionID, generation: number) {
+  if (activeHandles.get(sessionID)?.generation === generation) activeHandles.delete(sessionID)
+}
+
+export const cancelActiveHandle = Effect.fn("SessionRunState.cancelActiveHandle")(function* (
+  sessionID: SessionID,
+  generation: number,
+  afterJobs: Effect.Effect<void> = Effect.void,
+) {
+  const handle = activeHandles.get(sessionID)
+  if (!handle) return "not-running" as const
+  if (handle.generation !== generation) return "stale" as const
+  return (yield* handle.cancel(afterJobs)) ? ("cancelled" as const) : ("not-running" as const)
+})
+
+
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Abort only the current turn execution and exact-release its owner. Unlike
+   * cancel(), this preserves Session-owned background jobs.
+   */
+  readonly preempt: (sessionID: SessionID) => Effect.Effect<void>
   /**
    * Keep durable inbox work pending while allowing the current local activation
    * to quiesce and exact-release its owner generation (for example while the
@@ -60,7 +92,6 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
     const ownership = yield* SessionExecutionOwner.Service
     const { db } = yield* Database.Service
@@ -99,6 +130,7 @@ const layer = Layer.effect(
                 // closes that race (and the pre-start Idle window) during
                 // shutdown as well.
                 yield* ownership.release(entry.token)
+                forgetActiveHandle(sessionID, entry.token.generation)
               }), {
               concurrency: 8,
               discard: true,
@@ -125,16 +157,36 @@ const layer = Layer.effect(
           const existing = data.runners.get(sessionID)
           if (existing) return existing
 
-          let acquired = yield* ownership.tryAcquire(sessionID)
+          let acquired = yield* ownership.tryAcquireLocal(sessionID)
+          if (acquired.state === "maintenance-blocked") {
+            yield* Effect.logInfo("Session runner admission blocked by directory maintenance", {
+              sessionID,
+              reason: acquired.reason,
+              directory: acquired.directory,
+              directoryKey: acquired.directoryKey,
+              guards: acquired.guards,
+            })
+            return yield* busyError(sessionID)
+          }
           if (acquired.state === "busy") {
             const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, ownership, sessionID)
-            if (recovery.state === "recovered") acquired = yield* ownership.tryAcquire(sessionID)
+            if (recovery.state === "recovered") acquired = yield* ownership.tryAcquireLocal(sessionID)
             else if (recovery.state === "effect-unknown")
               yield* Effect.logWarning("Session recovery remains fenced by unresolved execution effects", {
                 sessionID,
                 generation: recovery.token.generation,
                 hazards: recovery.hazards,
               })
+          }
+          if (acquired.state === "maintenance-blocked") {
+            yield* Effect.logInfo("Session runner admission became maintenance-blocked after recovery", {
+              sessionID,
+              reason: acquired.reason,
+              directory: acquired.directory,
+              directoryKey: acquired.directoryKey,
+              guards: acquired.guards,
+            })
+            return yield* busyError(sessionID)
           }
           if (acquired.state === "busy") return yield* busyError(sessionID)
           const token = acquired.token
@@ -150,6 +202,7 @@ const layer = Layer.effect(
               const released = forced ? yield* ownership.release(token) : yield* ownership.releaseIfDrained(token)
               if (released !== "continue") {
                 if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
+                forgetActiveHandle(sessionID, token.generation)
                 data.forceRelease.delete(sessionID)
                 // A stale local token means a newer owner is authoritative. Do
                 // not publish a false idle transition over that newer runtime.
@@ -166,6 +219,7 @@ const layer = Layer.effect(
                 })
                 const exact = yield* ownership.release(token)
                 if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
+                forgetActiveHandle(sessionID, token.generation)
                 if (exact === "released") yield* status.set(sessionID, { type: "idle" })
                 return
               }
@@ -178,6 +232,7 @@ const layer = Layer.effect(
               if (entry.stopping || data.forceRelease.has(sessionID)) {
                 const exact = yield* ownership.release(token)
                 if (data.runners.get(sessionID) === entry) data.runners.delete(sessionID)
+                forgetActiveHandle(sessionID, token.generation)
                 data.forceRelease.delete(sessionID)
                 if (exact === "released")
                   yield* status.set(sessionID, { type: "idle" }, data.cancelled.has(sessionID) ? "aborted" : undefined)
@@ -209,6 +264,20 @@ const layer = Layer.effect(
           })
           entry = { runner: next, token, stopping: false }
           data.runners.set(sessionID, entry)
+          let handle!: ActiveHandle
+          handle = {
+            generation: token.generation,
+            cancel: (afterJobs) => Effect.suspend(() => {
+              if (activeHandles.get(sessionID) !== handle || data.runners.get(sessionID) !== entry) {
+                return Effect.succeed(false)
+              }
+              return BackgroundJobOwner.cancelOwnedBySession(
+                sessionID,
+                afterJobs.pipe(Effect.andThen(cancelEntry(data, entry)), Effect.asVoid),
+              ).pipe(Effect.as(true))
+            }),
+          }
+          activeHandles.set(sessionID, handle)
           return entry
         }),
       )
@@ -222,35 +291,63 @@ const layer = Layer.effect(
       if (snapshot.ownerID) yield* busyError(sessionID)
     })
 
-    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      yield* cancelBackgroundJobs(background, sessionID)
+    const cancelEntry = Effect.fn("SessionRunState.cancelEntry")(function* (
+      data: { runners: Map<SessionID, Entry>; cancelled: Set<SessionID>; forceRelease: Set<SessionID> },
+      existing: Entry,
+    ) {
+      const sessionID = existing.token.sessionID
+      if (data.runners.get(sessionID) !== existing) return false
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          // cancel() is an execution barrier, not merely a best-effort interrupt
+          // request. Once this local generation is marked stopping, caller
+          // interruption (for example an HTTP disconnect) must not strand the
+          // registry entry or durable owner halfway through quiescence.
+          existing.stopping = true
+          data.forceRelease.add(sessionID)
+          data.cancelled.add(sessionID)
+          try {
+            yield* existing.runner.cancel
+            // Runner transitions its local state to Idle before its onIdle callback
+            // finishes. Exact release is safe to race with onIdle: one side releases
+            // this generation and the other observes "stale".
+            const released = yield* ownership.release(existing.token)
+            if (data.runners.get(sessionID) === existing) data.runners.delete(sessionID)
+            data.forceRelease.delete(sessionID)
+            forgetActiveHandle(sessionID, existing.token.generation)
+            if (released === "released") yield* status.set(sessionID, { type: "idle" }, "aborted")
+          } finally {
+            data.cancelled.delete(sessionID)
+          }
+          return true
+        }),
+      )
+    })
+
+    const stopCurrent = Effect.fn("SessionRunState.stopCurrent")(function* (
+      sessionID: SessionID,
+      reason: "operator" | "handoff",
+    ) {
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
-      const interrupt = yield* ownership.requestInterrupt(sessionID, "operator")
+      const interrupt = yield* ownership.requestInterrupt(sessionID, reason, existing?.token.generation)
       if (!existing) {
         // If another process owns the Session, the durable interrupt request is
         // authoritative. Publishing idle here would race/falsify its live state.
         if (interrupt.state === "idle") yield* status.set(sessionID, { type: "idle" }, "aborted")
         return
       }
-      existing.stopping = true
-      data.forceRelease.add(sessionID)
-      data.cancelled.add(sessionID)
-      try {
-        yield* existing.runner.cancel
-        // Runner transitions its local state to Idle before its onIdle effect
-        // finishes. A verification/cancel caller must not return in that window
-        // while the durable SessionExecutionOwner row still says busy. Exact
-        // release is safe to race with onIdle: one side releases this generation
-        // and the other observes "stale".
-        const released = yield* ownership.release(existing.token)
-        if (data.runners.get(sessionID) === existing) data.runners.delete(sessionID)
-        data.forceRelease.delete(sessionID)
-        if (released === "released") yield* status.set(sessionID, { type: "idle" }, "aborted")
-      } finally {
-        data.cancelled.delete(sessionID)
-      }
+      return yield* cancelEntry(data, existing)
     })
+
+    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+      yield* BackgroundJobOwner.cancelOwnedBySession(sessionID)
+      yield* stopCurrent(sessionID, "operator")
+    })
+
+    const preempt = Effect.fn("SessionRunState.preempt")((sessionID: SessionID) =>
+      stopCurrent(sessionID, "handoff"),
+    )
 
     const deferPending = Effect.fn("SessionRunState.deferPending")(function* (sessionID: SessionID) {
       const data = yield* InstanceState.get(state)
@@ -302,49 +399,11 @@ const layer = Layer.effect(
       }),
     )
 
-    return Service.of({ assertNotBusy, cancel, deferPending, registerDrain, ensureRunning, startShell })
+    return Service.of({ assertNotBusy, cancel, preempt, deferPending, registerDrain, ensureRunning, startShell })
   }),
 )
 
-const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
-  background: BackgroundJob.Interface,
-  sessionID: SessionID,
-) {
-  const jobs = yield* background.list()
-  const pending = new Set<string>([sessionID])
-  const cancelled = new Set<string>()
-  const matches = (job: BackgroundJob.Info) => {
-    if (job.status !== "running") return false
-    if (cancelled.has(job.id)) return false
-    // Detached task work is session-owned, not parent-turn-owned. Stopping a
-    // parent generation must not kill background children that are expected to
-    // finish independently and report back later. Cancelling the child session
-    // itself still owns and cancels its job.
-    if (job.id === sessionID || job.metadata?.sessionId === sessionID) return true
-    if (job.metadata?.background === true) return false
-    if (pending.has(job.id)) return true
-    if (typeof job.metadata?.sessionId === "string" && pending.has(job.metadata.sessionId)) return true
-    return typeof job.metadata?.parentSessionId === "string" && pending.has(job.metadata.parentSessionId)
-  }
-  let batch = jobs.filter(matches)
-  while (batch.length > 0) {
-    yield* Effect.forEach(
-      batch,
-      (job) =>
-        background.cancel(job.id).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              cancelled.add(job.id)
-              pending.add(job.id)
-              if (typeof job.metadata?.sessionId === "string") pending.add(job.metadata.sessionId)
-            }),
-          ),
-        ),
-      { concurrency: 8, discard: true },
-    )
-    batch = jobs.filter(matches)
-  }
-})
+export const cancelSessionBackgroundJobs = BackgroundJobOwner.cancelOwnedBySession
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
@@ -353,7 +412,7 @@ function busyError(sessionID: SessionID) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, SessionStatus.node, SessionExecutionOwner.node, Database.node],
+  deps: [SessionStatus.node, SessionExecutionOwner.node, Database.node]
 })
 
 export * as SessionRunState from "./run-state"

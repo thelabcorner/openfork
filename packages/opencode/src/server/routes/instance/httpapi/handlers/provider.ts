@@ -1,18 +1,10 @@
 import { ProviderAuth } from "@/provider/auth"
-import { Config } from "@/config/config"
-import { ModelsDev } from "@opencode-ai/core/models-dev"
-import { Provider } from "@/provider/provider"
-import { Auth } from "@/auth"
-
-import { mapValues } from "remeda"
 import { Effect, Schema } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { ProviderAuthApiError } from "../groups/provider"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { isT3CodeCompatibilityProfile } from "@/compat/t3code"
-import { filterT3CodeAccountModels, projectT3CodeAccountModels } from "@/compat/t3code-provider"
 
 function mapProviderAuthError<A, R>(self: Effect.Effect<A, ProviderAuth.Error, R>) {
   return self.pipe(
@@ -36,49 +28,7 @@ function mapProviderAuthError<A, R>(self: Effect.Effect<A, ProviderAuth.Error, R
 
 export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider", (handlers) =>
   Effect.gen(function* () {
-    const cfg = yield* Config.Service
-    const provider = yield* Provider.Service
     const svc = yield* ProviderAuth.Service
-    const authStore = yield* Auth.Service
-
-    const list = Effect.fn("ProviderHttpApi.list")(function* () {
-      const config = yield* cfg.get()
-      const all = yield* ModelsDev.Service.use((s) => s.get())
-      const disabled = new Set(config.disabled_providers ?? [])
-      const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
-      const filtered: Record<string, (typeof all)[string]> = {}
-      for (const [key, value] of Object.entries(all)) {
-        if ((enabled ? enabled.has(key) : true) && !disabled.has(key)) filtered[key] = value
-      }
-      const connected = yield* provider.list()
-      const credentials = yield* authStore.all().pipe(Effect.orDie)
-      const providers = Object.assign(
-        mapValues(filtered, (item) => Provider.fromModelsDevProvider(item)),
-        connected,
-      )
-      // Preserve the canonical account-neutral defaults before adding T3's
-      // compatibility-only one-row-per-account aliases.
-      const defaults = Provider.defaultModelIDs(providers)
-      const accountModels = isT3CodeCompatibilityProfile()
-        ? filterT3CodeAccountModels(
-            yield* provider.listAccountModelProjections(),
-            {
-              enabledProviders: config.enabled_providers,
-              disabledProviders: config.disabled_providers,
-            },
-          )
-        : []
-      const t3Projection = accountModels.length > 0
-        ? projectT3CodeAccountModels(providers, accountModels)
-        : { providers, connected: new Set<string>() }
-      return {
-        all: Object.values(t3Projection.providers).map(Provider.toPublicInfo),
-        default: defaults,
-        connected: Object.keys(t3Projection.providers).filter(
-          (id) => id in connected || credentials[id] || t3Projection.connected.has(id),
-        ),
-      }
-    })
 
     const auth = Effect.fn("ProviderHttpApi.auth")(function* () {
       return yield* svc.methods()
@@ -127,7 +77,6 @@ export const providerHandlers = HttpApiBuilder.group(InstanceHttpApi, "provider"
     })
 
     return handlers
-      .handle("list", list)
       .handle("auth", auth)
       .handleRaw("authorize", authorizeRaw)
       .handle("callback", callback)

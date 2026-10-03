@@ -128,6 +128,29 @@ describe("plugin.install.task", () => {
     expect(tui.plugin).toEqual(["acme@1.2.3"])
   })
 
+  test("targets the canonical openfork and tui config basenames", async () => {
+    await using tmp = await tmpdir()
+    const target = await plugin(tmp.path, ["server", "tui"])
+    const names: string[] = []
+    const base = deps(path.join(tmp.path, "global"), target)
+    const run = createPlugTask(
+      {
+        mod: "acme@1.2.3",
+      },
+      {
+        ...base,
+        files: (dir, name) => {
+          names.push(name)
+          return base.files(dir, name)
+        },
+      },
+    )
+
+    const ok = await run(ctx(tmp.path))
+    expect(ok).toBe(true)
+    expect(names.sort()).toEqual(["openfork", "tui"])
+  })
+
   test("writes default options from exports config metadata", async () => {
     await using tmp = await tmpdir()
     const target = await plugin(tmp.path, ["server", "tui"], {

@@ -3,6 +3,7 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { Database } from "@opencode-ai/core/database/database"
+import { ProviderAccountRouteHealthTable } from "@opencode-ai/core/provider-route-health.sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { APICallError } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
@@ -32,6 +33,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
@@ -289,6 +291,7 @@ type CompactionProcessOptions = {
   llm?: Layer.Layer<LLM.Service>
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
+  processor?: Layer.Layer<SessionProcessorModule.SessionProcessor.Service>
   config?: Layer.Layer<Config.Service>
 }
 
@@ -305,7 +308,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
   if (!options?.llm) {
     return AppNodeBuilder.build(compactionTestNode, [
       ...replacements,
-      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
+      [SessionProcessorModule.SessionProcessor.node, options?.processor ?? processorLayer(options?.result ?? "continue")],
       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
     ])
@@ -400,6 +403,7 @@ function plugin(ready: Deferred.Deferred<void>) {
       )
     },
     list: () => Effect.succeed([]),
+    transformChatMessages: <M>(messages: M[]) => Effect.succeed(messages),
     init: () => Effect.void,
   })
 }
@@ -414,6 +418,7 @@ function autocontinue(enabled: boolean) {
       })
     },
     list: () => Effect.succeed([]),
+    transformChatMessages: <M>(messages: M[]) => Effect.succeed(messages),
     init: () => Effect.void,
   })
 }
@@ -428,6 +433,7 @@ function compactionContext(context: string) {
       })
     },
     list: () => Effect.succeed([]),
+    transformChatMessages: <M>(messages: M[]) => Effect.succeed(messages),
     init: () => Effect.void,
   })
 }
@@ -959,6 +965,403 @@ describe("session.compaction.process", () => {
       expect(seen).toContain(SessionCompaction.Event.Compacted.type)
       expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
     }),
+  )
+
+  itCompaction.instance(
+    "inherits the committed route for same-provider compaction models without direct lookup",
+    () => {
+      const model = createModel({ context: 100_000, output: 32_000 })
+      const inherited: Array<{ providerID: string; modelID: string }> = []
+      const direct: Array<{ providerID: string; modelID: string }> = []
+      let processorRoute: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeAttribution"]
+      let processorLease: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeLease"]
+      const routedProvider = ProviderTest.fake({
+        model,
+        getModel: Effect.fn("TestProvider.unexpectedDirectGetModel")((providerID, modelID) => {
+          direct.push({ providerID, modelID })
+          return Effect.die(new Error(`unexpected direct maintenance lookup: ${providerID}/${modelID}`))
+        }),
+        resolveInheritedRoutedModel: Effect.fn("TestProvider.resolveInheritedRoutedModel")((input) => {
+          inherited.push({ providerID: input.providerID, modelID: input.modelID })
+          const attribution = {
+            sessionID: input.sessionID,
+            affinityDomain: "opencode-provider/test",
+            providerID: input.providerID,
+            routeRevision: 7,
+            routeKind: "account" as const,
+            accountID: "account-test",
+          } satisfies ProviderRouteResolution.RouteAttribution
+          const lease = {
+            sessionID: input.sessionID,
+            affinityDomain: attribution.affinityDomain,
+            routeRevision: attribution.routeRevision,
+            route: {
+              kind: "account" as const,
+              providerID: input.providerID,
+              accountID: "account-test",
+              credentialHandle: "cred-account-test",
+              credentialRevision: 9,
+            },
+          } satisfies ProviderRouteResolution.ProviderRouteLease
+          return Effect.succeed({ model, route: { attribution, lease } as never })
+        }),
+      })
+      const processor = Layer.succeed(
+        SessionProcessorModule.SessionProcessor.Service,
+        SessionProcessorModule.SessionProcessor.Service.of({
+          create: Effect.fn("TestSessionProcessor.captureInheritedLease")((input) => {
+            processorRoute = input.routeAttribution
+            processorLease = input.routeLease
+            return Effect.succeed(fake(input, "continue"))
+          }),
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const route = {
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/test",
+          providerID: ref.providerID,
+          routeRevision: 7,
+          routeKind: "account",
+          accountID: "account-test",
+        } satisfies ProviderRouteResolution.RouteAttribution
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+          route,
+        })
+
+        expect(result).toBe("continue")
+        expect(direct).toEqual([])
+        expect(inherited).toContainEqual({ providerID: "test", modelID: "test-model" })
+        expect(processorRoute).toEqual({ routeKind: "account", accountID: "account-test" })
+        expect(processorLease).toMatchObject({
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/test",
+          routeRevision: 7,
+          route: {
+            kind: "account",
+            providerID: "test",
+            accountID: "account-test",
+            credentialHandle: "cred-account-test",
+            credentialRevision: 9,
+          },
+        })
+      }).pipe(
+        withCompaction({
+          provider: routedProvider,
+          processor,
+          config: cfg({ models: { small: "test/test-model" } }),
+        }),
+      )
+    },
+  )
+
+  itCompaction.instance(
+    "passes the exact recompiled binding lease through the session-model compaction fallback",
+    () => {
+      const model = createModel({ context: 100_000, output: 32_000 })
+      const tinyTier = {
+        ...model,
+        limit: { ...model.limit, context: 1_000 },
+      } satisfies Provider.Model
+      let inheritedCalls = 0
+      let processorRoute: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeAttribution"]
+      let processorLease: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeLease"]
+      const routedProvider = ProviderTest.fake({
+        model,
+        resolveInheritedRoutedModel: Effect.fn("TestProvider.resolveFallbackCandidate")((input) => {
+          inheritedCalls++
+          const attribution = {
+            sessionID: input.sessionID,
+            affinityDomain: "opencode-provider/test",
+            providerID: input.providerID,
+            routeRevision: 11,
+            routeKind: "account" as const,
+            accountID: "account-test",
+          } satisfies ProviderRouteResolution.RouteAttribution
+          const lease = {
+            sessionID: input.sessionID,
+            affinityDomain: attribution.affinityDomain,
+            routeRevision: attribution.routeRevision,
+            route: {
+              kind: "account" as const,
+              providerID: input.providerID,
+              accountID: "account-test",
+              credentialHandle: "cred-tier",
+              credentialRevision: 99,
+            },
+          } satisfies ProviderRouteResolution.ProviderRouteLease
+          return Effect.succeed({
+            model: inheritedCalls === 1 ? model : tinyTier,
+            route: { attribution, lease } as never,
+          })
+        }),
+      })
+      const processor = Layer.succeed(
+        SessionProcessorModule.SessionProcessor.Service,
+        SessionProcessorModule.SessionProcessor.Service.of({
+          create: Effect.fn("TestSessionProcessor.captureFallbackLease")((input) => {
+            processorRoute = input.routeAttribution
+            processorLease = input.routeLease
+            return Effect.succeed(fake(input, "continue"))
+          }),
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const route = {
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/test",
+          providerID: ref.providerID,
+          routeRevision: 11,
+          routeKind: "account",
+          accountID: "account-test",
+        } satisfies ProviderRouteResolution.RouteAttribution
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+          route,
+        })
+
+        expect(result).toBe("continue")
+        expect(inheritedCalls).toBe(1)
+        expect(processorRoute).toEqual({ routeKind: "account", accountID: "account-test" })
+        expect(processorLease).toMatchObject({
+          sessionID: session.id,
+          affinityDomain: route.affinityDomain,
+          routeRevision: route.routeRevision,
+          route: {
+            kind: "account",
+            providerID: "test",
+            accountID: "account-test",
+            credentialHandle: "cred-tier",
+            credentialRevision: 99,
+          },
+        })
+      }).pipe(
+        withCompaction({
+          provider: routedProvider,
+          processor,
+          config: cfg({ models: {} }),
+        }),
+      )
+    },
+  )
+
+  itCompaction.instance(
+    "records account-local compaction failure health from the exact inherited lease",
+    () => {
+      const model = createModel({ context: 100_000, output: 32_000 })
+      const stub = llm()
+      stub.push(
+        Stream.fail(
+          new APICallError({
+            message: "account throttled",
+            url: "https://example.test/v1/chat/completions",
+            requestBodyValues: {},
+            statusCode: 429,
+            responseHeaders: { "retry-after": "120" },
+            responseBody: '{"error":{"message":"account throttled"}}',
+            isRetryable: true,
+          }),
+        ),
+      )
+
+      const routedProvider = ProviderTest.fake({
+        model,
+        resolveInheritedRoutedModel: Effect.fn("TestProvider.resolveHealthLease")((input) => {
+          const attribution = {
+            sessionID: input.sessionID,
+            affinityDomain: "opencode-provider/test",
+            providerID: input.providerID,
+            routeRevision: 17,
+            routeKind: "account" as const,
+            accountID: "account-health",
+          } satisfies ProviderRouteResolution.RouteAttribution
+          const lease = {
+            sessionID: input.sessionID,
+            affinityDomain: attribution.affinityDomain,
+            routeRevision: attribution.routeRevision,
+            route: {
+              kind: "account" as const,
+              providerID: input.providerID,
+              accountID: "account-health",
+              credentialHandle: "cred-health",
+              credentialRevision: 5,
+            },
+          } satisfies ProviderRouteResolution.ProviderRouteLease
+          return Effect.succeed({ model, route: { attribution, lease } as never })
+        }),
+      })
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const { readDb } = yield* Database.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const route = {
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/test",
+          providerID: ref.providerID,
+          routeRevision: 17,
+          routeKind: "account",
+          accountID: "account-health",
+        } satisfies ProviderRouteResolution.RouteAttribution
+        const before = Date.now()
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+          route,
+        })
+
+        expect(result).toBe("stop")
+        const rows = yield* readDb.select().from(ProviderAccountRouteHealthTable).all()
+        expect(rows).toHaveLength(1)
+        expect(rows[0]).toMatchObject({
+          provider_id: "test",
+          account_id: "account-health",
+          model_id: "test-model",
+          state: "cooling-down",
+          credential_revision: null,
+        })
+        expect(rows[0]?.expires_at).toBeGreaterThanOrEqual(before + 119_000)
+        expect(Object.keys(rows[0] ?? {})).not.toContain("credential_handle")
+      }).pipe(
+        withCompaction({
+          provider: routedProvider,
+          llm: stub.llmLayer,
+          config: cfg({ models: {} }),
+        }),
+      )
+    },
+  )
+
+  itCompaction.instance(
+    "settles an explicit cross-provider compaction override under its own route",
+    () => {
+      const parentModel = createModel({ context: 100_000, output: 32_000 })
+      const overrideModel = {
+        ...parentModel,
+        id: ModelV2.ID.make("other-model"),
+        providerID: ProviderV2.ID.make("other"),
+        api: { ...parentModel.api, id: "other-model" },
+        limit: { ...parentModel.limit, context: 50_000 },
+      } satisfies Provider.Model
+      const routed: Array<{ providerID: string; modelID: string }> = []
+      let processorRoute: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeAttribution"]
+      let processorLease: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeLease"]
+      const routedProvider = ProviderTest.fake({
+        model: parentModel,
+        getModel: Effect.fn("TestProvider.unexpectedDirectGetModel")((providerID, modelID) =>
+          Effect.die(new Error(`unexpected direct maintenance lookup: ${providerID}/${modelID}`)),
+        ),
+        resolveInheritedRoutedModel: Effect.fn("TestProvider.resolveInheritedRoutedModel")((input) => {
+          const attribution = {
+            sessionID: input.sessionID,
+            affinityDomain: "opencode-provider/test",
+            providerID: input.providerID,
+            routeRevision: 7,
+            routeKind: "account" as const,
+            accountID: "account-test",
+          } satisfies ProviderRouteResolution.RouteAttribution
+          return Effect.succeed({ model: parentModel, route: { attribution } as never })
+        }),
+        resolveRoutedModel: (input) =>
+          Effect.sync(() => {
+            routed.push({ providerID: input.providerID, modelID: input.modelID })
+            if (input.providerID !== "other" || input.modelID !== "other-model") return undefined
+            const attribution = {
+              sessionID: input.sessionID,
+              affinityDomain: "opencode-provider/other",
+              providerID: input.providerID,
+              routeRevision: 1,
+              routeKind: "public" as const,
+            } satisfies ProviderRouteResolution.RouteAttribution
+            const lease = {
+              sessionID: input.sessionID,
+              affinityDomain: attribution.affinityDomain,
+              routeRevision: attribution.routeRevision,
+              route: {
+                kind: "public" as const,
+                providerID: input.providerID,
+                routeID: "other:public",
+              },
+            } satisfies ProviderRouteResolution.ProviderRouteLease
+            return { model: overrideModel, route: { attribution, lease } as never }
+          }),
+      })
+      const processor = Layer.succeed(
+        SessionProcessorModule.SessionProcessor.Service,
+        SessionProcessorModule.SessionProcessor.Service.of({
+          create: Effect.fn("TestSessionProcessor.captureRoute")((input) => {
+            processorRoute = input.routeAttribution
+            processorLease = input.routeLease
+            return Effect.succeed(fake(input, "continue"))
+          }),
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const parent = yield* createUserMessage(session.id, "hello")
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const parentRoute = {
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/test",
+          providerID: ref.providerID,
+          routeRevision: 7,
+          routeKind: "account",
+          accountID: "account-test",
+        } satisfies ProviderRouteResolution.RouteAttribution
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+          route: parentRoute,
+        })
+
+        expect(result).toBe("continue")
+        expect(routed).toContainEqual({ providerID: "other", modelID: "other-model" })
+        expect(processorRoute).toEqual({ routeKind: "public" })
+        expect(processorLease).toMatchObject({
+          sessionID: session.id,
+          affinityDomain: "opencode-provider/other",
+          routeRevision: 1,
+          route: {
+            kind: "public",
+            providerID: "other",
+            routeID: "other:public",
+          },
+        })
+      }).pipe(
+        withCompaction({
+          provider: routedProvider,
+          processor,
+          config: cfg({ models: { small: "other/other-model" } }),
+        }),
+      )
+    },
   )
 
   itCompaction.instance(
@@ -1517,9 +1920,11 @@ describe("session.compaction.process", () => {
     () => {
       const stub = llm()
       let messages: LLM.StreamInput["messages"] = []
+      let continuity: LLM.StreamInput["continuity"]
       stub.push(
         reply("summary", (input) => {
           messages = input.messages
+          continuity = input.continuity
         }),
       )
       return Effect.gen(function* () {
@@ -1541,6 +1946,7 @@ describe("session.compaction.process", () => {
         })
 
         const captured = JSON.stringify(messages)
+        expect(continuity).toBe("isolated")
         expect(messages).toHaveLength(1)
         expect(messages[0]?.role).toBe("user")
         expect(captured).toContain("Here is the conversation so far:")

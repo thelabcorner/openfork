@@ -26,9 +26,13 @@ const BaseParameterFields = {
 
 export const Parameters = Schema.Struct({
   ...BaseParameterFields,
+  mode: Schema.optional(Schema.Literals(["foreground", "background", "supervisor"])).annotate({
+    description:
+      'Execution mode. "foreground" (default) blocks until the subagent finishes. "background" detaches and returns immediately; you are notified on completion and should not poll. "supervisor" also detaches but you REMAIN RESPONSIBLE: inspect progress and meaningful state changes, audit evidence rather than trusting final responses, steer blocked/drifting/duplicating workers, then own final integration and verification. Do not combine with `background`.',
+  }),
   background: Schema.optional(Schema.Boolean).annotate({
     description:
-      "Execution mode for this invocation. Omit/false to block in foreground; true to detach in background. This never creates a different kind of session",
+      "Legacy compatibility alias for mode. Omit/false to block in foreground; true to detach in background. Do not pass together with `mode`; prefer `mode`. This never creates a different kind of session.",
   }),
 })
 
@@ -61,6 +65,7 @@ export const TaskTool = Tool.define(
               taskID: params.task_id,
               command: params.command,
               background: params.background,
+              mode: params.mode,
             },
             {
               parentSessionID: ctx.sessionID,

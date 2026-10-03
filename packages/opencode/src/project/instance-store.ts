@@ -15,6 +15,11 @@ export interface LoadInput {
   directory: string
   worktree?: string
   project?: Project.Info
+  attribution?: {
+    caller: string
+    route?: string
+    reason?: string
+  }
 }
 
 export interface Interface {
@@ -158,7 +163,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
-            yield* Effect.logInfo("creating instance", { directory: directory })
+            yield* Effect.logInfo("creating instance", {
+              directory,
+              explicitLocation: input.attribution ? true : undefined,
+              caller: input.attribution?.caller ?? "unspecified",
+              route: input.attribution?.route,
+              reason: input.attribution?.reason,
+            })
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
           return yield* restore(Deferred.await(entry.deferred))

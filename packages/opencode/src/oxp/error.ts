@@ -139,6 +139,20 @@ export class ProviderAccountUnavailable extends Schema.TaggedErrorClass<Provider
   }
 }
 
+/**
+ * An explicit route choice this host cannot bind yet. Deliberately distinct
+ * from ProviderAccountUnavailable: Public is a route class rather than a
+ * provider account, so this error never carries an account identity for it.
+ */
+export class RouteBindingUnavailable extends Schema.TaggedErrorClass<RouteBindingUnavailable>()(
+  "OXP_ROUTE_BINDING_UNAVAILABLE",
+  fields,
+) {
+  override get message() {
+    return this.detail
+  }
+}
+
 export class IntegrationOffline extends Schema.TaggedErrorClass<IntegrationOffline>()("OXP_INTEGRATION_OFFLINE", fields) {
   override get message() {
     return this.detail
@@ -170,6 +184,7 @@ export type Error =
   | Cancelled
   | DependencyUnavailable
   | ProviderAccountUnavailable
+  | RouteBindingUnavailable
   | IntegrationOffline
   | AmbiguousExternalResult
 
@@ -189,6 +204,7 @@ const tags = new Set([
   "OXP_CANCELLED",
   "OXP_DEPENDENCY_UNAVAILABLE",
   "OXP_PROVIDER_ACCOUNT_UNAVAILABLE",
+  "OXP_ROUTE_BINDING_UNAVAILABLE",
   "OXP_INTEGRATION_OFFLINE",
   "OXP_AMBIGUOUS_EXTERNAL_RESULT",
 ])

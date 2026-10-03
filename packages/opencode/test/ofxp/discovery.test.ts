@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test"
+import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { OfxpDiscovery } from "../../src/ofxp/discovery"
 import { OfxpMetrics } from "../../src/ofxp/metrics"
 
 function peerID(seed: number) {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
   const char = alphabet[seed % alphabet.length]!
-  return `ofxp_${char.repeat(43)}`
+  return Ofxp.PeerID.make(`ofxp_${char.repeat(43)}`)
 }
 
 function service(input: {
@@ -113,7 +114,7 @@ describe("OFXP discovery candidate projection", () => {
   test("self-filters and deduplicates one peer across several advertised endpoints", () => {
     const local = peerID(3)
     const remote = peerID(4)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
 
     expect(directory.up(service({ peerID: local }), 10)).toBe(false)
     expect(directory.up(service({ peerID: remote, fqdn: "remote-a._ofxp._tcp.local", port: 4001 }), 20)).toBe(true)
@@ -131,7 +132,7 @@ describe("OFXP discovery candidate projection", () => {
   test("deduplicates one peer across providers and removes only the requested provider instance", () => {
     const local = peerID(7)
     const remote = peerID(8)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
     expect(directory.up(service({ peerID: remote, fqdn: "remote._ofxp._tcp.local", port: 4100 }), 10)).toBe(true)
     expect(directory.upSeed(seed({ peerID: remote, source: "server", id: "configured-server", port: 4200 }), 20)).toBe(true)
     expect(directory.upSeed(seed({ peerID: remote, source: "known", id: "last-authenticated", port: 4300 }), 30)).toBe(true)
@@ -150,7 +151,7 @@ describe("OFXP discovery candidate projection", () => {
     const mdnsPeer = peerID(51)
     const serverPeer = peerID(52)
     const replacementPeer = peerID(53)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
     directory.up(service({ peerID: mdnsPeer, fqdn: "mdns._ofxp._tcp.local" }), 10)
 
     expect(
@@ -177,7 +178,7 @@ describe("OFXP discovery candidate projection", () => {
 
   test("self-filters passive seeds through the same directory boundary", () => {
     const local = peerID(9)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
     expect(directory.upSeed(seed({ peerID: local }), 10)).toBe(false)
     expect(directory.list()).toEqual([])
   })
@@ -185,7 +186,7 @@ describe("OFXP discovery candidate projection", () => {
   test("evicts stale observations in one bounded sweep and emits once", () => {
     const local = peerID(10)
     const remote = peerID(11)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
     let changes = 0
     directory.subscribe(() => changes++)
     directory.up(service({ peerID: remote, fqdn: "old._ofxp._tcp.local" }), 10)
@@ -202,7 +203,7 @@ describe("OFXP discovery candidate projection", () => {
 
   test("bounds candidate cardinality without allocating per-candidate timers", () => {
     const local = peerID(5)
-    const directory = new OfxpDiscovery.Directory(local as never, 3)
+    const directory = new OfxpDiscovery.Directory(local, 3)
     const peers = Array.from({ length: 5 }, (_, index) => peerID(index + 10))
     peers.forEach((peer, index) => directory.up(service({ peerID: peer, fqdn: `p${index}._ofxp._tcp.local` }), index + 1))
     const result = directory.list()
@@ -213,7 +214,7 @@ describe("OFXP discovery candidate projection", () => {
   test("bounds endpoint fanout from one maliciously noisy peer", () => {
     const local = peerID(20)
     const remote = peerID(21)
-    const directory = new OfxpDiscovery.Directory(local as never)
+    const directory = new OfxpDiscovery.Directory(local)
     for (let i = 0; i < OfxpDiscovery.MAX_INSTANCES_PER_PEER + 20; i++) {
       directory.up(service({ peerID: remote, fqdn: `noisy-${i}._ofxp._tcp.local`, port: 10_000 + i }), i + 1)
     }
@@ -227,7 +228,7 @@ describe("OFXP discovery candidate projection", () => {
     const first = peerID(41)
     const second = peerID(42)
     const metrics = new OfxpMetrics.Metrics()
-    const directory = new OfxpDiscovery.Directory(local as never, OfxpDiscovery.MAX_CANDIDATES, metrics)
+    const directory = new OfxpDiscovery.Directory(local, OfxpDiscovery.MAX_CANDIDATES, metrics)
 
     directory.up(service({ peerID: first, fqdn: "first-a._ofxp._tcp.local" }))
     directory.up(service({ peerID: first, fqdn: "first-b._ofxp._tcp.local" }))

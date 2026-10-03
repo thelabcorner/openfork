@@ -44,6 +44,7 @@ type Call =
     }
 
 const calls: Call[] = []
+let requestFailure: Error | undefined
 
 const guarded = <A>(
   target: OxpRequestControl.Target,
@@ -59,7 +60,8 @@ const controlLayer = Layer.succeed(
   OxpRequestControl.Service,
   OxpRequestControl.Service.of({
     list: (target) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
+        if (requestFailure) return yield* Effect.fail(requestFailure)
         calls.push({ action: "list", target })
         return {
           permissions: [
@@ -133,6 +135,7 @@ const it = testEffect(layer)
 
 beforeEach(async () => {
   calls.length = 0
+  requestFailure = undefined
   await fs.rm(suite, { recursive: true, force: true })
   await fs.mkdir(configDir, { recursive: true })
   await fs.mkdir(stateDir, { recursive: true })
@@ -200,6 +203,35 @@ const prepare = Effect.fnUntraced(function* () {
 
 describe("OxpRequest", () => {
   it.live(
+    "preserves actionable native dependency identity without leaking raw failure detail",
+    Effect.gen(function* () {
+      const { config, root } = yield* prepare()
+      const requests = yield* OxpRequest.Service
+      yield* config.setGrant({
+        sessionSupervision: "approved-roots",
+        requestSupervision: true,
+      })
+      requestFailure = new Error(
+        "Service not found: @opencode/core/Question secret-native-detail",
+      )
+
+      const error = yield* requests.execute({
+        action: "list",
+        sessionID: approvedID,
+        rootID: root.id,
+      }).pipe(Effect.flip)
+
+      expect(error._tag).toBe("OXP_DEPENDENCY_UNAVAILABLE")
+      expect(error.detail).toContain("@opencode/core/Question")
+      expect(error.detail).not.toContain("secret-native-detail")
+      expect(error.metadata).toMatchObject({
+        dependency: "@opencode/core/Question",
+        nativeError: "Error",
+      })
+    }),
+  )
+
+  it.live(
     "requires requestSupervision independently from Session supervision",
     Effect.gen(function* () {
       const { config } = yield* prepare()
@@ -212,6 +244,39 @@ describe("OxpRequest", () => {
         .execute({ action: "list", sessionID: approvedID })
         .pipe(Effect.flip)
       expect(error._tag).toBe("OXP_AUTH_DENIED")
+      expect(calls).toEqual([])
+    }),
+  )
+
+  it.live(
+    "rejects action-incompatible and incomplete fields before authority or request-control work",
+    Effect.gen(function* () {
+      const { config } = yield* prepare()
+      const requests = yield* OxpRequest.Service
+      yield* config.setGrant({
+        sessionSupervision: "none",
+        requestSupervision: false,
+      })
+
+      const ignoredAnswers = yield* requests
+        .execute({
+          action: "list",
+          sessionID: approvedID,
+          answers: [["must-not-be-ignored"]],
+        })
+        .pipe(Effect.flip)
+      expect(ignoredAnswers._tag).toBe("OXP_INVALID_ARGUMENT")
+      expect(ignoredAnswers.detail).toContain("list does not accept: answers")
+
+      const missingReply = yield* requests
+        .execute({
+          action: "reply_permission",
+          sessionID: approvedID,
+          requestID: "per_oxp",
+        })
+        .pipe(Effect.flip)
+      expect(missingReply._tag).toBe("OXP_INVALID_ARGUMENT")
+      expect(missingReply.detail).toContain("requires: reply")
       expect(calls).toEqual([])
     }),
   )

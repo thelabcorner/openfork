@@ -1,4 +1,3 @@
-import { Agent } from "@/agent/agent"
 import { Command } from "@/command"
 import * as InstanceState from "@/effect/instance-state"
 import { Format } from "@/format"
@@ -14,7 +13,6 @@ import { markInstanceForDisposal } from "../lifecycle"
 
 export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance", (handlers) =>
   Effect.gen(function* () {
-    const agent = yield* Agent.Service
     const command = yield* Command.Service
     const format = yield* Format.Service
     const lsp = yield* LSP.Service
@@ -77,10 +75,6 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       return yield* command.list()
     })
 
-    const getAgent = Effect.fn("InstanceHttpApi.agent")(function* () {
-      return yield* agent.list()
-    })
-
     const getSkill = Effect.fn("InstanceHttpApi.skill")(function* () {
       return yield* skill.all()
     })
@@ -102,7 +96,6 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
       .handle("vcsDiffRaw", getVcsDiffRaw)
       .handle("vcsApply", applyVcs)
       .handle("command", getCommand)
-      .handle("agent", getAgent)
       .handle("skill", getSkill)
       .handle("lsp", getLsp)
       .handle("formatter", getFormatter)

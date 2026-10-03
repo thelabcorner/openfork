@@ -65,8 +65,8 @@ type FailureState = { state: ZenAccountState; resetAt: number | undefined }
  * Unified key pool for both "opencode" (Zen free) and "opencode-go" (Go paid)
  * providers, which share the same physical `OPENCODE_API_KEY` env keys plus
  * fork-vault keys. Deliberately simple: no session affinity, no learned
- * cooldown windows, no persistence — mirrors how verdent/workbuddy bind one
- * key per session, except here the "session" is the model's account suffix,
+ * cooldown windows, no persistence — unlike WorkBuddy's session binding, the
+ * "session" here is the model's account suffix,
  * resolved once per request by the caller.
  *
  * In-memory 402/429 tracking is best-effort and process-local; a restart

@@ -3,7 +3,9 @@ import { Provider } from "@/provider/provider"
 import { LLM as SessionLLM } from "@/session/llm"
 import { MessageID, SessionID } from "@/session/schema"
 import { MCP } from "@/mcp"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { PromptRevisor } from "@opencode-ai/core/prompt-revisor"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
 import { collectUntilTerminalTool } from "@opencode-ai/core/special-agent-completion"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -36,6 +38,24 @@ const toolChoiceIdentity = (model: Provider.Model): ToolChoiceCapabilityIdentity
   apiID: model.api?.id,
 })
 
+const usageRoute = (route?: ProviderRouteResolution.RouteAttribution) =>
+  route?.routeKind === "account"
+    ? ({ routeKind: "account", accountID: route.accountID! } as const)
+    : route?.routeKind === "public"
+      ? ({ routeKind: "public" } as const)
+      : undefined
+
+const routedRef = (ref: ModelV2.Ref, route?: ProviderRouteResolution.RouteAttribution) =>
+  route?.routeKind === "account"
+    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID! })
+    : route?.routeKind === "public"
+      ? ModelV2.Ref.make({
+          providerID: ref.providerID,
+          id: ref.id,
+          ...(ref.variant ? { variant: ref.variant } : {}),
+        })
+      : ref
+
 /**
  * Production Prompt Revisor runtime. Model lookup and execution deliberately go
  * through the same Provider + Session LLM services used by ordinary chat turns.
@@ -48,16 +68,62 @@ export const makeRuntime = (
   agents: Agent.Interface,
   mcp?: MCP.Interface,
 ): PromptRevisor.Runtime => ({
-  resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({ candidates }) {
+  resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({
+    candidates,
+    explicitCandidates = [],
+    session,
+  }) {
+    const candidateKey = (candidate: ModelV2.Ref) =>
+      `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
+    const explicit = new Set(explicitCandidates.map(candidateKey))
+    const sessionModelKey = session?.model ? candidateKey(session.model) : undefined
     const seen = new Set<string>()
     for (const candidate of candidates) {
-      const key = `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
+      const key = candidateKey(candidate)
       if (seen.has(key)) continue
       seen.add(key)
+
+      if (session) {
+        const explicitOverride = explicit.has(key)
+        const inheritedProvider =
+          session.model === undefined || candidate.providerID === session.model.providerID
+        if (!explicitOverride && !inheritedProvider) continue
+
+        const accountID =
+          explicitOverride || key === sessionModelKey ? candidate.accountID : undefined
+        const routed = yield* provider
+          .resolveRoutedModel({
+            sessionID: session.id,
+            providerID: candidate.providerID,
+            modelID: candidate.id,
+            ...(accountID ? { accountID } : {}),
+          })
+          .pipe(Effect.option)
+        if (routed._tag === "None") continue
+        if (routed.value) {
+          const route = routed.value.route.attribution
+          return {
+            ref: routedRef(candidate, route),
+            value: routed.value.model,
+            route: usageRoute(route),
+            capability: toolChoiceIdentity(routed.value.model),
+          }
+        }
+        // The route owner positively reports this provider/model is outside its
+        // domain. Preserve direct-provider execution only for the inherited
+        // provider or an explicit override.
+      }
+
       const resolved = yield* provider
-        .getModel(candidate.providerID, candidate.id, candidate.accountID)
+        .getModel(
+          candidate.providerID,
+          candidate.id,
+          session && !explicit.has(key) && key !== sessionModelKey ? undefined : candidate.accountID,
+        )
         .pipe(Effect.option)
-      if (resolved._tag === "Some") return { ref: candidate, value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
+      if (resolved._tag === "Some") {
+        return { ref: candidate, value: resolved.value, capability: toolChoiceIdentity(resolved.value) }
+      }
     }
 
     // Match ordinary session semantics: an explicit model chain is authoritative.
@@ -109,12 +175,16 @@ export const makeRuntime = (
     const user = makeV1SpecialAgentAnchor({
       sessionID,
       agent: request.specialAgent,
-      model: {
-        providerID: request.model.ref.providerID,
-        modelID: request.model.ref.id,
-        ...(request.model.ref.accountID ? { accountID: request.model.ref.accountID } : {}),
-        variant: request.model.ref.variant,
-      },
+        model: {
+          providerID: request.model.ref.providerID,
+          modelID: request.model.ref.id,
+          ...(request.model.route?.routeKind === "account"
+            ? { accountID: request.model.route.accountID }
+            : request.model.ref.accountID
+              ? { accountID: request.model.ref.accountID }
+              : {}),
+          variant: request.model.ref.variant,
+        },
     })
     // Prompt revision is a real built-in agent, not a synthetic request-local
     // Agent.Info. Preserve its configured model options, permissions, variant,
@@ -137,8 +207,10 @@ export const makeRuntime = (
             user,
             sessionID,
             model,
+            ...(request.model.route ? { route: request.model.route } : {}),
             agent,
             system: [],
+            continuity: "isolated",
             messages,
             tools: toTools(request.tools),
             retries: 0,

@@ -1,4 +1,5 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Permission } from "@/permission"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
@@ -6,7 +7,6 @@ import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-own
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
-import { Permission } from "@/permission"
 import { Project } from "@/project/project"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
@@ -19,10 +19,9 @@ import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Provider } from "@/provider/provider"
 import { canonicalT3CodeModelRef, canonicalT3CodeModelSlug } from "@/compat/t3code"
-import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { Cause, Effect, Option, Schema, Scope } from "effect"
+import { Cause, Effect, Schema, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { InstanceState } from "@/effect/instance-state"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -34,8 +33,6 @@ import {
   ForkPayload,
   InitPayload,
   ListQuery,
-  MessagesQuery,
-  PermissionResponsePayload,
   PromptPayload,
   RegenerateTitlePayload,
   RevertPayload,
@@ -43,7 +40,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError, ServiceUnavailableError, SessionBusyError } from "../errors"
+import { ServiceUnavailableError, SessionBusyError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -62,9 +59,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const runState = yield* SessionRunState.Service
     const agentSvc = yield* Agent.Service
     const providerSvc = yield* Provider.Service
-    const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
-    const todoSvc = yield* Todo.Service
     const broker = yield* BrowserHostBroker.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
@@ -84,9 +79,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       })
     })
 
-    const status = Effect.fn("SessionHttpApi.status")(function* () {
-      return Object.fromEntries(yield* statusSvc.list())
-    })
 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
@@ -106,19 +98,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     ) {
       const current = yield* requireSession(sessionID)
       return yield* authorizePublicMutableSession(current)
-    })
-
-    const specialAgentExecution = (current: Session.Info): MessageV2.CurrentV1Execution => ({
-      agent: SessionMetadataOwnership.specialAgentKind(current.metadata) ?? current.agent,
-      ...(current.model
-        ? {
-            model: {
-              providerID: current.model.providerID,
-              modelID: current.model.id,
-              ...(current.model.variant ? { variant: current.model.variant } : {}),
-            },
-          }
-        : {}),
     })
 
     const requireInteractiveSession = Effect.fn("SessionHttpApi.requireInteractiveSession")(function* (
@@ -143,132 +122,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return current
     })
 
-    const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
-      return yield* requireSession(ctx.params.sessionID)
-    })
-
-    const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* requireSession(ctx.params.sessionID)
-      return yield* session.children(ctx.params.sessionID)
-    })
-
-    const todo = Effect.fn("SessionHttpApi.todo")(function* (ctx: { params: { sessionID: SessionID } }) {
-      yield* requireSession(ctx.params.sessionID)
-      return yield* todoSvc.get(ctx.params.sessionID)
-    })
-
     const diff = Effect.fn("SessionHttpApi.diff")(function* (ctx: {
       params: { sessionID: SessionID }
       query: typeof DiffQuery.Type
     }) {
       return yield* summary.diff({ sessionID: ctx.params.sessionID, messageID: ctx.query.messageID })
-    })
-
-    const messages = Effect.fn("SessionHttpApi.messages")(function* (ctx: {
-      params: { sessionID: SessionID }
-      query: typeof MessagesQuery.Type
-    }) {
-      if (ctx.query.before && ctx.query.limit === undefined) return yield* new HttpApiError.BadRequest({})
-      if (ctx.query.before) {
-        const before = ctx.query.before
-        yield* Effect.try({
-          try: () => MessageV2.cursor.decode(before),
-          catch: () => new HttpApiError.BadRequest({}),
-        })
-      }
-      const current = yield* requireSession(ctx.params.sessionID)
-      const specialAgent = SessionMetadataOwnership.isSpecialAgent(current.metadata)
-      const execution = specialAgent ? specialAgentExecution(current) : undefined
-      if (ctx.query.limit === undefined || ctx.query.limit === 0) {
-        return yield* SessionError.mapStorageNotFound(
-          specialAgent
-            ? MessageV2.currentAll({ sessionID: ctx.params.sessionID, execution })
-            : session.messages({ sessionID: ctx.params.sessionID }),
-        )
-      }
-
-      const page = yield* SessionError.mapStorageNotFound(
-        specialAgent
-          ? MessageV2.currentPage({
-              sessionID: ctx.params.sessionID,
-              limit: ctx.query.limit,
-              before: ctx.query.before,
-              execution,
-            })
-          : MessageV2.page({
-              sessionID: ctx.params.sessionID,
-              limit: ctx.query.limit,
-              before: ctx.query.before,
-            }),
-      )
-      if (!page.cursor) return page.items
-
-      const request = yield* HttpServerRequest.HttpServerRequest
-      // toURL() honors the Host + x-forwarded-proto headers, so the Link
-      // header echoes the real origin instead of a hard-coded localhost.
-      const url = Option.getOrElse(HttpServerRequest.toURL(request), () => new URL(request.url, "http://localhost"))
-      url.searchParams.set("limit", ctx.query.limit.toString())
-      url.searchParams.set("before", page.cursor)
-      return HttpServerResponse.jsonUnsafe(page.items, {
-        headers: {
-          "Access-Control-Expose-Headers": "Link, X-Next-Cursor",
-          Link: `<${url.toString()}>; rel="next"`,
-          "X-Next-Cursor": page.cursor,
-        },
-      })
-    })
-
-    const message = Effect.fn("SessionHttpApi.message")(function* (ctx: {
-      params: { sessionID: SessionID; messageID: MessageID }
-    }) {
-      const current = yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapStorageNotFound(
-        SessionMetadataOwnership.isSpecialAgent(current.metadata)
-          ? MessageV2.currentGet({
-              sessionID: ctx.params.sessionID,
-              messageID: ctx.params.messageID,
-              execution: specialAgentExecution(current),
-            })
-          : MessageV2.get({ sessionID: ctx.params.sessionID, messageID: ctx.params.messageID }),
-      )
-    })
-
-    const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
-      // Keep create/update semantics aligned: a session carrying an unknown
-      // agent is not runnable, and persisting it defers a deterministic
-      // configuration error until the first prompt. Under automated callers
-      // that can become an async retry storm because prompt_async has already
-      // returned 204 by the time the run rejects. Reject the invalid state at
-      // admission instead.
-      if (ctx.payload?.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
-        return yield* new HttpApiError.BadRequest({})
-      }
-      const payload = ctx.payload
-        ? {
-            ...ctx.payload,
-            metadata: SessionMetadataOwnership.forPublicCreate(ctx.payload.metadata),
-          }
-        : ctx.payload
-      return yield* shareSvc.create(payload)
-    })
-
-    const createRaw = Effect.fn("SessionHttpApi.createRaw")(function* (ctx: {
-      request: HttpServerRequest.HttpServerRequest
-    }) {
-      const body = yield* Effect.orDie(ctx.request.text)
-      if (body.trim().length === 0) return yield* create({})
-
-      const json = yield* tryParseJson(body)
-      const decoded = yield* Schema.decodeUnknownEffect(Session.CreateInput)(json).pipe(
-        Effect.mapError(() => new HttpApiError.BadRequest({})),
-      )
-      const payload = decoded
-        ? {
-            ...decoded,
-            permission: decoded.permission ? [...decoded.permission] : undefined,
-          }
-        : decoded
-      return yield* create({ payload })
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -366,16 +224,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         Effect.mapError(() => new HttpApiError.BadRequest({})),
       )
       return yield* fork({ params: ctx.params, payload })
-    })
-
-    const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
-      // Abort is historically idempotent for a missing Session. Preserve that
-      // contract while still refusing public control takeover of an existing
-      // producer-owned aggregate.
-      const current = yield* session.get(ctx.params.sessionID).pipe(Effect.option)
-      if (Option.isSome(current)) yield* authorizePublicMutableSession(current.value)
-      yield* promptSvc.cancel(ctx.params.sessionID)
-      return true
     })
 
     // V1 pause is stored on the legacy session row and propagated through the
@@ -693,24 +541,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* SessionError.mapBusy(revertSvc.unrevert({ sessionID: ctx.params.sessionID }))
     })
 
-    const permissionRespond = Effect.fn("SessionHttpApi.permissionRespond")(function* (ctx: {
-      params: { sessionID: SessionID; permissionID: PermissionV1.ID }
-      payload: typeof PermissionResponsePayload.Type
-    }) {
-      yield* requireSession(ctx.params.sessionID)
-      yield* permissionSvc.reply({ requestID: ctx.params.permissionID, reply: ctx.payload.response }).pipe(
-        Effect.catchTag("Permission.NotFoundError", (error) =>
-          Effect.fail(
-            new PermissionNotFoundError({
-              requestID: String(error.requestID),
-              message: `Permission request not found: ${error.requestID}`,
-            }),
-          ),
-        ),
-      )
-      return true
-    })
-
     const authorizePublicMessageMutation = Effect.fn("SessionHttpApi.authorizePublicMessageMutation")(function* (
       input: {
         sessionID: SessionID
@@ -787,18 +617,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     return handlers
       .handle("list", list)
-      .handle("status", status)
-      .handle("get", get)
-      .handle("children", children)
-      .handle("todo", todo)
       .handle("diff", diff)
-      .handle("messages", messages)
-      .handle("message", message)
-      .handleRaw("create", createRaw)
       .handle("remove", remove)
       .handle("update", update)
       .handleRaw("fork", forkRaw)
-      .handle("abort", abort)
       .handle("pause", pause)
       .handle("resume", resume)
       .handle("regenerateTitle", regenerateTitle)
@@ -812,7 +634,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("shell", shell)
       .handle("revert", revert)
       .handle("unrevert", unrevert)
-      .handle("permissionRespond", permissionRespond)
       .handle("deleteMessage", deleteMessage)
       .handle("deletePart", deletePart)
       .handle("updatePart", updatePart)

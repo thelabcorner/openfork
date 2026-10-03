@@ -1,38 +1,50 @@
 import { NodeHttpServer } from "@effect/platform-node"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionStatus } from "../../src/session/status"
 import { afterEach, describe, expect } from "bun:test"
 import { Context, Deferred, Effect, Layer, Option, Schema, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { DirectoryActivityFence } from "@opencode-ai/core/directory-activity-fence"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmProfilePreflight } from "../../src/swarm/profile-preflight"
 import { Auth } from "../../src/auth"
+import { Capacity } from "../../src/capacity/capacity"
 import { Config } from "../../src/config/config"
 import { ForkCredentials } from "../../src/fork/credentials"
 import { Installation } from "../../src/installation"
+import { OfxpRoot } from "../../src/ofxp/root"
+import { OfxpRuntime } from "../../src/ofxp/runtime"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
+import { OfxpInvocation } from "@opencode-ai/core/ofxp-invocation"
+import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { ServerAuth } from "../../src/server/auth"
 import { GlobalBus } from "../../src/bus/global"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { controlHandlers } from "../../src/server/routes/instance/httpapi/handlers/control"
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
+import { directoryActivityFenceHandlers } from "../../src/server/routes/instance/httpapi/handlers/directory-activity-fence"
 import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi/handlers/fork-credential"
 import { globalHandlers, MAX_REPLAY_FRAMES, SUBSCRIBER_HEADROOM } from "../../src/server/routes/instance/httpapi/handlers/global"
+import { ofxpHandlers } from "../../src/server/routes/instance/httpapi/handlers/ofxp"
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
 import { wakatimeHandlers } from "../../src/server/routes/instance/httpapi/handlers/wakatime"
-import { WakaTime } from "@opencode-ai/core/wakatime"
 import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { Usage } from "../../src/usage/usage"
+import { WakaTime } from "@opencode-ai/core/wakatime"
 import { Quota } from "../../src/quota/quota"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
@@ -70,8 +82,10 @@ const apiLayer = HttpRouter.serve(
     Layer.provide([
       controlHandlers,
       controlPlaneHandlers,
+      directoryActivityFenceHandlers,
       forkCredentialHandlers,
       globalHandlers,
+      ofxpHandlers,
       providerSettingsHandlers,
       usageHandlers,
       wakatimeHandlers,
@@ -86,10 +100,15 @@ const apiLayer = HttpRouter.serve(
   ),
   { disableListenLog: true, disableLogger: true },
 ).pipe(
-  Layer.provideMerge(NodeHttpServer.layerTest),
+    Layer.provideMerge(NodeHttpServer.layerTest),
+    Layer.provide(Layer.mergeAll(
+      Layer.mock(SessionExecutionOwner.Service)({}),
+      Layer.mock(SessionStatus.Service)({}),
+    )),
   Layer.provide(Layer.mock(Auth.Service)({})),
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(ForkCredentials.Service)({})),
+  Layer.provide(Layer.mock(Capacity.Service)({})),
   Layer.provide(Layer.mock(SessionUsage.Service)({})),
   Layer.provide(
     Layer.mock(Quota.Service)({
@@ -99,14 +118,20 @@ const apiLayer = HttpRouter.serve(
         Effect.succeed({ from, to, generatedAt: from, occurrences: [], failures: [] }),
     }),
   ),
+  Layer.provide(Layer.mock(OfxpInvocation.Service)({})),
+  Layer.provide(Layer.mock(OfxpPeer.Service)({ subscribe: () => () => {} })),
+  Layer.provide(Layer.mock(OfxpRoot.Service)({})),
+  Layer.provide(Layer.mock(OfxpRuntime.Service)({})),
   Layer.provide(Layer.mock(OxpActivity.Service)({})),
   Layer.provide(Layer.mock(OxpActivityInspection.Service)({})),
   Layer.provide(Layer.mock(RevisionDraft.Service)({})),
   Layer.provide(Layer.mock(ScheduledTask.Service)({})),
   Layer.provide(Layer.mock(ScheduledTaskSessionBinding.Service)({})),
-  Layer.provide(Layer.mock(SwarmV2.Service)({})),
-  Layer.provide(Layer.mock(SwarmMemberSessionWake.Service)({})),
-  Layer.provide(Layer.mock(WakaTime.Service)({})),
+  Layer.provide([
+    Layer.mock(SwarmV2.Service)({}),
+    Layer.mock(SwarmProfilePreflight.Service)({ check: () => Effect.die("unused Swarm profile preflight") }),
+    Layer.mock(SwarmMemberSessionWake.Service)({}),
+  ]),
   Layer.provide(
     Layer.mock(Usage.Service)({
       summary: () => Effect.die("unused usage summary"),
@@ -114,7 +139,11 @@ const apiLayer = HttpRouter.serve(
       recordMaintenance: () => Effect.void,
     }),
   ),
+).pipe(
+  Layer.provide(Layer.mock(OxpAttribution.Service)({})),
   Layer.provide(Layer.mock(MoveSession.Service)({})),
+  Layer.provide(Layer.mock(WakaTime.Service)({})),
+  Layer.provide(Layer.mock(DirectoryActivityFence.Service)({})),
   Layer.provide(
     Layer.mock(Installation.Service)({
       method: () => Effect.succeed("curl"),

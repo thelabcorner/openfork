@@ -3,7 +3,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -43,6 +43,45 @@ afterAll(async () => {
 })
 
 describe("OxpFind", () => {
+  it.live("publishes a typed transport envelope and preserves filtered-text search semantics", Effect.gen(function* () {
+    const decode = Schema.decodeUnknownEffect(OxpFind.Parameters, { onExcessProperty: "error" })
+    const glob = yield* decode({ rootID: "00000000-0000-4000-8000-000000000001", glob: "*.ts" })
+    const grep = yield* decode({ rootID: "00000000-0000-4000-8000-000000000001", grep: "needle", syntax: "literal" })
+    const filtered = yield* decode({
+      rootID: "00000000-0000-4000-8000-000000000001",
+      grep: "needle",
+      glob: "*.ts",
+      offset: 2,
+      limit: 10,
+    })
+    expect(glob).toMatchObject({ glob: "*.ts" })
+    expect(grep).toMatchObject({ grep: "needle", syntax: "literal" })
+    expect(filtered).toMatchObject({ grep: "needle", glob: "*.ts", offset: 2, limit: 10 })
+
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const find = yield* OxpFind.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    yield* Effect.promise(() => fs.writeFile(path.join(rootDir, "match.ts"), "needle\n"))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ read: true })
+
+    const filteredResult = yield* find.execute({ rootID: root.id, glob: "*.ts", grep: "needle" })
+    expect(filteredResult.output).toContain("needle")
+
+    const underspecified = yield* find.execute({ rootID: root.id }).pipe(Effect.flip)
+    expect(underspecified._tag).toBe("OXP_INVALID_ARGUMENT")
+    expect(underspecified.detail).toContain("Invalid OXP find arguments")
+
+    const conflicting = yield* find
+      .execute({ rootID: root.id, grep: "needle", glob: "*.ts", include: "*.txt" })
+      .pipe(Effect.flip)
+    expect(conflicting._tag).toBe("OXP_INVALID_ARGUMENT")
+    expect(conflicting.detail).toContain("filters conflict")
+  }))
+
   it.live(
     "searches only an explicitly approved root and projects native paths into the OXP namespace",
     Effect.gen(function* () {
@@ -147,6 +186,68 @@ describe("OxpFind", () => {
   )
 
   it.live(
+    "paginates live grep results without skipping rows hidden by model-facing projection",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const find = yield* OxpFind.Service
+      const rootDir = path.join(suite, "workspace")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      yield* Effect.promise(() =>
+        fs.writeFile(
+          path.join(rootDir, "page.ts"),
+          Array.from({ length: 5 }, (_, index) => `needle ${index + 1}`).join("\n") + "\n",
+        ),
+      )
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+
+      const first = yield* find.execute({ grep: "needle", rootID: root.id, limit: 2 })
+      expect(first.output).toContain("Line 1: needle 1")
+      expect(first.output).toContain("Line 2: needle 2")
+      expect(first.output).not.toContain("Line 3:")
+      expect(first.metadata).toMatchObject({
+        offset: 0,
+        limit: 2,
+        count: 2,
+        hasMore: true,
+        nextOffset: 2,
+        complete: false,
+        pagination: "live",
+      })
+
+      const second = yield* find.execute({ grep: "needle", rootID: root.id, offset: 2, limit: 2 })
+      expect(second.output).toContain("Line 3: needle 3")
+      expect(second.output).toContain("Line 4: needle 4")
+      expect(second.output).not.toContain("Line 1:")
+      expect(second.metadata).toMatchObject({
+        offset: 2,
+        limit: 2,
+        count: 2,
+        hasMore: true,
+        nextOffset: 4,
+        complete: false,
+      })
+
+      const final = yield* find.execute({ grep: "needle", rootID: root.id, offset: 4, limit: 2 })
+      expect(final.output).toContain("Line 5: needle 5")
+      expect(final.metadata).toMatchObject({
+        offset: 4,
+        limit: 2,
+        count: 1,
+        hasMore: false,
+        complete: true,
+        truncated: false,
+      })
+      expect(final.metadata).not.toHaveProperty("nextOffset")
+
+      const invalid = yield* find.execute({ grep: "needle", rootID: root.id, offset: 100_001 }).pipe(Effect.flip)
+      expect(invalid._tag).toBe("OXP_INVALID_ARGUMENT")
+    }),
+  )
+
+  it.live(
     "refuses relative shorthand without an explicit root even when only one root exists",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service
@@ -199,7 +300,14 @@ describe("OxpFind", () => {
 
       const result = yield* find.execute({ grep: "needle", rootID: root.id, include: "*.txt" })
       expect(Buffer.byteLength(result.output, "utf8")).toBeLessThanOrEqual(96 * 1024)
-      expect(result.metadata?.projectionTruncated).toBe(true)
+      expect(result.metadata).toMatchObject({
+        projectionTruncated: false,
+        pageTruncated: true,
+        truncated: true,
+        hasMore: true,
+        complete: false,
+      })
+      expect(typeof result.metadata?.nextOffset).toBe("number")
       expect(result.output).not.toContain(rootDir)
     }),
     { timeout: 15_000 },

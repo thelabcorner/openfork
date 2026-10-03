@@ -5,6 +5,15 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { RootHttpApi } from "../api"
 import { ApiMoveSessionError, MoveSessionPayload } from "../groups/control-plane"
 
+function message(error: MoveSession.Error) {
+  if (error instanceof SessionV2.NotFoundError) return `Session not found: ${error.sessionID}`
+  if (error instanceof MoveSession.DestinationProjectMismatchError)
+    return "Cannot transfer uncommitted changes across projects. Move without transferring changes to change the session's project."
+  if (error instanceof MoveSession.ApplyChangesError)
+    return "Unable to apply your changes in the destination directory. The files may conflict with existing changes."
+  return error.message
+}
+
 export const controlPlaneHandlers = HttpApiBuilder.group(RootHttpApi, "controlPlane", (handlers) =>
   Effect.gen(function* () {
     const service = yield* MoveSession.Service
@@ -26,12 +35,3 @@ export const controlPlaneHandlers = HttpApiBuilder.group(RootHttpApi, "controlPl
     return handlers.handle("moveSession", moveSession)
   }),
 )
-
-function message(error: MoveSession.Error) {
-  if (error instanceof SessionV2.NotFoundError) return `Session not found: ${error.sessionID}`
-  if (error instanceof MoveSession.DestinationProjectMismatchError)
-    return "Cannot transfer uncommitted changes across projects. Move without transferring changes to change the session's project."
-  if (error instanceof MoveSession.ApplyChangesError)
-    return `Unable to apply your changes in the destination directory. The files may conflict with existing changes.`
-  return error.message
-}

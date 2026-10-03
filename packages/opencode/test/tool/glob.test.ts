@@ -107,6 +107,26 @@ describe("tool.glob", () => {
     }),
   )
 
+  // WP0.5: an internal caller composes over `data` through the semantic seam. It
+  // never re-parses `output` and never crosses the provider delivery boundary.
+  it.instance("composes over structured data through the semantic seam", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "b.txt"), "hello\n"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const exit = yield* glob.semantic({ pattern: "*.ts", path: test.directory }, ctx).pipe(Effect.exit)
+
+      expect(Exit.isSuccess(exit)).toBe(true)
+      if (!Exit.isSuccess(exit)) return
+      const data = exit.value.data as { files: ReadonlyArray<string>; count: number; truncated: boolean }
+      expect(data.count).toBe(1)
+      expect(data.truncated).toBe(false)
+      expect(data.files).toEqual([path.join(test.directory, "a.ts")])
+    }),
+  )
+
   it.instance("rejects exact file paths", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

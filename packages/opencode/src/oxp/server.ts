@@ -23,10 +23,14 @@ import { OxpParentToolEpoch } from "./parent-tool-epoch"
 import { OxpActivityRecorder } from "./activity-recorder"
 import { OxpActivityIdentity } from "./activity-identity"
 import { OxpRuntimeRefresh } from "./runtime-refresh"
+import { resultContextChars } from "./context-footprint"
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024
 const TOOL_LIST_PAGE_BYTES = 2 * 1024 * 1024
-const VERSION = "0.1.0"
+// The public tunnel identity is intentionally stable. Address the MCP server
+// identity by the schema-rich surface fingerprint so reconnecting clients have
+// an explicit protocol-visible cache key change whenever tools/instructions do.
+const VERSION = `0.1.0+schema.${OxpSurface.FINGERPRINT.slice(0, 12)}`
 
 interface Cursor {
   readonly v: 1
@@ -106,9 +110,8 @@ export function paginateToolList(
   // The permanent OXP surface is immutable and overwhelmingly dominates this
   // path. Reuse its precomputed surface fingerprint rather than canonicalizing
   // and hashing the full (schema-rich) manifest on every tools/list request.
-  const fingerprint = tools === OxpSurface.TOOLS
-    ? OxpSurface.FINGERPRINT
-    : OxpSurface.toolProjectionFingerprint(ordered)
+  const fingerprint =
+    tools === OxpSurface.TOOLS ? OxpSurface.FINGERPRINT : OxpSurface.toolProjectionFingerprint(ordered)
   const offset = decodeCursor(cursor, fingerprint, ordered.length)
   const budget = Math.max(1, Math.floor(byteBudget))
   const page: Tool[] = []
@@ -172,11 +175,37 @@ export function bridgeRequestCancellation(req: IncomingMessage, res: ServerRespo
   }
 }
 
+type AfterResponse = NonNullable<OxpResult.CapabilityResult["afterResponse"]>
+type ExecutedToolCall = {
+  readonly result: CallToolResult
+  readonly afterResponse?: AfterResponse
+}
+
+async function endResponse(res: ServerResponse, body: Buffer | undefined): Promise<boolean> {
+  if (res.destroyed && !res.writableFinished) return false
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    const finish = (value: boolean) => {
+      if (settled) return
+      settled = true
+      res.off("finish", onFinish)
+      res.off("close", onClose)
+      resolve(value)
+    }
+    const onFinish = () => finish(true)
+    const onClose = () => finish(res.writableFinished)
+    res.once("finish", onFinish)
+    res.once("close", onClose)
+    res.end(body)
+  })
+}
+
 async function handleMcpRequest(
   handler: ReturnType<typeof createMcpHandler>,
   req: IncomingMessage,
   res: ServerResponse,
   parsedBody: unknown,
+  takeAfterResponse?: (request: Request) => AfterResponse | undefined,
 ) {
   const cancellation = bridgeRequestCancellation(req, res)
   const headers = new Headers()
@@ -204,7 +233,13 @@ async function handleMcpRequest(
     const body = response.body ? Buffer.from(await response.arrayBuffer()) : undefined
     if (body) responseHeaders["content-length"] = String(body.byteLength)
     res.writeHead(response.status, responseHeaders)
-    res.end(body)
+    const finished = await endResponse(res, body)
+    if (finished) {
+      const afterResponse = takeAfterResponse?.(request)
+      if (afterResponse) {
+        await Promise.resolve(afterResponse()).catch(() => undefined)
+      }
+    }
   } finally {
     cancellation.dispose()
   }
@@ -243,7 +278,7 @@ function toolError(error: OxpError.Error): CallToolResult {
   const text = `${projected.code}: ${projected.message}`
   return {
     content: [{ type: "text", text }],
-    structuredContent: { error: projected },
+    structuredContent: { output: text, error: projected },
     isError: true,
   }
 }
@@ -260,11 +295,7 @@ function establishesDurableContinuation(name: string, args: unknown) {
   return typeof action === "string" && CONTINUATION_ACTIONS.has(action)
 }
 
-export function durableContinuationObserved(
-  name: string,
-  args: unknown,
-  error?: OxpError.Error,
-) {
+export function durableContinuationObserved(name: string, args: unknown, error?: OxpError.Error) {
   if (!establishesDurableContinuation(name, args)) return false
   return error === undefined || error.metadata?.committed === true
 }
@@ -289,9 +320,7 @@ export interface FileActivityTarget {
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
 }
 
 function boundedText(source: Record<string, unknown> | undefined, key: string, max: number) {
@@ -309,8 +338,7 @@ export function fileActivityRoute(name: string, args: unknown) {
   if (name !== "capability") return false
   const source = record(args)
   return (
-    boundedText(source, "namespace", 64) === "openfork" &&
-    boundedText(source, "capability", 512) === "file.transfer"
+    boundedText(source, "namespace", 64) === "openfork" && boundedText(source, "capability", 512) === "file.transfer"
   )
 }
 
@@ -340,8 +368,7 @@ export function fileActivityTargets(
   // Only a committed operation is real file activity. Discovery, uncommitted
   // attempts, and externally ambiguous transfers never reach this boundary.
   if (result.mutation?.committed !== true) return []
-  const virtualPath =
-    kind === "write" ? boundedText(structured, "path", 4096) : boundedText(structured, "source", 4096)
+  const virtualPath = kind === "write" ? boundedText(structured, "path", 4096) : boundedText(structured, "source", 4096)
   if (virtualPath === undefined) return []
   // A transferred blob publishes verified byte counts, never a before/after line
   // delta. There is deliberately no line-count field to read here: any number
@@ -382,10 +409,7 @@ export function fileActivityProject(canonicalRootPath: string, alias?: string) {
  * target was reached through `OxpRoot.resolvePath`, so the seam holds genuine
  * root authority even though the transfer broker itself never saw a directory.
  */
-export function fileActivityInput(
-  kind: CodingActivity.Kind,
-  resolved: OxpRoot.ResolvedPath,
-): CodingActivity.Input {
+export function fileActivityInput(kind: CodingActivity.Kind, resolved: OxpRoot.ResolvedPath): CodingActivity.Input {
   return {
     entity: resolved.path,
     kind,
@@ -502,7 +526,15 @@ const layer = Layer.effect(
       context: OxpCapability.CallContext = {},
     ) {
       if (signal.aborted) return yield* new OxpError.Cancelled({ detail: "OXP request was cancelled" })
-      if (name === "read" || name === "find" || name === "edit" || name === "write" || name === "patch" || name === "git" || name === "process") {
+      if (
+        name === "read" ||
+        name === "find" ||
+        name === "edit" ||
+        name === "write" ||
+        name === "patch" ||
+        name === "git" ||
+        name === "process"
+      ) {
         return yield* capability.call(name, args, signal, context)
       }
 
@@ -510,13 +542,16 @@ const layer = Layer.effect(
         const input = yield* Schema.decodeUnknownEffect(OxpCapability.Parameters)(args, {
           onExcessProperty: "error",
         }).pipe(Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP capability arguments" })))
-        return yield* capability.execute(input, signal, context)
+        return yield* capability.execute(input, signal, {
+          ...context,
+          workerExecute: (workerInput, workerSignal) => workers.execute(workerInput, workerSignal),
+        })
       }
 
       if (name === "openai_files") {
-        const input = yield* Schema.decodeUnknownEffect(
-          OxpFileExchange.OpenAiParameters,
-        )(args, { onExcessProperty: "error" }).pipe(
+        const input = yield* Schema.decodeUnknownEffect(OxpFileExchange.OpenAiRuntimeParameters)(args, {
+          onExcessProperty: "error",
+        }).pipe(
           Effect.mapError(
             () =>
               new OxpError.InvalidArgument({
@@ -639,7 +674,7 @@ const layer = Layer.effect(
             args: unknown,
             requestMeta: Readonly<Record<string, unknown>> | undefined,
             signal: AbortSignal,
-          ) => {
+          ): Promise<ExecutedToolCall> => {
             const parentCorrelation = OxpParentToolEpoch.parentCorrelation(requestMeta)
             const continuity = parentEpochs.observe(parentCorrelation)
             const activityInput = {
@@ -666,31 +701,35 @@ const layer = Layer.effect(
                 return yield* dispatch(name, args, signal, callContext).pipe(
                   Effect.matchEffect({
                     onFailure: (error) =>
-                      activity.failure(recording, activityInput, error).pipe(
-                        Effect.map(() => {
-                          metricState.failures += 1
-                          if (durableContinuationObserved(name, args, error)) {
-                            parentEpochs.markDurableContinuation(parentCorrelation)
-                          }
-                          return withContinuity(
-                            toolError(error),
-                            continuity,
-                            parentEpochs.hasDurableContinuation(parentCorrelation),
-                          )
-                        }),
-                      ),
+                      Effect.gen(function* () {
+                        metricState.failures += 1
+                        if (durableContinuationObserved(name, args, error)) {
+                          parentEpochs.markDurableContinuation(parentCorrelation)
+                        }
+                        const finalResult = withContinuity(
+                          toolError(error),
+                          continuity,
+                          parentEpochs.hasDurableContinuation(parentCorrelation),
+                        )
+                        yield* activity.failure(recording, activityInput, error, resultContextChars(finalResult))
+                        return { result: finalResult }
+                      }),
                     onSuccess: (result) =>
                       Effect.gen(function* () {
                         yield* fileActivity(name, args, result)
-                        yield* activity.success(recording, activityInput, result)
                         if (durableContinuationObserved(name, args)) {
                           parentEpochs.markDurableContinuation(parentCorrelation)
                         }
-                        return withContinuity(
+                        const finalResult = withContinuity(
                           toolResult(result),
                           continuity,
                           parentEpochs.hasDurableContinuation(parentCorrelation),
                         )
+                        yield* activity.success(recording, activityInput, result, resultContextChars(finalResult))
+                        return {
+                          result: finalResult,
+                          ...(result.afterResponse ? { afterResponse: result.afterResponse } : {}),
+                        }
                       }),
                   }),
                 )
@@ -698,46 +737,52 @@ const layer = Layer.effect(
             )
           }
 
-          const mcpHandler = createMcpHandler((requestContext) => {
-            const outputSchema =
-              requestContext.era === "legacy"
-                ? OxpSurface.LEGACY_OUTPUT_SCHEMA
-                : OxpSurface.OUTPUT_SCHEMA
-            const tools =
-              requestContext.era === "legacy"
-                ? OxpSurface.TOOLS.map((tool) => ({
-                    ...tool,
-                    outputSchema,
-                  }))
-                : OxpSurface.TOOLS
-            const mcp = new Server(
-              { name: "OpenFork OXP", version: VERSION },
-              { capabilities: { tools: {} }, instructions: OxpSurface.SERVER_INSTRUCTIONS },
-            )
-            const outputValidator = fromJsonSchema(outputSchema)
-            mcp.setRequestHandler("tools/list", async (request) =>
-              paginateToolList(tools, request.params?.cursor),
-            )
-            mcp.setRequestHandler("tools/call", async (request, ctx) => {
-              const result = await executeToolCall(
-                request.params.name,
-                request.params.arguments ?? {},
-                request.params._meta,
-                ctx.mcpReq.signal,
+          const afterResponses = new WeakMap<Request, AfterResponse>()
+          const mcpHandler = createMcpHandler(
+            (requestContext) => {
+              const outputSchema =
+                requestContext.era === "legacy" ? OxpSurface.LEGACY_OUTPUT_SCHEMA : OxpSurface.OUTPUT_SCHEMA
+              const tools =
+                requestContext.era === "legacy"
+                  ? OxpSurface.TOOLS.map((tool) => ({
+                      ...tool,
+                      outputSchema,
+                    }))
+                  : OxpSurface.TOOLS
+              const mcp = new Server(
+                { name: "OpenFork OXP", version: VERSION },
+                { capabilities: { tools: {} }, instructions: OxpSurface.SERVER_INSTRUCTIONS },
               )
-              if (!result.isError && result.structuredContent !== undefined) {
-                const validation = await outputValidator["~standard"].validate(result.structuredContent)
-                if (validation.issues?.length) {
-                  return {
-                    content: [{ type: "text" as const, text: "OXP_INTERNAL: structured result violated outputSchema" }],
-                    isError: true,
+              const outputValidator = fromJsonSchema(outputSchema)
+              mcp.setRequestHandler("tools/list", async (request) => paginateToolList(tools, request.params?.cursor))
+              mcp.setRequestHandler("tools/call", async (request, ctx) => {
+                const executed = await executeToolCall(
+                  request.params.name,
+                  request.params.arguments ?? {},
+                  request.params._meta,
+                  ctx.mcpReq.signal,
+                )
+                const result = executed.result
+                if (executed.afterResponse && requestContext.requestInfo) {
+                  afterResponses.set(requestContext.requestInfo, executed.afterResponse)
+                }
+                if (result.structuredContent !== undefined) {
+                  const validation = await outputValidator["~standard"].validate(result.structuredContent)
+                  if (validation.issues?.length) {
+                    return {
+                      content: [
+                        { type: "text" as const, text: "OXP_INTERNAL: structured result violated outputSchema" },
+                      ],
+                      isError: true,
+                    }
                   }
                 }
-              }
-              return mcp.projectCallToolResult(result, outputSchema)
-            })
-            return mcp
-          }, { legacy: "stateless" })
+                return mcp.projectCallToolResult(result, outputSchema)
+              })
+              return mcp
+            },
+            { legacy: "stateless" },
+          )
 
           const server = createServer((req, res) => {
             const pathOnly = (req.url ?? "").split("?", 1)[0] ?? ""
@@ -804,7 +849,11 @@ const layer = Layer.effect(
                 return
               }
               try {
-                await handleMcpRequest(mcpHandler, req, res, parsed.body)
+                await handleMcpRequest(mcpHandler, req, res, parsed.body, (request) => {
+                  const afterResponse = afterResponses.get(request)
+                  afterResponses.delete(request)
+                  return afterResponse
+                })
               } catch {
                 if (!res.headersSent) jsonError(res, 500, "mcp_transport_error")
                 else res.end()

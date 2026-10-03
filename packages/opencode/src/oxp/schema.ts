@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const UUIDString = Schema.String.check(Schema.isPattern(UUID), Schema.isMaxLength(36))
@@ -61,6 +62,11 @@ export const ModelSelection = Schema.Struct({
   modelID: SelectionID,
   accountID: Schema.optional(SelectionID),
   variant: Schema.optional(SelectionID),
+  /**
+   * Secret-free routing intent only. Binding, credential resolution and route
+   * revision remain downstream ProviderRoute responsibilities.
+   */
+  routeIntent: Schema.optional(ProviderRouteIntent.Info),
 }).annotate({ identifier: "Oxp.ModelSelection" })
 export type ModelSelection = Schema.Schema.Type<typeof ModelSelection>
 
@@ -74,11 +80,17 @@ export type WorkerAgentRootPolicy = Schema.Schema.Type<
 >
 
 export const WorkerPolicy = Schema.Struct({
+  /**
+   * Compatibility-only remnants of the pre-2026-09-26 OXP selection
+   * authorization gate. They are parsed and preserved but MUST NOT gate a live
+   * explicit delegation selection.
+   */
   models: Schema.Array(ModelSelection).check(Schema.isMaxLength(64)),
-  /** Legacy global agent authority. New configs use agentRoots. */
+  /** Compatibility-only legacy global agent list; not live authorization. */
   agents: Schema.Array(SelectionID).check(Schema.isMaxLength(64)),
+  /** Durable model preference used when an OXP start omits model. */
   defaultModel: Schema.optional(ModelSelection),
-  /** Legacy global default. New configs use root-scoped defaults. */
+  /** Legacy global preference. New mutations use root-scoped defaults. */
   defaultAgent: Schema.optional(SelectionID),
   agentRoots: Schema.optional(
     Schema.Array(WorkerAgentRootPolicy).check(Schema.isMaxLength(MAX_ROOTS)),
@@ -154,9 +166,10 @@ export const Config = Schema.Struct({
   roots: Schema.Array(Root).check(Schema.isMaxLength(MAX_ROOTS)),
   grant: Grant,
   /**
-   * Legacy v0 delegation-selection policy. Parsed only so existing oxp.json
-   * documents remain readable; live OXP no longer treats model/agent selection
-   * as an authorization boundary and normalized config drops this field.
+   * Delegation preferences plus compatibility fields from the old selection
+   * authorization design. defaultModel and agentRoots[].defaultAgent are live
+   * preferences; models/agents are preserved but never authorize or deny a
+   * selection.
    */
   workerPolicy: Schema.optional(WorkerPolicy),
 })

@@ -7,6 +7,8 @@ import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-own
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { AppRuntime } from "@/effect/app-runtime"
 import { BackgroundJob } from "@/background/job"
+import { OxpRequestControl } from "@/oxp/request-control"
+import { OxpRequestControlV1 } from "@/oxp/request-control-v1"
 import { InstanceStore } from "@/project/instance-store"
 import { DelegatedWorker } from "@/session/delegated-worker"
 import { Session } from "@/session/session"
@@ -22,13 +24,17 @@ import { testProviderConfig } from "../lib/test-provider"
  * hostPrompt admission -> BackgroundJob drain) against the test LLM server.
  */
 const llmRuntime = ManagedRuntime.make(TestLLMServer.layer)
+const requestRuntime = ManagedRuntime.make(OxpRequestControlV1.layer)
 
 afterAll(async () => {
   await llmRuntime.dispose()
+  await requestRuntime.dispose()
 })
 
 const MODEL = { providerID: "test", modelID: "test-model" } as const
 const ALT_MODEL = { providerID: "test", modelID: "test-model-alt" } as const
+const CANONICAL_MODEL = { ...MODEL, routeIntent: { kind: "auto" } } as const
+const CANONICAL_ALT_MODEL = { ...ALT_MODEL, routeIntent: { kind: "auto" } } as const
 
 const ORIGIN = {
   producer: "oxp",
@@ -132,6 +138,165 @@ describe("DelegatedWorker start path", () => {
     expect(outcome.result).toContain("delegated worker result")
   }, 60_000)
 
+  test("persists an explicit Public worker route account-free in protected origin metadata", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    const publicModel = { ...MODEL, routeIntent: { kind: "public" as const } }
+    const publicOrigin = {
+      ...ORIGIN,
+      invocationRef: "oxp-inv:delegated-worker-public",
+      model: publicModel,
+    }
+
+    await AppRuntime.runPromise(
+      runInInstance(llm, () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const worker = yield* DelegatedWorker.make
+          const session = yield* worker.start({
+            title: "Delegated worker Public route",
+            prompt: "stay account-free",
+            agent: ORIGIN.agent,
+            model: publicModel,
+            origin: publicOrigin,
+          })
+
+          const persisted = yield* sessions.get(session.id)
+          expect(persisted.model).toMatchObject({
+            providerID: ProviderV2.ID.make("test"),
+            id: ModelV2.ID.make("test-model"),
+          })
+          expect(persisted.model?.variant).toBeUndefined()
+          expect(
+            SessionMetadataOwnership.workerDelegation(persisted.metadata)?.model,
+          ).toEqual(publicModel)
+          expect(
+            SessionMetadataOwnership.workerDelegation(persisted.metadata)?.model.accountID,
+          ).toBeUndefined()
+
+          yield* worker.cancel({ sessionID: session.id, identity: IDENTITY })
+        }),
+      ),
+    )
+  }, 60_000)
+
+  test("surfaces a real native question wall as blocked and resumes the same worker after reply", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    const requestControl = await requestRuntime.runPromise(
+      OxpRequestControl.Service,
+    )
+    await llmRuntime.runPromise(
+      llm.toolMatch(
+        (hit) => !isTitleRequest(hit),
+        "question",
+        {
+          questions: [
+            {
+              question: "Should delegated work continue?",
+              header: "Continue",
+              options: [
+                {
+                  label: "Continue",
+                  description: "Resume the delegated worker",
+                },
+              ],
+            },
+          ],
+        },
+      ),
+    )
+    await llmRuntime.runPromise(
+      llm.textMatch(
+        (hit) => !isTitleRequest(hit),
+        "delegated question resumed",
+      ),
+    )
+
+    const outcome = await AppRuntime.runPromise(
+      runInInstance(llm, () =>
+        Effect.gen(function* () {
+          const worker = yield* DelegatedWorker.make
+          const session = yield* worker.start({
+            title: "Delegated worker question wall",
+            prompt: "ask the required question, then continue",
+            agent: ORIGIN.agent,
+            model: MODEL,
+            origin: {
+              ...ORIGIN,
+              invocationRef: "oxp-inv:delegated-worker-question-wall",
+            },
+          })
+
+          const blocked = yield* worker.wait({
+            sessionID: session.id,
+            identity: IDENTITY,
+            timeout: 20_000,
+          })
+          expect(blocked.state).toBe("blocked")
+          const blocker = blocked.blockedBy?.find(
+            (item) => item.type === "question",
+          )
+          expect(blocker).toMatchObject({
+            type: "question",
+            sessionID: session.id,
+            questionCount: 1,
+          })
+          if (!blocker) throw new Error("expected delegated question blocker")
+
+          const target = {
+            directory: session.directory,
+            sessionID: String(session.id),
+          }
+          const nativeRequests = yield* requestControl.list(target)
+          const pending = nativeRequests.questions.find(
+            (item) => item.id === blocker.id,
+          )
+          expect(pending).toMatchObject({
+            id: blocker.id,
+            questions: [
+              expect.objectContaining({
+                question: "Should delegated work continue?",
+              }),
+            ],
+          })
+          if (!pending) {
+            throw new Error(
+              "expected OXP request control to observe the native pending question",
+            )
+          }
+
+          yield* requestControl.answerQuestion(target, {
+            requestID: blocker.id,
+            answers: [["Continue"]],
+            actorRef: "oxp:test-supervisor",
+          })
+          const alreadyResolved = yield* requestControl
+            .answerQuestion(target, {
+              requestID: blocker.id,
+              answers: [["Continue"]],
+              actorRef: "oxp:test-supervisor",
+            })
+            .pipe(Effect.flip)
+          expect(alreadyResolved).toBeInstanceOf(
+            OxpRequestControl.RequestNotFound,
+          )
+
+          const completed = yield* worker.wait({
+            sessionID: session.id,
+            identity: IDENTITY,
+            timeout: 20_000,
+          })
+          expect(completed.state).toBe("completed")
+          expect(completed.generation).toBe(1)
+          expect(completed.result).toContain("delegated question resumed")
+          return completed
+        }),
+      ),
+    )
+
+    expect(outcome.state).toBe("completed")
+    expect(outcome.generation).toBe(1)
+  }, 60_000)
+
   test("continues a completed worker into generation 2 and returns the second result", async () => {
     const llm = await llmRuntime.runPromise(TestLLMServer)
     await llmRuntime.runPromise(llm.pushMatch((hit) => !isTitleRequest(hit), workerReply("generation one result")))
@@ -193,6 +358,7 @@ describe("DelegatedWorker start path", () => {
     await llmRuntime.runPromise(llm.pushMatch((hit) => !isTitleRequest(hit), workerReply("after rebind")))
 
     const rebound = { ...ALT_MODEL, variant: "high" } as const
+    const canonicalRebound = { ...rebound, routeIntent: { kind: "auto" } } as const
     const outcome = await AppRuntime.runPromise(
       runInInstance(llm, () =>
         Effect.gen(function* () {
@@ -214,8 +380,8 @@ describe("DelegatedWorker start path", () => {
             expectedModel: MODEL,
           })
           expect(changed.changed).toBe(true)
-          expect(changed.previousModel).toEqual(MODEL)
-          expect(changed.model).toEqual(rebound)
+          expect(changed.previousModel).toEqual(CANONICAL_MODEL)
+          expect(changed.model).toEqual(canonicalRebound)
 
           const persisted = yield* sessions.get(session.id)
           expect(persisted.model).toEqual({
@@ -225,7 +391,7 @@ describe("DelegatedWorker start path", () => {
           })
           expect(
             SessionMetadataOwnership.workerDelegation(persisted.metadata)?.model,
-          ).toEqual(rebound)
+          ).toEqual(canonicalRebound)
 
           const stale = yield* Effect.exit(
             worker.setSelection({
@@ -240,7 +406,7 @@ describe("DelegatedWorker start path", () => {
             SessionMetadataOwnership.workerDelegation(
               (yield* sessions.get(session.id)).metadata,
             )?.model,
-          ).toEqual(rebound)
+          ).toEqual(canonicalRebound)
 
           yield* worker.continue({
             sessionID: session.id,
@@ -276,6 +442,71 @@ describe("DelegatedWorker start path", () => {
 
     expect(outcome.generation).toBe(2)
     expect(outcome.result).toContain("after rebind")
+  }, 60_000)
+
+  test("treats a route-only Auto to Public rebind as a real CAS selection mutation", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    await llmRuntime.runPromise(
+      llm.pushMatch((hit) => !isTitleRequest(hit), workerReply("route-only rebind ready")),
+    )
+
+    await AppRuntime.runPromise(
+      runInInstance(llm, () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const worker = yield* DelegatedWorker.make
+          const session = yield* worker.start({
+            title: "Delegated worker route-only rebind",
+            prompt: "complete before route mutation",
+            agent: ORIGIN.agent,
+            model: MODEL,
+            origin: {
+              ...ORIGIN,
+              invocationRef: "oxp-inv:delegated-worker-route-only-rebind",
+            },
+          })
+          yield* worker.wait({
+            sessionID: session.id,
+            identity: IDENTITY,
+            timeout: 20_000,
+          })
+
+          const publicModel = {
+            ...MODEL,
+            routeIntent: { kind: "public" as const },
+          }
+          const changed = yield* worker.setSelection({
+            sessionID: session.id,
+            identity: IDENTITY,
+            model: publicModel,
+            expectedModel: MODEL,
+          })
+          expect(changed.changed).toBe(true)
+          expect(changed.previousModel).toEqual(CANONICAL_MODEL)
+          expect(changed.model).toEqual(publicModel)
+
+          const persisted = yield* sessions.get(session.id)
+          expect(
+            SessionMetadataOwnership.workerDelegation(persisted.metadata)?.model,
+          ).toEqual(publicModel)
+
+          const stale = yield* Effect.exit(
+            worker.setSelection({
+              sessionID: session.id,
+              identity: IDENTITY,
+              model: MODEL,
+              expectedModel: MODEL,
+            }),
+          )
+          expect(stale._tag).toBe("Failure")
+          expect(
+            SessionMetadataOwnership.workerDelegation(
+              (yield* sessions.get(session.id)).metadata,
+            )?.model,
+          ).toEqual(publicModel)
+        }),
+      ),
+    )
   }, 60_000)
 
   test("changes selection while running without rewriting the in-flight turn", async () => {
@@ -317,7 +548,7 @@ describe("DelegatedWorker start path", () => {
           })
           expect(changed.changed).toBe(true)
           expect(changed.snapshot.state).toBe("running")
-          expect(changed.model).toEqual(ALT_MODEL)
+          expect(changed.model).toEqual(CANONICAL_ALT_MODEL)
 
           const persisted = yield* sessions.get(session.id)
           expect(persisted.model).toEqual({
@@ -327,7 +558,7 @@ describe("DelegatedWorker start path", () => {
           })
           expect(
             SessionMetadataOwnership.workerDelegation(persisted.metadata)?.model,
-          ).toEqual(ALT_MODEL)
+          ).toEqual(CANONICAL_ALT_MODEL)
 
           const messages = yield* sessions.messages({ sessionID: session.id })
           const inFlight = messages.find(

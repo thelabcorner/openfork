@@ -1,7 +1,8 @@
 export * as SessionLedger from "./ledger"
 
-import { Effect } from "effect"
+import { DateTime, Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionMessage as CurrentSessionMessage } from "@opencode-ai/core/session/message"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import type { WithParts } from "@opencode-ai/schema/session-v1"
 import { SessionContext } from "@opencode-ai/schema/session-context"
@@ -107,4 +108,96 @@ export const build = Effect.fn("SessionLedger.build")(function* (input: {
   }
 
   return ledger
+})
+
+function previewForCurrentMessage(msg: CurrentSessionMessage.Message): string {
+  if (msg.type === "user" || msg.type === "synthetic") return msg.text.slice(0, 120) || `[${msg.type}]`
+  if (msg.type !== "assistant") return `[${msg.type}]`
+  for (const part of msg.content) {
+    if ((part.type === "text" || part.type === "reasoning") && part.text.trim()) return part.text.slice(0, 120)
+    if (part.type === "tool") return `[tool: ${part.name}]`
+  }
+  return "[assistant]"
+}
+
+function estimateCurrentMessageTokens(msg: CurrentSessionMessage.Message): number {
+  let total = 4
+  if (msg.type === "user" || msg.type === "synthetic") {
+    total += estimateTokens(msg.text)
+    total += (msg.files?.length ?? 0) * 200
+    return total
+  }
+  if (msg.type !== "assistant") return total
+  for (const part of msg.content) {
+    if (part.type === "text" || part.type === "reasoning") total += estimateTokens(part.text)
+    if (part.type === "tool") {
+      total += estimateTokens(JSON.stringify(part.state.input ?? {}))
+      if (part.state.status === "completed") {
+        for (const item of part.state.content) if (item.type === "text") total += estimateTokens(item.text)
+      } else if (part.state.status === "error") {
+        total += estimateTokens(part.state.error.message)
+      }
+    }
+  }
+  return total
+}
+
+/**
+ * Read-only ledger for authoritative current/V2 transcripts.
+ *
+ * Special-agent sessions are host-owned and can be assistant-only. Lowering
+ * them through V1 conversation pairing drops such assistants because V1
+ * requires a user parent. This projection intentionally stays in current
+ * semantics and never consults mutable context overlays.
+ */
+export const buildCurrentReadOnly = Effect.fn("SessionLedger.buildCurrentReadOnly")(function* (input: {
+  sessionID: string
+  messages: readonly CurrentSessionMessage.Message[]
+}) {
+  const entries: SessionContext.LedgerEntry[] = input.messages.flatMap((msg) => {
+    if (msg.type !== "user" && msg.type !== "synthetic" && msg.type !== "assistant") return []
+    const hasSignedReasoning =
+      msg.type === "assistant" &&
+      msg.content.some(
+        (part) => part.type === "reasoning" && (part.providerMetadata as any)?.anthropic?.signature != null,
+      )
+    const type: SessionContext.LedgerEntryType =
+      msg.type === "assistant"
+        ? msg.content.some((part) => part.type === "tool")
+          ? "tool"
+          : "assistant"
+        : msg.type === "synthetic"
+          ? "synthetic"
+          : "user"
+    return [{
+      messageID: msg.id as any,
+      type,
+      role: msg.type === "assistant" ? "assistant" : "user",
+      preview: previewForCurrentMessage(msg),
+      tokenEstimate: estimateCurrentMessageTokens(msg),
+      excluded: false,
+      pinned: false,
+      edited: false,
+      hasSignedReasoning,
+      partCount:
+        msg.type === "assistant"
+          ? msg.content.length
+          : (msg.text.trim() ? 1 : 0) + (msg.files?.length ?? 0),
+      timeCreated: DateTime.toEpochMillis(msg.time.created),
+    }]
+  })
+
+  const estimatedTokens = entries.reduce((sum, entry) => sum + entry.tokenEstimate, 0)
+  return {
+    sessionID: input.sessionID as any,
+    entries,
+    totals: {
+      messageCount: entries.length,
+      excludedCount: 0,
+      pinnedCount: 0,
+      editedCount: 0,
+      estimatedTokens,
+      estimatedTokensExcluded: 0,
+    },
+  } satisfies SessionContext.Ledger
 })

@@ -35,6 +35,91 @@ export const Parameters = Schema.Struct({
 })
 export type Input = Schema.Schema.Type<typeof Parameters>
 
+const ACTION_FIELDS = Object.freeze({
+  list: ["action", "sessionID", "rootID"],
+  reply_permission: [
+    "action",
+    "sessionID",
+    "rootID",
+    "requestID",
+    "reply",
+    "message",
+  ],
+  answer_question: [
+    "action",
+    "sessionID",
+    "rootID",
+    "requestID",
+    "answers",
+    "details",
+  ],
+  reject_question: ["action", "sessionID", "rootID", "requestID"],
+} satisfies Record<Input["action"], readonly (keyof Input)[]>)
+
+const ACTION_REQUIRED = Object.freeze({
+  list: ["sessionID"],
+  reply_permission: ["sessionID", "requestID", "reply"],
+  answer_question: ["sessionID", "requestID", "answers"],
+  reject_question: ["sessionID", "requestID"],
+} satisfies Record<Input["action"], readonly (keyof Input)[]>)
+
+export function validateInput(input: Input) {
+  const value = input as Record<string, unknown>
+  const allowed = new Set<string>(ACTION_FIELDS[input.action])
+  const extras = Object.entries(value)
+    .filter(([key, item]) => item !== undefined && !allowed.has(key))
+    .map(([key]) => key)
+  if (extras.length) {
+    throw new OxpError.InvalidArgument({
+      detail: `openfork_request ${input.action} does not accept: ${extras.join(", ")}`,
+    })
+  }
+  const missing = ACTION_REQUIRED[input.action].filter(
+    (key) => value[String(key)] === undefined,
+  )
+  if (missing.length) {
+    throw new OxpError.InvalidArgument({
+      detail: `openfork_request ${input.action} requires: ${missing.join(", ")}`,
+    })
+  }
+  return input
+}
+
+const transportAction = (
+  action: Input["action"],
+  fields: readonly string[],
+  required: readonly string[],
+) => ({
+  type: "object" as const,
+  properties: Object.fromEntries([
+    ["action", { const: action }],
+    ...fields.map((name) => [name, {}] as const),
+  ]),
+  required: ["action", ...required],
+  additionalProperties: false as const,
+})
+
+export const TransportActionConstraints = Object.freeze({
+  oneOf: Object.freeze([
+    transportAction("list", ["sessionID", "rootID"], ["sessionID"]),
+    transportAction(
+      "reply_permission",
+      ["sessionID", "rootID", "requestID", "reply", "message"],
+      ["sessionID", "requestID", "reply"],
+    ),
+    transportAction(
+      "answer_question",
+      ["sessionID", "rootID", "requestID", "answers", "details"],
+      ["sessionID", "requestID", "answers"],
+    ),
+    transportAction(
+      "reject_question",
+      ["sessionID", "rootID", "requestID"],
+      ["sessionID", "requestID"],
+    ),
+  ]),
+})
+
 export interface Interface {
   readonly execute: (
     input: Input,
@@ -74,8 +159,23 @@ const layer = Layer.effect(
       if (error instanceof OxpRequestControl.ExternalDirectoryBlocked) {
         return new OxpError.AuthDenied({ detail: OxpError.boundDetail(error.message) })
       }
+      const service = error.message.match(/Service not found:\s*([^\s)]+)/i)?.[1]
+      if (service) {
+        return new OxpError.DependencyUnavailable({
+          detail: OxpError.boundDetail(
+            `Native Permission/Question runtime dependency is unavailable: ${service}`,
+          ),
+          metadata: {
+            dependency: service.slice(0, 256),
+            nativeError: error.name.slice(0, 256),
+          },
+        })
+      }
       return new OxpError.DependencyUnavailable({
         detail: "Native Permission/Question supervision failed",
+        metadata: {
+          nativeError: error.name.slice(0, 256),
+        },
       })
     }
 
@@ -84,6 +184,15 @@ const layer = Layer.effect(
       signal?: AbortSignal,
     ) {
       yield* cancelled(signal)
+      yield* Effect.try({
+        try: () => validateInput(input),
+        catch: (cause) =>
+          OxpError.isError(cause)
+            ? cause
+            : new OxpError.InvalidArgument({
+                detail: "Invalid OpenFork request arguments",
+              }),
+      })
       const operation = "request." + input.action
       const visible = yield* authority.discover({
         plane: "supervision",

@@ -7,6 +7,8 @@ import { makeV1SpecialAgentAnchor } from "@/special-agent/v1-anchor"
 import { GoalAuditor } from "@opencode-ai/core/goal/auditor"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import { SessionSchema as CoreSessionSchema } from "@opencode-ai/core/session/schema"
 import { collectUntilTerminalTool } from "@opencode-ai/core/special-agent-completion"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
@@ -39,6 +41,24 @@ const capability = (model: Provider.Model) => ({
   apiID: model.api?.id,
 })
 
+const usageRoute = (route?: ProviderRouteResolution.RouteAttribution) =>
+  route?.routeKind === "account"
+    ? ({ routeKind: "account", accountID: route.accountID! } as const)
+    : route?.routeKind === "public"
+      ? ({ routeKind: "public" } as const)
+      : undefined
+
+const routedRef = (ref: ModelV2.Ref, route?: ProviderRouteResolution.RouteAttribution) =>
+  route?.routeKind === "account"
+    ? ModelV2.Ref.make({ ...ref, accountID: route.accountID! })
+    : route?.routeKind === "public"
+      ? ModelV2.Ref.make({
+          providerID: ref.providerID,
+          id: ref.id,
+          ...(ref.variant ? { variant: ref.variant } : {}),
+        })
+      : ref
+
 function candidates(input: {
   configured?: ModelV2.Ref
   workerModel?: ModelV2.Ref
@@ -65,20 +85,79 @@ function candidates(input: {
  * stack as ordinary worker turns. Core still owns audit protocol, read-only
  * tool execution, transcript publication, leases and verdict semantics.
  */
-export const makeRuntime = (provider: Provider.Interface, llm: SessionLLM.Interface): GoalAuditor.Runtime => ({
+export const makeRuntime = (
+  provider: Provider.Interface,
+  llm: SessionLLM.Interface,
+  parentRoute?: {
+    sessionID: CoreSessionSchema.ID
+    route: ProviderRouteResolution.RouteAttribution
+  },
+): GoalAuditor.Runtime => ({
   resolveModel: Effect.fn("GoalAuditorRuntime.resolveModel")(function* (input) {
     const attempted = new Set<string>()
     for (const candidate of candidates(input)) {
       const key = `${candidate.providerID}/${candidate.id}/${candidate.variant ?? ""}`
       if (attempted.has(key)) continue
       attempted.add(key)
-      const found = yield* provider.getModel(candidate.providerID, candidate.id).pipe(Effect.option)
-      if (found._tag === "None") continue
+      let model: Provider.Model | undefined
+      let selectedRoute: ProviderRouteResolution.RouteAttribution | undefined
+
+      if (parentRoute?.route.providerID === candidate.providerID) {
+        if (
+          candidate.accountID &&
+          (parentRoute.route.routeKind !== "account" || parentRoute.route.accountID !== candidate.accountID)
+        ) {
+          continue
+        }
+        const inherited = yield* provider
+          .resolveInheritedRoutedModel({
+            sessionID: parentRoute.sessionID,
+            providerID: candidate.providerID,
+            modelID: candidate.id,
+            route: parentRoute.route,
+          })
+          .pipe(Effect.option)
+        if (inherited._tag === "None") continue
+        model = inherited.value.model
+        selectedRoute = inherited.value.route.attribution
+      } else if (parentRoute) {
+        // candidates() returns only the configured model when one exists, so a
+        // different provider here is a true explicit maintenance override.
+        if (!input.configured) continue
+        const routed = yield* provider
+          .resolveRoutedModel({
+            sessionID: parentRoute.sessionID,
+            providerID: candidate.providerID,
+            modelID: candidate.id,
+            ...(candidate.accountID ? { accountID: candidate.accountID } : {}),
+          })
+          .pipe(Effect.option)
+        if (routed._tag === "None") continue
+        if (routed.value) {
+          model = routed.value.model
+          selectedRoute = routed.value.route.attribution
+        } else {
+          const direct = yield* provider
+            .getModel(candidate.providerID, candidate.id, candidate.accountID)
+            .pipe(Effect.option)
+          if (direct._tag === "None") continue
+          model = direct.value
+        }
+      } else {
+        const direct = yield* provider
+          .getModel(candidate.providerID, candidate.id, candidate.accountID)
+          .pipe(Effect.option)
+        if (direct._tag === "None") continue
+        model = direct.value
+      }
+
+      const ref = routedRef(candidate, selectedRoute)
       return {
-        ref: candidate,
-        value: found.value,
-        capability: capability(found.value),
-        outputLimit: found.value.limit.output,
+        ref,
+        value: model,
+        ...(selectedRoute ? { route: usageRoute(selectedRoute) } : {}),
+        capability: capability(model),
+        outputLimit: model.limit.output,
       } satisfies GoalAuditor.ResolvedModel
     }
 
@@ -120,11 +199,16 @@ export const makeRuntime = (provider: Provider.Interface, llm: SessionLLM.Interf
     const user = makeV1SpecialAgentAnchor({
       sessionID: request.sessionID,
       agent: "goal_auditor",
-      model: {
-        providerID: model.providerID,
-        modelID: model.id,
-        variant: request.model.ref.variant,
-      },
+       model: {
+         providerID: model.providerID,
+         modelID: model.id,
+          ...(request.model.route?.routeKind === "account"
+            ? { accountID: request.model.route.accountID }
+            : request.model.ref.accountID
+              ? { accountID: request.model.ref.accountID }
+              : {}),
+         variant: request.model.ref.variant,
+       },
     })
     const agent: Agent.Info = {
       name: "goal-auditor",
@@ -144,6 +228,7 @@ export const makeRuntime = (provider: Provider.Interface, llm: SessionLLM.Interf
           user,
           sessionID: request.sessionID,
           model,
+          ...(request.model.route ? { route: request.model.route } : {}),
           agent,
           system: [],
           messages: canonicalMessagesToModelMessages(request.messages),

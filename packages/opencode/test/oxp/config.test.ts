@@ -108,7 +108,7 @@ describe("OxpConfig", () => {
   )
 
   it.live(
-    "accepts legacy workerPolicy on read but strips it from live state and the next semantic write",
+    "preserves legacy workerPolicy compatibility fields while keeping delegation defaults durable",
     Effect.gen(function* () {
       const legacy = {
         ...OxpSchema.defaults(OxpSchema.ConnectorID.make(randomUUID())),
@@ -124,11 +124,23 @@ describe("OxpConfig", () => {
       )
       const config = yield* OxpConfig.Service
       const current = yield* config.get()
-      expect(current.workerPolicy).toBeUndefined()
+      expect(current.workerPolicy).toMatchObject(legacy.workerPolicy)
 
       const enabled = yield* config.setEnabled(true)
-      expect(enabled.workerPolicy).toBeUndefined()
-      expect(yield* Effect.promise(() => fs.readFile(configFile, "utf8"))).not.toContain('"workerPolicy"')
+      expect(enabled.workerPolicy).toMatchObject(legacy.workerPolicy)
+      expect(yield* Effect.promise(() => fs.readFile(configFile, "utf8"))).toContain('"workerPolicy"')
+
+      const exact = {
+        providerID: "workbuddy",
+        modelID: "deepseek-r2",
+        accountID: "wb-explicit",
+        variant: "thinking",
+      }
+      const selected = yield* config.setWorkerDefaultModel(exact)
+      expect(selected.workerPolicy?.defaultModel).toEqual(exact)
+      // Compatibility arrays are no longer an authorization surface and must
+      // not be mutated just because a preference changed.
+      expect(selected.workerPolicy?.models).toEqual(legacy.workerPolicy.models)
     }),
   )
 

@@ -53,7 +53,7 @@ export function fromSchema(schema: Schema.Top): JSONSchema7 {
       ...document.schema,
       ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
     })
-    const inlined = dropDefinitionsIfResolved(inlineLocalReferences(result))
+    const inlined = ensureObjectRootProperties(dropDefinitionsIfResolved(inlineLocalReferences(result)))
     if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
     cache.set(schema, inlined)
     return inlined
@@ -66,7 +66,7 @@ export function fromSchema(schema: Schema.Top): JSONSchema7 {
 }
 
 export function fromTool(tool: Tool.Def): JSONSchema7 {
-  return tool.jsonSchema ?? fromSchema(tool.parameters as Schema.Top)
+  return tool.jsonSchema ? fromJsonSchema(tool.jsonSchema) : fromSchema(tool.parameters as Schema.Top)
 }
 
 /**
@@ -81,7 +81,7 @@ export function fromTool(tool: Tool.Def): JSONSchema7 {
 export function fromJsonSchema(schema: JSONSchema7): JSONSchema7 {
   assertJsonSchemaDepth(schema)
   const normalized = normalize(schema)
-  const inlined = dropDefinitionsIfResolved(inlineLocalReferences(normalized))
+  const inlined = ensureObjectRootProperties(dropDefinitionsIfResolved(inlineLocalReferences(normalized)))
   assertJsonSchemaDepth(inlined)
   if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
   return inlined
@@ -156,6 +156,11 @@ function normalize(value: unknown, options: { stripNull?: boolean } = {}): unkno
   }
 
   return schema
+}
+
+function ensureObjectRootProperties(value: unknown): unknown {
+  if (!isRecord(value) || value.type !== "object" || isRecord(value.properties)) return value
+  return { ...value, properties: {} }
 }
 
 function isRecord(value: unknown): value is JsonObject {

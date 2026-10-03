@@ -12,6 +12,14 @@ import { decodeTransportEvent, type ResultEvent, type RuntimeEventSink } from ".
 import { buildChildEnv, type ChildEnv } from "./env"
 import { defaultSdkLoader, resolveCliPath, type ClaudeSdkModuleShape } from "./availability"
 import { isClaudeEffort } from "./models"
+import { refreshClaudeSubscriptionModelsFromHandle } from "./model-discovery"
+import {
+  apiRetryDelayMs,
+  classifyClaudeFailure,
+  overloadedResultText,
+  refusalText,
+  resultErrorText,
+} from "./failure"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
 
 // ── SDK port (fixture-friendly) ──
@@ -31,6 +39,7 @@ export interface SdkQueryHandle {
   interrupt(): Promise<void>
   close(): void
   readonly pid?: number | undefined
+  supportedModels?: () => Promise<unknown[]>
 }
 
 /**
@@ -62,6 +71,7 @@ export function normalizeQueryResult(raw: unknown): SdkQueryHandle {
     close?: unknown
     return?: unknown
     pid?: unknown
+    supportedModels?: unknown
     [Symbol.asyncIterator]?: unknown
   }
   const iterable =
@@ -83,6 +93,10 @@ export function normalizeQueryResult(raw: unknown): SdkQueryHandle {
       else if (typeof candidate.return === "function") void Promise.resolve(candidate.return()).catch(() => {})
     },
     pid: typeof candidate.pid === "number" ? candidate.pid : undefined,
+    supportedModels:
+      typeof candidate.supportedModels === "function"
+        ? () => Promise.resolve((candidate.supportedModels as () => Promise<unknown[]>).call(raw))
+        : undefined,
   }
 }
 
@@ -129,6 +143,8 @@ export interface RuntimeTimeouts {
   readonly turnMs?: number
   /** Max silence between transport events before the turn is stalled. */
   readonly stallMs?: number
+  /** Grace after interrupt() for Claude Code to record a clean interrupted turn. */
+  readonly stopGraceMs?: number
 }
 
 export interface RuntimeOptions {
@@ -156,15 +172,23 @@ export interface TurnRequest {
   readonly model?: string
   readonly effort?: string
   readonly resume?: string
+  /** Pin resume to the last main-chain transcript entry OpenFork observed. */
+  readonly resumeSessionAt?: string
   readonly permissionMode?: string
   readonly maxTurns?: number
+  /** False for maintenance turns that must never create a resumable Claude transcript. */
+  readonly persistSession?: boolean
   readonly signal?: AbortSignal
   /** Per-turn event sink; takes precedence over the constructor sink. */
   readonly sink?: RuntimeEventSink
-  /** OpenCode-owned tools exposed through the SDK's in-process MCP server. */
+  /** Host-owned tools exposed through the SDK's in-process MCP server. */
   readonly mcpTools?: readonly SdkMcpToolDefinition[]
+  /** Host-owned MCP namespace (for example `openfork`). */
+  readonly mcpServerName?: string
   /** SDK aliases for names the model may emit before MCP name resolution. */
   readonly toolAliases?: Readonly<Record<string, string>>
+  /** Host-owned note appended to Claude Code's preset system prompt. */
+  readonly systemPromptAppend?: string
   /** Reports whether MCP registration was available for this turn. */
   readonly onMcpToolsRegistered?: (registered: boolean) => void
 }
@@ -184,6 +208,12 @@ export interface TurnOutcome {
   readonly isError?: boolean
   readonly sessionID?: string
   readonly usage?: TurnUsage
+  /** Anthropic/Claude Code stop reason (max_tokens, refusal, end_turn, ...). */
+  readonly stopReason?: string
+  /** Last Anthropic HTTP status when Claude Code exhausted its own retries. */
+  readonly apiErrorStatus?: number
+  /** Last non-replay, main-chain Claude transcript UUID observed this turn. */
+  readonly leafUuid?: string
   /** Sanitized failure category when the turn did not complete normally. */
   readonly category?: string
   /** Sanitized, bounded failure message; never contains prompts or tokens. */
@@ -192,6 +222,7 @@ export interface TurnOutcome {
 
 const DEFAULT_TURN_MS = 10 * 60_000
 const DEFAULT_STALL_MS = 10 * 60_000
+const DEFAULT_STOP_GRACE_MS = 2_000
 
 interface Diagnostics {
   turnsStarted: number
@@ -210,6 +241,9 @@ interface PumpResult {
   readonly error?: { category: string; message: string }
   readonly result?: ResultEvent
   readonly sessionID?: string
+  readonly sawOutput?: boolean
+  readonly refusal?: string
+  readonly leafUuid?: string
 }
 
 type StopReason = "cancelled" | "timedOut" | "stalled" | "disposed"
@@ -234,7 +268,6 @@ export class ClaudeAgentRuntime {
   private turnActive = false
   private activeStop: ((reason: StopReason) => void) | undefined
   private loaderPromise: Promise<ClaudeSdkModuleShape> | undefined
-  private lastSessionID: string | undefined
   // Per-turn sink (request.sink); single-turn-at-a-time makes this safe.
   private turnSink: RuntimeEventSink | undefined
   private readonly diag: Diagnostics = {
@@ -315,6 +348,7 @@ export class ClaudeAgentRuntime {
     const turnID = nextTurnID(this.options.turnIDPrefix ?? DEFAULT_TURN_ID_PREFIX)
     const turnMs = this.options.timeouts?.turnMs ?? DEFAULT_TURN_MS
     const stallMs = this.options.timeouts?.stallMs ?? DEFAULT_STALL_MS
+    const stopGraceMs = this.options.timeouts?.stopGraceMs ?? DEFAULT_STOP_GRACE_MS
     const killTree = this.options.killTree
       ? (pid: number, force?: boolean) => this.options.killTree!(pid, force)
       : (pid: number, force?: boolean) => killProcessTree(pid, { force })
@@ -331,9 +365,9 @@ export class ClaudeAgentRuntime {
     }
 
     let stallTimer: ReturnType<typeof setTimeout> | undefined
-    const armStallTimer = () => {
+    const armStallTimer = (extraMs = 0) => {
       if (stallTimer) clearTimeout(stallTimer)
-      stallTimer = setTimeout(() => requestStop("stalled"), stallMs)
+      stallTimer = setTimeout(() => requestStop("stalled"), stallMs + Math.max(0, extraMs))
     }
 
     const timers: Array<ReturnType<typeof setTimeout>> = []
@@ -360,6 +394,10 @@ export class ClaudeAgentRuntime {
         prompt: request.prompt,
         options: this.buildQueryOptions(request, sdk),
       })
+      // Account-authoritative catalog refresh piggybacks the already-running
+      // authenticated query. It is deliberately non-blocking and never runs
+      // from passive provider/model listing.
+      void refreshClaudeSubscriptionModelsFromHandle(handle)
 
       const turnTimer = setTimeout(() => requestStop("timedOut"), turnMs)
       timers.push(turnTimer)
@@ -375,34 +413,54 @@ export class ClaudeAgentRuntime {
       request.signal?.removeEventListener("abort", abortHandler)
 
       if (winner === "stop") {
-        stopHandle(handle, killTree)
-        // The stream settles on its own after interrupt/close; never block
-        // the outcome on a hung iterator.
-        void pumpDone.catch(() => {})
+        const stoppedPump = await stopHandleGracefully(handle, pumpDone, killTree, stopGraceMs)
         const reason: StopReason = stopReason ?? "disposed"
-        return this.outcomeForStop(turnID, reason, turnMs, stallMs)
+        return this.outcomeForStop(turnID, reason, turnMs, stallMs, {
+          sessionID: stoppedPump?.result?.session_id ?? stoppedPump?.sessionID ?? request.resume,
+          leafUuid: stoppedPump?.leafUuid,
+        })
       }
 
       const pumped = await pumpDone
       // Streaming-input queries remain alive after a result until their input
       // closes. This adapter owns one turn, so release the SDK process here.
       handle.close()
+      const terminalFields = {
+        sessionID: pumped.result?.session_id ?? pumped.sessionID ?? request.resume,
+        stopReason: pumped.result?.stop_reason,
+        apiErrorStatus: pumped.result?.api_error_status,
+        leafUuid: pumped.leafUuid,
+        usage: pumped.result?.usage
+          ? { input_tokens: pumped.result.usage.input_tokens, output_tokens: pumped.result.usage.output_tokens }
+          : undefined,
+      }
       if (pumped.error) {
-        return this.settle(turnID, "failed", { category: pumped.error.category, message: pumped.error.message })
+        return this.settle(
+          turnID,
+          "failed",
+          { category: pumped.error.category, message: pumped.error.message },
+          terminalFields,
+        )
+      }
+      const overloaded = pumped.result && !pumped.sawOutput ? overloadedResultText(pumped.result) : undefined
+      if (overloaded) {
+        return this.settle(turnID, "failed", {
+          category: "overloaded",
+          message: overloaded,
+        }, terminalFields)
       }
       if (pumped.result?.is_error) {
+        const message = pumped.refusal ?? resultErrorText(pumped.result)
+        const classified = classifyClaudeFailure(message)
         return this.settle(turnID, "failed", {
-          category: "provider-error",
-          message: sanitizeDetail(pumped.result.result || "Claude reported an error"),
-        })
+          category: classified === "unknown" ? "provider-error" : classified,
+          message: sanitizeDetail(message),
+        }, terminalFields)
       }
       return this.settle(turnID, "completed", undefined, {
         resultText: pumped.result?.result,
         isError: pumped.result?.is_error,
-        sessionID: pumped.result?.session_id ?? pumped.sessionID ?? this.lastSessionID,
-        usage: pumped.result?.usage
-          ? { input_tokens: pumped.result.usage.input_tokens, output_tokens: pumped.result.usage.output_tokens }
-          : undefined,
+        ...terminalFields,
       })
     } catch (error) {
       clearTimers()
@@ -427,16 +485,59 @@ export class ClaudeAgentRuntime {
    * Consume the transport stream until the result event or stream end.
    * Never settles the turn itself; run() decides between pump and stop.
    */
-  private async pump(handle: SdkQueryHandle, turnID: string, armStallTimer: () => void): Promise<PumpResult> {
+  private async pump(handle: SdkQueryHandle, turnID: string, armStallTimer: (extraMs?: number) => void): Promise<PumpResult> {
     let result: ResultEvent | undefined
     let sawInit = false
+    let sawOutput = false
+    let refusal: string | undefined
+    let leafUuid: string | undefined
+    let sessionID: string | undefined
     try {
       for await (const raw of handle.events) {
-        armStallTimer()
         const event = decodeTransportEvent(raw)
+        armStallTimer(
+          event.type === "system" && "subtype" in event && event.subtype === "api_retry"
+            ? apiRetryDelayMs(event)
+            : 0,
+        )
         if (event.type === "system" && "subtype" in event && event.subtype === "init") {
           sawInit = true
-          if ("session_id" in event && event.session_id) this.lastSessionID = event.session_id
+        }
+        if ("session_id" in event && typeof event.session_id === "string" && event.session_id) {
+          sessionID = event.session_id
+        }
+        if (event.type === "system" && "subtype" in event && event.subtype === "model_refusal_no_fallback") {
+          refusal = refusalText(event)
+        }
+        if (
+          (event.type === "assistant" || event.type === "user") &&
+          "uuid" in event &&
+          event.uuid &&
+          !event.parent_tool_use_id &&
+          event.isReplay !== true
+        ) {
+          leafUuid = event.uuid
+        }
+        if (event.type === "assistant" && "message" in event && event.message?.content) {
+          sawOutput ||= event.message.content.some(
+            (block) =>
+              block.type === "tool_use" ||
+              (block.type === "text" && typeof block.text === "string" && block.text.length > 0),
+          )
+        }
+        if (event.type === "stream_event" && "event" in event && event.event && typeof event.event === "object") {
+          const stream = event.event as Record<string, unknown>
+          const delta = stream.delta
+          if (
+            stream.type === "content_block_delta" &&
+            delta &&
+            typeof delta === "object" &&
+            (delta as Record<string, unknown>).type === "text_delta" &&
+            typeof (delta as Record<string, unknown>).text === "string" &&
+            ((delta as Record<string, unknown>).text as string).length > 0
+          ) {
+            sawOutput = true
+          }
         }
         if (event.type === "result" && "is_error" in event) result = event
         this.emit({ kind: "transport", turnID, event })
@@ -445,30 +546,38 @@ export class ClaudeAgentRuntime {
       if (!sawInit && !result) {
         return { error: { category: "empty-stream", message: "Claude stream ended without any events" } }
       }
-      return { result, sessionID: this.lastSessionID }
+      return { result, sessionID, sawOutput, refusal, leafUuid }
     } catch (error) {
-      if (this.disposed) return {}
+      if (this.disposed) return { sessionID, leafUuid }
       return {
         error: {
           category: "stream-error",
           message: sanitizeDetail(error instanceof Error ? error.message : String(error)),
         },
+        sessionID,
+        leafUuid,
       }
     }
   }
 
-  private outcomeForStop(turnID: string, reason: StopReason, turnMs: number, stallMs: number): TurnOutcome {
+  private outcomeForStop(
+    turnID: string,
+    reason: StopReason,
+    turnMs: number,
+    stallMs: number,
+    fields?: Partial<Pick<TurnOutcome, "sessionID" | "leafUuid">>,
+  ): TurnOutcome {
     switch (reason) {
       case "cancelled":
-        return this.settle(turnID, "cancelled")
+        return this.settle(turnID, "cancelled", undefined, fields)
       case "timedOut":
         this.emit({ kind: "timedOut", turnID, timeoutMs: turnMs })
-        return this.settle(turnID, "timedOut", { message: `turn exceeded ${turnMs}ms` })
+        return this.settle(turnID, "timedOut", { message: `turn exceeded ${turnMs}ms` }, fields)
       case "stalled":
         this.emit({ kind: "stalled", turnID, stallMs })
-        return this.settle(turnID, "stalled", { message: `no transport activity for ${stallMs}ms` })
+        return this.settle(turnID, "stalled", { message: `no transport activity for ${stallMs}ms` }, fields)
       case "disposed":
-        return this.settle(turnID, "disposed")
+        return this.settle(turnID, "disposed", undefined, fields)
     }
   }
 
@@ -476,7 +585,12 @@ export class ClaudeAgentRuntime {
     turnID: string,
     status: TurnStatus,
     extra?: { category: string; message?: string } | { category?: undefined; message: string },
-    fields?: Partial<Pick<TurnOutcome, "resultText" | "isError" | "sessionID" | "usage">>,
+    fields?: Partial<
+      Pick<
+        TurnOutcome,
+        "resultText" | "isError" | "sessionID" | "usage" | "stopReason" | "apiErrorStatus" | "leafUuid"
+      >
+    >,
   ): TurnOutcome {
     const category = status === "failed" ? (extra?.category ?? "unknown") : undefined
     const message = extra?.message
@@ -532,9 +646,13 @@ export class ClaudeAgentRuntime {
       settingSources: ["user", "project", "local"],
       autoCompactEnabled: true,
       skills: "all",
-      systemPrompt: { type: "preset", preset: "claude_code" },
-      // OpenCode is the tool authority for this provider. Claude's built-in
-      // tools must stay disabled or the model can bypass OpenCode permissions.
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        ...(request.systemPromptAppend ? { append: request.systemPromptAppend } : {}),
+      },
+      // The host is the tool authority for this provider. Claude's built-in
+      // tools must stay disabled or the model can bypass host permissions.
       tools: [],
     }
 
@@ -546,14 +664,18 @@ export class ClaudeAgentRuntime {
       // the adapter uses that path when in-process MCP is unavailable.
       request.onMcpToolsRegistered?.(false)
     } else {
+      const mcpServerName =
+        request.mcpServerName && /^[A-Za-z0-9_-]+$/.test(request.mcpServerName)
+          ? request.mcpServerName
+          : "opencode"
       const server = (sdk.createSdkMcpServer as (options: Record<string, unknown>) => unknown)({
-        name: "opencode",
+        name: mcpServerName,
         version: "1.0.0",
         tools: [...mcpTools],
         alwaysLoad: true,
       })
-      options.mcpServers = { opencode: server }
-      options.allowedTools = mcpTools.map((tool) => `mcp__opencode__${tool.name}`)
+      options.mcpServers = { [mcpServerName]: server }
+      options.allowedTools = mcpTools.map((tool) => `mcp__${mcpServerName}__${tool.name}`)
       if (request.toolAliases && Object.keys(request.toolAliases).length > 0) {
         options.toolAliases = { ...request.toolAliases }
       }
@@ -563,11 +685,19 @@ export class ClaudeAgentRuntime {
     if (executable) options.pathToClaudeCodeExecutable = executable
     if (request.model) options.model = request.model
     if (request.resume) options.resume = request.resume
+    if (request.resumeSessionAt) options.resumeSessionAt = request.resumeSessionAt
     if (request.permissionMode) options.permissionMode = request.permissionMode
+    if (request.persistSession === false) options.persistSession = false
     if (isClaudeEffort(request.effort)) {
       options.effort = request.effort
       options.thinking = { type: "adaptive" }
     }
+    // Claude Code's thinking stream is otherwise empty until the final answer
+    // on models that think without an explicit effort variant. Match the
+    // current opencode-claude/t3code behavior and request streamed summaries
+    // whenever this runtime has not explicitly disabled thinking.
+    options.settings = { showThinkingSummaries: true }
+    options.extraArgs = { "thinking-display": "summarized" }
     if (request.maxTurns && Number.isInteger(request.maxTurns) && request.maxTurns > 0) {
       options.maxTurns = request.maxTurns
     }
@@ -591,6 +721,47 @@ function stopHandle(handle: SdkQueryHandle, killTree: (pid: number, force?: bool
   void handle.interrupt().catch(() => {})
   killTree(handle.pid ?? 0, false)
   handle.close()
+}
+
+/**
+ * Stop like Claude Code's own Esc path: interrupt first so the CLI can write
+ * its interruption/tool settlement to the transcript, let our existing pump
+ * remain the sole stream reader, and only hard-stop if it does not settle
+ * within the bounded grace.
+ */
+async function stopHandleGracefully(
+  handle: SdkQueryHandle,
+  pumpDone: Promise<PumpResult>,
+  killTree: (pid: number, force?: boolean) => void,
+  graceMs: number,
+): Promise<PumpResult | undefined> {
+  // The grace bounds the control request too. Query.interrupt() is normally
+  // quick, but if the SDK/child is wedged its Promise can hang indefinitely;
+  // awaiting it before arming the grace would turn cancellation into another
+  // unbounded wait. Start it first and let the existing pump remain the sole
+  // reader while we race transcript settlement against the bounded grace.
+  void handle.interrupt().catch(() => {})
+
+  let settled: PumpResult | undefined
+  if (graceMs > 0) {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      pumpDone
+        .then((value) => {
+          settled = value
+        })
+        .catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, graceMs)
+        timer.unref?.()
+      }),
+    ])
+    if (timer) clearTimeout(timer)
+  }
+
+  if (!settled) killTree(handle.pid ?? 0, false)
+  handle.close()
+  return settled
 }
 
 export * as ClaudeRuntime from "./runtime"

@@ -32,10 +32,12 @@ describe("OXP Gate C surface/performance proof", () => {
     const canonical = DIRECT_TOOL_DESCRIPTIONS as Record<string, string>
     expect(OxpSurface.TOOLS.map((tool) => tool.name).toSorted()).toEqual(Object.keys(canonical).toSorted())
     for (const tool of OxpSurface.TOOLS) {
-      expect(tool.description).toBe(canonical[tool.name])
-      expect(tool.description.length).toBeGreaterThanOrEqual(90)
-      expect(tool.description.length).toBeLessThanOrEqual(180)
-      expect(tool.description).not.toContain("\n")
+      const description = tool.description
+      expect(description).toBe(canonical[tool.name])
+      if (description === undefined) throw new Error(`OXP tool ${tool.name} has no description`)
+      expect(description.length).toBeGreaterThanOrEqual(90)
+      expect(description.length).toBeLessThanOrEqual(180)
+      expect(description).not.toContain("\n")
     }
   })
 

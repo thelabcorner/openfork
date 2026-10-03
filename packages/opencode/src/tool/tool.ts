@@ -46,18 +46,49 @@ export type Context<M extends Metadata = Metadata> = {
   ask(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
 }
 
+/**
+ * Expected tool failure: an operation that legitimately refuses, is denied, or
+ * cannot complete. It is recoverable and provider-visible, so it must survive
+ * from the leaf all the way to provider delivery instead of being erased or
+ * promoted to a defect on the way. Genuine defects stay in the defect channel
+ * and are deliberately not typed here.
+ */
+export type Failure = unknown
+
 export interface ExecuteResult<M extends Metadata = Metadata> {
   title: string
   metadata: M
   output: string
+  /**
+   * Structured semantic payload for host/internal composition. `output` remains
+   * the only provider projection, so this value is never model-facing text and
+   * is deliberately exempt from the harness-owned `tool_output` bound.
+   */
+  data?: unknown
   attachments?: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[]
 }
 
-export interface Def<
+/**
+ * Raw semantic invocation of one tool: decoded input -> typed expected failure
+ * -> structured result. It performs no provider projection and no `orDie`, so
+ * an internal caller keeps both the leaf's expected failure channel and its
+ * structured payload intact. This is the seam the capability invocation
+ * gateway calls; `Def.execute` is derived from it rather than replacing it.
+ */
+export type SemanticInvoke<
+  Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
+  M extends Metadata = Metadata,
+> = (args: Schema.Schema.Type<Parameters>, ctx: Context) => Effect.Effect<ExecuteResult<M>, Failure>
+
+/**
+ * Authoring shape: what a tool module declares. Expected failures are erased at
+ * the type level on purpose in the old shape; here they are part of the
+ * contract, and provider delivery is the layer that turns them into defects.
+ */
+export interface DefWithoutID<
   Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
   M extends Metadata = Metadata,
 > {
-  id: string
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
@@ -68,20 +99,43 @@ export interface Def<
    * merely because a low-frequency capability is needed mid-conversation.
    */
   exposure?: "default" | "lazy"
-  execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
+  execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>, Failure>
   formatValidationError?(error: unknown): string
 }
-export type DefWithoutID<
+
+/**
+ * A tool definition as consumed by the provider/tool loop. `execute` is
+ * provider delivery: the semantic result projected through the harness-owned
+ * model-facing bound and then turned into a defect. Behavior here is unchanged.
+ */
+export interface Def<
   Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
   M extends Metadata = Metadata,
-> = Omit<Def<Parameters, M>, "id">
+> extends Omit<DefWithoutID<Parameters, M>, "execute"> {
+  id: string
+  execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
+}
+
+/**
+ * A `Tool.init`-produced definition. The semantic executor is structurally
+ * present rather than optionally probed, so an internal caller cannot silently
+ * fall back to provider delivery and lose truncation/exit-gate authority.
+ * Raw hand-built `Tool.Def` values (the lazy broker, plugin tools) have no
+ * semantic seam until their owner adopts one.
+ */
+export interface InitializedDef<
+  Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
+  M extends Metadata = Metadata,
+> extends Def<Parameters, M> {
+  semantic: SemanticInvoke<Parameters, M>
+}
 
 export interface Info<
   Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,
   M extends Metadata = Metadata,
 > {
   id: string
-  init: () => Effect.Effect<DefWithoutID<Parameters, M>>
+  init: () => Effect.Effect<InitializedDef<Parameters, M>>
 }
 
 type Init<Parameters extends Schema.Decoder<unknown>, M extends Metadata> =
@@ -111,7 +165,10 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
 ) {
   return () =>
     Effect.gen(function* () {
-      const toolInfo = typeof init === "function" ? { ...(yield* init()) } : { ...init }
+      const toolInfo = (typeof init === "function" ? { ...(yield* init()) } : { ...init }) as DefWithoutID<
+        Parameters,
+        Result
+      >
       // Builtin lazy exposure is fork-owned policy, not a per-adapter guess.
       // Explicit custom/tool-local exposure remains valid; the shared policy
       // guarantees known builtin lazy tools cannot accidentally become eager.
@@ -121,36 +178,53 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
       // every LLM tool invocation.
       const decode = Schema.decodeUnknownEffect(toolInfo.parameters)
       const execute = toolInfo.execute
-      toolInfo.execute = (args, ctx) => {
-        const attrs = {
-          "tool.name": id,
-          "session.id": ctx.sessionID,
-          "message.id": ctx.messageID,
-          ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
-        }
-        return Effect.gen(function* () {
+      const formatValidationError = toolInfo.formatValidationError
+
+      // The single decoded-input boundary, and the only place a tool's raw
+      // semantics exist. No truncation and no `orDie`: an expected failure stays
+      // an expected failure, and `data` stays structured.
+      const semantic: SemanticInvoke<Parameters, Result> = (args, ctx) =>
+        Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError(
               (error) =>
                 new InvalidArgumentsError({
                   tool: id,
-                  detail: toolInfo.formatValidationError ? toolInfo.formatValidationError(error) : String(error),
+                  detail: formatValidationError ? formatValidationError(error) : String(error),
                 }),
             ),
           )
-          const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
-          // Producer/domain truncation (for example grep hit caps or SQLite row
-          // paging) is not authority to bypass the harness's final model-facing
-          // output bound. Every tool result crosses this boundary exactly once.
-          const projected = yield* truncate.output(result.output)
-          return {
-            ...result,
-            output: projected.content,
-            metadata: Truncate.mergeMetadata(result.metadata, projected),
+          return yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
+        })
+
+      return {
+        ...toolInfo,
+        id,
+        semantic,
+        // Provider delivery derives from the same semantic executor, so the
+        // harness-owned model-facing bound is applied exactly once, at the outer
+        // boundary, no matter which entry point invoked the tool.
+        execute: ((args: unknown, ctx: Context) => {
+          const attrs = {
+            "tool.name": id,
+            "session.id": ctx.sessionID,
+            "message.id": ctx.messageID,
+            ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
           }
-        }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
-      }
-      return toolInfo
+          return Effect.gen(function* () {
+            const result = yield* semantic(args as Schema.Schema.Type<Parameters>, ctx)
+            // Producer/domain truncation (for example grep hit caps or SQLite row
+            // paging) is not authority to bypass the harness's final model-facing
+            // output bound. Every tool result crosses this boundary exactly once.
+            const projected = yield* truncate.output(result.output)
+            return {
+              ...result,
+              output: projected.content,
+              metadata: Truncate.mergeMetadata(result.metadata, projected),
+            }
+          }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
+        }) as Def<Parameters, Result>["execute"],
+      } satisfies InitializedDef<Parameters, Result>
     })
 }
 
@@ -175,11 +249,11 @@ export function define<
 
 export function init<P extends Schema.Decoder<unknown>, M extends Metadata>(
   info: Info<P, M>,
-): Effect.Effect<Def<P, M>> {
+): Effect.Effect<InitializedDef<P, M>> {
   return Effect.gen(function* () {
-    const init = yield* info.init()
+    const initialized = yield* info.init()
     return {
-      ...init,
+      ...initialized,
       id: info.id,
     }
   })

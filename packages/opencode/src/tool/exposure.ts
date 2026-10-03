@@ -12,7 +12,6 @@ export const BUILTIN_LAZY_TOOL_IDS = Object.freeze([
   "sqlite",
   "swarm",
   "sympy",
-  "system-one",
   "test",
 ] as const)
 

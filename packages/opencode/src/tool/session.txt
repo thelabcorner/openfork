@@ -6,8 +6,20 @@ Use one action per call.
 
 Existing-session actions use sessionId as the source of truth. Do not invent or guess a directory for a session.
 
-list discovers sessions. status only reads status. messages only reads existing conversation text.
+list discovers sessions by metadata. search recalls sessions by indexed titles/content and exact tool-call evidence. status only reads status. messages only reads existing conversation text. children inspects a whole supervised cohort at once.
 
 list filters: search, roots, parentId. Use parentId to enumerate the child sessions of one session — subagent/task children appear there, which is how you recover a failed or interrupted task's session id after it scrolled out of context.
+
+search is the preferred cross-session recall surface. It is a bootstrap-free durable index read: it does not open every Session or hydrate transcripts. query searches Session titles plus indexed user/assistant/reasoning/tool-input content. tool searches an exact tool name and returns structurally verified tool-call hits; combine tool + query to find calls whose bounded input contains the query. scope defaults to current and may be current, project, or global; roots, parentId, includeArchived, and limit further bound the search. Results include compact per-session routing rows, granular title/content/part/tool hits, and a coverage object. When coverage.complete is false, the index/candidate bounds did not prove an exhaustive negative; treat zero hits as "not proven" rather than "never happened". Set repairIndex:true to process one small, resumable historical-index chunk on a low-priority connection before retrying; ordinary search never performs maintenance.
+
+children is the preferred supervision inspection surface. Prefer it over issuing one status call plus one messages call per worker. It returns one bounded, compact, structured snapshot of every direct child worker of a parent session in a single tool call:
+
+- parentId: defaults to the CURRENT session, so a supervisor normally omits it. Pass it to inspect another session's children.
+- groupId: restricts the snapshot to one supervision cohort (the assistant-turn-derived supervision group id). Use it to see exactly the workers you launched together.
+- limit: bounded row cap (default 25, hard max 50). When children exceed the cap, the result sets truncated: true.
+
+Each worker entry reports sessionId, mode (foreground | background | supervisor | unknown), agent, description, live status, a conservative blocked classification, and cheap evidence: latest meaningful assistant activity (truncated), last/current tool, pending permission/question signals when available, tokens, cost, updatedAt, and a terminal summary for completed/failed workers. Supervised workers are distinguished from ordinary background/foreground children by mode.
+
+children returns a bounded projection, never transcripts. Full transcript inspection remains available through session messages (action "messages", sessionId).
 
 messages may wait for an already-running Session to become idle before reading when the next step genuinely requires the completed transcript. Waiting never starts, resumes, or otherwise mutates execution.

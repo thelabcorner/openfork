@@ -6,7 +6,6 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { ExchangeAttribution } from "../../src/exchange/attribution"
-import { ExchangeError } from "../../src/exchange/error"
 import { ExchangeFileMutation } from "../../src/exchange/file-mutation"
 import { ExchangeRead } from "../../src/exchange/read"
 import { ExchangeWrite } from "../../src/exchange/write"
@@ -45,6 +44,7 @@ const attributionFor = (projectFolder: string): ExchangeAttribution.Attribution 
   project: "canonical-project",
   projectFolder,
   sourceRef: "ofxp:peer:principal",
+  replayToken: "ofxp:invocation:exact",
 })
 
 const update = (target: string, displayPath: string, before: string, after: string): ExchangeFileMutation.Change => ({
@@ -103,19 +103,46 @@ describe("exchange coding activity", () => {
         expect(empty.committed).toBe(false)
         expect(empty.changes).toHaveLength(0)
 
-        // A stale `before` fails the pre-commit CAS. The strict whole-plan
-        // commit rejects the call, so nothing may be written and nothing may
-        // be recorded.
-        const conflicted = yield* ExchangeFileMutation.commit(fs, [target], {
+        const conflicted = yield* ExchangeFileMutation.commitIndependent(fs, [target], {
           prepare: () => Effect.succeed({ changes: [update(target, "a.txt", "stale\n", "after\n")], value: undefined }),
           revalidate: () => Effect.void,
           beforeCommit: () => Effect.void,
-        }).pipe(Effect.flip)
-        expect(conflicted).toBeInstanceOf(ExchangeError.Conflict)
-        expect(yield* Effect.promise(() => Bun.file(target).text())).toBe("current\n")
+        })
+        expect(conflicted.committed).toBe(false)
+        expect(conflicted.conflicts).toHaveLength(1)
 
         const events = yield* drainCodingActivity(log, "mutation-none")
         expect(events.filter((event) => event.entity === target)).toEqual([])
+      }),
+    ),
+  )
+
+  it.live("ExchangeFileMutation.commitIndependent records only accepted siblings", () =>
+    withTmp((dir) =>
+      Effect.gen(function* () {
+        const fs = yield* FSUtil.Service
+        const accepted = path.join(dir, "accepted.txt")
+        const raced = path.join(dir, "raced.txt")
+        yield* Effect.promise(() => Bun.write(accepted, "alpha\n"))
+        yield* Effect.promise(() => Bun.write(raced, "bravo-raced\n"))
+        const log = yield* subscribeCodingActivity
+        const changes = [
+          update(accepted, "accepted.txt", "alpha\n", "ALPHA\n"),
+          update(raced, "raced.txt", "bravo\n", "BRAVO\n"),
+        ]
+
+        const result = yield* ExchangeFileMutation.commitIndependent(fs, [accepted, raced], {
+          prepare: () => Effect.succeed({ changes, value: undefined }),
+          revalidate: () => Effect.void,
+          beforeCommit: () => Effect.void,
+        })
+        expect(result.committed).toBe(true)
+        expect(result.changes.map((change) => change.displayPath)).toEqual(["accepted.txt"])
+        expect(result.conflicts.map((conflict) => conflict.change.displayPath)).toEqual(["raced.txt"])
+
+        const events = yield* drainCodingActivity(log, "mutation-independent")
+        expect(events.filter((event) => event.entity === accepted)).toHaveLength(1)
+        expect(events.filter((event) => event.entity === raced)).toEqual([])
       }),
     ),
   )
@@ -316,7 +343,7 @@ describe("exchange coding activity", () => {
         )
         expect(empty.committed).toBe(false)
 
-        const conflicted = yield* ExchangeFileMutation.commit(
+        const conflicted = yield* ExchangeFileMutation.commitIndependent(
           fs,
           [target],
           {
@@ -327,9 +354,9 @@ describe("exchange coding activity", () => {
           },
           undefined,
           attribution,
-        ).pipe(Effect.flip)
-        expect(conflicted).toBeInstanceOf(ExchangeError.Conflict)
-        expect(yield* Effect.promise(() => Bun.file(target).text())).toBe("current\n")
+        )
+        expect(conflicted.committed).toBe(false)
+        expect(conflicted.conflicts).toHaveLength(1)
 
         const noop = yield* ExchangeWrite.execute(
           fs,

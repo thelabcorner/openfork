@@ -8,6 +8,7 @@ import { Global } from "@opencode-ai/core/global"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { OxpError } from "./error"
+import { OxpModelSelection } from "./model-selection"
 import { OxpSchema } from "./schema"
 
 type LoadState =
@@ -20,6 +21,15 @@ export interface Interface {
   readonly update: (fn: (current: OxpSchema.Config) => OxpSchema.Config) => Effect.Effect<OxpSchema.Config, OxpError.Error>
   readonly setEnabled: (enabled: boolean) => Effect.Effect<OxpSchema.Config, OxpError.Error>
   readonly setGrant: (patch: Partial<OxpSchema.Grant>) => Effect.Effect<OxpSchema.Config, OxpError.Error>
+  /** Durable OXP delegation preference. This is not a provider/model allowlist. */
+  readonly setWorkerDefaultModel: (
+    model: OxpSchema.ModelSelection | undefined,
+  ) => Effect.Effect<OxpSchema.Config, OxpError.Error>
+  /** Durable root-scoped OXP agent preference. This is not agent authorization. */
+  readonly setWorkerDefaultAgent: (
+    rootID: OxpSchema.RootID,
+    agent: string | undefined,
+  ) => Effect.Effect<OxpSchema.Config, OxpError.Error>
   readonly subscribe: (listener: (config: OxpSchema.Config) => void) => Effect.Effect<() => void>
 }
 
@@ -29,22 +39,61 @@ export const use = serviceUse(Service)
 function freezeConfig(config: OxpSchema.Config): OxpSchema.Config {
   // New default-off grants are materialized in memory so older, otherwise valid
   // oxp.json documents remain compatible without an eager disk rewrite.
-  const { workerPolicy: _legacyWorkerPolicy, ...rest } = config
   const normalized = {
-    ...rest,
+    ...config,
     grant: {
       ...config.grant,
       automation: config.grant.automation ?? false,
     },
+    // models/agents are retained only for on-disk compatibility with the old
+    // selection-authorization design. Defaults remain active preferences.
+    workerPolicy: config.workerPolicy ?? {
+      models: [],
+      agents: [],
+      agentRoots: [],
+    },
   } satisfies OxpSchema.Config
   Object.freeze(normalized.connector)
   Object.freeze(normalized.grant)
+  for (const model of normalized.workerPolicy.models) Object.freeze(model)
+  Object.freeze(normalized.workerPolicy.models)
+  Object.freeze(normalized.workerPolicy.agents)
+  for (const scoped of normalized.workerPolicy.agentRoots ?? []) {
+    Object.freeze(scoped.agents)
+    Object.freeze(scoped)
+  }
+  if (normalized.workerPolicy.agentRoots) Object.freeze(normalized.workerPolicy.agentRoots)
+  if (normalized.workerPolicy.defaultModel) Object.freeze(normalized.workerPolicy.defaultModel)
+  Object.freeze(normalized.workerPolicy)
   for (const root of normalized.roots) {
     if (root.sources) Object.freeze(root.sources)
     Object.freeze(root)
   }
   Object.freeze(normalized.roots)
   return Object.freeze(normalized)
+}
+
+/**
+ * Pre-root-scoping configs stored one connector-global defaultAgent. Freeze
+ * that preference onto roots that already exist the first time worker-agent
+ * preferences are mutated. Newly approved roots never inherit it implicitly.
+ *
+ * Legacy models/agents arrays are preserved byte-for-byte for compatibility;
+ * runtime delegation no longer treats either array as authorization.
+ */
+export function scopeLegacyWorkerAgentPolicy(
+  config: OxpSchema.Config,
+): OxpSchema.WorkerPolicy {
+  const policy = config.workerPolicy ?? { models: [], agents: [] }
+  if (policy.agentRoots !== undefined) return policy
+  return {
+    ...policy,
+    agentRoots: config.roots.map((root) => ({
+      rootID: root.id,
+      agents: [...policy.agents],
+      ...(policy.defaultAgent ? { defaultAgent: policy.defaultAgent } : {}),
+    })),
+  }
 }
 
 function semantic(config: OxpSchema.Config) {
@@ -202,6 +251,64 @@ const layer = Layer.effect(
       })
     })
 
+    const setWorkerDefaultModel = Effect.fn("OxpConfig.setWorkerDefaultModel")(
+      function* (model: OxpSchema.ModelSelection | undefined) {
+        return yield* update((current) => {
+          const policy = current.workerPolicy ?? {
+            models: [],
+            agents: [],
+            agentRoots: [],
+          }
+          const normalized = model
+            ? OxpModelSelection.normalize(model)
+            : undefined
+          return {
+            ...current,
+            workerPolicy: {
+              ...policy,
+              ...(normalized
+                ? { defaultModel: { ...normalized } }
+                : { defaultModel: undefined }),
+            },
+          }
+        })
+      },
+    )
+
+    const setWorkerDefaultAgent = Effect.fn("OxpConfig.setWorkerDefaultAgent")(
+      function* (rootID: OxpSchema.RootID, agent: string | undefined) {
+        return yield* update((current) => {
+          if (!current.roots.some((root) => root.id === rootID)) {
+            throw new OxpError.RootNotFound({
+              detail: "Approved root does not exist",
+            })
+          }
+          const policy = scopeLegacyWorkerAgentPolicy(current)
+          const currentRoot =
+            policy.agentRoots?.find((entry) => entry.rootID === rootID) ?? {
+              rootID,
+              agents: [],
+            }
+          const nextRoot: OxpSchema.WorkerAgentRootPolicy = {
+            ...currentRoot,
+            ...(agent ? { defaultAgent: agent } : { defaultAgent: undefined }),
+          }
+          return {
+            ...current,
+            workerPolicy: {
+              ...policy,
+              agentRoots: [
+                ...(policy.agentRoots ?? []).filter(
+                  (entry) => entry.rootID !== rootID,
+                ),
+                nextRoot,
+              ],
+            },
+          }
+        })
+      },
+    )
+
 
     const subscribe = Effect.fn("OxpConfig.subscribe")(function* (listener: (config: OxpSchema.Config) => void) {
       listeners.add(listener)
@@ -216,6 +323,8 @@ const layer = Layer.effect(
       update,
       setEnabled,
       setGrant,
+      setWorkerDefaultModel,
+      setWorkerDefaultAgent,
       subscribe,
     })
   }),

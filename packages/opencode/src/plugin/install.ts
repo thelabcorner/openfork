@@ -19,6 +19,8 @@ import { parsePluginSpecifier, readPackageThemes, readPluginPackage, resolvePlug
 type Mode = "noop" | "add" | "replace"
 type Kind = "server" | "tui"
 
+export type PatchConfigName = typeof CONFIG_BASENAME | "tui"
+
 export type Target = {
   kind: Kind
   opts?: Record<string, unknown>
@@ -32,7 +34,7 @@ export type PatchDeps = {
   readText: (file: string) => Promise<string>
   write: (file: string, text: string) => Promise<void>
   exists: (file: string) => Promise<boolean>
-  files: (dir: string, name: "opencode" | "tui") => string[]
+  files: (dir: string, name: PatchConfigName) => string[]
 }
 
 export type PatchInput = {
@@ -338,7 +340,7 @@ function patchDir(input: PatchInput) {
   return ConfigPaths.projectConfigDirectory(root)
 }
 
-function patchName(kind: Kind): typeof CONFIG_BASENAME | "tui" {
+function patchName(kind: Kind): PatchConfigName {
   if (kind === "server") return CONFIG_BASENAME
   return "tui"
 }

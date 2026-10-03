@@ -1,27 +1,39 @@
 import { NodeHttpServer } from "@effect/platform-node"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionStatus } from "../../src/session/status"
 import { describe, expect } from "bun:test"
 import { Context, DateTime, Effect, Layer, Option, Ref } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { Credential } from "@opencode-ai/core/credential"
+import { DirectoryActivityFence } from "@opencode-ai/core/directory-activity-fence"
 import { EventV2 } from "@opencode-ai/core/event"
+import { GlobalIntegrationAuth } from "@opencode-ai/core/integration/global-auth"
 import { OfxpInvocation } from "@opencode-ai/core/ofxp-invocation"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmProfilePreflight } from "../../src/swarm/profile-preflight"
+import { Integration } from "@opencode-ai/schema/integration"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { ForkCredentials } from "../../src/fork/credentials"
 import { Capacity } from "../../src/capacity/capacity"
+import * as GeneralUsage from "../../src/capacity/general-usage"
+import { InstanceStore } from "../../src/project/instance-store"
 import { OfxpRuntime } from "../../src/ofxp/runtime"
 import { OfxpRoot } from "../../src/ofxp/root"
 import { Usage } from "../../src/usage/usage"
@@ -32,8 +44,11 @@ import { ServerAuth } from "../../src/server/auth"
 import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { OfxpPaths } from "../../src/server/routes/instance/httpapi/groups/ofxp"
+import { ProviderSettingsPaths } from "../../src/server/routes/instance/httpapi/groups/provider-settings"
+import { UsagePaths } from "../../src/server/routes/instance/httpapi/groups/usage"
 import { controlHandlers } from "../../src/server/routes/instance/httpapi/handlers/control"
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
+import { directoryActivityFenceHandlers } from "../../src/server/routes/instance/httpapi/handlers/directory-activity-fence"
 import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi/handlers/fork-credential"
 import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { ofxpHandlers } from "../../src/server/routes/instance/httpapi/handlers/ofxp"
@@ -42,9 +57,9 @@ import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { WakaTimePaths } from "../../src/server/routes/instance/httpapi/groups/wakatime"
 import { wakatimeHandlers } from "../../src/server/routes/instance/httpapi/handlers/wakatime"
-import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
@@ -54,6 +69,10 @@ const capturedTaskCreate = Ref.makeUnsafe<Record<string, unknown> | undefined>(u
 const capturedOfxpRotations = Ref.makeUnsafe(0)
 const capturedOfxpRotationFinalizations = Ref.makeUnsafe(0)
 const capturedOfxpServerSeeds = Ref.makeUnsafe<ReadonlyArray<Record<string, unknown>>>([])
+const providerSettingsAttemptID = Integration.AttemptID.create()
+const providerSettingsAttemptTime = { created: 100, expires: 600_100 }
+const providerSettingsOauthCompletes = Ref.makeUnsafe(0)
+const providerSettingsOauthCancels = Ref.makeUnsafe(0)
 const ofxpActivityPeerID = Ofxp.PeerID.make(`ofxp_${"B".repeat(43)}`)
 const ofxpActivityReceipt: Ofxp.InvocationReceipt = {
   invocationID: Ofxp.InvocationID.create(),
@@ -98,8 +117,8 @@ const httpTask = Swarm.Task.make({
 
 /**
  * Core owns the exporter. The transport mock therefore exposes exactly the Core
- * `Status` shape - enabled/configured plus the optional resolved CLI and its
- * source - and nothing else. There is deliberately no credential mutation here:
+ * `Status` shape — enabled/configured plus the optional resolved CLI and its
+ * source — and nothing else. There is deliberately no credential mutation here:
  * enablement authority is the only writable fact on this surface.
  */
 const instanceLoads = Ref.makeUnsafe(0)
@@ -135,6 +154,7 @@ const apiLayer = HttpRouter.serve(
     Layer.provide([
       controlHandlers,
       controlPlaneHandlers,
+      directoryActivityFenceHandlers,
       forkCredentialHandlers,
       globalHandlers,
       ofxpHandlers,
@@ -152,7 +172,13 @@ const apiLayer = HttpRouter.serve(
   ),
   { disableListenLog: true, disableLogger: true },
 ).pipe(
-  Layer.provideMerge(NodeHttpServer.layerTest),
+    Layer.provideMerge(NodeHttpServer.layerTest),
+    // Root census is owned by durable storage, not a workspace Session mock.
+    Layer.provide(AppNodeBuilder.build(Database.node)),
+    Layer.provide(Layer.mergeAll(
+      Layer.mock(SessionExecutionOwner.Service)({}),
+      Layer.mock(SessionStatus.Service)({}),
+    )),
   Layer.provide(
     Layer.mock(Auth.Service)({
       all: () => Effect.succeed({}),
@@ -193,9 +219,16 @@ const apiLayer = HttpRouter.serve(
           routed: [],
           accounts: [],
         }),
+      general: () => Effect.succeed(GeneralUsage.build([])),
+      providers: () => Effect.succeed({ providers: [], generalUsage: GeneralUsage.build([]) }),
     }),
   ),
   Layer.provide(Layer.mock(MoveSession.Service)({})),
+  Layer.provide(
+    Layer.mock(DirectoryActivityFence.Service, {
+      acquire: () => Effect.succeed({ state: "blocked" as const, blocked: [], executing: [] }),
+    }),
+  ),
   Layer.provide(
     Layer.mock(ModelsDev.Service)({
       get: () => Effect.succeed({}),
@@ -208,9 +241,48 @@ const apiLayer = HttpRouter.serve(
     }),
   ),
   Layer.provide(
-    Layer.mock(EventV2.Service)({
-      publish: () => Effect.succeed({} as never),
-    }),
+    Layer.mergeAll(
+      Layer.mock(EventV2.Service)({
+        publish: () => Effect.succeed({} as never),
+      }),
+      Layer.mock(GlobalIntegrationAuth.Service)({
+        methods: (integrationID) =>
+          Effect.succeed(
+            integrationID === Integration.ID.make("opencode")
+              ? [
+                  {
+                    id: Integration.MethodID.make("device"),
+                    type: "oauth" as const,
+                    label: "OpenCode Console account",
+                  },
+                  {
+                    type: "key" as const,
+                    label: "API key (service account)",
+                  },
+                ]
+              : [],
+          ),
+        oauth: () =>
+          Effect.succeed(
+            new Integration.Attempt({
+              attemptID: providerSettingsAttemptID,
+              url: "https://opencode.ai/console/device?user_code=TIER0",
+              instructions: "Enter code: TIER0",
+              mode: "auto",
+              time: providerSettingsAttemptTime,
+            }),
+          ),
+        attempt: {
+          status: () =>
+            Effect.succeed({
+              status: "pending" as const,
+              time: providerSettingsAttemptTime,
+            }),
+          complete: () => Ref.update(providerSettingsOauthCompletes, (count) => count + 1),
+          cancel: () => Ref.update(providerSettingsOauthCancels, (count) => count + 1),
+        },
+      }),
+    ),
   ),
   Layer.provide([
     Layer.mock(OfxpInvocation.Service)({
@@ -355,10 +427,15 @@ const apiLayer = HttpRouter.serve(
       listGlobal: () => Effect.succeed([]),
     }),
   ),
-  Layer.provide(Layer.mock(ScheduledTask.Service)({})),
-  Layer.provide(Layer.mock(ScheduledTaskSessionBinding.Service)({})),
   Layer.provide(
-    Layer.mock(SwarmV2.Service)({
+    Layer.mergeAll(
+      Layer.mock(ScheduledTask.Service)({}),
+      Layer.mock(ScheduledTaskSessionBinding.Service)({}),
+    ),
+  ),
+  Layer.provide(
+    Layer.mergeAll(
+      Layer.mock(SwarmV2.Service)({
       summaries: () => Effect.succeed([]),
       info: (id) => Effect.succeed({ id } as never),
       update: (input) =>
@@ -382,13 +459,32 @@ const apiLayer = HttpRouter.serve(
         Ref.set(capturedTaskCreate, input as unknown as Record<string, unknown>).pipe(
           Effect.as(httpTask),
         ),
-    }),
+      }),
+      Layer.mock(SwarmProfilePreflight.Service)({
+        check: ({ profile }) =>
+          profile.agent === "build" && profile.model.providerID === "test"
+            ? Effect.succeed({ model: undefined as never })
+            : Effect.die("unexpected Swarm profile preflight in Tier-0 route test"),
+      }),
+    ),
   ),
   Layer.provide(
     Layer.mock(SwarmMemberSessionWake.Service)({
       request: () => Effect.succeed(false),
     }),
   ),
+  // Tier-0 WakaTime service with observable behavior. The mock never loads an
+  // Instance; the InstanceStore probe below turns any accidental bootstrap
+  // into an explicit, attributable failure.
+  Layer.provide(
+    Layer.mock(InstanceStore.Service, {
+      load: () =>
+        Ref.update(instanceLoads, (count) => count + 1).pipe(
+          Effect.andThen(Effect.die("Tier-0 WakaTime routes must never load an Instance")),
+        ),
+    }),
+  ),
+).pipe(
   Layer.provide(
     Layer.mock(WakaTime.Service)({
       status: () => Ref.get(wakatimeState).pipe(Effect.map(wakatimeStatus)),
@@ -418,23 +514,61 @@ const apiLayer = HttpRouter.serve(
       invocations: () =>
         Effect.succeed({ items: [], links: [], more: false }),
       resource: () => Effect.succeed([]),
+      invocationDetail: () => Effect.succeed(undefined),
     }),
   ),
+  Layer.provide(Layer.mock(OxpAttribution.Service)({})),
   Layer.provide(
-    Layer.mock(RevisionDraft.Service)({
-      recover: () => Effect.succeed(undefined),
-      consume: () => Effect.void,
-    }),
+    Layer.mergeAll(
+      Layer.mock(RevisionDraft.Service)({
+        recover: () => Effect.succeed(undefined),
+        consume: () => Effect.void,
+      }),
+      Layer.mock(Usage.Service)({
+        summary: () => Effect.die("unused usage summary"),
+        modelProfile: () => Effect.succeed({ models: [] }),
+        pricingCatalog: () => Effect.succeed({ models: [] }),
+        sessionContext: (sessionID) =>
+          Effect.succeed({
+            sessionID,
+            createdAt: 100,
+            updatedAt: 200,
+            counts: { all: 3, user: 1, assistant: 1 },
+            systemPrompt: null,
+            totals: {
+              messages: 1,
+              toolCalls: 0,
+              cost: 0,
+              freeMessages: 1,
+              tokens: { input: 12, cacheRead: 0, cacheWrite: 0, output: 4, reasoning: 0 },
+              freeTokens: { input: 12, cacheRead: 0, cacheWrite: 0, output: 4, reasoning: 0 },
+              generatedMs: 10,
+              toolMs: 0,
+              ttftMs: 2,
+              ttftRecords: 1,
+              upstreamTTFTMs: 1,
+              upstreamTTFTRecords: 1,
+            },
+            models: [],
+            breakdown: {
+              system: 0,
+              user: 12,
+              synthetic: 0,
+              shell: 0,
+              compaction: 0,
+              assistant: 4,
+              tool: 0,
+              other: 0,
+            },
+          }),
+        recordMaintenance: () => Effect.void,
+      }),
+      Layer.mock(SessionTelemetry.Service)({
+        snapshot: () => Effect.succeed({}),
+      }),
+      ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode", publicUrl: "" }),
+    ),
   ),
-  Layer.provide(
-    Layer.mock(Usage.Service)({
-      summary: () => Effect.die("unused usage summary"),
-      modelProfile: () => Effect.succeed({ models: [] }),
-      pricingCatalog: () => Effect.succeed({ models: [] }),
-      recordMaintenance: () => Effect.void,
-    }),
-  ),
-  Layer.provide(ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode", publicUrl: "" })),
 )
 
 const it = testEffect(apiLayer)
@@ -448,6 +582,22 @@ describe("Tier-0 root ownership", () => {
     }),
   )
 
+  it.live("serves the directory activity fence route without any workspace runtime", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.post("/experimental/directory-activity-fence/acquire").pipe(
+        HttpClientRequest.setBody(HttpBody.jsonUnsafe({ guardId: "guard-tier0", directories: ["/one", "/two"] })),
+        HttpClient.execute,
+      )
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        fenceProtocolVersion: 1,
+        state: "blocked",
+        blocked: [],
+        executing: [],
+      })
+    }),
+  )
+
   it.live("serves provider settings models without a workspace runtime", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.get("/provider-settings/models").pipe(HttpClient.execute)
@@ -456,11 +606,129 @@ describe("Tier-0 root ownership", () => {
     }),
   )
 
+  it.live("serves provider auth methods without a workspace runtime", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get(
+        ProviderSettingsPaths.auth.replace(":providerID", "opencode"),
+      ).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        methods: [
+          {
+            id: "device",
+            type: "oauth",
+            label: "OpenCode Console account",
+          },
+          {
+            type: "key",
+            label: "API key (service account)",
+          },
+        ],
+      })
+    }),
+  )
+
+  it.live("runs the provider OAuth attempt lifecycle without a workspace runtime", () =>
+    Effect.gen(function* () {
+      yield* Ref.set(providerSettingsOauthCompletes, 0)
+      yield* Ref.set(providerSettingsOauthCancels, 0)
+
+      const start = yield* HttpClientRequest.post(
+        ProviderSettingsPaths.connectOauth.replace(":providerID", "opencode"),
+      ).pipe(
+        HttpClientRequest.setBody(
+          HttpBody.jsonUnsafe({
+            methodID: "device",
+            inputs: {},
+            label: "Personal",
+          }),
+        ),
+        HttpClient.execute,
+      )
+      expect(start.status).toBe(200)
+      expect(yield* start.json).toEqual({
+        attemptID: providerSettingsAttemptID,
+        url: "https://opencode.ai/console/device?user_code=TIER0",
+        instructions: "Enter code: TIER0",
+        mode: "auto",
+        time: providerSettingsAttemptTime,
+      })
+
+      const status = yield* HttpClientRequest.get(
+        ProviderSettingsPaths.oauthAttempt.replace(":attemptID", providerSettingsAttemptID),
+      ).pipe(HttpClient.execute)
+      expect(status.status).toBe(200)
+      expect(yield* status.json).toEqual({
+        status: "pending",
+        time: providerSettingsAttemptTime,
+      })
+
+      const complete = yield* HttpClientRequest.post(
+        ProviderSettingsPaths.oauthComplete.replace(":attemptID", providerSettingsAttemptID),
+      ).pipe(
+        HttpClientRequest.setBody(HttpBody.jsonUnsafe({})),
+        HttpClient.execute,
+      )
+      expect(complete.status).toBe(204)
+      expect(yield* Ref.get(providerSettingsOauthCompletes)).toBe(1)
+
+      const cancel = yield* HttpClientRequest.delete(
+        ProviderSettingsPaths.oauthAttempt.replace(":attemptID", providerSettingsAttemptID),
+      ).pipe(HttpClient.execute)
+      expect(cancel.status).toBe(204)
+      expect(yield* Ref.get(providerSettingsOauthCancels)).toBe(1)
+    }),
+  )
+
   it.live("serves usage model profile without a workspace runtime", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.get("/usage/model-profile").pipe(HttpClient.execute)
       expect(response.status).toBe(200)
       expect(yield* response.json).toEqual({ models: [] })
+    }),
+  )
+
+  it.live("serves session context without InstanceStore or a workspace runtime", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get(
+        UsagePaths.sessionContext.replace(":sessionID", "ctx-root"),
+      ).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({
+        history: {
+          sessionID: "ctx-root",
+          createdAt: 100,
+          updatedAt: 200,
+          counts: { all: 3, user: 1, assistant: 1 },
+          systemPrompt: null,
+          totals: {
+            messages: 1,
+            toolCalls: 0,
+            cost: 0,
+            freeMessages: 1,
+            tokens: { input: 12, cacheRead: 0, cacheWrite: 0, output: 4, reasoning: 0 },
+            freeTokens: { input: 12, cacheRead: 0, cacheWrite: 0, output: 4, reasoning: 0 },
+            generatedMs: 10,
+            toolMs: 0,
+            ttftMs: 2,
+            ttftRecords: 1,
+            upstreamTTFTMs: 1,
+            upstreamTTFTRecords: 1,
+          },
+          models: [],
+          breakdown: {
+            system: 0,
+            user: 12,
+            synthetic: 0,
+            shell: 0,
+            compaction: 0,
+            assistant: 4,
+            tool: 0,
+            other: 0,
+          },
+        },
+        telemetry: null,
+      })
     }),
   )
 
@@ -490,7 +758,27 @@ describe("Tier-0 root ownership", () => {
         priorFetchedAt: 0,
         routed: [],
         accounts: [],
+        providers: [
+          {
+            providerName: "OpenCode Go",
+            quotaProviderID: "opencode-go",
+            modelProviderIDs: ["opencode-go"],
+            status: "ok",
+            estimates: [],
+            defaultEstimates: [],
+            accounts: [],
+          },
+        ],
+        generalUsage: GeneralUsage.build([]),
       })
+    }),
+  )
+
+  it.live("serves generalized usage without provider quota fan-out or a workspace runtime", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get("/fork/general-usage").pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual(GeneralUsage.build([]))
     }),
   )
 

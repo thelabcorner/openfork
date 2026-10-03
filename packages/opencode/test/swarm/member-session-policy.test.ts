@@ -7,9 +7,9 @@ import { Provider } from "@/provider/provider"
 import {
   effectiveBoundary,
   sessionIDForBinding,
-  unsupportedCapabilities,
   worktreeNameForMember,
 } from "@/swarm/member-session"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 
 const profile = Swarm.MemberExecutionProfile.make({
   agent: Agent.ID.make("build"),
@@ -39,7 +39,7 @@ describe("Swarm managed-member policy", () => {
     expect(effectiveBoundary(profile, { mode: "shared-write" })).toEqual([...profile.permissionBoundary])
   })
 
-  test("capability validation fails closed for unknown or unsupported requests", () => {
+  test("model-requirement validation fails closed for unsupported or unknown requests", () => {
     const model = {
       capabilities: {
         toolcall: true,
@@ -51,11 +51,21 @@ describe("Swarm managed-member policy", () => {
       },
     } as Provider.Model
 
-    expect(unsupportedCapabilities(model, ["tools", "image", "pdf", "output:text"])).toEqual([])
-    expect(unsupportedCapabilities(model, ["reasoning", "output:image", "future-capability"])).toEqual([
+    expect(
+      SwarmProfilePreflight.unsupportedModelRequirements(model, [
+        "toolcall",
+        "input_image",
+        "input_pdf",
+        "output_text",
+      ]),
+    ).toEqual([])
+    // A requirement outside the closed vocabulary is unrepresentable in the
+    // contract, so it can never reach this comparison as a "future-capability"
+    // string the way the retired free-form field could.
+    expect(SwarmProfilePreflight.unsupportedModelRequirements(model, ["reasoning", "output_image", "input_audio"])).toEqual([
       "reasoning",
-      "output:image",
-      "future-capability",
+      "output_image",
+      "input_audio",
     ])
   })
 })

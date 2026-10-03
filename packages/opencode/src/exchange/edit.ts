@@ -55,6 +55,7 @@ export interface ExecuteInput extends Input {
   readonly groundedFingerprint?: string
   readonly ungroundedWarning?: string
   readonly signal?: AbortSignal
+  /** Optional boundary attribution folded into the single write record. */
   readonly attribution?: ExchangeAttribution.Attribution
 }
 
@@ -111,7 +112,10 @@ function shape(input: Input) {
       throw new ExchangeError.InvalidArgument({ detail: "Exact edit requires both oldString and newString" })
     }
     if (input.oldString === "") {
-      throw new ExchangeError.InvalidArgument({ detail: "Edit does not create files with an empty oldString; use patch add-file semantics" })
+      throw new ExchangeError.InvalidArgument({
+        detail:
+          "An empty oldString is ambiguous for an existing file. Use edit.content for full replacement, or provide a non-empty oldString for surgical editing.",
+      })
     }
     return "exact" as const
   }
@@ -207,7 +211,13 @@ export function execute<E>(
   return Effect.gen(function* () {
     if (input.signal?.aborted) return yield* new ExchangeError.Cancelled({ detail: "Edit was cancelled" })
     const initialStat = yield* fs.stat(input.canonicalPath).pipe(
-      Effect.mapError(() => new ExchangeError.NotFound({ detail: `Edit target does not exist: ${input.displayPath}` })),
+      Effect.mapError(
+        () =>
+          new ExchangeError.NotFound({
+            detail:
+              `Edit target does not exist: ${input.displayPath}. The OXP adapter may self-heal creation-shaped requests through atomic write semantics.`,
+          }),
+      ),
     )
     if (initialStat.type !== "File") {
       return yield* new ExchangeError.InvalidArgument({ detail: `Edit target is not a file: ${input.displayPath}` })

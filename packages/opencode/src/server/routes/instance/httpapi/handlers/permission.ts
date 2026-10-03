@@ -1,41 +1,22 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { Permission } from "@/permission"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { PermissionNotFoundError } from "../errors"
+import { PendingResponseRegistry } from "@/server/pending-response-registry"
+import { WorkspaceRouteContext } from "../middleware/workspace-routing"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 
 export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
   Effect.gen(function* () {
-    const svc = yield* Permission.Service
+    const responses = yield* PendingResponseRegistry.Service
 
     const list = Effect.fn("PermissionHttpApi.list")(function* () {
-      return yield* svc.list()
+      const route = yield* WorkspaceRouteContext
+      return (yield* responses.list({ kind: "permission", directory: FSUtil.resolve(route.directory) })) as ReadonlyArray<
+        typeof PermissionV1.Request.Type
+      >
     })
 
-    const reply = Effect.fn("PermissionHttpApi.reply")(function* (ctx: {
-      params: { requestID: PermissionV1.ID }
-      payload: PermissionV1.ReplyBody
-    }) {
-      yield* svc
-        .reply({
-          requestID: ctx.params.requestID,
-          reply: ctx.payload.reply,
-          message: ctx.payload.message,
-        })
-        .pipe(
-          Effect.catchTag("Permission.NotFoundError", (error) =>
-            Effect.fail(
-              new PermissionNotFoundError({
-                requestID: String(error.requestID),
-                message: `Permission request not found: ${error.requestID}`,
-              }),
-            ),
-          ),
-        )
-      return true
-    })
-
-    return handlers.handle("list", list).handle("reply", reply)
+    return handlers.handle("list", list)
   }),
 )

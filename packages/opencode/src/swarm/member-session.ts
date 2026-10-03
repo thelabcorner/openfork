@@ -13,9 +13,8 @@ import { SwarmSchema } from "@opencode-ai/core/swarm/schema"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceRef } from "@/effect/instance-ref"
-import { Agent } from "@/agent/agent"
-import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { Worktree } from "@/worktree"
 import { Git } from "@/git"
 import { eq } from "drizzle-orm"
@@ -43,54 +42,6 @@ export function effectiveBoundary(
     { action: "edit", resource: "*", effect: "deny" as const },
     { action: "bash", resource: "*", effect: "deny" as const },
   ]
-}
-
-type ProviderModel = Provider.Model
-
-function supportsCapability(model: ProviderModel, capability: string) {
-  switch (capability.trim().toLowerCase()) {
-    case "tools":
-    case "toolcall":
-      return model.capabilities.toolcall
-    case "reasoning":
-      return model.capabilities.reasoning
-    case "attachment":
-      return model.capabilities.attachment
-    case "temperature":
-      return model.capabilities.temperature
-    case "text":
-    case "input:text":
-      return model.capabilities.input.text
-    case "audio":
-    case "input:audio":
-      return model.capabilities.input.audio
-    case "image":
-    case "input:image":
-      return model.capabilities.input.image
-    case "video":
-    case "input:video":
-      return model.capabilities.input.video
-    case "pdf":
-    case "input:pdf":
-      return model.capabilities.input.pdf
-    case "output:text":
-      return model.capabilities.output.text
-    case "output:audio":
-      return model.capabilities.output.audio
-    case "output:image":
-      return model.capabilities.output.image
-    case "output:video":
-      return model.capabilities.output.video
-    case "output:pdf":
-      return model.capabilities.output.pdf
-    default:
-      return false
-  }
-}
-
-export function unsupportedCapabilities(model: ProviderModel, requested: readonly string[] | undefined) {
-  if (!requested?.length) return []
-  return [...new Set(requested.filter((item) => !supportsCapability(model, item)))]
 }
 
 export class MaterializationError extends Schema.TaggedErrorClass<MaterializationError>()(
@@ -142,9 +93,8 @@ export const layer = Layer.effect(
     const { readDb } = yield* Database.Service
     const store = yield* InstanceStore.Service
     const fs = yield* FSUtil.Service
-    const agents = yield* Agent.Service
-    const providers = yield* Provider.Service
     const sessions = yield* Session.Service
+    const profilePreflight = yield* SwarmProfilePreflight.Service
     const worktrees = yield* Worktree.Service
     const git = yield* Git.Service
 
@@ -191,37 +141,13 @@ export const layer = Layer.effect(
       directory: string,
       profile: SwarmModel.MemberExecutionProfile,
     ) {
+      // Delegate creation already ran the identical preflight before the first
+      // durable write. Repeating it here through the same shared owner is what
+      // keeps a recovery pass, a catalog drift, or a member reconfigure from
+      // binding a Session the selected model cannot serve.
       return yield* store
-        .provide(
-          { directory },
-          Effect.gen(function* () {
-            const agent = yield* agents.get(profile.agent)
-            if (!agent) return yield* fail(target, `Agent not found: ${profile.agent}`)
-            const model = yield* providers.getModel(profile.model.providerID, profile.model.id, profile.model.accountID)
-            const variant = profile.model.variant
-            if (variant && variant !== "default" && !model.variants?.[variant]) {
-              return yield* fail(
-                target,
-                `Model ${profile.model.providerID}/${profile.model.id} does not publish variant ${variant}.`,
-              )
-            }
-            const unsupported = unsupportedCapabilities(model, profile.requestedCapabilities)
-            if (unsupported.length > 0) {
-              return yield* fail(
-                target,
-                `Model ${profile.model.providerID}/${profile.model.id} does not satisfy requested capabilities: ${unsupported.join(", ")}.`,
-              )
-            }
-            return model
-          }),
-        )
-        .pipe(
-          Effect.catch((error) =>
-            error instanceof MaterializationError
-              ? Effect.fail(error)
-              : Effect.fail(fail(target, error instanceof Error ? error.message : String(error))),
-          ),
-        )
+        .provide({ directory }, profilePreflight.check({ directory, profile }))
+        .pipe(Effect.catch((error) => Effect.fail(fail(target, error.reason))))
     })
 
     const resetCreatedWorktree = Effect.fn("SwarmMemberSession.resetCreatedWorktree")(function* (
@@ -446,6 +372,18 @@ export const layer = Layer.effect(
       }
       const profile = target.member.desiredProfile
       if (!profile) return yield* fail(target, "Managed worker has no desired execution profile.")
+      // A legacy profile value this runtime cannot map onto the closed
+      // ModelRequirement vocabulary is not permission to run anyway. Refusing
+      // here is the fail-closed half of the compatibility boundary: honoring it
+      // as a requirement would strand the member forever, dropping it would
+      // silently weaken a real historical constraint.
+      const unproven = target.member.capabilities?.legacyUnprovenRequirements ?? []
+      if (unproven.length > 0) {
+        return yield* fail(
+          target,
+          `Stored execution profile carries unprovable legacy requirements (${unproven.join("; ")}). Reconfigure this member's model requirements before materializing it.`,
+        )
+      }
       const resolved = yield* resolveDirectory(target)
       yield* validateProfile(target, resolved.directory, profile)
       return yield* createAndBind(target, profile, resolved.directory, resolved.reusedWorktree)
@@ -522,8 +460,7 @@ export const node = makeGlobalNode({
     Database.node,
     InstanceStore.node,
     FSUtil.node,
-    Agent.node,
-    Provider.node,
+    SwarmProfilePreflight.node,
     Session.node,
     Worktree.node,
     Git.node,

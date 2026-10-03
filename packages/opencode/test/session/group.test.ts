@@ -501,7 +501,6 @@ it.instance("couples the reusable Goal Auditor child into the parent subagent gr
         title: "Audited Goal",
         objective: "Keep one durable auditor transcript",
         criteria: ["Auditor is coupled to the parent Session"],
-        continuationPolicy: {},
       })
       .pipe(Effect.orDie)
     const active = yield* goals
@@ -527,6 +526,7 @@ it.instance("couples the reusable Goal Auditor child into the parent subagent gr
       origin: "goal_auditor",
       originRef: `goal:${active.goal.id}`,
       parentID: parent.id,
+      specialAgent: "goal_auditor",
     })
 
     if (!detail) throw new Error("Goal Auditor group was not attached")
@@ -570,7 +570,12 @@ it.instance("couples generic special-agent children as locked special_agent memb
       origin: "special_agent",
       originRef: "prompt_revisor:owner-1",
       parentID: parent.id,
+      specialAgent: "prompt_revisor",
     })
+    // The parent is an ordinary worker, not a special agent, even though it
+    // anchors the group that contains one — classification must come from its
+    // own metadata, never from group membership or title text.
+    expect(revisorDetail?.sessions.find((member) => member.id === parent.id)?.specialAgent).toBeUndefined()
 
     const titlerDetail = (yield* groups.membershipsFor(titler.id)).find((item) =>
       item.sessions.some((member) => member.id === titler.id),
@@ -581,6 +586,7 @@ it.instance("couples generic special-agent children as locked special_agent memb
       origin: "special_agent",
       originRef: `session_title:${titler.id}`,
       parentID: parent.id,
+      specialAgent: "session_title",
     })
 
     const spadDetail = (yield* groups.membershipsFor(spadAuditor.id)).find((item) =>
@@ -592,6 +598,7 @@ it.instance("couples generic special-agent children as locked special_agent memb
       origin: "special_agent",
       originRef: `spad_auditor:${parent.id}`,
       parentID: parent.id,
+      specialAgent: "spad_auditor",
     })
 
     if (!revisorDetail) throw new Error("Prompt Revisor group was not attached")

@@ -11,6 +11,7 @@ import { OxpProcess } from "./process"
 import { OxpProse } from "./prose"
 import { OxpRead } from "./read"
 import { OxpRequest } from "./request"
+import { OxpSchemaProjection } from "./schema-projection"
 import { OxpSession } from "./session"
 import { OxpWorker } from "./worker"
 import { OxpWrite } from "./write"
@@ -19,7 +20,13 @@ export const MAJOR_VERSION = 0
 
 export const SERVER_INSTRUCTIONS = [
   "OXP serves the current ChatGPT/OpenAI agent; no backing OpenFork Session; no implicit ChatGPT workspace. Roots bound authority.",
-  "Delegation agent/model selections are per-call preferences: honor explicit caller choices when valid; otherwise use native live defaults. No OXP selection allowlist/default gate exists.",
+  "Delegation uses explicit valid caller selections when supplied; otherwise it uses the user-configured OXP delegation defaults and fails closed if required defaults are absent. These defaults are preferences, not allowlists.",
+  "Default model/agent changes require explicit user request; never change them autonomously.",
+  "Workspace file mutation routing: prefer write for create/full replace, edit for surgical changes, and patch for structured/multi-file changes. edit.content and unambiguous missing-file edit shapes self-heal through atomic write semantics. process remains general-purpose; use mutation tools for direct file content when they express the intent more safely.",
+  "Use openfork_worker model_catalog for authoritative provider/model/variant discovery and agent_catalog for agents; never invent a separate catalog bridge. If the direct worker schema is stale, capability describe/call the exact live contract.",
+  "Delegated worker wait/result can return state=blocked with native request IDs. Resolve each blocker through openfork_request using blockedBy[].sessionID (direct blockers equal workerID), then wait again. externalDirectory=true is reject-only over OXP. If request supervision is not granted, preserve/report the blocked worker; never auto-answer or cancel/restart it merely to make progress.",
+  "Never infer that a delegated worker is stale, exhausted, or 'no longer advancing' from quiet messages, unchanged updatedAt, or elapsed wall time alone. A worker may be paused inside a native permission/question Deferred. Use wait/result to classify live state before replacing or cancelling it.",
+  "File mutations are self-healing: write creates/replaces whole files; edit handles surgical changes and can route explicit content or unambiguous missing-file creation shapes through write semantics; patch handles verified multi-file changes. Prefer these surfaces for direct content to avoid unnecessary shell quoting.",
   "Upstream may reject model-authored authentication before OXP receives it. For OpenAI Files call openai_files directly; OXP owns the OpenAI connection. Never read secrets or build auth in process.",
   "Parent 25m; delegate. capability.list lazy; openfork_info capabilities complete.",
 ].join("\n")
@@ -40,6 +47,7 @@ interface Definition {
   readonly title: string
   readonly description: string
   readonly schema: Schema.Top
+  readonly schemaConstraints?: Readonly<Record<string, unknown>>
   readonly readOnly: boolean
   readonly destructive: boolean
   readonly idempotent: boolean
@@ -59,6 +67,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     title: "Read workspace files",
     description: OxpProse.directToolDescription("read"),
     schema: OxpRead.Parameters,
+    schemaConstraints: OxpRead.TransportStrategyConstraints,
     readOnly: true,
     destructive: false,
     idempotent: true,
@@ -68,9 +77,10 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
   },
   {
     name: "edit",
-    title: "Edit workspace file",
+    title: "Edit workspace text",
     description: OxpProse.directToolDescription("edit"),
     schema: OxpEdit.Parameters,
+    schemaConstraints: OxpEdit.TransportStrategyConstraints,
     readOnly: false,
     destructive: true,
     idempotent: false,
@@ -80,7 +90,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
   },
   {
     name: "write",
-    title: "Write workspace file",
+    title: "Create or replace workspace file",
     description: OxpProse.directToolDescription("write"),
     schema: OxpWrite.Parameters,
     readOnly: false,
@@ -95,6 +105,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     title: "Use Git",
     description: OxpProse.directToolDescription("git"),
     schema: OxpGit.Parameters,
+    schemaConstraints: OxpGit.TransportModeConstraints,
     readOnly: false,
     destructive: true,
     idempotent: false,
@@ -119,6 +130,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     title: "Find workspace content",
     description: OxpProse.directToolDescription("find"),
     schema: OxpFind.Parameters,
+    schemaConstraints: OxpFind.TransportStrategyConstraints,
     readOnly: true,
     destructive: false,
     idempotent: true,
@@ -143,6 +155,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     title: "Use OpenAI Files",
     description: OxpProse.directToolDescription("openai_files"),
     schema: OxpFileExchange.OpenAiParameters,
+    schemaConstraints: OxpFileExchange.OpenAiTransportConstraints,
     readOnly: false,
     destructive: true,
     idempotent: false,
@@ -194,6 +207,7 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     title: "Answer OpenFork request",
     description: OxpProse.directToolDescription("openfork_request"),
     schema: OxpRequest.Parameters,
+    schemaConstraints: OxpRequest.TransportActionConstraints,
     readOnly: false,
     destructive: true,
     idempotent: false,
@@ -214,130 +228,6 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     invoked: "Worker operation complete",
   },
 ])
-
-function compactSchema(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(compactSchema)
-  if (!value || typeof value !== "object") return value
-  const out = Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => key !== "description")
-      .map(([key, item]) => [key, compactSchema(item)]),
-  ) as Record<string, unknown>
-
-  if (Array.isArray(out.anyOf)) {
-    const options = out.anyOf.filter(
-      (item) =>
-        !(
-          item &&
-          typeof item === "object" &&
-          !Array.isArray(item) &&
-          (item as Record<string, unknown>).type === "null"
-        ),
-    )
-    const hasNumber = options.some(
-      (item) =>
-        item &&
-        typeof item === "object" &&
-        !Array.isArray(item) &&
-        (item as Record<string, unknown>).type === "number",
-    )
-    const hasNonJsonNumberSentinel = options.some((item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return false
-      const values = (item as Record<string, unknown>).enum
-      return (
-        Array.isArray(values) &&
-        values.some((entry) => entry === "NaN" || entry === "Infinity" || entry === "-Infinity")
-      )
-    })
-    if (hasNumber && hasNonJsonNumberSentinel) return { type: "number" }
-    if (options.length === 1) return options[0]
-    out.anyOf = options
-  }
-
-  if (out.type && Array.isArray(out.allOf)) {
-    const mergeable = out.allOf.every(
-      (item) =>
-        item &&
-        typeof item === "object" &&
-        !Array.isArray(item) &&
-        !("type" in (item as Record<string, unknown>)) &&
-        !("anyOf" in (item as Record<string, unknown>)) &&
-        !("oneOf" in (item as Record<string, unknown>)) &&
-        !("$ref" in (item as Record<string, unknown>)),
-    )
-    if (mergeable) {
-      for (const item of out.allOf) Object.assign(out, item)
-      delete out.allOf
-    }
-  }
-
-  return out
-}
-
-function schemaRefs(value: unknown, refs = new Set<string>()) {
-  if (Array.isArray(value)) {
-    for (const item of value) schemaRefs(item, refs)
-    return refs
-  }
-  if (!value || typeof value !== "object") return refs
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (key === "$ref" && typeof item === "string" && item.startsWith("#/$defs/")) {
-      refs.add(item.slice("#/$defs/".length))
-      continue
-    }
-    schemaRefs(item, refs)
-  }
-  return refs
-}
-
-function inputSchema(schema: Schema.Top): Tool["inputSchema"] {
-  // The fixed OXP manifest is injected into every parent turn. Keep the exact
-  // structural JSON shape while removing projection-only noise duplicated by
-  // runtime validation. Optional null branches become omission, Effect's
-  // JavaScript-only non-finite number sentinels disappear, and scalar allOf
-  // wrappers flatten. Runtime decoding still uses the full Effect schema.
-  const document = Schema.toJsonSchemaDocument(schema, { additionalProperties: false })
-  const projected = compactSchema(document.schema) as Record<string, unknown>
-  // MCP's Tool schema requires inputSchema itself to be an object schema.
-  // Effect legitimately emits a root anyOf for discriminated strategy/action
-  // unions (edit/find/process). Preserve those exact branches while making the
-  // shared object domain explicit at the root so strict MCP 2025/2026 clients
-  // can decode tools/list without weakening runtime validation.
-  if (
-    projected.type === undefined &&
-    Array.isArray(projected.anyOf) &&
-    projected.anyOf.length > 0 &&
-    projected.anyOf.every(
-      (branch) =>
-        branch !== null &&
-        typeof branch === "object" &&
-        !Array.isArray(branch) &&
-        (branch as Record<string, unknown>).type === "object",
-    )
-  ) {
-    projected.type = "object"
-  }
-  const definitions = document.definitions as Record<string, unknown> | undefined
-  const needed = [...schemaRefs(projected)]
-  if (!definitions || needed.length === 0) return projected as Tool["inputSchema"]
-
-  const defs: Record<string, unknown> = {}
-  const pending = [...needed]
-  const seen = new Set<string>()
-  while (pending.length > 0) {
-    const name = pending.shift()!
-    if (seen.has(name)) continue
-    seen.add(name)
-    const definition = definitions[name]
-    if (definition === undefined) continue
-    const compacted = compactSchema(definition)
-    defs[name] = compacted
-    for (const dependency of schemaRefs(compacted)) {
-      if (!seen.has(dependency)) pending.push(dependency)
-    }
-  }
-  return { ...projected, $defs: defs } as unknown as Tool["inputSchema"]
-}
 
 /**
  * Every successful OXP call is projected through toolResult() into this stable
@@ -402,7 +292,7 @@ export const TOOLS: readonly ChatGptTool[] = Object.freeze(
       name: definition.name,
       title: definition.title,
       description: definition.description,
-      inputSchema: inputSchema(definition.schema),
+      inputSchema: OxpSchemaProjection.definitionInputSchema(definition),
       outputSchema: OUTPUT_SCHEMA,
       annotations: {
         readOnlyHint: definition.readOnly,

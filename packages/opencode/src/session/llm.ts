@@ -29,6 +29,7 @@ import { Storage } from "@/storage/storage"
 import { ClaudeBindingPersistence } from "@/claude/binding-persistence"
 import { ClaudeToolBridge } from "@/claude/tool-bridge"
 import { ClaudeSessions } from "@/claude/sessions"
+import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
@@ -49,11 +50,23 @@ export type StreamInput = {
   system: string[]
   messages: ModelMessage[]
   small?: boolean
+  /**
+   * External-provider conversation continuity. Ordinary Session turns are
+   * bound to the Session; maintenance/derived generations must be isolated so
+   * they cannot resume, invalidate, or fork the Session's provider transcript.
+   */
+  continuity?: "session" | "isolated"
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
   /** Optional caller-specific cap, clamped against the provider/model maximum. */
   maxOutputTokens?: number
+  /**
+   * Secret-free committed route authority for this dispatch. When present,
+   * Provider already materialized the exact account/Public transport; legacy
+   * Auth.Service must not independently select or inject another credential.
+   */
+  route?: UsageRouteAttribution.Committed
 }
 
 export type StreamRequest = StreamInput & {
@@ -107,8 +120,8 @@ const live: Layer.Layer<
         [
           provider.getLanguage(input.model),
           config.get(),
-          provider.getProvider(input.model.providerID),
-          auth.get(input.model.providerID),
+          provider.getProvider(input.model.providerID, input.model),
+          input.route ? Effect.succeed(undefined) : auth.get(input.model.providerID),
         ],
         { concurrency: 4 },
       )
@@ -258,6 +271,10 @@ const live: Layer.Layer<
               modelID: input.model.id,
               providerID: input.model.providerID,
               effort: input.user.model.variant,
+              // Small generations are maintenance by contract. Callers that
+              // use the parent Session ID for telemetry must not implicitly
+              // inherit its external Claude transcript.
+              continuity: input.continuity ?? (input.small ? "isolated" : "session"),
               abort: input.abort,
               permission: bindPermission(perm, bridge),
               ruleset: Permission.merge(input.agent.permission ?? [], input.permission ?? []),
@@ -269,6 +286,8 @@ const live: Layer.Layer<
                 directory: context.directory,
               },
               transcriptExists: (claudeSessionID, cwd) => ClaudeSessions.transcriptExists(claudeSessionID, { cwd }),
+              transcriptHasEntry: (claudeSessionID, uuid, cwd) =>
+                ClaudeSessions.transcriptHasEntry(claudeSessionID, uuid, { cwd }),
             }),
           }
         }

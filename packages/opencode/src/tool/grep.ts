@@ -32,6 +32,7 @@ export const GrepTool = Tool.define(
             title: params.pattern,
             metadata: { matches: 0, truncated: false },
             output: "No files found",
+            data: { matches: [] as ReadonlyArray<FileSearch.GrepRow>, total: 0, truncated: false },
           }
           if (!params.pattern) {
             throw new Error("pattern is required")
@@ -95,8 +96,11 @@ export const GrepTool = Tool.define(
               truncated,
             },
             output: output.join("\n"),
+            // Structured owner: an internal caller composes over `data` instead of
+            // reparsing the model-facing rendering.
+            data: { matches: rows, total, truncated },
           }
-        }).pipe(Effect.orDie),
+        }),
     }
   }),
 )

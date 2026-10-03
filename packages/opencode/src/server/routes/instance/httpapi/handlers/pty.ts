@@ -23,7 +23,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
 import { InstanceHttpApi } from "../api"
 import * as ApiError from "../errors"
-import { CursorQuery, PtyConnectApi } from "../groups/pty"
+import { CursorQuery, PtyConnectApi, PtyShellApi } from "../groups/pty"
 import { WebSocketTracker } from "../websocket-tracker"
 
 function validOrigin(request: HttpServerRequest.HttpServerRequest, opts: CorsOptions | undefined) {
@@ -69,10 +69,6 @@ export const ptyHandlers = HttpApiBuilder.group(InstanceHttpApi, "pty", (handler
           locations.get(Location.Ref.make({ directory: AbsolutePath.make((yield* InstanceState.context).directory) })),
         ),
       )
-    })
-
-    const shells = Effect.fn("PtyHttpApi.shells")(function* () {
-      return yield* Effect.promise(() => Shell.list())
     })
 
     const list = Effect.fn("PtyHttpApi.list")(function* () {
@@ -164,7 +160,6 @@ export const ptyHandlers = HttpApiBuilder.group(InstanceHttpApi, "pty", (handler
     })
 
     return handlers
-      .handle("shells", shells)
       .handle("list", list)
       .handle("create", create)
       .handle("get", get)
@@ -172,6 +167,10 @@ export const ptyHandlers = HttpApiBuilder.group(InstanceHttpApi, "pty", (handler
       .handle("remove", remove)
       .handle("connectToken", connectToken)
   }),
+)
+
+export const ptyShellHandlers = HttpApiBuilder.group(PtyShellApi, "pty-shell", (handlers) =>
+  handlers.handle("shells", () => Effect.promise(() => Shell.list())),
 )
 
 export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-connect", (handlers) =>

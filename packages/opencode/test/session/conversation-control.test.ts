@@ -3,7 +3,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Deferred, Effect, Exit, Layer } from "effect"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { DateTime, Deferred, Effect, Exit, Layer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionContextState } from "@/session/context/state"
@@ -44,6 +45,47 @@ const it = testEffect(
 )
 
 describe("conversation control", () => {
+  it.effect("keeps assistant-only current transcripts visible in the read-only ledger", () =>
+    Effect.gen(function* () {
+      const message = SessionMessage.Assistant.make({
+        id: SessionMessage.ID.make("msg_special_assistant_only"),
+        type: "assistant",
+        agent: "goal_auditor",
+        model: { providerID: "openai" as any, id: "gpt-test" as any },
+        content: [
+          { type: "reasoning", id: "reasoning-1", text: "Inspecting production evidence." },
+          { type: "text", id: "text-1", text: "The deployment proof is incomplete." },
+        ],
+        time: {
+          created: DateTime.makeUnsafe(1_000),
+          completed: DateTime.makeUnsafe(2_000),
+        },
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 10, output: 4, reasoning: 2, cache: { read: 20, write: 1 } },
+      })
+
+      const ledger = yield* SessionLedger.buildCurrentReadOnly({
+        sessionID: "ses_special_assistant_only",
+        messages: [message],
+      })
+
+      expect(ledger.totals.messageCount).toBe(1)
+      expect(ledger.totals.estimatedTokens).toBeGreaterThan(4)
+      expect(ledger.entries[0]).toMatchObject({
+        messageID: "msg_special_assistant_only",
+        role: "assistant",
+        type: "assistant",
+        preview: "Inspecting production evidence.",
+        excluded: false,
+        pinned: false,
+        edited: false,
+        partCount: 2,
+        timeCreated: 1_000,
+      })
+    }),
+  )
+
   it.instance("excludes a message from effective context and restores it", () =>
     Effect.gen(function* () {
       const sessionSvc = yield* SessionNs.Service

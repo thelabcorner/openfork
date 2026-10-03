@@ -27,6 +27,7 @@ import {
   registerEventStreamInterest,
   unregisterEventStreamInterest,
   updateEventStreamInterest,
+  eventStreamInterestGeneration,
   type EventStreamInterest,
 } from "@opencode-ai/server/event-interest"
 import { Installation } from "@/installation"
@@ -34,6 +35,9 @@ import { disposeAllInstancesAndEmitGlobalDisposed, emitGlobalDisposed } from "@/
 import { InstanceStore } from "@/project/instance-store"
 import { resetLocalData } from "@/storage/reset-local-data"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { and, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
@@ -44,31 +48,34 @@ import { Session } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionStatus } from "@/session/status"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
 import { serializeLegacyEvent } from "@/server/event-serialization"
-import {
-  isT3CodeCompatibilityProfile,
-  localClientReportedVersion,
-} from "@/compat/t3code"
+import { isT3CodeCompatibilityProfile, localClientReportedVersion } from "@/compat/t3code"
 import { RootHttpApi } from "../api"
 import {
+  GlobalArchivedSessionRootsInput,
   GlobalSessionRootsQuery,
+  GlobalSessionMetadataInput,
+  GlobalSessionStatusQuery,
   GlobalSessionTelemetryInput,
   GlobalOxpActivityListQuery,
   GlobalOxpActivityPatch,
+  GlobalOxpAttributionQuery,
   GlobalOxpInvocationQuery,
   GlobalOxpResourceQuery,
   GlobalUpgradeInput,
   ModelPreferencesPatch,
 } from "../groups/global"
+import { SemanticCompactionFeature } from "../groups/sync"
 
-function projectOxpActivity(
-  row: OxpActivityInspection.ParentSummary,
-) {
+function projectOxpActivity(row: OxpActivityInspection.ParentSummary) {
   return {
     id: row.id,
     ...(row.title ? { title: row.title } : {}),
@@ -82,9 +89,7 @@ function projectOxpActivity(
     observedEpochCount: row.observed_epoch_count,
     ...(row.last_tool ? { lastTool: row.last_tool } : {}),
     ...(row.last_root_alias ? { lastRootAlias: row.last_root_alias } : {}),
-    ...(row.time_archived === null || row.time_archived === undefined
-      ? {}
-      : { archivedAt: row.time_archived }),
+    ...(row.time_archived === null || row.time_archived === undefined ? {} : { archivedAt: row.time_archived }),
   }
 }
 
@@ -96,9 +101,7 @@ function projectOxpInvocation(
     id: row.id,
     activityID: row.activity_id,
     hostRunID: row.host_run_id,
-    ...(row.observed_epoch === null || row.observed_epoch === undefined
-      ? {}
-      : { observedEpoch: row.observed_epoch }),
+    ...(row.observed_epoch === null || row.observed_epoch === undefined ? {} : { observedEpoch: row.observed_epoch }),
     plane: row.plane,
     tool: row.tool,
     ...(row.action ? { action: row.action } : {}),
@@ -113,9 +116,7 @@ function projectOxpInvocation(
     mutationAttempted: row.mutation_attempted,
     mutationCommitted: row.mutation_committed,
     startedAt: row.time_started,
-    ...(row.time_completed === null || row.time_completed === undefined
-      ? {}
-      : { completedAt: row.time_completed }),
+    ...(row.time_completed === null || row.time_completed === undefined ? {} : { completedAt: row.time_completed }),
     links: links.map((link) => ({
       kind: link.kind,
       ref: link.ref,
@@ -277,7 +278,6 @@ class GlobalReplayGate {
     }
   }
 
-
   /**
    * Track the actual GlobalBus listener owned by a response body. This is
    * intentionally separate from `subscribers`: the response scope can be alive
@@ -322,7 +322,7 @@ function eventResponse(gate: GlobalReplayGate) {
     yield* Effect.addFinalizer(() => Effect.sync(release))
     const replay = generation.replay
     const sequences = generation.sequences
-    yield* Effect.logInfo("global event connected")
+    yield* Effect.logInfo("global event connected", { subscriber: initialInterest?.subscriber })
     // Request-derived context must be read here, not inside the stream: the
     // body stream runs after this effect returns and no longer has access to
     // per-request services.
@@ -336,7 +336,11 @@ function eventResponse(gate: GlobalReplayGate) {
     // before the returned stream emits its first frame.
     const output = Stream.unwrap(
       Effect.gen(function* () {
-        const interest = registerEventStreamInterest(initialInterest?.subscriber, initialInterest?.sessions)
+        const interest = registerEventStreamInterest(
+          initialInterest?.subscriber,
+          initialInterest?.sessions,
+          initialInterest?.generation,
+        )
         yield* Effect.addFinalizer(() => Effect.sync(() => unregisterEventStreamInterest(interest)))
         const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedGlobalEvent>({
           // Replay bypasses this queue and is pulled directly by the response
@@ -476,26 +480,31 @@ function eventResponse(gate: GlobalReplayGate) {
         })
         if (replayResult.kind === "gap") EventTrace.count("global.gap")
         let replayPrefix: SequencedGlobalEvent[]
-        if (replayResult.kind === "gap" || replayResult.frames.length > MAX_REPLAY_FRAMES ||
-          replayResult.bytes > MAX_REPLAY_BYTES) {
+        if (
+          replayResult.kind === "gap" ||
+          replayResult.frames.length > MAX_REPLAY_FRAMES ||
+          replayResult.bytes > MAX_REPLAY_BYTES
+        ) {
           // Deliberately sequence-free. `replayResult.latest` is the last
           // sequence already assigned to a real event, so using it here emitted a
           // duplicate, non-monotonic SSE id. A gap is a repair signal, not
           // replayable domain state, so it needs no cursor.
-          replayPrefix = [{
-            event: {
-              directory: "global",
-              payload: {
-                id: EventV2.ID.create(),
-                type: "server.stream.gap",
-                properties: {
-                  requested: replayResult.kind === "gap" ? replayResult.requested : cursor ?? 0,
-                  oldest: replayResult.kind === "gap" ? replayResult.oldest : undefined,
-                  latest: replayResult.latest,
+          replayPrefix = [
+            {
+              event: {
+                directory: "global",
+                payload: {
+                  id: EventV2.ID.create(),
+                  type: "server.stream.gap",
+                  properties: {
+                    requested: replayResult.kind === "gap" ? replayResult.requested : (cursor ?? 0),
+                    oldest: replayResult.kind === "gap" ? replayResult.oldest : undefined,
+                    latest: replayResult.latest,
+                  },
                 },
               },
             },
-          }]
+          ]
         } else {
           replayPrefix = []
           let segment: SequencedGlobalEvent[] = []
@@ -535,7 +544,8 @@ function eventResponse(gate: GlobalReplayGate) {
             }
             coalesceSegment()
             EventTrace.count("global.interestReplaySuppressed")
-            if (markEventStreamSessionSuppressed(interest, sessionID)) replayPrefix.push(streamStaleGlobalEvent(sessionID))
+            if (markEventStreamSessionSuppressed(interest, sessionID))
+              replayPrefix.push(streamStaleGlobalEvent(sessionID))
             replayProgress = item.sequence
           }
           coalesceSegment()
@@ -564,7 +574,9 @@ function eventResponse(gate: GlobalReplayGate) {
         // keeps heartbeats from advancing Last-Event-ID.
         const heartbeat = Stream.tick("10 seconds").pipe(
           Stream.drop(1),
-          Stream.map(() => eventData({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
+          Stream.map(() =>
+            eventData({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } }),
+          ),
         )
 
         const replayEvents = Stream.fromIterable(replayPrefix).pipe(
@@ -587,7 +599,7 @@ function eventResponse(gate: GlobalReplayGate) {
       output.pipe(
         Stream.pipeThroughChannel(Sse.encode()),
         Stream.encodeText,
-        Stream.ensuring(Effect.logInfo("global event disconnected")),
+        Stream.ensuring(Effect.logInfo("global event disconnected", { subscriber: initialInterest?.subscriber })),
       ),
       {
         contentType: "text/event-stream",
@@ -606,6 +618,11 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const gate = new GlobalReplayGate()
     const oxpActivity = yield* OxpActivity.Service
     const oxpInspection = yield* OxpActivityInspection.Service
+    const oxpAttribution = yield* OxpAttribution.Service
+    // Resolve Tier-0 status dependencies when constructing the served graph.
+    // Request-time lookup hid a missing owner until the first project opened.
+    const execution = yield* SessionExecutionOwner.Service
+    const statuses = yield* SessionStatus.Service
     // Capture is registered for the route's lifetime but only APPENDS while a
     // subscriber is connected. Registering unconditionally keeps the
     // documented invariant that replay capture must remain complete even if a
@@ -653,41 +670,111 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       }
     })
 
+    const syncCapabilities = Effect.fn("SyncHttpApi.capabilities")(function* () {
+      return { version: 1 as const, features: [SemanticCompactionFeature] }
+    })
+
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
       return yield* eventResponse(gate)
     })
 
     const eventInterest = Effect.fn("GlobalHttpApi.eventInterest")(function* (ctx: {
-      payload: { readonly subscriber: string; readonly sessions: readonly string[] }
+      payload: { readonly subscriber: string; readonly sessions: readonly string[]; readonly generation?: number }
     }) {
-      return { updated: updateEventStreamInterest(ctx.payload.subscriber, ctx.payload.sessions) }
+      const updated = updateEventStreamInterest(ctx.payload.subscriber, ctx.payload.sessions, ctx.payload.generation)
+      const generation = eventStreamInterestGeneration(ctx.payload.subscriber)
+      return { updated, ...(generation === undefined ? {} : { generation }) }
     })
 
     const sessionRoots = Effect.fn("GlobalHttpApi.sessionRoots")(function* (ctx: {
       query: typeof GlobalSessionRootsQuery.Type
     }) {
-      const sessions = yield* Session.Service
-      const rows = yield* sessions.listGlobal({
-        ...(ctx.query.projectID
-          ? { projectID: ctx.query.projectID }
-          : { directory: FSUtil.resolve(ctx.query.directory) }),
-        roots: true,
-        archived: false,
-        limit: ctx.query.limit ?? 50,
-      })
-      // `listGlobal` enriches rows with project metadata for cross-project UIs.
-      // Startup consumers need only Session.Info and should not pay for or bind
-      // themselves to that extra response shape.
-      return rows.map(({ project: _project, ...session }) => session)
+      const { readDb } = yield* Database.Service
+      const rows = yield* readDb
+        .select()
+        .from(SessionTable)
+        .where(
+          and(
+            ctx.query.projectID
+              ? eq(SessionTable.project_id, ctx.query.projectID)
+              : eq(SessionTable.directory, FSUtil.resolve(ctx.query.directory)),
+            isNull(SessionTable.parent_id),
+            isNull(SessionTable.time_archived),
+            sql`json_extract(${SessionTable.metadata}, '$.workerDelegation.producer') IS NOT 'oxp' OR ${SessionTable.group_id} IS NULL`,
+          ),
+        )
+        .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
+        .limit(ctx.query.limit ?? 50)
+        .all()
+        .pipe(Effect.orDie)
+      return rows.map(Session.fromRow)
     })
 
-    const sessionGet = Effect.fn("GlobalHttpApi.sessionGet")(function* (ctx: {
-      params: { sessionID: SessionID }
+    const sessionMetadata = Effect.fn("GlobalHttpApi.sessionMetadata")(function* (ctx: {
+      payload: typeof GlobalSessionMetadataInput.Type
     }) {
+      const sessions = [...new Set(ctx.payload.sessions)]
+      if (sessions.length === 0) return []
+      const { readDb } = yield* Database.Service
+      const rows = yield* readDb
+        .select()
+        .from(SessionTable)
+        .where(inArray(SessionTable.id, sessions))
+        .all()
+        .pipe(Effect.orDie)
+      const byID = new Map(rows.map((row) => [row.id, row]))
+      // Preserve caller order while omitting IDs deleted between status
+      // snapshot and metadata resolution.
+      return sessions.flatMap((sessionID) => {
+        const row = byID.get(sessionID)
+        return row ? [Session.fromRow(row)] : []
+      })
+    })
+
+    const archivedSessionRoots = Effect.fn("GlobalHttpApi.archivedSessionRoots")(function* (ctx: {
+      payload: typeof GlobalArchivedSessionRootsInput.Type
+    }) {
+      const { readDb } = yield* Database.Service
+      const directories = [...new Set(ctx.payload.directories.map((directory) => FSUtil.resolve(directory)))]
+      const limit = ctx.payload.limit ?? 50
+      const cursor = ctx.payload.before
+      const cursorCondition = cursor
+        ? or(
+            lt(SessionTable.time_archived, cursor.archivedAt),
+            and(eq(SessionTable.time_archived, cursor.archivedAt), lt(SessionTable.id, cursor.id)),
+          )
+        : undefined
+      const rows = yield* readDb
+        .select()
+        .from(SessionTable)
+        .where(
+          and(
+            inArray(SessionTable.directory, directories),
+            isNull(SessionTable.parent_id),
+            sql`${SessionTable.time_archived} IS NOT NULL`,
+            sql`json_extract(${SessionTable.metadata}, '$.workerDelegation.producer') IS NOT 'oxp' OR ${SessionTable.group_id} IS NULL`,
+            cursorCondition,
+          ),
+        )
+        .orderBy(desc(SessionTable.time_archived), desc(SessionTable.id))
+        .limit(limit + 1)
+        .all()
+        .pipe(Effect.orDie)
+      const more = rows.length > limit
+      const page = more ? rows.slice(0, limit) : rows
+      const last = page.at(-1)
+      return {
+        items: page.map(Session.fromRow),
+        more,
+        ...(more && last?.time_archived != null ? { before: { archivedAt: last.time_archived, id: last.id } } : {}),
+      }
+    })
+
+    const sessionGet = Effect.fn("GlobalHttpApi.sessionGet")(function* (ctx: { params: { sessionID: SessionID } }) {
       const sessions = yield* Session.Service
-      return yield* sessions.get(ctx.params.sessionID).pipe(
-        Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(null)),
-      )
+      return yield* sessions
+        .get(ctx.params.sessionID)
+        .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(null)))
     })
 
     const sessionTelemetry = Effect.fn("GlobalHttpApi.sessionTelemetry")(function* (ctx: {
@@ -697,124 +784,134 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return yield* telemetry.snapshot(ctx.payload.sessions)
     })
 
-    const oxpActivities = Effect.fn("GlobalHttpApi.oxpActivities")(
-      function* (ctx: { query: typeof GlobalOxpActivityListQuery.Type }) {
-        const before =
-          ctx.query.beforeLastSeenAt !== undefined && ctx.query.beforeID
-            ? {
-                lastSeenAt: ctx.query.beforeLastSeenAt,
-                id: ctx.query.beforeID,
-              }
-            : undefined
-        const rows = yield* oxpInspection.list({
-          limit: ctx.query.limit,
-          includeArchived: ctx.query.includeArchived === "true",
-          ...(before ? { before } : {}),
-        })
-        return rows.map(projectOxpActivity)
-      },
-    )
-
-    const oxpActivityGet = Effect.fn("GlobalHttpApi.oxpActivityGet")(
-      function* (ctx: {
-        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
-      }) {
-        const row = yield* oxpInspection.get(ctx.params.activityID)
-        return row ? projectOxpActivity(row) : null
-      },
-    )
-
-    const oxpInvocations = Effect.fn("GlobalHttpApi.oxpInvocations")(
-      function* (ctx: {
-        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
-        query: typeof GlobalOxpInvocationQuery.Type
-      }) {
-        const before =
-          ctx.query.beforeStartedAt !== undefined && ctx.query.beforeID
-            ? {
-                startedAt: ctx.query.beforeStartedAt,
-                id: ctx.query.beforeID,
-              }
-            : undefined
-        const page = yield* oxpInspection.invocations({
-          activityID: ctx.params.activityID,
-          limit: ctx.query.limit,
-          ...(before ? { before } : {}),
-        })
-        const links = new Map<string, OxpActivityInspection.InvocationLink[]>()
-        for (const link of page.links) {
-          const rows = links.get(link.invocation_id)
-          if (rows) rows.push(link)
-          else links.set(link.invocation_id, [link])
+    const sessionStatus = Effect.fn("GlobalHttpApi.sessionStatus")(function* (ctx: {
+      query: typeof GlobalSessionStatusQuery.Type
+    }) {
+      const directory = ctx.query.directory ?? ctx.query.workspace
+      if (directory !== undefined) {
+        const resolved = FSUtil.resolve(directory)
+        const current = yield* statuses.list()
+        const candidates = [...current.keys()]
+        const sessionIDs = yield* execution.listSessionIDsByDirectory(resolved, candidates)
+        const currentByDirectory = yield* statuses.listForSessionIDs(sessionIDs)
+        const result = Object.fromEntries(currentByDirectory)
+        for (const [sessionID] of yield* execution.listWorkingByDirectory(resolved)) {
+          result[sessionID] ??= { type: "busy" }
         }
-        return {
-          items: page.items.map((row) =>
-            projectOxpInvocation(row, links.get(row.id) ?? []),
-          ),
-          more: page.more,
-          ...(page.before ? { before: page.before } : {}),
-        }
-      },
-    )
+        return result
+      }
+      const result = Object.fromEntries(yield* statuses.list())
+      for (const [sessionID] of yield* execution.listWorking()) {
+        result[sessionID] ??= { type: "busy" }
+      }
+      return result
+    })
 
-    const oxpInvocationDetail = Effect.fn("GlobalHttpApi.oxpInvocationDetail")(
-      function* (ctx: {
-        params: { invocationID: Parameters<typeof oxpInspection.invocationDetail>[0] }
-      }) {
-        const row = yield* oxpInspection.invocationDetail(ctx.params.invocationID)
-        if (!row) return null
-        return {
-          invocationID: row.invocation_id,
-          ...(row.request ? { request: row.request } : {}),
-          ...(row.outcome ? { outcome: row.outcome } : {}),
-        }
-      },
-    )
+    const oxpActivities = Effect.fn("GlobalHttpApi.oxpActivities")(function* (ctx: {
+      query: typeof GlobalOxpActivityListQuery.Type
+    }) {
+      const before =
+        ctx.query.beforeLastSeenAt !== undefined && ctx.query.beforeID
+          ? {
+              lastSeenAt: ctx.query.beforeLastSeenAt,
+              id: ctx.query.beforeID,
+            }
+          : undefined
+      const rows = yield* oxpInspection.list({
+        limit: ctx.query.limit,
+        includeArchived: ctx.query.includeArchived === "true",
+        ...(before ? { before } : {}),
+      })
+      return rows.map(projectOxpActivity)
+    })
 
-    const oxpResource = Effect.fn("GlobalHttpApi.oxpResource")(
-      function* (ctx: { query: typeof GlobalOxpResourceQuery.Type }) {
-        return yield* oxpInspection.resource({
-          kind: ctx.query.kind,
-          ref: ctx.query.ref,
-          limit: ctx.query.limit,
-        })
-      },
-    )
+    const oxpActivityGet = Effect.fn("GlobalHttpApi.oxpActivityGet")(function* (ctx: {
+      params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+    }) {
+      const row = yield* oxpInspection.get(ctx.params.activityID)
+      return row ? projectOxpActivity(row) : null
+    })
 
-    const oxpActivityUpdate = Effect.fn("GlobalHttpApi.oxpActivityUpdate")(
-      function* (ctx: {
-        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
-        payload: typeof GlobalOxpActivityPatch.Type
-      }) {
-        let changed = false
-        if (ctx.payload.title !== undefined || ctx.payload.clearTitle === true) {
-          const title =
-            ctx.payload.clearTitle === true || !ctx.payload.title?.trim()
-              ? undefined
-              : ctx.payload.title.trim()
-          changed =
-            (yield* oxpActivity.rename(ctx.params.activityID, title)) || changed
-        }
-        if (ctx.payload.archived !== undefined) {
-          changed =
-            (yield* oxpActivity.archive(
-              ctx.params.activityID,
-              ctx.payload.archived,
-            )) || changed
-        }
-        return changed
-      },
-    )
+    const oxpAttributionSnapshot = Effect.fn("GlobalHttpApi.oxpAttribution")(function* (ctx: {
+      query: typeof GlobalOxpAttributionQuery.Type
+    }) {
+      return yield* oxpAttribution.snapshot(ctx.query)
+    })
 
-    const oxpActivityDelete = Effect.fn("GlobalHttpApi.oxpActivityDelete")(
-      function* (ctx: {
-        params: { activityID: Parameters<typeof oxpInspection.get>[0] }
-      }) {
-        return {
-          deleted: yield* oxpActivity.deleteHistory(ctx.params.activityID),
-        }
-      },
-    )
+    const oxpInvocations = Effect.fn("GlobalHttpApi.oxpInvocations")(function* (ctx: {
+      params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+      query: typeof GlobalOxpInvocationQuery.Type
+    }) {
+      const before =
+        ctx.query.beforeStartedAt !== undefined && ctx.query.beforeID
+          ? {
+              startedAt: ctx.query.beforeStartedAt,
+              id: ctx.query.beforeID,
+            }
+          : undefined
+      const page = yield* oxpInspection.invocations({
+        activityID: ctx.params.activityID,
+        limit: ctx.query.limit,
+        ...(before ? { before } : {}),
+      })
+      const links = new Map<string, OxpActivityInspection.InvocationLink[]>()
+      for (const link of page.links) {
+        const rows = links.get(link.invocation_id)
+        if (rows) rows.push(link)
+        else links.set(link.invocation_id, [link])
+      }
+      return {
+        items: page.items.map((row) => projectOxpInvocation(row, links.get(row.id) ?? [])),
+        more: page.more,
+        ...(page.before ? { before: page.before } : {}),
+      }
+    })
+
+    const oxpInvocationDetail = Effect.fn("GlobalHttpApi.oxpInvocationDetail")(function* (ctx: {
+      params: { invocationID: Parameters<typeof oxpInspection.invocationDetail>[0] }
+    }) {
+      const row = yield* oxpInspection.invocationDetail(ctx.params.invocationID)
+      if (!row) return null
+      return {
+        invocationID: row.invocation_id,
+        ...(row.request ? { request: row.request } : {}),
+        ...(row.outcome ? { outcome: row.outcome } : {}),
+      }
+    })
+
+    const oxpResource = Effect.fn("GlobalHttpApi.oxpResource")(function* (ctx: {
+      query: typeof GlobalOxpResourceQuery.Type
+    }) {
+      return yield* oxpInspection.resource({
+        kind: ctx.query.kind,
+        ref: ctx.query.ref,
+        limit: ctx.query.limit,
+      })
+    })
+
+    const oxpActivityUpdate = Effect.fn("GlobalHttpApi.oxpActivityUpdate")(function* (ctx: {
+      params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+      payload: typeof GlobalOxpActivityPatch.Type
+    }) {
+      let changed = false
+      if (ctx.payload.title !== undefined || ctx.payload.clearTitle === true) {
+        const title =
+          ctx.payload.clearTitle === true || !ctx.payload.title?.trim() ? undefined : ctx.payload.title.trim()
+        changed = (yield* oxpActivity.rename(ctx.params.activityID, title)) || changed
+      }
+      if (ctx.payload.archived !== undefined) {
+        changed = (yield* oxpActivity.archive(ctx.params.activityID, ctx.payload.archived)) || changed
+      }
+      return changed
+    })
+
+    const oxpActivityDelete = Effect.fn("GlobalHttpApi.oxpActivityDelete")(function* (ctx: {
+      params: { activityID: Parameters<typeof oxpInspection.get>[0] }
+    }) {
+      return {
+        deleted: yield* oxpActivity.deleteHistory(ctx.params.activityID),
+      }
+    })
 
     const projectList = Effect.fn("GlobalHttpApi.projects")(function* () {
       const projects = yield* Project.Service
@@ -830,6 +927,22 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       const config = yield* Config.Service
       const bridge = yield* EffectBridge.make()
       const result = yield* config.updateGlobal(ctx.payload)
+      if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
+      return result.info
+    })
+
+    const configAgentSet = Effect.fn("GlobalHttpApi.configAgentSet")(function* (ctx) {
+      const config = yield* Config.Service
+      const bridge = yield* EffectBridge.make()
+      const result = yield* config.updateGlobalAgent({ id: ctx.params.agentID, value: ctx.payload })
+      if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
+      return result.info
+    })
+
+    const configAgentDelete = Effect.fn("GlobalHttpApi.configAgentDelete")(function* (ctx) {
+      const config = yield* Config.Service
+      const bridge = yield* EffectBridge.make()
+      const result = yield* config.updateGlobalAgent({ id: ctx.params.agentID, value: null })
       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
       return result.info
     })
@@ -897,15 +1010,20 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     return handlers
+      .handle("syncCapabilities", syncCapabilities)
       .handle("health", health)
       .handleRaw("event", event)
       .handle("eventInterest", eventInterest)
       .handle("sessionRoots", sessionRoots)
+      .handle("sessionMetadata", sessionMetadata)
+      .handle("archivedSessionRoots", archivedSessionRoots)
       .handle("sessionGet", sessionGet)
       .handle("sessionTelemetry", sessionTelemetry)
+      .handle("sessionStatus", sessionStatus)
       .handle("oxpActivities", oxpActivities)
       .handle("oxpActivityGet", oxpActivityGet)
       .handle("oxpInvocations", oxpInvocations)
+      .handle("oxpAttribution", oxpAttributionSnapshot)
       .handle("oxpInvocationDetail", oxpInvocationDetail)
       .handle("oxpResource", oxpResource)
       .handle("oxpActivityUpdate", oxpActivityUpdate)
@@ -913,6 +1031,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("projects", projectList)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
+      .handle("configAgentSet", configAgentSet)
+      .handle("configAgentDelete", configAgentDelete)
       .handle("preferencesGet", preferencesGet)
       .handle("preferencesUpdate", preferencesUpdate)
       .handle("dispose", dispose)

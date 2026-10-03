@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Queue } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Permission } from "../../src/permission"
@@ -111,6 +111,25 @@ const itDeny = pluginIt((_input, output) => {
 const itAllow = pluginIt((_input, output) => {
   output.status = "allow"
 })
+
+itHook.instance("interruption during permission publication releases pending ownership", () =>
+  Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const publishing = yield* Deferred.make<void>()
+    const unsubscribe = yield* events.listen((event) => event.type === Permission.Event.Asked.type
+      ? Deferred.succeed(publishing, undefined).pipe(Effect.andThen(Effect.never))
+      : Effect.void)
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const fiber = yield* ask({
+      sessionID: SessionID.make("ses_permission_publication_interrupt"), permission: "bash",
+      patterns: ["echo hello"], always: ["echo *"], metadata: {}, ruleset: [],
+    }).pipe(Effect.forkScoped)
+    yield* Deferred.await(publishing)
+    expect(yield* list()).toHaveLength(1)
+    yield* Fiber.interrupt(fiber)
+    expect(yield* list()).toHaveLength(0)
+  }), { git: true },
+)
 
 // fromConfig tests
 
@@ -970,6 +989,33 @@ it.instance(
 )
 
 it.instance(
+  "reply settles the active ask before a blocked transient event listener",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const published = yield* Deferred.make<void>()
+      const unsubscribe = yield* events.listen((event) => event.type === Permission.Event.Replied.type
+        ? Deferred.succeed(published, undefined).pipe(Effect.andThen(Effect.never))
+        : Effect.void)
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_blocked_replied_listener"),
+        sessionID: SessionID.make("ses_blocked_replied_listener"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_blocked_replied_listener"), reply: "once" })
+      yield* Fiber.join(fiber)
+      yield* Deferred.await(published).pipe(Effect.timeout("2 seconds"))
+    }),
+  { git: true },
+)
+
+it.instance(
   "reply - publishes replied event",
   () =>
     Effect.gen(function* () {
@@ -1032,10 +1078,10 @@ it.instance(
         source: "oxp.supervisor",
         ref: "oxp:test-connector",
       }
-      const seen: Array<Record<string, unknown> | undefined> = []
+      const seen = yield* Queue.unbounded<Record<string, unknown> | undefined>()
       const unsub = yield* events.listen((event) => {
         if (event.type === Permission.Event.Replied.type) {
-          seen.push(event.metadata)
+          Queue.offerUnsafe(seen, event.metadata)
         }
         return Effect.void
       })
@@ -1069,8 +1115,13 @@ it.instance(
       yield* Fiber.join(first)
       yield* Fiber.join(second)
 
-      expect(seen).toHaveLength(2)
-      expect(seen).toEqual([
+      const observed = yield* Effect.forEach([0, 1], () =>
+        Queue.take(seen).pipe(Effect.timeoutOrElse({
+          duration: "2 seconds",
+          orElse: () => Effect.fail(new Error("timed out waiting for permission attribution events")),
+        })),
+      )
+      expect(observed).toEqual([
         { actor },
         { actor },
       ])

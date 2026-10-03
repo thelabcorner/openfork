@@ -54,6 +54,7 @@ export namespace ProviderTest {
         Provider.Service,
         Provider.Service.of({
           list: Effect.fn("TestProvider.list")(() => Effect.succeed({ [row.id]: row })),
+          listAccountModelProjections: Effect.fn("TestProvider.listAccountModelProjections")(() => Effect.succeed([])),
           getProvider: Effect.fn("TestProvider.getProvider")((providerID) => {
             if (providerID === row.id) return Effect.succeed(row)
             return Effect.die(new Error(`Unknown test provider: ${providerID}`))
@@ -66,6 +67,13 @@ export namespace ProviderTest {
             if (providerID === row.id && modelID === mdl.id) return Effect.succeed(mdl)
             return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
           }),
+          resolveRoutedModel: Effect.fn("TestProvider.resolveRoutedModel")(() => Effect.succeed(undefined)),
+          resolveInheritedRoutedModel: Effect.fn("TestProvider.resolveInheritedRoutedModel")(() =>
+            Effect.die(new Error("ProviderTest.resolveInheritedRoutedModel not configured")),
+          ),
+          resolveTransientRoutedModel: Effect.fn("TestProvider.resolveTransientRoutedModel")(() =>
+            Effect.succeed(undefined),
+          ),
           getLanguage: Effect.fn("TestProvider.getLanguage")(() =>
             Effect.die(new Error("ProviderTest.getLanguage not configured")),
           ),

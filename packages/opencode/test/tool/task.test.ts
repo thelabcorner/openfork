@@ -20,6 +20,9 @@ import { SessionStatus } from "@/session/status"
 
 import { TaskTool } from "../../src/tool/task"
 import { DelegatedWorkerPolicy } from "../../src/session/delegated-worker-policy"
+import { SubagentDelegation, SUPERVISOR_WORKER_PROTOCOL } from "../../src/session/subagent-delegation"
+import * as SubagentSupervisionMetadata from "../../src/session/subagent-supervision-metadata"
+import { SupervisorRegistryTag, type SupervisorRegistry } from "../../src/session/subagent-supervision-contract"
 import type { HostPromptProvenance, SessionPromptOps } from "../../src/session/prompt-contract"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -175,6 +178,7 @@ function stubOps(opts?: {
         opts?.onPrompt?.(input, provenance)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
+    steer: () => Effect.die("stubOps does not implement supervisor steering"),
   }
 }
 
@@ -371,6 +375,11 @@ describe("tool.task", () => {
         modelID: "user-model",
         accountID: "user-account",
         variant: "high",
+        routeIntent: {
+          kind: "account",
+          accountID: "user-account",
+          pin: "hard",
+        } as const,
       } as const
       const origin = {
         producer: "oxp",
@@ -478,6 +487,161 @@ describe("tool.task", () => {
         model: delegatedModel,
         nestedDelegation: true,
       })
+    }),
+  )
+
+  it.instance("preserves explicit Public route authority into a protected nested worker", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const delegatedModel = {
+        providerID: "user-provider",
+        modelID: "public-model",
+        variant: "high",
+        routeIntent: { kind: "public" as const },
+      } as const
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:connector-nested-public",
+        invocationRef: "oxp-inv:nested-public-root",
+        rootRef: "root-nested-public",
+        agent: "build",
+        model: delegatedModel,
+        nestedDelegation: true,
+      } as const
+      const chat = yield* sessions.create({
+        title: "Protected Public delegated worker",
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make(delegatedModel.providerID),
+          id: ModelV2.ID.make(delegatedModel.modelID),
+          variant: delegatedModel.variant,
+        },
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+      const root = yield* sessions.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        provenance: SessionTurnProvenance.host(
+          SessionTurnProvenance.Source.OxpDelegation,
+          { ref: origin.invocationRef },
+        ),
+        sessionID: chat.id,
+        agent: "build",
+        model: {
+          providerID: ProviderV2.ID.make(delegatedModel.providerID),
+          modelID: ModelV2.ID.make(delegatedModel.modelID),
+        },
+        variant: delegatedModel.variant,
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: root.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "delegate nested public work",
+        metadata: DelegatedWorkerPolicy.turnMetadata({ nestedDelegation: true }),
+      })
+      const assistant: SessionV1.Assistant = {
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: root.id,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make(delegatedModel.modelID),
+        providerID: ProviderV2.ID.make(delegatedModel.providerID),
+        variant: delegatedModel.variant,
+        time: { created: Date.now() },
+      }
+      yield* sessions.updateMessage(assistant)
+
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const result = yield* def.execute(
+        {
+          description: "protected nested public worker",
+          prompt: "perform nested delegated work without selecting an account",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.output).toContain('state="completed"')
+      const child = (yield* sessions.children(chat.id))[0]
+      const childOrigin = SessionMetadataOwnership.workerDelegation(child?.metadata)
+      expect(childOrigin?.model).toEqual(delegatedModel)
+      expect(childOrigin?.model.accountID).toBeUndefined()
+      expect(childOrigin?.model.routeIntent).toEqual({ kind: "public" })
+
+      // Same visible model is insufficient authority. A protected child that
+      // was bound to Auto cannot be adopted/resumed by this Public parent.
+      const autoChild = yield* sessions.create({
+        parentID: chat.id,
+        title: "Mismatched Auto child",
+        agent: "general",
+        model: {
+          providerID: ProviderV2.ID.make(delegatedModel.providerID),
+          id: ModelV2.ID.make(delegatedModel.modelID),
+          variant: delegatedModel.variant,
+        },
+        metadata: SessionMetadataOwnership.delegatedWorker({
+          ...origin,
+          agent: "general",
+          parentWorkerID: chat.id,
+          model: {
+            providerID: delegatedModel.providerID,
+            modelID: delegatedModel.modelID,
+            variant: delegatedModel.variant,
+            routeIntent: { kind: "auto" },
+          },
+        }),
+      })
+      let mismatchedPrompts = 0
+      const mismatch = yield* def
+        .execute(
+          {
+            description: "reject route-only mismatch",
+            prompt: "do not run this",
+            subagent_type: "general",
+            task_id: autoChild.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                onPrompt: () => {
+                  mismatchedPrompts++
+                },
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(mismatch)).toBe(true)
+      if (Exit.isSuccess(mismatch)) throw new Error("expected protected route-binding mismatch")
+      expect((Cause.squash(mismatch.cause) as Error).message).toMatch(
+        /not bound to the current user-authorized subagent model/i,
+      )
+      expect(mismatchedPrompts).toBe(0)
     }),
   )
 
@@ -1020,6 +1184,7 @@ describe("tool.task", () => {
         cancel: (sessionID) => Deferred.succeed(cancelled, sessionID).pipe(Effect.asVoid),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: () => Deferred.succeed(ready, undefined).pipe(Effect.andThen(Effect.never)),
+        steer: () => Effect.die("test does not implement supervisor steering"),
       }
 
       const fiber = yield* def
@@ -1133,6 +1298,7 @@ describe("tool.task", () => {
             ready.resolve(input)
             return cancelled.promise
           }).pipe(Effect.as(reply(input, "cancelled"))),
+        steer: () => Effect.die("test does not implement supervisor steering"),
       }
 
       const fiber = yield* def
@@ -1581,6 +1747,7 @@ describe("tool.task", () => {
             return reply(input, "background done")
           })
         },
+        steer: () => Effect.die("test does not implement supervisor steering"),
       }
 
       const fiber = yield* def
@@ -2399,5 +2566,1051 @@ describe("tool.task", () => {
       expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
     }),
+  )
+})
+
+// Worker 1 — Task mode / delegation semantics.
+describe("tool.task supervisor mode", () => {
+  function recordingRegistry() {
+    const registered: string[] = []
+    const unregistered: string[] = []
+    const registry: SupervisorRegistry = {
+      register: (input) =>
+        Effect.sync(() => {
+          registered.push(input.childSessionID)
+        }),
+      unregister: (childSessionID) =>
+        Effect.sync(() => {
+          unregistered.push(childSessionID)
+        }),
+      adopt: (input) =>
+        Effect.sync(() => {
+          registered.push(input.childSessionID)
+        }),
+      relinquish: (input) =>
+        Effect.sync(() => {
+          unregistered.push(input.childSessionID)
+        }),
+    }
+    return { registry, registered, unregistered }
+  }
+
+  function withRegistry<A, E, R>(registry: SupervisorRegistry, effect: Effect.Effect<A, E, R>) {
+    return effect.pipe(Effect.provideService(SupervisorRegistryTag, registry)) as Effect.Effect<A, E, R>
+  }
+
+  it.instance("starts supervisor workers detached and returns immediately with supervision metadata", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const { registry, registered } = recordingRegistry()
+
+      const result = yield* withRegistry(
+        registry,
+        def.execute(
+          {
+            description: "parser audit",
+            prompt: "inspect the parser",
+            subagent_type: "general",
+            mode: "supervisor",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: { ...stubOps(), prompt: () => Effect.never } satisfies SessionPromptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        ),
+      )
+
+      expect(result.metadata.mode).toBe("supervisor")
+      expect(result.metadata.background).toBe(true)
+      expect(result.metadata.supervisorSessionId).toBe(chat.id)
+      expect(result.metadata.supervisionGroupId).toBe(`sup:${assistant.id}`)
+      expect(result.output).toContain('state="running"')
+      expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
+      expect(registered).toEqual([result.metadata.sessionId])
+
+      const child = yield* sessions.get(result.metadata.sessionId)
+      expect(SubagentSupervisionMetadata.taskDelegation(child.metadata)).toEqual({
+        mode: "supervisor",
+        supervisorSessionID: chat.id,
+        supervisionGroupID: `sup:${assistant.id}`,
+        description: "parser audit",
+        createdFromMessageID: assistant.id,
+      })
+    }),
+  )
+
+  it.instance("legacy background retains background:true and mode:background", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.background).toBe(true)
+      expect(result.metadata.mode).toBe("background")
+      expect(result.metadata.supervisorSessionId).toBeUndefined()
+      expect(result.metadata.supervisionGroupId).toBeUndefined()
+      expect(result.output).toContain('state="running"')
+    }),
+  )
+
+  it.instance("foreground default resolves to mode:foreground and background:false", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        { description: "inspect bug", prompt: "look into the cache key path", subagent_type: "general" },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.mode).toBe("foreground")
+      expect(result.metadata.background).toBe(false)
+      expect(result.output).toContain('state="completed"')
+    }),
+  )
+
+  it.instance("explicit mode:foreground matches the default", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          mode: "foreground",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.mode).toBe("foreground")
+      expect(result.metadata.background).toBe(false)
+    }),
+  )
+
+  it.instance("rejects combining explicit mode and background", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "ambiguous",
+            prompt: "do not run",
+            subagent_type: "general",
+            mode: "supervisor",
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected mode/background conflict failure")
+      expect(String(Cause.squash(exit.cause))).toMatch(/not both/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("shares one supervision group id within an assistant turn and differs across turns", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const context = (messageID: MessageID) => ({
+        sessionID: chat.id,
+        messageID,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: { ...stubOps(), prompt: () => Effect.never } satisfies SessionPromptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      })
+      const run = (messageID: MessageID, description: string) =>
+        def.execute(
+          { description, prompt: `inspect ${description}`, subagent_type: "general", mode: "supervisor" },
+          context(messageID),
+        )
+
+      const [a, b] = yield* Effect.all([run(assistant.id, "a"), run(assistant.id, "b")], {
+        concurrency: "unbounded",
+      })
+      const otherTurn = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        time: { created: Date.now() },
+      })
+      const c = yield* run(otherTurn.id, "c")
+
+      expect(a.metadata.supervisionGroupId).toBe(`sup:${assistant.id}`)
+      expect(b.metadata.supervisionGroupId).toBe(`sup:${assistant.id}`)
+      expect(c.metadata.supervisionGroupId).toBe(`sup:${otherTurn.id}`)
+      expect(c.metadata.supervisionGroupId).not.toBe(a.metadata.supervisionGroupId)
+    }),
+  )
+
+  it.instance("four supervisor calls create four independent child sessions without a swarm", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: { ...stubOps(), prompt: () => Effect.never } satisfies SessionPromptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const results = yield* Effect.all(
+        ["a", "b", "c", "d"].map((name) =>
+          def.execute(
+            { description: `worker ${name}`, prompt: `inspect ${name}`, subagent_type: "general", mode: "supervisor" },
+            context,
+          ),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      const ids = results.map((result) => result.metadata.sessionId)
+      expect(new Set(ids).size).toBe(4)
+      expect(yield* sessions.children(chat.id)).toHaveLength(4)
+      expect(results.every((result) => result.metadata.supervisionGroupId === `sup:${assistant.id}`)).toBe(true)
+    }),
+  )
+
+  it.instance("adopts a running background worker into supervision without restarting it", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      let childRuns = 0
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childRuns++
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.never
+            return reply(input, "never")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const launched = yield* def.execute(
+        {
+          description: "background worker",
+          prompt: "work",
+          subagent_type: "general",
+          background: true,
+        },
+        context,
+      )
+      yield* Deferred.await(started)
+      expect(childRuns).toBe(1)
+
+      const { registry, registered } = recordingRegistry()
+      const adopted = yield* withRegistry(
+        registry,
+        def.execute(
+          { description: "background worker", subagent_type: "general", task_id: launched.metadata.sessionId, mode: "supervisor" },
+          context,
+        ),
+      )
+
+      expect(adopted.metadata.sessionId).toBe(launched.metadata.sessionId)
+      expect(adopted.metadata.mode).toBe("supervisor")
+      expect(adopted.metadata.background).toBe(true)
+      expect(registered).toEqual([launched.metadata.sessionId])
+      expect(childRuns).toBe(1)
+      expect((yield* jobs.get(launched.metadata.sessionId))?.status).toBe("running")
+      const child = yield* sessions.get(launched.metadata.sessionId)
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(child.metadata)).toBe(true)
+      yield* jobs.cancel(launched.metadata.sessionId)
+    }),
+  )
+
+  it.instance("relinquishes supervision without stopping the worker", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      let childRuns = 0
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childRuns++
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Effect.never
+            return reply(input, "never")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const launched = yield* def.execute(
+        { description: "supervised", prompt: "work", subagent_type: "general", mode: "supervisor" },
+        context,
+      )
+      yield* Deferred.await(started)
+
+      const { registry, unregistered } = recordingRegistry()
+      const relinquished = yield* withRegistry(
+        registry,
+        def.execute(
+          { description: "supervised", subagent_type: "general", task_id: launched.metadata.sessionId, mode: "background" },
+          context,
+        ),
+      )
+
+      expect(relinquished.metadata.mode).toBe("background")
+      expect(relinquished.metadata.background).toBe(true)
+      expect(unregistered).toEqual([launched.metadata.sessionId])
+      expect(childRuns).toBe(1)
+      expect((yield* jobs.get(launched.metadata.sessionId))?.status).toBe("running")
+      const child = yield* sessions.get(launched.metadata.sessionId)
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(child.metadata)).toBe(false)
+      yield* jobs.cancel(launched.metadata.sessionId)
+    }),
+  )
+
+  it.instance("supervisor -> foreground attaches without restarting the worker", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      let childRuns = 0
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childRuns++
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(finish)
+            return reply(input, "worker done")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const launched = yield* def.execute(
+        { description: "supervised", prompt: "work", subagent_type: "general", mode: "supervisor" },
+        context,
+      )
+      yield* Deferred.await(started)
+
+      const { registry, unregistered } = recordingRegistry()
+      const attached = yield* withRegistry(
+        registry,
+        def
+          .execute(
+            { description: "supervised", subagent_type: "general", task_id: launched.metadata.sessionId, mode: "foreground" },
+            context,
+          )
+          .pipe(Effect.forkChild),
+      )
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const info = yield* jobs.get(launched.metadata.sessionId)
+          return info?.metadata?.background === false ? info : undefined
+        }),
+        "worker never entered foreground mode",
+      )
+      expect(childRuns).toBe(1)
+
+      yield* Deferred.succeed(finish, undefined)
+      const result = yield* Fiber.join(attached)
+      expect(result.metadata.sessionId).toBe(launched.metadata.sessionId)
+      expect(result.metadata.mode).toBe("foreground")
+      expect(result.metadata.background).toBe(false)
+      expect(result.output).toContain('state="completed"')
+      expect(childRuns).toBe(1)
+      expect(unregistered).toEqual([launched.metadata.sessionId])
+    }),
+  )
+
+  it.instance("foreground -> supervisor detaches and establishes supervision", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      let childRuns = 0
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childRuns++
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(finish)
+            return reply(input, "worker done")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const foreground = yield* def
+        .execute({ description: "fg", prompt: "work", subagent_type: "general" }, context)
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const job = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          return (yield* jobs.list()).find((item) => item.metadata?.parentSessionId === chat.id)
+        }),
+        "task job never started",
+      )
+      if (!job) throw new Error("task job not found")
+
+      const { registry, registered } = recordingRegistry()
+      const detached = yield* withRegistry(
+        registry,
+        def.execute(
+          { description: "fg", subagent_type: "general", task_id: job.id, mode: "supervisor" },
+          context,
+        ),
+      )
+
+      expect(detached.metadata.sessionId).toBe(job.id)
+      expect(detached.metadata.mode).toBe("supervisor")
+      expect(detached.metadata.background).toBe(true)
+      expect(registered).toEqual([job.id])
+      expect(childRuns).toBe(1)
+
+      yield* Deferred.succeed(finish, undefined)
+      const result = yield* Fiber.join(foreground)
+      expect(result.metadata.background).toBe(true)
+      expect(childRuns).toBe(1)
+    }),
+  )
+
+  it.instance("re-prompts a completed worker under supervisor mode using the same session", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let childRuns = 0
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childRuns++
+          return Effect.succeed(reply(input, childRuns === 1 ? "first" : "second"))
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const first = yield* def.execute(
+        { description: "worker", prompt: "first", subagent_type: "general" },
+        context,
+      )
+      const second = yield* def.execute(
+        {
+          description: "worker",
+          prompt: "continue",
+          subagent_type: "general",
+          task_id: first.metadata.sessionId,
+          mode: "supervisor",
+        },
+        context,
+      )
+
+      expect(second.metadata.sessionId).toBe(first.metadata.sessionId)
+      expect(second.metadata.mode).toBe("supervisor")
+      expect(second.metadata.background).toBe(true)
+      const waited = yield* jobs.wait({ id: second.metadata.sessionId, timeout: 1_000 })
+      expect(waited.info?.status).toBe("completed")
+      expect(waited.info?.output).toBe("second")
+      expect(childRuns).toBe(2)
+    }),
+  )
+
+  it.instance("appends the supervisor worker protocol only in supervisor mode", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const seen: string[] = []
+      const promptOps = stubOps({
+        onPrompt: (input) => {
+          seen.push(input.parts.map((part) => (part.type === "text" ? part.text : "")).join("\n"))
+        },
+      })
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      yield* def.execute({ description: "fg", prompt: "fg work", subagent_type: "general" }, context)
+      yield* def.execute(
+        { description: "sup", prompt: "sup work", subagent_type: "general", mode: "supervisor" },
+        context,
+      )
+
+      expect(seen[0]).toBe("fg work")
+      expect(seen[0]).not.toContain("SUPERVISOR WORKER PROTOCOL")
+      expect(seen[1]).toContain("sup work")
+      expect(seen[1]).toContain(SUPERVISOR_WORKER_PROTOCOL)
+    }),
+  )
+
+  it.instance("supervisor mode respects the subagent depth limit", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: child.id,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          { description: "nested supervisor", prompt: "spawn", subagent_type: "general", mode: "supervisor" },
+          {
+            sessionID: child.id,
+            messageID: nestedAssistant.id,
+            agent: "general",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected depth-limit failure")
+      expect(String(Cause.squash(exit.cause))).toMatch(/depth limit/i)
+      expect(yield* sessions.children(child.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("supervisor mode does not widen protected delegated authority", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seedDelegated({ allowed: false, source: "turn" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          { description: "denied supervisor", prompt: "try to spawn", subagent_type: "general", mode: "supervisor" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected protected authority refusal")
+      expect((Cause.squash(exit.cause) as Error).message).toMatch(/nested subagent spawning is not authorized/i)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("supervisor metadata helper round-trips, strips, and is not producer-owned", () =>
+    Effect.gen(function* () {
+      const envelope: SubagentSupervisionMetadata.TaskDelegation = {
+        mode: "supervisor",
+        supervisorSessionID: "ses_parent",
+        supervisionGroupID: "sup:msg_1",
+        description: "parser audit",
+        createdFromMessageID: "msg_1",
+      }
+      const withKey = SubagentSupervisionMetadata.withTaskDelegation(envelope, { keep: "me" })
+      expect(withKey.keep).toBe("me")
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(withKey)).toBe(true)
+      expect(SubagentSupervisionMetadata.taskDelegation(withKey)).toEqual(envelope)
+      // Not registered as immutable producer identity.
+      expect(SessionMetadataOwnership.hasWorkerDelegationOrigin(withKey)).toBe(false)
+      expect(SessionMetadataOwnership.isProducerOwned(withKey)).toBe(false)
+
+      const stripped = SubagentSupervisionMetadata.withoutTaskDelegation(withKey)
+      expect(stripped.keep).toBe("me")
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(stripped)).toBe(false)
+      expect(SubagentSupervisionMetadata.taskDelegation(stripped)).toBeUndefined()
+      // Malformed envelopes fail closed.
+      expect(SubagentSupervisionMetadata.taskDelegation({ taskDelegation: { mode: "supervisor" } })).toBeUndefined()
+      expect(SubagentSupervisionMetadata.taskDelegation({ taskDelegation: { mode: "background" } })).toBeUndefined()
+    }),
+  )
+
+  it.instance(
+    "steers a RUNNING supervised worker through the steer seam without a second execution generation",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const started = yield* Deferred.make<void>()
+        const finish = yield* Deferred.make<void>()
+        let childPrompts = 0
+        let steerCalls = 0
+        const steered: SessionPrompt.PromptInput[] = []
+        const steeredProvenance: (HostPromptProvenance | undefined)[] = []
+        const promptOps: SessionPromptOps = {
+          ...stubOps(),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+            childPrompts++
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(finish)
+              return reply(input, "worker done")
+            })
+          },
+          steer: (input, provenance) => {
+            steerCalls++
+            steered.push(input)
+            steeredProvenance.push(provenance)
+            return Effect.succeed(reply(input, "steer acknowledged"))
+          },
+        }
+        const context = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+
+        const launched = yield* def.execute(
+          { description: "supervised", prompt: "initial work", subagent_type: "general", mode: "supervisor" },
+          context,
+        )
+        yield* Deferred.await(started)
+        const before = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const info = yield* jobs.get(launched.metadata.sessionId)
+            return info?.status === "running" ? info : undefined
+          }),
+          "supervised worker never started running",
+        )
+        expect(childPrompts).toBe(1)
+        expect(steerCalls).toBe(0)
+
+        const steeredResult = yield* def.execute(
+          {
+            description: "supervised",
+            prompt: "stop and audit the AST layer instead",
+            subagent_type: "general",
+            task_id: launched.metadata.sessionId,
+            mode: "supervisor",
+          },
+          context,
+        )
+
+        // The supervisor prompt went through the steer seam, not a queued
+        // continuation: prompt() was not called again.
+        expect(steerCalls).toBe(1)
+        expect(childPrompts).toBe(1)
+        expect(steered[0]?.sessionID).toBe(launched.metadata.sessionId)
+        expect(steered[0]?.agent).toBe("general")
+        expect(
+          steered[0]?.parts
+            .map((part) => (part.type === "text" ? part.text : ""))
+            .join("\n"),
+        ).toContain("stop and audit the AST layer instead")
+        expect(
+          steered[0]?.parts
+            .map((part) => (part.type === "text" ? part.text : ""))
+            .join("\n"),
+        ).toContain(SUPERVISOR_WORKER_PROTOCOL)
+        expect(steeredProvenance).toEqual([undefined])
+
+        expect(steeredResult.metadata.sessionId).toBe(launched.metadata.sessionId)
+        expect(steeredResult.metadata.mode).toBe("supervisor")
+        expect(steeredResult.metadata.background).toBe(true)
+        expect(steeredResult.output).toContain("Supervised worker steered")
+
+        // No second execution generation and no duplicate child Session.
+        const after = yield* jobs.get(launched.metadata.sessionId)
+        expect(after?.status).toBe("running")
+        expect(after?.generation).toBe(before?.generation)
+        expect(yield* sessions.children(chat.id)).toHaveLength(1)
+
+        yield* Deferred.succeed(finish, undefined)
+        const waited = yield* jobs.wait({ id: launched.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("completed")
+        expect(childPrompts).toBe(1)
+        expect(steerCalls).toBe(1)
+      }),
+  )
+
+  it.instance("fails loudly instead of downgrading supervisor steering to a queued continuation", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      let childPrompts = 0
+      // Deliberately omit `steer` from the prompt control surface.
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          childPrompts++
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(finish)
+            return reply(input, "worker done")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const launched = yield* def.execute(
+        { description: "supervised", prompt: "initial work", subagent_type: "general", mode: "supervisor" },
+        context,
+      )
+      yield* Deferred.await(started)
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "supervised",
+            prompt: "change direction",
+            subagent_type: "general",
+            task_id: launched.metadata.sessionId,
+            mode: "supervisor",
+          },
+          context,
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected supervisor steering refusal without steer")
+      expect(String(Cause.squash(exit.cause))).toMatch(/steer/i)
+      // It did not silently queue a continuation instead.
+      expect(childPrompts).toBe(1)
+      expect((yield* jobs.get(launched.metadata.sessionId))?.status).toBe("running")
+      yield* Deferred.succeed(finish, undefined)
+    }),
+  )
+
+  it.instance("does not mutate child metadata when foregrounding a never-supervised child", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const promptOps: SessionPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(reply(input, "injected"))
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(finish)
+            return reply(input, "worker done")
+          })
+        },
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const launched = yield* def
+        .execute({ description: "plain", prompt: "work", subagent_type: "general" }, context)
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const child = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const kids = yield* sessions.children(chat.id)
+          return kids[0]
+        }),
+        "child session never appeared",
+      )
+      const before = yield* sessions.get(child.id)
+      // A plain foreground child carries no supervision envelope.
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(before.metadata)).toBe(false)
+
+      const jobs = yield* BackgroundJob.Service
+      const job = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          return (yield* jobs.list()).find((item) => item.metadata?.sessionId === child.id)
+        }),
+        "task job never started",
+      )
+      if (!job) throw new Error("task job not found")
+      // Fork the foreground attach; it blocks until the (shared) worker settles.
+      const attached = yield* def
+        .execute(
+          { description: "plain", subagent_type: "general", task_id: child.id, mode: "foreground" },
+          context,
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.succeed(finish, undefined)
+      yield* Fiber.join(attached)
+      yield* Fiber.join(launched)
+
+      const after = yield* sessions.get(child.id)
+      // Foregrounding a never-supervised child must not add or strip anything.
+      expect(after.metadata).toEqual(before.metadata)
+      expect(SubagentSupervisionMetadata.hasTaskDelegationOrigin(after.metadata)).toBe(false)
+    }),
+  )
+
+  it.instance("delegation description documents all modes without dropping background", () =>
+    Effect.sync(() => {
+      expect(SubagentDelegation.BACKGROUND_DESCRIPTION).toContain("mode")
+      expect(SubagentDelegation.BACKGROUND_DESCRIPTION).toContain("background")
+      expect(SubagentDelegation.BACKGROUND_DESCRIPTION).toContain("supervisor")
+    }),
+  )
+
+  it.instance("refuses primary-only agents before asking Task permission", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let asks = 0
+
+      const exit = yield* def
+        .execute(
+          { description: "invalid primary delegation", prompt: "do work", subagent_type: "build" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () =>
+              Effect.sync(() => {
+                asks++
+              }),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected primary-only delegation refusal")
+      expect((Cause.squash(exit.cause) as Error).message).toMatch(/primary agent.*cannot be used as a subagent/i)
+      expect(asks).toBe(0)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance(
+    "hidden subagents remain delegatable by exact name",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let asks = 0
+
+        const result = yield* def.execute(
+          { description: "hidden specialist", prompt: "complete the hidden task", subagent_type: "hidden-worker" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () =>
+              Effect.sync(() => {
+                asks++
+              }),
+          },
+        )
+
+        expect(result.output).toContain('state="completed"')
+        expect(asks).toBe(1)
+        const children = yield* sessions.children(chat.id)
+        expect(children).toHaveLength(1)
+        expect(children[0]?.agent).toBe("hidden-worker")
+      }),
+    {
+      config: {
+        agent: {
+          "hidden-worker": {
+            description: "Hidden delegated specialist",
+            mode: "subagent",
+            hidden: true,
+          },
+        },
+      },
+    },
   )
 })

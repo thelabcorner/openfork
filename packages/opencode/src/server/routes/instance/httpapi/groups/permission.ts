@@ -4,8 +4,9 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { PermissionNotFoundError } from "../errors"
 import { Authorization } from "../middleware/authorization"
-import { InstanceContextMiddleware } from "../middleware/instance-context"
 import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
+import { SessionID } from "@/session/schema"
+import { SessionPaths } from "./session"
 import { described } from "./metadata"
 
 const root = "/permission"
@@ -13,6 +14,8 @@ const ReplyPayload = Schema.Struct({
   reply: PermissionV1.Reply,
   message: Schema.optional(Schema.String),
 })
+
+export const PermissionResponsePayload = Schema.Struct({ response: PermissionV1.Reply })
 
 export const PermissionApi = HttpApi.make("permission")
   .add(
@@ -28,19 +31,6 @@ export const PermissionApi = HttpApi.make("permission")
             description: "Get all pending permission requests across all sessions.",
           }),
         ),
-        HttpApiEndpoint.post("reply", `${root}/:requestID/reply`, {
-          params: { requestID: PermissionV1.ID },
-          query: WorkspaceRoutingQuery,
-          payload: ReplyPayload,
-          success: described(Schema.Boolean, "Permission processed successfully"),
-          error: [HttpApiError.BadRequest, PermissionNotFoundError],
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "permission.reply",
-            summary: "Respond to permission request",
-            description: "Approve or deny a permission request from the AI assistant.",
-          }),
-        ),
       )
       .annotateMerge(
         OpenApi.annotations({
@@ -48,7 +38,6 @@ export const PermissionApi = HttpApi.make("permission")
           description: "Experimental HttpApi permission routes.",
         }),
       )
-      .middleware(InstanceContextMiddleware)
       .middleware(WorkspaceRoutingMiddleware)
       .middleware(Authorization),
   )
@@ -59,3 +48,37 @@ export const PermissionApi = HttpApi.make("permission")
       description: "Experimental HttpApi surface for selected instance routes.",
     }),
   )
+
+export const PermissionControlApi = HttpApi.make("permission-control").add(
+  HttpApiGroup.make("permissionControl")
+    .add(
+      HttpApiEndpoint.post("reply", `${root}/:requestID/reply`, {
+        params: { requestID: PermissionV1.ID },
+        query: WorkspaceRoutingQuery,
+        payload: ReplyPayload,
+        success: described(Schema.Boolean, "Permission processed successfully"),
+        error: [HttpApiError.BadRequest, PermissionNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "permission.reply",
+          summary: "Respond to permission request",
+          description: "Approve or deny a pending permission request without loading a workspace Instance.",
+        }),
+      ),
+      HttpApiEndpoint.post("sessionReply", SessionPaths.permissions, {
+        params: { sessionID: SessionID, permissionID: PermissionV1.ID },
+        query: WorkspaceRoutingQuery,
+        payload: PermissionResponsePayload,
+        success: described(Schema.Boolean, "Permission processed successfully"),
+        error: [HttpApiError.BadRequest, PermissionNotFoundError],
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "permission.respond",
+          summary: "Respond to permission",
+          description: "Approve or deny a permission request without loading a workspace Instance.",
+        }),
+      ),
+    )
+    .middleware(WorkspaceRoutingMiddleware)
+    .middleware(Authorization),
+)

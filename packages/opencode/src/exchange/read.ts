@@ -118,7 +118,12 @@ function renderWindow(displayPath: string, file: ReadFilesystem.LineResult) {
     output += `\n\n(End of file - total ${file.count} lines)`
   }
   output += "\n</content>"
-  return { output, truncated: file.cut || file.more }
+  const truncated = file.cut || file.more
+  return {
+    output,
+    truncated,
+    ...(truncated ? { nextOffset: next } : {}),
+  }
 }
 
 function project(result: Result, marker: string) {
@@ -128,14 +133,44 @@ function project(result: Result, marker: string) {
     strategy: "head",
     marker,
   })
+  const metadata: Record<string, unknown> = {
+    ...result.metadata,
+    projectionTruncated: projected.truncated,
+    truncated:
+      projected.truncated || result.metadata?.truncated === true,
+  }
+  if (
+    projected.truncated &&
+    typeof result.metadata?.offset === "number"
+  ) {
+    const retryOffset = result.metadata.offset
+    const nextOffset = result.metadata.nextOffset
+    const span =
+      typeof nextOffset === "number" && nextOffset > retryOffset
+        ? nextOffset - retryOffset
+        : undefined
+    const retainedRatio =
+      projected.originalBytes > 0
+        ? projected.retainedBytes / projected.originalBytes
+        : 0
+    const recommendedLimit =
+      span === undefined
+        ? Math.max(1, OUTPUT_LINES - 16)
+        : Math.max(
+            1,
+            Math.min(
+              OUTPUT_LINES - 16,
+              Math.floor(span * retainedRatio * 0.8),
+            ),
+          )
+    delete metadata.nextOffset
+    metadata.retryOffset = retryOffset
+    metadata.recommendedLimit = recommendedLimit
+  }
   return {
     ...result,
     output: projected.content,
-    metadata: {
-      ...result.metadata,
-      projectionTruncated: projected.truncated,
-      truncated: projected.truncated || result.metadata?.truncated === true,
-    },
+    metadata,
   } satisfies Result
 }
 
@@ -174,7 +209,15 @@ export function execute<E>(
           {
             title: input.displayPath,
             output: `<path entries="${items.length}">${input.displayPath}</path>\n<type>directory</type>\n<entries>\n${rows.join("\n")}\n${truncated ? `(Showing ${rows.length} of ${items.length} entries. Use offset to continue.)` : `(${items.length} entries.)`}\n</entries>`,
-            metadata: { action, path: input.displayPath, directory: true, entries: items.length, truncated },
+            metadata: {
+              action,
+              path: input.displayPath,
+              directory: true,
+              entries: items.length,
+              offset: usedOffset,
+              ...(truncated ? { nextOffset: usedOffset + rows.length } : {}),
+              truncated,
+            },
           },
           input.projectionMarker ?? "<note>Read output truncated; narrow the read window</note>",
         ),
@@ -248,6 +291,7 @@ export function execute<E>(
             path: input.displayPath,
             lines: file.count,
             offset: file.offset,
+            ...(rendered.nextOffset === undefined ? {} : { nextOffset: rendered.nextOffset }),
             truncated: rendered.truncated,
           },
         },

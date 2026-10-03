@@ -360,12 +360,14 @@ describe("OFXP coding-activity attribution", () => {
           project: "repo",
           projectFolder: repo,
           sourceRef: OfxpPrincipal.key(source.key.peerID, editRequest.context),
+          replayToken: editRequest.context.invocationID,
         })
         expect(mine.find((event) => event.entity === patched)).toMatchObject({
           kind: "write",
           project: "repo",
           projectFolder: repo,
           sourceRef: OfxpPrincipal.key(source.key.peerID, patchRequest.context),
+          replayToken: patchRequest.context.invocationID,
         })
         expect(yield* Effect.promise(() => fs.readFile(edited, "utf8"))).toBe("ALPHA\n")
         expect(yield* Effect.promise(() => fs.readFile(patched, "utf8"))).toBe("BRAVO\n")
@@ -390,14 +392,21 @@ describe("OFXP coding-activity attribution", () => {
       )
       expect(built.source).toBe("ofxp")
       expect(built.project).toBe("canonical-repo")
+      expect(built.sourceRef).toBe(OfxpPrincipal.key(source.key.peerID, request.context))
+      expect(built.replayToken).toBe(request.context.invocationID)
       // The folder is the granted root's own path, never its alias or basename.
       expect(built.projectFolder).toBe(path.join("C:", "workspaces", "canonical-repo"))
       expect(built.projectFolder).not.toBe("public-alias")
       expect(built.projectFolder).not.toBe("canonical-repo")
-      expect(built.sourceRef).toBe(OfxpPrincipal.key(source.key.peerID, request.context))
-      // The receipt token and the authorization scope are not actor identity.
+      // The receipt token is an idempotency identity, never actor identity.
       expect(built.sourceRef).not.toContain(request.context.invocationID)
-      expect(Object.keys(built).slice().sort()).toEqual(["project", "projectFolder", "source", "sourceRef"])
+      expect(Object.keys(built).slice().sort()).toEqual([
+        "project",
+        "projectFolder",
+        "replayToken",
+        "source",
+        "sourceRef",
+      ])
     }),
   )
 })

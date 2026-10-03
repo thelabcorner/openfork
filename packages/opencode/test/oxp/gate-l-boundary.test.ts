@@ -62,6 +62,9 @@ describe("OXP Gate L file-exchange architecture boundary", () => {
     expect(source).toContain("O_EXCL")
     expect(source).toContain("512 * 1024 * 1024")
     expect(source).toContain("fs.link(partial, destination)")
+    expect(source).toContain("assertNoSymlinkComponents(parent)")
+    expect(source).toContain("fs.lstat(destination)")
+    expect(source).toContain("published.ino !== staged.ino")
     expect(source).toContain("Destination already exists; file exchange never overwrites files")
   })
 

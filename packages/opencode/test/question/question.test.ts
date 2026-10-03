@@ -1,6 +1,6 @@
 import { afterEach, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Queue } from "effect"
 import { Question } from "../../src/question"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -64,6 +64,48 @@ const waitForPending = Effect.fn("QuestionTest.waitForPending")(function* (count
     yield* Queue.take(asked).pipe(Effect.timeout("2 seconds"))
   }
 })
+
+it.instance(
+  "replied control settles the active ask before a blocked transient event listener",
+  () => Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const published = yield* Deferred.make<void>()
+    const unsubscribe = yield* events.listen((event) => event.type === Question.Event.Replied.type
+      ? Deferred.succeed(published, undefined).pipe(Effect.andThen(Effect.never))
+      : Effect.void)
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_blocked_replied_listener"),
+      questions: [{ question: "Continue?", header: "Action", options: [{ label: "Yes", description: "Continue" }] }],
+    }).pipe(Effect.forkScoped)
+    const [pending] = yield* waitForPending(1)
+    yield* replyEffect({ requestID: pending!.id, answers: [["Yes"]] })
+    expect(yield* Fiber.join(fiber)).toEqual([["Yes"]])
+    yield* Deferred.await(published).pipe(Effect.timeout("2 seconds"))
+  }),
+  { git: true },
+)
+
+it.instance(
+  "interruption during Asked publication releases pending ownership",
+  () => Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const publishing = yield* Deferred.make<void>()
+    const unsubscribe = yield* events.listen((event) => event.type === Question.Event.Asked.type
+      ? Deferred.succeed(publishing, undefined).pipe(Effect.andThen(Effect.never))
+      : Effect.void)
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const fiber = yield* askEffect({
+      sessionID: SessionID.make("ses_publication_interrupt"),
+      questions: [{ question: "Continue?", header: "Action", options: [{ label: "Yes", description: "Continue" }] }],
+    }).pipe(Effect.forkScoped)
+    yield* Deferred.await(publishing)
+    expect(yield* listEffect).toHaveLength(1)
+    yield* Fiber.interrupt(fiber)
+    expect(yield* listEffect).toHaveLength(0)
+  }),
+  { git: true },
+)
 
 it.instance(
   "ask - remains pending until answered",
@@ -274,16 +316,16 @@ it.instance(
         source: "oxp.supervisor",
         ref: "oxp:test-connector",
       }
-      const seen: Array<{
+      const seen = yield* Queue.unbounded<{
         type: string
         metadata?: Record<string, unknown>
-      }> = []
+      }>()
       const unsub = yield* events.listen((event) => {
         if (
           event.type === Question.Event.Replied.type ||
           event.type === Question.Event.Rejected.type
         ) {
-          seen.push({ type: event.type, metadata: event.metadata })
+          Queue.offerUnsafe(seen, { type: event.type, metadata: event.metadata })
         }
         return Effect.void
       })
@@ -321,7 +363,13 @@ it.instance(
       yield* question.reject(second.id, actor)
       expect((yield* Fiber.await(rejected))._tag).toBe("Failure")
 
-      expect(seen).toEqual([
+      const observed = yield* Effect.forEach([0, 1], () =>
+        Queue.take(seen).pipe(Effect.timeoutOrElse({
+          duration: "2 seconds",
+          orElse: () => Effect.fail(new Error("timed out waiting for question attribution events")),
+        })),
+      )
+      expect(observed).toEqual([
         { type: Question.Event.Replied.type, metadata: { actor } },
         { type: Question.Event.Rejected.type, metadata: { actor } },
       ])

@@ -117,10 +117,10 @@ describe("OFXP TLS bootstrap transport", () => {
       })
       const aPreview = a.pairing.acceptAnswer(success.answer)
       const bPreview = b.pairing.preview(offer.pairingID)
-      expect(bPreview).toBeDefined()
-      expect(aPreview.sas).toBe(bPreview?.sas)
+      if (!bPreview) throw new Error("OFXP responder did not preview the pairing offer")
+      expect(aPreview.sas).toBe(bPreview.sas)
       expect(aPreview.peer.id).toBe(b.key.peerID)
-      expect(bPreview?.peer.id).toBe(a.key.peerID)
+      expect(bPreview.peer.id).toBe(a.key.peerID)
 
       const forgedOffer = { ...fake.pairing.begin(), pairingID: fake.pairing.begin().pairingID }
       await expect(OfxpTransport.requestJson({

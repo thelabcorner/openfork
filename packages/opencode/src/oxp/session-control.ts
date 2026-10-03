@@ -60,10 +60,45 @@ export class SelectionUnavailable extends Error {
   }
 }
 
+export class GoalRevisionConflict extends Error {
+  override readonly name = "OxpSessionGoalRevisionConflict"
+  constructor(
+    readonly goalID: string,
+    readonly expectedRevision: number,
+    readonly actualRevision: number,
+  ) {
+    super(`Goal ${goalID} revision changed from ${expectedRevision} to ${actualRevision}`)
+  }
+}
+
+export class GoalVerificationUnavailable extends Error {
+  override readonly name = "OxpSessionGoalVerificationUnavailable"
+  constructor(
+    readonly goalID: string,
+    readonly status: string,
+  ) {
+    super(`Goal ${goalID} cannot request verification while ${status}`)
+  }
+}
+
+export class HostOwned extends Error {
+  override readonly name = "OxpSessionHostOwned"
+  constructor(
+    readonly sessionID: string,
+    readonly parentID: string,
+    readonly kind: string,
+  ) {
+    super(`Session ${sessionID} is owned by the host producer ${kind}`)
+  }
+}
+
 export interface Interface {
   readonly pause: (target: Target) => Effect.Effect<void, Error>
   readonly resume: (target: Target) => Effect.Effect<void, Error>
   readonly abort: (target: Target) => Effect.Effect<void, Error>
+  readonly archive: (target: Target) => Effect.Effect<void, Error>
+  readonly unarchive: (target: Target) => Effect.Effect<void, Error>
+  readonly delete: (target: Target) => Effect.Effect<void, Error>
   readonly setSelection: (target: Target, input: SelectionInput) => Effect.Effect<void, Error>
   readonly send: (target: Target, input: PromptInput) => Effect.Effect<PromptResult, Error>
   readonly turn: (

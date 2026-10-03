@@ -8,6 +8,7 @@ type OpenApiSchema = {
   readonly anyOf?: ReadonlyArray<OpenApiSchema>
   readonly type?: string
   readonly enum?: readonly unknown[]
+  readonly items?: OpenApiSchema
   readonly properties?: Record<string, OpenApiSchema>
   readonly required?: readonly string[]
   readonly contentSchema?: OpenApiSchema
@@ -18,6 +19,7 @@ type OpenApiResponse = {
   readonly content?: Record<string, { readonly schema?: OpenApiSchema }>
 }
 type OpenApiOperation = {
+  readonly operationId?: string
   readonly parameters?: ReadonlyArray<{
     readonly name: string
     readonly in: string
@@ -70,6 +72,23 @@ function isBuiltInEndpointError(name: string) {
 }
 
 describe("PublicApi OpenAPI v2 errors", () => {
+  test("retains the V1 provider list operation after splitting catalog ownership", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const operation = spec.paths["/provider"]?.get
+    expect(operation?.operationId).toBe("provider.list")
+    expect(operation?.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "directory", in: "query", required: false }),
+    ]))
+    expect(operation?.responses?.["200"]).toBeDefined()
+  }, 30000)
+
+  test("publishes the Tier-0 OpenRouter free-usage operation to the generated SDK surface", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const operation = spec.paths["/experimental/openrouter-free-usage"]?.get
+    expect(operation?.operationId).toBe("experimental.openrouterFreeUsage.get")
+    expect(operation?.responses?.["200"]).toBeDefined()
+  }, 30000)
+
   test("includes plugin-facing core schemas", () => {
     const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
 
@@ -347,4 +366,36 @@ describe("PublicApi OpenAPI v2 errors", () => {
       "ProjectNotFoundError",
     )
   })
+
+  test("keeps /fork/capacity estimate nullability while stripping optional null elsewhere", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const nullableNumber = { anyOf: [{ type: "number" }, { type: "null" }] }
+    const schema = spec.paths["/fork/capacity"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema
+    expect(schema).toBeDefined()
+
+    // Provider estimates and account estimates, including the optional
+    // per-account default estimate.
+    const provider = schema?.properties?.providers?.items
+    const account = provider?.properties?.accounts?.items
+    for (const location of [
+      provider?.properties?.defaultEstimates?.items,
+      provider?.properties?.estimates?.items,
+      account?.properties?.defaultEstimate,
+      account?.properties?.estimates?.items,
+    ]) {
+      expect(location?.properties?.estimatedRequests).toEqual(nullableNumber)
+      expect(location?.properties?.remainingPercent).toEqual(nullableNumber)
+      expect(location?.properties?.resetAt).toEqual(nullableNumber)
+    }
+
+    // The Go-specific rows stay non-nullable: those three fields are always finite.
+    const goEstimate = schema?.properties?.routed?.items
+    expect(goEstimate?.properties?.estimatedRequests).toEqual({ type: "number" })
+    expect(goEstimate?.properties?.remainingPercent).toEqual({ type: "number" })
+    expect(goEstimate?.properties?.resetAt).toEqual({ type: "number" })
+
+    // The global null-strip behavior is unchanged for other responses.
+    const providerModel = spec.paths["/provider"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema
+    expect(JSON.stringify(providerModel)).not.toContain('"type": "null"')
+  }, 30000)
 })

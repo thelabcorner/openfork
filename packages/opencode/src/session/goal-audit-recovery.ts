@@ -6,10 +6,11 @@ import { InstanceStore } from "@/project/instance-store"
 import { SessionPrompt } from "./prompt"
 
 /**
- * Process-start recovery for the one Goal state that otherwise has no wake
- * source: a focused automatic Goal is durably `verifying`, but no automation
- * cursor exists. The durable owning Session supplies the exact directory, and
- * InstanceStore provides that location before any Tier-3 model/runtime work.
+ * Process-start recovery for focused automatic Goals durably `verifying` but
+ * lacking an automation cursor. Recovery enters through the same durable
+ * requestGoalAudit owner as UI/OXP verification so cursor creation, runner
+ * quiescence, and auditor dispatch cannot diverge. The durable owning Session
+ * supplies the exact directory before any Tier-3 model/runtime work.
  *
  * Explicit audit_error rows are excluded by GoalAutomation so a provider/auth
  * failure cannot become a reboot retry loop.
@@ -21,24 +22,30 @@ const layer = Layer.effectDiscard(
     const instances = yield* InstanceStore.Service
     const scope = yield* Scope.Scope
 
-    for (const orphan of yield* automation.orphanedAuditSessions()) {
+    const recover = Effect.fnUntraced(function* (orphan) {
       yield* instances
         .provide(
           { directory: orphan.directory },
-          prompt.auditGoal(orphan.sessionID).pipe(Effect.provideService(WorkspaceRef, orphan.workspaceID)),
+          prompt.requestGoalAudit(orphan.sessionID).pipe(Effect.provideService(WorkspaceRef, orphan.workspaceID)),
         )
         .pipe(
-        Effect.catchCause((cause) =>
-          Effect.logError("orphaned Goal audit recovery failed", {
-            sessionID: orphan.sessionID,
-            directory: orphan.directory,
-            cause,
-          }),
-        ),
-        Effect.forkIn(scope, { startImmediately: true }),
-        Effect.ignore,
+          Effect.catchCause((cause) =>
+            Effect.logError("orphaned Goal audit recovery failed", {
+              sessionID: orphan.sessionID,
+              directory: orphan.directory,
+              cause,
+            }),
+          ),
         )
-    }
+    })
+
+    // A restart can recover many orphaned Goals at once. Bound Tier-3
+    // workspace/model activation like continuation recovery does, while
+    // keeping the dispatcher detached from server bootstrap.
+    yield* Effect.forEach(yield* automation.orphanedAuditSessions(), recover, {
+      concurrency: 2,
+      discard: true,
+    }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
   }),
 )
 

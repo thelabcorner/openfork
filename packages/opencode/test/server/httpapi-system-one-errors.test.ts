@@ -25,7 +25,7 @@ describe("System One HttpApi provider failures", () => {
   test("maps unavailable live provider-account rosters to service unavailable", () => {
     const mapped = mapSystemOneError(
       new Provider.AccountResolutionError({
-        providerID: ProviderV2.ID.make("verdent"),
+        providerID: ProviderV2.ID.make("workbuddy"),
         selector: "team",
         reason: "unavailable",
       }),
@@ -33,7 +33,7 @@ describe("System One HttpApi provider failures", () => {
 
     expect(mapped).toMatchObject({
       _tag: "ServiceUnavailableError",
-      service: "verdent",
+      service: "workbuddy",
     })
   })
 

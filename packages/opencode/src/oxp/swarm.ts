@@ -7,6 +7,7 @@ import type { SwarmV2 } from "@opencode-ai/core/swarm"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { InstanceState } from "@/effect/instance-state"
 import { SwarmCommand } from "@/swarm/command"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { Parameters as NativeParameters } from "@/tool/swarm"
 import { OxpAuthority } from "./authority"
 import { OxpError } from "./error"
@@ -38,6 +39,7 @@ const READ_ACTIONS = new Set<Input["action"]>([
   "list",
   "get",
   "summary",
+  "task.runs",
   "message.list",
   "blackboard.get",
   "claim.list",
@@ -111,15 +113,18 @@ const layer = Layer.effect(
           const [
             { SwarmV2: RuntimeSwarm },
             { SwarmMemberSessionWake: RuntimeMemberWake },
+            { SwarmProfilePreflight: RuntimeProfilePreflight },
             { Project: RuntimeProject },
           ] = await Promise.all([
             import("@opencode-ai/core/swarm"),
             import("@/swarm/member-session-wake"),
+            import("@/swarm/profile-preflight"),
             import("@/project/project"),
           ])
           return Effect.gen(function* () {
             const swarms = yield* RuntimeSwarm.Service
             const memberWake = yield* RuntimeMemberWake.Service
+            const profilePreflight = yield* RuntimeProfilePreflight.Service
             const projects = yield* RuntimeProject.Service
             const persistedProject = yield* projects.fromDirectory(root.canonicalPath)
             const projectID = persistedProject.project.id
@@ -164,7 +169,7 @@ const layer = Layer.effect(
             if (params.action === "delegate") {
               yield* commit()
               const workspaceID = yield* InstanceState.workspaceID
-              const created = yield* SwarmCommand.delegate(swarms, {
+              const created = yield* SwarmCommand.delegate(swarms, profilePreflight, {
                 projectID,
                 ...(workspaceID === undefined ? {} : { workspaceID }),
                 directory: root.canonicalPath,
@@ -193,20 +198,26 @@ const layer = Layer.effect(
               const summary = yield* swarms.summary(swarmID)
               return { title: "OpenFork Swarm summary", value: summary, metadata: { swarmId: swarmID, status: summary.swarm.status }, mutating: false }
             }
-            if (params.action === "state") {
+            if (params.action === "set_status" || params.action === "state") {
               const { detail } = yield* coordinator(swarmID)
               const status = params.status
               if (!status || !["active", "paused", "completed", "failed", "archived"].includes(status)) {
-                return yield* Effect.fail(new Error("state requires status=active|paused|completed|failed|archived"))
+                return yield* Effect.fail(new Error("set_status requires status=active|paused|completed|failed|archived"))
               }
               yield* commit()
               const value = yield* swarms.update({ id: swarmID, expectedRevision: detail.swarm.revision, status })
               return { title: "OpenFork Swarm " + value.status, value, metadata: { swarmId: swarmID, status: value.status }, mutating: true }
             }
             if (params.action === "member.add") {
-              yield* coordinator(swarmID)
+              const { detail } = yield* coordinator(swarmID)
               if (!params.desiredProfile) return yield* Effect.fail(new Error("desiredProfile is required for member.add"))
               if (!params.workspacePolicy) return yield* Effect.fail(new Error("workspacePolicy is required for member.add"))
+              // Read-only admission, proven against the catalog owned by the
+              // Swarm's own authoritative directory rather than the connector
+              // payload or the approval root. It runs before commit() so an
+              // unrunnable profile can neither consume the authority recheck
+              // nor become a durable connector-owned member row.
+              yield* profilePreflight.check({ directory: detail.swarm.directory, profile: params.desiredProfile })
               yield* commit()
               const value = yield* swarms.addMember({
                 swarmID,
@@ -281,6 +292,33 @@ const layer = Layer.effect(
               const dependencies = yield* swarms.dependencies(taskID)
               return { title: "Updated Swarm task dependencies", value: { task, dependencies }, metadata: { swarmId: swarmID, taskId: taskID, count: dependencies.length }, mutating: true }
             }
+            if (params.action === "task.runs") {
+              yield* scopedDetail(swarmID)
+              const page = yield* swarms.taskRunHistory({
+                swarmID,
+                ...(params.taskId === undefined ? {} : { taskID: SwarmModel.TaskID.make(params.taskId) }),
+                limit: params.limit ?? 50,
+                ...(params.runCursor === undefined
+                  ? {}
+                  : {
+                      before: {
+                        createdAt: params.runCursor.createdAt,
+                        id: SwarmModel.TaskRunID.make(params.runCursor.id),
+                      },
+                    }),
+              })
+              return {
+                title: "Swarm task runs",
+                value: page,
+                metadata: {
+                  swarmId: swarmID,
+                  ...(params.taskId === undefined ? {} : { taskId: params.taskId }),
+                  count: page.items.length,
+                  status: page.more ? "more" : "complete",
+                },
+                mutating: false,
+              }
+            }
             if (params.action === "task.settle") {
               yield* scopedDetail(swarmID)
               if (!settleTarget || !params.sessionID) return yield* Effect.fail(new Error("task.settle requires supervised sessionID"))
@@ -297,7 +335,10 @@ const layer = Layer.effect(
                 token: owned.token,
                 runID: owned.run.id,
                 settlement: params.settlement === "completed"
-                  ? { type: "completed" }
+                  ? {
+                      type: "completed",
+                      ...(params.resultSummary === undefined ? {} : { summary: params.resultSummary }),
+                    }
                   : { type: "failed", failureKind: params.failureKind!, ...(params.detail === undefined ? {} : { detail: params.detail }) },
               })
               return { title: "Settled Swarm task", value, metadata: { swarmId: swarmID, memberId: owned.member.id, taskId: value.task.id, status: value.task.status }, mutating: true }

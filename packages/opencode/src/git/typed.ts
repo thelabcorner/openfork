@@ -105,6 +105,35 @@ export const Parameters = Schema.Struct(Fields)
 export type Input = Schema.Schema.Type<typeof Parameters>
 export type Mode = NonNullable<Input["mode"]>
 
+export const ModeFields = Object.freeze({
+  help: [] as const,
+  status: ["paths", "maxBytes"] as const,
+  summary: ["paths", "maxBytes", "maxCount"] as const,
+  diff: ["paths", "ref", "staged", "maxBytes", "contextLines"] as const,
+  log: ["ref", "maxBytes", "maxCount"] as const,
+  show: ["paths", "ref", "maxBytes"] as const,
+  stage: ["paths", "confirm", "maxBytes"] as const,
+  unstage: ["paths", "confirm", "maxBytes"] as const,
+  restore: ["paths", "confirm", "restoreTarget", "maxBytes"] as const,
+  commit: ["message", "dryRun", "confirm", "allowEmpty", "sign", "maxBytes"] as const,
+  shell: ["argv", "maxBytes"] as const,
+} satisfies Record<Mode, readonly (keyof Input)[]>)
+
+export function validateInput(input: Input) {
+  const mode = input.mode ?? "status"
+  const allowed = new Set<string>(["mode", ...ModeFields[mode]])
+  const extras = Object.entries(input)
+    .filter(([, value]) => value !== undefined)
+    .map(([key]) => key)
+    .filter((key) => !allowed.has(key))
+  if (extras.length > 0) {
+    throw new Error(`git ${mode} does not accept: ${extras.join(", ")}`)
+  }
+  if (mode === "show" && !input.ref) throw new Error("show mode requires ref")
+  if (mode === "commit" && !input.message) throw new Error("commit mode requires message")
+  if (mode === "shell" && (!input.argv || input.argv.length === 0)) throw new Error("shell mode requires argv")
+}
+
 export type Metadata = {
   mode: string
   ok: boolean
@@ -163,32 +192,20 @@ export const run = Effect.fn("GitTyped.run")(function* (
   cwd: string,
   options: { maxBytes?: number; timeoutMs?: number; signal?: AbortSignal } = {},
 ) {
-  const result = yield* app
-    .run(
-      ChildProcess.make("git", [...GIT, ...args], {
-        cwd,
-        env: SAFE_ENV,
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      }),
-      {
-        maxOutputBytes: options.maxBytes ?? 80_000,
-        timeout: options.timeoutMs ?? 30_000,
-        signal: options.signal,
-      },
-    )
-    .pipe(
-      Effect.catch((error) =>
-        Effect.succeed({
-          exitCode: typeof (error as { exitCode?: unknown }).exitCode === "number" ? (error as { exitCode: number }).exitCode : 1,
-          stdout: Buffer.alloc(0),
-          stderr: Buffer.from(error instanceof Error ? error.message : String(error)),
-          stdoutTruncated: false,
-          stderrTruncated: false,
-        }),
-      ),
-    )
+  const result = yield* app.run(
+    ChildProcess.make("git", [...GIT, ...args], {
+      cwd,
+      env: SAFE_ENV,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    }),
+    {
+      maxOutputBytes: options.maxBytes ?? 80_000,
+      timeout: options.timeoutMs ?? 30_000,
+      signal: options.signal,
+    },
+  )
   return {
     exitCode: result.exitCode,
     stdout: result.stdout.toString("utf8"),
@@ -241,6 +258,10 @@ const executeRaw = Effect.fn("GitTyped.execute")(function* (
   signal?: AbortSignal,
   beforeMutation?: BeforeMutation,
 ) {
+  yield* Effect.try({
+    try: () => validateInput(input),
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  })
   const mode = input.mode ?? "status"
   const maxBytes = input.maxBytes ?? 80_000
   const paths = input.paths?.map((item) => resolvePathInside(root, item)) ?? []

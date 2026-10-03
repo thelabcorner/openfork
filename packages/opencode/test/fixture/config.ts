@@ -6,9 +6,15 @@ export function make(overrides: Partial<Config.Interface> = {}) {
   return Config.Service.of({
     get: () => Effect.succeed({}),
     getGlobal: () => Effect.succeed({}),
+    sharePolicyForLocation: () => Effect.succeed(undefined),
     getConsoleState: () => Effect.succeed(emptyConsoleState),
     update: () => Effect.void,
     updateGlobal: (config) => Effect.succeed({ info: config, changed: false }),
+    updateGlobalAgent: (input) =>
+      Effect.succeed({
+        info: input.value === null ? {} : { agent: { [input.id]: input.value } },
+        changed: false,
+      }),
     invalidate: () => Effect.void,
     directories: () => Effect.succeed([]),
     waitForDependencies: () => Effect.void,

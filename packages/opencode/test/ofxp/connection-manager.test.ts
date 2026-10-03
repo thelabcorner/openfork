@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { OfxpIdentity } from "@opencode-ai/core/ofxp-peer/identity"
+import type { PeerCertificateIdentity } from "../../src/ofxp/certificate"
 import { OfxpConnectionManager } from "../../src/ofxp/connection-manager"
 import { OfxpMetrics } from "../../src/ofxp/metrics"
 
@@ -26,7 +27,7 @@ class FakeConnection implements OfxpConnectionManager.ConnectionLike {
   pending = 0
   closed = 0
   constructor(
-    readonly peer: ReturnType<typeof peer>["certIdentity"],
+    readonly peer: PeerCertificateIdentity,
     private closeFailures = 0,
   ) {}
   get isOpen() {

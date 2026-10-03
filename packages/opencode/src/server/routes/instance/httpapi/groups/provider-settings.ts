@@ -4,6 +4,7 @@ import { Connection } from "@opencode-ai/schema/connection"
 import { Credential } from "@opencode-ai/schema/credential"
 import { Integration } from "@opencode-ai/schema/integration"
 import { Authorization } from "../middleware/authorization"
+import { InvalidRequestError } from "../errors"
 import { described } from "./metadata"
 
 export const ProviderSettingsSource = Schema.Literals(["env", "api", "config", "custom"])
@@ -34,10 +35,18 @@ export const ProviderSettingsModels = Schema.Struct({
   models: Schema.Array(ProviderSettingsModel),
 })
 
+export const ProviderSettingsAuthMethods = Schema.Struct({
+  methods: Schema.Array(Integration.Method),
+})
+
 export const ProviderSettingsPaths = {
   list: "/provider-settings",
   models: "/provider-settings/models",
   connectKey: "/provider-settings/:providerID/key",
+  auth: "/provider-settings/:providerID/auth",
+  connectOauth: "/provider-settings/:providerID/oauth",
+  oauthAttempt: "/provider-settings/oauth/:attemptID",
+  oauthComplete: "/provider-settings/oauth/:attemptID/complete",
   credential: "/provider-settings/credential/:credentialID",
   credentialSelect: "/provider-settings/credential/:credentialID/select",
 } as const
@@ -75,6 +84,76 @@ export const ProviderSettingsApi = HttpApi.make("provider-settings").add(
           summary: "Store a server-level provider key",
           description:
             "Store a provider API key in the process-global credential store without creating a workspace instance.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("auth", ProviderSettingsPaths.auth, {
+        params: { providerID: Integration.ID },
+        success: described(ProviderSettingsAuthMethods, "Bootstrap-free provider authentication methods"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "providerSettings.auth",
+          summary: "List server-level provider authentication methods",
+          description:
+            "Return bootstrap-free authentication methods registered for a provider without materializing a workspace or plugin runtime.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.post("connectOauth", ProviderSettingsPaths.connectOauth, {
+        params: { providerID: Integration.ID },
+        payload: Schema.Struct({
+          methodID: Integration.MethodID,
+          inputs: Integration.Inputs,
+          label: Schema.optional(Schema.String),
+        }),
+        success: Integration.Attempt,
+        error: InvalidRequestError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "providerSettings.connectOauth",
+          summary: "Begin server-level OAuth connection",
+          description:
+            "Start a bootstrap-free OAuth attempt and return the authorization details without creating a workspace runtime.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("oauthStatus", ProviderSettingsPaths.oauthAttempt, {
+        params: { attemptID: Integration.AttemptID },
+        success: Integration.AttemptStatus,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "providerSettings.oauth.status",
+          summary: "Get server-level OAuth attempt status",
+          description: "Poll a bootstrap-free provider OAuth attempt.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.post("oauthComplete", ProviderSettingsPaths.oauthComplete, {
+        params: { attemptID: Integration.AttemptID },
+        payload: Schema.Struct({ code: Schema.optional(Schema.String) }),
+        success: HttpApiSchema.NoContent,
+        error: InvalidRequestError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "providerSettings.oauth.complete",
+          summary: "Complete server-level OAuth connection",
+          description: "Complete a code-based provider OAuth attempt and persist the resulting credential.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.delete("oauthCancel", ProviderSettingsPaths.oauthAttempt, {
+        params: { attemptID: Integration.AttemptID },
+        success: HttpApiSchema.NoContent,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "providerSettings.oauth.cancel",
+          summary: "Cancel server-level OAuth connection",
+          description: "Cancel a bootstrap-free provider OAuth attempt and release its resources.",
         }),
       ),
     )

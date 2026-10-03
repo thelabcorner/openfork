@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import fs from "node:fs/promises"
 import path from "node:path"
-import { Effect } from "effect"
+import { Effect, PlatformError } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -27,6 +27,15 @@ const layer = AppNodeBuilder.build(
   [[Database.node, Database.layerFromPath(":memory:")]],
 )
 const it = testEffect(layer)
+
+function failure(method: string, description: string): PlatformError.PlatformError {
+  return PlatformError.systemError({
+    _tag: "Unknown",
+    module: "FSUtil",
+    method,
+    description,
+  })
+}
 
 function identity(label: string) {
   const key = OfxpIdentity.generateKeyPair()
@@ -297,7 +306,7 @@ describe("OFXP shared edit/patch capabilities", () => {
             expectedRevision: granted.info.grantRevision,
             grant: { ...Ofxp.DENY_GRANT },
           })
-          .pipe(Effect.andThen(afs.readFile(pathname)))
+          .pipe(Effect.orDie, Effect.andThen(afs.readFile(pathname)))
       },
     })
     const request = call(
@@ -347,14 +356,10 @@ describe("OFXP shared edit/patch capabilities", () => {
       rename: (from, to) => {
         renameCount++
         if (renameCount === 1) {
-          return afs.rename(from, to).pipe(
-            Effect.andThen(
-              Effect.fail(new FSUtil.FileSystemError({ method: "rename", cause: new Error("injected visible failure") })),
-            ),
-          )
+          return afs.rename(from, to).pipe(Effect.andThen(Effect.fail(failure("rename", "injected visible failure"))))
         }
         if (renameCount === 2) {
-          return Effect.fail(new FSUtil.FileSystemError({ method: "rename", cause: new Error("injected rollback failure") }))
+          return Effect.fail(failure("rename", "injected rollback failure"))
         }
         return afs.rename(from, to)
       },

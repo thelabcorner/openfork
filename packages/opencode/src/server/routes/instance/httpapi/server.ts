@@ -37,7 +37,9 @@ import { Project } from "@/project/project"
 import { Vcs } from "@/project/vcs"
 import { ProviderAuth } from "@/provider/auth"
 import { Provider } from "@/provider/provider"
+import * as ProviderCatalog from "@/provider/catalog"
 import { Question } from "@/question"
+import { PendingResponseRegistry } from "@/server/pending-response-registry"
 import { SystemOne } from "@/system-one/system-one"
 import { SessionCompaction } from "@/session/compaction"
 import { Instruction } from "@/session/instruction"
@@ -59,6 +61,7 @@ import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/se
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { ScheduledTaskRunner } from "@/scheduled-task/runner"
 import { ScheduledTaskExecutor } from "@/scheduled-task/executor"
 import * as SessionContextProjector from "@/session/context/projector"
@@ -78,13 +81,19 @@ import { Truncate } from "@/tool/truncate"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
+import { DirectoryMaintenanceGuard } from "@opencode-ai/core/directory-maintenance-guard"
+import { DirectoryActivityFence } from "@opencode-ai/core/directory-activity-fence"
 import { Database } from "@opencode-ai/core/database/database"
+import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { Credential } from "@opencode-ai/core/credential"
+import * as CredentialResolver from "@opencode-ai/core/credential/resolver"
 import { Device } from "@opencode-ai/core/device"
+import * as AgentCatalog from "@opencode-ai/core/agent/catalog"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { EventV2 } from "@opencode-ai/core/event"
+import { GlobalIntegrationAuth } from "@opencode-ai/core/integration/global-auth"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Npm } from "@opencode-ai/core/npm"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
@@ -104,6 +113,7 @@ import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { OfxpInvocation } from "@opencode-ai/core/ofxp-invocation"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { Usage } from "@/usage/usage"
@@ -125,19 +135,38 @@ import {
   serverAuthorizationLayer,
 } from "./middleware/authorization"
 import { EventApi } from "./groups/event"
-import { PtyConnectApi } from "./groups/pty"
+import { AgentCatalogApi } from "./groups/agent-catalog"
+import { ProviderCatalogApi } from "./groups/provider-catalog"
+import { OpenRouterReferenceApi } from "./groups/openrouter-reference"
+import { OpenRouterFreeUsageApi } from "./groups/openrouter-free-usage"
+import { SessionReadApi } from "./groups/session-read"
+import { SessionCreateApi } from "./groups/session-create"
+import { SessionControlApi } from "./groups/session-control"
+import { PermissionControlApi } from "./groups/permission"
+import { QuestionControlApi } from "./groups/question"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { PtyConnectApi, PtyShellApi } from "./groups/pty"
 import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { DeviceApi } from "./groups/device"
 import { eventHandlers } from "./handlers/event"
 import { pairHandlers, pairClaimHandlers } from "./handlers/pair"
 import { deviceHandlers } from "./handlers/device"
 import { configHandlers } from "./handlers/config"
+import { agentCatalogHandlers } from "./handlers/agent-catalog"
+import { providerCatalogHandlers } from "./handlers/provider-catalog"
+import { openRouterReferenceHandlers } from "./handlers/openrouter-reference"
+import { openRouterFreeUsageHandlers } from "./handlers/openrouter-free-usage"
 import { controlHandlers } from "./handlers/control"
 import { controlPlaneHandlers } from "./handlers/control-plane"
+import { directoryActivityFenceHandlers } from "./handlers/directory-activity-fence"
 import { experimentalHandlers } from "./handlers/experimental"
 import { forkCredentialHandlers } from "./handlers/fork-credential"
 import { fileHandlers } from "./handlers/file"
 import { globalHandlers } from "./handlers/global"
+import { sessionReadHandlers } from "./handlers/session-read"
+import { sessionCreateHandlers } from "./handlers/session-create"
+import { sessionControlHandlers } from "./handlers/session-control"
+import { permissionControlHandlers, questionControlHandlers } from "./handlers/pending-response-control"
 import { instanceHandlers } from "./handlers/instance"
 import { mcpHandlers } from "./handlers/mcp"
 import { ofxpHandlers } from "./handlers/ofxp"
@@ -146,7 +175,7 @@ import { projectHandlers } from "./handlers/project"
 import { projectCopyHandlers } from "./handlers/project-copy"
 import { providerHandlers } from "./handlers/provider"
 import { providerSettingsHandlers } from "./handlers/provider-settings"
-import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
+import { ptyConnectHandlers, ptyHandlers, ptyShellHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { quotaHandlers } from "./handlers/quota"
 import { sessionHandlers } from "./handlers/session"
@@ -207,7 +236,7 @@ const requestBodyLimit = HttpRouter.middleware(
 
 // Route tree:
 // - rootApiRoutes: typed /global/* and control routes; auth is declared by RootHttpApi.
-// - eventApiRoutes: typed SSE route with instance routing context and its existing API contract.
+// - eventApiRoutes: typed SSE route with explicit workspace route context and its existing API contract.
 // - pairBeginApiRoutes / pairClaimApiRoutes: pairing ceremony; begin is authed, claim is public by design.
 // - deviceApiRoutes: paired-device management; authed.
 // - ptyConnectApiRoutes: typed WebSocket upgrade route with ticket-aware auth.
@@ -229,6 +258,7 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide([
     controlHandlers,
     controlPlaneHandlers,
+    directoryActivityFenceHandlers,
     forkCredentialHandlers,
     globalHandlers,
     providerSettingsHandlers,
@@ -243,9 +273,78 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide(schemaErrorLayer),
   Layer.provide(httpApiAuthLayer),
 )
+const agentCatalogRoutes = HttpApiBuilder.layer(AgentCatalogApi).pipe(
+  Layer.provide(agentCatalogHandlers),
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer, workspaceRoutingLive, AgentCatalog.buildMap()]),
+)
+const providerCatalogRoutes = HttpApiBuilder.layer(ProviderCatalogApi).pipe(
+  Layer.provide(providerCatalogHandlers),
+  Layer.provide([httpApiAuthLayer]),
+  // Keep this Tier-2 service available to the route independently of the
+  // workspace Instance graph. Its dependencies are global/cache owners only.
+  Layer.provide(
+    AppNodeBuilderV1.build(
+      LayerNode.group([
+        ProviderCatalog.node,
+        Database.node,
+        Credential.node,
+        CredentialResolver.node,
+        RuntimeFlags.node,
+        httpClient,
+      ]),
+    ),
+  ),
+)
+const openRouterReferenceRoutes = HttpApiBuilder.layer(OpenRouterReferenceApi).pipe(
+  Layer.provide(openRouterReferenceHandlers),
+  // Tier 0: authentication + the process-global HTTP client only. No workspace
+  // routing and no InstanceContext / InstanceStore acquisition.
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer, AppNodeBuilderV1.build(httpClient)]),
+)
+const openRouterFreeUsageRoutes = HttpApiBuilder.layer(OpenRouterFreeUsageApi).pipe(
+  Layer.provide(openRouterFreeUsageHandlers),
+  // Tier 0: account credentials and the process-global database only. The
+  // accepted legacy directory/workspace query fields are ignored; no workspace
+  // routing or InstanceContext is involved in an account-wide usage report.
+  Layer.provide([
+    schemaErrorLayer,
+    httpApiAuthLayer,
+    AppNodeBuilderV1.build(LayerNode.group([Auth.node, Credential.node, Database.node])),
+  ]),
+)
 const eventApiRoutes = HttpApiBuilder.layer(EventApi).pipe(
   Layer.provide(eventHandlers),
-  Layer.provide([httpApiAuthLayer, workspaceRoutingLive, instanceContextLayer]),
+  // Event delivery is directory-scoped process transport. The handler needs
+  // WorkspaceRouteContext only; loading an Instance here bootstraps project
+  // configuration and starts workspace warmup for every SSE subscriber.
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
+)
+const sessionReadRoutes = HttpApiBuilder.layer(SessionReadApi).pipe(
+  Layer.provide(sessionReadHandlers),
+  // Session detail/history reads use durable storage and explicit workspace
+  // routing, without creating an execution Instance.
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
+)
+const sessionCreateRoutes = HttpApiBuilder.layer(SessionCreateApi).pipe(
+  Layer.provide(sessionCreateHandlers),
+  // Durable Tier-1 admission: resolve only explicit workspace/project metadata,
+  // then persist the Session without acquiring an execution Instance.
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive, AgentCatalog.buildMap()]),
+)
+const sessionControlRoutes = HttpApiBuilder.layer(SessionControlApi).pipe(
+  Layer.provide(sessionControlHandlers),
+  // Abort uses durable Session ownership plus RunState's active-handle index;
+  // it must remain independent of InstanceContext/bootstrap.
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
+  Layer.provide(AppNodeBuilderV1.build(LayerNode.group([SessionExecutionOwner.node, GoalAutomation.node]))),
+)
+const permissionControlRoutes = HttpApiBuilder.layer(PermissionControlApi).pipe(
+  Layer.provide(permissionControlHandlers),
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
+)
+const questionControlRoutes = HttpApiBuilder.layer(QuestionControlApi).pipe(
+  Layer.provide(questionControlHandlers),
+  Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
 )
 const pairBeginApiRoutes = HttpApiBuilder.layer(PairBeginApi).pipe(
   Layer.provide(pairHandlers),
@@ -264,6 +363,12 @@ const deviceApiRoutes = HttpApiBuilder.layer(DeviceApi).pipe(
 const ptyConnectApiRoutes = HttpApiBuilder.layer(PtyConnectApi).pipe(
   Layer.provide(ptyConnectHandlers),
   Layer.provide([ptyConnectHttpApiAuthLayer, workspaceRoutingLive, instanceContextLayer]),
+)
+const ptyShellApiRoutes = HttpApiBuilder.layer(PtyShellApi).pipe(
+  Layer.provide(ptyShellHandlers),
+  // Process-level shell discovery uses shared authentication only. It must
+  // not cross workspace routing or InstanceContext middleware.
+  Layer.provide([httpApiAuthLayer, schemaErrorLayer]),
 )
 const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
   Layer.provide([
@@ -364,7 +469,15 @@ const app = LayerNode.group([
   Npm.node,
   FSUtil.node,
   Database.node,
+  CurrentParts.node,
+  // Directory activity fence authority for the dedicated Tier 0 fence endpoints.
+  // Registered in the served route graph (not only AppRuntime) so
+  // HttpApiApp.routes can resolve DirectoryActivityFence on its own
+  // Database/RuntimeOwner authority.
+  DirectoryMaintenanceGuard.node,
+  DirectoryActivityFence.node,
   Credential.node,
+  GlobalIntegrationAuth.node,
   Device.node,
   Auth.node,
   ForkCredentials.node,
@@ -378,16 +491,19 @@ const app = LayerNode.group([
   Plugin.node,
   ModelsDev.node,
   Provider.node,
+  ProviderCatalog.node,
   SystemOne.node,
   ProviderAuth.node,
   Agent.node,
   Skill.node,
   Discovery.node,
   Question.node,
+  PendingResponseRegistry.node,
   Permission.node,
   PermissionSaved.node,
   Todo.node,
   Session.node,
+  SessionExecutionOwner.node,
   SessionGroup.node,
   Goal.node,
   GoalContext.node,
@@ -400,6 +516,7 @@ const app = LayerNode.group([
   ScheduledTaskRunner.node,
   SwarmV2.node,
   SwarmMemberSessionWake.node,
+  SwarmProfilePreflight.node,
   SessionProjector.node,
   SessionContextProjector.node,
   SessionStatus.node,
@@ -407,6 +524,7 @@ const app = LayerNode.group([
   SessionTelemetry.node,
   OxpActivity.node,
   OxpActivityInspection.node,
+  OxpAttribution.node,
   UsageRecord.node,
   RevisionDraft.node,
   BackgroundJob.node,
@@ -472,7 +590,7 @@ const app = LayerNode.group([
   // AppRuntime also registers it, and that installs exactly one listener. The
   // adapter is a standard `makeGlobalNode` whose scoped acquireRelease owns the
   // one `EventV2.listenType` subscription, and both graphs build it through the
-  // shared process-wide `memoMap`, so the second graph reuses the live layer
+  // shared process-wide `memoMap` — so the second graph reuses the live layer
   // instead of installing a second listener, and the first graph to close
   // releases only its own lease rather than the survivor's subscription. Its
   // Idle callback calls Core's O(1) `requestFlushSession`, never
@@ -488,10 +606,20 @@ export function createRoutes(
 
   return Layer.mergeAll(
     rootApiRoutes,
+    agentCatalogRoutes,
+    providerCatalogRoutes,
+    openRouterReferenceRoutes,
+    openRouterFreeUsageRoutes,
     eventApiRoutes,
+    sessionReadRoutes,
+    sessionCreateRoutes,
+    sessionControlRoutes,
+    permissionControlRoutes,
+    questionControlRoutes,
     pairBeginApiRoutes,
     pairClaimApiRoutes,
     deviceApiRoutes,
+    ptyShellApiRoutes,
     ptyConnectApiRoutes,
     instanceRoutes,
     serverRoutes,

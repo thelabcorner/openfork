@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Project } from "@/project/project"
 import { $ } from "bun"
 import path from "path"
+import { realpath, rm, symlink } from "node:fs/promises"
 import { tmpdirScoped } from "../fixture/fixture"
 import { GlobalBus } from "../../src/bus/global"
 import { Database } from "@opencode-ai/core/database/database"
@@ -136,6 +137,23 @@ describe("Project.fromDirectory", () => {
       expect(result.project.id).not.toBe(ProjectV2.ID.global)
       expect(result.project.vcs).toBe("git")
       expect(result.project.worktree).toBe(tmp)
+    }),
+  )
+
+  it.live("canonicalizes a git checkout opened through a filesystem alias", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+      const alias = `${tmp}-project-alias-${Date.now()}`
+      yield* Effect.promise(() => symlink(tmp, alias, process.platform === "win32" ? "junction" : "dir"))
+      yield* Effect.addFinalizer(() => Effect.promise(() => rm(alias, { recursive: true, force: true })).pipe(Effect.ignore))
+
+      const canonical = yield* Effect.promise(() => realpath(tmp))
+      const result = yield* project.fromDirectory(alias)
+
+      expect(result.project.worktree).toBe(canonical)
+      expect(result.sandbox).toBe(canonical)
+      expect(result.project.worktree).not.toBe(alias)
     }),
   )
 

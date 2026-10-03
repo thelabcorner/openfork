@@ -5,6 +5,9 @@ import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { Agent } from "@opencode-ai/schema/agent"
+import { Model } from "@opencode-ai/schema/model"
+import { Provider } from "@opencode-ai/schema/provider"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
 import { OxpConfig } from "@/oxp/config"
@@ -69,6 +72,25 @@ describe("OxpSwarm", () => {
       status: "paused",
     })
     expect((paused.structured as { status: string }).status).toBe("paused")
+  }))
+
+  it.live("exposes bounded durable TaskRun audit as a root-confined read", Effect.gen(function* () {
+    const { swarm, root } = yield* prepare()
+    const created = yield* swarm.execute({
+      rootID: root.id,
+      action: "delegate",
+      swarmName: "Task run audit",
+    })
+    const swarmID = (created.structured as { swarm: { id: string } }).swarm.id
+
+    const runs = yield* swarm.execute({
+      rootID: root.id,
+      action: "task.runs",
+      swarmId: swarmID,
+      limit: 1,
+    })
+    expect(runs.structured).toMatchObject({ items: [], more: false })
+    expect(runs.metadata).toMatchObject({ swarmId: swarmID, count: 0, status: "complete" })
   }))
 
   it.live("routes member recovery through the authoritative AppRuntime wake owner", Effect.gen(function* () {
@@ -166,5 +188,72 @@ describe("OxpSwarm", () => {
     }).pipe(Effect.flip)
     expect(denied._tag).toBe("OXP_INVALID_ARGUMENT")
     expect(denied.detail).toContain("existing worker Session")
+  }))
+
+  it.live("refuses member.add with an unrunnable profile and leaves no durable member row", Effect.gen(function* () {
+    const { swarm, root } = yield* prepare()
+    const created = yield* swarm.execute({
+      rootID: root.id,
+      action: "delegate",
+      swarmName: "Member profile admission",
+    })
+    const swarmID = (created.structured as { swarm: { id: string } }).swarm.id
+
+    const denied = yield* swarm.execute({
+      rootID: root.id,
+      action: "member.add",
+      swarmId: swarmID,
+      memberName: "ghost",
+      memberRole: "research",
+      // A provider/model pair no catalog can resolve. Preflight owns this
+      // rejection, so it must land before addMember commits anything.
+      desiredProfile: {
+        agent: Agent.ID.make("build"),
+        model: { providerID: Provider.ID.make("no-such-provider"), id: Model.ID.make("no-such-model") },
+        permissionBoundary: [],
+      },
+      workspacePolicy: { mode: "shared-read" },
+    }).pipe(Effect.flip)
+
+    // The refusal must originate from the shared profile preflight, not from the
+    // argument-presence guards above it.
+    expect(denied.detail).toContain("Swarm operation rejected")
+    expect(["OXP_INVALID_ARGUMENT", "OXP_NOT_FOUND"]).toContain(denied._tag)
+
+    // Negative invariant: a refused profile creates zero durable members. Only
+    // the connector-owned coordinator exists.
+    const after = yield* swarm.execute({ rootID: root.id, action: "get", swarmId: swarmID })
+    const members = (after.structured as { members: ReadonlyArray<{ name: string }> }).members
+    expect(members.map((member) => member.name)).toEqual(["oxp-coordinator"])
+  }))
+
+  it.live("rejects an unknown agent before catalog resolution and still writes no member row", Effect.gen(function* () {
+    const { swarm, root } = yield* prepare()
+    const created = yield* swarm.execute({
+      rootID: root.id,
+      action: "delegate",
+      swarmName: "Member profile admission positive",
+    })
+    const swarmID = (created.structured as { swarm: { id: string } }).swarm.id
+
+    // Agent resolution runs first, so this proves the gate short-circuits on the
+    // cheap check and never reaches the provider catalog for a doomed request.
+    const denied = yield* swarm.execute({
+      rootID: root.id,
+      action: "member.add",
+      swarmId: swarmID,
+      memberName: "ghost-agent",
+      memberRole: "research",
+      desiredProfile: {
+        agent: Agent.ID.make("definitely-not-an-openfork-agent"),
+        model: { providerID: Provider.ID.make("no-such-provider"), id: Model.ID.make("no-such-model") },
+        permissionBoundary: [],
+      },
+      workspacePolicy: { mode: "shared-read" },
+    }).pipe(Effect.flip)
+    expect(denied.detail).toContain("Agent not found")
+
+    const after = yield* swarm.execute({ rootID: root.id, action: "get", swarmId: swarmID })
+    expect((after.structured as { members: unknown[] }).members).toHaveLength(1)
   }))
 })

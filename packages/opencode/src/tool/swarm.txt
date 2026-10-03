@@ -1,8 +1,8 @@
 Native first-party Swarm collaboration. This is one composite lazy capability over the host Swarm service; it does not own a second scheduler, agent runtime, wake loop, or state store.
 
-Use action=list/get/summary for cheap inspection. Use delegate to create a Swarm, coordinator, managed workers, and an initial DAG in one fail-closed workflow: durable setup remains non-runnable until the final activation step.
+Use action=list/get/summary for cheap inspection. Prefer the eager swarm_create tool for conversational creation: it removes broker ceremony while calling the exact same fail-closed creation workflow. This lazy tool retains delegate as a compatibility/explicit-@swarm creation path; durable setup remains non-runnable until the final activation step.
 
-Coordinator/admin actions are state, member.add, member.stop, member.resume, task.create, task.dependencies, and recover.members. These require the caller Session to be the Swarm's recorded coordinator; never infer coordinator authority from names or prose.
+Coordinator/admin actions are set_status, member.add, member.stop, member.resume, task.create, task.dependencies, task.review, recover.members, recover.effects, and recover.contain. These require the caller Session to be the Swarm's recorded coordinator; never infer coordinator authority from names or prose. set_status is the canonical mutating lifecycle action; the legacy name state is still accepted as a deprecated alias of set_status and does nothing else.
 
 Member actions derive identity from the trusted caller Session. message.send/reply, task.settle, blackboard.put, claim.acquire/renew/release, deliverable.publish, and deliverable.review never accept caller member identity as authority. task.settle also never accepts a lease token, generation, run id, or task id: Core resolves the exact active running lease/run for this Session and rejects stale, held, retiring, admitted-only, or rebound authority.
 
@@ -16,4 +16,10 @@ Shared-state actions: blackboard.get/put, claim.list/acquire/renew/release, deli
 
 recover.members is a bounded, Swarm-scoped reconciliation of managed member Session bindings. Normal convergence is event-driven; use recovery only when explicitly diagnosing or repairing a Swarm.
 
-All actions are scoped to the current project. One provider-visible Swarm capability performs internal leaf permission checks: swarm.read, swarm.message, swarm.task, swarm.member, swarm.memory, and swarm.review.
+Review and effect-unknown closure are explicit coordinator decisions. A task can reach review_pending when an execution ended without a semantic settlement. task.review resolves it with decision=accept|request_changes|retry|fail|cancel and requires expectedLeaseGeneration, the exact leaseGeneration of the task as you last observed it; a stale value fails closed instead of reviewing a newer execution. Never invent a generation.
+
+recover.effects lists, read-only, the Swarm's retiring task leases that are fenced because a proven-dead worker left an unresolved external effect. recover.contain acknowledges containment for exactly one taskId plus leaseGeneration, and only when recover.effects lists that pair for this Swarm. Acknowledgement is a judgement that the effects are contained, NOT evidence of success: the tool refuses to report an outcome. The task becomes review_pending, the run ends as unsettled, no semantic retry is spent, and the task stays non-dispatchable until a deliberate task.review. Never use recover.contain to make progress on a task that merely looks stuck; read recover.effects first.
+
+All actions are scoped to the current project. One provider-visible Swarm capability performs internal leaf permission checks: swarm.read, swarm.message, swarm.task, swarm.member, swarm.memory, and swarm.review. task.review and recover.contain share swarm.review, so an operator can grant outcome judgement without granting routine member churn.
+
+Action-specific required inputs are enforced by the tool schema itself, so a missing input fails as an invalid-argument error naming the action and the missing fields before any permission ask or Swarm mutation. The "Required inputs by action" block below is generated from that same schema, so it cannot drift from what is enforced. Integer inputs accept an exact numeric string such as "50"; bounds still apply, and "50.5" or "1e3" are rejected.

@@ -10,7 +10,7 @@ import { disposeInstance } from "@/effect/instance-registry"
 import { RootHttpApi } from "../api"
 import { bumpZenVaultPool } from "@/plugin/zen"
 import { bumpUsageCache } from "@/fork/usage-cache"
-import { forkUsageSnapshot } from "@/fork/usage"
+import { forkUsageSnapshot, officialUsedPercent } from "@/fork/usage"
 
 export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-credential", (handlers) =>
   Effect.gen(function* () {
@@ -79,6 +79,10 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       return (yield* forkUsageSnapshot({ credentials, usage, auth })).result
     })
 
+    const getGeneralUsage = Effect.fn("ForkCredentialHttpApi.generalUsage")(function* () {
+      return yield* capacity.general()
+    })
+
     const getCapacity = Effect.fn("ForkCredentialHttpApi.capacity")(function* () {
       const current = yield* getUsage()
       const accounts = current.byCredential.flatMap((entry) => {
@@ -93,11 +97,29 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
         // is historical evidence and must not be projected into the new window.
         if (window.resetsAt <= Date.now()) return []
 
-        // mergeOfficial writes the exact official percent back into
-        // spentUSD/limitUSD. Do NOT use estimatedPercent here: that legacy field
-        // may locally refine an integer percentage through the old universal
-        // dollar budget, whose denominator is not model-specific.
-        const usedFraction = Math.max(0, Math.min(1, window.spentUSD / window.limitUSD))
+        const officialPercent = officialUsedPercent(window)
+        if (officialPercent === undefined) return []
+        const usedFraction = officialPercent / 100
+        // forkUsageSnapshot already merged this credential's official 5h,
+        // week, and month windows out of ONE gated snapshot read. Weekly and
+        // monthly consumption are independent entitlements, so their observed
+        // fractions are handed to Capacity as separate windows instead of
+        // being discarded or folded into the 5h resource. "5h" stays the
+        // primary resource and is deliberately not repeated here, and no
+        // additional provider request is made.
+        const observedWindows = entry.windows.flatMap((candidate) => {
+          if (candidate.label !== "week" && candidate.label !== "month") return []
+          if (candidate.source !== "api") return []
+          if (candidate.resetsAt <= Date.now()) return []
+          const observedPercent = officialUsedPercent(candidate)
+          if (observedPercent === undefined) return []
+          const observedFraction = 1 - observedPercent / 100
+          return [{
+            window: candidate.label,
+            remainingFraction: observedFraction,
+            resetAt: candidate.resetsAt,
+          }]
+        })
         return [{
           accountID: entry.accountID ?? entry.credentialID,
           credentialID: entry.credentialID,
@@ -105,6 +127,7 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
           resetAt: window.resetsAt,
           snapshotAt,
           status,
+          ...(observedWindows.length ? { observedWindows } : {}),
         }]
       })
 
@@ -134,14 +157,15 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
           ),
         { concurrency: 4 },
       )
-      const providers = yield* capacity.providers({
+      const providerProjection = yield* capacity.providers({
         summaries: genericSummaries,
         results: genericResults,
       })
 
       return {
         ...go,
-        providers: [Capacity.goProviderView(go), ...providers],
+        providers: [Capacity.goProviderView(go), ...providerProjection.providers],
+        generalUsage: providerProjection.generalUsage,
       }
     })
 
@@ -152,6 +176,7 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       .handle("rename", rename)
       .handle("remove", remove)
       .handle("usage", getUsage)
+      .handle("generalUsage", getGeneralUsage)
       .handle("capacity", getCapacity)
   }),
 )

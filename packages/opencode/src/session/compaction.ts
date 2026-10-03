@@ -21,6 +21,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
@@ -36,6 +38,15 @@ const MAX_PRESERVE_RECENT_TOKENS = 15_000
 const COMPACTION_OUTPUT_RESERVE = 2_000
 const COMPACTION_TIER_ORDER = ["small", "medium", "large"] as const
 type CompactionTier = (typeof COMPACTION_TIER_ORDER)[number]
+
+const usageRoute = (
+  route?: ProviderRouteResolution.RouteAttribution,
+): UsageRouteAttribution.Committed | undefined => {
+  if (!route) return undefined
+  return route.routeKind === "account"
+    ? { routeKind: "account", accountID: route.accountID! }
+    : { routeKind: "public" }
+}
 
 function parseCompactionModel(value: string): { providerID: ProviderV2.ID; modelID: ModelV2.ID } | undefined {
   const trimmed = value.trim()
@@ -208,6 +219,7 @@ export interface Interface {
     auto: boolean
     continueAfter?: boolean
     overflow?: boolean
+    route?: ProviderRouteResolution.RouteAttribution
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -305,30 +317,108 @@ const layer = Layer.effect(
       }
     })
 
+    type CompactionResolvedCandidate = {
+      readonly tier: CompactionTier
+      readonly model: Provider.Model
+      readonly route?: ProviderRouteResolution.RouteAttribution
+      readonly lease?: ProviderRouteResolution.ProviderRouteLease
+      readonly ref: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
+    }
+
     const resolveTierCandidates = Effect.fn("SessionCompaction.resolveTierCandidates")(function* (input: {
       cfg: ConfigV1.Info
-      agentModel?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      sessionID: SessionID
+      route?: ProviderRouteResolution.RouteAttribution
+      agentModel?: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
     }) {
       const raw = input.cfg.compaction?.models
-      const tierDefs: Array<{ tier: CompactionTier; raw?: string }> = [
+      const tierDefs: Array<{
+        tier: CompactionTier
+        raw?: string
+        ref?: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
+      }> = [
         { tier: "small", raw: raw?.small },
         { tier: "medium", raw: raw?.medium },
         { tier: "large", raw: raw?.large },
       ]
       if (!tierDefs[2]!.raw && input.agentModel) {
-        tierDefs[2]!.raw = `${input.agentModel.providerID}/${input.agentModel.modelID}`
+        tierDefs[2] = { tier: "large", ref: input.agentModel }
       }
-      const candidates: Array<{ tier: CompactionTier; model: Provider.Model; ref: { providerID: ProviderV2.ID; modelID: ModelV2.ID } }> =
-        []
+
+      const candidates: CompactionResolvedCandidate[] = []
       for (const def of tierDefs) {
-        if (!def.raw) continue
-        const parsed = parseCompactionModel(def.raw)
+        const parsed:
+          | { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
+          | undefined = def.ref ?? (def.raw ? parseCompactionModel(def.raw) : undefined)
         if (!parsed) {
-          yield* Effect.logWarning("compaction tier model parse failed", { tier: def.tier, raw: def.raw })
+          if (def.raw) {
+            yield* Effect.logWarning("compaction tier model parse failed", { tier: def.tier, raw: def.raw })
+          }
           continue
         }
-        const maybe = yield* provider.getModel(parsed.providerID, parsed.modelID).pipe(Effect.option)
-        if (maybe._tag === "None" || maybe.value === undefined) {
+
+        if (input.route?.providerID === parsed.providerID) {
+          const inherited = yield* provider
+            .resolveInheritedRoutedModel({
+              sessionID: input.sessionID,
+              providerID: parsed.providerID,
+              modelID: parsed.modelID,
+              route: input.route,
+            })
+            .pipe(Effect.option)
+          if (inherited._tag === "None") {
+            yield* Effect.logWarning("compaction tier model unavailable on committed route", {
+              tier: def.tier,
+              providerID: parsed.providerID,
+              modelID: parsed.modelID,
+            })
+            continue
+          }
+          candidates.push({
+            tier: def.tier,
+            model: inherited.value.model,
+            route: inherited.value.route.attribution,
+            lease: inherited.value.route.lease,
+            ref: parsed,
+          })
+          continue
+        }
+
+        // Configured compaction tiers/agent models are explicit maintenance
+        // overrides. A provider distinct from the parent may own its own
+        // provider-specific route, but that route must be resolved before
+        // transport and later settled under its own attribution.
+        const routed = yield* provider
+          .resolveRoutedModel({
+            sessionID: input.sessionID,
+            providerID: parsed.providerID,
+            modelID: parsed.modelID,
+            ...(parsed.accountID ? { accountID: parsed.accountID } : {}),
+          })
+          .pipe(Effect.option)
+        if (routed._tag === "None") {
+          yield* Effect.logWarning("compaction override route unavailable", {
+            tier: def.tier,
+            providerID: parsed.providerID,
+            modelID: parsed.modelID,
+          })
+          continue
+        }
+        if (routed.value) {
+          candidates.push({
+            tier: def.tier,
+            model: routed.value.model,
+            route: routed.value.route.attribution,
+            lease: routed.value.route.lease,
+            ref: parsed,
+          })
+          continue
+        }
+
+        const direct = yield* provider
+          .getModel(parsed.providerID, parsed.modelID, parsed.accountID)
+          .pipe(Effect.option)
+        if (direct._tag === "None") {
           yield* Effect.logWarning("compaction tier model unavailable", {
             tier: def.tier,
             providerID: parsed.providerID,
@@ -336,8 +426,9 @@ const layer = Layer.effect(
           })
           continue
         }
-        candidates.push({ tier: def.tier, model: maybe.value, ref: parsed })
+        candidates.push({ tier: def.tier, model: direct.value, ref: parsed })
       }
+
       candidates.sort((a, b) => {
         const ca = a.model.limit.context || Number.MAX_SAFE_INTEGER
         const cb = b.model.limit.context || Number.MAX_SAFE_INTEGER
@@ -347,25 +438,39 @@ const layer = Layer.effect(
     })
 
     const pickCompactionModel = Effect.fn("SessionCompaction.pickCompactionModel")(function* (input: {
-      candidates: Array<{ tier: CompactionTier; model: Provider.Model }>
+      candidates: CompactionResolvedCandidate[]
       needed: number
       fallback: Provider.Model
+      fallbackRoute?: ProviderRouteResolution.RouteAttribution
+      fallbackLease?: ProviderRouteResolution.ProviderRouteLease
     }) {
-      if (input.candidates.length === 0) return { model: input.fallback, tier: "session" as const }
+      if (input.candidates.length === 0) {
+        return {
+          model: input.fallback,
+          tier: "session" as const,
+          route: input.fallbackRoute,
+          lease: input.fallbackLease,
+        }
+      }
       for (const c of input.candidates) {
         const ctx = c.model.limit.context
-        if (!ctx || ctx === 0) return { model: c.model, tier: c.tier }
-        if (input.needed < ctx - COMPACTION_OUTPUT_RESERVE) return { model: c.model, tier: c.tier }
+        if (!ctx || ctx === 0) return c
+        if (input.needed < ctx - COMPACTION_OUTPUT_RESERVE) return c
       }
       const largest = input.candidates.at(-1)!
       const largestCtx = largest.model.limit.context || Number.MAX_SAFE_INTEGER
-      if (input.needed < largestCtx - COMPACTION_OUTPUT_RESERVE) return { model: largest.model, tier: largest.tier }
+      if (input.needed < largestCtx - COMPACTION_OUTPUT_RESERVE) return largest
       yield* Effect.logWarning("compaction prompt exceeds all tier contexts, falling back to session model", {
         needed: input.needed,
         tiers: input.candidates.map((c) => ({ tier: c.tier, context: c.model.limit.context })),
         fallback: input.fallback.limit.context,
       })
-      return { model: input.fallback, tier: "session" as const }
+      return {
+        model: input.fallback,
+        tier: "session" as const,
+        route: input.fallbackRoute,
+        lease: input.fallbackLease,
+      }
     })
 
     // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
@@ -423,6 +528,7 @@ const layer = Layer.effect(
       auto: boolean
       continueAfter?: boolean
       overflow?: boolean
+      route?: ProviderRouteResolution.RouteAttribution
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -457,9 +563,26 @@ const layer = Layer.effect(
 
       const agent = yield* agents.get("compaction")
       const cfg = yield* config.get()
-      const sessionModel = yield* provider
-        .getModel(userMessage.model.providerID, userMessage.model.modelID)
-        .pipe(Effect.orDie)
+      let sessionModel: Provider.Model
+      let sessionRoute: ProviderRouteResolution.RouteAttribution | undefined
+      let sessionLease: ProviderRouteResolution.ProviderRouteLease | undefined
+      if (input.route) {
+        const inherited = yield* provider
+          .resolveInheritedRoutedModel({
+            sessionID: input.sessionID,
+            providerID: userMessage.model.providerID,
+            modelID: userMessage.model.modelID,
+            route: input.route,
+          })
+          .pipe(Effect.orDie)
+        sessionModel = inherited.model
+        sessionRoute = inherited.route.attribution
+        sessionLease = inherited.route.lease
+      } else {
+        sessionModel = yield* provider
+          .getModel(userMessage.model.providerID, userMessage.model.modelID, userMessage.model.accountID)
+          .pipe(Effect.orDie)
+      }
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
@@ -496,13 +619,22 @@ const layer = Layer.effect(
           .join("\n\n")
       // Tier-aware model selection: pick smallest tier whose window fits the prompt + reserve.
       const needed = Token.estimate(nextPrompt) + COMPACTION_OUTPUT_RESERVE
-      const tierCandidates = yield* resolveTierCandidates({ cfg, agentModel: agent.model })
+      const tierCandidates = yield* resolveTierCandidates({
+        cfg,
+        sessionID: input.sessionID,
+        ...(sessionRoute ? { route: sessionRoute } : {}),
+        agentModel: agent.model,
+      })
       const picked = yield* pickCompactionModel({
         candidates: tierCandidates,
         needed,
         fallback: sessionModel,
+        ...(sessionRoute ? { fallbackRoute: sessionRoute } : {}),
+        ...(sessionLease ? { fallbackLease: sessionLease } : {}),
       })
       const model = picked.model
+      const selectedRoute = picked.route
+      const selectedLease = picked.lease
       yield* Effect.logInfo("compaction tier selected", {
         sessionID: input.sessionID,
         tier: picked.tier,
@@ -511,6 +643,8 @@ const layer = Layer.effect(
         needed,
         context: model.limit.context,
         headSize: selected.head.length,
+        routeKind: selectedRoute?.routeKind ?? "legacy",
+        routeAccountID: selectedRoute?.accountID ?? null,
       })
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
@@ -544,6 +678,8 @@ const layer = Layer.effect(
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
+        ...(usageRoute(selectedRoute) ? { routeAttribution: usageRoute(selectedRoute) } : {}),
+        ...(selectedLease ? { routeLease: selectedLease } : {}),
       })
       const result = yield* processor.process({
         user: userMessage,
@@ -551,6 +687,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         tools: {},
         system: [],
+        continuity: "isolated",
         messages: [
           {
             role: "user",
@@ -635,9 +772,7 @@ const layer = Layer.effect(
               {
                 sessionID: input.sessionID,
                 agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
+                model: sessionModel,
                 provider: {
                   source: info.source,
                   info,
@@ -698,7 +833,7 @@ const layer = Layer.effect(
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
       sessionID: SessionID
       agent: string
-      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+      model: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
       sourceMessageID: MessageID
       auto: boolean
       continueAfter?: boolean

@@ -33,6 +33,7 @@ import { SessionCompaction } from "@/session/compaction"
 import { SessionRevert } from "@/session/revert"
 import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
+import { SubagentSupervision } from "@/session/subagent-supervision"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
 import { LSP } from "@/lsp/lsp"
@@ -61,6 +62,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { DirectoryMaintenanceGuard } from "@opencode-ai/core/directory-maintenance-guard"
+import { DirectoryActivityFence } from "@opencode-ai/core/directory-activity-fence"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
@@ -80,12 +83,14 @@ import { ScheduledTaskRunner } from "@/scheduled-task/runner"
 import { SwarmMemberSession } from "@/swarm/member-session"
 import { SwarmMemberSessionRunner } from "@/swarm/member-session-runner"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { SwarmSessionAdmission } from "@/swarm/session-admission"
 import { SwarmRuntimeRetention } from "@/swarm/runtime-retention"
 import { SwarmTaskExecutor } from "@/swarm/task-executor"
 import { SwarmMailExecutor } from "@/swarm/mail-executor"
 import { SwarmDispatcher } from "@/swarm/dispatcher"
 import { SwarmTaskRetirement } from "@/swarm/task-retirement"
+import { SwarmTaskClosure } from "@/swarm/task-closure"
 import { SwarmRecovery } from "@/swarm/recovery"
 import { SwarmDeadlineOwner } from "@/swarm/deadline-owner"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
@@ -120,6 +125,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     SwarmV2.node,
     SwarmMemberSessionWake.node,
     SwarmMemberSession.node,
+    SwarmProfilePreflight.node,
     SwarmMemberSessionRunner.node,
     SwarmSessionAdmission.node,
     SwarmRuntimeRetention.node,
@@ -127,6 +133,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     SwarmMailExecutor.node,
     SwarmDispatcher.node,
     SwarmTaskRetirement.node,
+    SwarmTaskClosure.node,
     SwarmRecovery.node,
     SwarmDeadlineOwner.node,
     Auth.node,
@@ -163,7 +170,17 @@ export const AppLayer = AppNodeBuilderV1.build(
     // Keep it explicit at the AppRuntime boundary so lazy OXP worker/session
     // entry can never observe a partially composed instance graph.
     SessionExecutionOwner.node,
+    // Worktree fence authority must share SessionExecutionOwner's Database and
+    // RuntimeOwner identity: guard admission and execution admission race for
+    // the same SQLite writer reservation and must never observe split owner
+    // rows or a split heartbeat.
+    DirectoryMaintenanceGuard.node,
+    DirectoryActivityFence.node,
     SessionStatus.node,
+    // Task supervision consumes this capability via serviceOption. Keep it
+    // explicit at the AppRuntime boundary so production resolves the registry
+    // instead of silently degrading to durable-metadata-only supervision.
+    SubagentSupervision.node,
     BackgroundJob.node,
     RuntimeFlags.node,
     EventV2Bridge.node,

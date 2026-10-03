@@ -2,6 +2,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 import { Device } from "@opencode-ai/core/device"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Credential } from "@opencode-ai/core/credential"
@@ -75,4 +76,4 @@ function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config
 export const routes = createRoutes()
 
 export const webHandler = () =>
-  HttpRouter.toWebHandler(routes.pipe(Layer.provide(HttpServer.layerServices)), { disableLogger: true })
+  HttpRouter.toWebHandler(routes.pipe(Layer.provide(HttpServer.layerServices)), { disableLogger: true, memoMap })

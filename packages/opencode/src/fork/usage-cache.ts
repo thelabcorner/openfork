@@ -197,6 +197,15 @@ export interface LocalWindow {
   readonly label: ForkWindowLabel
   readonly spentUSD: number
   readonly limitUSD: number
+  /**
+   * The official provider's own used-percentage for this window, preserved
+   * verbatim at merge time.
+   *
+   * `spentUSD / limitUSD` re-derives the same fraction through a local dollar
+   * budget whose denominator is not model- and not window-specific. Consumers
+   * that need the real window fraction must read this field; it is absent for
+   * local-only windows, where there is no official percentage to report.
+   */
   readonly estimatedPercent?: number
   readonly resetsAt: number
   readonly clearsAt: number
@@ -204,6 +213,7 @@ export interface LocalWindow {
   readonly callsInWindow: number
   readonly source: "api" | "local"
   readonly status?: string
+  readonly officialPercent?: number
 }
 
 export interface WindowBounds {

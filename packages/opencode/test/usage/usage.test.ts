@@ -55,6 +55,8 @@ const CATALOG: Record<string, ModelsDev.Provider> = {
 const modelsDevStub = Layer.succeed(
   ModelsDev.Service,
   ModelsDev.Service.of({
+    getCached: () => Effect.succeed({}),
+    getForSelectedProvider: () => Effect.succeed(CATALOG),
     get: () => Effect.succeed(CATALOG),
     getDecisionModels: () => Effect.succeed({}),
     refresh: () => Effect.void,
@@ -412,6 +414,125 @@ describe("usage summary aggregation", () => {
       expect(hourMessages).toBe(5)
       expect(summary.dow.length).toBe(7)
       expect(summary.hours.length).toBe(24)
+    }),
+  )
+
+  it.live("keeps the complete Usage projection unchanged after a live Session is deleted", () =>
+    Effect.gen(function* () {
+      const usage = yield* Usage.Service
+      const request = {
+        since: BASE,
+        until: BASE + 8_002_000,
+        resolution: "day" as const,
+        projectID: null,
+      }
+
+      // Metadata may change after the final model response. The live Usage
+      // projection should see it now, and the delete trigger must preserve the
+      // exact same attribution once the Session row is gone.
+      yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        yield* db.run(sql`
+          UPDATE session
+          SET title = 'Session 1 renamed', time_updated = ${BASE + 9_000_000}
+          WHERE id = 's1'
+        `).pipe(Effect.orDie)
+        yield* db.run(sql`UPDATE project SET name = 'proj-a-renamed' WHERE id = 'p1'`).pipe(Effect.orDie)
+      }).pipe(Effect.provide(Database.layerFromPath(dbPath)))
+      Usage.resetUsageSummaryCache()
+
+      const before = yield* usage.summary(request)
+      const rowsBefore = yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        return yield* db
+          .all<{ count: number }>(sql`SELECT COUNT(*) AS count FROM usage_record WHERE session_id = 's1'`)
+          .pipe(Effect.orDie)
+      }).pipe(Effect.provide(Database.layerFromPath(dbPath)))
+
+      yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        yield* db.run(sql`DELETE FROM session WHERE id = 's1'`).pipe(Effect.orDie)
+      }).pipe(Effect.provide(Database.layerFromPath(dbPath)))
+      Usage.resetUsageSummaryCache()
+
+      const after = yield* usage.summary(request)
+      const postDelete = yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const rows = yield* db
+          .all<{ count: number }>(sql`SELECT COUNT(*) AS count FROM usage_record WHERE session_id = 's1'`)
+          .pipe(Effect.orDie)
+        const dimension = yield* db
+          .all<{
+            projectID: string
+            title: string
+            projectName: string | null
+            lastUsageAt: number
+          }>(sql`
+            SELECT
+              project_id AS projectID,
+              title,
+              project_name AS projectName,
+              last_usage_at AS lastUsageAt
+            FROM usage_session
+            WHERE session_id = 's1'
+          `)
+          .pipe(Effect.orDie)
+        return { rows, dimension }
+      }).pipe(Effect.provide(Database.layerFromPath(dbPath)))
+
+      expect(rowsBefore[0]?.count).toBeGreaterThan(0)
+      expect(postDelete.rows).toEqual(rowsBefore)
+      expect(postDelete.dimension).toEqual([
+        {
+          projectID: "p1",
+          title: "Session 1 renamed",
+          projectName: "proj-a-renamed",
+          lastUsageAt: BASE + 92_000,
+        },
+      ])
+      expect(after).toEqual(before)
+    }),
+  )
+
+  it.live("counts pre-migration orphaned Usage rows through the historical fallback", () =>
+    Effect.gen(function* () {
+      const usage = yield* Usage.Service
+      const orphan: SeedMessage = {
+        id: "m-pre-migration-orphan",
+        sessionID: "s-pre-migration-deleted",
+        providerID: "openai",
+        modelID: "gpt-4o",
+        created: BASE + 8_001_200,
+        completed: BASE + 8_001_500,
+        cost: 0.0002,
+        tokens: { input: 7, cacheRead: 0, cacheWrite: 0, output: 3, reasoning: 0 },
+      }
+
+      yield* Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        yield* seedUsageRecord(db, orphan)
+      }).pipe(Effect.provide(Database.layerFromPath(dbPath)))
+      Usage.resetUsageSummaryCache()
+
+      const summary = yield* usage.summary({
+        since: BASE + 8_001_100,
+        until: BASE + 8_001_900,
+        resolution: "hour",
+        projectID: null,
+      })
+
+      expect(summary.totals.messages).toBe(1)
+      expect(summary.totals.sessions).toBe(1)
+      expect(summary.projects).toEqual([
+        {
+          projectID: "__historical__",
+          name: "Historical usage",
+          sessions: 1,
+          messages: 1,
+          cost: 0.0002,
+          tokens: 10,
+        },
+      ])
     }),
   )
 })

@@ -4,7 +4,15 @@
 
 import { Effect, Schema } from "effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { ClaudeModels, PROVIDER_ID, MODEL_IDS, MODEL_METADATA, ClaudeModelStatus, resolveAlias } from "./models"
+import {
+  ClaudeModels,
+  PROVIDER_ID,
+  MODEL_IDS,
+  MODEL_METADATA,
+  ClaudeModelStatus,
+  getClaudeSubscriptionModelMetadata,
+  resolveAlias,
+} from "./models"
 
 export const ProviderStatus = Schema.Literals(["available", "unavailable", "setup-required", "approval-required"])
 export type ProviderStatus = typeof ProviderStatus.Type
@@ -24,9 +32,7 @@ export interface DiscoveryResult {
 // Pure discovery: zero process side effects. No SDK import, no CLI spawn.
 export function discoverPure(): DiscoveryResult {
   const models: Record<string, { id: string; name: string; status: ClaudeModelStatus }> = {}
-  for (const id of MODEL_IDS) {
-    const meta = MODEL_METADATA[id]
-    if (!meta) continue
+  for (const [id, meta] of Object.entries(getClaudeSubscriptionModelMetadata())) {
     models[id] = {
       id,
       name: meta.name,
@@ -61,7 +67,8 @@ export interface ClaudeProviderContract {
 export const contract: ClaudeProviderContract = {
   discover: discoverPure,
   resolveAlias,
-  modelStatus: (modelID: string) => MODEL_METADATA[modelID]?.status ?? undefined,
+  modelStatus: (modelID: string) =>
+    getClaudeSubscriptionModelMetadata()[modelID]?.status ?? MODEL_METADATA[modelID]?.status ?? undefined,
   providerStatus: () => "unavailable",
 }
 
@@ -70,6 +77,7 @@ export const contract: ClaudeProviderContract = {
 export function migrateLegacyReference(ref: string): string | undefined {
   const alias = resolveAlias(ref)
   if (alias) return alias
+  if (getClaudeSubscriptionModelMetadata()[ref]) return ref
   // If the reference is already a canonical model ID, return it.
   if (MODEL_IDS.includes(ref)) return ref
   return undefined

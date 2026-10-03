@@ -113,6 +113,7 @@ function makeRuntime(
       sinkEvents.push({ kind: event.kind })
     },
     ...overrides,
+    timeouts: { stopGraceMs: 5, ...overrides.timeouts },
   })
   return { runtime, killed, sinkEvents }
 }
@@ -143,6 +144,8 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     expect(fixture.queryCalls[0]!.options.skills).toBe("all")
     expect(fixture.queryCalls[0]!.options.settingSources).toEqual(["user", "project", "local"])
     expect(fixture.queryCalls[0]!.options.includePartialMessages).toBe(true)
+    expect(fixture.queryCalls[0]!.options.settings).toEqual({ showThinkingSummaries: true })
+    expect(fixture.queryCalls[0]!.options.extraArgs).toEqual({ "thinking-display": "summarized" })
 
     const diag = runtime.diagnostics()
     expect(diag.turnsStarted).toBe(1)
@@ -166,6 +169,90 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     expect(outcome.resultText).toBeUndefined()
   })
 
+  test("failed results use errors/terminal_reason and strip CLI diagnostics", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "too long" })
+    stream.push(initEvent)
+    stream.push({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      errors: ["[ede_diagnostic] result_type=user", "Prompt is too long"],
+      terminal_reason: "prompt_too_long",
+    })
+    stream.end()
+
+    const outcome = await done
+    expect(outcome.status).toBe("failed")
+    expect(outcome.category).toBe("context_overflow")
+    expect(outcome.message).toBe("Prompt is too long")
+  })
+
+  test("empty success after exhausted 5xx retries is an overload failure", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "retry me" })
+    stream.push(initEvent)
+    stream.push({ type: "result", subtype: "success", is_error: false, result: "", api_error_status: 529 })
+    stream.end()
+
+    const outcome = await done
+    expect(outcome.status).toBe("failed")
+    expect(outcome.category).toBe("overloaded")
+    expect(outcome.message).toContain("overloaded (529)")
+  })
+
+  test("api error status does not erase a response that already streamed content", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "partial success" })
+    stream.push(initEvent)
+    stream.push({ type: "assistant", message: { content: [{ type: "text", text: "answer" }] } })
+    stream.push({ type: "result", subtype: "success", is_error: false, result: "", api_error_status: 529 })
+    stream.end()
+
+    const outcome = await done
+    expect(outcome.status).toBe("completed")
+    expect(outcome.apiErrorStatus).toBe(529)
+  })
+
+  test("preserves Claude stop reason for host finish-reason mapping", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "long answer" })
+    stream.push(initEvent)
+    stream.push({ ...resultEvent, stop_reason: "max_tokens" })
+    stream.end()
+    const outcome = await done
+    expect(outcome.status).toBe("completed")
+    expect(outcome.stopReason).toBe("max_tokens")
+  })
+
+  test("api_retry extends the stall deadline by the announced retry delay", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module, { timeouts: { stallMs: 15, turnMs: 500 } })
+    const done = runtime.run({ prompt: "retrying" })
+    stream.push(initEvent)
+    stream.push({
+      type: "system",
+      subtype: "api_retry",
+      attempt: 1,
+      max_retries: 10,
+      retry_delay_ms: 60,
+      error_status: 529,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    stream.push(resultEvent)
+    stream.end()
+    expect((await done).status).toBe("completed")
+  })
+
   test("effort variant maps to Agent SDK effort + adaptive thinking", async () => {
     const stream = new StreamController()
     const fixture = fixtureSdk([stream])
@@ -177,6 +264,39 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     await done
     expect(fixture.queryCalls[0]!.options.effort).toBe("high")
     expect(fixture.queryCalls[0]!.options.thinking).toEqual({ type: "adaptive" })
+    expect(fixture.queryCalls[0]!.options.settings).toEqual({ showThinkingSummaries: true })
+  })
+
+  test("resumeSessionAt is forwarded only with a resumed Claude session", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({
+      prompt: "continue",
+      resume: "ext-session-1",
+      resumeSessionAt: "leaf-main",
+    })
+    stream.push(initEvent)
+    stream.push(resultEvent)
+    stream.end()
+    await done
+    expect(fixture.queryCalls[0]!.options.resume).toBe("ext-session-1")
+    expect(fixture.queryCalls[0]!.options.resumeSessionAt).toBe("leaf-main")
+  })
+
+  test("persistSession false makes maintenance turns non-resumable at the Agent SDK boundary", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({
+      prompt: "maintenance",
+      persistSession: false,
+    })
+    stream.push(initEvent)
+    stream.push(resultEvent)
+    stream.end()
+    await done
+    expect(fixture.queryCalls[0]!.options.persistSession).toBe(false)
   })
 
   test("SDK is loaded lazily and memoized across turns", async () => {
@@ -235,6 +355,75 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     const diag = runtime.diagnostics()
     expect(diag.cancelled).toBe(1)
   })
+
+  test("abort drains Claude's interrupt result and avoids killing a cleanly settled child", async () => {
+    const stream = new StreamController()
+    let closeCalls = 0
+    let queryStarted = false
+    const module = {
+      query: () => {
+        queryStarted = true
+        return {
+          events: stream.events,
+          pid: 777,
+          interrupt: async () => {
+            stream.push({
+              type: "result",
+              subtype: "error_during_execution",
+              is_error: true,
+              terminal_reason: "aborted_tools",
+            })
+            stream.end()
+          },
+          close: () => {
+            closeCalls += 1
+            stream.end()
+          },
+        }
+      },
+    }
+    const { runtime, killed } = makeRuntime(module as any, { timeouts: { stopGraceMs: 50 } })
+    const controller = new AbortController()
+    const done = runtime.run({ prompt: "parked tool turn", signal: controller.signal })
+    while (!queryStarted) await Promise.resolve()
+    stream.push(initEvent)
+    controller.abort()
+    const outcome = await done
+    expect(outcome.status).toBe("cancelled")
+    expect(killed).toEqual([])
+    expect(closeCalls).toBe(1)
+  })
+
+  test("abort grace stays bounded when the SDK interrupt promise wedges", async () => {
+    const stream = new StreamController()
+    let closeCalls = 0
+    let queryStarted = false
+    const module = {
+      query: () => {
+        queryStarted = true
+        return {
+          events: stream.events,
+          pid: 778,
+          interrupt: () => new Promise<void>(() => {}),
+          close: () => {
+            closeCalls += 1
+            stream.end()
+          },
+        }
+      },
+    }
+    const { runtime, killed } = makeRuntime(module as any, { timeouts: { stopGraceMs: 20 } })
+    const controller = new AbortController()
+    const done = runtime.run({ prompt: "wedged interrupt", signal: controller.signal })
+    while (!queryStarted) await Promise.resolve()
+    stream.push(initEvent)
+    controller.abort()
+
+    const outcome = await done
+    expect(outcome.status).toBe("cancelled")
+    expect(killed).toEqual([778])
+    expect(closeCalls).toBe(1)
+  }, 2000)
 
   test("silence beyond the stall window fails the turn as stalled", async () => {
     const stream = new StreamController()

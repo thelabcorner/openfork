@@ -29,6 +29,8 @@ import { CheckpointTool } from "./checkpoint"
 import { GoalTool } from "./goal"
 import { ScheduledTaskTool } from "./scheduled-task"
 import { SwarmTool } from "./swarm"
+import { SwarmCreateTool } from "./swarm-create"
+import { SwarmMemberTool } from "./swarm-member"
 import { SessionTool } from "./session"
 import { TurnCheckpoint } from "@/session/checkpoint"
 import { Snapshot } from "@/snapshot"
@@ -88,6 +90,8 @@ import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import { ScheduledTaskAgent } from "@opencode-ai/core/scheduled-task/agent"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
+import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
+import { SwarmContainment } from "@/swarm/containment"
 
 export function webSearchEnabled(
   providerID: ProviderV2.ID,
@@ -133,6 +137,7 @@ const snapshotReadOnlyTools = new Set([
   "session",
   "goal",
   "scheduled_task",
+  "swarm_create",
   "ofxp",
   TOOL_ACCESS_ID,
 ])
@@ -174,6 +179,11 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
       return !["list", "status", "read", "wait"].includes(String(args.action))
     case "swarm":
       return args.action === "recover.members"
+    case "swarm_member":
+      // Session-derived Swarm collaboration is durable-domain state only. It
+      // never reads or writes workspace files: `files` in publish records a path
+      // reference, it does not transfer bytes.
+      return false
     default:
       return true
   }
@@ -181,7 +191,24 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
 
 const delegatedPermissionTools = new Set([FindTool.id, WebTool.id, BrowserTool.id])
 
+/**
+ * Provider-visible aliases must never widen an older permission boundary.
+ *
+ * swarm_create is a direct UX facade over the lazy swarm owner, so an existing
+ * broad swarm deny also denies creation. A tool-specific deny still applies
+ * independently; an explicit facade allow cannot punch through the owner deny.
+ */
+const providerPermissionOwners: Readonly<Record<string, string>> = {
+  swarm_create: "swarm",
+}
+
 function providerPolicy(toolID: string, ruleset: PermissionV1.Ruleset): PermissionV1.Rule {
+  const owner = providerPermissionOwners[toolID]
+  if (owner) {
+    const ownerPolicy = Permission.evaluate(owner, "*", ruleset)
+    if (ownerPolicy.action === "deny") return ownerPolicy
+  }
+
   if (!delegatedPermissionTools.has(toolID)) return Permission.evaluate(toolID, "*", ruleset)
   return (
     ruleset.findLast((rule) => rule.permission === toolID && rule.pattern === "*") ?? {
@@ -257,6 +284,8 @@ const layer = Layer.effect(
     const goaltool = yield* GoalTool
     const scheduledtasktool = yield* ScheduledTaskTool
     const swarmtool = yield* SwarmTool
+    const swarmcreatetool = yield* SwarmCreateTool
+    const swarmmembertool = yield* SwarmMemberTool
     const sessiontool = yield* SessionTool
     const typechecktool = yield* TypecheckTool
     const projecttool = yield* ProjectTool
@@ -307,6 +336,8 @@ const layer = Layer.effect(
           goal: Tool.init(goaltool),
           scheduledTask: Tool.init(scheduledtasktool),
           swarm: Tool.init(swarmtool),
+          swarmCreate: Tool.init(swarmcreatetool),
+          swarmMember: Tool.init(swarmmembertool),
           session: Tool.init(sessiontool),
           typecheck: Tool.init(typechecktool),
           project: Tool.init(projecttool),
@@ -364,6 +395,8 @@ const layer = Layer.effect(
             tool.goal,
             tool.scheduledTask,
             tool.swarm,
+            tool.swarmCreate,
+            tool.swarmMember,
             tool.session,
             tool.typecheck,
             tool.project,
@@ -570,6 +603,8 @@ export const node = LayerNode.make({
     ScheduledTaskAgent.node,
     SwarmV2.node,
     SwarmMemberSessionWake.node,
+    SwarmProfilePreflight.node,
+    SwarmContainment.node,
     Ripgrep.node,
     Symbols.node,
     RipgrepBinary.node,

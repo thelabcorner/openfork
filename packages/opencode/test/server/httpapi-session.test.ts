@@ -1,10 +1,14 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, spyOn } from "bun:test"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import * as AppBackgroundJob from "../../src/background/job"
+import * as SessionMetadataOwnership from "@opencode-ai/core/session/metadata-ownership"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -26,11 +30,18 @@ import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/grou
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
+import { SessionRunState } from "@/session/run-state"
+import { PendingResponseRegistry } from "@/server/pending-response-registry"
+import { EventV2Bridge } from "@/event-v2-bridge"
+import { Question } from "@/question"
+import { QuestionID } from "@/question/schema"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionHistory } from "@opencode-ai/core/session/history"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { SessionTurnProvenance as CurrentSessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { SessionTurnProvenance as V1SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionTitle } from "@opencode-ai/core/session/title"
@@ -51,7 +62,22 @@ const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service.of({ gate: Effect.void, warmup: Effect.void }),
 )
 const appLayer = AppNodeBuilder.build(
-  LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
+  LayerNode.group([
+    InstanceStore.node,
+    Project.node,
+    Session.node,
+    Workspace.node,
+    Database.node,
+    SessionTelemetry.node,
+    SessionExecutionOwner.node,
+    GoalAutomation.node,
+    SessionRunState.node,
+    PendingResponseRegistry.node,
+    EventV2Bridge.node,
+    AppBackgroundJob.node,
+    CurrentParts.node,
+    Ripgrep.node,
+  ]),
   [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
@@ -242,6 +268,83 @@ afterEach(async () => {
 })
 
 describe("session HttpApi", () => {
+  it.live(
+    "admits V1 sessions for 1, 3, and 6 concurrent creates without loading an Instance",
+    () =>
+      Effect.gen(function* () {
+        const directory = yield* tmpdirScoped({ config: { share: "disabled" } })
+        const store = yield* InstanceStore.Service
+        const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+        let start = 0
+        const created: Session.Info[] = []
+        for (const count of [1, 3, 6]) {
+          const results = yield* Effect.forEach(
+            Array.from({ length: count }, (_, index) => index),
+            (index) =>
+              requestJson<Session.Info>(SessionPaths.create, {
+                method: "POST",
+                headers: {
+                  "x-opencode-directory": directory,
+                  "content-type": "application/json",
+                },
+                body: JSON.stringify({ title: `parallel admission ${start + index}` }),
+              }),
+            { concurrency: count },
+          )
+          expect(results.every((session) => session.id)).toBe(true)
+          created.push(...results)
+          start += count
+        }
+        expect(new Set(created.map((session) => session.id)).size).toBe(10)
+        expect(load).not.toHaveBeenCalled()
+        load.mockRestore()
+      }),
+  )
+
+  it.live(
+    "includes an in-flight V1 run in the process-wide active snapshot",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.hang
+
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "legacy active snapshot" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory }
+        const prompt = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { ...headers, "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "stay in flight" }],
+            }),
+          },
+        ).pipe(Effect.forkChild)
+
+        // The legacy processor has entered the provider stream, but this test
+        // has never opened/hydrated the session through the renderer path.
+        yield* llm.wait(1)
+
+        const active = yield* requestJson<{
+          data: Record<string, { type: "running" | "paused" }>
+        }>("/api/session/active")
+        expect(active.data[session.id]).toEqual({ type: "running" })
+
+        // Cleanly terminate the deliberately hung provider request.
+        const pause = yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+        })
+        expect(pause.status).toBe(204)
+        yield* awaitWithTimeout(Fiber.await(prompt), "legacy prompt did not stop after pause", "10 seconds")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
   it.effect("maps busy sessions to public session busy errors", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.descending()
@@ -881,6 +984,317 @@ describe("session HttpApi", () => {
   )
 
   it.instance(
+    "aborts an active V1 handle without loading or waiting for an Instance",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const runState = yield* SessionRunState.Service
+        const owner = yield* SessionExecutionOwner.Service
+        const store = yield* InstanceStore.Service
+        const session = yield* createSession({ title: "bootstrap-free abort" })
+        const running = yield* runState
+          .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+          .pipe(Effect.forkChild)
+        yield* Effect.sleep("50 millis")
+
+        const load = spyOn(store, "load")
+        const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+          method: "POST",
+          headers: { "x-opencode-directory": test.directory },
+        })
+        expect(response.status).toBe(200)
+        expect(yield* responseJson(response)).toBe(true)
+        expect(load).not.toHaveBeenCalled()
+        load.mockRestore()
+
+        yield* Fiber.await(running)
+        expect((yield* owner.snapshot(session.id)).ownerID).toBeUndefined()
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance("answers active pending-response handles over HTTP without loading an Instance", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const store = yield* InstanceStore.Service
+      const registry = yield* PendingResponseRegistry.Service
+      const settled = new Set<string>()
+      const unregister = [] as Array<Effect.Effect<void>>
+      const ids = Array.from({ length: 10 }, (_, index) => `question_control_${index + 1}`)
+      for (const id of ids) {
+        unregister.push(yield* registry.register({
+          kind: "question",
+          requestID: id,
+          sessionID: SessionID.make(`ses_${id}`),
+          directory: FSUtil.resolve(test.directory),
+          snapshot: { id, sessionID: SessionID.make(`ses_${id}`), questions: [] },
+          settle: () => Effect.sync(() => { settled.add(id) }),
+        }))
+      }
+      yield* Effect.addFinalizer(() => Effect.forEach(unregister, (remove) => remove, { discard: true }))
+      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+      try {
+        let start = 0
+        for (const count of [1, 3, 6]) {
+          const group = ids.slice(start, start + count)
+          const responses = yield* Effect.forEach(group, (requestID) => request(
+            `/question/${requestID}/reject`,
+            { method: "POST", headers: { "x-opencode-directory": test.directory } },
+          ), { concurrency: count })
+          expect(responses.map((response) => response.status)).toEqual(Array.from({ length: count }, () => 200))
+          expect(yield* Effect.forEach(responses, responseJson)).toEqual(Array.from({ length: count }, () => true))
+          start += count
+        }
+        expect(settled.size).toBe(10)
+        expect(load).not.toHaveBeenCalled()
+
+        const literalPercentDirectory = `${test.directory}_literal%2Fdirectory`
+        const removePercent = yield* registry.register({
+          kind: "question",
+          requestID: "question_control_percent",
+          sessionID: SessionID.make("ses_question_control_percent"),
+          directory: FSUtil.resolve(literalPercentDirectory),
+          snapshot: { id: "question_control_percent", sessionID: SessionID.make("ses_question_control_percent"), questions: [] },
+          settle: () => Effect.sync(() => { settled.add("question_control_percent") }),
+        })
+        yield* Effect.addFinalizer(() => removePercent)
+        const percentResponse = yield* request("/question/question_control_percent/reject", {
+          method: "POST",
+          headers: { "x-opencode-directory": literalPercentDirectory },
+        })
+        expect(percentResponse.status).toBe(200)
+        expect(yield* responseJson(percentResponse)).toBe(true)
+      } finally {
+        load.mockRestore()
+      }
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance("overflowed transient notifications publish an invalidation and the active snapshot repairs state", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const registry = yield* PendingResponseRegistry.Service
+      const events = yield* EventV2Bridge.Service
+      const store = yield* InstanceStore.Service
+      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const invalidated = yield* Deferred.make<void>()
+      let blockOnce = true
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type === Question.Event.Rejected.type && blockOnce) {
+          blockOnce = false
+          return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+        }
+        if (event.type === "server.pending-response-state-invalidated")
+          return Deferred.succeed(invalidated, undefined)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      const id = "question_overflow_active"
+      const sessionID = SessionID.make("ses_question_overflow_active")
+      const unregister = yield* registry.register({
+        kind: "question",
+        requestID: id,
+        sessionID,
+        directory: FSUtil.resolve(test.directory),
+        snapshot: { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
+        settle: () => Effect.void,
+      })
+      yield* Effect.addFinalizer(() => unregister)
+
+      yield* registry.notify(
+        events.publish(Question.Event.Rejected, { sessionID, requestID: QuestionID.make("que_worker_blocker") }),
+        FSUtil.resolve(test.directory),
+      )
+      yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
+      for (let index = 0; index < 129; index++) yield* registry.notify(Effect.void, FSUtil.resolve(test.directory))
+      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.await(invalidated).pipe(Effect.timeout("5 seconds"))
+
+      const response = yield* request("/question", { headers: { "x-opencode-directory": test.directory } })
+      expect(response.status).toBe(200)
+      expect(yield* responseJson(response)).toEqual([
+        { id, sessionID, questions: [{ question: "Continue?", header: "Action", options: [] }] },
+      ])
+      expect(load).not.toHaveBeenCalled()
+      load.mockRestore()
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance(
+    "cancels 1, 3, and 6 active V1 sessions over HTTP while Instance bootstrap is blocked",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const runState = yield* SessionRunState.Service
+        const store = yield* InstanceStore.Service
+        const owner = yield* SessionExecutionOwner.Service
+        const sessions = yield* Effect.forEach(Array.from({ length: 10 }), (_, index) =>
+          createSession({ title: `parallel abort ${index}` }),
+        )
+        const fibers = [] as Fiber.Fiber<unknown, unknown>[]
+        for (const session of sessions) {
+          fibers.push(
+            yield* runState
+              .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+              .pipe(Effect.forkChild),
+          )
+        }
+        yield* Effect.sleep("50 millis")
+        for (const session of sessions) expect((yield* owner.snapshot(session.id)).ownerID).toBeTruthy()
+
+        // Any accidental transition back through InstanceContext now blocks
+        // forever; the control route must finish using only durable owners.
+        const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+        let start = 0
+        for (const count of [1, 3, 6]) {
+          const group = sessions.slice(start, start + count)
+          const responses = yield* Effect.forEach(
+            group,
+            (session) =>
+              request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+                method: "POST",
+                headers: { "x-opencode-directory": test.directory },
+              }),
+            { concurrency: count },
+          )
+          expect(responses.map((response) => response.status)).toEqual(Array.from({ length: count }, () => 200))
+          expect(yield* Effect.forEach(responses, responseJson)).toEqual(Array.from({ length: count }, () => true))
+          start += count
+        }
+        expect(load).not.toHaveBeenCalled()
+        load.mockRestore()
+        yield* Effect.forEach(fibers, (fiber) => Fiber.await(fiber), { concurrency: 8 })
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance("aborts an orphaned session-owned BackgroundJob without loading an Instance", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const store = yield* InstanceStore.Service
+      const session = yield* createSession({ title: "orphaned background task" })
+      const job = yield* AppBackgroundJob.Service.use((jobs) =>
+        jobs.start({
+          id: `job_${session.id}`,
+          type: "test-orphan",
+          metadata: { sessionId: session.id },
+          run: Effect.never,
+        }),
+      ).pipe(provideInstanceEffect(test.directory))
+      const load = spyOn(store, "load").mockImplementation(() => Effect.never as never)
+
+      const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": test.directory },
+      })
+
+      expect(response.status).toBe(200)
+      expect(yield* responseJson(response)).toBe(true)
+      expect(load).not.toHaveBeenCalled()
+      load.mockRestore()
+      expect(
+        yield* AppBackgroundJob.Service.use((jobs) => jobs.get(job.id)).pipe(provideInstanceEffect(test.directory)),
+      ).toMatchObject({ status: "cancelled" })
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance("does not let a delayed stale abort cancel a newer session generation", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const runState = yield* SessionRunState.Service
+      const owner = yield* SessionExecutionOwner.Service
+      const automation = yield* GoalAutomation.Service
+      const session = yield* createSession({ title: "stale abort fence" })
+      const running = yield* runState
+        .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep("30 millis")
+      const previous = yield* owner.snapshot(session.id)
+      expect(previous.ownerID).toBeTruthy()
+
+      const entered = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const cancelAutomation = spyOn(automation, "cancel")
+      const requestInterrupt = owner.requestInterrupt
+      const delayed = spyOn(owner, "requestInterrupt").mockImplementation((id, reason, generation) =>
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(resume)),
+          Effect.andThen(requestInterrupt(id, reason, generation)),
+        ),
+      )
+      const abort = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": test.directory },
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(entered).pipe(Effect.timeout("2 seconds"))
+
+      yield* owner.release({
+        sessionID: session.id,
+        ownerID: previous.ownerID!,
+        generation: previous.generation,
+      })
+      const acquired = yield* owner.tryAcquireLocal(session.id)
+      expect(acquired.state).toBe("acquired")
+      if (acquired.state !== "acquired") return
+
+      yield* Deferred.succeed(resume, undefined)
+      const response = yield* Fiber.join(abort).pipe(Effect.timeout("2 seconds"))
+      delayed.mockRestore()
+      expect(response.status).toBe(200)
+      expect(yield* responseJson(response)).toBe(false)
+      const current = yield* owner.snapshot(session.id)
+      expect(current.ownerID).toBe(acquired.token.ownerID)
+      expect(current.generation).toBe(acquired.token.generation)
+      expect(cancelAutomation).not.toHaveBeenCalled()
+      cancelAutomation.mockRestore()
+
+      yield* owner.release(acquired.token)
+      yield* runState.cancel(session.id)
+      yield* Fiber.await(running)
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+    15_000,
+  )
+
+  it.instance("rejects abort for producer-owned sessions without canceling their active owner", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const runState = yield* SessionRunState.Service
+      const owner = yield* SessionExecutionOwner.Service
+      const session = yield* createSession({ title: "producer-owned abort" })
+      const metadata = SessionMetadataOwnership.specialAgent({ agent: "test-owner", ownerKind: "goal", ownerID: "goal_test" })
+      const { db } = yield* Database.Service
+      yield* db.update(SessionTable).set({ metadata }).where(eq(SessionTable.id, session.id)).run().pipe(Effect.orDie)
+      expect(SessionMetadataOwnership.isProducerOwned(metadata)).toBe(true)
+      const running = yield* runState
+        .ensureRunning(session.id, Effect.succeed({} as SessionV1.WithParts), Effect.never)
+        .pipe(Effect.forkChild)
+      yield* Effect.sleep("30 millis")
+      const before = yield* owner.snapshot(session.id)
+      const response = yield* request(pathFor(SessionPaths.abort, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": test.directory },
+      })
+      expect(response.status).toBe(400)
+      expect((yield* owner.snapshot(session.id)).generation).toBe(before.generation)
+      expect((yield* owner.snapshot(session.id)).ownerID).toBe(before.ownerID)
+      yield* runState.cancel(session.id)
+      yield* Fiber.await(running)
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
     "serves sessions with migrated summary diffs missing file details",
     () =>
       Effect.gen(function* () {
@@ -910,6 +1324,20 @@ describe("session HttpApi", () => {
           headers,
         })
         expect(createdEmpty.id).toBeTruthy()
+
+        const createdWhitespace = yield* requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: "  \n\t",
+        })
+        expect(createdWhitespace.id).toBeTruthy()
+
+        const invalidCreate = yield* request(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: "{",
+        })
+        expect(invalidCreate.status).toBe(400)
 
         const created = yield* requestJson<Session.Info>(SessionPaths.create, {
           method: "POST",
@@ -1338,6 +1766,32 @@ describe("session HttpApi", () => {
         expect(response.headers["access-control-expose-headers"]?.toLowerCase()).toContain("x-next-cursor")
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "detail recovery reads the live producer prefix without changing durable history",
+    () => Effect.gen(function* () {
+      const test = yield* TestInstance
+      const headers = { "x-opencode-directory": test.directory }
+      const session = yield* createSession({ title: "live recovery" })
+      const stored = yield* createTextMessage(session.id, "")
+      const currentParts = yield* CurrentParts.Service
+      const live = { ...stored.part, text: "prefix while provider is silent" }
+      const key = { sessionID: session.id, messageID: stored.info.id, partID: stored.part.id }
+      const token = currentParts.register({ ...key, snapshot: () => live })
+      yield* Effect.addFinalizer(() => Effect.sync(() => currentParts.release(key, token)))
+      const route = `${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=1`
+      const recovered = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
+      expect(recovered[0]?.parts).toContainEqual(live)
+      const durable = yield* Session.Service.use((svc) => svc.messages({ sessionID: session.id }))
+      expect(durable[0]?.parts).toContainEqual(stored.part)
+      currentParts.release(key, token)
+      const after = yield* requestJson<SessionV1.WithParts[]>(route, { headers })
+      expect(after[0]?.parts).toContainEqual(stored.part)
+      expect(currentParts.snapshot(session.id, [stored.info.id])).toEqual([])
+    }),
+    { git: true, config: { formatter: false, lsp: false } },
+    { timeout: 30000 },
   )
 
   it.instance(

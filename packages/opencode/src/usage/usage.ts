@@ -2,10 +2,15 @@ export * as Usage from "./usage"
 
 import { sql } from "drizzle-orm"
 import { Context, Effect, Layer, Schema, Semaphore, Types } from "effect"
-import { Database, withBackfillDb } from "@opencode-ai/core/database/database"
+import { Database } from "@opencode-ai/core/database/database"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { UsageClassification } from "@opencode-ai/core/usage/classification"
 import { UsageRecord } from "@opencode-ai/core/usage/record"
+import { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionTelemetry as SessionTelemetrySchema } from "@opencode-ai/schema/session-telemetry"
+import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 
 /**
  * Global usage aggregation across every session in the database.
@@ -400,10 +405,109 @@ export const PricingCatalog = Schema.Struct({
 })
 export type PricingCatalog = Schema.Schema.Type<typeof PricingCatalog>
 
+const SessionContextRate = Schema.Struct({
+  input: Schema.Finite,
+  output: Schema.Finite,
+  cache: Schema.Struct({
+    read: Schema.Finite,
+    write: Schema.Finite,
+  }),
+})
+
+export const SessionContextModel = Schema.Struct({
+  providerID: Schema.String,
+  modelID: Schema.String,
+  variant: Schema.NullOr(Schema.String),
+  providerName: Schema.String,
+  modelName: Schema.String,
+  messages: Schema.Finite,
+  toolCalls: Schema.Finite,
+  cost: Schema.Finite,
+  freeMessages: Schema.Finite,
+  tokens: TokenTotals,
+  freeTokens: TokenTotals,
+  generatedMs: Schema.Finite,
+  toolMs: Schema.Finite,
+  ttftMs: Schema.Finite,
+  ttftRecords: Schema.Finite,
+  upstreamTTFTMs: Schema.Finite,
+  upstreamTTFTRecords: Schema.Finite,
+  firstMessageTime: Schema.Finite,
+  lastMessageTime: Schema.Finite,
+  costRate: Schema.optional(SessionContextRate),
+})
+export type SessionContextModel = Schema.Schema.Type<typeof SessionContextModel>
+
+export const SessionContextBreakdown = Schema.Struct({
+  system: Schema.Finite,
+  user: Schema.Finite,
+  synthetic: Schema.Finite,
+  shell: Schema.Finite,
+  compaction: Schema.Finite,
+  assistant: Schema.Finite,
+  tool: Schema.Finite,
+  other: Schema.Finite,
+})
+export type SessionContextBreakdown = Schema.Schema.Type<typeof SessionContextBreakdown>
+
+export const SessionContextLatest = Schema.Struct({
+  providerID: Schema.String,
+  modelID: Schema.String,
+  variant: Schema.optional(Schema.String),
+  providerName: Schema.String,
+  modelName: Schema.String,
+  contextLimit: Schema.optional(Schema.Finite),
+  completedAt: Schema.Finite,
+  tokens: TokenTotals,
+})
+export type SessionContextLatest = Schema.Schema.Type<typeof SessionContextLatest>
+
+export const SessionContextHistory = Schema.Struct({
+  sessionID: Schema.String,
+  createdAt: Schema.Finite,
+  updatedAt: Schema.Finite,
+  counts: Schema.Struct({
+    all: Schema.Finite,
+    user: Schema.Finite,
+    assistant: Schema.Finite,
+  }),
+  systemPrompt: Schema.NullOr(Schema.String),
+  totals: Schema.Struct({
+    messages: Schema.Finite,
+    toolCalls: Schema.Finite,
+    cost: Schema.Finite,
+    freeMessages: Schema.Finite,
+    tokens: TokenTotals,
+    freeTokens: TokenTotals,
+    generatedMs: Schema.Finite,
+    toolMs: Schema.Finite,
+    ttftMs: Schema.Finite,
+    ttftRecords: Schema.Finite,
+    upstreamTTFTMs: Schema.Finite,
+    upstreamTTFTRecords: Schema.Finite,
+  }),
+  models: Schema.Array(SessionContextModel),
+  latest: Schema.optional(SessionContextLatest),
+  breakdown: SessionContextBreakdown,
+})
+export type SessionContextHistory = Schema.Schema.Type<typeof SessionContextHistory>
+
+/**
+ * Bootstrap-free context-pane projection. Historical analytics come from
+ * durable scalar/session projections; live occupancy and phase come from the
+ * bounded SessionTelemetry overlay. No message/part payloads cross this API.
+ */
+export const SessionContextSnapshot = Schema.Struct({
+  history: SessionContextHistory,
+  telemetry: Schema.NullOr(SessionTelemetrySchema.Info),
+})
+export type SessionContextSnapshot = Schema.Schema.Type<typeof SessionContextSnapshot>
+
 export interface Interface {
   readonly summary: (request: UsageSummaryRequest) => Effect.Effect<UsageSummary>
   readonly modelProfile: () => Effect.Effect<ModelProfile>
   readonly pricingCatalog: () => Effect.Effect<PricingCatalog>
+  readonly sessionContext: (sessionID: string) => Effect.Effect<SessionContextHistory | undefined>
   readonly recordMaintenance: (input: MaintenanceRecordInput) => Effect.Effect<void>
 }
 
@@ -464,10 +568,103 @@ type ModelProfileRow = {
   cache_read_tokens: number
 }
 
+type SessionContextModelRow = {
+  provider_id: string
+  model_id: string
+  variant: string | null
+  variant_count: number
+  messages: number
+  tool_calls: number
+  cost_usd: number
+  free_messages: number
+  input_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  free_input_tokens: number
+  free_cache_read_tokens: number
+  free_cache_write_tokens: number
+  free_output_tokens: number
+  free_reasoning_tokens: number
+  generated_ms: number
+  tool_ms: number
+  ttft_ms: number
+  ttft_records: number
+  upstream_ttft_ms: number
+  upstream_ttft_records: number
+  first_message_ms: number
+  last_message_ms: number
+}
+
+type SessionContextSessionRow = {
+  session_id: string
+  special_agent: number
+  model_provider_id: string | null
+  model_id: string | null
+  model_variant: string | null
+  cost_usd: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  created_ms: number
+  updated_ms: number
+  event_seq: number
+  latest_usage_completed_at: number | null
+  latest_usage_message_id: string | null
+}
+
+type SessionContextRawProjection = {
+  modelRows: SessionContextModelRow[]
+  latestRows: SessionContextLatestRow[]
+  messageGroups: SessionContextMessageGroupRow[]
+  promptRows: SessionContextPromptRow[]
+  partGroups: SessionContextPartGroupRow[]
+}
+
+type SessionContextLatestRow = {
+  provider_id: string
+  model_id: string
+  variant: string | null
+  completed_at: number
+  input_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+}
+
+type SessionContextSemanticRow = {
+  message_type: string | null
+  role: string | null
+  provenance_owner: string | null
+  provenance_source: string | null
+  provenance_lifetime: string | null
+}
+
+type SessionContextMessageGroupRow = SessionContextSemanticRow & {
+  messages: number
+}
+
+type SessionContextPromptRow = SessionContextSemanticRow & {
+  id: string
+  system_prompt: string
+  created_ms: number
+}
+
+type SessionContextPartGroupRow = SessionContextSemanticRow & {
+  content_chars: number
+  tool_chars: number
+}
+
 export type MaintenanceRecordInput = {
   agent: string
   providerID: string
   modelID: string
+  /** Committed route authority for this maintenance generation. */
+  route?: UsageRouteAttribution.Committed
   variant?: string | null
   sessionID?: string | null
   projectID?: string | null
@@ -506,9 +703,34 @@ const summaryCache = new Map<string, { at: number; revision: number; value: Usag
 const MODEL_PROFILE_CACHE_TTL_MS = 10_000
 let modelProfileCache: { at: number; database: string; revision: number; value: ModelProfile } | undefined
 
+// Context-pane history can be expensive to derive from large legacy transcripts,
+// but its inputs already expose tiny durable invalidation watermarks:
+//
+// - event_sequence.seq changes for Session message/part mutations;
+// - latest usage identity changes when a settled UsageRecord lands after the final
+//   message event.
+//
+// Cache only the fixed-size SQL projection, never raw transcript content. This
+// keeps repeat opens/refetches O(1) while preserving a cold path that can rebuild
+// from durable truth after restart or out-of-band maintenance.
+const SESSION_CONTEXT_CACHE_TTL_MS = 60_000
+const MAX_SESSION_CONTEXT_CACHE = 128
+const sessionContextProjectionCache = new Map<
+  string,
+  {
+    at: number
+    eventSeq: number
+    updatedAt: number
+    latestUsageCompletedAt: number | null
+    latestUsageMessageID: string | null
+    value: SessionContextRawProjection
+  }
+>()
+
 /** Invalidate process-local analytics after an out-of-band history mutation. */
 export const resetUsageSummaryCache = () => {
   summaryCache.clear()
+  sessionContextProjectionCache.clear()
   // modelProfile is derived from the same durable usage_record history as the
   // range summaries. A reset/history rewrite must therefore invalidate both
   // projections atomically; otherwise Settings/Usage can display a stale
@@ -544,12 +766,16 @@ function emptyBucket(): Mutable<CountBucket> {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db, filename } = yield* Database.Service
+    const { db, readDb, scanDb, filename } = yield* Database.Service
     const modelsDev = yield* ModelsDev.Service
     // Client aborts stop response delivery, but SQLite work already handed to
     // a separate connection may continue. Serialize analytics scans so rapid
     // range/project changes cannot create a concurrent scan storm.
     const queryPermit = yield* Semaphore.make(1)
+    // Session Context is an interactive, session-local read. Keep it off the
+    // global Usage scan permit and reuse Database's persistent query-only lane
+    // instead of opening/configuring a fresh SQLite handle on every panel fetch.
+    const contextQueryPermit = yield* Semaphore.make(1)
 
     const summary = Effect.fn("Usage.summary")(function* (request: UsageSummaryRequest) {
       const projectID = request.projectID ?? null
@@ -570,12 +796,13 @@ const layer = Layer.effect(
       // Run the scan on a dedicated connection so a large aggregation can
       // never block the app's shared connection, which serializes live
       // session/message queries (that starvation is what made the app stutter
-      // while this pane refreshed).
+      // while this pane refreshed). The scan lane is lazy and persistent, so
+      // Node pays worker/open/configure cost once per Database lifetime.
       const result = yield* queryPermit.withPermits(1)(
-        withBackfillDb(filename, (conn) =>
-          Effect.gen(function* () {
-            const rows = yield* conn
-              .all<UsageRow>(
+        Effect.gen(function* () {
+          const conn = yield* scanDb()
+          const rows = yield* conn
+            .all<UsageRow>(
               sql`
                 SELECT
                   r.message_id AS id,
@@ -594,54 +821,55 @@ const layer = Layer.effect(
                   r.cache_write_tokens,
                   r.output_tokens,
                   r.reasoning_tokens,
-                  s.project_id,
-                  s.directory,
-                  s.title AS session_title,
-                  p.name AS project_name,
+                  COALESCE(s.project_id, us.project_id, '__historical__') AS project_id,
+                  COALESCE(s.directory, us.directory, 'Historical usage') AS directory,
+                  COALESCE(s.title, us.title, 'Deleted session') AS session_title,
+                  COALESCE(p.name, us.project_name) AS project_name,
                   r.agent,
                   r.mode
                 FROM usage_record r
-                JOIN session s ON s.id = r.session_id
+                LEFT JOIN session s ON s.id = r.session_id
                 LEFT JOIN project p ON p.id = s.project_id
+                LEFT JOIN usage_session us ON us.session_id = r.session_id
                 WHERE r.completed_at >= ${request.since}
                   AND r.completed_at < ${request.until}
-                  AND (${projectID} IS NULL OR s.project_id = ${projectID})
+                  AND (${projectID} IS NULL OR COALESCE(s.project_id, us.project_id, '__historical__') = ${projectID})
                 ORDER BY completed_ms ASC
+
               `,
-              )
-              .pipe(Effect.orDie)
-            const maintenanceRows = yield* conn
-              .all<MaintenanceUsageRow>(
-                sql`
-                  SELECT
-                    agent,
-                    provider_id,
-                    model_id,
-                    variant,
-                    session_id,
-                    project_id,
-                    requests,
-                    cost_usd,
-                    cost_estimated,
-                    input_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    output_tokens,
-                    reasoning_tokens,
-                    total_tokens,
-                    time_started AS started_ms,
-                    time_completed AS completed_ms
-                  FROM maintenance_usage
-                  WHERE time_completed >= ${request.since}
-                    AND time_completed < ${request.until}
-                    AND (${projectID} IS NULL OR project_id = ${projectID})
-                  ORDER BY time_completed ASC
-                `,
-              )
-              .pipe(Effect.orDie)
-            return aggregate(rows, maintenanceRows, rates, request)
-          }),
-        ).pipe(Effect.orDie),
+            )
+            .pipe(Effect.orDie)
+          const maintenanceRows = yield* conn
+            .all<MaintenanceUsageRow>(
+              sql`
+                SELECT
+                  agent,
+                  provider_id,
+                  model_id,
+                  variant,
+                  session_id,
+                  project_id,
+                  requests,
+                  cost_usd,
+                  cost_estimated,
+                  input_tokens,
+                  cache_read_tokens,
+                  cache_write_tokens,
+                  output_tokens,
+                  reasoning_tokens,
+                  total_tokens,
+                  time_started AS started_ms,
+                  time_completed AS completed_ms
+                FROM maintenance_usage
+                WHERE time_completed >= ${request.since}
+                  AND time_completed < ${request.until}
+                  AND (${projectID} IS NULL OR project_id = ${projectID})
+                ORDER BY time_completed ASC
+              `,
+            )
+            .pipe(Effect.orDie)
+          return aggregate(rows, maintenanceRows, rates, request)
+        }),
       )
 
       if (summaryCache.size > 100) summaryCache.clear()
@@ -660,8 +888,9 @@ const layer = Layer.effect(
       )
         return hit.value
       const rows = yield* queryPermit.withPermits(1)(
-        withBackfillDb(filename, (conn) =>
-          conn
+        Effect.gen(function* () {
+          const conn = yield* scanDb()
+          return yield* conn
             .all<ModelProfileRow>(sql`
               WITH recent AS (
                 SELECT
@@ -675,6 +904,7 @@ const layer = Layer.effect(
                     ORDER BY completed_at DESC, message_id DESC
                   ) AS sample_rank
                 FROM usage_record
+                WHERE COALESCE(mode, '') <> ${UsageClassification.MAINTENANCE_MODE}
               )
               SELECT
                 provider_id,
@@ -688,8 +918,8 @@ const layer = Layer.effect(
               WHERE sample_rank <= 200
               GROUP BY provider_id, model_id
             `)
-            .pipe(Effect.orDie),
-        ).pipe(Effect.orDie),
+            .pipe(Effect.orDie)
+        }),
       )
       const value: ModelProfile = {
         models: rows.map((row) => ({
@@ -731,6 +961,935 @@ const layer = Layer.effect(
       }
     })
 
+    const sessionContext = Effect.fn("Usage.sessionContext")(function* (sessionID: string) {
+      const catalog = yield* modelsDev.get()
+      const raw = yield* contextQueryPermit.withPermits(1)(
+        Effect.gen(function* () {
+            const conn = readDb
+            const sessionRows = yield* conn
+              .all<SessionContextSessionRow>(sql`
+                SELECT
+                  id AS session_id,
+                  CASE WHEN json_type(metadata, '$.specialAgent') = 'text' THEN 1 ELSE 0 END AS special_agent,
+                  CAST(json_extract(model, '$.providerID') AS TEXT) AS model_provider_id,
+                  CAST(json_extract(model, '$.id') AS TEXT) AS model_id,
+                  CAST(json_extract(model, '$.variant') AS TEXT) AS model_variant,
+                  cost AS cost_usd,
+                  tokens_input AS input_tokens,
+                  tokens_output AS output_tokens,
+                  tokens_reasoning AS reasoning_tokens,
+                  tokens_cache_read AS cache_read_tokens,
+                  tokens_cache_write AS cache_write_tokens,
+                  time_created AS created_ms,
+                  time_updated AS updated_ms,
+                  COALESCE((
+                    SELECT seq
+                    FROM event_sequence
+                    WHERE aggregate_id = session.id
+                    LIMIT 1
+                  ), 0) AS event_seq,
+                  (
+                    SELECT completed_at
+                    FROM usage_record
+                    WHERE session_id = session.id
+                    ORDER BY completed_at DESC, message_id DESC
+                    LIMIT 1
+                  ) AS latest_usage_completed_at,
+                  (
+                    SELECT message_id
+                    FROM usage_record
+                    WHERE session_id = session.id
+                    ORDER BY completed_at DESC, message_id DESC
+                    LIMIT 1
+                  ) AS latest_usage_message_id
+                FROM session
+                WHERE id = ${sessionID}
+                LIMIT 1
+                  `)
+                  .pipe(Effect.orDie)
+            const sessionRow = sessionRows[0]
+            if (!sessionRow) return undefined
+
+            const cacheKey = `${filename}:${sessionID}`
+            const cached = sessionContextProjectionCache.get(cacheKey)
+            if (
+              cached &&
+              Date.now() - cached.at < SESSION_CONTEXT_CACHE_TTL_MS &&
+              cached.eventSeq === sessionRow.event_seq &&
+              cached.updatedAt === sessionRow.updated_ms &&
+              cached.latestUsageCompletedAt === sessionRow.latest_usage_completed_at &&
+              cached.latestUsageMessageID === sessionRow.latest_usage_message_id
+            ) {
+              return { sessionRow, ...cached.value }
+            }
+
+            // Collapse the entire settled history inside SQLite. The wire/process
+            // result is O(models), not O(turns), and the indexed session_id scan
+            // touches only scalar usage rows.
+            const modelRows = sessionRow.special_agent
+              ? yield* conn
+                  .all<SessionContextModelRow>(sql`
+                    WITH tool_counts AS (
+                      SELECT
+                        o.message_id,
+                        COUNT(*) AS tool_calls
+                      FROM session_message_tool_overlay o
+                      JOIN session_message m ON m.id = o.message_id
+                      WHERE m.session_id = ${sessionID}
+                      GROUP BY o.message_id
+                    ),
+                    tool_times AS (
+                      SELECT
+                        m.id AS message_id,
+                        COALESCE(SUM(
+                          CASE
+                            WHEN json_extract(content.value, '$.type') = 'tool'
+                              AND json_extract(content.value, '$.time.completed') IS NOT NULL
+                            THEN MAX(
+                              0,
+                              CAST(json_extract(content.value, '$.time.completed') AS INTEGER) -
+                              COALESCE(
+                                CAST(json_extract(content.value, '$.time.ran') AS INTEGER),
+                                CAST(json_extract(content.value, '$.time.created') AS INTEGER)
+                              )
+                            )
+                            ELSE 0
+                          END
+                        ), 0) AS tool_ms
+                      FROM session_message m
+                      LEFT JOIN json_each(m.data, '$.content') content
+                        ON m.type = 'assistant'
+                      WHERE m.session_id = ${sessionID}
+                        AND m.type = 'assistant'
+                      GROUP BY m.id
+                    ),
+                    turns AS (
+                      SELECT
+                        m.id AS message_id,
+                        COALESCE(
+                          CAST(json_extract(m.data, '$.model.providerID') AS TEXT),
+                          ${sessionRow.model_provider_id}
+                        ) AS provider_id,
+                        COALESCE(
+                          CAST(json_extract(m.data, '$.model.id') AS TEXT),
+                          ${sessionRow.model_id}
+                        ) AS model_id,
+                        COALESCE(
+                          CAST(json_extract(m.data, '$.model.variant') AS TEXT),
+                          ${sessionRow.model_variant}
+                        ) AS variant,
+                        COALESCE(
+                          CAST(json_extract(m.data, '$.time.created') AS INTEGER),
+                          m.time_created
+                        ) AS created_at,
+                        CAST(json_extract(m.data, '$.time.requestSentAt') AS INTEGER) AS request_sent_at,
+                        CAST(json_extract(m.data, '$.time.firstTokenAt') AS INTEGER) AS first_token_at,
+                        COALESCE(
+                          l.streamed_at,
+                          CAST(json_extract(m.data, '$.time.streamedAt') AS INTEGER)
+                        ) AS streamed_at,
+                        CAST(json_extract(l.settlement, '$.completed') AS INTEGER) AS completed_at,
+                        COALESCE(CAST(json_extract(l.settlement, '$.cost') AS REAL), 0) AS cost_usd,
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.input') AS INTEGER), 0) AS input_tokens,
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.read') AS INTEGER), 0) AS cache_read_tokens,
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.write') AS INTEGER), 0) AS cache_write_tokens,
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.output') AS INTEGER), 0) AS output_tokens,
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.reasoning') AS INTEGER), 0) AS reasoning_tokens,
+                        COALESCE(tc.tool_calls, 0) AS tool_calls,
+                        COALESCE(tt.tool_ms, 0) AS tool_ms
+                      FROM session_message m
+                      JOIN session_message_lifecycle l ON l.message_id = m.id
+                      LEFT JOIN tool_counts tc ON tc.message_id = m.id
+                      LEFT JOIN tool_times tt ON tt.message_id = m.id
+                      WHERE m.session_id = ${sessionID}
+                        AND m.type = 'assistant'
+                        AND json_extract(l.settlement, '$.type') = 'ended'
+                        AND COALESCE(
+                          CAST(json_extract(m.data, '$.model.providerID') AS TEXT),
+                          ${sessionRow.model_provider_id}
+                        ) IS NOT NULL
+                        AND COALESCE(
+                          CAST(json_extract(m.data, '$.model.id') AS TEXT),
+                          ${sessionRow.model_id}
+                        ) IS NOT NULL
+                    )
+                    SELECT
+                      provider_id,
+                      model_id,
+                      MIN(variant) AS variant,
+                      COUNT(DISTINCT COALESCE(variant, '__null__')) AS variant_count,
+                      COUNT(*) AS messages,
+                      COALESCE(SUM(tool_calls), 0) AS tool_calls,
+                      COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN 1 ELSE 0 END) AS free_messages,
+                      SUM(input_tokens) AS input_tokens,
+                      SUM(cache_read_tokens) AS cache_read_tokens,
+                      SUM(cache_write_tokens) AS cache_write_tokens,
+                      SUM(output_tokens) AS output_tokens,
+                      SUM(reasoning_tokens) AS reasoning_tokens,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN input_tokens ELSE 0 END) AS free_input_tokens,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN cache_read_tokens ELSE 0 END) AS free_cache_read_tokens,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN cache_write_tokens ELSE 0 END) AS free_cache_write_tokens,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN output_tokens ELSE 0 END) AS free_output_tokens,
+                      SUM(CASE WHEN cost_usd <= 0.000000001 THEN reasoning_tokens ELSE 0 END) AS free_reasoning_tokens,
+                      SUM(
+                        CASE
+                          WHEN first_token_at IS NOT NULL AND streamed_at IS NOT NULL AND streamed_at >= first_token_at
+                          THEN streamed_at - first_token_at
+                          ELSE 0
+                        END
+                      ) AS generated_ms,
+                      COALESCE(SUM(tool_ms), 0) AS tool_ms,
+                      SUM(
+                        CASE
+                          WHEN first_token_at IS NOT NULL AND created_at IS NOT NULL AND first_token_at >= created_at
+                          THEN first_token_at - created_at
+                          ELSE 0
+                        END
+                      ) AS ttft_ms,
+                      SUM(
+                        CASE
+                          WHEN first_token_at IS NOT NULL AND created_at IS NOT NULL AND first_token_at >= created_at
+                          THEN 1
+                          ELSE 0
+                        END
+                      ) AS ttft_records,
+                      SUM(
+                        CASE
+                          WHEN first_token_at IS NOT NULL AND request_sent_at IS NOT NULL AND first_token_at >= request_sent_at
+                          THEN first_token_at - request_sent_at
+                          ELSE 0
+                        END
+                      ) AS upstream_ttft_ms,
+                      SUM(
+                        CASE
+                          WHEN first_token_at IS NOT NULL AND request_sent_at IS NOT NULL AND first_token_at >= request_sent_at
+                          THEN 1
+                          ELSE 0
+                        END
+                      ) AS upstream_ttft_records,
+                      MIN(COALESCE(created_at, completed_at)) AS first_message_ms,
+                      MAX(completed_at) AS last_message_ms
+                    FROM turns
+                    GROUP BY provider_id, model_id
+                  `)
+                  .pipe(Effect.orDie)
+              : yield* conn
+                  .all<SessionContextModelRow>(sql`
+                WITH tool_stats AS (
+                  SELECT
+                    message_id,
+                    COUNT(*) AS tool_calls,
+                    COALESCE(SUM(
+                      CASE
+                        WHEN json_extract(data, '$.state.time.start') IS NOT NULL
+                          AND json_extract(data, '$.state.time.end') IS NOT NULL
+                        THEN MAX(
+                          0,
+                          CAST(json_extract(data, '$.state.time.end') AS INTEGER) -
+                          CAST(json_extract(data, '$.state.time.start') AS INTEGER)
+                        )
+                        ELSE 0
+                      END
+                    ), 0) AS tool_ms
+                  FROM part
+                  WHERE session_id = ${sessionID}
+                    AND json_extract(data, '$.type') = 'tool'
+                  GROUP BY message_id
+                )
+                SELECT
+                  u.provider_id,
+                  u.model_id,
+                  MIN(u.variant) AS variant,
+                  COUNT(DISTINCT COALESCE(u.variant, '__null__')) AS variant_count,
+                  COUNT(*) AS messages,
+                  COALESCE(SUM(t.tool_calls), 0) AS tool_calls,
+                  COALESCE(SUM(u.cost_usd), 0) AS cost_usd,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN 1 ELSE 0 END) AS free_messages,
+                  SUM(u.input_tokens) AS input_tokens,
+                  SUM(u.cache_read_tokens) AS cache_read_tokens,
+                  SUM(u.cache_write_tokens) AS cache_write_tokens,
+                  SUM(u.output_tokens) AS output_tokens,
+                  SUM(u.reasoning_tokens) AS reasoning_tokens,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN u.input_tokens ELSE 0 END) AS free_input_tokens,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN u.cache_read_tokens ELSE 0 END) AS free_cache_read_tokens,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN u.cache_write_tokens ELSE 0 END) AS free_cache_write_tokens,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN u.output_tokens ELSE 0 END) AS free_output_tokens,
+                  SUM(CASE WHEN u.cost_usd IS NOT NULL AND u.cost_usd <= 0.000000001 THEN u.reasoning_tokens ELSE 0 END) AS free_reasoning_tokens,
+                  SUM(
+                    CASE
+                      WHEN u.first_token_at IS NOT NULL AND u.streamed_at IS NOT NULL AND u.streamed_at >= u.first_token_at
+                      THEN u.streamed_at - u.first_token_at
+                      ELSE 0
+                    END
+                  ) AS generated_ms,
+                  COALESCE(SUM(t.tool_ms), 0) AS tool_ms,
+                  SUM(
+                    CASE
+                      WHEN u.first_token_at IS NOT NULL AND u.created_at IS NOT NULL AND u.first_token_at >= u.created_at
+                      THEN u.first_token_at - u.created_at
+                      ELSE 0
+                    END
+                  ) AS ttft_ms,
+                  SUM(
+                    CASE
+                      WHEN u.first_token_at IS NOT NULL AND u.created_at IS NOT NULL AND u.first_token_at >= u.created_at
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS ttft_records,
+                  SUM(
+                    CASE
+                      WHEN u.first_token_at IS NOT NULL AND u.request_sent_at IS NOT NULL AND u.first_token_at >= u.request_sent_at
+                      THEN u.first_token_at - u.request_sent_at
+                      ELSE 0
+                    END
+                  ) AS upstream_ttft_ms,
+                  SUM(
+                    CASE
+                      WHEN u.first_token_at IS NOT NULL AND u.request_sent_at IS NOT NULL AND u.first_token_at >= u.request_sent_at
+                      THEN 1
+                      ELSE 0
+                    END
+                  ) AS upstream_ttft_records,
+                  MIN(COALESCE(u.created_at, u.completed_at)) AS first_message_ms,
+                  MAX(u.completed_at) AS last_message_ms
+                FROM usage_record u
+                LEFT JOIN tool_stats t ON t.message_id = u.message_id
+                WHERE u.session_id = ${sessionID}
+                GROUP BY u.provider_id, u.model_id
+                  `)
+                  .pipe(Effect.orDie)
+
+            // Some pre-usage-ledger special-agent transcripts settled provider
+            // accounting only into maintenance_usage. Prefer the canonical
+            // per-message settlement projection above; use maintenance rows only
+            // when that historical transcript has no settled assistant rows at
+            // all. This preserves old auditors without double-counting modern
+            // special-agent turns, which write both usage_record and
+            // maintenance_usage.
+            const resolvedModelRows =
+              sessionRow.special_agent && modelRows.length === 0
+                ? yield* conn
+                    .all<SessionContextModelRow>(sql`
+                      SELECT
+                        provider_id,
+                        model_id,
+                        MIN(variant) AS variant,
+                        COUNT(DISTINCT COALESCE(variant, '__null__')) AS variant_count,
+                        COALESCE(SUM(requests), 0) AS messages,
+                        0 AS tool_calls,
+                        COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN requests ELSE 0 END), 0) AS free_messages,
+                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                        COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                        COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN input_tokens ELSE 0 END), 0) AS free_input_tokens,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN cache_read_tokens ELSE 0 END), 0) AS free_cache_read_tokens,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN cache_write_tokens ELSE 0 END), 0) AS free_cache_write_tokens,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN output_tokens ELSE 0 END), 0) AS free_output_tokens,
+                        COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL AND cost_usd <= 0.000000001 THEN reasoning_tokens ELSE 0 END), 0) AS free_reasoning_tokens,
+                        0 AS generated_ms,
+                        0 AS tool_ms,
+                        0 AS ttft_ms,
+                        0 AS ttft_records,
+                        0 AS upstream_ttft_ms,
+                        0 AS upstream_ttft_records,
+                        MIN(time_started) AS first_message_ms,
+                        MAX(time_completed) AS last_message_ms
+                      FROM maintenance_usage
+                      WHERE session_id = ${sessionID}
+                      GROUP BY provider_id, model_id
+                    `)
+                    .pipe(Effect.orDie)
+                : modelRows
+
+            // Historical sessions can predate SessionTelemetry. Keep the cold
+            // fallback scalar-only and index-backed: the existing
+            // (session_id, completed_at) index serves this newest-settlement
+            // lookup without decoding any assistant message JSON.
+            const latestRows = sessionRow.special_agent
+              ? yield* conn
+                  .all<SessionContextLatestRow>(sql`
+                    SELECT
+                      COALESCE(
+                        CAST(json_extract(m.data, '$.model.providerID') AS TEXT),
+                        ${sessionRow.model_provider_id}
+                      ) AS provider_id,
+                      COALESCE(
+                        CAST(json_extract(m.data, '$.model.id') AS TEXT),
+                        ${sessionRow.model_id}
+                      ) AS model_id,
+                      COALESCE(
+                        CAST(json_extract(m.data, '$.model.variant') AS TEXT),
+                        ${sessionRow.model_variant}
+                      ) AS variant,
+                      CAST(json_extract(l.settlement, '$.completed') AS INTEGER) AS completed_at,
+                      COALESCE(CAST(json_extract(l.settlement, '$.tokens.input') AS INTEGER), 0) AS input_tokens,
+                      COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.read') AS INTEGER), 0) AS cache_read_tokens,
+                      COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.write') AS INTEGER), 0) AS cache_write_tokens,
+                      COALESCE(CAST(json_extract(l.settlement, '$.tokens.output') AS INTEGER), 0) AS output_tokens,
+                      COALESCE(CAST(json_extract(l.settlement, '$.tokens.reasoning') AS INTEGER), 0) AS reasoning_tokens
+                    FROM session_message m
+                    JOIN session_message_lifecycle l ON l.message_id = m.id
+                    WHERE m.session_id = ${sessionID}
+                      AND m.type = 'assistant'
+                      AND json_extract(l.settlement, '$.type') = 'ended'
+                      AND (
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.input') AS INTEGER), 0) +
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.read') AS INTEGER), 0) +
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.cache.write') AS INTEGER), 0) +
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.output') AS INTEGER), 0) +
+                        COALESCE(CAST(json_extract(l.settlement, '$.tokens.reasoning') AS INTEGER), 0)
+                      ) > 0
+                    ORDER BY CAST(json_extract(l.settlement, '$.completed') AS INTEGER) DESC, m.seq DESC
+                    LIMIT 1
+                  `)
+                  .pipe(Effect.orDie)
+              : yield* conn
+                  .all<SessionContextLatestRow>(sql`
+                SELECT
+                  provider_id,
+                  model_id,
+                  variant,
+                  completed_at,
+                  input_tokens,
+                  cache_read_tokens,
+                  cache_write_tokens,
+                  output_tokens,
+                  reasoning_tokens
+                FROM usage_record
+                WHERE session_id = ${sessionID}
+                  AND (
+                    input_tokens +
+                    cache_read_tokens +
+                    cache_write_tokens +
+                    output_tokens +
+                    reasoning_tokens
+                  ) > 0
+                ORDER BY completed_at DESC, message_id DESC
+                LIMIT 1
+                  `)
+                  .pipe(Effect.orDie)
+
+            const resolvedLatestRows =
+              sessionRow.special_agent && latestRows.length === 0
+                ? yield* conn
+                    .all<SessionContextLatestRow>(sql`
+                      SELECT
+                        provider_id,
+                        model_id,
+                        variant,
+                        time_completed AS completed_at,
+                        input_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        output_tokens,
+                        reasoning_tokens
+                      FROM maintenance_usage
+                      WHERE session_id = ${sessionID}
+                        AND (
+                          input_tokens +
+                          cache_read_tokens +
+                          cache_write_tokens +
+                          output_tokens +
+                          reasoning_tokens
+                        ) > 0
+                      ORDER BY time_completed DESC, rowid DESC
+                      LIMIT 1
+                    `)
+                    .pipe(Effect.orDie)
+                : latestRows
+
+            // Keep semantic classification in the centralized provenance owner,
+            // but collapse repeated message metadata in SQLite first. Result
+            // cardinality is O(distinct semantic sources), never O(messages).
+            const messageGroups = sessionRow.special_agent
+              ? yield* conn
+                  .all<SessionContextMessageGroupRow>(sql`
+                    SELECT
+                      type AS message_type,
+                      CASE
+                        WHEN type = 'assistant' THEN 'assistant'
+                        WHEN type IN ('user', 'synthetic') THEN 'user'
+                        ELSE NULL
+                      END AS role,
+                      json_extract(data, '$.provenance.owner') AS provenance_owner,
+                      json_extract(data, '$.provenance.source') AS provenance_source,
+                      json_extract(data, '$.provenance.lifetime') AS provenance_lifetime,
+                      COUNT(*) AS messages
+                    FROM session_message
+                    WHERE session_id = ${sessionID}
+                      AND type IN ('user', 'synthetic', 'system', 'shell', 'compaction', 'assistant')
+                    GROUP BY 1, 2, 3, 4, 5
+                  `)
+                  .pipe(Effect.orDie)
+              : yield* conn
+                  .all<SessionContextMessageGroupRow>(sql`
+                    SELECT
+                      NULL AS message_type,
+                      json_extract(data, '$.role') AS role,
+                      json_extract(data, '$.provenance.owner') AS provenance_owner,
+                      json_extract(data, '$.provenance.source') AS provenance_source,
+                      json_extract(data, '$.provenance.lifetime') AS provenance_lifetime,
+                      COUNT(*) AS messages
+                    FROM message
+                    WHERE session_id = ${sessionID}
+                    GROUP BY 1, 2, 3, 4, 5
+                  `)
+                  .pipe(Effect.orDie)
+
+            // A Session can accumulate many user-role host continuations that
+            // repeat the same system prompt. Keep only the newest non-empty
+            // candidate per semantic provenance tuple, then let the shared
+            // provenance classifier choose the newest genuine user prompt.
+            const promptRows = sessionRow.special_agent
+              ? ([] satisfies SessionContextPromptRow[])
+              : yield* conn
+                  .all<SessionContextPromptRow>(sql`
+                WITH ranked AS (
+                  SELECT
+                    id,
+                    json_extract(data, '$.role') AS role,
+                    json_extract(data, '$.provenance.owner') AS provenance_owner,
+                    json_extract(data, '$.provenance.source') AS provenance_source,
+                    json_extract(data, '$.provenance.lifetime') AS provenance_lifetime,
+                    CAST(json_extract(data, '$.system') AS TEXT) AS system_prompt,
+                    time_created AS created_ms,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY
+                        COALESCE(json_extract(data, '$.role'), ''),
+                        COALESCE(json_extract(data, '$.provenance.owner'), ''),
+                        COALESCE(json_extract(data, '$.provenance.source'), ''),
+                        COALESCE(json_extract(data, '$.provenance.lifetime'), '')
+                      ORDER BY time_created DESC, id DESC
+                    ) AS row_rank
+                  FROM message
+                  WHERE session_id = ${sessionID}
+                    AND TRIM(COALESCE(CAST(json_extract(data, '$.system') AS TEXT), '')) <> ''
+                )
+                SELECT
+                  id,
+                  NULL AS message_type,
+                  role,
+                  provenance_owner,
+                  provenance_source,
+                  provenance_lifetime,
+                  system_prompt,
+                  created_ms
+                FROM ranked
+                WHERE row_rank = 1
+              `)
+              .pipe(Effect.orDie)
+
+            // Aggregate context-shape characters in SQLite. Legacy V1 data is
+            // measured directly from message/part JSON. Current special-agent
+            // rows do the same while inline, with search_text only as a bounded
+            // fallback for OPCL-externalized canonical payloads. The fallback is
+            // deliberately approximate (tool results are not fully indexed),
+            // but it prevents an externalized transcript from collapsing to a
+            // fictitious zero-context shape without hydrating event_value blobs.
+            // Only fixed-size sums cross into JavaScript.
+            const partGroups = sessionRow.special_agent
+              ? yield* conn
+                  .all<SessionContextPartGroupRow>(sql`
+                    WITH projected AS (
+                      SELECT
+                        m.type AS message_type,
+                        CASE
+                          WHEN m.type = 'assistant' THEN 'assistant'
+                          WHEN m.type IN ('user', 'synthetic') THEN 'user'
+                          ELSE NULL
+                        END AS role,
+                        json_extract(m.data, '$.provenance.owner') AS provenance_owner,
+                        json_extract(m.data, '$.provenance.source') AS provenance_source,
+                        json_extract(m.data, '$.provenance.lifetime') AS provenance_lifetime,
+                        CASE m.type
+                          WHEN 'user' THEN length(COALESCE(CAST(json_extract(m.data, '$.text') AS TEXT), NULLIF(m.search_text, ''), ''))
+                          WHEN 'synthetic' THEN length(COALESCE(CAST(json_extract(m.data, '$.text') AS TEXT), NULLIF(m.search_text, ''), ''))
+                          WHEN 'system' THEN length(COALESCE(CAST(json_extract(m.data, '$.text') AS TEXT), NULLIF(m.search_text, ''), ''))
+                          WHEN 'shell' THEN
+                            CASE
+                              WHEN json_extract(m.data, '$.command') IS NULL
+                                AND json_extract(m.data, '$.output') IS NULL
+                              THEN length(COALESCE(m.search_text, ''))
+                              ELSE
+                                length(COALESCE(CAST(json_extract(m.data, '$.command') AS TEXT), '')) +
+                                length(COALESCE(CAST(json_extract(m.data, '$.output') AS TEXT), ''))
+                            END
+                          WHEN 'compaction' THEN
+                            CASE
+                              WHEN json_extract(m.data, '$.summary') IS NULL
+                                AND json_extract(m.data, '$.recent') IS NULL
+                              THEN length(COALESCE(m.search_text, ''))
+                              ELSE
+                                length(COALESCE(CAST(json_extract(m.data, '$.summary') AS TEXT), '')) +
+                                length(COALESCE(CAST(json_extract(m.data, '$.recent') AS TEXT), ''))
+                            END
+                          ELSE 0
+                        END AS content_chars,
+                        0 AS tool_chars
+                      FROM session_message m
+                      WHERE m.session_id = ${sessionID}
+                        AND m.type <> 'assistant'
+
+                      UNION ALL
+
+                      SELECT
+                        'assistant' AS message_type,
+                        'assistant' AS role,
+                        NULL AS provenance_owner,
+                        NULL AS provenance_source,
+                        NULL AS provenance_lifetime,
+                        COALESCE(SUM(
+                          CASE json_extract(content.value, '$.type')
+                            WHEN 'text' THEN length(COALESCE(CAST(json_extract(content.value, '$.text') AS TEXT), ''))
+                            WHEN 'reasoning' THEN length(COALESCE(CAST(json_extract(content.value, '$.text') AS TEXT), ''))
+                            ELSE 0
+                          END
+                        ), 0) +
+                        CASE
+                          WHEN json_type(m.data, '$.content') IS NULL
+                          THEN length(COALESCE(m.search_text, ''))
+                          ELSE 0
+                        END AS content_chars,
+                        COALESCE(SUM(
+                          CASE
+                            WHEN json_extract(content.value, '$.type') <> 'tool' THEN 0
+                            ELSE
+                              length(COALESCE(CAST(json_extract(content.value, '$.state.input') AS TEXT), '')) +
+                              CASE json_extract(content.value, '$.state.status')
+                                WHEN 'pending' THEN 0
+                                WHEN 'completed' THEN COALESCE((
+                                  SELECT SUM(length(COALESCE(CAST(json_extract(tool_content.value, '$.text') AS TEXT), '')))
+                                  FROM json_each(content.value, '$.state.content') tool_content
+                                  WHERE json_extract(tool_content.value, '$.type') = 'text'
+                                ), 0)
+                                WHEN 'error' THEN length(COALESCE(CAST(json_extract(content.value, '$.state.error.message') AS TEXT), ''))
+                                ELSE 0
+                              END
+                          END
+                        ), 0) AS tool_chars
+                      FROM session_message m
+                      LEFT JOIN json_each(m.data, '$.content') content
+                        ON m.type = 'assistant'
+                      WHERE m.session_id = ${sessionID}
+                        AND m.type = 'assistant'
+                      GROUP BY m.id
+                    )
+                    SELECT
+                      message_type,
+                      role,
+                      provenance_owner,
+                      provenance_source,
+                      provenance_lifetime,
+                      COALESCE(SUM(content_chars), 0) AS content_chars,
+                      COALESCE(SUM(tool_chars), 0) AS tool_chars
+                    FROM projected
+                    GROUP BY 1, 2, 3, 4, 5
+                  `)
+                  .pipe(Effect.orDie)
+              : yield* conn
+                  .all<SessionContextPartGroupRow>(sql`
+                SELECT
+                  NULL AS message_type,
+                  json_extract(m.data, '$.role') AS role,
+                  json_extract(m.data, '$.provenance.owner') AS provenance_owner,
+                  json_extract(m.data, '$.provenance.source') AS provenance_source,
+                  json_extract(m.data, '$.provenance.lifetime') AS provenance_lifetime,
+                  COALESCE(SUM(
+                    CASE json_extract(p.data, '$.type')
+                      WHEN 'text' THEN length(COALESCE(CAST(json_extract(p.data, '$.text') AS TEXT), ''))
+                      WHEN 'reasoning' THEN length(COALESCE(CAST(json_extract(p.data, '$.text') AS TEXT), ''))
+                      WHEN 'file' THEN length(COALESCE(CAST(json_extract(p.data, '$.source.text.value') AS TEXT), ''))
+                      WHEN 'agent' THEN length(COALESCE(CAST(json_extract(p.data, '$.source.value') AS TEXT), ''))
+                      ELSE 0
+                    END
+                  ), 0) AS content_chars,
+                  COALESCE(SUM(
+                    CASE
+                      WHEN json_extract(p.data, '$.type') <> 'tool' THEN 0
+                      ELSE
+                        length(COALESCE(CAST(json_extract(p.data, '$.state.input') AS TEXT), '')) +
+                        CASE json_extract(p.data, '$.state.status')
+                          WHEN 'pending' THEN length(COALESCE(CAST(json_extract(p.data, '$.state.raw') AS TEXT), ''))
+                          WHEN 'completed' THEN length(COALESCE(CAST(json_extract(p.data, '$.state.output') AS TEXT), ''))
+                          WHEN 'error' THEN length(COALESCE(CAST(json_extract(p.data, '$.state.error') AS TEXT), ''))
+                          ELSE 0
+                        END
+                    END
+                  ), 0) AS tool_chars
+                FROM part p
+                JOIN message m
+                  ON m.id = p.message_id
+                 AND m.session_id = p.session_id
+                WHERE p.session_id = ${sessionID}
+                GROUP BY 1, 2, 3, 4, 5
+                  `)
+                  .pipe(Effect.orDie)
+
+            const value: SessionContextRawProjection = {
+              modelRows: resolvedModelRows,
+              latestRows: resolvedLatestRows,
+              messageGroups,
+              promptRows,
+              partGroups,
+            }
+            if (!sessionContextProjectionCache.has(cacheKey) && sessionContextProjectionCache.size >= MAX_SESSION_CONTEXT_CACHE) {
+              const oldest = sessionContextProjectionCache.keys().next().value
+              if (oldest !== undefined) sessionContextProjectionCache.delete(oldest)
+            }
+            sessionContextProjectionCache.delete(cacheKey)
+            sessionContextProjectionCache.set(cacheKey, {
+              at: Date.now(),
+              eventSeq: sessionRow.event_seq,
+              updatedAt: sessionRow.updated_ms,
+              latestUsageCompletedAt: sessionRow.latest_usage_completed_at,
+              latestUsageMessageID: sessionRow.latest_usage_message_id,
+              value,
+            })
+            return { sessionRow, ...value }
+          }),
+      )
+      if (!raw) return undefined
+
+      const { sessionRow, modelRows, latestRows, messageGroups, promptRows, partGroups } = raw
+      let userMessages = 0
+      let assistantMessages = 0
+      let systemPrompt: string | null = null
+      let messageCount = 0
+
+      const semanticKind = (row: SessionContextSemanticRow) => {
+        if (row.message_type === "assistant") return "assistant" as const
+        // Current special-agent System events are durable transcript markers
+        // (audit-cycle notices, read-only notices, etc.), not proof of the
+        // privileged provider system prompt. Keep them in the catch-all
+        // transcript bucket rather than labeling them provider-visible system
+        // context.
+        if (row.message_type === "system") return undefined
+        if (row.message_type === "synthetic") return "synthetic" as const
+        if (row.message_type === "shell") return "shell" as const
+        if (row.message_type === "compaction") return "compaction" as const
+        const role = row.role ?? "unknown"
+        if (role !== "user") return role === "assistant" ? ("assistant" as const) : undefined
+        const owner =
+          row.provenance_owner === "user" || row.provenance_owner === "host"
+            ? row.provenance_owner
+            : undefined
+        const provenance =
+          owner && row.provenance_source
+            ? owner === "user"
+              ? {
+                  owner: "user" as const,
+                  source: row.provenance_source,
+                  ...(row.provenance_lifetime === "historical" ? { lifetime: "historical" as const } : {}),
+                }
+              : {
+                  owner: "host" as const,
+                  source: row.provenance_source,
+                  ...(row.provenance_lifetime === "historical" ? { lifetime: "historical" as const } : {}),
+                }
+            : undefined
+        return SessionTurnProvenance.semanticKindInfo({ role, provenance })
+      }
+
+      for (const row of messageGroups) {
+        messageCount += row.messages
+        const kind = semanticKind(row)
+        if (kind === "user") userMessages += row.messages
+        if (kind === "assistant") assistantMessages += row.messages
+      }
+
+      for (const row of promptRows.sort(
+        (left, right) => right.created_ms - left.created_ms || right.id.localeCompare(left.id),
+      )) {
+        if (semanticKind(row) !== "user") continue
+        const prompt = row.system_prompt.trim()
+        if (!prompt) continue
+        systemPrompt = prompt
+        break
+      }
+
+      const breakdown: Mutable<SessionContextBreakdown> = {
+        system: systemPrompt ? Math.ceil(systemPrompt.length / 4) : 0,
+        user: 0,
+        synthetic: 0,
+        shell: 0,
+        compaction: 0,
+        assistant: 0,
+        tool: 0,
+        other: 0,
+      }
+      const toolCalls = modelRows.reduce((sum, row) => sum + row.tool_calls, 0)
+      const toolMs = modelRows.reduce((sum, row) => sum + row.tool_ms, 0)
+
+      for (const row of partGroups) {
+        const contentTokens = Math.max(0, Math.ceil(row.content_chars / 4))
+        const toolTokens = Math.max(0, Math.ceil(row.tool_chars / 4))
+        const kind = semanticKind(row)
+        if (kind === "assistant") {
+          breakdown.assistant += contentTokens
+          breakdown.tool += toolTokens
+          continue
+        }
+        if (kind === "user") breakdown.user += contentTokens
+        else if (kind === "shell") breakdown.shell += contentTokens
+        else if (kind === "compaction") breakdown.compaction += contentTokens
+        else if (kind === "synthetic") breakdown.synthetic += contentTokens
+        else breakdown.other += contentTokens + toolTokens
+      }
+
+      const freeTokens = zeroTokens()
+      let freeMessages = 0
+      let generatedMs = 0
+      let ttftMs = 0
+      let ttftRecords = 0
+      let upstreamTTFTMs = 0
+      let upstreamTTFTRecords = 0
+      let settledMessages = 0
+      let settledCost = 0
+      const settledTokens = zeroTokens()
+
+      for (const row of modelRows) {
+        settledMessages += row.messages
+        settledCost += row.cost_usd
+        settledTokens.input += row.input_tokens
+        settledTokens.cacheRead += row.cache_read_tokens
+        settledTokens.cacheWrite += row.cache_write_tokens
+        settledTokens.output += row.output_tokens
+        settledTokens.reasoning += row.reasoning_tokens
+        freeMessages += row.free_messages
+        freeTokens.input += row.free_input_tokens
+        freeTokens.cacheRead += row.free_cache_read_tokens
+        freeTokens.cacheWrite += row.free_cache_write_tokens
+        freeTokens.output += row.free_output_tokens
+        freeTokens.reasoning += row.free_reasoning_tokens
+        generatedMs += row.generated_ms
+        ttftMs += row.ttft_ms
+        ttftRecords += row.ttft_records
+        upstreamTTFTMs += row.upstream_ttft_ms
+        upstreamTTFTRecords += row.upstream_ttft_records
+      }
+
+      const providerCatalog = new Map(Object.values(catalog).map((provider) => [provider.id, provider] as const))
+      const catalogModel = (provider: (typeof catalog)[string] | undefined, modelID: string) =>
+        provider?.models[modelID] ?? provider?.models[splitAccountModelID(modelID).baseModelID]
+      const latestRow = latestRows[0]
+      const latest: SessionContextLatest | undefined = latestRow
+        ? (() => {
+            const provider = providerCatalog.get(latestRow.provider_id)
+            const model = catalogModel(provider, latestRow.model_id)
+            return {
+              providerID: latestRow.provider_id,
+              modelID: latestRow.model_id,
+              ...(latestRow.variant ? { variant: latestRow.variant } : {}),
+              providerName: provider?.name ?? latestRow.provider_id,
+              modelName: model?.name ?? latestRow.model_id,
+              ...(model ? { contextLimit: model.limit.context } : {}),
+              completedAt: latestRow.completed_at,
+              tokens: {
+                input: latestRow.input_tokens,
+                cacheRead: latestRow.cache_read_tokens,
+                cacheWrite: latestRow.cache_write_tokens,
+                output: latestRow.output_tokens,
+                reasoning: latestRow.reasoning_tokens,
+              },
+            }
+          })()
+        : undefined
+      const projectedModels: SessionContextModel[] = modelRows
+        .map((row) => {
+          const provider = providerCatalog.get(row.provider_id)
+          const model = catalogModel(provider, row.model_id)
+          const cost = model?.cost
+          return {
+            providerID: row.provider_id,
+            modelID: row.model_id,
+            variant: row.variant_count === 1 ? row.variant : null,
+            providerName: provider?.name ?? row.provider_id,
+            modelName: model?.name ?? row.model_id,
+            messages: row.messages,
+            toolCalls: row.tool_calls,
+            cost: row.cost_usd,
+            freeMessages: row.free_messages,
+            tokens: {
+              input: row.input_tokens,
+              cacheRead: row.cache_read_tokens,
+              cacheWrite: row.cache_write_tokens,
+              output: row.output_tokens,
+              reasoning: row.reasoning_tokens,
+            },
+            freeTokens: {
+              input: row.free_input_tokens,
+              cacheRead: row.free_cache_read_tokens,
+              cacheWrite: row.free_cache_write_tokens,
+              output: row.free_output_tokens,
+              reasoning: row.free_reasoning_tokens,
+            },
+            generatedMs: row.generated_ms,
+            toolMs: row.tool_ms,
+            ttftMs: row.ttft_ms,
+            ttftRecords: row.ttft_records,
+            upstreamTTFTMs: row.upstream_ttft_ms,
+            upstreamTTFTRecords: row.upstream_ttft_records,
+            firstMessageTime: row.first_message_ms,
+            lastMessageTime: row.last_message_ms,
+            ...(cost
+              ? {
+                  costRate: {
+                    input: cost.input,
+                    output: cost.output,
+                    cache: {
+                      read: cost.cache_read ?? cost.input,
+                      write: cost.cache_write ?? cost.input,
+                    },
+                  },
+                }
+              : {}),
+          }
+        })
+        .sort((a, b) => totalTokens(b.tokens) - totalTokens(a.tokens))
+
+      return {
+        sessionID,
+        createdAt: sessionRow.created_ms,
+        updatedAt: sessionRow.updated_ms,
+        counts: {
+          all: messageCount,
+          user: userMessages,
+          assistant: assistantMessages,
+        },
+        systemPrompt,
+        totals: {
+          messages: settledMessages,
+          toolCalls,
+          cost: sessionRow.special_agent ? settledCost : sessionRow.cost_usd,
+          freeMessages,
+          tokens: sessionRow.special_agent
+            ? settledTokens
+            : {
+                input: sessionRow.input_tokens,
+                cacheRead: sessionRow.cache_read_tokens,
+                cacheWrite: sessionRow.cache_write_tokens,
+                output: sessionRow.output_tokens,
+                reasoning: sessionRow.reasoning_tokens,
+              },
+          freeTokens,
+          generatedMs,
+          toolMs,
+          ttftMs,
+          ttftRecords,
+          upstreamTTFTMs,
+          upstreamTTFTRecords,
+        },
+        models: projectedModels,
+        latest,
+        breakdown,
+      } satisfies SessionContextHistory
+    })
+
     /**
      * Persist one completed support-agent generation (or an already-aggregated
      * operation with requests > 1). Usage accounting must never become a new
@@ -747,15 +1906,18 @@ const layer = Layer.effect(
         const sessionID = input.sessionID ?? null
         const projectID = input.projectID ?? null
         const variant = input.variant ?? null
+        const settled = UsageRouteAttribution.settle({ route: input.route })
+        const routeKind = input.route === undefined ? "unknown" : settled.attribution.kind
+        const accountID = settled.accountID ?? null
         const cost = input.cost !== undefined && input.cost !== null && Number.isFinite(input.cost) ? input.cost : null
         yield* db.run(sql`
           INSERT INTO maintenance_usage (
-            agent, provider_id, model_id, variant, session_id, project_id,
+            agent, provider_id, model_id, route_kind, account_id, variant, session_id, project_id,
             requests, cost_usd, cost_estimated, input_tokens, cache_read_tokens,
             cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
             time_started, time_completed
           ) VALUES (
-            ${input.agent}, ${input.providerID}, ${input.modelID}, ${variant}, ${sessionID},
+            ${input.agent}, ${input.providerID}, ${input.modelID}, ${routeKind}, ${accountID}, ${variant}, ${sessionID},
             COALESCE(${projectID}, (SELECT project_id FROM session WHERE id = ${sessionID} LIMIT 1)),
             ${requests}, ${cost}, ${input.costEstimated === true ? 1 : 0}, ${input.tokens.input}, ${input.tokens.cacheRead},
             ${input.tokens.cacheWrite}, ${input.tokens.output}, ${input.tokens.reasoning}, ${allTokens},
@@ -767,7 +1929,7 @@ const layer = Layer.effect(
         summaryCache.clear()
       }).pipe(Effect.catch(() => Effect.void))
 
-    return Service.of({ summary, modelProfile, pricingCatalog, recordMaintenance })
+    return Service.of({ summary, modelProfile, pricingCatalog, sessionContext, recordMaintenance })
   }),
 )
 
@@ -976,22 +2138,24 @@ function aggregate(
     // they are host maintenance rather than user-facing turns. Keep them out of
     // every ordinary usage bucket while still accounting for their real model
     // work alongside non-persisted special agents.
-    const maintenanceAgent = row.mode === "compaction" || row.agent === "compaction" ? "compaction" : row.agent === "summary" ? "summary" : undefined
+    const maintenanceAgent = UsageClassification.maintenanceAgent(row)
     if (maintenanceAgent) {
-      addMaintenance({
-        agent: maintenanceAgent,
-        providerID: row.provider_id ?? "unknown",
-        modelID: row.model_id ?? "unknown",
-        variant: row.variant ?? null,
-        sessionID: row.session_id,
-        requests: 1,
-        cost: row.cost_usd,
-        costEstimated: false,
-        tokens,
-        allTokens: totalTokens(tokens),
-        started: row.created_ms,
-        completed,
-      })
+      if (!UsageClassification.isMirroredMaintenanceSettlement(row)) {
+        addMaintenance({
+          agent: maintenanceAgent,
+          providerID: row.provider_id ?? "unknown",
+          modelID: row.model_id ?? "unknown",
+          variant: row.variant ?? null,
+          sessionID: row.session_id,
+          requests: 1,
+          cost: row.cost_usd,
+          costEstimated: false,
+          tokens,
+          allTokens: totalTokens(tokens),
+          started: row.created_ms,
+          completed,
+        })
+      }
       continue
     }
 

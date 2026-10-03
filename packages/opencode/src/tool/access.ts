@@ -23,6 +23,22 @@ export const Parameters = Schema.Struct({
 })
 
 const ProviderParameters = withContractedBrokerArgsSchema(ToolJsonSchema.fromSchema(Parameters))
+const BROKER_ACTIONS = new Set(["list", "describe", "call"])
+
+function routingDiagnostic(input: unknown) {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return
+  const action = (input as Record<string, unknown>).action
+  if (typeof action !== "string" || BROKER_ACTIONS.has(action)) return
+  return new Tool.InvalidArgumentsError({
+    tool: TOOL_ACCESS_ID,
+    detail: [
+      `"${action}" is not a broker action; broker actions are list, describe, and call`,
+      "Delegated capability actions belong inside args, never at the broker level",
+      `Use action="describe" with the lazy tool id first, then action="call" with that same tool/contract and args={action:"${action}", ...}`,
+      "No target tool or missing arguments were inferred or executed",
+    ].join(". "),
+  })
+}
 
 type Metadata = {
   brokerAction: "list" | "describe" | "call"
@@ -65,6 +81,9 @@ export function createToolAccessTool(
     jsonSchema: ProviderParameters,
     execute: (input, ctx) =>
       Effect.gen(function* () {
+        const routingError = routingDiagnostic(input)
+        if (routingError) return yield* Effect.fail(routingError)
+
         const params = yield* decode(input).pipe(
           Effect.mapError(
             (error) =>

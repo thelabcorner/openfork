@@ -5,13 +5,8 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
-import { inflateCompactedHistory, loadCompaction } from "@opencode-ai/core/database/chunk-compaction"
-import { asc } from "drizzle-orm"
-import { and } from "drizzle-orm"
-import { eq } from "drizzle-orm"
-import { lte } from "drizzle-orm"
-import { not } from "drizzle-orm"
-import { or } from "drizzle-orm"
+import { inflateCompactedHistory } from "@opencode-ai/core/database/chunk-compaction"
+import { and, eq, gt, lte, or, sql } from "drizzle-orm"
 import { Effect, Scope } from "effect"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
@@ -24,10 +19,6 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     const scope = yield* Scope.Scope
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
-
-    const capabilities = Effect.fn("SyncHttpApi.capabilities")(function* () {
-      return { version: 1 as const, features: [SemanticCompactionFeature] }
-    })
 
     const start = Effect.fn("SyncHttpApi.start")(function* () {
       yield* workspace
@@ -75,18 +66,55 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     })
 
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
-      const exclude = Object.entries(ctx.payload)
-      const rows = yield* db
-        .select()
-        .from(EventTable)
-        .where(
-          exclude.length > 0
-            ? not(or(...exclude.map(([id, seq]) => and(eq(EventTable.aggregate_id, id), lte(EventTable.seq, seq))))!)
-            : undefined,
-        )
-        .orderBy(asc(EventTable.seq))
-        .all()
-        .pipe(Effect.orDie)
+      // Pin the response frontier first, then fetch only the missing sequence
+      // ranges through that frontier. The old NOT(OR(aggregate, seq <= known))
+      // predicate scanned/returned rows for every aggregate and built one SQL
+      // expression proportional to the full client frontier, including
+      // aggregates whose histories were already current.
+      const frontiers = yield* db.select().from(EventSequenceTable).all().pipe(Effect.orDie)
+      const pending = frontiers.flatMap((frontier) => {
+        const after = ctx.payload[frontier.aggregate_id] ?? -1
+        return frontier.seq > after ? [{ frontier, after }] : []
+      })
+      const rows: Array<typeof EventTable.$inferSelect> = []
+      const compactionByAggregate = new Map<string, Uint8Array>()
+      // Keep each OR predicate below SQLite's bind limit even when a workspace
+      // knows many thousands of aggregate frontiers. The aggregate+sequence
+      // unique index serves every requested range. Read compaction metadata in
+      // the same bounded batches instead of issuing one extra query per
+      // aggregate during reconnect.
+      const QUERY_BATCH_SIZE = 100
+      for (let offset = 0; offset < pending.length; offset += QUERY_BATCH_SIZE) {
+        const batch = pending.slice(offset, offset + QUERY_BATCH_SIZE)
+        const page = yield* db
+          .select()
+          .from(EventTable)
+          .where(
+            or(
+              ...batch.map(({ frontier, after }) =>
+                and(
+                  eq(EventTable.aggregate_id, frontier.aggregate_id),
+                  gt(EventTable.seq, after),
+                  lte(EventTable.seq, frontier.seq),
+                ),
+              ),
+            )!,
+          )
+          .all()
+          .pipe(Effect.orDie)
+        rows.push(...page)
+        const compacted = yield* db
+          .all<{ aggregate_id: string; bitmap: Uint8Array }>(sql`
+            SELECT aggregate_id, bitmap
+            FROM event_compaction
+            WHERE aggregate_id IN (${sql.join(
+              batch.map(({ frontier }) => sql`${frontier.aggregate_id}`),
+              sql`,`,
+            )})
+          `)
+          .pipe(Effect.orDie)
+        for (const item of compacted) compactionByAggregate.set(item.aggregate_id, item.bitmap)
+      }
       type EventRow = (typeof rows)[number]
       const byAggregate = new Map<string, EventRow[]>()
       for (const row of rows) {
@@ -99,16 +127,12 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
         const hydrated = yield* EventV2.rehydrateEvents(db, aggregateID, group)
         hydratedByAggregate.set(aggregateID, hydrated)
       }
-      const frontiers = yield* db.select().from(EventSequenceTable).all().pipe(Effect.orDie)
       const output: Array<(typeof rows)[number]> = []
-      for (const frontier of frontiers) {
-        const after = ctx.payload[frontier.aggregate_id] ?? -1
-        if (frontier.seq <= after) continue
-        const compaction = yield* loadCompaction(db, frontier.aggregate_id).pipe(Effect.orDie)
+      for (const { frontier, after } of pending) {
         const contiguous = inflateCompactedHistory({
           aggregateID: frontier.aggregate_id,
           rows: hydratedByAggregate.get(frontier.aggregate_id) ?? [],
-          bitmap: compaction?.bitmap,
+          bitmap: compactionByAggregate.get(frontier.aggregate_id),
           after,
           through: frontier.seq,
         })
@@ -118,7 +142,6 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     })
 
     return handlers
-      .handle("capabilities", capabilities)
       .handle("start", start)
       .handle("replay", replay)
       .handle("steal", steal)

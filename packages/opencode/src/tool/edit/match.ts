@@ -197,6 +197,12 @@ export type ResolveOptions = {
   maxFuzz?: number
   /** Human label for error text ("oldString", "hunk 2 of 5", ...). */
   label?: string
+  /**
+   * 1-based source line hint carried by a unified diff. This is never used
+   * to override content: it may only select one candidate from an otherwise
+   * ambiguous winning tier when exactly one begins on this exact line.
+   */
+  expectedLine?: number
 }
 
 export type Resolution = {
@@ -286,6 +292,21 @@ export function resolveMatch(content: string, find: string, opts: ResolveOptions
   const tier = all.filter((m) => m.fuzz === bestFuzz)
 
   if (tier.length > 1) {
+    if (opts.expectedLine !== undefined) {
+      const positioned = tier.filter((m) => lineNumberAt(lines, m.start) === opts.expectedLine)
+      if (positioned.length === 1) {
+        const match = positioned[0]!
+        assertProportionate(content, find, match, label)
+        return {
+          match,
+          tier,
+          all,
+          warnings: [
+            `${label} was ambiguous file-wide but unified-diff source line ${opts.expectedLine} uniquely identified an otherwise-valid candidate.`,
+          ],
+        }
+      }
+    }
     const numbers = tier.map((m) => lineNumberAt(lines, m.start))
     const listed = numbers.slice(0, MAX_CANDIDATES_LISTED).join(", ")
     const suffix = numbers.length > MAX_CANDIDATES_LISTED ? `, … (+${numbers.length - MAX_CANDIDATES_LISTED} more)` : ""

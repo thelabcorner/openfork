@@ -8,7 +8,6 @@ import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
 import { forkUsageSnapshot } from "@/fork/usage"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
-import * as VerdentFreeUsage from "@/usage/verdent-free"
 import * as ZenFreeUsage from "@/usage/zen-free"
 import type { ProviderResult, ProvidersResult, ResetAgendaResult } from "./schema"
 import { buildResetAgenda } from "./resets"
@@ -18,7 +17,6 @@ import { genspark } from "./providers/genspark"
 import { kimi } from "./providers/kimi"
 import { opencodeGo } from "./providers/opencode-go"
 import { opencodeZen } from "./providers/opencode-zen"
-import { verdent } from "./providers/verdent"
 import { openrouter } from "./providers/openrouter"
 import { claude } from "./providers/claude"
 import { codex } from "./providers/codex"
@@ -72,7 +70,6 @@ const layer: Layer.Layer<
   | SessionUsage.Service
   | HttpClient.HttpClient
   | ZenFreeUsage.Service
-  | VerdentFreeUsage.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -81,11 +78,9 @@ const layer: Layer.Layer<
     const sessionUsage = yield* SessionUsage.Service
     const http = yield* HttpClient.HttpClient
     const zenFreeUsage = yield* ZenFreeUsage.Service
-    const verdentFreeUsage = yield* VerdentFreeUsage.Service
     const adapters: readonly Adapter[] = [
       opencodeGo(auth, credentials),
       opencodeZen(zenFreeUsage),
-      verdent(verdentFreeUsage),
       openrouter(http, auth),
       kimi(http, auth),
       deepseek(http, auth),
@@ -180,5 +175,5 @@ const layer: Layer.Layer<
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Auth.node, ForkCredentials.node, SessionUsage.node, httpClient, ZenFreeUsage.node, VerdentFreeUsage.node],
+  deps: [Auth.node, ForkCredentials.node, SessionUsage.node, httpClient, ZenFreeUsage.node],
 })

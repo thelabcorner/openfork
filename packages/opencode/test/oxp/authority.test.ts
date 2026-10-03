@@ -300,6 +300,71 @@ describe("OxpAuthority", () => {
   )
 
   it.live(
+    "does not silently retarget a path admission from a removed project root to a broader manual root",
+    Effect.gen(function* () {
+      const authority = yield* OxpAuthority.Service
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const manualDir = path.join(suite, "manual-parent")
+      const projectDir = path.join(manualDir, "selected-project")
+      const target = path.join(projectDir, "probe.txt")
+      yield* Effect.promise(() => fs.mkdir(projectDir, { recursive: true }))
+      yield* Effect.promise(() => fs.writeFile(target, "root identity"))
+      const manual = yield* roots.approve(manualDir)
+      const synced = yield* roots.syncProjectRoots([projectDir])
+      const project = synced.find((root) => root.path === projectDir)
+      expect(project).toBeDefined()
+      expect(project?.id).not.toBe(manual.id)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+
+      const admitted = yield* authority.authorize({
+        plane: "augmentation",
+        operation: "read",
+        phase: "read",
+        path: target,
+      })
+      expect(admitted.root?.root.id).toBe(project?.id)
+
+      yield* roots.syncProjectRoots([])
+      const revoked = yield* attempt(authority.revalidate(admitted, "egress"))
+      expect(revoked._tag).toBe("Left")
+      if (revoked._tag === "Left") expect(revoked.left._tag).toBe("OXP_AUTH_REVOKED")
+    }),
+  )
+
+  it.live(
+    "does not silently transfer an admission to a newly approved RootID at the same path",
+    Effect.gen(function* () {
+      const authority = yield* OxpAuthority.Service
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const rootDir = path.join(suite, "reapproved-root")
+      const target = path.join(rootDir, "probe.txt")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      yield* Effect.promise(() => fs.writeFile(target, "stable pathname"))
+      const first = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+
+      const admitted = yield* authority.authorize({
+        plane: "augmentation",
+        operation: "read",
+        phase: "read",
+        path: target,
+      })
+      expect(admitted.root?.root.id).toBe(first.id)
+
+      yield* roots.remove(first.id)
+      const replacement = yield* roots.approve(rootDir)
+      expect(replacement.id).not.toBe(first.id)
+      const revoked = yield* attempt(authority.revalidate(admitted, "egress"))
+      expect(revoked._tag).toBe("Left")
+      if (revoked._tag === "Left") expect(revoked.left._tag).toBe("OXP_AUTH_REVOKED")
+    }),
+  )
+
+  it.live(
     "treats runtime refresh as rootless process authority rather than workspace mutation",
     Effect.gen(function* () {
       const authority = yield* OxpAuthority.Service

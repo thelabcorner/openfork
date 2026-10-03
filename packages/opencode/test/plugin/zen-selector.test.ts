@@ -1,11 +1,18 @@
 import { describe, expect, test } from "bun:test"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import type { PluginInput } from "@opencode-ai/plugin"
 import { ROUTED_ACCOUNT_HEADER } from "@/provider/routing-metadata"
+import { stableZenIdentity } from "@/plugin/zen-accounts"
 import {
+  committedZenProviderFetch,
+  committedPublicZenProviderFetch,
   ZenGoPlugin,
   ZenPlugin,
   discoverZenSystemOneModel,
   resetZenPoolForTest,
+  setTestZenCatalogCacheFile,
   setTestZenFetch,
   setTestZenVaultCredentials,
   ZEN_PUBLIC_API_KEY,
@@ -13,6 +20,7 @@ import {
   zenGoProviderFetch,
   zenLimitSnapshot,
   zenProviderFetch,
+  zenHostedCatalog,
 } from "@/plugin/zen"
 
 function configure(keys: string[]) {
@@ -231,6 +239,78 @@ describe("zen System One compatibility discovery", () => {
       dispose()
     }
   })
+
+  test("keeps bounded stale hosted catalog across a simulated restart", async () => {
+    const dispose = configure([])
+    const dir = await mkdtemp(path.join(tmpdir(), "openfork-zen-catalog-"))
+    const cacheFile = path.join(dir, "catalog.json")
+    try {
+      setTestZenCatalogCacheFile(cacheFile)
+      setTestZenFetch(async () =>
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "jev-1.13-free", object: "model", owned_by: "opencode" }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      const fresh = await zenHostedCatalog()
+      expect(fresh.state).toBe("fresh")
+      expect(fresh.ids.has("jev-1.13-free")).toBe(true)
+
+      const persisted = JSON.parse(await readFile(cacheFile, "utf8"))
+      persisted.fetchedAt = Date.now() - 10 * 60_000
+      await writeFile(cacheFile, JSON.stringify(persisted))
+
+      setTestZenFetch(async () => new Response("unavailable", { status: 503 }))
+      setTestZenCatalogCacheFile(cacheFile)
+      const stale = await zenHostedCatalog()
+      expect(stale.state).toBe("stale")
+      expect(stale.ids.has("jev-1.13-free")).toBe(true)
+    } finally {
+      dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("does not overwrite last-known-good catalog with malformed refresh data", async () => {
+    const dispose = configure([])
+    const dir = await mkdtemp(path.join(tmpdir(), "openfork-zen-catalog-"))
+    const cacheFile = path.join(dir, "catalog.json")
+    try {
+      setTestZenCatalogCacheFile(cacheFile)
+      setTestZenFetch(async () =>
+        new Response(
+          JSON.stringify({
+            object: "list",
+            data: [{ id: "jev-1.13-free", object: "model", owned_by: "opencode" }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      await zenHostedCatalog()
+      const persisted = JSON.parse(await readFile(cacheFile, "utf8"))
+      persisted.fetchedAt = Date.now() - 7 * 60 * 60_000
+      await writeFile(cacheFile, JSON.stringify(persisted))
+
+      setTestZenFetch(async () =>
+        new Response(JSON.stringify({ object: "list", data: [{ nope: true }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      setTestZenCatalogCacheFile(cacheFile)
+      const expired = await zenHostedCatalog()
+      expect(expired.state).toBe("expired")
+      expect(expired.ids.has("jev-1.13-free")).toBe(true)
+      const after = JSON.parse(await readFile(cacheFile, "utf8"))
+      expect(after.ids).toEqual(["jev-1.13-free"])
+    } finally {
+      dispose()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe("zen provider fetch wrapper", () => {
@@ -322,12 +402,12 @@ describe("zen provider fetch wrapper", () => {
     }
   })
 
-  test("public bootstrap sentinel yields to the real pool default", async () => {
+  test("public bootstrap sentinel stays public even when the pool has a default", async () => {
     const dispose = configure(["pool-default-key"])
     try {
       stubFetch([new Response(JSON.stringify({ choices: [] }), { status: 200 })])
       await runFetch("model-public", ZEN_PUBLIC_API_KEY)
-      expect(lastCall().headers.get("Authorization")).toBe("Bearer pool-default-key")
+      expect(lastCall().headers.get("Authorization")).toBe("Bearer public")
     } finally {
       dispose()
     }
@@ -409,8 +489,8 @@ describe("zen routing authority", () => {
 
       const publicSentinel = await resolveZenRequest("jev-1.13-free", ZEN_PUBLIC_API_KEY)
       expect(publicSentinel.modelID).toBe("jev-1.13-free")
-      expect(publicSentinel.accountID).toBe(snapshot[0]!.accountId)
-      expect(publicSentinel.apiKey).toBe("route-key-a")
+      expect(publicSentinel.accountID).toBeUndefined()
+      expect(publicSentinel.apiKey).toBe(ZEN_PUBLIC_API_KEY)
     } finally {
       dispose()
     }
@@ -454,6 +534,186 @@ describe("zen routing authority", () => {
       expect(route.modelID).toBe("jev-1.13-free")
       expect(route.accountID).toBe(active!.accountId)
       expect(route.apiKey).toBe("active-pool-key")
+    } finally {
+      dispose()
+    }
+  })
+})
+
+describe("committed hosted route transport", () => {
+  const KEY_A = "committed-key-a"
+  const KEY_B = "committed-key-b"
+
+  test("a committed non-default account keeps its exact bearer on the physical request", async () => {
+    const dispose = configure([KEY_A, KEY_B])
+    const seen: Array<{ authorization?: string; model?: string; url: string }> = []
+    try {
+      const accountA = stableZenIdentity(KEY_A)
+      const accountB = stableZenIdentity(KEY_B)
+      // Sanity: the pool really does hold two accounts and a different default.
+      expect(zenLimitSnapshot().map((row) => row.accountId).sort()).toEqual([accountA, accountB].sort())
+      expect(zenLimitSnapshot().find((row) => row.isDefault)!.accountId).toBe(accountA)
+
+      setTestZenFetch(async (input, init) => {
+        const headers = new Headers(init?.headers)
+        seen.push({
+          authorization: headers.get("authorization") ?? undefined,
+          model: JSON.parse(String(init?.body)).model,
+          url: String(input),
+        })
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      const response = await committedZenProviderFetch(accountB)("https://opencode.ai/zen/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${KEY_B}` },
+        body: JSON.stringify({ model: `grok-code@${accountB}`, messages: [] }),
+      })
+
+      expect(response.ok).toBe(true)
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.authorization).toBe(`Bearer ${KEY_B}`)
+      expect(seen[0]!.authorization).not.toBe(`Bearer ${KEY_A}`)
+      expect(seen[0]!.model).toBe("grok-code")
+      expect(response.headers.get(ROUTED_ACCOUNT_HEADER)).toBe(accountB)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("a committed route refuses an explicit different account before any base request", async () => {
+    const dispose = configure([KEY_A, KEY_B])
+    let called = false
+    try {
+      const accountA = stableZenIdentity(KEY_A)
+      const accountB = stableZenIdentity(KEY_B)
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      await expect(
+        committedZenProviderFetch(accountB)("https://opencode.ai/zen/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${KEY_B}` },
+          body: JSON.stringify({ model: `grok-code@${accountA}`, messages: [] }),
+        }),
+      ).rejects.toThrow("does not match the committed route account")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("a committed route without its selected credential fails closed", async () => {
+    const dispose = configure([KEY_A])
+    let called = false
+    try {
+      const accountA = stableZenIdentity(KEY_A)
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      await expect(
+        committedZenProviderFetch(accountA)("https://opencode.ai/zen/v1/chat/completions", {
+          method: "POST",
+          body: JSON.stringify({ model: "grok-code", messages: [] }),
+        }),
+      ).rejects.toThrow("missing its selected credential")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+})
+
+describe("committed Public route transport", () => {
+  test("pins the committed public sentinel and never consults the pool default", async () => {
+    const dispose = configure(["public-pool-key-a", "public-pool-key-b"])
+    const seen: Array<{ authorization?: string; model?: string }> = []
+    try {
+      setTestZenFetch(async (_input, init) => {
+        const headers = new Headers(init?.headers)
+        seen.push({
+          authorization: headers.get("authorization") ?? undefined,
+          model: JSON.parse(String(init?.body)).model,
+        })
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      const response = await committedPublicZenProviderFetch("https://opencode.ai/zen/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${ZEN_PUBLIC_API_KEY}` },
+        body: JSON.stringify({ model: "grok-code", messages: [] }),
+      })
+
+      expect(response.ok).toBe(true)
+      expect(seen).toHaveLength(1)
+      expect(seen[0]!.authorization).toBe(`Bearer ${ZEN_PUBLIC_API_KEY}`)
+      expect(seen[0]!.authorization).not.toContain("public-pool-key")
+      expect(seen[0]!.model).toBe("grok-code")
+    } finally {
+      dispose()
+    }
+  })
+
+  test("refuses an account-qualified model because Public has no account to authorize", async () => {
+    const dispose = configure(["public-pool-key-a"])
+    let called = false
+    try {
+      const accountA = stableZenIdentity("public-pool-key-a")
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      expect(() =>
+        committedPublicZenProviderFetch("https://opencode.ai/zen/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ZEN_PUBLIC_API_KEY}` },
+          body: JSON.stringify({ model: `grok-code@${accountA}`, messages: [] }),
+        }),
+
+        ).toThrow("cannot be authorized by a committed Public route")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("fails closed when the committed public credential is absent", async () => {
+    const dispose = configure(["public-pool-key-a"])
+    let called = false
+    try {
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
+      })
+
+      expect(() =>
+        committedPublicZenProviderFetch("https://opencode.ai/zen/v1/chat/completions", {
+          method: "POST",
+          body: JSON.stringify({ model: "grok-code", messages: [] }),
+        }),
+
+        ).toThrow("missing its public credential")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+})
+
+describe("committed Public transport wiring", () => {
+  test("the public fetch is not the selecting provider fetch", async () => {
+    // Reachability guard: a committed Public route must not be able to install a
+    // fetch that can reach resolveZenRequest/pool.defaultAccount again.
+    const dispose = configure(["public-regression-key"])
+    try {
+      expect(committedPublicZenProviderFetch).not.toBe(zenProviderFetch)
+      expect(committedZenProviderFetch(stableZenIdentity("public-regression-key"))).not.toBe(zenProviderFetch)
+      expect(committedPublicZenProviderFetch).not.toBe(zenGoProviderFetch)
     } finally {
       dispose()
     }

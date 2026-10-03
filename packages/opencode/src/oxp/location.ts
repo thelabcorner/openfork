@@ -1,4 +1,5 @@
 import path from "path"
+import { Effect } from "effect"
 import { OxpError } from "./error"
 import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
@@ -14,12 +15,23 @@ export interface ExplicitLocation {
  * the caller must provide an absolute native/virtual spelling.
  */
 export function requireExplicit(input: ExplicitLocation, operation: string) {
-  if (input.rootID) return
-  if (!input.path) throw new OxpError.RootRequired({ detail: `${operation} requires an explicit approved root or path` })
+  if (input.rootID) return Effect.void
+  if (!input.path) {
+    return Effect.fail(
+      new OxpError.RootRequired({
+        detail: `${operation} requires an explicit approved root or path`,
+      }),
+    )
+  }
   const value = input.path.trim()
   if (!value || (!path.isAbsolute(value) && !/^[/\\]/.test(value))) {
-    throw new OxpError.RootRequired({ detail: `Relative ${operation} paths require an explicit approved root` })
+    return Effect.fail(
+      new OxpError.RootRequired({
+        detail: `Relative ${operation} paths require an explicit approved root`,
+      }),
+    )
   }
+  return Effect.void
 }
 
 export function targetPath(root: OxpRoot.ResolvedPath | OxpRoot.ResolvedRoot) {

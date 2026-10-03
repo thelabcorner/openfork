@@ -23,7 +23,7 @@ export const ModelsCommand = effectCmd({
         type: "boolean",
       })
       .option("refresh", {
-        describe: "refresh the models cache from models.dev",
+        describe: "refresh model caches (and Claude subscription models when provider is claude)",
         type: "boolean",
       }),
   handler: Effect.fn("Cli.models")(function* (args) {
@@ -31,6 +31,18 @@ export const ModelsCommand = effectCmd({
     if (args.refresh) {
       yield* ModelsDev.Service.use((s) => s.refresh(true))
       UI.println(UI.Style.TEXT_SUCCESS_BOLD + "Models cache refreshed" + UI.Style.TEXT_NORMAL)
+      if (args.provider === "claude") {
+        const { refreshClaudeSubscriptionModels } = yield* Effect.promise(() => import("@/claude/model-discovery"))
+        const { sanitizeDetail } = yield* Effect.promise(() => import("@/claude/errors"))
+        yield* Effect.tryPromise({
+          try: () => refreshClaudeSubscriptionModels({ force: true }),
+          catch: (cause) =>
+            new Error(sanitizeDetail(cause instanceof Error ? cause.message : String(cause), 300)),
+        }).pipe(
+          Effect.catch((error) => fail(`Claude subscription model refresh failed: ${error.message}`)),
+        )
+        UI.println(UI.Style.TEXT_SUCCESS_BOLD + "Claude subscription model cache refreshed" + UI.Style.TEXT_NORMAL)
+      }
     }
 
     const provider = yield* Provider.Service

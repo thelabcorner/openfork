@@ -5,6 +5,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import { Effect, Exit, Option, Scope } from "effect"
 import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
@@ -16,17 +17,43 @@ import { MessageV2 } from "./message-v2"
 import { MessageID, SessionID } from "./schema"
 import type { SessionPromptOps } from "./prompt-contract"
 import { DelegatedWorkerPolicy } from "./delegated-worker-policy"
+import { SupervisorRegistryTag } from "./subagent-supervision-contract"
+import * as SubagentSupervisionMetadata from "./subagent-supervision-metadata"
 
 export const ID = "task"
+
+/**
+ * Explicit Task execution mode. Kept alongside the legacy `background` alias for
+ * compatibility. Supervisor maps onto detached execution while retaining parent
+ * responsibility.
+ */
+export type TaskMode = "foreground" | "background" | "supervisor"
+
 export const BACKGROUND_DESCRIPTION = [
+  "Execution mode is chosen with `mode` (foreground | background | supervisor); the legacy `background` boolean remains a compatibility alias and must not be combined with `mode`.",
+  "foreground (default) blocks until the child finishes. background detaches and returns immediately. supervisor detaches but keeps you responsible for the worker.",
   "Foreground and background use the same child session, history, tools, and permissions; only parent waiting behavior changes.",
-  "Foreground is the default and blocks until the child finishes. background=true detaches and returns immediately.",
   "A running background task can be foregrounded by calling task again with its task_id and no prompt.",
-  "A running task can be re-prompted in the same session by supplying task_id and prompt; choose background=true to keep it detached or omit background to wait for the queued continuation.",
-  "Use background only for independent work that can run while you continue elsewhere.",
-  "You will be notified automatically when it finishes.",
-  "When launching several independent background subagents, call this tool several times in the SAME assistant message.",
+  "A running task can be re-prompted in the same session by supplying task_id and prompt; choose mode=\"background\" to keep it detached or omit mode to wait for the queued continuation.",
+  "Use background only for independent work that can run while you continue elsewhere; you will be notified automatically when it finishes.",
+  "Use supervisor when you must stay responsible for the worker: inspect progress, audit evidence, and steer before integrating.",
+  "When launching several independent subagents, call this tool several times in the SAME assistant message.",
 ].join(" ")
+
+/**
+ * Worker-side behavioral contract appended to the prompt only under supervisor
+ * mode. It is deliberately compact and does not require periodic status
+ * reports; the supervisor inspects the Session instead.
+ */
+export const SUPERVISOR_WORKER_PROTOCOL = [
+  "## SUPERVISOR WORKER PROTOCOL",
+  "You are an independent worker under an active supervisor.",
+  "Own the assigned scope and work autonomously; do not coordinate directly with sibling workers unless explicitly instructed.",
+  "Stay inside your assigned scope. Surface blockers and material discoveries clearly, and state when evidence changes your planned approach.",
+  "Return concrete evidence: files, symbols, tests, findings, or artifacts - not merely a confidence statement.",
+  "The supervisor owns cross-worker integration and final acceptance.",
+  "Do not emit periodic status reports; complete the work and return your evidence.",
+].join("\n")
 const BACKGROUND_STARTED = [
   "The task is working in the background. You will be notified automatically when it finishes.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work ΓÇö avoid working with the same files or topics it is using.",
@@ -39,11 +66,26 @@ const BACKGROUND_UPDATED = [
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
 
+const SUPERVISOR_STARTED = [
+  "The supervised workers are running detached under your supervision. You remain responsible for them until they reach terminal states.",
+  "Inspect the cohort when meaningful worker state changes occur: completion, failure, cancellation, a permission or question blocker, a material status change, or a finding that invalidates a sibling worker's assumption.",
+  "Audit worker reasoning and evidence rather than trusting final responses. Steer workers that are blocked, drifting, duplicating, or out of scope; do not micromanage healthy workers or poll without a reason.",
+  "Do not run a fixed-interval heartbeat or blind polling loop, and do not ask workers for periodic status reports.",
+  "Do not finish the overarching task merely because workers are still running; own final synthesis and verification.",
+].join("\n")
+
+const SUPERVISOR_UPDATED = [
+  "Guidance sent to the running supervised worker; it is still detached under your supervision.",
+  "You remain responsible for the cohort. Inspect progress and evidence when it changes, and steer only when warranted.",
+  "Do not finish the overarching task merely because workers are still running; own final synthesis and verification.",
+].join("\n")
+
 type DelegatedModelPolicy = {
   providerID: ProviderV2.ID
   modelID: ModelV2.ID
   accountID?: string
   variant?: string
+  routeIntent?: ProviderRouteIntent.Info
 }
 
 type DelegatedTaskPolicy = {
@@ -97,21 +139,39 @@ function policyFromWorkerDelegation(
       ...(origin.model.variant && origin.model.variant !== "default"
         ? { variant: origin.model.variant }
         : {}),
+      routeIntent: origin.model.routeIntent,
     },
   }
 }
 
 function sameModel(
-  left: { providerID: string; modelID?: string; id?: string; accountID?: string; variant?: string },
+  left: {
+    providerID: string
+    modelID?: string
+    id?: string
+    accountID?: string
+    variant?: string
+    routeIntent?: ProviderRouteIntent.Info
+  },
   right: DelegatedModelPolicy,
 ) {
   const leftID = left.modelID ?? left.id
-  const leftVariant = left.variant && left.variant !== "default" ? left.variant : undefined
-  return (
-    left.providerID === right.providerID &&
-    leftID === right.modelID &&
-    left.accountID === right.accountID &&
-    leftVariant === right.variant
+  if (!leftID) return false
+  return SessionMetadataOwnership.sameWorkerDelegationModel(
+    {
+      providerID: left.providerID,
+      modelID: leftID,
+      ...(left.accountID ? { accountID: left.accountID } : {}),
+      ...(left.variant ? { variant: left.variant } : {}),
+      ...(left.routeIntent ? { routeIntent: left.routeIntent } : {}),
+    },
+    {
+      providerID: right.providerID,
+      modelID: right.modelID,
+      ...(right.accountID ? { accountID: right.accountID } : {}),
+      ...(right.variant ? { variant: right.variant } : {}),
+      ...(right.routeIntent ? { routeIntent: right.routeIntent } : {}),
+    },
   )
 }
 
@@ -122,6 +182,7 @@ export interface Input {
   readonly taskID?: string
   readonly command?: string
   readonly background?: boolean
+  readonly mode?: TaskMode
 }
 
 export interface ExecutionContext {
@@ -212,8 +273,28 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
       context: ExecutionContext,
     ) {
       const cfg = yield* config.get()
-      const runInBackground = input.background === true
       const promptText = input.prompt?.trim() ? input.prompt : undefined
+
+      // Mode resolution is frozen for compatibility:
+      //   mode ?? (background === true ? "background" : "foreground")
+      // Combining both explicit signals is ambiguous and must fail loudly
+      // rather than silently reconciling conflicting intent.
+      if (input.mode !== undefined && input.background !== undefined) {
+        return yield* Effect.fail(
+          new Error(
+            'Task accepts either explicit `mode` or the legacy `background` boolean, not both. Provide a single "mode" of "foreground", "background", or "supervisor" (or omit both for foreground).',
+          ),
+        )
+      }
+      const resolvedMode: TaskMode =
+        input.mode ?? (input.background === true ? "background" : "foreground")
+      const isSupervisor = resolvedMode === "supervisor"
+      // Supervisor maps to detached execution; background boolean stays present
+      // for compatibility. Foreground => false; background/supervisor => true.
+      const runInBackground = resolvedMode !== "foreground"
+      // Deterministic cohort identity: every supervisor call emitted in one
+      // assistant turn shares the same group ID.
+      const supervisionGroupID = `sup:${context.assistantMessageID}`
 
       const parent = yield* sessions.get(context.parentSessionID)
       let depth = 0
@@ -232,6 +313,39 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         )
       }
 
+      // Resolve the requested agent and enforce its delegation capability
+      // BEFORE asking for Task permission. A prompt for an agent that can never
+      // be delegated is a permission the user can approve that changes nothing,
+      // so the ordering here is a correctness property, not a style choice.
+      const next = yield* agent.get(input.subagentType)
+      if (!next) {
+        return yield* Effect.fail(new Error(`Unknown agent type: ${input.subagentType} is not a valid agent type`))
+      }
+
+      // `mode` is the canonical delegation capability. The Task tool description
+      // already advertises only `mode !== "primary"` agents (ToolRegistry
+      // .describeTask), so enforcing the same rule here — the single owner every
+      // delegation path flows through, whether the model called the Task tool or
+      // a `task` prompt input spawned the child — is what stops a model from
+      // bypassing its own tool description by naming a primary agent.
+      //
+      // `hidden` is deliberately not consulted: it is a chooser-discoverability
+      // flag, not a capability.
+      //
+      // Resume fails closed as well. A child session whose agent was switched to
+      // `primary` after it started is refused instead of being silently
+      // continued, so a capability change can never quietly re-grant
+      // delegation for a task that began under the old mode. The user-facing
+      // remedy is explicit in the error.
+      if (next.mode === "primary") {
+        return yield* Effect.fail(
+          new Error(
+            `Agent "${next.name}" is configured as a primary agent and cannot be used as a subagent. ` +
+              `Set its "mode" to "subagent" or "all" in OpenFork configuration to delegate work to it.`,
+          ),
+        )
+      }
+
       const authorizedAgentNames = context.authorizedAgentNames
       if (!authorizedAgentNames?.has(input.subagentType)) {
         yield* context.ask({
@@ -243,11 +357,6 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
             subagent_type: input.subagentType,
           },
         })
-      }
-
-      const next = yield* agent.get(input.subagentType)
-      if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${input.subagentType} is not a valid agent type`))
       }
 
       const session = input.taskID
@@ -416,6 +525,7 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
                 protectedChild.model.variant !== "default"
                   ? { variant: protectedChild.model.variant }
                   : {}),
+                routeIntent: protectedChild.model.routeIntent,
               }
             : undefined) ?? delegatedModel(existingLocalMcp.modelSelection)
         const sessionModel = session.model
@@ -516,6 +626,9 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
                         ...(strictModel.variant
                           ? { variant: strictModel.variant }
                           : {}),
+                        ...(strictModel.routeIntent
+                          ? { routeIntent: strictModel.routeIntent }
+                          : {}),
                       },
                     })
                   : {
@@ -553,7 +666,14 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         sessionId: nextSession.id,
         model,
         ...(taskVariant ? { variant: taskVariant } : {}),
+        mode: resolvedMode,
         background: runInBackground,
+        ...(isSupervisor
+          ? {
+              supervisorSessionId: context.parentSessionID,
+              supervisionGroupId: supervisionGroupID,
+            }
+          : {}),
       }
 
       yield* context.metadata({
@@ -561,8 +681,75 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         metadata,
       })
 
+      // Worker 4's supervision service is optional: consume it via serviceOption
+      // so Task delegation compiles and works before/without the service.
+      const supervisorRegistry = Option.getOrUndefined(yield* Effect.serviceOption(SupervisorRegistryTag))
+
+      const delegationEnvelope: SubagentSupervisionMetadata.TaskDelegation | undefined = isSupervisor
+        ? {
+            mode: "supervisor",
+            supervisorSessionID: context.parentSessionID,
+            supervisionGroupID,
+            description: input.description,
+            createdFromMessageID: context.assistantMessageID,
+          }
+        : undefined
+
+      // Durable supervision ownership lives on the child Session and is written
+      // through the fork-local metadata helper (mutable/caller-replaceable, not
+      // producer-owned identity). Non-supervisor modes strip/ignore it.
+      const establishSupervision = Effect.fnUntraced(function* () {
+        if (!delegationEnvelope) return
+        const current = yield* sessions.get(nextSession.id)
+        yield* sessions.setMetadata({
+          sessionID: nextSession.id,
+          metadata: SubagentSupervisionMetadata.withTaskDelegation(delegationEnvelope, current.metadata),
+        })
+        if (supervisorRegistry) {
+          yield* supervisorRegistry.register({
+            supervisorSessionID: context.parentSessionID,
+            childSessionID: nextSession.id,
+            supervisionGroupID,
+            mode: "supervisor",
+            description: input.description,
+            createdFromMessageID: context.assistantMessageID,
+          })
+        }
+      })
+
+      // Relinquishing supervision keeps the child detached and running; it only
+      // drops the active supervisory relationship.
+      //
+      // It is a strict no-op when the child carries no durable supervision
+      // envelope and no supervision registry is present, so a plain foreground
+      // task on a never-supervised child never mutates child metadata. The
+      // durable `taskDelegation` strip is gated on `hasTaskDelegationOrigin`;
+      // the live unregister is gated on an actual registry being installed.
+      const relinquishSupervision = Effect.fnUntraced(function* () {
+        if (!supervisorRegistry) {
+          // No live registry: the only thing that can be relinquished is the
+          // durable envelope. Skip the read entirely for a brand-new child that
+          // cannot carry one.
+          if (!input.taskID) return
+        }
+        const current = yield* sessions.get(nextSession.id)
+        const supervised = SubagentSupervisionMetadata.hasTaskDelegationOrigin(current.metadata)
+        if (supervisorRegistry) yield* supervisorRegistry.unregister(nextSession.id)
+        if (supervised) {
+          yield* sessions.setMetadata({
+            sessionID: nextSession.id,
+            metadata: SubagentSupervisionMetadata.withoutTaskDelegation(current.metadata),
+          })
+        }
+      })
+
       const runTask = Effect.fn("SubagentDelegation.runTask")(function* (prompt: string) {
-        const parts = yield* ops.resolvePromptParts(prompt)
+        const resolved = yield* ops.resolvePromptParts(prompt)
+        // Supervisor workers receive the compact worker protocol; other modes
+        // are byte-for-byte unchanged.
+        const parts = isSupervisor
+          ? [...resolved, { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL }]
+          : resolved
         const result = yield* ops.prompt(
           {
             messageID: MessageID.ascending(),
@@ -598,6 +785,58 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
           return yield* failRecoverable(nextSession.id, failed.state.error ?? "unknown tool error", result.parts)
         }
         return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+      })
+
+      // Safe-boundary supervisory steering. This is materially different from
+      // `background.extend`, which only queues a continuation behind the
+      // child's whole turn: `ops.steer` durably admits trusted host input to
+      // the child's SessionInput inbox in the host `steer` lane, so the worker
+      // reorients at its next safe provider-cycle boundary instead of waiting
+      // for a post-completion continuation cycle. It never creates a second
+      // child Session or a duplicate execution generation.
+      const steerChild = Effect.fn("SubagentDelegation.steerChild")(function* (prompt: string) {
+        const steer = ops.steer
+        if (typeof steer !== "function") {
+          // Fail loudly: silently downgrading supervisor steering to a queued
+          // background continuation would re-create "renamed Background" and
+          // violate the architectural invariant.
+          return yield* Effect.die(
+            new Error(
+              "Supervisor steering requires SessionPromptOps.steer, but the prompt control surface did not provide it. Refusing to downgrade supervisor steering to a queued background continuation.",
+            ),
+          )
+        }
+        const resolved = yield* ops.resolvePromptParts(prompt)
+        const parts = [...resolved, { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL }]
+        const steered = yield* steer.call(
+          ops,
+          {
+            sessionID: nextSession.id,
+            agent: next.name,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+              ...("accountID" in model && model.accountID ? { accountID: model.accountID } : {}),
+            },
+            variant: taskVariant,
+            parts,
+          },
+          workerOrigin
+            ? {
+                source: SessionTurnProvenance.Source.OxpDelegation,
+                ref: workerOrigin.invocationRef,
+                principalRef: workerOrigin.principalRef,
+              }
+            : undefined,
+        )
+        if (steered.info.role === "assistant" && steered.info.error) {
+          const message =
+            "message" in steered.info.error.data && typeof steered.info.error.data.message === "string"
+              ? steered.info.error.data.message
+              : steered.info.error.name
+          return yield* failRecoverable(nextSession.id, message, steered.parts)
+        }
+        return steered.parts.findLast((item) => item.type === "text")?.text ?? ""
       })
 
       const childTail = Effect.fn("SubagentDelegation.childTail")(function* (sessionID: SessionID) {
@@ -770,16 +1009,34 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
           const detached =
             existingJob.metadata?.background === true ? existingJob : yield* background.promote(nextSession.id)
           if (detached?.status === "running") {
-            if (!promptText) return backgroundResult("Task running in background", BACKGROUND_STARTED)
-            const extended = yield* background.extend({
-              id: nextSession.id,
-              run: runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
-            })
-            if (extended) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
+            if (isSupervisor) {
+              // Adopt (or re-affirm) supervision of the running worker without
+              // restarting it. A prompt-bearing supervisor call is genuine
+              // safe-boundary steering (ops.steer), NOT a queued continuation,
+              // and never starts a new execution generation.
+              yield* establishSupervision()
+              if (!promptText) return backgroundResult("Worker adopted into supervision", SUPERVISOR_STARTED)
+              yield* steerChild(promptText)
+              return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
+            } else {
+              // mode:"background" on an existing running worker relinquishes
+              // supervision (if any) while leaving the worker detached. Its
+              // queued-continuation semantics stay EXACTLY as they were.
+              yield* relinquishSupervision()
+              if (!promptText) return backgroundResult("Task running in background", BACKGROUND_STARTED)
+              const extended = yield* background.extend({
+                id: nextSession.id,
+                run: runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+              })
+              if (extended) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
+            }
           }
         } else {
           const attached = yield* background.foreground(nextSession.id, promotionMetadata)
           if (attached?.status === "running") {
+            // Supervisor -> foreground attaches without restart and drops the
+            // active supervisory relationship.
+            yield* relinquishSupervision()
             if (!promptText) return yield* waitForeground()
             const extended = yield* background.extend({
               id: nextSession.id,
@@ -794,6 +1051,8 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         const previous = yield* background.get(nextSession.id)
         if (previous?.status === "completed") {
           if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
+          if (isSupervisor) yield* establishSupervision()
+          else yield* relinquishSupervision()
           return {
             title: input.description,
             metadata: { ...metadata, background: false },
@@ -802,6 +1061,7 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         }
         if (previous?.status === "error") {
           if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
+          if (!isSupervisor) yield* relinquishSupervision()
           return yield* Effect.fail(new Error(previous.error ?? "Task failed"))
         }
         return yield* Effect.fail(
@@ -826,7 +1086,14 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
         })
         if (attempt.started) {
           yield* notify(attempt.info.id)
-          if (runInBackground) return backgroundResult("Background task started", BACKGROUND_STARTED)
+          if (isSupervisor) {
+            yield* establishSupervision()
+            return backgroundResult("Supervised worker started", SUPERVISOR_STARTED)
+          }
+          if (runInBackground) {
+            yield* relinquishSupervision()
+            return backgroundResult("Background task started", BACKGROUND_STARTED)
+          }
           return yield* waitForeground()
         }
         if (attempt.info.type !== ID) {
@@ -839,6 +1106,14 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
           const detached =
             attempt.info.metadata?.background === true ? attempt.info : yield* background.promote(nextSession.id)
           if (detached?.status !== "running") continue
+          if (isSupervisor) {
+            // The child is already running, so a prompt-bearing supervisor call
+            // is safe-boundary steering, not a queued continuation.
+            yield* establishSupervision()
+            yield* steerChild(promptText)
+            return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
+          }
+          yield* relinquishSupervision()
           if (yield* background.extend({ id: nextSession.id, run: runPrompt() })) {
             return backgroundResult("Background task updated", BACKGROUND_UPDATED)
           }

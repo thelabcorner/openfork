@@ -167,8 +167,6 @@ export const ProviderUsage = Schema.Struct({
   accountLabels: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   /** WorkBuddy promotional frequency windows, separate from package-credit windows. */
   workbuddyAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
-  /** Verdent account-local model frequency observations; shared windows stay in `windows`. */
-  verdentAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
   /** Zen per-key rows: unified-pool state and reset countdown per configured key. */
   zenAccounts: Schema.optional(Schema.Array(ZenKeyLimits)),
 })

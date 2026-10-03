@@ -109,7 +109,7 @@ export function translateGitDiff(patchText: string): Hunk[] | null {
         }
       }
       if (oldLines.length === 0) return null // unsafe: native semantics append at EOF
-      chunks.push({ old_lines: oldLines, new_lines: newLines })
+      chunks.push({ old_lines: oldLines, new_lines: newLines, old_start: h.oldStart })
     }
     if (oldName === newName) hunks.push({ type: "update", path: oldName, chunks })
     else hunks.push({ type: "update", path: oldName, move_path: newName, chunks })

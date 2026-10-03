@@ -4,7 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Effect, Exit, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -144,6 +144,49 @@ describe("session.retry.delay", () => {
       )
 
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+    }),
+  )
+
+  it.instance("does not automatically retry a terminal free-limit failure", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const sets: number[] = []
+      const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Free usage exceeded",
+          isRetryable: true,
+          statusCode: 429,
+          responseBody: JSON.stringify({
+            type: "error",
+            error: { type: "FreeUsageLimitError", message: "Free usage exceeded" },
+          }),
+        }).toObject(),
+      )
+
+      const program = Effect.gen(function* () {
+        attempts++
+        return yield* Effect.fail(error)
+      })
+
+      const exit = yield* Effect.exit(
+        program.pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "opencode",
+              route: { routeKind: "public" },
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              set: (info) =>
+                Effect.sync(() => {
+                  sets.push(info.attempt)
+                }),
+            }),
+          ),
+        ),
+      )
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toBe(1)
+      expect(sets).toStrictEqual([1])
     }),
   )
 })
@@ -350,6 +393,7 @@ describe("session.retry.retryable", () => {
 
     expect(SessionRetry.retryable(error, "opencode")).toEqual({
       message: SessionRetry.GO_UPSELL_MESSAGE,
+      terminal: true,
       action: {
         reason: "free_tier_limit",
         provider: "opencode",
@@ -425,6 +469,300 @@ describe("session.retry.retryable", () => {
       "Usage limit reached. It will reset in 15 minutes. To continue using this model now, enable usage from your available balance",
     )
   })
+})
+
+describe("session.retry.classify", () => {
+  const error = (input: {
+    message: string
+    statusCode?: number
+    responseBody?: string
+    responseHeaders?: Record<string, string>
+    isRetryable?: boolean
+  }) =>
+    Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: input.message,
+        isRetryable: input.isRetryable ?? true,
+        statusCode: input.statusCode,
+        responseBody: input.responseBody,
+        responseHeaders: input.responseHeaders,
+      }).toObject(),
+    )
+
+  const freeLimit = () =>
+    error({
+      message: "Free usage exceeded",
+      statusCode: 429,
+      responseBody: JSON.stringify({
+        type: "error",
+        error: { type: "FreeUsageLimitError", message: "Free usage exceeded" },
+      }),
+    })
+
+  const goLimit = () =>
+    error({
+      message: "Subscription quota exceeded",
+      statusCode: 429,
+      responseHeaders: { "retry-after": "19380" },
+      responseBody: JSON.stringify({
+        type: "error",
+        error: { type: "GoUsageLimitError", message: "Subscription quota exceeded" },
+        metadata: { workspace: "wrk_test", limitName: "5 hour" },
+      }),
+    })
+
+  test("classifies FreeUsageLimitError as Public quota only for a committed Public route", () => {
+    const decision = SessionRetry.classify(freeLimit(), "opencode", { routeKind: "public" })
+    expect(decision).toMatchObject({
+      class: "public-quota",
+      retry: "none",
+      routeEffect: "public-quota-exhausted",
+      action: { reason: "free_tier_limit", provider: "opencode" },
+    })
+  })
+
+  test("does not manufacture Public quota state from FreeUsageLimitError on an account route", () => {
+    expect(
+      SessionRetry.classify(freeLimit(), "opencode", {
+        routeKind: "account",
+        accountID: "acct-a",
+      }),
+    ).toEqual({
+      class: "request-admission",
+      retry: "none",
+      routeEffect: "none",
+      message: "Free usage exceeded",
+    })
+  })
+
+  test("legacy uncommitted FreeUsageLimitError may keep the action but cannot claim Public health", () => {
+    expect(SessionRetry.classify(freeLimit(), "opencode")).toMatchObject({
+      class: "request-admission",
+      retry: "none",
+      routeEffect: "none",
+      action: { reason: "free_tier_limit" },
+    })
+  })
+
+  for (const signal of ["FreeTierError", "MissingSessionID"]) {
+    test(`treats ${signal} as deterministic request admission rather than a retryable provider failure`, () => {
+      const decision = SessionRetry.classify(
+        error({
+          message: `${signal}: request rejected`,
+          statusCode: 500,
+          responseBody: JSON.stringify({ error: { type: signal } }),
+        }),
+        "opencode",
+        { routeKind: "public" },
+      )
+      expect(decision).toEqual({
+        class: "request-admission",
+        retry: "none",
+        routeEffect: "none",
+        message: `${signal}: request rejected`,
+      })
+    })
+  }
+
+  test("classifies GoUsageLimitError as terminal account quota on the committed account with an absolute reset", () => {
+    const now = 1_000
+    expect(
+      SessionRetry.classify(
+        goLimit(),
+        "opencode-go",
+        {
+          routeKind: "account",
+          accountID: "acct-go",
+        },
+        now,
+      ),
+    ).toMatchObject({
+      class: "account-quota",
+      retry: "none",
+      routeEffect: "account-quota-exhausted",
+      resetAt: now + 19_380_000,
+      action: { reason: "account_rate_limit", provider: "opencode-go" },
+    })
+  })
+
+  test("parses standardized Retry-After evidence without inventing a durable deadline", () => {
+    const now = Date.UTC(2026, 8, 26, 18, 0, 0)
+    const seconds = error({
+      message: "rate limited",
+      statusCode: 429,
+      responseHeaders: { "ReTrY-AfTeR": "2.5" },
+    })
+    expect(SessionRetry.retryResetAt(seconds, now)).toBe(now + 2_500)
+
+    const milliseconds = error({
+      message: "rate limited",
+      statusCode: 429,
+      responseHeaders: { "retry-after-ms": "125.2" },
+    })
+    expect(SessionRetry.retryResetAt(milliseconds, now)).toBe(now + 126)
+
+    const date = error({
+      message: "rate limited",
+      statusCode: 429,
+      responseHeaders: { "retry-after": "Sat, 26 Sep 2026 18:05:00 GMT" },
+    })
+    expect(SessionRetry.retryResetAt(date, now)).toBe(Date.UTC(2026, 8, 26, 18, 5, 0))
+
+    const absent = error({ message: "rate limited", statusCode: 429 })
+    expect(SessionRetry.retryResetAt(absent, now)).toBeUndefined()
+
+    for (const malformed of ["-1", "2seconds", "1e3"]) {
+      expect(
+        SessionRetry.retryResetAt(
+          error({
+            message: "rate limited",
+            statusCode: 429,
+            responseHeaders: { "retry-after": malformed },
+          }),
+          now,
+        ),
+      ).toBeUndefined()
+    }
+    expect(
+      SessionRetry.retryResetAt(
+        error({
+          message: "rate limited",
+          statusCode: 429,
+          responseHeaders: { "retry-after-ms": "125ms" },
+        }),
+        now,
+      ),
+    ).toBeUndefined()
+  })
+
+  test("does not project GoUsageLimitError onto account state from a committed Public route", () => {
+    expect(SessionRetry.classify(goLimit(), "opencode", { routeKind: "public" })).toEqual({
+      class: "request-admission",
+      retry: "none",
+      routeEffect: "none",
+      message: "Subscription quota exceeded",
+    })
+  })
+
+  test("classifies account auth and generic account rate-limit failures without cross-route retry", () => {
+    expect(
+      SessionRetry.classify(
+        error({ message: "credential rejected", statusCode: 401, isRetryable: false }),
+        "opencode",
+        { routeKind: "account", accountID: "acct-a" },
+      ),
+    ).toEqual({
+      class: "account-auth",
+      retry: "none",
+      routeEffect: "account-auth-invalid",
+      message: "credential rejected",
+    })
+
+    expect(
+      SessionRetry.classify(error({ message: "rate limited", statusCode: 429 }), "opencode", {
+        routeKind: "account",
+        accountID: "acct-a",
+      }),
+    ).toEqual({
+      class: "account-rate-limit",
+      retry: "none",
+      routeEffect: "account-cooldown",
+      message: "rate limited",
+    })
+  })
+
+  test("keeps genuine transient provider failures on the exact same route", () => {
+    const transient = error({ message: "Service unavailable", statusCode: 503 })
+    expect(SessionRetry.classify(transient, "opencode", { routeKind: "public" })).toMatchObject({
+      class: "provider-transient",
+      retry: "same-route",
+      routeEffect: "none",
+    })
+    expect(
+      SessionRetry.classify(transient, "opencode", {
+        routeKind: "account",
+        accountID: "acct-a",
+      }),
+    ).toMatchObject({
+      class: "provider-transient",
+      retry: "same-route",
+      routeEffect: "none",
+    })
+  })
+
+  it.instance("account FreeUsageLimitError terminates without publishing a Public upsell action", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const sets: number[] = []
+      const program = Effect.gen(function* () {
+        attempts++
+        return yield* Effect.fail(freeLimit())
+      })
+
+      const exit = yield* Effect.exit(
+        program.pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "opencode",
+              route: { routeKind: "account", accountID: "acct-a" },
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              set: (info) =>
+                Effect.sync(() => {
+                  sets.push(info.attempt)
+                }),
+            }),
+          ),
+        ),
+      )
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toBe(1)
+      expect(sets).toEqual([])
+    }),
+  )
+
+  it.instance("account GoUsageLimitError reports its action and route effect exactly once without sleeping to the reset", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const sets: Array<{ attempt: number; reason?: string }> = []
+      const observations: SessionRetry.ProviderFailureDecision[] = []
+      const program = Effect.gen(function* () {
+        attempts++
+        return yield* Effect.fail(goLimit())
+      })
+
+      const exit = yield* Effect.exit(
+        program.pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "opencode-go",
+              route: { routeKind: "account", accountID: "acct-go" },
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              observe: ({ decision }) =>
+                Effect.sync(() => {
+                  observations.push(decision)
+                }),
+              set: (info) =>
+                Effect.sync(() => {
+                  sets.push({ attempt: info.attempt, reason: info.action?.reason })
+                }),
+            }),
+          ),
+        ),
+      )
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toBe(1)
+      expect(sets).toEqual([{ attempt: 1, reason: "account_rate_limit" }])
+      expect(observations).toHaveLength(1)
+      expect(observations[0]).toMatchObject({
+        class: "account-quota",
+        retry: "none",
+        routeEffect: "account-quota-exhausted",
+      })
+      expect(observations[0]?.resetAt).toBeGreaterThan(Date.now())
+    }),
+  )
 })
 
 describe("session.message-v2.fromError", () => {

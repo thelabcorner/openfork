@@ -114,11 +114,22 @@ export function execute<E>(
         signal,
       })
 
-    const gitProbe = yield* runOwned({
-      cwd: directory,
-      argv: ["git", ...GIT_ARGS, "rev-parse", "--show-toplevel"],
-      timeoutMs: 15_000,
-    }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    // Explicit file/files/folder scopes with an explicit tsconfig are already
+    // fully bounded by independently-authorized inputs. A Git worktree adds no
+    // semantics there, so avoid an extra owned subprocess on every scoped check.
+    // Keep Git discovery for changed/bottomUp and implicit-config checks where
+    // the worktree can affect file selection or upward config/compiler lookup.
+    const needsGitDiscovery =
+      params.tsconfig === undefined ||
+      mode === "changed" ||
+      mode === "bottomUp"
+    const gitProbe = needsGitDiscovery
+      ? yield* runOwned({
+          cwd: directory,
+          argv: ["git", ...GIT_ARGS, "rev-parse", "--show-toplevel"],
+          timeoutMs: 15_000,
+        }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      : undefined
     const gitRootRaw = gitProbe?.exitCode === 0 ? gitProbe.stdout.split(/\r?\n/).find(Boolean)?.trim() : undefined
     const gitRoot = gitRootRaw && contained(rootPath, path.resolve(gitRootRaw)) ? path.resolve(gitRootRaw) : undefined
     const worktree = gitRoot ?? directory
@@ -248,21 +259,39 @@ export function execute<E>(
     }
 
     yield* hooks.revalidate()
+    const diagnosticAbsolutePath = (file: string) =>
+      path.isAbsolute(file) ? path.resolve(file) : path.resolve(diagnosticCwd, file)
     const safeDiagnosticPath = (file: string) => {
-      const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(diagnosticCwd, file)
+      const absolute = diagnosticAbsolutePath(file)
       return contained(rootPath, absolute) ? safeVirtual(hooks as Hooks<unknown>, absolute) : `<external>/${path.basename(absolute)}`
     }
+    const pathKey = (file: string) => {
+      const resolved = path.resolve(file)
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved
+    }
+    const scopeKeys = new Set(scope.map(pathKey))
+    const isTargetDiagnostic = (diagnostic: TypecheckScope.Diagnostic) =>
+      mode === "full" || scopeKeys.has(pathKey(diagnosticAbsolutePath(diagnostic.file)))
+    const targetDiagnostics = diagnostics.filter(isTargetDiagnostic)
+    const transitiveDiagnostics = diagnostics.filter((diagnostic) => !isTargetDiagnostic(diagnostic))
     const counts: Record<string, number> = {}
     for (const diagnostic of diagnostics) counts[diagnostic.severity] = (counts[diagnostic.severity] ?? 0) + 1
     const clusters = TypecheckScope.clusterDiagnostics(diagnostics)
     const status = timedOut ? "timed-out" : exitCode === 0 ? "passed" : "failed"
+    const next = timedOut
+      ? "Typecheck timed out and the owned compiler process tree was retired."
+      : targetDiagnostics.length
+        ? `Fix selected-scope diagnostics first; ${transitiveDiagnostics.length} transitive/imported diagnostic(s) are also reported.`
+        : transitiveDiagnostics.length
+          ? `No diagnostics in the selected files; compiler failed on ${transitiveDiagnostics.length} transitive/imported diagnostic(s). Do not edit unrelated files solely to clear this scoped validation.`
+          : "No errors detected in the selected scope."
     const output = [
       `<typecheck mode="${mode}" status="${status}" errors="${diagnostics.length}" truncated="${truncated}">`,
       `  <scope files="${scope.length}">`,
       ...scope.map((file) => `    <file>${escapeXml(hooks.toVirtualPath(file))}</file>`),
       "  </scope>",
       tsconfigPath ? `  <tsconfig>${escapeXml(hooks.toVirtualPath(tsconfigPath))}</tsconfig>` : "  <tsconfig>package typecheck script</tsconfig>",
-      `  <summary status="${status}" errors="${diagnostics.length}" bin="${bin}" exit="${exitCode}" />`,
+      `  <summary status="${status}" errors="${diagnostics.length}" targetErrors="${targetDiagnostics.length}" transitiveErrors="${transitiveDiagnostics.length}" bin="${bin}" exit="${exitCode}" />`,
       "  <triage>",
       `    <p0>${counts.P0 ?? 0}</p0>`,
       `    <p1>${counts.P1 ?? 0}</p1>`,
@@ -280,12 +309,12 @@ export function execute<E>(
             "  <diagnostics>",
             ...diagnostics.map(
               (diagnostic) =>
-                `    <diagnostic file="${escapeXml(safeDiagnosticPath(diagnostic.file))}" line="${diagnostic.line}" column="${diagnostic.column}" code="TS${diagnostic.code}" severity="${diagnostic.severity}" category="${escapeXml(diagnostic.category)}">\n      <message>${escapeXml(diagnostic.message)}</message>\n      <suggestion>${escapeXml(diagnostic.suggestion)}</suggestion>\n    </diagnostic>`,
+                `    <diagnostic scope="${isTargetDiagnostic(diagnostic) ? "target" : "transitive"}" file="${escapeXml(safeDiagnosticPath(diagnostic.file))}" line="${diagnostic.line}" column="${diagnostic.column}" code="TS${diagnostic.code}" severity="${diagnostic.severity}" category="${escapeXml(diagnostic.category)}">\n      <message>${escapeXml(diagnostic.message)}</message>\n      <suggestion>${escapeXml(diagnostic.suggestion)}</suggestion>\n    </diagnostic>`,
             ),
             "  </diagnostics>",
           ]
         : []),
-      `  <next>${timedOut ? "Typecheck timed out and the owned compiler process tree was retired." : diagnostics.length ? "Fix P0 then P1 diagnostics first." : "No errors detected in the selected scope."}</next>`,
+      `  <next>${escapeXml(next)}</next>`,
       "</typecheck>",
     ].join("\n")
 
@@ -297,6 +326,8 @@ export function execute<E>(
         status,
         files: scope.map((file) => hooks.toVirtualPath(file)),
         errors: diagnostics.length,
+        targetErrors: targetDiagnostics.length,
+        transitiveErrors: transitiveDiagnostics.length,
         truncated,
         timedOut,
         exitCode,

@@ -203,7 +203,20 @@ const layer = Layer.effect(
           }),
         )
       }
-      return yield* authorize(request).pipe(Effect.catch(onFailure))
+      const fresh = yield* authorize(request).pipe(Effect.catch(onFailure))
+      const admittedRootID = admission.root?.root.id
+      const freshRootID = fresh.root?.root.id
+      if (
+        fresh.connectorID !== admission.connectorID ||
+        fresh.authority !== admission.authority ||
+        freshRootID !== admittedRootID
+      ) {
+        return yield* new OxpError.AuthRevoked({
+          detail: "OXP authority was revoked or its approved location changed",
+          metadata: { admittedRevision: admission.revision },
+        })
+      }
+      return fresh
     })
 
     return Service.of({ discover, authorize, revalidate })

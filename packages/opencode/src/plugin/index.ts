@@ -22,7 +22,6 @@ import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { CerebrasPlugin } from "./cerebras"
 import { WorkBuddyPlugin } from "./workbuddy"
-import { VerdentPlugin } from "./verdent"
 import { ZenPlugin, ZenGoPlugin } from "./zen"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { ClaudeAuthPlugin } from "./claude"
@@ -108,7 +107,6 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     DigitalOceanAuthPlugin,
     SnowflakeCortexAuthPlugin,
     WorkBuddyPlugin,
-    VerdentPlugin,
     ZenPlugin,
     ZenGoPlugin,
     XaiAuthPlugin,

@@ -62,6 +62,26 @@ export type CatalogItem = {
   source: "registry" | "mcp" | "mcp-resource"
 }
 
+function finalFunctionParametersSchema(schema: ReturnType<typeof ProviderTransform.schema>) {
+  const objectRoot =
+    schema.type === "object" ||
+    (Array.isArray(schema.type) && schema.type.includes("object"))
+  if (!objectRoot || schema.properties !== undefined) return schema
+  return { ...schema, properties: {} }
+}
+
+function abortSignalEffect(signal: AbortSignal): Effect.Effect<never> {
+  return Effect.callback<never>((resume) => {
+    if (signal.aborted) {
+      resume(Effect.die(new DOMException("Tool execution aborted", "AbortError")))
+      return
+    }
+    const onAbort = () => resume(Effect.die(new DOMException("Tool execution aborted", "AbortError")))
+    signal.addEventListener("abort", onAbort, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", onAbort))
+  })
+}
+
 function compactToolDescription(value: string | undefined) {
   const line = value
     ?.split(/\r?\n/, 1)[0]
@@ -320,15 +340,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }
       })
     },
-    ask: (req) =>
-      permission
+    ask: (req) => {
+      const wait = permission
         .ask({
           ...req,
           sessionID: input.session.id,
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
         })
-        .pipe(Effect.orDie),
+        .pipe(Effect.orDie)
+      const abort = killable ?? options.abortSignal
+      // Tool execution crosses a Promise boundary below. A per-call kill aborts
+      // the child signal while a Session/turn cancellation aborts the parent.
+      // Race the permission wait against either signal so Deferred.await is
+      // interrupted and its ensuring cleanup releases the pending request.
+      return abort ? Effect.raceFirst(wait, abortSignalEffect(abort)) : wait
+    },
   })
 
   for (const item of yield* registry.tools({
@@ -337,7 +364,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     agent: input.agent,
     permission: input.session.permission,
   })) {
-    const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
+    const schema = finalFunctionParametersSchema(
+      ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item)),
+    )
     const wrapped = tool({
       description: item.description,
       inputSchema: jsonSchema(schema),
@@ -383,6 +412,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 yield* interrupt.release({ sessionID: input.session.id, callID: options.toolCallId })
             }
           }),
+          { signal: options.abortSignal },
         )
       },
     })
@@ -472,6 +502,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -553,6 +584,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -633,6 +665,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             return output
           }),
+          { signal: opts.abortSignal },
         )
       },
     })
@@ -651,7 +684,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     if (!execute) continue
 
     const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
-    const transformed = ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} })
+    const transformed = finalFunctionParametersSchema(
+      ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} }),
+    )
     item.inputSchema = jsonSchema(transformed)
     item.execute = (args, opts) =>
       run.promise(
@@ -746,6 +781,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           }
           return output
         }),
+        { signal: opts.abortSignal },
       )
     tools[key] = item
   }

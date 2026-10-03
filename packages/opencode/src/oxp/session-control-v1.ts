@@ -2,7 +2,7 @@ import { Cause, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { OxpSessionControl } from "./session-control"
 import { OxpRuntimeV1 } from "./runtime-v1"
 
-type BasicAction = "pause" | "resume" | "abort"
+type BasicAction = "pause" | "resume" | "abort" | "archive" | "unarchive" | "delete"
 
 type StartedPrompt = {
   readonly admittedMessageID: string
@@ -227,24 +227,36 @@ const startPrompt = (
         const sessionID = runtime.SessionID.make(target.sessionID)
         const selected = yield* ensurePromptSelection(runtime, target, input.actorRef)
         yield* commitGuard(target)
-        const admitted = yield* prompt.hostPrompt(
-          {
-            sessionID,
-            agent: selected.agent,
-            model: {
-              providerID: runtime.ProviderV2.ID.make(selected.model.providerID),
-              modelID: runtime.ModelV2.ID.make(selected.model.modelID),
-              ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
+        const admitted = yield* prompt
+          .hostPrompt(
+            {
+              sessionID,
+              agent: selected.agent,
+              model: {
+                providerID: runtime.ProviderV2.ID.make(selected.model.providerID),
+                modelID: runtime.ModelV2.ID.make(selected.model.modelID),
+                ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
+              },
+              ...(selected.model.variant ? { variant: selected.model.variant } : {}),
+              noReply: true,
+              parts: [{ type: "text", text: input.text }],
             },
-            ...(selected.model.variant ? { variant: selected.model.variant } : {}),
-            noReply: true,
-            parts: [{ type: "text", text: input.text }],
-          },
-          {
-            source: runtime.SessionTurnProvenance.Source.OxpSupervisor,
-            ref: input.actorRef,
-          },
-        )
+            {
+              source: runtime.SessionTurnProvenance.Source.OxpSupervisor,
+              ref: input.actorRef,
+            },
+          )
+          .pipe(
+            Effect.mapError((error) =>
+              error instanceof runtime.SessionPrompt.HostOwnedSessionError
+                ? new OxpSessionControl.HostOwned(
+                    String(error.sessionID),
+                    String(error.parentID),
+                    String(error.kind),
+                  )
+                : error,
+            ),
+          )
         const current = yield* v1Sessions.get(sessionID)
         if (current.pausedAt !== undefined) {
           return {
@@ -348,6 +360,37 @@ function runBasic(
           return
         }
 
+        if (action === "archive" || action === "unarchive") {
+          yield* commitGuard(target)
+          yield* sessions.setArchived({
+            sessionID,
+            time: action === "archive" ? Date.now() : null,
+          })
+          return
+        }
+
+        if (action === "delete") {
+          // Quiesce the target before the final authorization gate so there is
+          // no prompt-cancellation await between commit revalidation and native
+          // recursive deletion.
+          yield* prompt.cancel(sessionID)
+          yield* commitGuard(target)
+          // Match the user-facing destructive lifecycle and delegate recursive
+          // cleanup to Session.remove. Usage history is independent of this
+          // live Session lifecycle.
+          yield* sessions.remove(sessionID)
+          const stillPresent = yield* sessions
+            .get(sessionID)
+            .pipe(
+              Effect.as(true),
+              Effect.catch(() => Effect.succeed(false)),
+            )
+          if (stillPresent) {
+            return yield* Effect.fail(new Error("Native Session delete did not remove the target"))
+          }
+          return
+        }
+
         yield* commitGuard(target)
         yield* sessions.setPaused({ sessionID, pausedAt: undefined })
         yield* prompt.loop({ sessionID }).pipe(
@@ -372,6 +415,9 @@ export const layer = Layer.effect(
       pause: (target) => runBasic(scope, target, "pause"),
       resume: (target) => runBasic(scope, target, "resume"),
       abort: (target) => runBasic(scope, target, "abort"),
+      archive: (target) => runBasic(scope, target, "archive"),
+      unarchive: (target) => runBasic(scope, target, "unarchive"),
+      delete: (target) => runBasic(scope, target, "delete"),
       setSelection,
       send: (target, input) =>
         startPrompt(scope, target, input).pipe(
@@ -462,11 +508,60 @@ export const layer = Layer.effect(
           (runtime) =>
             Effect.gen(function* () {
               const goals = yield* runtime.GoalAgent.Service
+              const sessionID = runtime.SessionSchema.ID.make(target.sessionID)
+
+              if (input.action === "request_verification") {
+                // request_verification is not merely a Goal lifecycle mutation.
+                // The native host owns verification as an execution-preemption
+                // command: latch durable audit work, quiesce any worker/tool
+                // fiber, then launch the independent auditor. OXP must reuse
+                // that owner rather than calling GoalAgent's conversational
+                // transition directly, which would strand the Goal in
+                // verifying with no auditor.
+                const current = yield* goals.execute(sessionID, { action: "status" })
+                const detail = current.goal
+                const revision = detail.goal.revision
+                if (input.expectedRevision !== undefined && input.expectedRevision !== revision) {
+                  return yield* Effect.fail(
+                    new OxpSessionControl.GoalRevisionConflict(
+                      detail.goal.id,
+                      input.expectedRevision,
+                      revision,
+                    ),
+                  )
+                }
+                if (detail.goal.status !== "active" && detail.goal.status !== "verifying") {
+                  return yield* Effect.fail(
+                    new OxpSessionControl.GoalVerificationUnavailable(
+                      detail.goal.id,
+                      detail.goal.status,
+                    ),
+                  )
+                }
+
+                const prompt = yield* runtime.SessionPrompt.Service
+                yield* commitGuard(target)
+                yield* prompt
+                  .requestGoalAudit(runtime.SessionID.make(target.sessionID))
+                  .pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logError("OXP Goal verification dispatch failed", {
+                        sessionID: target.sessionID,
+                        goalID: detail.goal.id,
+                        cause,
+                      }),
+                    ),
+                    Effect.forkIn(scope, { startImmediately: true }),
+                    Effect.asVoid,
+                  )
+                return { action: input.action, goal: detail }
+              }
+
               // Deliberately omit TurnProvenance. Goal creation is user-owned and
               // GoalAgent will fail closed without a trusted current human turn;
               // all existing-Goal operations retain their native semantics.
               yield* commitGuard(target)
-              return yield* goals.execute(runtime.SessionSchema.ID.make(target.sessionID), input)
+              return yield* goals.execute(sessionID, input)
             }),
         ),
     })

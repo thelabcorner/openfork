@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { UsageYield } from "@opencode-ai/core/usage/yield"
+import { UsageHistoryWatermark } from "@opencode-ai/core/usage/history-watermark"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import {
   effectiveSamples,
@@ -16,6 +17,7 @@ import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { GoCapacityPrior } from "./go-prior"
 import * as ProviderCapacity from "./provider-capacity"
 import * as ResourceLearning from "./resource-learning"
+import * as GeneralUsage from "./general-usage"
 import type { ProviderResult, ProviderSummary } from "@/quota/schema"
 
 export const GoEvidence = Schema.Struct({
@@ -61,6 +63,58 @@ export const GoPredictiveRange = Schema.Union([
 ])
 export type GoPredictiveRange = Schema.Schema.Type<typeof GoPredictiveRange>
 
+/**
+ * Full-window request capacity for one published quota window.
+ *
+ * This is a DIFFERENT quantity from `estimatedRequests` on the same estimate:
+ * that one is requests remaining in the current 5h window, while this one is
+ * how many requests of THIS model's typical published size the whole window
+ * affords. Capacity divides the published window limit by the same workload
+ * posterior as the remaining line, so the two stay consistent
+ * (`estimatedRequests ≈ remainingFraction x windowCapacity["5h"].pointRequests`)
+ * without the client ever recomputing either.
+ *
+ * A window appears only when the provider published a real limit for it. There
+ * is no synthesized or cross-provider fallback value, so an absent window means
+ * "no authoritative support", never "zero requests".
+ *
+ * `remaining` carries the OTHER half of the answer, and only where it is
+ * actually known: requests still available in THIS window when the official
+ * snapshot really reported that window's consumption. An absent `remaining`
+ * means the window's consumption is unknown, never zero, and never borrowed
+ * from the 5h window.
+ *
+ * There is deliberately NO predictive range on these rows. The deployed
+ * `GoPredictiveRange` is a 5h renewal/stopping-time calibration validated
+ * against realized counts of requests until the next 5h reset; it was never
+ * validated for full-window totals or for weekly/monthly stopping behaviour, so
+ * attaching it to a window total would claim coverage that was not measured. A
+ * consumer that wants a sensitivity band for a full-window total must derive
+ * one from its own representative request corpus, and must not call it a
+ * confidence interval.
+ */
+export const GoWindowRemaining = Schema.Struct({
+  /** Real official remaining percentage for this window, 0-100. */
+  remainingPercent: Schema.Finite,
+  /** Requests still available in this window; null when the read fails closed. */
+  remainingRequests: Schema.NullOr(Schema.Finite),
+ /** Real reset boundary of this window; absent when the provider reported none. */
+  resetAt: Schema.optional(Schema.Finite),
+  status: Schema.Literals(["ready", "unavailable"]),
+})
+export type GoWindowRemaining = Schema.Schema.Type<typeof GoWindowRemaining>
+
+export const GoWindowCapacity = Schema.Struct({
+  window: Schema.Literals(["5h", "week", "month"]),
+  /** Published full-window limit, in typical request-equivalents. */
+  baselineRequests: Schema.Finite,
+  /** Full-window capacity under the same workload posterior as the remaining line. */
+  pointRequests: Schema.Finite,
+  /** Observed remaining capacity for this window; absent when not observed. */
+  remaining: Schema.optional(GoWindowRemaining),
+})
+export type GoWindowCapacity = Schema.Schema.Type<typeof GoWindowCapacity>
+
 export const GoEstimate = Schema.Struct({
   modelID: Schema.String,
   accountID: Schema.optional(Schema.String),
@@ -75,6 +129,11 @@ export const GoEstimate = Schema.Struct({
   quotaStatus: Schema.Literals(["ok", "stale"]),
   projectionStatus: Schema.Literals(["ok", "incomplete-local-accounting"]),
   predictiveRange: GoPredictiveRange,
+  /**
+   * Full-window request capacity per published window, in window order. Additive
+   * relative to the remaining-5h fields above; absent on older servers.
+   */
+  windowCapacity: Schema.Array(GoWindowCapacity),
   evidence: GoEvidence,
 })
 export type GoEstimate = Schema.Schema.Type<typeof GoEstimate>
@@ -109,6 +168,7 @@ export const Snapshot = Schema.Struct({
   routed: Schema.Array(GoEstimate),
   accounts: Schema.Array(GoAccountEstimate),
   providers: Schema.Array(ProviderCapacity.Provider),
+  generalUsage: GeneralUsage.Snapshot,
 })
 export type Snapshot = Schema.Schema.Type<typeof Snapshot>
 
@@ -122,6 +182,25 @@ export interface GoResource {
   readonly localRequestsApplied?: number
   readonly localFractionConsumed?: number
   readonly localUnnormalizedRequests?: number
+  /**
+   * Observed non-primary windows (week/month) carried by the SAME official
+   * snapshot that produced the primary 5h resource above. No extra provider
+   * read is involved; this is the already-merged weekly/monthly telemetry.
+   */
+  readonly observedWindows?: readonly GoObservedWindow[]
+}
+
+/**
+ * One non-primary Go window whose consumption the official snapshot really
+ * reported. `5h` is the primary resource and is deliberately not repeated
+ * here.
+ */
+export interface GoObservedWindow {
+  readonly window: "week" | "month"
+  readonly remainingFraction: number
+  readonly resetAt?: number
+  /** Local post-snapshot burn that could not be normalized into this window. */
+  readonly unnormalizedRequests?: number
 }
 
 export interface LocalSettlement {
@@ -155,7 +234,12 @@ export interface ProvidersInput {
 
 export interface Interface {
   readonly go: (input: GoInput) => Effect.Effect<GoSnapshot>
-  readonly providers: (input: ProvidersInput) => Effect.Effect<ProviderCapacity.Provider[]>
+  /** Fast local-only generalized workload projection; performs no provider I/O. */
+  readonly general: () => Effect.Effect<GeneralUsage.Snapshot>
+  readonly providers: (input: ProvidersInput) => Effect.Effect<{
+    readonly providers: ProviderCapacity.Provider[]
+    readonly generalUsage: GeneralUsage.Snapshot
+  }>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Capacity") {}
@@ -214,16 +298,68 @@ export const GO_CAPACITY_PREDICTIVE_RANGE = {
 
 type PredictiveBudget = keyof typeof GO_CAPACITY_PREDICTIVE_RANGE.budgets
 
-function predictiveBudgetFor(remainingTypicalRequests: number): PredictiveBudget {
-  if (!(remainingTypicalRequests > 0)) return 5
-  if (remainingTypicalRequests <= Math.sqrt(5 * 20)) return 5
-  if (remainingTypicalRequests <= Math.sqrt(20 * 100)) return 20
+/**
+ * Windows Capacity publishes a full-window request capacity for, in display
+ * order. Every one of these is a window the upstream OpenCode Go table actually
+ * publishes a per-model request limit for, so no window here needs a
+ * synthesized value.
+ */
+const GO_CAPACITY_WINDOWS: readonly GoCapacityPrior.Window[] = ["5h", "week", "month"]
+
+type WindowDebit = { fraction: number; requests: number; unnormalized: number }
+
+/**
+ * The observed remaining fraction for one window, or undefined when that
+ * window's consumption was never actually observed.
+ *
+ * The 5h window is the primary resource. Every other window must be carried
+ * explicitly by the caller, which is what stops a 5h percentage from being
+ * restated as a weekly or monthly one.
+ */
+function goWindowObservation(
+  resource: GoResource,
+  window: GoCapacityPrior.Window,
+): { remainingFraction: number; resetAt?: number; unnormalized: number } | undefined {
+  if (window === "5h") {
+    return {
+      remainingFraction: clampFraction(resource.remainingFraction),
+      resetAt: resource.resetAt,
+      unnormalized: resource.localUnnormalizedRequests ?? 0,
+    }
+  }
+  const observed = resource.observedWindows?.find((entry) => entry.window === window)
+  if (!observed) return undefined
+  return {
+    remainingFraction: clampFraction(observed.remainingFraction),
+    ...(observed.resetAt !== undefined ? { resetAt: observed.resetAt } : {}),
+    unnormalized: observed.unnormalizedRequests ?? 0,
+  }
+}
+
+function predictiveBudgetFor(budgetRequests: number): PredictiveBudget {
+  if (!(budgetRequests > 0)) return 5
+  if (budgetRequests <= Math.sqrt(5 * 20)) return 5
+  if (budgetRequests <= Math.sqrt(20 * 100)) return 20
   return 100
 }
 
+/**
+ * Calibrated multiplicative uncertainty around a point request count.
+ *
+ * `budgetRequests` is the typical request-equivalent scale of the window the
+ * point was drawn from: the remaining 5h entitlement for the requests-left
+ * line, or the whole published window limit for a full-window capacity row. The
+ * calibrated error is multiplicative (log-residual), so the same budget ladder
+ * and the same calibration numbers apply at either scale — only the absolute
+ * size of the entitlement decides which neighbor band is selected.
+ *
+ * Passing the window's own baseline (rather than a near-zero remaining
+ * fraction) is what keeps a nearly-exhausted window from collapsing into a
+ * degenerate "0 requests, range 0-0" instead of an honest full-window capacity.
+ */
 function predictiveRange(input: {
   readonly pointRequests: number
-  readonly remainingTypicalRequests: number
+  readonly budgetRequests: number
   readonly effectiveSamples: number
   readonly projectionStatus: GoEstimate["projectionStatus"]
 }): GoPredictiveRange {
@@ -244,7 +380,7 @@ function predictiveRange(input: {
     }
   }
 
-  const calibrationBudget = predictiveBudgetFor(input.remainingTypicalRequests)
+  const calibrationBudget = predictiveBudgetFor(input.budgetRequests)
   const calibration = GO_CAPACITY_PREDICTIVE_RANGE.budgets[calibrationBudget]
   const point = Math.max(0, input.pointRequests)
   return {
@@ -441,9 +577,48 @@ export function estimateGoModel(input: {
     account.observations > 0 ? account.sessionEffectiveSamples : base.sessionEffectiveSamples
   const range = predictiveRange({
     pointRequests,
-    remainingTypicalRequests,
+    budgetRequests: remainingTypicalRequests,
     effectiveSamples: predictiveEffectiveSamples,
     projectionStatus,
+  })
+
+  // Full-window capacity: the published window limit personalized by the same
+  // workload posterior. Deliberately NOT `pointRequests / remainingFraction` —
+  // that would invert a near-zero remainder into an unbounded claim. The
+  // multiplier is a per-request size ratio, so it applies to a whole window
+  // exactly as it does to the remaining slice of one.
+  //
+  // `projectionStatus` is intentionally forced to "ok" here. Incomplete local
+  // accounting invalidates the *remaining* fraction, never the published window
+  // limit or the personal request-size posterior, so a capacity row stays
+  // usable in precisely the case where the requests-left line fails closed.
+  const windowCapacity = GO_CAPACITY_WINDOWS.flatMap((window): GoWindowCapacity[] => {
+    const windowBaseline = GoCapacityPrior.requestsAt(input.prior, window, at)
+    if (!(Number.isFinite(windowBaseline) && windowBaseline > 0 && workloadMultiplier > 0)) return []
+    const windowPoint = windowBaseline / workloadMultiplier
+    if (!(Number.isFinite(windowPoint) && windowPoint > 0)) return []
+    // Remaining capacity is published only for a window whose consumption was
+    // really observed, and it reuses the SAME published limit and the SAME
+    // workload multiplier as the capacity row beside it. Ambiguous local
+    // accounting fails this line closed; it never invalidates the capacity row.
+    const observation = goWindowObservation(input.resource, window)
+    const remaining: GoWindowRemaining | undefined = observation
+      ? {
+          remainingPercent: observation.remainingFraction * 100,
+          remainingRequests:
+            observation.unnormalized > 0
+              ? null
+              : floorRequestCount((windowBaseline * observation.remainingFraction) / workloadMultiplier),
+          ...(observation.resetAt !== undefined ? { resetAt: observation.resetAt } : {}),
+          status: observation.unnormalized > 0 ? ("unavailable" as const) : ("ready" as const),
+        }
+      : undefined
+    return [{
+      window,
+      baselineRequests: windowBaseline,
+      pointRequests: windowPoint,
+      ...(remaining ? { remaining } : {}),
+    }]
   })
 
   return {
@@ -460,6 +635,7 @@ export function estimateGoModel(input: {
     quotaStatus: input.resource.status,
     projectionStatus,
     predictiveRange: range,
+    windowCapacity,
     evidence: {
       observations: active.observations,
       requestEffectiveSamples: active.requestEffectiveSamples,
@@ -494,16 +670,39 @@ export function applyLocalDepletion(input: {
       resource.credentialID ? [[resource.credentialID, resource] as const] : [],
     ),
   )
-  const consumed = new Map<string, { fraction: number; requests: number; unnormalized: number }>()
+  // Local burn is debited per window in that window's own request-equivalent
+  // units: one settled request costs a 5h window 1/requests_5h and a weekly
+  // window 1/requests_week. Debiting one window with another window's
+  // denominator is how a per-window projection becomes untruthful.
+  const consumed = new Map<string, Map<GoCapacityPrior.Window, WindowDebit>>()
   const seenMessageIDs = new Set<string>()
 
-  const currentFor = (resource: GoResource) => {
-    const current = consumed.get(resource.accountID) ?? { fraction: 0, requests: 0, unnormalized: 0 }
-    consumed.set(resource.accountID, current)
+  const currentFor = (resource: GoResource, window: GoCapacityPrior.Window): WindowDebit => {
+    let byWindow = consumed.get(resource.accountID)
+    if (!byWindow) {
+      byWindow = new Map()
+      consumed.set(resource.accountID, byWindow)
+    }
+    const current = byWindow.get(window) ?? { fraction: 0, requests: 0, unnormalized: 0 }
+    byWindow.set(window, current)
     return current
   }
+  const windowsFor = (resource: GoResource) => [
+    ...new Set<GoCapacityPrior.Window>(["5h", ...(resource.observedWindows ?? []).map((entry) => entry.window)]),
+  ]
+  const windowResetAt = (resource: GoResource, window: GoCapacityPrior.Window) =>
+    window === "5h"
+      ? resource.resetAt
+      : resource.observedWindows?.find((entry) => entry.window === window)?.resetAt
+  const belongsToWindow = (resource: GoResource, window: GoCapacityPrior.Window, completedAt: number) => {
+    if (completedAt <= resource.snapshotAt) return false
+    const resetAt = windowResetAt(resource, window)
+    // A window whose reset boundary is unknown cannot prove membership, so an
+    // unverifiable debit is recorded as ambiguous instead of being skipped.
+    return resetAt !== undefined && completedAt < resetAt
+  }
   const belongsToSnapshotWindow = (resource: GoResource, completedAt: number) =>
-    completedAt > resource.snapshotAt && completedAt < resource.resetAt && resource.resetAt > at
+    resource.resetAt > at && belongsToWindow(resource, "5h", completedAt)
 
   for (const settlement of input.settlements) {
     if (settlement.messageID) {
@@ -526,7 +725,8 @@ export function applyLocalDepletion(input: {
       // could contain the request is therefore non-projectable until a newer
       // official snapshot supersedes the ambiguity.
       for (const candidate of input.resources) {
-        if (belongsToSnapshotWindow(candidate, settlement.completedAt)) currentFor(candidate).unnormalized += 1
+        if (!belongsToSnapshotWindow(candidate, settlement.completedAt)) continue
+        for (const window of windowsFor(candidate)) currentFor(candidate, window).unnormalized += 1
       }
       continue
     }
@@ -538,36 +738,40 @@ export function applyLocalDepletion(input: {
 
     const modelID = settlement.baseModelID ?? splitAccountModelID(settlement.modelID).baseModelID
     const prior = priorByModel.get(modelID)
-    if (!prior) {
-      currentFor(resource).unnormalized += 1
-      continue
-    }
-
-    const requests = GoCapacityPrior.requestsAt(prior, "5h", settlement.completedAt)
-    const typicalCost = GoCapacityPrior.priceTypical(prior)
-    const actualCost = GoCapacityPrior.priceTokens(prior, settlement.tokens)
+    const typicalCost = prior ? GoCapacityPrior.priceTypical(prior) : undefined
+    const actualCost = prior ? GoCapacityPrior.priceTokens(prior, settlement.tokens) : undefined
     if (
-      !(requests > 0) ||
       !(typicalCost !== undefined && typicalCost > 0) ||
       !(actualCost !== undefined && actualCost > 0)
     ) {
-      currentFor(resource).unnormalized += 1
+      for (const window of windowsFor(resource)) currentFor(resource, window).unnormalized += 1
       continue
     }
 
     const multiplier = actualCost / typicalCost
     if (!(Number.isFinite(multiplier) && multiplier > 0)) {
-      currentFor(resource).unnormalized += 1
+      for (const window of windowsFor(resource)) currentFor(resource, window).unnormalized += 1
       continue
     }
 
-    const current = currentFor(resource)
-    current.fraction += multiplier / requests
-    current.requests += 1
+    for (const window of windowsFor(resource)) {
+      if (!belongsToWindow(resource, window, settlement.completedAt)) continue
+      const requests = prior ? GoCapacityPrior.requestsAt(prior, window, settlement.completedAt) : 0
+      if (!(requests > 0)) {
+        currentFor(resource, window).unnormalized += 1
+        continue
+      }
+      const current = currentFor(resource, window)
+      current.fraction += multiplier / requests
+      current.requests += 1
+    }
   }
 
   return input.resources.map((resource) => {
-    const local = consumed.get(resource.accountID)
+    const byWindow = consumed.get(resource.accountID)
+    const debitFor = (window: GoCapacityPrior.Window): WindowDebit =>
+      byWindow?.get(window) ?? { fraction: 0, requests: 0, unnormalized: 0 }
+    const local = debitFor("5h")
     const fraction = Math.max(0, local?.fraction ?? 0)
     return {
       ...resource,
@@ -575,8 +779,41 @@ export function applyLocalDepletion(input: {
       localRequestsApplied: local?.requests ?? 0,
       localFractionConsumed: fraction,
       localUnnormalizedRequests: local?.unnormalized ?? 0,
+      ...(resource.observedWindows
+        ? {
+            observedWindows: resource.observedWindows.map((entry) => {
+              const debit = debitFor(entry.window)
+              return {
+                window: entry.window,
+                remainingFraction: clampFraction(entry.remainingFraction - Math.max(0, debit.fraction)),
+                ...(entry.resetAt !== undefined ? { resetAt: entry.resetAt } : {}),
+                ...(debit.unnormalized > 0 ? { unnormalizedRequests: debit.unnormalized } : {}),
+              }
+            }),
+          }
+        : {}),
     }
   })
+}
+
+/**
+ * Clamp one resource's observed fractions and drop non-primary windows whose
+ * reset boundary has already passed. An official percentage is evidence about
+ * the window that produced it, so a reset week/month window is historical.
+ */
+function normalizeGoResource(resource: GoResource, at: number): GoResource {
+  const observedWindows = resource.observedWindows?.flatMap((entry) =>
+    entry.resetAt !== undefined && entry.resetAt <= at
+      ? []
+      : [{ ...entry, remainingFraction: clampFraction(entry.remainingFraction) }],
+  )
+  return {
+    ...resource,
+    remainingFraction: clampFraction(resource.remainingFraction),
+    // Assigned unconditionally when a list existed: an emptied list must
+    // REPLACE the original array, not fall back to it through the spread above.
+    ...(observedWindows !== undefined ? { observedWindows } : {}),
+  }
 }
 
 export function buildGoSnapshot(input: {
@@ -598,10 +835,7 @@ export function buildGoSnapshot(input: {
     if (resource.resetAt <= at) continue
     const current = resources.get(resource.accountID)
     if (!current || (current.status === "stale" && resource.status === "ok")) {
-      resources.set(resource.accountID, {
-        ...resource,
-        remainingFraction: clampFraction(resource.remainingFraction),
-      })
+      resources.set(resource.accountID, normalizeGoResource(resource, at))
     }
   }
 
@@ -644,6 +878,39 @@ export function buildGoSnapshot(input: {
 }
 
 export function goProviderView(snapshot: GoSnapshot): ProviderCapacity.Provider {
+  // Go's published window ids are already its display labels ("5h", "week",
+  // "month"), so the cross-provider view never invents a second label.
+  const convertWindow = (
+    estimate: GoEstimate,
+    window: GoWindowCapacity,
+  ): ProviderCapacity.Window => ({
+    id: window.window,
+    label: window.window,
+    basis: window.remaining ? ("observed-remaining" as const) : ("personalized-total-capacity" as const),
+    status: window.remaining?.status === "unavailable" ? ("unavailable" as const) : ("ready" as const),
+    source: "published-model-capacity",
+    // Personalization is a property of the workload posterior, which is shared
+    // by every window of this estimate. It is never per-window.
+    personalized: estimate.personalized,
+    estimatedRequests: window.remaining
+      ? window.remaining.remainingRequests
+      : ProviderCapacity.floorRequestCount(window.pointRequests),
+    remainingPercent: window.remaining ? window.remaining.remainingPercent : null,
+    resetAt: window.remaining?.resetAt ?? null,
+  })
+
+  // The binding window is the observed-remaining window with the fewest
+  // remaining requests. A capacity-only window is deliberately excluded: it
+  // describes what a window could hold, not what is left in it.
+  const bindingWindow = (estimate: GoEstimate) =>
+    estimate.windowCapacity.reduce<GoWindowCapacity | undefined>((best, window) => {
+      const requests = window.remaining?.remainingRequests
+      if (!window.remaining || requests === null || requests === undefined) return best
+      if (!best) return window
+      const current = best.remaining?.remainingRequests ?? Number.POSITIVE_INFINITY
+      return requests < current ? window : best
+    }, undefined)
+
   const convert = (estimate: GoEstimate): ProviderCapacity.Estimate => ({
     providerID: "opencode-go",
     modelID: estimate.modelID,
@@ -657,6 +924,15 @@ export function goProviderView(snapshot: GoSnapshot): ProviderCapacity.Provider 
     ...(estimate.projectionStatus === "ok"
       ? {}
       : { reason: "Local post-snapshot resource consumption could not be normalized safely." }),
+    ...(bindingWindow(estimate) ? { limitingWindow: bindingWindow(estimate)!.window } : {}),
+    ...(estimate.windowCapacity.length
+      ? {
+          windows: ProviderCapacity.boundedCapacityWindows(
+            estimate.windowCapacity.map((window) => convertWindow(estimate, window)),
+            bindingWindow(estimate)?.window,
+          ),
+        }
+      : {}),
     evidence: {
       observations: estimate.evidence.observations,
       requestEffectiveSamples: estimate.evidence.requestEffectiveSamples,
@@ -685,12 +961,56 @@ const layer = Layer.effect(
     const modelsDev = yield* ModelsDev.Service
     const { db, readDb } = yield* Database.Service
     yield* ResourceLearning.ensureTables(db)
+    // Capacity memoizes durable usage history in process memory. Key that memo on
+    // the combined in-process + cross-process watermark: a second host sharing
+    // this database file commits settlements that an in-process revision alone
+    // can never observe, which left this cache permanently stale. There is no TTL
+    // fallback here — invalidation is driven only by the exact commit signals the
+    // Database and Usage owners already expose.
+    const usageWatermark = UsageHistoryWatermark.make(db)
+    const usageEntries = UsageHistoryWatermark.cached(
+      Effect.suspend(() => usageYield.list()),
+      usageWatermark,
+    )
+    let generalUsageCache:
+      | {
+          watermark: UsageHistoryWatermark.Value
+          count: number
+          updatedAt: number
+          value: GeneralUsage.Snapshot
+        }
+      | undefined
+
+    const generalUsageFor = (
+      watermark: UsageHistoryWatermark.Value,
+      entries: readonly UsageYield.Entry[],
+    ) => {
+      let updatedAt = 0
+      let count = 0
+      for (const entry of entries) {
+        if (entry.key.accountID) continue
+        count += 1
+        if (entry.updatedAt > updatedAt) updatedAt = entry.updatedAt
+      }
+      const cached = generalUsageCache
+      if (
+        cached &&
+        UsageHistoryWatermark.same(cached.watermark, watermark) &&
+        cached.count === count &&
+        cached.updatedAt === updatedAt
+      )
+        return cached.value
+      const value = GeneralUsage.build(entries)
+      generalUsageCache = { watermark, count, updatedAt, value }
+      return value
+    }
 
     const go = Effect.fn("Capacity.go")(function* (input: GoInput) {
-      const [prior, entries] = yield* Effect.all(
-        [GoCapacityPrior.cache.get(), usageYield.list()],
+      const [prior, usage] = yield* Effect.all(
+        [GoCapacityPrior.cache.get(), usageEntries()],
         { concurrency: 2 },
       )
+      const entries = usage.value
       const earliestSnapshot = Math.min(
         ...input.accounts.map((resource) => resource.snapshotAt).filter((value) => value > 0),
       )
@@ -769,12 +1089,18 @@ const layer = Layer.effect(
       })
     })
 
+    const general = Effect.fn("Capacity.general")(function* () {
+      const usage = yield* usageEntries()
+      return generalUsageFor(usage.watermark, usage.value)
+    })
+
     const providers = Effect.fn("Capacity.providers")(function* (input: ProvidersInput) {
       const at = input.at ?? Date.now()
-      const [catalog, entries] = yield* Effect.all(
-        [modelsDev.get(), usageYield.list()],
+      const [catalog, usage] = yield* Effect.all(
+        [modelsDev.get(), usageEntries()],
         { concurrency: 2 },
       )
+      const entries = usage.value
       const byID = new Map(input.results.map((result) => [result.providerId, result] as const))
       const resolved = input.summaries.map((summary) => {
         const result =
@@ -804,19 +1130,22 @@ const layer = Layer.effect(
         })),
       )
 
-      return resolved.map(({ summary, result }) =>
-        ProviderCapacity.buildProvider({
-          summary,
-          result,
-          catalog,
-          entries,
-          burns,
-          at,
-        }),
-      )
+      return {
+        providers: resolved.map(({ summary, result }) =>
+          ProviderCapacity.buildProvider({
+            summary,
+            result,
+            catalog,
+            entries,
+            burns,
+            at,
+          }),
+        ),
+        generalUsage: generalUsageFor(usage.watermark, entries),
+      }
     })
 
-    return Service.of({ go, providers })
+    return Service.of({ go, general, providers })
   }),
 )
 

@@ -2,6 +2,7 @@ import { LLMResponse, Usage as LLMUsage } from "@opencode-ai/llm"
 import { Token } from "@opencode-ai/core/util/token"
 import { Effect } from "effect"
 import type { Provider } from "@/provider/provider"
+import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import { Session } from "@/session/session"
 import type { Interface as UsageInterface, TokenTotals } from "./usage"
 
@@ -30,6 +31,7 @@ export const recordResponse = (input: {
   usage: UsageInterface
   agent: string
   model: Provider.Model
+  route?: UsageRouteAttribution.Committed
   response: LLMResponse
   request: unknown
   sessionID?: string | null
@@ -64,6 +66,7 @@ export const recordResponse = (input: {
       agent: input.agent,
       providerID: input.model.providerID,
       modelID: input.model.id,
+      ...(input.route ? { route: input.route } : {}),
       variant: input.variant ?? null,
       sessionID: input.sessionID ?? null,
       projectID: input.projectID ?? null,

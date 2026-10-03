@@ -19,6 +19,44 @@ export const Parameters = Schema.Struct({
 })
 export type Input = Schema.Schema.Type<typeof Parameters>
 
+const transportMode = (
+  mode: GitTyped.Mode,
+  fields: readonly string[],
+  required: readonly string[] = [],
+  defaultMode = false,
+) => ({
+  type: "object" as const,
+  properties: Object.fromEntries([
+    ["rootID", {}],
+    ["workdir", {}],
+    ["mode", { const: mode }],
+    ...fields.map((name) => [name, {}] as const),
+  ]),
+  required: ["rootID", ...(defaultMode ? [] : ["mode"]), ...required],
+  additionalProperties: false as const,
+})
+
+/**
+ * Exact mode grammar for MCP clients that preserve conditional JSON Schema.
+ * The top-level schema remains a flat transport-safe envelope; GitTyped
+ * defensively validates again before any repository process executes.
+ */
+export const TransportModeConstraints = Object.freeze({
+  oneOf: Object.freeze([
+    transportMode("help", GitTyped.ModeFields.help),
+    transportMode("status", GitTyped.ModeFields.status, [], true),
+    transportMode("summary", GitTyped.ModeFields.summary),
+    transportMode("diff", GitTyped.ModeFields.diff),
+    transportMode("log", GitTyped.ModeFields.log),
+    transportMode("show", GitTyped.ModeFields.show, ["ref"]),
+    transportMode("stage", GitTyped.ModeFields.stage),
+    transportMode("unstage", GitTyped.ModeFields.unstage),
+    transportMode("restore", GitTyped.ModeFields.restore),
+    transportMode("commit", GitTyped.ModeFields.commit, ["message"]),
+    transportMode("shell", GitTyped.ModeFields.shell, ["argv"]),
+  ]),
+})
+
 export interface Interface {
   readonly execute: (input: Input, signal?: AbortSignal) => Effect.Effect<OxpResult.CapabilityResult, OxpError.Error>
 }
@@ -32,6 +70,29 @@ function cancelled(signal?: AbortSignal) {
     : Effect.void
 }
 
+function processError(
+  error: unknown,
+  signal?: AbortSignal,
+): OxpError.Error | undefined {
+  if (!(error instanceof AppProcess.AppProcessError)) return undefined
+  if (signal?.aborted) {
+    return new OxpError.Cancelled({
+      detail: "OXP Git operation was cancelled",
+    })
+  }
+  if (
+    error.cause instanceof Error &&
+    error.cause.message === "Timed out"
+  ) {
+    return new OxpError.Timeout({
+      detail: "OXP Git operation timed out",
+    })
+  }
+  return new OxpError.DependencyUnavailable({
+    detail: OxpError.boundDetail(error.message),
+  })
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -41,8 +102,16 @@ const layer = Layer.effect(
     const execute: Interface["execute"] = (input, signal) =>
       Effect.gen(function* () {
         yield* cancelled(signal)
-        const mode = input.mode ?? "status"
-        const mutating = GitTyped.isMutating(input)
+        const { rootID: _rootID, workdir: _workdir, ...gitInput } = input
+        yield* Effect.try({
+          try: () => GitTyped.validateInput(gitInput),
+          catch: (cause) =>
+            new OxpError.InvalidArgument({
+              detail: cause instanceof Error ? cause.message.slice(0, 1000) : "Invalid OXP Git arguments",
+            }),
+        })
+        const mode = gitInput.mode ?? "status"
+        const mutating = GitTyped.isMutating(gitInput)
         const admission = yield* authority.authorize({
           plane: "augmentation",
           operation: `git.${mode}`,
@@ -69,11 +138,14 @@ const layer = Layer.effect(
           requestedLocation = scoped.root.path
         }
         worktree = yield* GitTyped.resolveWorktreeRoot(app, requestedLocation).pipe(
-          Effect.mapError(() => new OxpError.InvalidArgument({
-            detail: input.workdir
-              ? "The selected OXP Git workdir is not inside a Git worktree"
-              : "The approved OXP root is not itself a Git worktree; provide workdir to select a repository inside it",
-          })),
+          Effect.mapError((error) =>
+            processError(error, signal) ??
+            new OxpError.InvalidArgument({
+              detail: input.workdir
+                ? "The selected OXP Git workdir is not inside a Git worktree"
+                : "The approved OXP root is not itself a Git worktree; provide workdir to select a repository inside it",
+            }),
+          ),
         )
         const approvedRoot = FSUtil.normalizePath(admission.root.canonicalPath)
         worktree = FSUtil.normalizePath(worktree)
@@ -100,10 +172,11 @@ const layer = Layer.effect(
             }),
           )
 
-        const result = yield* GitTyped.execute(app, input, worktree, signal, beforeMutation).pipe(
+        const result = yield* GitTyped.execute(app, gitInput, worktree, signal, beforeMutation).pipe(
           Effect.mapError((error) => {
             if (OxpError.isError(error)) return error
-            if (signal?.aborted) return new OxpError.Cancelled({ detail: "OXP Git operation was cancelled" })
+            const process = processError(error, signal)
+            if (process) return process
             return new OxpError.Conflict({
               detail: error instanceof Error ? error.message.slice(0, 1000) : "Git operation failed",
             })

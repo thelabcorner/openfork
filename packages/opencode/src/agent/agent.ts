@@ -1,10 +1,17 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Flag } from "@opencode-ai/core/flag/flag"
+import { OpenCodeHostedUserAgent } from "@opencode-ai/core/installation/version"
+import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Config } from "@/config/config"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Provider } from "@/provider/provider"
+import { Usage as UsageAnalytics } from "@/usage/usage"
+import { Session } from "@/session/session"
+import { MessageID, SessionID } from "@/session/schema"
 
-import { generateObject, streamObject, type ModelMessage } from "ai"
+import { generateObject, streamObject, wrapLanguageModel, type ModelMessage } from "ai"
+import { Usage as LLMUsage } from "@opencode-ai/llm"
 import { Truncate } from "@/tool/truncate"
 import { Auth } from "../auth"
 import { ProviderTransform } from "@/provider/transform"
@@ -31,6 +38,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Reference } from "@opencode-ai/core/reference"
+import { Agent as AgentContract } from "@opencode-ai/schema/agent"
 import { Location } from "@opencode-ai/core/location"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 
@@ -64,6 +72,18 @@ const GeneratedAgent = Schema.Struct({
   systemPrompt: Schema.String,
 })
 
+/**
+ * Built-in identity and shipped mode/hidden defaults come from the shared agent
+ * contract. Config may override effective exposure later in this state builder;
+ * `AgentContract.builtIn` throwing here still ensures a newly shipped native
+ * agent cannot exist without declaring its default topology once.
+ */
+function native(id: string) {
+  const topology = AgentContract.builtIn(id)
+  if (!topology) throw new Error(`built-in agent "${id}" is missing from the shared agent contract topology`)
+  return topology
+}
+
 export interface Interface {
   readonly get: (agent: string) => Effect.Effect<Info>
   readonly list: () => Effect.Effect<Info[]>
@@ -78,7 +98,7 @@ export interface Interface {
       whenToUse: string
       systemPrompt: string
     },
-    Provider.DefaultModelError | Provider.UnsupportedModelPrimitiveError
+    Provider.DefaultModelError | Provider.UnsupportedModelPrimitiveError | Provider.RouteResolutionError
   >
 }
 
@@ -88,6 +108,54 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Ag
 
 export const use = serviceUse(Service)
 
+const routeAttribution = (
+  routed: Provider.TransientRoutedModel | undefined,
+): UsageRouteAttribution.Committed | undefined =>
+  routed?.route.route.kind === "account"
+    ? { routeKind: "account", accountID: routed.route.route.accountID }
+    : routed?.route.route.kind === "public"
+      ? { routeKind: "public" }
+      : undefined
+
+type StructuredUsage = {
+  readonly inputTokens?: number
+  readonly outputTokens?: number
+  readonly totalTokens?: number
+  readonly reasoningTokens?: number
+  readonly cachedInputTokens?: number
+  readonly inputTokenDetails?: { readonly cacheReadTokens?: number; readonly cacheWriteTokens?: number }
+  readonly outputTokenDetails?: { readonly reasoningTokens?: number }
+}
+
+const finiteToken = (value: number | undefined) =>
+  typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
+
+function normalizeStructuredUsage(value: StructuredUsage) {
+  const cacheRead = finiteToken(value.inputTokenDetails?.cacheReadTokens ?? value.cachedInputTokens)
+  const cacheWrite = finiteToken(value.inputTokenDetails?.cacheWriteTokens)
+  const reasoning = finiteToken(value.outputTokenDetails?.reasoningTokens ?? value.reasoningTokens)
+  const inputTotal = finiteToken(value.inputTokens)
+  const outputTotal = finiteToken(value.outputTokens)
+  const input = Math.max(0, inputTotal - cacheRead - cacheWrite)
+  const output = Math.max(0, outputTotal - reasoning)
+  const totalTokens = Math.max(
+    finiteToken(value.totalTokens),
+    input + cacheRead + cacheWrite + output + reasoning,
+  )
+  return {
+    raw: new LLMUsage({
+      inputTokens: inputTotal,
+      outputTokens: outputTotal,
+      totalTokens,
+      cacheReadInputTokens: cacheRead,
+      cacheWriteInputTokens: cacheWrite,
+      reasoningTokens: reasoning,
+    }),
+    tokens: { input, cacheRead, cacheWrite, output, reasoning },
+    totalTokens,
+  }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -96,6 +164,7 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const skill = yield* Skill.Service
     const provider = yield* Provider.Service
+    const usage = yield* UsageAnalytics.Service
     const locations = yield* LocationServiceMap.Service
 
     const state = yield* InstanceState.make<State>(
@@ -153,7 +222,7 @@ const layer = Layer.effect(
               }),
               user,
             ),
-            mode: "primary",
+            mode: native("build").mode,
             native: true,
           },
           plan: {
@@ -180,7 +249,7 @@ const layer = Layer.effect(
               }),
               user,
             ),
-            mode: "primary",
+            mode: native("plan").mode,
             native: true,
           },
           yolo: {
@@ -189,7 +258,7 @@ const layer = Layer.effect(
               "Full-autonomy mode for trusted development work. Routine permissions are auto-approved; catastrophic recursive deletes remain hard-blocked.",
             options: {},
             permission: Permission.merge(defaults, user, Permission.fromConfig({ "*": "allow" })),
-            mode: "primary",
+            mode: native("yolo").mode,
             native: true,
           },
           general: {
@@ -203,7 +272,7 @@ const layer = Layer.effect(
               user,
             ),
             options: {},
-            mode: "subagent",
+            mode: native("general").mode,
             native: true,
           },
           explore: {
@@ -226,14 +295,14 @@ const layer = Layer.effect(
             description: `Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.`,
             prompt: PROMPT_EXPLORE,
             options: {},
-            mode: "subagent",
+            mode: native("explore").mode,
             native: true,
           },
           compaction: {
             name: "compaction",
-            mode: "primary",
+            mode: native("compaction").mode,
             native: true,
-            hidden: true,
+            hidden: native("compaction").hidden,
             prompt: PROMPT_COMPACTION,
             permission: Permission.merge(
               defaults,
@@ -246,10 +315,10 @@ const layer = Layer.effect(
           },
           title: {
             name: "title",
-            mode: "primary",
+            mode: native("title").mode,
             options: {},
             native: true,
-            hidden: true,
+            hidden: native("title").hidden,
             temperature: 0.5,
             permission: Permission.merge(
               defaults,
@@ -263,9 +332,9 @@ const layer = Layer.effect(
           "prompt-revisor": {
             name: "prompt-revisor",
             description: "Read-only host-owned prompt and Goal revision agent.",
-            mode: "primary",
+            mode: native("prompt-revisor").mode,
             native: true,
-            hidden: true,
+            hidden: native("prompt-revisor").hidden,
             steps: 3,
             prompt: PROMPT_REVISOR,
             permission: Permission.merge(
@@ -285,10 +354,10 @@ const layer = Layer.effect(
           },
           summary: {
             name: "summary",
-            mode: "primary",
+            mode: native("summary").mode,
             options: {},
             native: true,
-            hidden: true,
+            hidden: native("summary").hidden,
             permission: Permission.merge(
               defaults,
               Permission.fromConfig({
@@ -413,7 +482,17 @@ const layer = Layer.effect(
       }) {
         const cfg = yield* config.get()
         const model = input.model ?? (yield* provider.defaultModel())
-        const resolved = yield* provider.getModel(model.providerID, model.modelID, input.model?.accountID)
+        const routed = yield* provider.resolveTransientRoutedModel({
+          providerID: model.providerID,
+          modelID: model.modelID,
+          ...(input.model?.accountID
+            ? { accountID: input.model.accountID }
+            : { routeIntent: { kind: "auto" as const } }),
+        })
+        const resolved =
+          routed?.model ?? (yield* provider.getModel(model.providerID, model.modelID, input.model?.accountID))
+        const route = routeAttribution(routed)
+        const hosted = resolved.providerID.startsWith("opencode")
         const language = yield* provider.getLanguage(resolved)
         const tracer = cfg.experimental?.openTelemetry
           ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))
@@ -423,9 +502,62 @@ const layer = Layer.effect(
         yield* plugin.trigger("experimental.chat.system.transform", { model: resolved }, { system })
         const existing = yield* InstanceState.useEffect(state, (s) => s.list())
 
-        // TODO: clean this up so provider specific logic doesnt bleed over
-        const authInfo = yield* auth.get(model.providerID).pipe(Effect.orDie)
+        // A committed transient OpenCode route already owns auth. Legacy Auth
+        // remains available only for intentionally direct providers.
+        const authInfo = routed ? undefined : yield* auth.get(model.providerID).pipe(Effect.orDie)
         const isOpenaiOauth = model.providerID === "openai" && authInfo?.type === "oauth"
+        const requestSessionID = SessionID.descending()
+        const requestID = MessageID.ascending()
+        const instance = hosted ? yield* InstanceState.context : undefined
+        const headers = hosted
+          ? {
+              ...(instance?.project.id ? { "x-opencode-project": instance.project.id } : {}),
+              "x-opencode-session": requestSessionID,
+              "x-opencode-request": requestID,
+              "x-opencode-client": Flag.OPENCODE_CLIENT,
+              "User-Agent": OpenCodeHostedUserAgent(),
+            }
+          : undefined
+        const exactLanguage = hosted
+          ? wrapLanguageModel({
+              model: language,
+              middleware: {
+                specificationVersion: "v3" as const,
+                async transformParams(args) {
+                  // AI SDK appends its own `ai/<version>` suffix before model
+                  // middleware runs. OpenCode's hosted service expects the exact
+                  // upstream OpenCode User-Agent, so restore it at the final
+                  // provider boundary rather than merely preparing it earlier.
+                  return {
+                    ...args.params,
+                    headers: {
+                      ...args.params.headers,
+                      "user-agent": OpenCodeHostedUserAgent(),
+                    },
+                  }
+                },
+              },
+            })
+          : language
+        const startedAt = Date.now()
+
+        const recordUsage = Effect.fn("Agent.generate.recordUsage")(function* (raw: StructuredUsage) {
+          const normalized = normalizeStructuredUsage(raw)
+          const priced = Session.getUsage({ model: resolved, usage: normalized.raw })
+          yield* usage.recordMaintenance({
+            agent: "agent_generator",
+            providerID: resolved.providerID,
+            modelID: resolved.id,
+            ...(route ? { route } : {}),
+            projectID: instance?.project.id ?? null,
+            sessionID: null,
+            cost: priced.cost,
+            tokens: normalized.tokens,
+            totalTokens: normalized.totalTokens,
+            startedAt,
+            completedAt: Date.now(),
+          })
+        })
 
         const params = {
           experimental_telemetry: {
@@ -436,6 +568,7 @@ const layer = Layer.effect(
             },
           },
           temperature: 0.3,
+          ...(headers ? { headers } : {}),
           messages: [
             ...(isOpenaiOauth
               ? []
@@ -450,7 +583,7 @@ const layer = Layer.effect(
               content: `Create an agent configuration based on this request: "${input.description}".\n\nIMPORTANT: The following identifiers already exist and must NOT be used: ${existing.map((i) => i.name).join(", ")}\n  Return ONLY the JSON object, no other text, do not wrap in backticks`,
             },
           ],
-          model: language,
+          model: exactLanguage,
           schema: Object.assign(
             Schema.toStandardSchemaV1(GeneratedAgent),
             Schema.toStandardJSONSchemaV1(GeneratedAgent),
@@ -458,7 +591,7 @@ const layer = Layer.effect(
         } satisfies Parameters<typeof generateObject>[0]
 
         if (isOpenaiOauth) {
-          return yield* Effect.promise(async () => {
+          const generated = yield* Effect.promise(async () => {
             const result = streamObject({
               ...params,
               providerOptions: ProviderTransform.providerOptions(resolved, {
@@ -470,11 +603,18 @@ const layer = Layer.effect(
             for await (const part of result.fullStream) {
               if (part.type === "error") throw part.error
             }
-            return result.object
+            return {
+              object: await result.object,
+              usage: await result.usage,
+            }
           })
+          yield* recordUsage(generated.usage)
+          return generated.object
         }
 
-        return yield* Effect.promise(() => generateObject(params).then((r) => r.object))
+        const generated = yield* Effect.promise(() => generateObject(params))
+        yield* recordUsage(generated.usage)
+        return generated.object
       }),
     })
   }),
@@ -489,7 +629,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, locationServiceMapNode],
+  deps: [Config.node, Auth.node, Plugin.node, Skill.node, Provider.node, UsageAnalytics.node, locationServiceMapNode],
 })
 
 export * as Agent from "./agent"

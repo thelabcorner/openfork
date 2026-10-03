@@ -9,7 +9,7 @@ import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
-import { InstallationUserAgent } from "@opencode-ai/core/installation/version"
+import { InstallationUserAgent, OpenCodeHostedUserAgent } from "@opencode-ai/core/installation/version"
 import { Effect, Record } from "effect"
 import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
@@ -204,9 +204,12 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     ? (yield* InstanceState.context).project.id
     : undefined
 
-  // The Console free-tier gate validates the canonical installation identity,
-  // so provider requests must share one owner for channel/version/client.
-  const userAgent = InstallationUserAgent(input.flags.client)
+  // Preserve the exact first-party User-Agent emitted by upstream OpenCode for
+  // hosted wire/observability parity. Anonymous Zen eligibility is a separate
+  // concern owned by public credential/model routing, not by this header.
+  const userAgent = input.model.providerID.startsWith("opencode")
+    ? OpenCodeHostedUserAgent()
+    : InstallationUserAgent(input.flags.client)
 
   const sortedTools = preserveCanonicalFindToolMap(
     tools,

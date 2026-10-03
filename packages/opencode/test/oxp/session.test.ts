@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import os from "os"
 import path from "path"
 import { randomUUID } from "crypto"
+import { eq } from "drizzle-orm"
 import { Effect, Layer } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -12,6 +13,7 @@ import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { partSearchText } from "@opencode-ai/core/session/search-text"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { OxpConfig } from "@/oxp/config"
@@ -24,7 +26,7 @@ const suite = path.join(os.tmpdir(), `opencode-oxp-session-${randomUUID()}`)
 const configDir = path.join(suite, ".config")
 const stateDir = path.join(suite, ".state")
 type ControlCall =
-  | { action: "pause" | "resume" | "abort"; target: OxpSessionControl.Target }
+  | { action: "pause" | "resume" | "abort" | "archive" | "unarchive" | "delete"; target: OxpSessionControl.Target }
   | {
       action: "set_selection"
       target: OxpSessionControl.Target
@@ -53,6 +55,7 @@ type ControlCall =
 const controlCalls: ControlCall[] = []
 let cancelTurnWait = false
 let turnFailure: Error | undefined
+let goalFailure: Error | undefined
 let supervisedTodos: Array<{ content: string; status: string; priority: string }> = []
 
 const guarded = <A>(
@@ -74,6 +77,12 @@ const controlLayer = Layer.succeed(
       guarded(target, Effect.sync(() => controlCalls.push({ action: "resume", target }))),
     abort: (target) =>
       guarded(target, Effect.sync(() => controlCalls.push({ action: "abort", target }))),
+    archive: (target) =>
+      guarded(target, Effect.sync(() => controlCalls.push({ action: "archive", target }))),
+    unarchive: (target) =>
+      guarded(target, Effect.sync(() => controlCalls.push({ action: "unarchive", target }))),
+    delete: (target) =>
+      guarded(target, Effect.sync(() => controlCalls.push({ action: "delete", target }))),
     setSelection: (target, input) =>
       guarded(
         target,
@@ -143,8 +152,9 @@ const controlLayer = Layer.succeed(
     goal: (target, input) =>
       guarded(
         target,
-        Effect.sync(() => {
+        Effect.gen(function* () {
           controlCalls.push({ action: "goal", target, input })
+          if (goalFailure) return yield* Effect.fail(goalFailure)
           return {
             action: input.action,
             goal: {
@@ -155,7 +165,6 @@ const controlLayer = Layer.succeed(
                 objective: "fixture",
                 constraints: [],
                 status: "active",
-                continuationPolicy: {},
                 revision: 1,
                 createdAt: 1,
                 updatedAt: 1,
@@ -187,6 +196,7 @@ beforeEach(async () => {
   controlCalls.length = 0
   cancelTurnWait = false
   turnFailure = undefined
+  goalFailure = undefined
   supervisedTodos = []
   await fs.rm(suite, { recursive: true, force: true })
   await fs.mkdir(configDir, { recursive: true })
@@ -311,6 +321,39 @@ describe("OxpSession", () => {
     })
   }))
 
+  it.live("directs host-owned delegated Sessions to openfork_worker instead of retrying Session control", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const sessions = yield* OxpSession.Service
+    const approvedDir = path.join(suite, "approved")
+    const outsideDir = path.join(suite, "outside")
+    yield* Effect.promise(() => Promise.all([fs.mkdir(approvedDir), fs.mkdir(outsideDir)]))
+    yield* seed(approvedDir, outsideDir)
+    const root = yield* roots.approve(approvedDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ sessionSupervision: "approved-roots" })
+    turnFailure = new OxpSessionControl.HostOwned(
+      String(approvedID),
+      String(approvedID),
+      "delegated_worker",
+    )
+
+    const error = yield* sessions.execute({
+      action: "turn",
+      sessionID: approvedID,
+      rootID: root.id,
+      text: "wrong control surface",
+    }).pipe(Effect.flip)
+
+    expect(error._tag).toBe("OXP_CONFLICT")
+    expect(error.detail).toContain("openfork_worker continue")
+    expect(error.metadata).toMatchObject({
+      sessionID: approvedID,
+      ownerKind: "delegated_worker",
+      ownerSurface: "openfork_worker",
+    })
+  }))
+
   it.live("supervises checkpoint reads and independently gates restore commits on OXP write authority", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service
@@ -370,6 +413,35 @@ describe("OxpSession", () => {
     })
     expect(status.structured).toMatchObject({ sessionID: approvedID, action: "status" })
     expect(controlCalls.at(-1)).toMatchObject({ action: "goal", input: { action: "status" } })
+
+    goalFailure = new OxpSessionControl.GoalRevisionConflict("goal_fixture", 4, 7)
+    const conflict = yield* sessions
+      .execute({
+        action: "goal",
+        sessionID: approvedID,
+        rootID: root.id,
+        goal: { action: "request_verification", expectedRevision: 4 },
+      })
+      .pipe(Effect.flip)
+    expect(conflict._tag).toBe("OXP_CONFLICT")
+    expect(conflict.metadata).toMatchObject({
+      goalID: "goal_fixture",
+      expectedRevision: 4,
+      actualRevision: 7,
+    })
+    goalFailure = undefined
+
+    const requested = yield* sessions.execute({
+      action: "goal",
+      sessionID: approvedID,
+      rootID: root.id,
+      goal: { action: "request_verification", expectedRevision: 1 },
+    })
+    expect(requested.structured).toMatchObject({
+      sessionID: approvedID,
+      action: "request_verification",
+      verificationDispatch: "scheduled",
+    })
 
     const hidden = yield* sessions.execute({
       action: "goal",
@@ -456,6 +528,127 @@ describe("OxpSession", () => {
     // All five operations above are Tier 0/1 reads. A regression that enters
     // InstanceStore/SessionPrompt would hit this counter through the host port.
     expect(controlCalls).toEqual([])
+  }))
+
+  it.live("scopes Session search before FTS ranking and never leaks unauthorized native paths", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const sessions = yield* OxpSession.Service
+    const { db } = yield* Database.Service
+    const approvedDir = path.join(suite, "approved")
+    const outsideDir = path.join(suite, "outside")
+    yield* Effect.promise(() => Promise.all([
+      fs.mkdir(approvedDir, { recursive: true }),
+      fs.mkdir(outsideDir, { recursive: true }),
+    ]))
+    yield* seed(approvedDir, outsideDir)
+    const root = yield* roots.approve(approvedDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ sessionSupervision: "approved-roots" })
+
+    const toolMessageID = SessionV1.MessageID.make("msg_oxp_search_tool")
+    yield* db
+      .insert(MessageTable)
+      .values({
+        id: toolMessageID,
+        session_id: approvedID,
+        time_created: Date.now(),
+        data: { role: "assistant", time: { created: Date.now() } } as never,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    const toolPart = SessionV1.ToolPart.make({
+      id: SessionV1.PartID.make("prt_oxp_search_tool"),
+      sessionID: approvedID,
+      messageID: toolMessageID,
+      type: "tool",
+      callID: "call_oxp_search_read",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: { path: "needle.txt" },
+        output: "ok",
+        title: "read",
+        metadata: {},
+        time: { start: Date.now(), end: Date.now() + 1 },
+      },
+    })
+    const { id: toolPartID, messageID: _, sessionID: __, ...toolData } = toolPart
+    yield* db
+      .insert(PartTable)
+      .values({
+        id: toolPartID,
+        message_id: toolMessageID,
+        session_id: approvedID,
+        time_created: Date.now(),
+        data: toolData as never,
+        search_text: partSearchText(toolPart),
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    const outsideMessage = SessionV1.MessageID.make("msg_oxp_outside_rank")
+    yield* db
+      .insert(MessageTable)
+      .values({
+        id: outsideMessage,
+        session_id: outsideID,
+        time_created: Date.now() + 1_000,
+        data: { role: "user", time: { created: Date.now() + 1_000 } } as never,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(PartTable)
+      .values({
+        id: SessionV1.PartID.make("prt_oxp_outside_rank"),
+        message_id: outsideMessage,
+        session_id: outsideID,
+        time_created: Date.now() + 1_000,
+        data: {
+          type: "text",
+          text: "supervised supervised supervised supervised supervised session",
+          time: { start: Date.now() + 1_000 },
+        } as never,
+        search_text: "supervised supervised supervised supervised supervised session",
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    const result = yield* sessions.execute({
+      action: "search",
+      rootID: root.id,
+      search: "supervised",
+      limit: 1,
+    })
+    const structured = result.structured as {
+      sessions: Array<{ sessionId: string; directory: string }>
+      coverage: { complete: boolean }
+    }
+
+    expect(structured.sessions.map((item) => item.sessionId)).toEqual([approvedID])
+    expect(structured.sessions[0]?.directory).toBe("/" + root.alias)
+    expect(result.output).not.toContain(outsideID)
+    expect(result.output).not.toContain(outsideDir)
+    expect(result.output).not.toContain(approvedDir)
+    expect(result.mutation).toEqual({ attempted: false, committed: false })
+    expect(result.metadata).toMatchObject({ count: 1, authorizedRoots: 1 })
+    expect(controlCalls).toEqual([])
+
+    const toolOnly = yield* sessions.execute({
+      action: "search",
+      rootID: root.id,
+      search: "tool:read needle",
+      limit: 1,
+    })
+    expect(toolOnly.mutation).toEqual({ attempted: false, committed: false })
+    expect((toolOnly.structured as {
+      tool?: string
+      hits: { tools: Array<{ partId?: string; tool: string }> }
+    })).toMatchObject({
+      tool: "read",
+      hits: { tools: [{ partId: "prt_oxp_search_tool", tool: "read" }] },
+    })
   }))
 
   it.live("keeps set_selection account identity first-class and attributes control to the OXP connector principal", Effect.gen(function* () {
@@ -632,6 +825,39 @@ describe("OxpSession", () => {
     expect(controlCalls).toEqual([])
   }))
 
+  it.live("refuses recursive delete when any descendant falls outside the approved OXP root", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const sessions = yield* OxpSession.Service
+    const { db } = yield* Database.Service
+    const approvedDir = path.join(suite, "approved")
+    const outsideDir = path.join(suite, "outside")
+    yield* Effect.promise(() => Promise.all([
+      fs.mkdir(approvedDir, { recursive: true }),
+      fs.mkdir(outsideDir, { recursive: true }),
+    ]))
+    yield* seed(approvedDir, outsideDir)
+    const root = yield* roots.approve(approvedDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ sessionSupervision: "approved-roots" })
+
+    yield* db
+      .update(SessionTable)
+      .set({ parent_id: approvedID })
+      .where(eq(SessionTable.id, outsideID))
+      .run()
+      .pipe(Effect.orDie)
+
+    const error = yield* sessions.execute({
+      action: "delete",
+      sessionID: approvedID,
+      rootID: root.id,
+    }).pipe(Effect.flip)
+
+    expect(error._tag).toBe("OXP_NOT_FOUND")
+    expect(controlCalls).toEqual([])
+  }))
+
   it.live("enters Tier-3 runtime control only after live grant/root revalidation", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service
@@ -655,10 +881,18 @@ describe("OxpSession", () => {
       target: { sessionID: approvedID, directory: approvedDir },
     })
 
+    const archived = yield* sessions.execute({ action: "archive", sessionID: approvedID, rootID: root.id })
+    const unarchived = yield* sessions.execute({ action: "unarchive", sessionID: approvedID, rootID: root.id })
+    const deleted = yield* sessions.execute({ action: "delete", sessionID: approvedID, rootID: root.id })
+    expect(archived.mutation).toEqual({ attempted: true, committed: true })
+    expect(unarchived.mutation).toEqual({ attempted: true, committed: true })
+    expect(deleted.mutation).toEqual({ attempted: true, committed: true })
+    expect(controlCalls.map((call) => call.action)).toEqual(["pause", "archive", "unarchive", "delete"])
+
     yield* config.setGrant({ sessionSupervision: "none" })
     const denied = yield* sessions.execute({ action: "resume", sessionID: approvedID, rootID: root.id }).pipe(Effect.flip)
     expect(denied._tag).toBe("OXP_AUTH_DENIED")
-    expect(controlCalls).toHaveLength(1)
+    expect(controlCalls).toHaveLength(4)
   }))
 
   it.live("holds approved-root supervision under 1/3/6 concurrent reads and controls", Effect.gen(function* () {

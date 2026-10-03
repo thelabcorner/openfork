@@ -93,6 +93,7 @@ export interface Interface {
 }
 
 interface CreateInput {
+  id?: ID
   name: string
   kind?: SessionGroup.MutableKind
   anchorSessionId?: string
@@ -129,7 +130,6 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
     const swarms = yield* SwarmV2.Service
-    const filename = database.filename
     let listCache: { at: number; value: Info[] } | null = null
     let detailCache: { at: number; value: Detail[] } | null = null
     const LIST_TTL = 5_000
@@ -162,7 +162,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           )
           .orderBy(asc(SessionGroupTable.position))
           .all()
-      const rows = yield* (filename === ":memory:" ? read(database.db) : Database.withBackfillDb(filename, read)).pipe(
+      const rows = yield* read(database.readDb).pipe(
         Effect.orDie,
       )
       const value = rows.map(fromGroupRow)
@@ -200,6 +200,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
                 timeCreated: SessionTable.time_created,
                 timeUpdated: SessionTable.time_updated,
                 timeArchived: SessionTable.time_archived,
+                metadata: SessionTable.metadata,
               },
             })
             .from(SessionGroupMemberTable)
@@ -208,9 +209,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
             .all()
           return [groupRows, memberRows] as const
         })
-      const [groups, memberships] = yield* (
-        filename === ":memory:" ? read(database.db) : Database.withBackfillDb(filename, read)
-      ).pipe(Effect.orDie)
+      const [groups, memberships] = yield* read(database.readDb).pipe(Effect.orDie)
       const byGroup = new Map<string, Member[]>()
       for (const row of memberships) {
         const bucket = byGroup.get(row.member.group_id)
@@ -241,7 +240,19 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const create = Effect.fn("SessionGroup.create")(function* (input: CreateInput) {
-      const id = SessionGroup.ID.create()
+      const id = input.id ?? SessionGroup.ID.create()
+      const prior = yield* database.db
+        .select()
+        .from(SessionGroupTable)
+        .where(eq(SessionGroupTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      if (prior) {
+        if (prior.kind !== (input.kind ?? "user") || prior.owner_ref !== (input.ownerRef ?? null)) {
+          return yield* Effect.die(new Error(`Session group identity collision: ${id}`))
+        }
+        return fromGroupRow(prior)
+      }
       const now = Date.now()
       const row: typeof SessionGroupTable.$inferInsert = {
         id,
@@ -255,7 +266,25 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         time_created: now,
         time_updated: now,
       }
-      yield* database.db.insert(SessionGroupTable).values(row).run().pipe(Effect.orDie)
+      const inserted = yield* database.db
+        .insert(SessionGroupTable)
+        .values(row)
+        .onConflictDoNothing()
+        .returning({ id: SessionGroupTable.id })
+        .get()
+        .pipe(Effect.orDie)
+      if (!inserted) {
+        const raced = yield* database.db
+          .select()
+          .from(SessionGroupTable)
+          .where(eq(SessionGroupTable.id, id))
+          .get()
+          .pipe(Effect.orDie)
+        if (!raced || raced.kind !== row.kind || raced.owner_ref !== (row.owner_ref ?? null)) {
+          return yield* Effect.die(new Error(`Session group identity collision: ${id}`))
+        }
+        return fromGroupRow(raced)
+      }
       invalidate()
       const info = fromGroupRow({
         id: row.id,
@@ -276,6 +305,17 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
 
     const resolveOrCreate = Effect.fn("SessionGroup.resolveOrCreate")(function* (input: ResolveInput) {
       const anchorSessionID = input.anchorSessionId ? SessionID.make(input.anchorSessionId) : undefined
+
+      if (input.kind === "delegation" && input.ownerRef) {
+        const existing = yield* database.db
+          .select()
+          .from(SessionGroupTable)
+          .where(and(eq(SessionGroupTable.kind, "delegation"), eq(SessionGroupTable.owner_ref, input.ownerRef)))
+          .get()
+          .pipe(Effect.orDie)
+        if (existing) return fromGroupRow(existing)
+        return yield* create(input)
+      }
 
       // Plugin-owned groups use a stable ownerRef instead of their anchor as
       // identity. A single coordinator may own multiple plugin groups, and the
@@ -500,28 +540,40 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       if (!session) return yield* new NotFoundError({ message: `Session not found: ${input.sessionId}` })
       const now = Date.now()
       const inserted = yield* database.db
-        .insert(SessionGroupMemberTable)
-        .values({
-          group_id: input.groupId,
-          session_id: sessionID,
-          locked: input.locked ?? false,
-          origin: input.origin ?? "user",
-          origin_plugin: input.originPlugin,
-          origin_ref: input.originRef,
-          position: input.position ?? now,
-          time_added: now,
-        })
-        .onConflictDoNothing()
-        .returning({ session_id: SessionGroupMemberTable.session_id })
-        .get()
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            const session = yield* tx
+              .select({ id: SessionTable.id })
+              .from(SessionTable)
+              .where(eq(SessionTable.id, sessionID))
+              .get()
+            if (!session) return yield* new NotFoundError({ message: `Session not found: ${input.sessionId}` })
+            const member = yield* tx
+              .insert(SessionGroupMemberTable)
+              .values({
+                group_id: input.groupId,
+                session_id: sessionID,
+                locked: input.locked ?? false,
+                origin: input.origin ?? "user",
+                origin_plugin: input.originPlugin,
+                origin_ref: input.originRef,
+                position: input.position ?? now,
+                time_added: now,
+              })
+              .onConflictDoNothing()
+              .returning({ session_id: SessionGroupMemberTable.session_id })
+              .get()
+            yield* tx
+              .update(SessionTable)
+              .set({ group_id: input.groupId, time_updated: now })
+              .where(and(eq(SessionTable.id, sessionID), sql`${SessionTable.group_id} IS NULL`))
+              .run()
+            return member !== undefined
+          }),
+          { behavior: "immediate" },
+        )
         .pipe(Effect.orDie)
       if (!inserted) return
-      yield* database.db
-        .update(SessionTable)
-        .set({ group_id: input.groupId, time_updated: now })
-        .where(and(eq(SessionTable.id, sessionID), sql`${SessionTable.group_id} IS NULL`))
-        .run()
-        .pipe(Effect.orDie)
       invalidate(input.sessionId)
       yield* events.publish(Event.SessionAdded, { groupID: input.groupId, sessionID: input.sessionId })
     })
@@ -949,6 +1001,7 @@ function fromMemberRow(row: {
     timeCreated: number
     timeUpdated: number
     timeArchived: number | null
+    metadata: Record<string, unknown> | null
   }
 }): Member {
   return {
@@ -968,6 +1021,7 @@ function fromMemberRow(row: {
     origin: row.member.origin,
     originPlugin: row.member.origin_plugin ?? undefined,
     originRef: row.member.origin_ref ?? undefined,
+    specialAgent: SessionMetadataOwnership.specialAgentKind(row.session.metadata ?? undefined),
     position: row.member.position,
     timeAdded: DateTime.makeUnsafe(row.member.time_added),
   }

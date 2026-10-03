@@ -79,6 +79,24 @@ describe("optional tool access", () => {
     }),
   )
 
+  it.instance("diagnoses delegated actions placed at the broker level without guessing or executing", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
+      const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)!
+
+      const exit = yield* Effect.exit(broker.execute({ action: "delegate" } as never, ctx))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = Cause.pretty(exit.cause)
+        expect(message).toContain('"delegate" is not a broker action')
+        expect(message).toContain("list, describe, and call")
+        expect(message).toContain('args={action:"delegate"')
+        expect(message).toContain("No target tool or missing arguments were inferred or executed")
+      }
+    }),
+  )
+
   it.instance("describe returns the hidden schema as result content without changing the manifest", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

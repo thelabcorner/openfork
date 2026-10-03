@@ -90,3 +90,57 @@ all of their results before synthesizing a conclusion.
 Never duplicate a delegated task, poll it by repeatedly launching the same task, or
 ask a second agent to touch the same files while the first is working. Continue with
 non-overlapping work only.
+
+## Execution mode: foreground, background, or supervisor
+
+Choose the mode with the `mode` parameter. The legacy `background` boolean is still
+accepted as an alias, but do not pass both `mode` and `background` in the same call.
+
+- `foreground` (default): block until the subagent finishes. Use when you need the
+  result before the next dependent step.
+- `background`: detach and return immediately. You are notified when it finishes.
+  Treat it as set-and-forget: do not poll, do not ask for status, do not touch the
+  same files. Use only for independent work you can abandon until notified.
+- `supervisor`: detach, but stay responsible for the worker. The worker runs in the
+  background while you inspect progress, audit evidence, steer, and integrate.
+
+### Supervisor mode
+
+Use `mode: "supervisor"` when you are launching workers whose output you must
+actively own end to end. These workers are ordinary independent child sessions that
+happen to run detached under your supervision - this is **not** Swarm: there is no
+peer messaging, shared blackboard, task DAG, or scheduler, and workers do not talk
+to each other.
+
+When you run supervised workers, you must:
+
+- launch each worker with a non-overlapping scope and a concrete expected return;
+- keep doing useful, non-overlapping work while workers run;
+- inspect progress periodically and whenever meaningful worker state changes;
+- audit worker reasoning and evidence (diffs, files, symbols, tests) instead of
+  trusting a final "done, tests pass" response;
+- steer workers that are blocked, drifting, duplicating, out of scope, or pursuing
+  an incorrect approach, by calling Task again with the worker's `task_id` and a
+  correction prompt;
+- reconcile cross-worker assumptions and resolve ownership conflicts;
+- own final synthesis, integration, and verification.
+
+You must not micromanage healthy workers, poll without a reason, or finish the
+overarching task merely because workers are still running. Worker completion is
+evidence, not automatic acceptance.
+
+Calls made in the same assistant message automatically share one supervision group,
+so several workers launched together form one cohort. You can change a worker's mode
+without restarting it: `task_id` with `mode: "supervisor"` adopts a running worker,
+`mode: "background"` relinquishes supervision while the worker continues, and
+`mode: "foreground"` attaches and waits.
+
+| | Foreground | Background | Supervisor | Swarm |
+|---|---|---|---|---|
+| Parent waits | yes | no | no | no |
+| Parent stays responsible | until done | no | **yes** | coordinator |
+| Inspect/audit/steer | n/a | discouraged | **required** | native |
+| Peer messaging | no | no | no | yes |
+| Shared blackboard / DAG | no | no | no | yes |
+| Runtime | Task | Task | Task | Swarm |
+

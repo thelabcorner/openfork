@@ -61,8 +61,8 @@ describe("provider account selector resolution", () => {
 
   test("fails closed on duplicate aliases", () => {
     const duplicate = [
-      { id: "vd-a", label: "Dana #1111", aliases: ["dana@example.com"] },
-      { id: "vd-b", label: "Dana #2222", aliases: ["DANA@example.com"] },
+      { id: "wb-c", label: "Dana #1111", aliases: ["dana@example.com"] },
+      { id: "wb-d", label: "Dana #2222", aliases: ["DANA@example.com"] },
     ] as const
     expect(resolveProviderAccountSelector("dana@example.com", duplicate)).toEqual({
       kind: "ambiguous",

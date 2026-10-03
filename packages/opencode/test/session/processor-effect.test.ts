@@ -3,8 +3,9 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { sql } from "drizzle-orm"
+import { APICallError, tool } from "ai"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -24,8 +25,14 @@ import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderAccountRouteHealthTable } from "@opencode-ai/core/provider-route-health.sql"
+import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import { SessionSchema as CoreSessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
+import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { ProviderTest } from "../fake/provider"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -40,6 +47,29 @@ const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
 }
+
+const claudeRef = {
+  providerID: ProviderV2.ID.make("claude"),
+  modelID: ModelV2.ID.make("claude-fable-5-1[1m]"),
+}
+const CLAUDE_FALLBACK_MODEL = ModelV2.ID.make("claude-opus-5-5[1m]")
+
+const accountRouteLease = (
+  sessionID: SessionID,
+  accountID = "acct-fixed-route",
+  credentialRevision = 7,
+): ProviderRouteResolution.ProviderRouteLease => ({
+  sessionID: CoreSessionSchema.ID.make(sessionID),
+  affinityDomain: "opencode-provider/test",
+  routeRevision: 1,
+  route: {
+    kind: "account",
+    providerID: ref.providerID,
+    accountID,
+    credentialHandle: "cred_test_route",
+    credentialRevision,
+  },
+})
 
 const cfg = {
   provider: {
@@ -114,14 +144,18 @@ const waitFor = <A>(check: Effect.Effect<A | undefined>, message: string) =>
     return yield* Effect.fail(new Error(message))
   })
 
-const user = Effect.fn("TestSession.user")(function* (sessionID: SessionID, text: string) {
+const user = Effect.fn("TestSession.user")(function* (
+  sessionID: SessionID,
+  text: string,
+  model: typeof ref = ref,
+) {
   const session = yield* Session.Service
   const msg = yield* session.updateMessage({
     id: MessageID.ascending(),
     role: "user",
     sessionID,
     agent: "build",
-    model: ref,
+    model,
     time: { created: Date.now() },
   })
   yield* session.updatePart({
@@ -138,6 +172,7 @@ const assistant = Effect.fn("TestSession.assistant")(function* (
   sessionID: SessionID,
   parentID: MessageID,
   root: string,
+  model: typeof ref = ref,
 ) {
   const session = yield* Session.Service
   const msg: SessionV1.Assistant = {
@@ -155,8 +190,8 @@ const assistant = Effect.fn("TestSession.assistant")(function* (
       reasoning: 0,
       cache: { read: 0, write: 0 },
     },
-    modelID: ref.modelID,
-    providerID: ref.providerID,
+    modelID: model.modelID,
+    providerID: model.providerID,
     parentID,
     time: { created: Date.now() },
     finish: "end_turn",
@@ -166,6 +201,7 @@ const assistant = Effect.fn("TestSession.assistant")(function* (
 })
 
 const root = LayerNode.group([
+  CurrentParts.node,
   SessionProcessor.node,
   Session.node,
   SessionProjector.node,
@@ -226,18 +262,141 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
-const coalesceLLM = Layer.succeed(
+const claudeFallbackLLM = Layer.succeed(
   LLM.Service,
   LLM.Service.of({
     stream: () =>
       Stream.make(
         LLMEvent.stepStart({ index: 0 }),
-        LLMEvent.textStart({ id: "text-1" }),
-        ...Array.from({ length: 50 }, () => LLMEvent.textDelta({ id: "text-1", text: "x" })),
-        LLMEvent.textEnd({ id: "text-1" }),
+        LLMEvent.reasoningStart({
+          id: "claude-fallback",
+          providerMetadata: {
+            claude: {
+              event: "model_refusal_fallback",
+              scope: "session",
+              originalModelID: claudeRef.modelID,
+              fallbackModelID: CLAUDE_FALLBACK_MODEL,
+              category: "bio",
+            },
+          },
+        }),
+        LLMEvent.reasoningDelta({ id: "claude-fallback", text: "Claude switched models after a refusal." }),
+        LLMEvent.reasoningEnd({ id: "claude-fallback" }),
         LLMEvent.stepFinish({ index: 0, reason: "stop" }),
         LLMEvent.finish({ reason: "stop" }),
       ),
+  }),
+)
+const claudeFallbackProvider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: claudeRef.providerID,
+    id: claudeRef.modelID,
+    limit: { context: 1_000_000, output: 128_000 },
+  }),
+})
+const claudeFallbackEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, claudeFallbackLLM],
+  [Provider.node, claudeFallbackProvider.layer],
+])
+const itClaudeFallback = testEffect(claudeFallbackEnv)
+
+const retryRouteInputs: Array<LLM.StreamInput["route"]> = []
+let retryRouteAttempts = 0
+const routedRetryLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      retryRouteInputs.push(input.route)
+      retryRouteAttempts++
+      if (retryRouteAttempts === 1) {
+        return Stream.fail(
+          new APICallError({
+            message: "retry committed route",
+            url: "https://example.test/v1/chat/completions",
+            requestBodyValues: {},
+            statusCode: 503,
+            responseHeaders: { "retry-after-ms": "0" },
+            responseBody: '{"error":{"message":"retry committed route"}}',
+            isRetryable: true,
+          }),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-route-retry" }),
+        LLMEvent.textDelta({ id: "text-route-retry", text: "after routed retry" }),
+        LLMEvent.textEnd({ id: "text-route-retry" }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          providerMetadata: { openfork: { accountID: "acct-wrong-route" } },
+        }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const routedRetryProvider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: ref.providerID,
+    id: ref.modelID,
+    limit: { context: 100_000, output: 10_000 },
+  }),
+})
+const routedRetryEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, routedRetryLLM],
+  [Provider.node, routedRetryProvider.layer],
+])
+const itRoutedRetry = testEffect(routedRetryEnv)
+
+let routedHealthFailureInputs: Array<LLM.StreamInput["route"]> = []
+const routedHealthFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      routedHealthFailureInputs.push(input.route)
+      return Stream.fail(
+        new APICallError({
+          message: "account throttled",
+          url: "https://example.test/v1/chat/completions",
+          requestBodyValues: {},
+          statusCode: 429,
+          responseHeaders: { "retry-after": "120" },
+          responseBody: '{"error":{"message":"account throttled"}}',
+          isRetryable: true,
+        }),
+      )
+    },
+  }),
+)
+const routedHealthFailureEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, routedHealthFailureLLM],
+  [Provider.node, routedRetryProvider.layer],
+])
+const itRoutedHealthFailure = testEffect(routedHealthFailureEnv)
+
+let releaseCoalesce: Deferred.Deferred<void> | undefined
+const coalesceLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => Stream.unwrap(Effect.gen(function* () {
+      releaseCoalesce = yield* Deferred.make<void>()
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-1" }),
+        ...Array.from({ length: 50 }, () => LLMEvent.textDelta({ id: "text-1", text: "x" })),
+      ).pipe(
+        Stream.concat(Stream.fromEffect(Deferred.await(releaseCoalesce)).pipe(Stream.drain)),
+        Stream.concat(Stream.make(
+          LLMEvent.textEnd({ id: "text-1" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+          LLMEvent.finish({ reason: "stop" }),
+        )),
+      )
+    })),
   }),
 )
 const coalesceEnv = LayerNode.compile(root, [...replacements, [LLM.node, coalesceLLM]])
@@ -618,6 +777,407 @@ it.live("session.processor effect tests retry recognized structured json errors"
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itClaudeFallback.live("session.processor persists a session-scoped Claude refusal fallback at the Session owner", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+
+      const chat = yield* session.create({})
+      yield* session.setAgentModel({
+        sessionID: chat.id,
+        agent: "build",
+        model: {
+          providerID: claudeRef.providerID,
+          id: claudeRef.modelID,
+          variant: "high",
+        },
+        time: Date.now(),
+      })
+      const parent = yield* user(chat.id, "fallback please", claudeRef)
+      const msg = yield* assistant(chat.id, parent.id, directory, claudeRef)
+      const mdl = yield* provider.getModel(claudeRef.providerID, claudeRef.modelID)
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: claudeRef.providerID, modelID: claudeRef.modelID, variant: "high" },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "fallback please" }],
+        tools: {},
+      })
+
+      const updated = yield* session.get(chat.id)
+      expect(value).toBe("continue")
+      expect(updated.model).toEqual({
+        providerID: claudeRef.providerID,
+        id: CLAUDE_FALLBACK_MODEL,
+        variant: "high",
+      })
+    }),
+  ),
+)
+
+itClaudeFallback.live("session.processor never lets a stale Claude fallback overwrite a newer Session model", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "fallback race", claudeRef)
+      const msg = yield* assistant(chat.id, parent.id, directory, claudeRef)
+      const mdl = yield* provider.getModel(claudeRef.providerID, claudeRef.modelID)
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+      })
+
+      // Simulate a user/host model change after this physical turn was admitted
+      // but before Claude reports its refusal fallback.
+      yield* session.setAgentModel({
+        sessionID: chat.id,
+        agent: "build",
+        model: {
+          providerID: claudeRef.providerID,
+          id: ModelV2.ID.make("claude-sonnet-5"),
+          variant: "medium",
+        },
+        time: Date.now(),
+      })
+
+      yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: claudeRef.providerID, modelID: claudeRef.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "fallback race" }],
+        tools: {},
+      })
+
+      const updated = yield* session.get(chat.id)
+      expect(updated.model).toEqual({
+        providerID: claudeRef.providerID,
+        id: ModelV2.ID.make("claude-sonnet-5"),
+        variant: "medium",
+      })
+    }),
+  ),
+)
+
+itClaudeFallback.live("session.processor never persists a Claude fallback over protected delegated-worker model ownership", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+
+      const chat = yield* session.create({
+        agent: "build",
+        model: {
+          providerID: claudeRef.providerID,
+          id: claudeRef.modelID,
+          variant: "high",
+        },
+        metadata: SessionMetadataOwnership.delegatedWorker({
+          producer: "oxp",
+          principalRef: "oxp:claude-fallback-test",
+          invocationRef: "oxp-inv:claude-fallback-test",
+          rootRef: "root-claude-fallback-test",
+          agent: "build",
+          model: {
+            providerID: String(claudeRef.providerID),
+            modelID: String(claudeRef.modelID),
+            variant: "high",
+            routeIntent: { kind: "auto" },
+          },
+          nestedDelegation: false,
+        }),
+      })
+      const parent = yield* user(chat.id, "delegated fallback", claudeRef)
+      const msg = yield* assistant(chat.id, parent.id, directory, claudeRef)
+      const mdl = yield* provider.getModel(claudeRef.providerID, claudeRef.modelID)
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: claudeRef.providerID, modelID: claudeRef.modelID, variant: "high" },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "delegated fallback" }],
+        tools: {},
+      })
+
+      const updated = yield* session.get(chat.id)
+      expect(value).toBe("continue")
+      expect(updated.model).toEqual({
+        providerID: claudeRef.providerID,
+        id: claudeRef.modelID,
+        variant: "high",
+      })
+      expect(SessionMetadataOwnership.workerDelegation(updated.metadata)?.model).toMatchObject({
+        providerID: String(claudeRef.providerID),
+        modelID: String(claudeRef.modelID),
+        variant: "high",
+        routeIntent: { kind: "auto" },
+      })
+    }),
+  ),
+)
+
+itRoutedRetry.live("session.processor retries preserve the exact committed route attribution", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      retryRouteInputs.length = 0
+      retryRouteAttempts = 0
+
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const { db, readDb } = yield* Database.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "retry with committed route")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+      const committedRoute = { routeKind: "account" as const, accountID: "acct-fixed-route" }
+      const routeLease = accountRouteLease(chat.id, committedRoute.accountID)
+      yield* db
+        .insert(ProviderAccountRouteHealthTable)
+        .values({
+          provider_id: ref.providerID,
+          account_id: committedRoute.accountID,
+          model_id: mdl.id,
+          state: "auth-invalid",
+          credential_revision: 7,
+          expires_at: null,
+          observed_at: Date.now(),
+        })
+        .run()
+        .pipe(Effect.orDie)
+      expect(
+        yield* readDb.get<{ state: string }>(sql`
+          SELECT state
+          FROM provider_account_route_health
+          WHERE provider_id = ${ref.providerID}
+            AND account_id = ${committedRoute.accountID}
+            AND model_id = ${mdl.id}
+        `),
+      ).toEqual({ state: "auth-invalid" })
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+        routeAttribution: committedRoute,
+        routeLease,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: ref.providerID, modelID: ref.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "retry with committed route" }],
+        tools: {},
+      })
+
+      expect(value).toBe("continue")
+      expect(retryRouteAttempts).toBe(2)
+      expect(retryRouteInputs).toEqual([committedRoute, committedRoute])
+      const parts = yield* MessageV2.parts(msg.id)
+      expect(parts.some((part) => part.type === "text" && part.text === "after routed retry")).toBe(true)
+
+      // Response metadata is validation-only. Even a contradictory account from
+      // the successful physical retry cannot rewrite committed settlement.
+      const settled = yield* readDb.get<{ route_kind: string | null; account_id: string | null }>(sql`
+        SELECT route_kind, account_id
+        FROM usage_record
+        WHERE message_id = ${msg.id}
+      `)
+      expect(settled).toEqual({
+        route_kind: "account",
+        account_id: committedRoute.accountID,
+      })
+      expect(
+        yield* readDb.get<{ state: string }>(sql`
+          SELECT state
+          FROM provider_account_route_health
+          WHERE provider_id = ${ref.providerID}
+            AND account_id = ${committedRoute.accountID}
+            AND model_id = ${mdl.id}
+        `),
+      ).toBeUndefined()
+    }),
+  ),
+)
+
+itRoutedHealthFailure.live("session.processor records terminal account cooldown from the exact committed lease", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      routedHealthFailureInputs = []
+
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const { readDb } = yield* Database.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "terminal account cooldown")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+      const committedRoute = { routeKind: "account" as const, accountID: "acct-health-failure" }
+      const routeLease = accountRouteLease(chat.id, committedRoute.accountID, 9)
+      const before = Date.now()
+
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+        routeAttribution: committedRoute,
+        routeLease,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: ref.providerID, modelID: ref.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "terminal account cooldown" }],
+        tools: {},
+      })
+
+      expect(value).toBe("stop")
+      expect(routedHealthFailureInputs).toEqual([committedRoute])
+      const persisted = yield* readDb.get<{
+        state: string
+        credential_revision: number | null
+        expires_at: number | null
+      }>(sql`
+        SELECT state, credential_revision, expires_at
+        FROM provider_account_route_health
+        WHERE provider_id = ${ref.providerID}
+          AND account_id = ${committedRoute.accountID}
+          AND model_id = ${mdl.id}
+      `)
+      expect(persisted).toMatchObject({
+        state: "cooling-down",
+        credential_revision: null,
+      })
+      expect(persisted?.expires_at).toBeGreaterThanOrEqual(before + 119_000)
+    }),
+  ),
+)
+
+itRoutedHealthFailure.live("session.processor rejects a different Session lease as health authority", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      routedHealthFailureInputs = []
+
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const { readDb } = yield* Database.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "mismatched health lease")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+      const committedRoute = { routeKind: "account" as const, accountID: "acct-health-mismatch" }
+      const foreignLease = accountRouteLease(
+        SessionID.make("ses_foreign_health_authority"),
+        committedRoute.accountID,
+        11,
+      )
+
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+        routeAttribution: committedRoute,
+        routeLease: foreignLease,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: ref.providerID, modelID: ref.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [{ role: "user", content: "mismatched health lease" }],
+        tools: {},
+      })
+
+      expect(value).toBe("stop")
+      expect(routedHealthFailureInputs).toEqual([committedRoute])
+      expect(
+        yield* readDb.get<{ state: string }>(sql`
+          SELECT state
+          FROM provider_account_route_health
+          WHERE provider_id = ${ref.providerID}
+            AND account_id = ${committedRoute.accountID}
+            AND model_id = ${mdl.id}
+        `),
+      ).toBeUndefined()
+    }),
   ),
 )
 
@@ -1193,15 +1753,24 @@ itCoalesce.live("session.processor effect tests coalesce rapid text deltas into 
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2Bridge.Service
+        const currentParts = yield* CurrentParts.Service
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "coalesce")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
         const deltas: string[] = []
+        const livePrefixes: string[] = []
+        const offsets: number[] = []
         const off = yield* events.listen((event) => {
           if (event.type === MessageV2.Event.PartDelta.type) {
             deltas.push((event.data as { delta: string }).delta)
+            const payload = event.data as { offset?: number }
+            if (payload.offset !== undefined) offsets.push(payload.offset)
+            for (const value of currentParts.snapshot(chat.id, [msg.id])) {
+              if (value.type === "text") livePrefixes.push(value.text)
+            }
+            if (releaseCoalesce) return Deferred.succeed(releaseCoalesce, undefined).pipe(Effect.asVoid)
           }
           return Effect.void
         })
@@ -1234,6 +1803,13 @@ itCoalesce.live("session.processor effect tests coalesce rapid text deltas into 
         expect(deltas.join("")).toBe("x".repeat(50))
         // 50 provider chunks must not produce 50 publishes.
         expect(deltas.length).toBeLessThan(50)
+        // An active detail repair can recover already-produced text before the
+        // final durable PartUpdated; the borrowed producer state is released
+        // after that boundary and cannot leak into a later execution.
+        expect(livePrefixes.length).toBeGreaterThan(0)
+        expect(livePrefixes.every((text) => text.length > 0)).toBe(true)
+        expect(offsets[0]).toBe(0)
+        expect(currentParts.snapshot(chat.id, [msg.id])).toEqual([])
       }),
     { config: cfg },
   ),
