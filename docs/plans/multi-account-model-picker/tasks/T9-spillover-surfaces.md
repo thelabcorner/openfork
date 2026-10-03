@@ -40,9 +40,9 @@ currently shows `Hunyuan 4 Preview (jack@example.com)`:
 
 ## Acceptance
 
-- [ ] `grep -rn '@wb-\|@vd-' packages/app/src` shows no raw id rendered into user-visible
-      text.
-- [ ] Manage-models shows one toggle per model for WorkBuddy/Verdent.
+- [ ] No raw account-qualified id reaches user-visible text: `grep -rn '@wb-' packages/app/src`
+      (plus each registered provider's `accountPrefix`) is clean.
+- [ ] Manage-models shows one toggle per model for every multi-account provider.
 - [ ] The composer shows `Hunyuan 4 Preview` + a `dana` chip when pinned, and no chip when on
       Auto.
 - [ ] A message from a removed account still renders a readable model name.

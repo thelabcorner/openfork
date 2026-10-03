@@ -28,8 +28,10 @@ and
 5. **Permission default.** Confirm `deny` against whatever sandboxing
    actually exists here (03 § 5.1). If a sandbox exists, say so and
    reconsider; if not, `deny` stands.
-6. **Goal budgets.** Do unattended scheduled goals get tighter default
-   bounds than interactive ones? (03 § 4.1. Recommendation: yes.)
+6. **Goal autonomy.** **Resolved/superseded:** ScheduledTask MUST NOT inject
+   continuation budgets into Goal Mode. Goal intrinsically loops until complete,
+   failed, or genuinely blocked; scheduler run timeout/retry/permission safety
+   remains ScheduledTask-owned. (03 § 4.1.)
 7. **Quota-aware retry.** Does v1 use known quota reset times or plain
    backoff? (03 § 6.)
 8. **Navigation.** Global Scheduled pane or per-project? (04 § 10.)

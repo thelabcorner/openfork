@@ -3,7 +3,8 @@
 ## Compatibility Goals
 
 - Existing Claude sessions should remain selectable.
-- Existing `claude-code/<model>` references should continue to resolve directly to the built-in provider.
+- Compatible existing `claude-code/<model>` selections should migrate to the
+  built-in `claude` provider without falling through to `claude-api`.
 - Existing external plugin users should not run two Claude runtimes.
 - Existing `claude-code` provider config should not override the first-party runtime's private transport.
 - Removing the plugin should not delete Claude CLI credentials, Claude transcripts, or OpenCode sessions.
@@ -16,7 +17,12 @@ Detect the external plugin package and legacy `claude-code` config. Verify that 
 
 ### Stage 1: First-party parity opt-in
 
-Ship the built-in provider behind a feature flag or channel gate. It must pass parity tests against the plugin's fake CLI/SDK fixtures before becoming the default. If the external package is configured during the compatibility window, prevent both runtimes from owning `claude-code` simultaneously and provide an explicit rollback switch.
+Ship the built-in provider behind a feature flag or channel gate. It must pass
+parity tests against the plugin's fake CLI/SDK fixtures before becoming the
+default. During the compatibility window, keep the built-in runtime under
+`claude` and the external package under `claude-code`; prevent duplicate
+runtime ownership of the same Claude turn/session path and provide an explicit
+rollback switch.
 
 ### Stage 2: Prevent duplicate registration
 

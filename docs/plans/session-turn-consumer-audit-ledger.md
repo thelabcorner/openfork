@@ -148,14 +148,14 @@ transparent without reviving live STATE authority.
 
 ### 2.8 Provider / plugin transport
 
-Raw provider-role operations in provider transforms, Claude runtime, Workbuddy, Verdent, etc. are not automatically defects. They operate after semantic lowering in many cases. Each use must be proven to be wire/protocol behavior rather than domain ownership inference before being left unchanged.
+Raw provider-role operations in provider transforms, Claude runtime, WorkBuddy, etc. are not automatically defects. They operate after semantic lowering in many cases. Each use must be proven to be wire/protocol behavior rather than domain ownership inference before being left unchanged.
 
 Audited examples:
 
 - Claude external runtime's `ModelMessage.role` checks operate after canonical
   lowering; external resume identity comes from explicit OpenCode↔Claude binding,
   not provider role.
-- WorkBuddy/Verdent user-message counts operate on provider-wire request arrays,
+- WorkBuddy user-message counts operate on provider-wire request arrays,
   not Session ownership.
 - Copilot `x-initiator` derives from canonical provenance before provider
   projection; legacy fallback is centralized in the V1 resolver.
@@ -233,7 +233,7 @@ The current production tree's previously open buckets are classified:
 - Current/V2 protocol, server, and client reducers preserve provenance and do not
   expose caller-authored provenance. Cross-generation producer ownership is now
   enforced despite Current `Session.Info` hiding the V1 compatibility metadata bag.
-- Plugin transforms receive isolated provider-context clones; WorkBuddy/Verdent
+- Plugin transforms receive isolated provider-context clones; WorkBuddy
   role counts are provider-wire heuristics; Copilot initiator ownership is resolved
   from canonical provenance before lowering.
 

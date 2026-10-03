@@ -3,7 +3,7 @@
 **Goal:** One pure ranking function used by the router *and* by the UI preview, plus two new
 routing policies beside today's sticky behaviour.
 
-**This task edits the code path every WorkBuddy/Verdent request goes through. Split it into
+**This task edits the code path every WorkBuddy request goes through. Split it into
 two commits: (a) pure extraction with existing tests green, (b) new policies.**
 
 ## Context
@@ -11,7 +11,8 @@ two commits: (a) pure extraction with existing tests green, (b) new policies.**
 `AccountRouter.select()` (`plugin/workbuddy-accounts.ts:598-660`) mixes three concerns:
 explicit-intent rebinding, session-affinity maintenance with a blocked-account check
 (`:617-634`), and eligibility+preference ranking (`:636-660`). Only the third is
-policy-dependent. `VerdentRouter` (`verdent-accounts.ts:591`) duplicates it.
+policy-dependent — so the second provider whose router duplicated this logic is gone, and
+keeping `rankAccounts()` shared is what stops the duplication from coming back.
 
 The blocked-check has hard-won semantics worth preserving verbatim:
 
@@ -27,12 +28,12 @@ The blocked-check has hard-won semantics worth preserving verbatim:
   `AutoPolicy`, `rankAccounts()` (pure, no I/O, no Date.now default in the hot path).
 - NEW `packages/opencode/src/plugin/account-policy.test.ts` — fixture table (shared with
   the renderer mirror in T10).
-- EDIT `plugin/workbuddy-accounts.ts` / `plugin/verdent-accounts.ts` — `select()` delegates
-  to `rankAccounts`, gains a `policy` parameter.
-- EDIT `plugin/workbuddy.ts` / `plugin/verdent.ts` — `decodeAccountModel` /
-  `decodeVerdentAccountModel` recognise `@<prefix>auto:<mode>` and pass `policy` through;
+- EDIT `plugin/workbuddy-accounts.ts` — `select()` delegates to `rankAccounts`, gains a
+  `policy` parameter.
+- EDIT `plugin/workbuddy.ts` — `decodeAccountModel` recognises `@<prefix>auto:<mode>`
+  (prefix read from the descriptor, not a literal) and passes `policy` through;
   `handleCompletions` forwards it to `select()`.
-- EDIT `plugin/workbuddy.ts` `models()` / `verdent.ts` `models()` — **do not** emit one
+- EDIT `plugin/workbuddy.ts` `models()` — **do not** emit one
   model per policy. Policies are selected client-side by rewriting the id; the catalog stays
   bare + per-account.
 - EDIT capabilities response — `accountRoutingPolicies: ["sticky","headroom","spread"]`.
@@ -52,7 +53,7 @@ An explicit account id still overrides everything and rebinds.
 
 1. **Commit A — extraction.** Move steps 2–3 of `select()` into `rankAccounts(policy:
    "sticky")`; `select()` keeps its signature. `bun test packages/opencode -- workbuddy-accounts`
-   must pass with zero test edits. Do the same for Verdent.
+   must pass with zero test edits.
 2. **Commit B — policies.** Add `headroom` and `spread` branches; thread `policy` from the
    decoded model id; add the `auto:` decoding with the reserved-namespace guard from T1.
 3. `spread` needs a per-provider last-selected map (in-memory, keyed by account id) for the

@@ -1,5 +1,15 @@
 # HANDOFF — Goal continuation, turn provenance, and V1/V2 message semantics
 
+> **Execution-policy supersession (2026-10-02):** this handoff remains
+> authoritative for continuation provenance, Synthetic/conversational placement,
+> causal-root ownership, crash recovery, and worker/auditor channel isolation.
+> It is **not** authoritative for old Goal continuation-policy/budget semantics.
+> Current Goal execution semantics are defined by
+> `docs/architecture/goal-mode.md`: one intrinsic worker → auditor → worker
+> loop until independently complete or genuinely blocked, with no
+> manual/auto/unattended mode, continuation policy, turn/no-progress/token
+> ceiling, blocked hysteresis, or auditor terminal-fail verdict.
+
 **Date:** 2026-09-18
 **Status:** Root cause proven and architecture converged. V1 and current/V2 Goal continuations use durable conversational/Synthetic placement instead of worker System injection; V1 crash-recovery/idempotent materialization and causal-root ownership are implemented; replaceable Goal STATE is now transparent across execution, context, fork, throughput, pagination, and presentation boundaries. Focused provenance/Goal verification is green; repository-wide OpenCode/App production checks remain blocked only by unrelated concurrent worktree diagnostics.
 **Primary owners:** `packages/schema/src/v1/session.ts`, `packages/core/src/v1/session-turn-provenance.ts`, `packages/opencode/src/session/*`, `packages/core/src/goal/*`.
@@ -111,20 +121,20 @@ type backed by Schema policy.
 
 For model-visible content, keep these questions separate:
 
-| Axis | Question | Goal continuation example |
-| --- | --- | --- |
-| authoritative domain owner | which service/table can prove the current state? | GoalAutomation reservation |
-| turn ownership/provenance | who caused/owns this durable turn boundary? | host / `goal.continuation` |
-| semantic kind | what kind of Session item is it? | Synthetic |
-| instruction authority | how strongly should it constrain the model? | conversational/user lane |
-| lineage / correlation | what durable cause/state does it derive from? | Goal id/reservation + source worker turn |
-| fragment origin | where did an individual content fragment come from? | synthetic text |
-| trust class | may embedded bytes themselves carry host authority? | host-authored orchestration text; not privileged policy |
-| provider projection | how does this exact API/runtime encode it? | provider `user` |
+| Axis                       | Question                                            | Goal continuation example                               |
+| -------------------------- | --------------------------------------------------- | ------------------------------------------------------- |
+| authoritative domain owner | which service/table can prove the current state?    | GoalAutomation reservation                              |
+| turn ownership/provenance  | who caused/owns this durable turn boundary?         | host / `goal.continuation`                              |
+| semantic kind              | what kind of Session item is it?                    | Synthetic                                               |
+| instruction authority      | how strongly should it constrain the model?         | conversational/user lane                                |
+| lineage / correlation      | what durable cause/state does it derive from?       | Goal id/reservation + source worker turn                |
+| fragment origin            | where did an individual content fragment come from? | synthetic text                                          |
+| trust class                | may embedded bytes themselves carry host authority? | host-authored orchestration text; not privileged policy |
+| provider projection        | how does this exact API/runtime encode it?          | provider `user`                                         |
 
-Do **not** call lineage "causal authority." Causality answers *why this item
-exists*; instruction authority answers *how strongly the model should prioritize
-its contents*. They are orthogonal.
+Do **not** call lineage "causal authority." Causality answers _why this item
+exists_; instruction authority answers _how strongly the model should prioritize
+its contents_. They are orthogonal.
 
 Permanent laws:
 
@@ -207,13 +217,10 @@ Conceptually:
 const continuationUser: SessionV1.User = {
   ...source.info,
   id: MessageID.ascending(),
-  provenance: SessionTurnProvenance.host(
-    SessionTurnProvenance.Source.GoalContinuation,
-    {
-      sourceMessageID: source.info.id,
-      ref: reservation.id,
-    },
-  ),
+  provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+    sourceMessageID: source.info.id,
+    ref: reservation.id,
+  }),
   time: { created: Date.now() },
 }
 
@@ -300,12 +307,7 @@ It defines stable producer sources including:
 The central classifier exposes V2-compatible semantic kinds:
 
 ```ts
-type SemanticKind =
-  | "user"
-  | "synthetic"
-  | "shell"
-  | "compaction"
-  | "assistant"
+type SemanticKind = "user" | "synthetic" | "shell" | "compaction" | "assistant"
 ```
 
 For new rows, classification is O(1) from explicit message provenance plus message structure. Only old rows without `provenance` are allowed to use the legacy part-shape inference, and that fallback is marked `confidence: "legacy-inferred"`.
@@ -356,16 +358,16 @@ Do not simplify the model to `owner=user => kind=user`.
 
 Examples:
 
-| durable event | owner | semantic kind | provider role |
-| --- | --- | --- | --- |
-| human prompt | user | user | user |
-| slash command | user | user | user |
-| user-triggered shell followup | user | shell | user |
-| plan-approval generated context | user | synthetic | user |
-| scheduled/host prompt | host | synthetic/user-worker-source depending purpose | user |
-| Goal continuation | host | synthetic | user |
-| recovery continuation | host | synthetic | user |
-| compaction continuation | host | compaction/synthetic according to durable shape | user |
+| durable event                   | owner | semantic kind                                   | provider role |
+| ------------------------------- | ----- | ----------------------------------------------- | ------------- |
+| human prompt                    | user  | user                                            | user          |
+| slash command                   | user  | user                                            | user          |
+| user-triggered shell followup   | user  | shell                                           | user          |
+| plan-approval generated context | user  | synthetic                                       | user          |
+| scheduled/host prompt           | host  | synthetic/user-worker-source depending purpose  | user          |
+| Goal continuation               | host  | synthetic                                       | user          |
+| recovery continuation           | host  | synthetic                                       | user          |
+| compaction continuation         | host  | compaction/synthetic according to durable shape | user          |
 
 This is why consumers need **purpose-specific selectors**, not one vague `isRealUserMessage()` helper.
 
@@ -654,16 +656,16 @@ Keep those concerns separate from turn provenance. Provenance fixes the worker/a
 
 ## Key references
 
-| concern | source |
-| --- | --- |
-| V1 provenance schema | `packages/schema/src/v1/session.ts` — `UserTurnProvenance`, `User.provenance` |
-| centralized V1 compatibility/classifier | `packages/core/src/v1/session-turn-provenance.ts` |
-| V1 Goal continuation materialization | `packages/opencode/src/session/prompt.ts` |
-| V1 provider lowering | `packages/opencode/src/session/message-v2.ts` |
-| V1 compaction producers/behavior | `packages/opencode/src/session/compaction.ts` |
-| current/V2 semantic message kinds | `packages/schema/src/session-message.ts` |
-| current/V2 runner lowering | `packages/core/src/session/runner/` |
-| Goal automation reservation/verdict state | `packages/core/src/goal/automation.ts` |
-| Goal Auditor runtime/protocol | `packages/core/src/goal/auditor.ts`, `packages/opencode/src/goal/auditor-runtime.ts` |
-| repository ownership contract | `AGENTS.md` |
-| long-form ownership methodology | `docs/handoff/ARCHITECTURE-OWNERSHIP-PLAYBOOK.md` |
+| concern                                   | source                                                                               |
+| ----------------------------------------- | ------------------------------------------------------------------------------------ |
+| V1 provenance schema                      | `packages/schema/src/v1/session.ts` — `UserTurnProvenance`, `User.provenance`        |
+| centralized V1 compatibility/classifier   | `packages/core/src/v1/session-turn-provenance.ts`                                    |
+| V1 Goal continuation materialization      | `packages/opencode/src/session/prompt.ts`                                            |
+| V1 provider lowering                      | `packages/opencode/src/session/message-v2.ts`                                        |
+| V1 compaction producers/behavior          | `packages/opencode/src/session/compaction.ts`                                        |
+| current/V2 semantic message kinds         | `packages/schema/src/session-message.ts`                                             |
+| current/V2 runner lowering                | `packages/core/src/session/runner/`                                                  |
+| Goal automation reservation/verdict state | `packages/core/src/goal/automation.ts`                                               |
+| Goal Auditor runtime/protocol             | `packages/core/src/goal/auditor.ts`, `packages/opencode/src/goal/auditor-runtime.ts` |
+| repository ownership contract             | `AGENTS.md`                                                                          |
+| long-form ownership methodology           | `docs/handoff/ARCHITECTURE-OWNERSHIP-PLAYBOOK.md`                                    |

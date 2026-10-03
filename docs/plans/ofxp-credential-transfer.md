@@ -181,10 +181,11 @@ Supports:
 
 Some integrations maintain additional state outside the generic Auth owner.
 
-Example: Verdent reads an existing Verdent desktop session from the OS credential
-store/keytar and has its own multi-account/vault behavior. That is **foreign/
-externally managed credential material** from OpenFork's perspective and must not
-be assumed exportable.
+Example: a provider plugin reads an already-authenticated desktop session token
+from the OS credential store (keytar/Secret Service/Keychain) and layers its own
+multi-account/vault behavior on top. That is **foreign/externally managed
+credential material** from OpenFork's perspective and must not be assumed
+exportable.
 
 #### Desktop secure-storage precedent
 
@@ -229,7 +230,7 @@ OFXP must never learn implementation facts such as:
 
 - "`fork_credential.key` is the secret";
 - "`auth.json` has a provider entry";
-- "Verdent uses this keytar service";
+- "a provider plugin uses this keytar service";
 - "copy this SQLite row";
 - "the remote local credential ID should be preserved."
 
@@ -1173,7 +1174,7 @@ Adapters must not:
 | Current `Credential.Key` | **clone after owner integration** | Add/use an explicit monotonic owner revision for security fencing; `time_updated` alone should not be the sole proof because timestamp equality is not a rigorous generation token. Import with non-destructive `Credential.Service.add`, not `create`. |
 | Current `Credential.OAuth` | **unsupported by default** | Provider-specific policy required. |
 | `OPENCODE_AUTH_CONTENT` | **non_exportable / destination-managed** | Externally managed process configuration. Also refuse/flag imports that would be shadowed by active environment-owned auth instead of pretending the imported file credential became active. |
-| Verdent desktop keytar token | **non_exportable** | Credential is owned by another application/OS store; OpenFork should not silently redistribute it. |
+| Externally managed desktop keytar token | **non_exportable** | Credential is owned by another application/OS store; OpenFork should not silently redistribute it. |
 | Unknown plugin credential | **unsupported** | Opt-in adapter required. |
 
 This table is intentionally conservative.
@@ -1906,8 +1907,8 @@ OpenCode Go
 Anthropic
   [ ] Personal OAuth     Re-login required on the new device
 
-Verdent
-  [ ] Managed by Verdent desktop — cannot be transferred
+Third-party desktop integration
+  [ ] Managed externally — cannot be transferred
 
 [Transfer selected accounts]
 ```

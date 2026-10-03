@@ -46,6 +46,48 @@ originate in OpenCode. Their APIs are not required to remain compatible with
 upstream. The strict external boundary is any upstream-operated remote service
 OpenFork elects to consume.
 
+### Process-global coding activity telemetry
+
+WakaTime is a deliberate cross-generation first-party integration. Producers in the
+V1 host and shared Core publish compact `CodingActivity` observations; Core owns the
+single process-global WakaTime consumer/exporter, and the local host exposes only a
+bootstrap-free Tier-0 `GET/PATCH /global/wakatime` control surface to the V2 Settings
+UI. No workspace instance owns the exporter, and multiple runtime graphs must lease
+the same process service rather than creating duplicate subscribers.
+
+`CodingActivity.source` is the authoritative attribution input. Core projects it
+into exactly three WakaTime buckets: OpenFork, OpenFork OXP, and OpenFork OFXP.
+That projection participates in coalescing and CLI-delivery grouping so activity
+from different boundaries can never collapse into one heartbeat or inherit another
+boundary's `--plugin` identity. WakaTime receives that bucket first followed by one
+stable `openfork-wakatime` integration token; host-client transport identity is not
+another WakaTime dimension. The 60-second delivery limiter remains keyed only by
+canonical project folder, preventing attribution separation from multiplying rate
+windows for one checkout. Its process projection is restored from one bounded
+global-state document containing only SHA-256 project fingerprints and recent
+delivery timestamps, so a process restart does not reset the ordinary one-minute
+budget and raw project paths are not persisted for limiter bookkeeping. Core does
+not discover or realpath project roots on the telemetry hot path: project-folder
+authority belongs to the producer boundary, whose canonical root is carried in the
+observation. `sourceRef` is actor/origin attribution and is never replay identity;
+only an explicit per-observation `replayToken` may suppress a duplicate, and neither
+identifier reaches the WakaTime wire.
+
+Automatic delivery selects one project per scheduler turn and carries all of that
+project's OpenFork/OXP/OFXP groups together, so one automatic turn performs at most
+three sequential CLI attempts before yielding and immediately continuing with other
+ready projects. Explicit flush is intentionally unsliced. Delivery prerequisites are
+checked before the project window is spent: without credentials or a usable CLI,
+the batch is not considered attempted and its replay tokens become eligible again.
+
+Status reads are passive and may probe only existing credentials/binaries. Explicit
+Enable is the active preparation boundary: unless the operator has forced WakaTime
+off, it reuses or prepares a usable CLI before persisting opt-in. A forced-off
+`OPENFORK_WAKATIME=0` request cannot create a latent future opt-in. The
+dashboard-facing heartbeat contract intentionally tracks `opencode-wakatime` 1.4.0;
+the exact compatibility scope and intentional OpenFork supersets are recorded in
+`docs/architecture/compatibility-boundary.md`.
+
 The presentation layer deliberately does **not** follow the V1-first runtime rule:
 V2/new-layout UI is the primary product direction. The generation split is allowed
 and expected: newer V2 presentation can consume V1/fork execution and local API

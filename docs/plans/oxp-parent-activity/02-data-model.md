@@ -186,12 +186,24 @@ exact start/completion times.
 
 ## 6. Retention
 
-Initial Gate P should preserve activity history until explicit archive/delete.
+Structural activity history remains durable until explicit archive/delete:
+parent aggregates, invocation rows, status/timing, safe summaries, and typed
+resource links are the historical source of truth.
 
-Future pruning may be added, but:
+Rich invocation detail is deliberately different. It is a bounded presentation
+cache, not durable raw tool history:
 
-- pruning must never delete linked native resources;
-- summary counters must remain truthful for retained history or explicitly expose
-  that older history was pruned;
-- no retention timer should exist while the feature is disabled unless a global
-  maintenance owner already legitimately runs one.
+- each request/outcome detail object is capped at 4 KiB by Core;
+- the recorder persists only allowlisted request fields and small failure
+  diagnostics; successful raw output/structured payloads are not duplicated;
+- maintenance converges rich detail toward a 16,384-row global ceiling, with a
+  14-day age ceiling; bounded transient overshoot between passes is preferred to
+  putting a count/prune query on every tool-call hot path;
+- a low-priority maintenance owner prunes at most 2,048 rows per pass, on a
+  dedicated SQLite connection after a cross-process quiet window;
+- pruning detail must never delete invocation rows, parent counters, links, or
+  linked native resources.
+
+This split is intentional: summary/provenance truth stays durable while rich UI
+detail has an explicit global storage/write budget. Retention must never run on
+the invocation hot path or devolve into insert-then-prune churn.

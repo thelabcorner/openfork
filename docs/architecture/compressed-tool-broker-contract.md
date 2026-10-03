@@ -36,6 +36,38 @@ before the parent epoch expires rather than relying on additional broker calls.
 
 An explicit `@<lazy-tool-id>` user mention is already strong target intent. `SessionTools.explicitLazyToolContext` may inject that target's exact descriptor/schema and matching contract into the request-only turn context. That pre-seed satisfies the discovery phase for that exact descriptor, so the model should call the stable `tool` broker directly with the supplied contract rather than wasting a `describe` round trip.
 
+### Narrow eager intent facades
+
+Compression applies to **tool-family breadth**, not to every common intent regardless of measured
+failure cost. A broad lazy tool may expose one or more small eager facades when all of the following
+hold:
+
+1. the facade represents one high-frequency/high-value intent with a substantially smaller schema
+   than the hidden tool family;
+2. it delegates to the exact same domain/service owner rather than reimplementing semantics;
+3. it does not expose host-derived authority such as project/session/member/task/run ids;
+4. its provider-visible schema is manifest-stable across Session permission state;
+5. owner-level denies also deny the facade, so the alias cannot widen an existing permission
+   boundary;
+6. the broad/long-tail surface remains lazy.
+
+Native Swarm is the measured precedent:
+
+| Surface | Exposure | Purpose |
+| --- | --- | --- |
+| `swarm` | lazy | broad coordinator/admin/read/recovery surface |
+| `swarm_create` | eager | creation-only facade over the same `SwarmCommand.delegate` workflow |
+| `swarm_member` | eager | Session-derived worker intent: settle/send/inbox/shared state/publish |
+
+A live coordinator required three attempts to create a Swarm through the generic broker, including a
+broker-vs-target action mistake and a malformed nested call. After the creation-only facade was added,
+the same model created a Swarm on its **first and only `swarm_create` invocation**, with zero broker
+calls before creation and zero malformed creation attempts. The broad `swarm` schema remains hidden.
+
+This exception is intentionally narrow. Do **not** solve hidden-schema failures by making the whole
+delegated family eager, by auto-repairing guessed nested arguments, or by allowing a facade to invent
+authority that the hidden owner would reject.
+
 ## Repository census
 
 ### Hidden-schema brokers: descriptor contract required
@@ -55,6 +87,8 @@ These surfaces are compressed/multiplexed, but their permanent outer schema alre
 | `web`        | `webfetch` + `websearch`        | All action/provider/query/url fields are present in the provider schema |
 | `find`       | `glob` + `grep`                 | The outer schema directly exposes `glob`, `grep`, `path`, and `include` |
 | `background` | job management + monitor launch | Action-specific fields are directly represented in the outer schema     |
+| `swarm_create` | one direct creation intent | Complete creation schema is provider-visible; broad Swarm administration remains lazy |
+| `swarm_member` | one direct managed-worker intent family | Complete worker-intent schema is provider-visible and authority is derived from caller Session |
 
 ### Code Mode `execute`
 
@@ -73,6 +107,8 @@ The regression suite also scans `src/**/*.ts` for the current opaque nested-args
 - Do not allow "call directly if you already know the args" for a hidden-schema broker. Remembered args may be stale.
 - Do not treat the descriptor contract as permission or authority. Leaf authorization remains live and independent.
 - Do not require the handshake for multiplexed tools whose complete executable schema is already provider-visible.
+- Narrow eager intent facades may exist only when they preserve the same owner/authority semantics and leave long-tail breadth compressed.
+- A provider-visible alias must never bypass a deny on its underlying owner.
 - Preserve the explicit-mention pre-seed path so strong user intent does not pay a redundant round trip.
 
 ## Validation gates
@@ -85,4 +121,6 @@ Focused tests cover:
 - cross-target/stale contracts are rejected;
 - JSON-stringified nested objects continue to normalize safely;
 - OXP broker calls require contracts while direct OXP hot-tool dispatch remains unchanged;
-- source-level opaque broker census requires `BrokerContract` adoption.
+- source-level opaque broker census requires `BrokerContract` adoption;
+- narrow eager Swarm facades remain provider-visible while broad `swarm` remains lazy;
+- `swarm_create` contains no broker fields or host-derived authority ids, stays under its schema-size ceiling, and inherits broad `swarm` denies.

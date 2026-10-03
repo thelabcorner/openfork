@@ -81,6 +81,63 @@ The full consumer snapshot, operation/event matrix, distribution requirements,
 and update procedure are documented in
 `docs/architecture/t3code-compatibility.md`.
 
+### Explicit compatibility exception: WakaTime OpenCode integration
+
+OpenFork's first-party WakaTime exporter intentionally preserves the dashboard-visible
+heartbeat contract of `opencode-wakatime` **1.4.0**. This exception is behavioral,
+not a promise that OpenFork can load that OpenCode plugin or reproduce its internal
+module/lifecycle structure. Newer plugin releases are not automatically covered until
+their externally observable heartbeat behavior is reviewed and the reference version
+here is updated.
+
+The compatibility target covers the semantics WakaTime observes: file entities,
+`ai coding` category, per-file coalescing, signed AI line-change deltas with zero
+omitted, optional write markers, proven project-folder scoping, batched extra
+heartbeats, the ordinary 60-second project delivery floor, forced settlement, and
+WakaTime configuration discovery including `WAKATIME_HOME` tilde expansion. The
+delivery floor is restart-persistent as in the reference adapter, but OpenFork uses
+one bounded mode-0600 state document containing only SHA-256 project fingerprints
+and timestamps rather than one raw-path-derived state file per project.
+
+OpenFork deliberately diverges where first-party ownership makes the behavior safer
+or more accurate: one process-global exporter, explicit opt-in and a Tier-0 control
+surface, observation timestamps on the primary heartbeat, OpenFork-owned plugin
+identity, `--sync-ai-disabled` to prevent transcript double counting, bounded queues
+and replay state, and checksum-verified/tag-pinned/bounded managed CLI delivery.
+Internal attribution and idempotency are separate: `sourceRef` may be a durable
+actor/principal identity, while only a producer-proven per-observation `replayToken`
+can suppress a replay. Neither identifier is serialized to WakaTime.
+The plugin identity is intentionally producer-aware: native activity is attributed
+to `openfork`, OXP activity to `openfork-oxp`, and OFXP activity to
+`openfork-ofxp`. A second stable `openfork-wakatime` token identifies the
+first-party integration. Carrier-client identity is deliberately omitted from the
+WakaTime wire so desktop/CLI/ACP transport details cannot fragment or override the
+three producer-attribution buckets. Since one CLI invocation owns one `--plugin`
+value for its primary and extra heartbeats, Core partitions a project batch by that
+attribution boundary without splitting the project-scoped delivery limiter into
+independent rate windows. The automatic scheduler selects one canonical project per
+turn and includes all of that project's attribution buckets, bounding one automatic
+turn to at most three sequential CLI attempts before yielding and immediately
+continuing with another ready project. Explicit flush remains a full settlement
+operation. A missing credential or unavailable CLI is not a delivery attempt: it
+opens no project window and releases any provisional replay suppression so the same
+logical observation can be retried once delivery becomes available.
+
+`projectFolder` is a producer-authority contract rather than a Core filesystem
+lookup. V1 instance roots enter through `FSUtil.resolve`, Git worktrees are resolved
+at project discovery, and OXP/OFXP approved roots are realpathed before attribution.
+The Tier-0 exporter therefore uses the supplied canonical folder directly and does
+not stat/realpath on every coding observation.
+OpenFork's write marker follows WakaTime's write/save meaning rather than copying any
+upstream adapter heuristic that only marks newly-created files. Those differences are
+part of the supported OpenFork contract and must not be "fixed" merely to reproduce
+plugin internals.
+
+Plugin-owned diagnostics are also outside this exception. OpenFork does not recreate
+the plugin's private `opencode.log` file or its `debug = true` config sniffing; WakaTime
+CLI configuration remains WakaTime-owned, while first-party exporter diagnostics use
+OpenFork's existing logging/observability surfaces.
+
 ## Distribution is not compatibility
 
 Retained executable, config, package, and protocol identifiers exist to avoid

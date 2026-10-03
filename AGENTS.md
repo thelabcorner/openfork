@@ -13,6 +13,22 @@ upstream-vs-fork boundaries, and source-tree lookup. The map is an orientation
 layer; this file and `FORK.md` remain authoritative when a rule or ownership
 decision is normative.
 
+### Goal Mode intrinsic-autonomy invariant
+
+Before changing Goal execution, scheduling integration, Goal UI/API contracts, or
+Goal persistence, read `docs/architecture/goal-mode.md`.
+
+- Goal Mode has one execution behavior: worker → independent auditor → worker
+  until independently complete or genuinely blocked.
+- Do not add or reconstruct manual/auto/unattended Goal modes, a continuation
+  policy, turn/no-progress/token ceilings, blocked hysteresis, or an auditor
+  terminal-fail verdict.
+- `GoalAutomationTable` is a crash-safe operational cursor, not policy.
+- Historical migrations and old handoffs may contain removed policy fields.
+  They are archaeology, not current semantics. In particular,
+  `20260907015557_goal_mode.ts` must remain immutable history; the forward
+  `20261003023542_goal_intrinsic_autonomy.ts` migration removes that state.
+
 ### Product and compatibility boundary
 
 OpenFork is an **independent product surface**, not an OpenCode-compatible
@@ -117,7 +133,7 @@ The required investigation order is:
 5. design the narrowest correct server/service projection and transport;
 6. only then wire client state and presentation.
 
-The UI may define *what the user needs to see*. It does not thereby become the
+The UI may define _what the user needs to see_. It does not thereby become the
 owner of the computation. Existing frontend helpers, stores, and endpoints are
 implementation evidence, not proof of correct ownership.
 
@@ -204,6 +220,15 @@ to a provider user message; that does **not** make them human/user-owned turns.
   is durable audit lineage, not a permanent privileged/instruction-authority
   token. Consumers must read current Goal state from the Goal owner rather than
   re-deriving it from the original prompt.
+- **Goal Mode is intrinsically autonomous.** Do not add a continuation mode,
+  continuation policy, turn/no-progress/token budget, or scheduled/manual/
+  unattended variant to the Goal domain. A runnable Goal exists to loop:
+  worker cycle → independent audit → next worker cycle. Auditor `continue`
+  therefore always authorizes the next durable continuation; auditor `blocked`
+  immediately records durable blocked Goal state; `complete` and `fail` are
+  terminal domain outcomes. A genuine new user turn may reactivate a blocked
+  Goal. Scheduler retry, timeout, permission, and run-safety policy belongs to
+  ScheduledTask, not Goal continuation.
 - Prefer the term **instruction authority** for model-priority semantics:
   conversational/user-lane versus privileged/operator-lane. Do not call causal
   provenance "authority"; use lineage/origin/authorization so it cannot be

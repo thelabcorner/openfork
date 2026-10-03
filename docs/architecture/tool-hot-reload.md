@@ -185,7 +185,12 @@ const all: Interface["all"] = Effect.fn("ToolRegistry.all")(function* () {
   changes a def's schema returns stale JSON Schema — bust the WeakMap entry on reload (key by
   def identity+version).
 
-### 3.2 Detection: watcher (primary) + polling (fallback) + manual (always)
+### 3.2 Detection: watcher (primary) + polling (fallback) + manual (Bun runtime)
+
+Current runtime caveat: the Bun runtime uses the watcher/poll/manual pipeline below. The Node
+desktop sidecar does not materialize `ToolReload`; its file hot-reload path cannot transpile
+custom TypeScript tools or plugins safely. Manual reload in Node returns an explicit
+unavailable warning and preserves the active tool registry.
 
 Pipeline: `trigger → debounce 150-300ms + coalesce + one-at-a-time gate + backoff →
 Bun.build bundle → data:-URL import (versioned-copy fallback) → shape check + fromPlugin →
@@ -205,11 +210,12 @@ validate → build State → Ref.set → emit event`.
   `@parcel/watcher` subscription via `EffectBridge.bind` with `InstanceState`-scoped cleanup
   (the AGENTS.md-sanctioned path).
 - **Fallback: polling + content fingerprint** (hash + size of each watched file) on the
-  global config dir + project `.opencode` tool/plugin dirs, interval ~2s. Catches: watcher
-  failure/unavailability, atomic-save replace patterns, global-dir changes. Cheap — a handful
-  of files.
-- **Manual: always available.** `POST /tool/reload` (V1, §3.5) + CLI flag/command (P1) — the
-  escape hatch, the test path, the fix for any watcher failure.
+  global config dir + project `.opencode` tool/plugin dirs, every 10s when native watcher
+  coverage is unavailable or incomplete. Healthy native coverage disables polling. The Node
+  desktop sidecar disables ToolReload entirely because it cannot transpile custom TypeScript
+  tool/plugin files; this avoids per-workspace scans and pollers for an unsupported capability.
+- **Manual:** `POST /tool/reload` (V1, §3.5) is available in Bun; Node reports that file
+  hot-reload is unavailable and preserves the existing tool registry.
 - **Half-written files:** prefer rename-based saves (parcel emits create+unlink or change)
   and enforce **read-twice stability** — two identical content hashes N ms apart — before
   treating a file as final. Note: with content-addressed freshness, debounce + read-twice

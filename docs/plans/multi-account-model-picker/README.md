@@ -6,17 +6,20 @@
 
 ## 1. The problem
 
-`workbuddy` and `verdent` are *genuinely multi-account* providers: the user enrolls N
-credentials, and each credential owns an independent entitlement (credits, per-model 24h
-frequency windows, cooldowns, catalog membership). Both plugins expose that to the model
-catalog by **emitting one `Model` per (model × account)**:
+`workbuddy` is a *genuinely multi-account* provider: the user enrolls N credentials, and
+each credential owns an independent entitlement (credits, per-model 24h frequency windows,
+cooldowns, catalog membership). The plugin exposes that to the model catalog by **emitting
+one `Model` per (model × account)**:
 
 - `packages/opencode/src/plugin/workbuddy.ts:1234-1262` — for every account, for every
   catalog entry, `exposedModels(...)` emits `` `${entry.id}@${account.id}` `` plus the
   bare `entry.id` (automatic routing).
-- `packages/opencode/src/plugin/verdent.ts:2358-2394` — identical shape with `@vd-…`.
 - Display names get disambiguated by suffix: `` `${entry.name} (${accountLabel})` ``
-  (`workbuddy.ts:1160`, `verdent.ts:2328`).
+  (`workbuddy.ts:1160`).
+
+That per-(model × account) emission is the *contract*, not a WorkBuddy quirk: it is exactly
+what the collapse layer consumes for any provider the registry declares multi-account
+(PROVIDER-MATRIX §1).
 
 So a user with 4 WorkBuddy accounts and a 12-model catalog sees **60 rows** where there
 are 12 models — and because WorkBuddy also emits context-window aliases
@@ -60,7 +63,8 @@ providers want.
   consumers (§5 of ARCHITECTURE).
 - Touching OpenRouter's sub-provider flow. It stays as-is; we borrow its shape.
 - Account enrollment/OAuth UX. The submenu links out to existing auth flows.
-- Cross-provider routing ("pick the cheapest account across WorkBuddy *and* Verdent").
+- Cross-provider routing ("pick the cheapest account across two different providers"). The
+  picker ranks inside one provider; it never compares a WorkBuddy account against another.
 
 ## 4. Documents
 
@@ -77,7 +81,7 @@ providers want.
 | # | Decision | Rationale |
 |---|----------|-----------|
 | D1 | Collapsing is **pure and provider-declared**, in `utils/multi-account-providers.ts` + `dialog-select-model-accounts.ts` | Keeps the 2.7k-line selector free of another provider special-case; new providers are one descriptor |
-| D2 | The **account is the model id**, not a side-channel pin | `@wb-…` / `@vd-…` already round-trips through recents, favorites, drafts, session persistence and `chat.headers`. A parallel pin store (like `subProvider`) would fight it |
+| D2 | The **account is the model id**, not a side-channel pin | `@wb-…` already round-trips through recents, favorites, drafts, session persistence and `chat.headers`. A parallel pin store (like `subProvider`) would fight it |
 | D3 | Routing policy encoded as a **reserved account suffix** `@<prefix>auto:<mode>` | Backwards compatible: an old server decodes an unknown account id and falls back to automatic selection. No schema/transport change needed for the happy path |
 | D4 | Account eligibility ranking extracted to a **shared pure module** used by both `AccountRouter.select()` and the UI preview | Otherwise the "Auto would pick X" preview drifts from what the router actually does — the single worst failure mode of this feature |
 | D5 | Data comes from `useLimits()` first, routing endpoint second | Quota is already polled and cached; the new endpoint is an enrichment, and the UI degrades to quota-only, then to label-only |

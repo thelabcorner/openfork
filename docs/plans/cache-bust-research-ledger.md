@@ -260,7 +260,7 @@ temporary per Schema guidance.
 | compaction boundary | new Context Epoch after completed compaction | same mechanism; fork uses different policy constants | surface replacement/new series/consolidation | intentional cache reset, measure policy frequency/size |
 | tool/header change | request/tool definitions change | same + fork tool work | `request/header` change/series identity | classify separately from history mutation |
 | tool ordering | registration / Map insertion order | same | canonical lexical order unless explicit configured `toolOrder` | decide whether order is semantic; never let incidental plugin timing define cache identity |
-| final provider/proxy transform | protocol/provider adapters | plus custom fork proxies (e.g. Verdent) | exact adapter prepares route and request context | cache lab must inspect final cache-sensitive native projection |
+| final provider/proxy transform | protocol/provider adapters | plus fork-owned proxy plugins | exact adapter prepares route and request context | cache lab must inspect final cache-sensitive native projection |
 
 The crosswalk is intentionally semantic rather than file-for-file. A backport or
 optimization is good when it converges ownership/invariants; copying an
@@ -2078,18 +2078,18 @@ Required review for every request-only injection:
 Correct Session semantics do not guarantee a stable final provider prefix.
 Provider and proxy adapters can transform messages after Session assembly.
 
-Concrete local example: `packages/opencode/src/plugin/verdent.ts`:
+Representative local pattern, observed in fork-owned account-pool proxy plugins:
 
 - coalesces adjacent messages with the same provider role;
 - appends a trailing user `"Please continue."` when the last assistant message
   has no tool use;
 - normalizes tool schemas by model;
-- builds a Verdent-specific encoded system/messages/tools envelope.
+- builds a provider-specific encoded system/messages/tools envelope.
 
 Those transforms are deterministic model-visible changes and can alter exact
 provider cache boundaries even when the canonical Session history is unchanged.
 
-The same Verdent wire body also contains intentionally volatile transport fields
+The same proxy wire body also contains intentionally volatile transport fields
 such as per-conversation/per-turn identifiers. A naïve full-JSON hash would call
 every request different even if those fields are not part of the upstream model's
 prompt-cache identity.
@@ -2836,7 +2836,7 @@ Only after correctness and identity are proven:
    composite append-turn transaction, or stable message/part IDs plus explicit
    completion state?
 14. Which provider/proxy adapters need a dedicated deterministic pre-transport compile seam because `LLMClient.prepare()` does not cover their final model-visible transformation?
-15. Which wire-envelope fields are documented cache identity versus transport-only volatility for custom proxies such as Verdent?
+15. Which wire-envelope fields are documented cache identity versus transport-only volatility for fork-owned proxy plugins?
 16. Should the current Context Epoch baseline remain a durable side table, or
    eventually become a projection/checkpoint over one reconstructable
    model-visible System surface? This is a long-term simplification question, not

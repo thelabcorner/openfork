@@ -468,7 +468,7 @@ Specific seams that require explicit hosted classification include:
 - `plugin/openai/ws-pool.ts` keys persistent response WebSockets by `sessionID`. That can be safe only if the entire WebSocket-pool instance is constructed below the tenant/location boundary. A process-global pool keyed by session ID alone is not acceptable.
 - `plugin/azure.ts` caches Azure CLI access tokens inside the plugin-hook instance and also reads the machine's process-global Azure CLI/environment identity. Azure CLI OAuth is therefore a standalone feature, not a hosted tenant credential path, until it has an explicitly tenant-scoped auth implementation.
 
-Other account/provider caches (`WorkBuddy`, Verdent, quota registries, usage caches, MCP pending transports and similar modules) must be covered by the state-boundary inventory before their hosted feature flag can be enabled.
+Other account/provider caches (`WorkBuddy`, quota registries, usage caches, MCP pending transports and similar modules) must be covered by the state-boundary inventory before their hosted feature flag can be enabled.
 
 This produces an additional hosted invariant:
 

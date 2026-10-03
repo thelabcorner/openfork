@@ -1741,25 +1741,17 @@ The runner should supply that fact explicitly (for example “superseded by newe
 user admission”) rather than Goal querying Session history or reconstructing
 timing.
 
-#### Guardrail accounting should match its name
+#### Goal continuation is intrinsic, not a budgeted mode
 
-`maxConsecutiveTurns`, `maxNoProgressTurns`, and `tokenBudget` are
-continuation-policy guardrails. During implementation, audit whether their
-counters should represent:
+**Superseded 2026-10-02:** Goal Mode no longer has continuation-policy
+guardrails such as turn counts, no-progress counts, duration ceilings, or token
+budgets. A runnable Goal exists specifically to keep cycling worker →
+independent auditor → worker until the auditor verifies completion, concludes
+failure, or identifies a real blocker.
 
-- all worker cycles, or
-- only autonomous continuation cycles.
-
-Today user-triggered worker cycles contribute to the same counters despite the
-code/comments describing automatic continuation limits. Adding host cycles
-without deciding this would deepen the ambiguity.
-
-Preferred semantic direction:
-
-- user/host cycles can reset/rebase no-progress context when they add new
-  external information,
-- autonomous turn/token budgets count autonomous work,
-- the focused Goal's durable lifecycle remains independent.
+User/host supersession still fences stale autonomous work, but it does not
+change the Goal's continuation semantics. Scheduler/provider safety limits
+belong to their owning domains rather than being encoded as Goal policy.
 
 Freeze this with Goal-specific regression tests before changing persisted
 counter semantics.

@@ -14,13 +14,20 @@ Default: preserve the plugin's CLI-owned authentication and rate-limit behavior 
 
 Status: release verification.
 
-The parity port keeps provider ID `claude-code` and existing model references. Verify release copy and branding before distribution rather than changing behavior speculatively.
+The built-in subscription transport is presented as **Claude Subscription**
+under provider ID `claude`. Direct Anthropic API-key access remains a
+separate `claude-api` provider, while `claude-code` stays reserved for the
+external plugin compatibility surface. Verify release copy and branding before
+distribution without collapsing those identities.
 
 ## D3 - Canonical Provider ID
 
-Status: pending implementation spike.
+Status: resolved.
 
-Proposed: keep `claude-code` as the canonical built-in provider ID. Keep quota source ID `claude` separate.
+Decision: `claude` is the canonical built-in Claude Subscription provider.
+`claude-api` is the direct Anthropic API-key provider. `claude-code` remains
+reserved for the external plugin so first-party and plugin transports cannot
+collide.
 
 ## D4 - Agent Loop Authority
 
@@ -39,3 +46,15 @@ OpenCode owns the binding metadata. Claude owns its own transcript files. A bind
 Status: recommendation.
 
 Default: read-only detection and delegation to the Claude CLI; no token refresh/write in OpenCode.
+
+## D7 - Subscription Model Catalog Authority
+
+Status: resolved.
+
+The signed-in Claude Agent SDK/CLI `supportedModels()` response is the
+availability/entitlement authority for `claude`. OpenFork persists the
+normalized concrete catalog and refreshes it only at explicit/live Claude
+runtime boundaries; passive provider listing never starts Claude. models.dev is
+metadata enrichment only and may neither add subscription entitlements nor
+rewrite SDK-derived 200K/1M runtime semantics. A small concrete bootstrap
+catalog is allowed before the first successful account discovery.

@@ -249,14 +249,13 @@ goal specification and delegates:
 
 ```ts
 export const Action = Schema.Struct({
-  prompt: Schema.String,            // may be a slash command, e.g. \"/review src/\"
+  prompt: Schema.String,            // may be a slash command, e.g. "/review src/"
   agent: optional(Schema.String),
-  model: optional(ModelRef),         // \"provider/model\"
+  model: optional(ModelRef),         // "provider/model"
   goal: optional(Schema.Struct({
     title: Schema.String,
     objective: Schema.String,
     criteria: optional(Schema.Array(Schema.String)),
-    continuationPolicy: Goal.ContinuationPolicy,  // reuse existing type
   })),
 })
 ```
@@ -266,19 +265,19 @@ goal preparation entry point — the same one any other caller uses. The
 scheduler contributes **intent and identity**; the Goal subsystem owns
 continuation, auditing, and termination.
 
-### 4.1 The budget interaction (important)
+### 4.1 Goal autonomy versus scheduler safety
 
-`Goal.ContinuationPolicy` already carries bounds — the `goal_automation` state
-tracks `consecutive_turns`, `no_progress_turns`, and `consumed_tokens`, and
-`automation.ts` reads `maxTurns` / `maxNoProgress` / `maxDurationMs` /
-`tokenBudget` defaults. **Unattended scheduled goals must not inherit the
-interactive defaults silently.**
+Goal Mode has no continuation policy or scheduled/manual/unattended variant.
+Once started, a Goal repeatedly executes worker → independent auditor → worker
+until the auditor verifies completion, conclusively fails the Goal, or reports a
+real blocker. The scheduler MUST NOT inject turn-count, no-progress, duration,
+or token ceilings into Goal state.
 
-A human-supervised goal can afford a generous turn budget because a person is
-watching. A 3am unattended goal with the same budget is a token bill and a
-repository diff nobody asked for. T0 must decide whether scheduled goals get
-**their own tighter default bounds**. Recommendation: yes, and surface them in
-the editor.
+Scheduled execution is still bounded by the scheduler's own run-safety surface:
+retry/attempt policy, permission handling, lease ownership, and the Scheduled
+Task run timeout remain ScheduledTask concerns. A scheduler timeout terminates
+that scheduled run; it does not redefine Goal continuation semantics or persist
+a fake Goal blocker.
 
 ## 5. Unattended safety
 

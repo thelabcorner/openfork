@@ -1,191 +1,274 @@
 # OpenCode Zen: multi-API-key parallel routing
 
-Status: ideation / not started. No code has been written for this yet.
+Status: implemented. `packages/opencode/src/plugin/zen.ts` and
+`packages/opencode/src/plugin/zen-accounts.ts` ship the account pool, routing,
+transport, and per-key limits surfacing described below. This is the as-built
+contract, not a proposal.
 
 ## Goal
 
-Today `opencode-zen` (`packages/opencode/src/quota/providers/opencode-zen.ts`) is a
-plain OpenAI-compatible provider: one API key, one credential, used serially.
-`verdent.ts` and `workbuddy.ts` (in `packages/opencode/src/plugin/`) both solve a
-harder problem — many accounts, each with its own quota — by running a local
-loopback proxy in front of a **registry** of accounts and a **router** that picks
-which account serves each request, with a stateful **governor** per account that
-tracks quota/cooldown and blocks bad accounts automatically.
+Zen and Go requests used to be pinned to a single credential. A user can now
+supply N Zen API keys — through environment variables or the fork credential
+vault — and each request is authorized with the key that its model selected.
 
-The ask: give Zen the same shape, so a user can hand OpenCode `N` Zen API keys and
-have requests spread across them instead of pinning to one key until it's
-exhausted or erroring out.
+Two provider ids share one physical key pool:
 
-## Why Zen is a simpler case than Verdent/WorkBuddy
+- `opencode` — Zen, the hosted OpenAI-compatible gateway (includes the free tier)
+- `opencode-go` — Go
 
-Both existing plugins carry a lot of weight that doesn't apply here:
+Both are assembled in `packages/opencode/src/provider/provider.ts` against
+`@ai-sdk/openai-compatible`. The quota adapter
+(`quota/providers/opencode-zen.ts`) only reports usage; it does not own routing.
 
-- **Verdent**: no public API. The plugin exists to *reverse-engineer* a private,
-  encrypted proxy protocol (AES-256-GCM, custom headers, device fingerprinting)
-  and pretend it's OpenAI-compatible locally. Zen already speaks a normal,
-  documented OpenAI-compatible API — no protocol translation needed.
-- **WorkBuddy**: the governor encodes vendor-specific admission rules (which
-  models a given account tier may call, 402 = hard quota exhaustion, promotional
-  model seeding, etc.) reverse-engineered from a specific backend.
-- Both discover credentials from OS credential stores / desktop app session
-  files, because the user never manually issues a token.
+## Relationship to the WorkBuddy plugin
 
-Zen keys are user-issued API keys with (presumably) a documented or inferable
-quota shape (requests/tokens per day, or credit balance). So the new plugin can
-reuse the *pattern* — registry + router + governor — without reimplementing
-protocol reverse-engineering or desktop credential scraping.
+Many-accounts-one-quota is a precedent, not a template. WorkBuddy
+(`packages/opencode/src/plugin/workbuddy*.ts`) is the in-tree plugin that solves
+the same problem, and Zen's module names follow its parts. The semantics are
+deliberately different, so this section records both what carries over and what
+does not.
 
-## Proposed shape
+### Carried over (semantics match)
+
+- **One vault, owned by the fork.** WorkBuddy keeps credentials in its own
+  `AccountVault` (a filesystem store in `workbuddy-accounts.ts`). Zen adds no
+  vault of its own: it reads the fork-owned SQLite `ForkCredentials` service
+  (`src/fork/credentials.ts`), which already holds multiple Zen keys with a
+  label, a default flag, and per-message usage attribution. A second secret store
+  would have duplicated an existing owner.
+- **Stable, secret-free account identity.** WorkBuddy's `stableAccountIdentity`
+  hashes durable fields so an account can be named in logs and UI without the
+  credential. Zen's `stableZenIdentity` is the same contract over a single
+  input: sha256 of the API key, first 12 hex chars, rendered `zen-<hash>`. Env
+  and vault keys hash identically, so one physical key never produces two
+  routing ids. Unlabeled keys fall back to `key-<hash8>`.
+- **Registry shape.** `AccountRegistry` collects accounts for a router to choose
+  from; `ZenAccountPool` is the same collection keyed by identity, with one
+  account designated default.
+
+### Not carried over (Zen has none of these)
+
+Do not read Zen as behaving like WorkBuddy in these areas — they are where the
+two plugins deliberately diverge.
+
+- **Session binding.** WorkBuddy's `AccountRouter` binds a session to one
+  account, breaks that affinity when the account is blocked, and breaks ties on
+  in-flight load (`metrics.active + metrics.queued + ...`). Zen has no router in
+  that sense; its equivalent of a session is the account suffix in the model id.
+- **Entitlement governor.** `WorkBuddyEntitlementGovernor` is a persisted state
+  machine with admission leases, per-model windows, learned limits, auth
+  recovery, and forbidden-cooldown handling. Zen's state is a three-value
+  in-memory subset: `READY`, `COOLING_DOWN`, `QUOTA_EXHAUSTED`.
+- **Model entitlements.** `canAdmitModel`, `hasKnownCredits`, and `modelReports`
+  are WorkBuddy-only. Zen has no per-`(key, model)` entitlement or admission
+  check.
+- **Loopback proxy.** WorkBuddy terminates on `127.0.0.1` because it has to
+  impersonate a private protocol. Zen is already OpenAI-compatible, so there is
+  no proxy hop.
+- **Reset-header ladder.** WorkBuddy's `parseResetAt` tries Retry-After, then
+  JSON `resetAt` / `reset_time` / `resetDate` / `reset_at` fields, then
+  natural-language text. Zen parses `retry-after` only — seconds or HTTP-date —
+  and otherwise applies a fixed 30s cooldown.
+- **Persistence.** Zen's failure state is process-local and cleared by a restart.
+
+## Module layout
 
 ```
 packages/opencode/src/plugin/
-  zen.ts              # Hooks/PluginInput entry point, mirrors verdent.ts's role
-  zen-accounts.ts      # ZenRegistry, ZenRouter, ZenVault, ZenAccount (mirrors verdent-accounts.ts)
-  zen-governor.ts       # per-key quota/cooldown state machine (mirrors workbuddy-governor.ts,
-                         # but Zen-specific: no model-entitlement tiers, just rate/credit tracking)
+  zen.ts           # ZenPlugin / ZenGoPlugin: routing, transport, model aliases,
+                   # hosted catalog discovery, observation hooks, test seams
+  zen-accounts.ts  # ZenAccountPool, stableZenIdentity, env intake, failure state
 ```
 
-### 1. Credential intake (`ZenVault` / discovery)
+## 1. Account intake
 
-Sources, in priority order (matches the Verdent env-token pattern at
-`verdent-accounts.ts:403-428`):
+Sources, in precedence order.
 
-- `ZEN_API_KEY` (single, back-compat with today's config)
-- `ZEN_API_KEYS` (comma-separated list)
-- `ZEN_API_KEY_2`, `ZEN_API_KEY_3`, ... numbered env vars
-- An on-disk vault (`~/.local/share/opencode/zen/accounts.json` or similar,
-  encrypted at rest the way `VerdentVault` does) for keys added via a CLI/TUI
-  command (`opencode auth zen add <key>`), so this isn't env-var-only.
+- **Environment** (`zenEnvCredentials`): `OPENCODE_API_KEY`, `OPENCODE_API_KEYS`
+  (comma-separated), and numbered `OPENCODE_API_KEY_2` through
+  `OPENCODE_API_KEY_10`. Values are trimmed and quote-stripped; the numbered
+  range is capped at ten.
+- **Fork vault** (`ForkCredentials.list()`): labeled keys, the default flag, and
+  any key that exists only there.
 
-Each key becomes a `ZenAccount`: `{ id, label, apiKey, governor, source, mtime,
-everUsed }`. Ordering for failover comes entirely from the governor's
-`resetAt` plus this `everUsed` flag (below) — no separate load or
-last-released bookkeeping needed.
-`id` is a stable hash of the key (never the raw key) so accounts are
-addressable in logs/UI without leaking secrets — same as
-`stableVerdentIdentity`.
+Precedence in `ZenAccountPool.sync()`:
 
-### 2. Governor (per-key state)
+- Deduplication is by `stableZenIdentity`, so a key present in both places is one
+  account, sourced from the environment.
+- With any env key present, the first-declared env key is the default. The vault
+  default flag is honored only when there are no env keys at all.
+- If nothing ends up marked default, the first account in insertion order is
+  promoted.
 
-A trimmed-down version of `WorkBuddyEntitlementGovernor`. Responsibilities:
+The vault is read through a small Effect runtime built over `ForkCredentials.node`
+with the shared memo map, so it reuses the app's existing Database layer rather
+than opening a second connection. Reads are single-flight and TTL-cached; a read
+failure leaves the current pool intact and falls back to environment keys. The
+fork credential surface calls `bumpZenVaultPool()` after add / remove / rename /
+set-default, so the pool updates immediately instead of waiting out the TTL.
 
-- Track observed rate-limit responses (HTTP 429) and hard quota errors
-  (whatever Zen returns for exhausted balance — likely 402 or a specific error
-  body) per key.
-- Maintain a state machine: `READY -> COOLING_DOWN -> QUOTA_EXHAUSTED`, with
-  reset timestamps parsed from response headers if Zen sends
-  `x-ratelimit-reset` / `retry-after`, else exponential backoff learned from
-  repeated failures (same estimation trick as `estimateZenFreeLimit` in
-  `opencode-zen.ts`, which already does statistical limit-learning for the
-  *free* tier — that logic is directly reusable per-key here).
-- No model-entitlement tiers needed (unlike WorkBuddy) unless Zen itself gates
-  specific models per key/plan — if it doesn't, this governor is strictly
-  simpler: just "is this key usable right now."
-- **The governor's `resetAt` is the router's ordering key.** This is the same
-  `resetAt` timestamp already computed for the limits panel
-  (`limits-panel.tsx:69,113,199-213` — every window row, including the free-tier
-  and Verdent-style windows, resolves to a `resetAt`/`resetAfterSeconds` pair
-  today). The Zen governor should compute and expose that identical value per
-  key rather than inventing a second notion of "when this key comes back," so
-  the router's failover ordering and the limits panel's displayed countdown
-  are always reading the same number.
+## 2. Routing: the model id selects the key
 
-### 3. Router (session-bound key selection)
+There is no session router. **The account suffix in the model id is the explicit
+intent**, parsed per request by `resolveZenModelParts`.
 
-This is a direct copy of `VerdentRouter.select()`'s model, not a departure
-from it — that's the whole point. One key per session, sticky:
+- The **last** `@zen-` marker is authoritative routing metadata. It survives a
+  context suffix (`base@300k@zen-<hash>` routes to `<hash>`) and neutralizes
+  junk after the account (`base@zen-x@300k` routes to `x`, sends `base`).
+  Malformed double-account ids route on the last account and have every trailing
+  marker stripped before the wire.
+- A marker at index 0 — pure routing metadata with no model — is left untouched.
+- Account-qualified models are emitted from the `provider.models` hook as
+  `${baseModelID}@${account.id}` with display name `${baseName} (${label})`, for
+  both provider ids. The bare catalog models remain the default-account entries.
+  `zenAccountModelAliases` returns nothing for an already-qualified id, so
+  aliases never nest.
 
-- **Session affinity, always**: a session binds to exactly one key and every
-  request from that session uses that key. Requests from the same session
-  must never be split across keys concurrently — that's the failure mode to
-  avoid, not a feature to add. This also keeps any provider-side prompt
-  caching keyed by API key intact for the life of the session.
-- **Automatic failover on exhaustion only, ordered by reset window — not
-  load**: if the bound key's governor reports `QUOTA_EXHAUSTED` or a cooldown
-  window, and only then, the router unbinds the session and rebinds it to
-  the next key in a queue sorted by exactly two rules, applied in order:
+Bare (unqualified) models resolve by provider, in `resolveZenRequest`:
 
-  1. **Primary: `resetAt` ascending.** Whichever already-used key resets
-     soonest goes first.
-  2. **Never-yet-used keys always sort last**, below every already-used key,
-     regardless of what their (nonexistent) reset window would be.
+1. An explicit account suffix wins over everything and **fails closed** — if the
+   named account is gone, the request errors rather than silently falling
+   through to another key.
+2. For `opencode`, the `public` sentinel is a credential-free route in its own
+   right, not an invitation to pick the pool default, and it is preserved all the
+   way to transport. It never enters the account pool.
+3. For `opencode-go`, a directly connected provider credential outranks the pool
+   default, and the account id is attached when that key is also in the pool so
+   observation stays tied to the unified identity.
+4. For `opencode`, a populated pool owns ordinary routing. This is what keeps
+   stale legacy auth state from shadowing a vault-selected account.
+5. Only when the pool is empty does provider auth act as a compatibility
+   fallback.
 
-  So the queue looks like: `[key resetting soonest, ..., key resetting
-  furthest out, ...untouched keys held in reserve]`.
+## 3. Transport
 
-  This is the opposite of "spread load evenly" — it's deliberately
-  front-loading the keys closest to reset. Picking the soonest-to-reset key
-  next means we come back around to it again sooner, so its reset events
-  keep landing while it's in rotation instead of while it sits idle. Reach
-  for an unused reserve key only once every already-used key has taken its
-  turn: pulling in a fresh key early doesn't shorten anyone's reset window,
-  it just adds a key whose window hasn't even started counting down, which
-  is strictly worse for how soon the *pool* has a `READY` key on hand. This
-  replaces `verdent-accounts.ts:660-666`'s in-flight/queued-load tie-break —
-  Zen has no per-key concurrency signal worth balancing on. The switch
-  happens between requests, not mid-flight — an in-progress request finishes
-  on the key it started with.
-- **Manual override**: the user can explicitly pin/switch a session to a
-  specific key id at any time (mirrors `VerdentRouter.select()`'s
-  `explicitAccountId` path), which then becomes the new sticky binding.
-- **Where "parallel" comes from**: not from splitting one session's traffic
-  across keys, but from *different sessions* independently binding to
-  *different* keys. Today, with one shared key, every session queues behind
-  the same rate limit; with N keys, up to N sessions can each have their own
-  key and run without contending with each other. Concurrency is achieved
-  by spreading sessions across keys, never by spreading one session's
-  requests across keys.
+Zen has no loopback proxy. Routing happens in an `options.fetch` wrapper that the
+SDK client is constructed with, so client count stays at one per provider.
 
-### 4. Transport
+`provider.ts` injects the wrapper in the provider loaders:
 
-Because Zen is already OpenAI-compatible and has no private protocol to
-impersonate, this plugin does **not** need Verdent's loopback HTTP proxy. The
-router can sit directly in front of the existing `@ai-sdk/openai-compatible`
-client construction: pick an account, construct (or reuse a cached) client
-instance with that account's `apiKey` and `baseURL`, dispatch. A loopback
-proxy would only become necessary if we want to unify retry/failover logic in
-one place across all callers (including callers that construct their own SDK
-client) — worth deciding explicitly rather than copying Verdent's approach by
-default.
+- The `opencode` custom loader attaches `zenProviderFetch`, and adds
+  `apiKey: ZEN_PUBLIC_API_KEY` when no credential is available.
+  `snowflake-cortex` is the in-tree precedent for a provider loader supplying
+  `options.fetch`.
+- The `opencode-go` loader attaches `zenGoProviderFetch`.
 
-### 5. Surfacing to the rest of the app
+The wrapper (`routedZenProviderFetch`):
 
-- `zenLimitSnapshot()` (mirrors `verdentLimitSnapshot` in `verdent.ts:98-111`):
-  exposes per-key usage to the limits panel /
-  `packages/app/src/pages/session/limits-panel.tsx` so the user can see which
-  keys are healthy/exhausted, not just an aggregate.
-- The existing `estimateZenFreeLimit` quota-estimation code in
-  `quota/providers/opencode-zen.ts` currently assumes one account; it should
-  be called once per `ZenAccount` and the results merged/labeled, the same
-  way `verdentLimitSnapshot` maps over `verdentRegistry.all()`.
-- Per key, the panel should show its position in the failover queue
-  alongside its `resetAt`, so the user can see *why* the router will pick key
-  B next and not just that key A is exhausted — the ordering should be
-  legible, not a black box.
+- parses the request body's `model` field;
+- resolves the route as above;
+- sets `Authorization: Bearer <selected key>`;
+- rewrites the body to the de-qualified base model id, so upstream never sees
+  the account suffix;
+- on a non-ok response, records status and reset time into the pool;
+- reports the account back on the response via `withRoutedAccount`
+  (`provider/routing-metadata.ts`), which sets the routed-account header.
 
-## Open questions to resolve before implementation
+Two further transports serve already-committed routes, where selection is
+decided and must not be revisited:
 
-1. **What does Zen actually return on rate-limit / exhaustion?** Need to hit
-   the real API (or check existing logs) to know if this is 429 + headers,
-   402, or something else, before the governor's state machine can be
-   written correctly — this is the single biggest unknown, and everything
-   about backoff/cooldown timing depends on it.
-2. **Does a Zen API key ever have model-level restrictions** (e.g. some keys
-   are free-tier and can't hit paid models)? Determines whether the governor
-   needs WorkBuddy's `canAdmitModel` concept or can skip it.
-3. **Key storage**: is an on-disk vault wanted, or is env-var-only (`ZEN_API_KEYS`)
-   sufficient for v1? Vault adds a CLI/UI surface (add/remove/list keys) that
-   is real scope; env-only is a much smaller first cut and still delivers
-   parallelism.
-4. **Where does client construction currently happen for Zen?** — it wasn't
-   found in `provider.ts` in this pass (only `zenmux` referenced); needs a
-   proper trace of how a Zen provider config currently turns into an SDK
-   client before the router can be spliced in at the right seam.
+- `committedZenProviderFetch(accountID)` reuses the bearer the committed binding
+  already injected, refuses a request naming a different explicit `@zen-`
+  account, and still de-qualifies the model and observes failures. A committed
+  route can never be replaced by the pool default at the physical boundary.
+- `committedPublicZenProviderFetch` pins the public sentinel and fails closed if
+  a request carries an explicit `@zen-` account, because Public has no account
+  to authorize. Public route health is owned by the shared route-health owner,
+  so there is deliberately no pool observation here.
 
-## Suggested incremental path
+## 4. Failure state
 
-1. Env-only multi-key support (`ZEN_API_KEYS`) + governor + router, no vault,
-   no UI — validates the failover/parallelism logic cheaply.
-2. Per-key limits-panel surfacing, reusing the existing free-tier estimation
-   code per key.
-3. Vault + CLI management commands, once the shape has proven out.
+`ZenAccountPool.observe(accountId, status, resetAt)` is best-effort,
+process-local bookkeeping:
+
+- `402` → `QUOTA_EXHAUSTED` (no reset).
+- `429` → `COOLING_DOWN` with the parsed `retry-after` as `resetAt`.
+- `2xx` → clears the record.
+
+`state()` promotes a `COOLING_DOWN` account back to `READY` once `now` reaches
+`resetAt`, and drops the record. There is no learned cooldown window and no
+persistence: a restart clears state, which is acceptable because upstream
+re-teaches it within a request.
+
+Observation has two paths, because the fetch wrapper cannot see in-band errors
+inside a 200 SSE stream:
+
+- The transport path above sees non-ok responses directly.
+- The plugin `event` hook watches `message.updated`, attributes the message to
+  the account named by its model suffix, feeds an `APIError` into `observe`, and
+  treats a completed error-free message as evidence the account works — but only
+  when the pool currently holds that key back, so ordinary updates do not keep
+  re-clearing state.
+
+## 5. Surfacing per-key state
+
+- `zenLimitSnapshot(now)` returns the pool snapshot: `{ accountId, label, source,
+  isDefault, state, resetAt }` per account.
+- The `opencodeZen` quota adapter turns that into one `zenAccounts` row per key
+  via `zenKeyLimitsRows`, carrying `keyId`, `label`, mapped state, `exhausted`,
+  `isDefault`, `resetAt` / `resetAfterSeconds`, and the free-tier estimate.
+- The panel's `WindowRow` renders any row carrying `resetAt` /
+  `resetAfterSeconds`, so countdowns and `ResetCell` need no special casing.
+- `zenQuotaAccounts()` returns pool ids and wire keys for quota adapters that
+  must read a per-key upstream usage gate. The provider loaders call
+  `syncZenAccountPool()` before reading it, so env and vault keys are both
+  present when they decide whether the Zen providers are configured.
+
+**Free-tier nuance worth keeping:** the free limiter is IP-scoped, so the daily
+free-tier estimate is computed once and shared across keys. Per-key
+differentiation comes only from the in-memory 402/429 observation. The shared
+`daily <source>` window keeps its single `zenUtcDayEnd(fetchedAt)` reset; Zen
+does not mint one quota window per key.
+
+## 6. Hosted model catalog discovery
+
+The models.dev catalog is the source of truth, with a live fallback:
+
+- `zenHostedCatalog()` fetches `https://opencode.ai/zen/v1/models` and returns
+  explicit freshness semantics — `fresh`, `stale`, `expired`, `unavailable`.
+  Fresh data returns directly; bounded-stale data stays usable while one
+  background refresh runs; expired data gets one synchronous attempt and stays
+  observably expired; unavailable data yields an empty set.
+- The catalog is cached in memory and persisted to `zen-public-models.json` in
+  the cache directory, written `0o600` via a temp file plus rename, versioned,
+  and rejected when implausible (bad timestamp, empty or oversized list, invalid
+  ids). Discovery is disabled in tests unless a test fetch or cache file is set.
+- `discoverZenSystemOneModel` synthesizes the documented zero-cost System One
+  model only for the exact free id `jev-1.13-free`, and only while the live
+  `/models` surface advertises it. Go is not synthesized, and paid Jev stays
+  catalog-owned so local billing metadata cannot drift.
+- When the user has no credential, the `opencode` loader prunes catalog models,
+  keeping only models that are both advertised by the hosted catalog and already
+  trusted as zero-cost.
+
+## Open questions still open
+
+1. **What does a paid Zen key return on exhaustion?** The in-repo evidence is
+   free-tier only. Error-body discrimination over `FreeUsageLimitError` and a
+   `402` handler are the observed shapes; paid-key credit exhaustion is
+   unverified and must be observed at runtime, not assumed.
+2. **Does a paid key ever have model-level restrictions?** No in-tree evidence.
+   If gating appears, the WorkBuddy `canAdmitModel` shape is the precedent — but
+   that would be new Zen code, not something Zen already does.
+3. **Should failure state drive routing?** Today it is display-only and
+   process-local; nothing consumes `COOLING_DOWN` to steer selection.
+4. **Session affinity for Zen?** Deliberately absent — the model suffix is the
+   intent channel. If per-session stickiness is ever wanted, WorkBuddy's
+   `AccountRouter` is the in-tree precedent, and adopting it is a real behavior
+   change rather than a wiring fix.
+
+## Test conventions and seams
+
+Tests live under `packages/opencode/test/**` and run with `bun test` from
+`packages/opencode`, never repo root. Zen coverage includes
+`test/plugin/zen-verify.test.ts`, `test/plugin/zen-smoke.test.ts`,
+`test/plugin/zen-selector.test.ts`, `test/quota/opencode-zen.test.ts`, and
+`test/usage/zen-free.test.ts`.
+
+Zen exposes explicit test-only seams, following the isolation approach of the
+WorkBuddy governor's `setEntitlementFile`:
+
+- `setTestZenFetch` — replace the base fetch; `undefined` restores the real one.
+- `setTestZenCatalogCacheFile` — redirect hosted-catalog cache I/O.
+- `setTestZenVaultCredentials` — pin the vault credential list, bypassing SQLite.
+- `resetZenPoolForTest` — replace the pool with a fresh instance.

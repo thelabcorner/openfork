@@ -37,10 +37,10 @@ and
 say
 so
    plainly rather than implying stronger guarantees than exist.
-4. **Silent cost growth.** Scheduled goals can burn tokens indefinitely.
-   Mitigated by tighter unattended budgets, the circuit breaker, and
-the
-   inbox surface.
+4. **Silent cost growth.** Scheduled goals can continue autonomously until
+   complete or blocked. Mitigated by ScheduledTask run timeout/retry controls,
+   the circuit breaker, and the inbox surface — not by changing Goal
+   continuation semantics.
 5. **Architectural rot.** The Tier 0 boundary is only real if it is
    enforced. Mitigated by the D1–D7 negative tests, especially the
 static
@@ -71,7 +71,7 @@ static
 | 3 | Recurrence dependency | `luxon` (already in catalog/store, added to `@opencode-ai/core` deps) for IANA zone arithmetic + a hand-rolled 5-field cron parser with an explicit DST policy adapter. No new cron library. | No cron lib exists in the lockfile; 02 § 3.2 Case D requires our gap policy to *override* library behavior anyway; 6-field seconds, `@reboot`, `L/W/#` are rejected (02 § 2.3). | 2026-09-17 |
 | 4 | Fan-out in v1 | One target per task. Idempotency key stays `(task_id, fire_for)`. | 01 § 3.5 extension point noted; retrofitting `(task_id, target_id, fire_for)` is only needed when fan-out actually lands. | 2026-09-17 |
 | 5 | Permission default | `deny`. Auto-reject `permission.asked` for the run's session via `Permission.reply({ reply: "reject" })`. `pause` parks the run as `waiting`; `inherit` is a no-op. | No sandbox exists here — permission is an allow/deny/ask policy layer only. Copying Codex's "never ask" without their sandbox would be strictly more dangerous (03 § 5.1). | 2026-09-17 |
-| 6 | Unattended goal budgets | Yes, tighter. Scheduled goals default to `{ mode: "unattended", maxConsecutiveTurns: 16, maxNoProgressTurns: 2, maxDurationMs: 30m }`; explicit action policy overrides win. | Interactive defaults (32 turns / 2h) assume a human watching; a 3am goal with that budget is a token bill (03 § 4.1). | 2026-09-17 |
+| 6 | Goal continuation budgets | **Superseded. Goal Mode has no continuation policy or scheduled/manual/unattended mode.** A runnable Goal always loops worker → auditor → worker until complete, failed, or genuinely blocked. ScheduledTask retains its own run timeout, retry, permission, and lease-safety policy and MUST NOT translate those controls into Goal turn/no-progress/token ceilings. | Keeping scheduler safety in ScheduledTask preserves one Goal semantic everywhere and prevents a producer from silently changing what “Goal Mode” means. | 2026-09-17 / superseded 2026-10-02 |
 | 7 | Quota-aware retry | v1 uses bounded backoff only; `quota`/`provider` are retryable and excluded from the circuit breaker. | 03 § 6 recommends reset-time retry, but reset metadata is not exposed at this boundary; a blind-but-bounded retry is strictly better than no retry. | 2026-09-17 |
 | 8 | Navigation placement | Global Scheduled pane. `scheduled_task.project_id` stays nullable and the list accepts an optional `projectID` filter. | The authoritative rows are global (Tier 0); making navigation project-scoped would hide global tasks (04 § 10.1). | 2026-09-17 |
 | 9 | Global kill switch | Yes, in v1. Durable singleton `scheduled_task_control` row, consulted by `nextDueAt`/`due` and `runNow`; pausing removes recurrence eligibility while retaining the one cheap generation-reconciliation timer, and in-flight runs complete. | The control state is durable and cross-process; retaining reconciliation avoids making resume correctness depend on an in-memory event. | 2026-09-17 / refined 2026-09-18 |

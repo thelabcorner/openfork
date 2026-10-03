@@ -13,8 +13,8 @@ renderer:
   (`plugin/workbuddy.ts:1055-1077`) — a debug surface, not an API.
 - `governor.metrics()` (`workbuddy-governor.ts:881-902`) carries `state`, `cooldownUntil`,
   `packageCreditsRemaining` and per-model reports.
-- `workbuddyLimitSnapshot()` / `verdentLimitSnapshot()` already export the non-secret
-  per-account model reports (`workbuddy.ts:211-220`, `verdent.ts:97-106`).
+- `workbuddyLimitSnapshot()` already exports the non-secret per-account model reports
+  (`workbuddy.ts:211-220`).
 
 **The catalog gap.** `WorkBuddyPlugin.models()` emits bare (auto-routable) ids only for
 `accounts[0]`'s catalog (`workbuddy.ts:1253-1261`). A model that only account #2 is

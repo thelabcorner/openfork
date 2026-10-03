@@ -43,6 +43,7 @@ changes were treated as foreign and left untouched.
 ## Deliverables and files
 
 Core (`packages/core`):
+
 - `src/scheduled-task.ts` (namespace barrel)
 - `src/scheduled-task/sql.ts` — `scheduled_task`, `scheduled_task_lease`,
   `scheduled_task_run`, `scheduled_task_control`
@@ -57,10 +58,12 @@ Core (`packages/core`):
   `20260918224000_scheduled_task_generation` (durable liveness epoch + reconciled triggers)
 
 Schema (`packages/schema`):
+
 - `src/scheduled-task.ts`, `src/scheduled-task-id.ts`, event-manifest + index
   registration (`scheduledTask.created/updated/removed/runStarted/runSettled/runUpdated/controlChanged`)
 
 OpenCode (`packages/opencode`):
+
 - `src/scheduled-task/runner.ts` — one-timer runner, epoch-fenced timer ownership, generation reconciliation, globally bounded/coalesced dispatch, scoped heartbeats, recovery, kill switch
 - `src/scheduled-task/executor.ts` — the only Tier 3 component
 - `src/server/routes/instance/httpapi/groups/scheduled-task.ts` and `handlers/scheduled-task.ts` — one Tier-0 ScheduledTask HTTP group, including durable `runNow` enqueue
@@ -95,25 +98,28 @@ contradictions resolved back into 01/05/06 (runNow group, `waiting` status,
 5. Permission default: `deny`, implemented as auto-rejecting
    `permission.asked` for the run's session; `pause` parks the run as `waiting`;
    `inherit` is a no-op.
-6. Unattended goal budgets: tighter defaults
-   `{mode:"unattended", maxConsecutiveTurns:16, maxNoProgressTurns:2, maxDurationMs:30m}`,
-   written explicitly into the prepared Goal.
+6. ~~Unattended Goal budgets~~ **Superseded 2026-10-02.** Goal Mode has one
+   intrinsic behavior: continue autonomously until independently complete or
+   genuinely blocked. ScheduledTask run timeout/retry/permission policy remains scheduler
+   state and is not written into the Goal.
 7. Quota-aware retry: bounded backoff only; `quota`/`provider` retryable and
    excluded from the circuit breaker.
 8. Navigation: global pane; `projectID` filter optional.
 9. Kill switch: durable `scheduled_task_control` row + `controlChanged` event; pause removes recurrence eligibility but retains the cheap reconciliation timer.
 10. Cross-process liveness (2026-09-18): durable monotonic scheduler generation advanced by SQLite triggers; EventV2 is an accelerator, not a correctness dependency.
+
 ## Verification ledger — 2026-09-17 baseline
+
 ### Commands and results
 
-| Command (working dir) | Result |
-| --- | --- |
-| `bun test test/scheduled-task/` (packages/core) | **41 pass / 0 fail** |
-| `bun test test/scheduled-task/ --timeout 120000` (packages/opencode) | **27 pass / 0 fail** |
-| `bun test test/session/prompt.test.ts --timeout 120000 -t "loop calls LLM and returns assistant message"` | **1 pass** (headless session origination) |
-| `bun test test/database-migration.test.ts` (packages/core) | **19 pass / 0 fail** |
-| `bun run build` (packages/sdk/js) | generated SDK contains `/scheduled-task*`; exit 0 |
-| scoped `tsgo --noEmit` on all new/changed scheduled-task sources and tests | no errors attributable to this feature |
+| Command (working dir)                                                                                     | Result                                            |
+| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `bun test test/scheduled-task/` (packages/core)                                                           | **41 pass / 0 fail**                              |
+| `bun test test/scheduled-task/ --timeout 120000` (packages/opencode)                                      | **27 pass / 0 fail**                              |
+| `bun test test/session/prompt.test.ts --timeout 120000 -t "loop calls LLM and returns assistant message"` | **1 pass** (headless session origination)         |
+| `bun test test/database-migration.test.ts` (packages/core)                                                | **19 pass / 0 fail**                              |
+| `bun run build` (packages/sdk/js)                                                                         | generated SDK contains `/scheduled-task*`; exit 0 |
+| scoped `tsgo --noEmit` on all new/changed scheduled-task sources and tests                                | no errors attributable to this feature            |
 
 ### Tier A — 02 §8 acceptance fixtures (engine)
 
@@ -131,39 +137,39 @@ E5/E6/E7/E12/E13 are covered at the service level (Tier B) with a virtual clock.
 
 ### Tier C — 2026-09-17 concurrency/recovery baseline
 
-| ID | Evidence |
-| --- | --- |
-| C1 | Two **real OS processes** (`bun` children) racing one due task → exactly one claim, one run row (`concurrency.test.ts`) |
-| C2 | A killed runner's lease recovered by a second process with an advanced clock; run becomes `abandoned`; reacquisition `attempt = 2` |
-| C3 | Same `(task_id, fire_for)` inserted twice → unique index rejects; also two-process race |
-| C4 | Disabled/deleted between claim and fire → `skipSettled` advances, no execution (runner revalidation; E12 service fixture) |
-| C5 | Edit mid-run completes on the old spec and recomputes from the new schedule (E13) |
-| C6 | 100 simultaneously-due tasks → observed peak in-flight dispatch exactly 2 |
-| C7 | Backward clock jump / stale cursor cannot duplicate a fired instant; unique index is the backstop |
-| C8 | 14-day catch-up with `run_all` collapses to the cap and fires one lease-serialized run at a time (E7) |
+| ID  | Evidence                                                                                                                           |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | Two **real OS processes** (`bun` children) racing one due task → exactly one claim, one run row (`concurrency.test.ts`)            |
+| C2  | A killed runner's lease recovered by a second process with an advanced clock; run becomes `abandoned`; reacquisition `attempt = 2` |
+| C3  | Same `(task_id, fire_for)` inserted twice → unique index rejects; also two-process race                                            |
+| C4  | Disabled/deleted between claim and fire → `skipSettled` advances, no execution (runner revalidation; E12 service fixture)          |
+| C5  | Edit mid-run completes on the old spec and recomputes from the new schedule (E13)                                                  |
+| C6  | 100 simultaneously-due tasks → observed peak in-flight dispatch exactly 2                                                          |
+| C7  | Backward clock jump / stale cursor cannot duplicate a fired instant; unique index is the backstop                                  |
+| C8  | 14-day catch-up with `run_all` collapses to the cap and fires one lease-serialized run at a time (E7)                              |
 
 ### Tier D — 2026-09-17 negative-ownership baseline (D3/D4 superseded by 2026-09-18 liveness hardening)
 
-| ID | Evidence |
-| --- | --- |
-| D1/D2 | Tier 0 endpoints (`list/get/create/update/enabled/delete/preview/inbox/count/ack/control`) answered over HTTP **without any directory context**; group placement statically asserted on `RootHttpApi` |
-| D3 | Historical 2026-09-17 behavior: idle runner armed no timer. **Superseded:** current runner keeps one generation-reconciliation timer and performs only a scalar generation read when unchanged. |
-| D4/N2 | Historical 2026-09-17: 200 future tasks armed exactly **1** timer. **Current invariant:** any task count, including zero, owns at most one runner timer. |
-| D5 | Static scan: no scheduled-task source reads `process.cwd()`; executor stats the target before `store.provide`; missing target skips with **zero** instance loads (unit test with a dying `InstanceStore.provide` spy) |
-| D6 | Deleting a task deletes its own run rows only; session ids are scalar |
-| D7 | Static import-graph assertion: only `executor.ts` imports `InstanceStore`; core never references the execution runtime |
-| N8 | Sub-minute schedules rejected (no seconds cron), bounding the event rate |
-| N9 | Static assertion that the on-time grace fast path returns before any recurrence call |
+| ID    | Evidence                                                                                                                                                                                                              |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1/D2 | Tier 0 endpoints (`list/get/create/update/enabled/delete/preview/inbox/count/ack/control`) answered over HTTP **without any directory context**; group placement statically asserted on `RootHttpApi`                 |
+| D3    | Historical 2026-09-17 behavior: idle runner armed no timer. **Superseded:** current runner keeps one generation-reconciliation timer and performs only a scalar generation read when unchanged.                       |
+| D4/N2 | Historical 2026-09-17: 200 future tasks armed exactly **1** timer. **Current invariant:** any task count, including zero, owns at most one runner timer.                                                              |
+| D5    | Static scan: no scheduled-task source reads `process.cwd()`; executor stats the target before `store.provide`; missing target skips with **zero** instance loads (unit test with a dying `InstanceStore.provide` spy) |
+| D6    | Deleting a task deletes its own run rows only; session ids are scalar                                                                                                                                                 |
+| D7    | Static import-graph assertion: only `executor.ts` imports `InstanceStore`; core never references the execution runtime                                                                                                |
+| N8    | Sub-minute schedules rejected (no seconds cron), bounding the event rate                                                                                                                                              |
+| N9    | Static assertion that the on-time grace fast path returns before any recurrence call                                                                                                                                  |
 
 ### Performance — 2026-09-17 baseline (`bench-scheduler.ts`)
 
-| Scenario | Budget | Measured |
-| --- | --- | --- |
-| List 500 tasks | one indexed query, <10ms | **6.47 ms**, 500 rows |
-| Timer re-arm `nextDueAt` | one `MIN(next_run_at)` query | **1.72 ms** |
-| Inbox newest 50 across 50,000 runs | indexed, <20ms | **1.19 ms** |
-| Unread count across 50,000 runs | indexed | **0.57 ms** |
-| Idle runner, 0 due tasks | historical target: 0 queries | **Superseded 2026-09-18:** correctness now requires one scalar generation read / 60s while truly idle; see addendum |
+| Scenario                           | Budget                       | Measured                                                                                                            |
+| ---------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| List 500 tasks                     | one indexed query, <10ms     | **6.47 ms**, 500 rows                                                                                               |
+| Timer re-arm `nextDueAt`           | one `MIN(next_run_at)` query | **1.72 ms**                                                                                                         |
+| Inbox newest 50 across 50,000 runs | indexed, <20ms               | **1.19 ms**                                                                                                         |
+| Unread count across 50,000 runs    | indexed                      | **0.57 ms**                                                                                                         |
+| Idle runner, 0 due tasks           | historical target: 0 queries | **Superseded 2026-09-18:** correctness now requires one scalar generation read / 60s while truly idle; see addendum |
 
 One budget was initially **missed**: the global inbox scan measured 29.36 ms
 because the only run index was `(acknowledged_at, started_at)` and the unfiltered
@@ -241,6 +247,7 @@ physical/manual release checks themselves.
 ## Addendum — T8 client surface (implemented in a parallel workstream)
 
 Files (all additive):
+
 - `packages/app/src/context/scheduled-tasks.ts` — the single store/provider
 - `packages/app/src/components/scheduled-task-editor.tsx` — editor dialog
 - `packages/app/src/pages/scheduled-page.tsx` — Scheduled pane (TASKS + RUNS)
@@ -248,6 +255,7 @@ Files (all additive):
   i18n keys only
 
 04 § 4.1 compliance:
+
 - one `event.listen` subscription per server (`scheduledTask.*`), patching rows
   by id; the list query is not re-fetched per event;
 - one refcounted 1-second `setInterval` in the store drives every countdown;
@@ -269,7 +277,6 @@ Verification: `packages/app` `bun run typecheck` reports a pre-existing error se
 byte-identical to baseline (no errors in the new files); `oxlint` on the new
 files reports no errors. The desktop UI was not launched for manual QA (see
 Manual QA status above); no browser/visual verification was performed.
-
 
 ## Continuation — 2026-09-18 cross-process liveness hardening
 
@@ -422,12 +429,12 @@ initialization is repaired and the matrix is rerun.
 
 The latest successful pre-generation benchmark measured approximately:
 
-| Scenario | Measured |
-| --- | ---: |
-| List 500 tasks | 5.92 ms |
-| `nextDueAt` over 500 tasks | 1.38 ms |
-| Inbox newest 50 over 50k runs | 1.17 ms |
-| Unread count over 50k runs | 0.56 ms |
+| Scenario                      | Measured |
+| ----------------------------- | -------: |
+| List 500 tasks                |  5.92 ms |
+| `nextDueAt` over 500 tasks    |  1.38 ms |
+| Inbox newest 50 over 50k runs |  1.17 ms |
+| Unread count over 50k runs    |  0.56 ms |
 
 `bench-scheduler.ts` now additionally measures 1,000 sequential
 `generation()` reads and reports both total milliseconds and average
@@ -482,13 +489,13 @@ made the latent transaction-mode bug deterministic, not the architectural fault.
 The semantic-prune-enabled benchmark now completes. Final 2026-09-18 values
 below are the median of three isolated runs:
 
-| Scenario | Measured |
-| --- | ---: |
-| List 500 tasks | 7.37 ms |
-| `nextDueAt` | 1.76 ms |
-| 1,000 generation reads | 98.31 ms total / 98.31 µs each |
-| Inbox newest 50 over 50k runs | 1.31 ms |
-| Unread count | 0.56 ms |
+| Scenario                      |                       Measured |
+| ----------------------------- | -----------------------------: |
+| List 500 tasks                |                        7.37 ms |
+| `nextDueAt`                   |                        1.76 ms |
+| 1,000 generation reads        | 98.31 ms total / 98.31 µs each |
+| Inbox newest 50 over 50k runs |                        1.31 ms |
+| Unread count                  |                        0.56 ms |
 
 Run/session provenance was also tightened: a scheduled run binds its current
 attempt's Session to `scheduled_task_run.session_id` immediately after Session

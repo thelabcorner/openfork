@@ -90,6 +90,12 @@ If the response body is tiny but the path crosses
 the route is not cheap. You must account for project resolution, config, plugin
 init, tool reload, warmup, watchers, and service caches.
 
+The directory-scoped `/event` SSE transport is a process-level subscription, not
+a workspace execution request. Route it with the explicit `WorkspaceRouteContext`
+and keep replay/listener registration directory-scoped; opening an Instance for
+each stream connection repeats workspace discovery and detached warmup on every
+connect or reconnect.
+
 ### Optional directory with cwd fallback
 
 Optional location is dangerous on server routes. If missing input can become
@@ -258,4 +264,3 @@ When reviewing a proposed patch, ask these in order:
 
 The desired agent behavior is not "always backend first." It is: **source of
 truth first, owner second, projection third, client last.**
-

@@ -2,7 +2,14 @@
 
 ## Decision Summary
 
-Build a first-party `ClaudeAgentRuntime` behind the existing provider path, preserving the external plugin's behavior first. The parity port keeps provider ID `claude-code`, official CLI login relay, lazy Agent SDK query, ephemeral OpenAI-compatible proxy, MCP tool parking/resume, multimodal conversion, compact/history fallback, sticky sessions, and rate-limit gate. Users no longer install or configure an npm plugin.
+Build a first-party `ClaudeAgentRuntime` behind the existing provider path,
+preserving the external plugin's behavior while rooting ownership in OpenFork.
+The built-in subscription provider ID is `claude`; `claude-code` remains
+reserved for the external `@openchamber/opencode-claude` compatibility
+surface, and `claude-api` is the direct Anthropic API-key provider. Preserve
+the official CLI login relay, lazy Agent SDK query, MCP tool parking/resume,
+multimodal conversion, compact/history fallback, sticky sessions, and
+rate-limit behavior without requiring users to install an npm plugin.
 
 After parity is proven, the loopback proxy may be refactored into a same-process transport. That is a later hardening phase, not a prerequisite for first-party parity.
 
@@ -23,13 +30,17 @@ Create a bounded area under `../../../../packages/opencode/src/claude`:
 
 - `availability.ts`: executable, SDK, and CLI-auth detection; no network side effects.
 - `auth.ts`: official CLI status/login/install relay; never read, copy, refresh, or store subscription tokens.
-- `models.ts`: canonical model IDs, aliases, capability metadata, and effort variants.
+- `models.ts`: account-authoritative concrete model catalog/cache,
+  compatibility aliases, capability metadata, effort variants, and 200K/1M
+  normalization.
 - `runtime.ts`: lifecycle-owned Agent SDK query execution, cancellation, process cleanup, and diagnostic events.
 - `transport.ts`: typed turn/continuation events; maps text, reasoning, tool calls, tool results, usage, and failures.
 - `tools.ts`: OpenCode tool bridge with explicit permission checks and project context.
 - `sessions.ts`: project-scoped binding between OpenCode session ID and external Claude session ID, with config/cwd validation.
 - `errors.ts`: stable user-safe error categories and redacted diagnostics.
-- `provider.ts`: first-party `claude-code` provider registration/model loader, separate from generic plugin loading.
+- `provider.ts`: first-party `claude` subscription provider
+  registration/model loader, separate from `claude-api` and external
+  `claude-code` plugin loading.
 
 The exact names may change during the spike, but the ownership boundaries must remain.
 
@@ -37,16 +48,21 @@ The exact names may change during the spike, but the ownership boundaries must r
 
 The provider adapter must:
 
-- expose the existing canonical provider ID `claude-code`;
-- preserve legacy `claude-code/<model>` references without an alias hop;
+- expose canonical built-in provider ID `claude`;
+- migrate compatible legacy `claude-code/<model>` selections to the
+  first-party `claude` model surface without ever selecting `claude-api`;
 - own the live proxy URL internally instead of requiring a user-authored `baseURL`;
 - return unavailable/configuration errors without crashing provider discovery;
 - load the Agent SDK dynamically so users without Claude support do not pay startup cost or fail startup;
-- produce stable model metadata and variant names;
+- derive account-visible concrete models from Agent SDK
+  `supportedModels()`, with a small concrete cold-start bootstrap and
+  models.dev used only for descriptive enrichment;
 - route cancellation to the runtime and then to the child process tree;
 - preserve OpenCode's durable message/tool semantics.
 
-Keep quota source ID `claude` separate from provider ID `claude-code`; this matches current fork and plugin behavior.
+The advisory quota source also uses the string `claude`, but remains a
+separate quota/observability subsystem rather than provider credential or model
+authority.
 
 ## Authoritative Loop
 

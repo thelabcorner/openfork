@@ -221,7 +221,7 @@ model-picker/limits/composer data.
 The adapter registry is useful but its current output is too presentation-oriented:
 
 - generic `UsageWindow` percentage/value-label shape;
-- provider-specific side channels for WorkBuddy/Verdent/Zen;
+- provider-specific side channels for WorkBuddy/Zen;
 - client code often has to recover resource semantics.
 
 The provider integration should evolve toward typed resource observations while
@@ -235,11 +235,11 @@ Current request-capacity logic is spread across:
 - schema copy `packages/schema/src/model-select/usage-estimate.ts`;
 - `dialog-select-model.tsx`;
 - `use-workbuddy-usage`;
-- `use-verdent-usage`;
+
 - `use-genspark-usage`;
 - `usePersonalUsage` / `usage.modelProfile`;
 - OpenCode Go fork-usage paths;
-- OpenRouter/Verdent special usage paths.
+- OpenRouter special usage paths.
 
 This violates the intended ownership model even where individual hooks are locally
 optimized.
@@ -344,7 +344,7 @@ Today resource facts are split between:
 - `Quota.Service` provider adapters and provider-specific caches;
 - OpenCode Go `ForkUsage` client polling;
 - renderer singleton `useOpenRouterFreeUsage`;
-- renderer/history-derived `useVerdentFreeUsage`;
+- a renderer/history-derived free-usage hook that reconstructs state by scanning synced message history;
 - `useLimits`' renderer transport cache.
 
 That would still be a second fragmented architecture even if yield math moved
@@ -663,7 +663,7 @@ routingBindings()
 - WorkBuddy promo: account×model request entitlement.
 - OpenCode Go: model/window quota fractions + published/canonical yield priors.
 - OpenCode Zen: hidden request entitlement.
-- Verdent: account×model hidden/learned request entitlement.
+
 - Claude: 5h + weekly + model-scoped weekly + optional extra-use money.
 - Codex: primary/secondary rate windows + credits/spend.
 - Kimi: provider-defined quota windows.
@@ -861,9 +861,10 @@ The following current frontend paths are migration inputs, not permanent owners:
   stale-while-revalidate UX during migration, then make it consume a server-owned
   batched resource snapshot / refresh command rather than acting as the primary
   provider-fetch orchestrator.
-- `useVerdentFreeUsage` currently scans synced renderer message history. Remove
-  that path; the server already owns Verdent free usage state and must publish it
-  through the resource observation layer.
+- Any renderer/history-derived free-usage hook that scans synced message history is
+  a consumer-first reconstruction, not an owner. Remove that path; the server
+  already owns the corresponding free-usage state and must publish it through the
+  resource observation layer.
 - `useOpenRouterFreeUsage` currently owns a renderer singleton poller. Preserve
   its provider-specific upstream implementation only as needed while migrating,
   then feed the normalized server resource store so all surfaces share one
@@ -888,7 +889,7 @@ new revision.
 The dialog currently has provider-specific branches for:
 
 - WorkBuddy;
-- Verdent;
+
 - Genspark;
 - OpenRouter free;
 - OpenCode Go;
@@ -941,7 +942,7 @@ Remove dialog-owned imports/branches for:
 
 - `estimateRequestsRemaining*`;
 - `useWorkBuddyUsage` request estimation;
-- `useVerdentUsage` request estimation;
+
 - `useGensparkUsage` request estimation;
 - Go request math;
 - Zen request math.
@@ -1196,14 +1197,15 @@ the ranking engine needs it.
 
 ---
 
-## 12.7 OpenRouter/Verdent free special surfaces
+## 12.7 Free-tier special surfaces
 
-OpenRouter free and Verdent free currently expose evidence of the acquisition split
-the target architecture must remove:
+Free-tier offers currently expose evidence of the acquisition split the target
+architecture must remove:
 
 - OpenRouter free uses a renderer-global polling singleton;
-- Verdent free still has a renderer/history-derived hook even though the server
-  already has a Verdent-free usage service feeding the quota layer.
+- a free tier with a renderer/history-derived hook exposes a consumer-first
+  reconstruction even though the server already has a free-usage service feeding
+  the quota layer.
 
 Migration goal:
 
@@ -1407,7 +1409,7 @@ Capacity should project the **actual routing policy**, not:
 
 Expose routing bindings from the authoritative router/governor where practical.
 
-The capacity service should not reimplement WorkBuddy/Verdent/Zen account-ranking
+The capacity service should not reimplement WorkBuddy/Zen account-ranking
 rules in App.
 
 ---
@@ -1567,7 +1569,7 @@ Measure:
 - add one process-global last-good observation store + semantic resource revision;
 - move refresh orchestration behind the server owner with bounded concurrency;
 - adapt provider quota sources incrementally;
-- remove renderer-history-derived Verdent resource state;
+- remove renderer-history-derived free-tier resource state;
 - feed Go/OpenRouter-free observations into the same server resource revision;
 - preserve provider-native raw detail for Limits;
 - no UI request estimator math.
@@ -1626,7 +1628,7 @@ Delete/retire when no consumers remain:
 
 - `model-usage-estimate.ts`;
 - duplicated schema estimator;
-- request-estimation branches in WorkBuddy/Verdent/Genspark hooks;
+- request-estimation branches in WorkBuddy/Genspark hooks;
 - recent-200 `modelProfile` if no longer needed for unrelated ranking;
 - client parsing of numeric values from display labels;
 - synthetic per-provider fallback math superseded by Capacity.
@@ -2014,3 +2016,91 @@ presentation of the already-owned statistics.
 
 Those are additive provider/product extensions. They are not unfinished work in the
 OpenCode Go request-capacity implementation above.
+
+---
+
+## 26. Truthful per-window capacity
+
+The 5h numbers in section 23 are one window of a multi-window entitlement. The
+per-window model makes the other windows explicit instead of leaving consumers to
+guess them from a 5h percentage.
+
+### 26.1 Two different quantities, two different names
+
+For every published prior window the server publishes:
+
+```text
+personalized total capacity  = published window limit / workloadMultiplier
+remaining capacity           = published window limit x observed remaining / workloadMultiplier
+```
+
+`workloadMultiplier` is the SAME hierarchical posterior for every window. That is
+what a multiplier means, and reusing it keeps the two lines consistent
+(`remaining ~= remainingFraction x totalCapacity` for the observed window).
+
+An observed remaining fraction is applied ONLY to the window it was observed in.
+Publishing the 5h fraction as a weekly remaining count would restate a 5h fact as
+a weekly one, so a window whose consumption was not observed carries total
+capacity only. Unknown consumption is not zero consumption.
+
+Wire naming (`GoWindowCapacity.remaining`, `ProviderCapacity.Window.basis`):
+
+| Value | Meaning |
+| --- | --- |
+| `personalized-total-capacity` | what the whole window could hold at my workload |
+| `observed-remaining` | what is left in that exact window, from real provider telemetry |
+
+`remainingPercent` and `resetAt` are per window and absent/null unless the
+provider actually reported them for that window. No denominator is ever
+synthesized.
+
+### 26.2 No predictive range on window totals
+
+The deployed `GoPredictiveRange` is a 5h renewal/stopping-time calibration
+validated against realized counts of requests until the next 5h reset. It is not
+validated for full-window totals or for weekly/monthly stopping behaviour, so it
+stays on the legacy top-level 5h remaining line only. Window capacity rows carry
+the authoritative personalized point total and nothing else; a consumer that
+wants a sensitivity band for a full-window total derives one from its own
+representative request corpus and must not call it a confidence interval.
+
+### 26.3 Evidence comes from the snapshot that already exists
+
+`forkUsageSnapshot` already merges official `5h`, `week`, and `month` windows per
+credential out of ONE gated official read. The `/fork/capacity` handler used to
+keep only the `5h` window and discard the weekly/monthly consumption; it now
+carries them as `GoResource.observedWindows`, so weekly remaining is truthful
+when the official weekly window exists, with no additional provider request.
+`5h` stays the primary resource field for compatibility.
+
+The merged window now also preserves the provider's verbatim
+`officialPercent` alongside the dollar restatement. Capacity reads that value
+instead of reconstructing a window fraction from `spentUSD / limitUSD`, whose
+denominator is a local dollar budget rather than that window's own meter, and it
+never uses the legacy `estimatedPercent`.
+
+### 26.4 Local depletion is debited per window
+
+Post-snapshot local settlements are normalized per window using that window's own
+published limit (`multiplier / requests_window`), and a settlement is only debited
+to a window whose own reset boundary it precedes. Ambiguous burn marks the
+affected observed window unavailable instead of guessing; the total-capacity row
+survives because it depends on neither consumption nor local accounting. An
+observed window whose reset boundary has passed is dropped.
+
+### 26.5 Generic providers expose independent windows too
+
+`ProviderCapacity.Estimate.windows` carries one compact row per supported window
+(`id`, `label`, `basis`, point estimate, optional calibrated
+`lowerRequests`/`upperRequests`, `remainingPercent`, `resetAt`, provenance).
+Direct request budgets, monetary balances, convertible credit balances, and
+learned-burn windows all project per window now; the top-level fields and
+`limitingWindow` still describe the binding window, so existing consumers read the
+same binding number as before. A capacity-only window is never selected as the
+binding window.
+
+Bounds are preserved: the hard 64-model projection cap is unchanged and each
+estimate carries at most `MAX_CAPACITY_WINDOWS` (8) windows, with the binding
+window always retained so truncation can never drop the window the headline
+number came from. `requests`/`$` remains economics only; window rows never carry
+a price.

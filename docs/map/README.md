@@ -50,6 +50,7 @@ backend contracts.
 ## Atlas
 
 - [OpenFork compatibility boundary](../architecture/compatibility-boundary.md)
+- [Goal Mode intrinsic autonomy](../architecture/goal-mode.md)
 - [OXP parent-tool epoch and durable continuation](../architecture/oxp-parent-tool-epoch.md)
 - [OXP upstream authentication boundary](../specs/oxp-upstream-auth-boundary.md)
 - [Architecture and control/data flow](./architecture.md)

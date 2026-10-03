@@ -801,8 +801,9 @@ Consequences:
 - generic Session release no longer imports Goal state;
 - pending automatic Goal work gets the same revocation, replay, pause, and
   cross-process handoff semantics as every other SessionInput;
-- the Goal domain still owns continuation policy, budgets, auditor verdict,
-  causal source, and the correlation between Goal state and the admitted input.
+- the Goal domain owns the intrinsic continue-until-done-or-blocked loop,
+  auditor verdict, causal source, and the correlation between Goal state and
+  the admitted input; it does not own scheduler/resource continuation budgets.
 
 GoalAutomation may retain a durable `continuation_input_id` / correlation ID,
 but that is **domain correlation**, not execution ownership.

@@ -22,7 +22,7 @@ Initial families to evaluate:
 - OpenCode Go;
 - Claude subscription / Claude Code auth-context paths;
 - Codex subscription / OpenAI auth-context paths if enabled by PresGen;
-- Verdent / WorkBuddy style account pools only if PresGen intends to expose
+- WorkBuddy style account pools only if PresGen intends to expose
   them in hosted mode.
 
 Do not bundle every provider into one giant all-or-nothing rewrite.
@@ -54,7 +54,7 @@ Provider-specific, for example:
 - `packages/opencode/src/plugin/zen.ts`
 - `packages/opencode/src/plugin/zen-accounts.ts`
 - `packages/opencode/src/plugin/workbuddy*.ts`
-- `packages/opencode/src/plugin/verdent*.ts`
+
 - Claude/Codex binding/runtime/auth-context modules
 - quota/usage modules tied to those providers
 - provider-specific tests and T10 certification registry

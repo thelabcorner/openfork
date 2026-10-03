@@ -41,7 +41,7 @@
 |         +- SubContent: ModelTooltip | policy section | accounts | footer     |
 |                                     ^                                       |
 |   useAccountRouting(providerID) ----+                                       |
-|      +- useLimits()      (workbuddyAccounts / verdentAccounts / windows)    |
+|      +- useLimits()      (workbuddyAccounts / accountLabels / windows)      |
 |      +- sdk.experimental.accountRouting.get({provider})   [enrichment]      |
 +--------------------------+--------------------------------------------------+
                            |
@@ -70,7 +70,6 @@ hy4-preview                          bare        -> provider auto-routing (sessi
 hy4-preview#ctx-262144               bare + ctx  -> same, non-default context window
 hy4-preview@wb-3f1c9a                pinned      -> this WorkBuddy account, always
 hy4-preview#ctx-262144@wb-3f1c9a     pinned + ctx
-glm-5.3-flash-free@vd-ab12cd         pinned      -> this Verdent account
 ```
 
 Decoders that must stay in agreement:
@@ -78,13 +77,14 @@ Decoders that must stay in agreement:
 | Layer | Function | File |
 |-------|----------|------|
 | WorkBuddy proxy | `decodeAccountModel` (`lastIndexOf("@wb-")`) | `plugin/workbuddy.ts:834` |
-| Verdent proxy | `decodeVerdentAccountModel` (`lastIndexOf("@vd-")`) | `plugin/verdent.ts:436` |
 | Renderer usage | `splitWorkBuddyModelID` (`lastIndexOf("@")` + `#ctx-` strip) | `hooks/use-workbuddy-usage/index.ts:104` |
 
-> **Finding.** The three decoders disagree: the renderer splits on the *last `@`*, the
-> proxies on the *last `@wb-` / `@vd-`*. They agree today only because account ids happen
-> to start with `wb-`/`vd-`. T1 unifies this behind one descriptor-driven splitter with a
-> shared test-vector table, and keeps the proxy decoders as thin callers of it.
+> **Finding.** The two decoders disagree: the renderer splits on the *last `@`*, the proxy
+> on the *last `@wb-`*. They agree today only because account ids happen to start with
+> `wb-`. T1 unifies this behind one descriptor-driven splitter with a shared test-vector
+> table, and keeps the proxy decoder as a thin caller of it. The prefix is what has to stay
+> data-driven: any plugin that decodes an account suffix must read it from the descriptor,
+> not hardcode it.
 
 ### 3.2 The descriptor
 
@@ -92,11 +92,11 @@ Decoders that must stay in agreement:
 // packages/app/src/utils/multi-account-providers.ts   (NEW, pure, no Solid imports)
 export type MultiAccountProvider = {
   /** Provider id as it appears on ModelItem.provider.id. */
-  id: "workbuddy" | "verdent" | (string & {})
-  /** Account-id prefix used in the exposed model suffix: "wb-" | "vd-". */
+  id: "workbuddy" | (string & {})
+  /** Account-id prefix used in the exposed model suffix, e.g. "wb-". */
   accountPrefix: string
   /** Where per-account quota lives on ProviderResult.usage. */
-  accountsField: "workbuddyAccounts" | "verdentAccounts"
+  accountsField: string
   /** Aliases stripped before the account suffix (WorkBuddy context windows). */
   aliasMarkers: readonly string[]   // ["#ctx-"]
   /** Routing policies this provider supports. Gated by a capabilities probe. */
@@ -109,13 +109,13 @@ export type MultiAccountProvider = {
 ```
 
 `isMultiAccountProvider(id)`, `splitAccountModelID(id)`, `joinAccountModelID(base, acct)`
-and `canonicalModelName(item, labels)` all derive from the descriptor. Adding a third
+and `canonicalModelName(item, labels)` all derive from the descriptor. Adding another
 provider is one object literal plus one quota-adapter field.
 
 ### 3.3 Canonical display name
 
-The plugins bake the account label into `Model.name` (`` `${entry.name} (${accountLabel})` ``,
-`workbuddy.ts:1160`, `verdent.ts:2328`). The collapsed row must show `Hunyuan 4 Preview`,
+The plugin bakes the account label into `Model.name` (`` `${entry.name} (${accountLabel})` ``,
+`workbuddy.ts:1160`). The collapsed row must show `Hunyuan 4 Preview`,
 not `Hunyuan 4 Preview (jack@example.com)`. Resolution order:
 
 1. If a bare variant exists in the group, use its `name` (authoritative).
@@ -289,13 +289,18 @@ export function rankAccounts(
   as an estimate in the UI, and T10 adds a cross-check test that feeds identical candidate
   fixtures to both implementations and asserts identical ordering.
 
-### 5.5 Verdent
+### 5.5 Second routers (retired scope)
 
-`VerdentRouter` (`plugin/verdent-accounts.ts:591`) is a near-copy of WorkBuddy's. It gets
-the same `policy` parameter and the same `rankAccounts` call. Its governor is
-`WorkBuddyEntitlementGovernor` already (`verdent.ts:80`), so `modelWindow` comes from the
-same shape — with the hy3/hy4 placeholder filter that `verdentLimitSnapshot` already
-applies (`verdent.ts:104`).
+**Retired scope.** A second provider plugin used to ship a near-copy of `AccountRouter` — the
+same `select()` structure, the same `policy` parameter, the same `rankAccounts` call, and a
+governor that already produced WorkBuddy-shaped `modelWindow` data. That provider is no
+longer part of OpenFork, so this section has no code behind it; its plugin, quota adapter,
+router, registry entry and fixtures were removed together, and no stub is left behind.
+
+It stays written down because it is *why* `rankAccounts()` is a shared module and not a
+helper. The next multi-account provider takes its ordering from `rankAccounts` and its
+plumbing from a descriptor; a provider whose `modelWindow` is shaped differently is
+normalised in its quota adapter (PROVIDER-MATRIX §3), never with a second ranker.
 
 ## 6. Data plumbing
 
@@ -341,9 +346,8 @@ Implementation notes:
   handling, `isBestAccount`). T2 extracts its account-resolution core into
   `hooks/use-account-usage/` parameterised by descriptor, and re-exports
   `useWorkBuddyUsage` as a thin binding so existing call sites (`:1687`, `:2003`, `:2256`)
-  keep working unchanged. Verdent then gets a usage surface for free — today it has
-  **none** in the picker, so Verdent rows show no bar at all. This design fixes that as a
-  side effect.
+  keep working unchanged. The next multi-account provider then gets a usage surface from a
+  binding plus a descriptor entry — no new renderer code, and no picker rows without a bar.
 - Gated on `store.open`, like every other memo in the file.
 
 ### 6.2 Endpoint (enrichment tier)
@@ -472,8 +476,8 @@ CLI/TUI working with explicit ids. Collapsing is a *view* concern.
 *Alternative:* an `x-workbuddy-policy` header set by `chat.headers`. *Rejected for now:*
 the id is what persists into recents, favorites, drafts and session records, so "this
 session uses Auto · Spread" survives restart for free. A header would need a parallel store
-keyed by session. `chat.headers` still *reads* the policy out of the id for Verdent-style
-header routing, so both transports stay consistent.
+keyed by session. `chat.headers` still *reads* the policy out of the id, so a provider that
+routes by header stays consistent with the id-routed one.
 
 **ADR-3 — Preview the router, don't reimplement it.**
 *Alternative:* let the renderer pick the account and always send a pinned id. *Rejected:*
@@ -482,7 +486,7 @@ leases, `pressure`, or a `cooldownUntil` set 200 ms ago. Pinning on stale data i
 send a request to the account that just got 6004'd. The server decides at request time; the
 UI shows its best guess and says so.
 
-**ADR-4 — One submenu component, two providers, N future.**
+**ADR-4 — One submenu component, one provider today, N future.**
 *Alternative:* copy `OpenRouterRow` per provider. *Rejected:* the file is 2,687 lines and
 already carries three provider-specific pricing branches. The descriptor registry is the
 price of admission for "more likely to come in the future".
