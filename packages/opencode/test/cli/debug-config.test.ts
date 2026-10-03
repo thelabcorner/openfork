@@ -37,6 +37,7 @@ describe("debug config redaction", () => {
       expect(result.stdout).not.toContain("sk-example")
       expect(result.stdout).not.toContain("Bearer example")
     }),
+    15_000,
   )
 
   cliIt.live("does not mutate the input and preserves unrelated settings", () =>

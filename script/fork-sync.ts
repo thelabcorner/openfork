@@ -770,7 +770,7 @@ function cmdVerify(tag?: string): number {
       run: () => {
         const missing: string[] = []
         if (!fileContains("packages/app/src/app.tsx", "GoalsProvider")) missing.push("GoalsProvider")
-        if (!fileContains("packages/app/src/components/prompt-input-v2.tsx", "GoalComposerShelf")) missing.push("GoalComposerShelf")
+        if (!fileContains("packages/app/src/components/prompt-input-v2.tsx", "GoalComposerLauncher")) missing.push("GoalComposerLauncher")
         if (!fileContains("packages/session-ui/src/v2/components/prompt-input/index.tsx", "goalControl")) missing.push("goalControl slot")
         return missing.length > 0 ? `Goal composer integration missing: ${missing.join(", ")}` : undefined
       },
@@ -791,7 +791,7 @@ function cmdVerify(tag?: string): number {
         }
         if (!fileContains("packages/core/src/session/runner/llm.ts", "GoalAuditor")) missing.push("V2 auditor seam")
         if (!fileContains("packages/opencode/src/session/prompt.ts", "GoalAuditor")) missing.push("V1 auditor seam")
-        if (!fileContains("packages/app/src/components/settings-v2/general.tsx", "AuditorPromptDialog")) missing.push("auditor prompt settings")
+        if (!fileContains("packages/app/src/components/settings-v2/special-agents.tsx", "AuditorPromptDialog")) missing.push("auditor prompt settings")
         if (!fileContains("packages/app/src/components/goal-composer-shelf.tsx", "goal-auditor-model")) missing.push("per-Goal auditor model picker")
         return missing.length > 0 ? `Goal auditor missing: ${missing.join(", ")}` : undefined
       },
@@ -806,7 +806,7 @@ function cmdVerify(tag?: string): number {
         if (!fileContains("packages/core/src/goal/agent.ts", "GoalCreationPolicy.authorize")) missing.push("GoalAgent trusted authorization gate")
         if (!fileContains("packages/core/src/tool/tool.ts", "userTurn")) missing.push("V2 trusted tool user-turn context")
         if (!fileContains("packages/core/src/session/runner/llm.ts", "userTurn")) missing.push("V2 runner provenance seam")
-        if (!fileContains("packages/opencode/src/tool/goal.ts", "turnProvenance")) missing.push("V1 Goal provenance adapter")
+        if (!fileContains("packages/opencode/src/tool/goal.ts", "currentUserActionTurn(ctx.messages)")) missing.push("V1 Goal trusted user-action turn adapter")
         if (!fileContains("packages/core/src/goal/index.ts", "sourceMessageID")) missing.push("Goal creation source-message audit attribution")
         return missing.length > 0 ? `Goal agent creation provenance missing: ${missing.join(", ")}` : undefined
       },
@@ -823,7 +823,7 @@ function cmdVerify(tag?: string): number {
         if (!fileContains("packages/core/src/session/title.ts", "runTerminalCompletion")) missing.push("V2 title shared completion seam")
         if (!fileContains("packages/core/src/goal/auditor.ts", "runTerminalCompletion")) missing.push("Goal Auditor shared completion seam")
         if (!fileContains("packages/opencode/src/session/prompt.ts", "runTerminalCompletionWithTranscript")) missing.push("V1 title shared completion seam")
-        if (!fileContains("packages/opencode/src/prompt-revisor/runtime.ts", "generateAdaptive")) missing.push("Prompt Revisor host compatibility seam")
+        if (!fileContains("packages/core/src/prompt-revisor.ts", "generateAdaptive({")) missing.push("Prompt Revisor adaptive host seam")
         if (!fileContains("packages/opencode/src/special-agent/model-message-bridge.ts", "appendModelCompletionRepair")) missing.push("legacy transcript bridge")
         return missing.length > 0 ? `Special-agent protocol missing: ${missing.join(", ")}` : undefined
       },
@@ -892,7 +892,7 @@ function cmdVerify(tag?: string): number {
           failures.push("release versioning missing OpenFork repository default")
 
         const build = read("packages/opencode/script/build.ts")
-        if (!build.includes('PRODUCT_REPOSITORY } from "@opencode-ai/core/brand"'))
+        if (!build.includes("process.env.GH_REPO ?? PRODUCT_REPOSITORY"))
           failures.push("CLI release upload missing canonical OpenFork repository owner")
         if (build.includes("--repo ${process.env.GH_REPO}"))
           failures.push("CLI release upload can resolve to an undefined repository")
