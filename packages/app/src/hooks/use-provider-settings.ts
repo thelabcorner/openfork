@@ -1,11 +1,14 @@
 import { createMemo, type Accessor } from "solid-js"
 import { useQuery, useQueryClient } from "@tanstack/solid-query"
+import type { IntegrationMethod } from "@opencode-ai/client/promise"
 import type { ProviderSettingsListResponse, ProviderSettingsModelsResponse } from "@opencode-ai/sdk/v2/client"
 import { useServerSDK } from "@/context/server-sdk"
 import { safeQueryData } from "@/utils/safe-query-data"
 
 export type ProviderSettingsItem = ProviderSettingsListResponse["providers"][number]
+export type ProviderSettingsConnectMethod = Extract<IntegrationMethod, { type: "key" | "oauth" }>
 
+const KEY_ONLY_METHODS = [{ type: "key" as const }] satisfies ProviderSettingsConnectMethod[]
 const EMPTY: ProviderSettingsListResponse = { providers: [] }
 const EMPTY_MODELS: ProviderSettingsModelsResponse = { models: [] }
 const STALE_MS = 5 * 60_000
@@ -59,13 +62,28 @@ export function useProviderSettings(options: { enabled?: Accessor<boolean> } = {
     return value
   }
 
+  const get = (providerID: string) => all().get(providerID)
+
   return {
     query,
     data,
     all,
     connected,
-    get: (providerID: string) => all().get(providerID),
+    get,
     refresh,
+    auth: {
+      /**
+       * Bootstrap-free global auth capabilities.
+       *
+       * The current ProviderSettings API can settle key credentials only, so
+       * this intentionally fails closed to key-only. When the global auth
+       * attempt endpoints land, this is the single UI seam that should consume
+       * their method projection; callers must not synthesize a workspace.
+       */
+      methods: (providerID: string): readonly ProviderSettingsConnectMethod[] =>
+        get(providerID) ? KEY_ONLY_METHODS : [],
+      loading: () => query.isLoading,
+    },
     connectKey: (input: { providerID: string; key: string; label?: string }) =>
       afterMutation(() =>
         serverSDK().client.providerSettings.connectKey(input, { throwOnError: true }),

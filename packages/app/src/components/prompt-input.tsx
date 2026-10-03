@@ -30,6 +30,7 @@ import {
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
+import { isSubagentMentionableAgent } from "@/context/local-agent"
 import { useComments } from "@/context/comments"
 import { isSemanticUserMessage } from "@/utils/session-message"
 import { Button } from "@opencode-ai/ui/button"
@@ -588,7 +589,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const agentList = createMemo(() =>
     props.controls.agents.available
-      .filter((agent) => !agent.hidden && agent.mode !== "primary")
+      .filter(isSubagentMentionableAgent)
       .map((agent): AtOption => ({ type: "agent", name: agent.name, display: agent.name })),
   )
 

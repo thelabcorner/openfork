@@ -168,6 +168,33 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("an offset gap repairs the visible session without tab activation and overlaps are applied once", async () => {
+    const info = assistantMessage("msg_2", "msg_1", { time: { created: 2 } })
+    const repairedPage = deferredResponse()
+    const client = messageClient(
+      response([{ info: userMessage("msg_1"), parts: [] }, { info, parts: [textPart(info.id, { text: "" })] }]),
+      repairedPage.promise,
+    )
+    const store = createServerSession(client)
+    await store.sync("child")
+    const delta = (offset: number, text: string) => store.apply({
+      type: "message.part.delta",
+      properties: { sessionID: "child", messageID: info.id, partID: "part", field: "text", delta: text, offset },
+    })
+    delta(5, " world")
+    await client.requested(2)
+    expect(store.needsRepair("child")).toBe(true)
+    const repair = store.repairStreamContent("child")
+    repairedPage.resolve(response([{ info: userMessage("msg_1"), parts: [] }, { info, parts: [textPart(info.id, { text: "hello world" })] }]))
+    await repair
+    expect(store.needsRepair("child")).toBe(false)
+    delta(5, " world")
+    delta(11, "!")
+    expect(store.data.part[info.id]?.[0]).toMatchObject({ text: "hello world!" })
+    expect(client.requests).toHaveLength(2)
+    store.release("child")
+  })
+
   test("publishes the active timeline set only when stream interest changes", () => {
     const interests: string[][] = []
     const store = createServerSession(messageClient(response()), {

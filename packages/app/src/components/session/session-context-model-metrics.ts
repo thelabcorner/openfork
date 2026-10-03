@@ -1,4 +1,4 @@
-import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2/client"
+import type { AssistantMessage, Message, Part, UsageSessionContextResponse } from "@opencode-ai/sdk/v2/client"
 import { isFreeUsageCost, type SubsidyTokens } from "@/utils/usage-subsidy"
 
 type Provider = {
@@ -566,4 +566,96 @@ export function aggregateSessionContextByModel(
   }
 
   return { session, models }
+}
+
+/**
+ * Adapt the server-owned context projection into the presentation metrics shape.
+ *
+ * Unlike aggregateSessionContextByModel(), this never inspects client message
+ * or part stores: virtualization/pagination cannot change the result.
+ */
+export function projectSessionContextSnapshot(snapshot: UsageSessionContextResponse): SessionModelBreakdown {
+  const history = snapshot.history
+  const models: ModelContextMetrics[] = history.models.map((model) => {
+    const generatedSeconds = model.generatedMs / 1000
+    const total =
+      model.tokens.input +
+      model.tokens.output +
+      model.tokens.reasoning +
+      model.tokens.cacheRead +
+      model.tokens.cacheWrite
+    const entry: ModelContextMetrics = {
+      key: `${model.providerID}:${model.modelID}`,
+      providerID: model.providerID,
+      modelID: model.modelID,
+      providerLabel: model.providerName || model.providerID,
+      modelLabel: model.modelName || model.modelID,
+      messageCount: model.messages,
+      toolCallCount: model.toolCalls,
+      input: model.tokens.input,
+      output: model.tokens.output,
+      reasoning: model.tokens.reasoning,
+      cacheRead: model.tokens.cacheRead,
+      cacheWrite: model.tokens.cacheWrite,
+      total,
+      cost: model.cost,
+      freeMessageCount: model.freeMessages,
+      freeTokens: model.freeTokens,
+      cacheHitPercent: cacheHitPercent(model.tokens.cacheRead, model.tokens.input),
+      tokensPerSecond: tokensPerSecond(model.tokens.output + model.tokens.reasoning, generatedSeconds),
+      generatedSeconds,
+      toolSeconds: model.toolMs / 1000,
+      ttftSeconds: model.ttftRecords > 0 ? model.ttftMs / model.ttftRecords / 1000 : null,
+      upstreamTTFTSeconds:
+        model.upstreamTTFTRecords > 0 ? model.upstreamTTFTMs / model.upstreamTTFTRecords / 1000 : null,
+      firstMessageTime: model.firstMessageTime,
+      lastMessageTime: model.lastMessageTime,
+      costRate: model.costRate,
+      costBreakdown: costBreakdown(model.costRate, {
+        input: model.tokens.input,
+        output: model.tokens.output,
+        cacheRead: model.tokens.cacheRead,
+        cacheWrite: model.tokens.cacheWrite,
+      }),
+      cacheSavings: cacheSavings(model.costRate, model.tokens.cacheRead),
+    }
+    return entry
+  })
+
+  const availableBreakdowns = models.flatMap((model) => (model.costBreakdown ? [model.costBreakdown] : []))
+  const availableSavings = models.flatMap((model) => (model.cacheSavings !== undefined ? [model.cacheSavings] : []))
+  const tokens = history.totals.tokens
+  const telemetry = snapshot.telemetry as typeof snapshot.telemetry | null
+  const historicalGenerated = history.totals.generatedMs / 1000
+  const historicalTool = history.totals.toolMs / 1000
+  const generatedSeconds =
+    telemetry && telemetry.generatedMs > 0 ? telemetry.generatedMs / 1000 : historicalGenerated
+  const toolSeconds = telemetry && telemetry.toolMs > 0 ? telemetry.toolMs / 1000 : historicalTool
+
+  return {
+    models,
+    session: {
+      messageCount: history.totals.messages,
+      toolCallCount: history.totals.toolCalls,
+      input: tokens.input,
+      output: tokens.output,
+      reasoning: tokens.reasoning,
+      cacheRead: tokens.cacheRead,
+      cacheWrite: tokens.cacheWrite,
+      total: tokens.input + tokens.output + tokens.reasoning + tokens.cacheRead + tokens.cacheWrite,
+      cost: history.totals.cost,
+      cacheHitPercent: cacheHitPercent(tokens.cacheRead, tokens.input),
+      tokensPerSecond: tokensPerSecond(tokens.output + tokens.reasoning, generatedSeconds),
+      generatedSeconds,
+      toolSeconds,
+      ttftSeconds: history.totals.ttftRecords > 0 ? history.totals.ttftMs / history.totals.ttftRecords / 1000 : null,
+      upstreamTTFTSeconds:
+        history.totals.upstreamTTFTRecords > 0
+          ? history.totals.upstreamTTFTMs / history.totals.upstreamTTFTRecords / 1000
+          : null,
+      costBreakdown: sumCostBreakdown(availableBreakdowns),
+      costBreakdownComplete: models.length > 0 && availableBreakdowns.length === models.length,
+      cacheSavings: availableSavings.length > 0 ? availableSavings.reduce((sum, value) => sum + value, 0) : undefined,
+    },
+  }
 }

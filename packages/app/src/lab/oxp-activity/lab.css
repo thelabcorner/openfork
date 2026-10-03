@@ -1,0 +1,131 @@
+/* OXP activity transcript lab chrome. DEV-ONLY. */
+
+[data-component="oxp-lab"] {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--v2-background-bg-deep);
+  font-family: var(--v2-font-family-sans, "Inter", sans-serif);
+}
+
+[data-slot="oxp-lab-bar"] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--v2-border-border-muted);
+  background: var(--v2-background-bg-base);
+}
+
+[data-slot="oxp-lab-title"] {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-lab-group"] {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--v2-background-bg-layer-02);
+}
+
+[data-slot="oxp-lab-toggle"] {
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 520;
+  color: var(--v2-text-text-muted);
+  cursor: pointer;
+}
+
+[data-slot="oxp-lab-toggle"][aria-pressed="true"] {
+  background: var(--v2-background-bg-base);
+  color: var(--v2-text-text-base);
+  box-shadow: var(--v2-elevation-switch-on);
+}
+
+[data-slot="oxp-lab-latency"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-lab-latency"] input {
+  width: 96px;
+}
+
+[data-slot="oxp-lab-stage"] {
+  display: flex;
+  justify-content: center;
+  min-height: 0;
+  flex: 1;
+  padding: 16px;
+  overflow: auto;
+}
+
+[data-slot="oxp-lab-frame"] {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-width: 100%;
+  height: 100%;
+  resize: horizontal;
+}
+
+/* The page normally sits inside the app shell's flex column. */
+[data-slot="oxp-lab-frame"] > [data-component="oxp-activity"] {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Expanded-body gallery: every detail renderer at once, each inside the same
+   tool card the collapsible would give it. */
+[data-slot="oxp-lab-gallery"] {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 100%;
+  padding-bottom: 40px;
+}
+
+[data-slot="oxp-lab-gallery-item"] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+[data-slot="oxp-lab-gallery-title"] {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 620;
+  color: var(--v2-text-text-base);
+}
+
+[data-slot="oxp-lab-gallery-title"] span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--v2-font-family-mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--v2-text-text-faint);
+}
+
+[data-slot="oxp-lab-gallery"] [data-slot="tool-content"][data-variant="card"] {
+  margin: 0;
+}

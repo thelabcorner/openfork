@@ -44,6 +44,8 @@ import {
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
 import { isSessionStreamContentEvent } from "@/utils/session-stream-content"
+import { appendRunningToolOutputPreview, runningToolPartPreview } from "@/utils/tool-output-preview"
+import { applyPartDelta } from "./session-part-delta"
 
 type MessageApi = ServerApi["message"]
 type SessionStreamEvent = OpenCodeEvent | typeof SessionEvent.All.Encoded
@@ -74,8 +76,8 @@ async function mapAsyncLimited<A, B>(
   return results
 }
 
-function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
-  const boundary = source.find(
+function turnRootBoundary(source: readonly SessionMessageInfo[]) {
+  return source.find(
     (message) =>
       !hasSessionMessageStateSemantics(message) &&
       (message.type === "user" ||
@@ -83,14 +85,6 @@ function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
       message.type === "assistant" ||
       (message.type === "synthetic" && message.text.trim())),
   )
-  if (boundary?.type === "assistant") return true
-  if (boundary?.type !== "synthetic") return false
-  const provenance = boundary.provenance
-  if (provenance?.owner !== "host" || !provenance.sourceMessageID) return false
-  // Modern continuation lineage is explicit. If the canonical worker root is
-  // older than the loaded window, keep paging until it is available instead of
-  // accepting the continuation itself as an adjacency-derived root.
-  return !source.some((message) => message.id === provenance.sourceMessageID)
 }
 
 type OptimisticItem = {
@@ -248,6 +242,7 @@ type ServerSessionOptions = {
   retry?: typeof retry
   protocol?: Promise<"v1" | "v2">
   requests?: ServerRequestScheduler
+  getSessionInfo?: (sessionID: string) => Promise<Session>
   onStreamInterestChanged?: (sessions: readonly string[]) => void
 }
 
@@ -309,6 +304,19 @@ export function createServerSession(
   // resolves that background status (see `prefetch` and `release`/`resume`).
   const activated = new Set<string>()
   const stale = new Set<string>()
+  const staleGeneration = new Map<string, number>()
+  const repairingSessions = new Set<string>()
+  const streamRepairs = new Map<string, Promise<void>>()
+  const markStale = (sessionID: string) => {
+    const alreadyStale = stale.has(sessionID)
+    stale.add(sessionID)
+    // Repeated content events while a hidden session is already stale should
+    // stay a single latch. Advance the epoch only when a repair is in flight,
+    // where a new gap must survive the older request's completion.
+    if (!alreadyStale || repairingSessions.has(sessionID)) {
+      staleGeneration.set(sessionID, (staleGeneration.get(sessionID) ?? 0) + 1)
+    }
+  }
   const publishStreamInterest = () => options?.onStreamInterestChanged?.([...activated].sort())
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
@@ -400,10 +408,10 @@ export function createServerSession(
     return session
   }
 
-  const resolve = (sessionID: string, options?: { force?: boolean; priority?: ServerRequestPriority }) => {
-    const priority = options?.priority ?? "interactive"
+  const resolve = (sessionID: string, resolveOptions?: { force?: boolean; priority?: ServerRequestPriority }) => {
+    const priority = resolveOptions?.priority ?? "interactive"
     const cached = data.info[sessionID]
-    if (cached && !options?.force) return Promise.resolve(cached)
+    if (cached && !resolveOptions?.force) return Promise.resolve(cached)
     const pending = requests.get(sessionID)
     if (pending) {
       promoteSessionRequests(sessionID, priority)
@@ -411,12 +419,14 @@ export function createServerSession(
     }
     const active = generation(sessionID)
     const request = scheduleRequest(sessionID, priority, "session-info", () =>
-      sessionApi
-        ? sessionApi.get({ sessionID }).then(normalizeSessionInfo)
-        : client.session.get({ sessionID }).then((result) => {
-            if (!result.data) throw sessionNotFoundError(sessionID)
-            return result.data
-          }),
+      options?.getSessionInfo
+        ? options.getSessionInfo(sessionID)
+        : sessionApi
+          ? sessionApi.get({ sessionID }).then(normalizeSessionInfo)
+          : client.session.get({ sessionID }).then((result) => {
+              if (!result.data) throw sessionNotFoundError(sessionID)
+              return result.data
+            }),
     )
     const resolved = request.then((result) => {
       if (generations.get(sessionID) !== active) return result
@@ -600,6 +610,7 @@ export function createServerSession(
       suspended.delete(sessionID)
       activated.delete(sessionID)
       stale.delete(sessionID)
+      staleGeneration.delete(sessionID)
     })
     setData(
       produce((draft) => {
@@ -642,7 +653,17 @@ export function createServerSession(
     cacheBytes.set(sessionID, estimateSessionCacheBytes(data, sessionID))
   }
 
-  const touch = (sessionID: string) =>
+  const touch = (sessionID: string) => {
+    if (seen.has(sessionID)) seen.delete(sessionID)
+    seen.add(sessionID)
+
+    // Most events only refresh the LRU position. Protection state can span
+    // thousands of sessions, so materialize it only when the bounded cache is
+    // actually over its count or byte budget and an eviction decision is due.
+    let retainedBytes = 0
+    for (const id of seen) retainedBytes += cacheBytes.get(id) ?? 0
+    if (seen.size <= SESSION_CACHE_LIMIT && retainedBytes <= SESSION_CACHE_BYTE_LIMIT) return
+
     evict(
       pickSessionCacheEvictions({
         seen,
@@ -653,6 +674,7 @@ export function createServerSession(
         maxBytes: SESSION_CACHE_BYTE_LIMIT,
       }),
     )
+  }
 
   const setSessionStatus = (sessionID: string, status: SessionStatus) => {
     if (status.type === "idle") {
@@ -684,13 +706,93 @@ export function createServerSession(
         })
       const first = await request(before)
       const pages = [first]
-      while (pages.at(-1)?.cursor.next && needsOlderTurnRoot(pages.flatMap((page) => page.data).toReversed())) {
+      let boundary = turnRootBoundary(first.data.toReversed())
+      const ids = new Set(first.data.map((message) => message.id))
+      const sourceByID = new Map(first.data.map((message) => [message.id, message]))
+      let keyedRoot: SessionMessageInfo | undefined
+      const keyedMessage = async (messageID: string) => {
+        if (typeof client.session?.message !== "function") return undefined
+        const response = await (options?.retry ?? retry)(() => {
+          onAttempt?.()
+          return scheduleRequest(sessionID, priority, "session-message", () =>
+            client.session.message({ sessionID, messageID }, { throwOnError: false, responseStyle: "fields" }),
+          )
+        })
+        const result = response as unknown as {
+          data?: { info: Message; parts: Part[] }
+          error?: unknown
+          response?: Response
+        }
+        if (result.data) return result.data
+        // A stale causal pointer can outlive its message (for example after
+        // compaction). Let the normal cursor traversal recover in that case.
+        const status = result.response?.status
+        if (status === 404) return undefined
+        throw result.error ?? new Error(`Failed to read session message ${messageID} (${status ?? "unknown status"})`)
+      }
+      while (
+        pages.at(-1)?.cursor.next &&
+        (boundary?.type === "assistant" ||
+          (boundary?.type === "synthetic" &&
+            boundary.provenance?.owner === "host" &&
+            !!boundary.provenance.sourceMessageID &&
+            !ids.has(boundary.provenance.sourceMessageID)))
+      ) {
+        const provenance = boundary.type === "synthetic" ? boundary.provenance : undefined
+        if (boundary.type === "assistant") {
+          // The current message projection omits parentID, but the existing
+          // V1-compatible keyed endpoint provides it without loading history.
+          const projected = await keyedMessage(boundary.id)
+          const parentID = projected?.info.role === "assistant" ? projected.info.parentID : undefined
+          if (projected?.info.sessionID === sessionID && parentID) {
+            const knownParent = sourceByID.get(parentID)
+            if (
+              knownParent &&
+              !hasSessionMessageStateSemantics(knownParent) &&
+              (knownParent.type === "user" || knownParent.type === "synthetic")
+            ) {
+              break
+            }
+            if (!knownParent) {
+              const parent = await keyedMessage(parentID)
+              if (parent?.info.sessionID === sessionID && isConversationParentMessage(parent.info)) {
+                keyedRoot = legacyMessageSource([parent])[0]
+                ids.add(parent.info.id)
+                break
+              }
+            }
+          }
+        }
+        // Host continuations carry the canonical worker root explicitly. Fetch
+        // that one keyed ancestor instead of paging through every intervening
+        // message merely to discover its ID in the history window.
+        if (
+          provenance?.owner === "host" &&
+          provenance.sourceMessageID &&
+          !ids.has(provenance.sourceMessageID)
+        ) {
+          const root = await keyedMessage(provenance.sourceMessageID)
+          if (root?.info.sessionID === sessionID && isConversationParentMessage(root.info)) {
+            keyedRoot = legacyMessageSource([root])[0]
+            ids.add(root.info.id)
+            break
+          }
+        }
         const response = await request(pages.at(-1)!.cursor.next ?? undefined)
         pages.push(response)
+        for (const message of response.data) {
+          ids.add(message.id)
+          sourceByID.set(message.id, message)
+        }
+        boundary = turnRootBoundary(response.data.toReversed()) ?? boundary
         if (!response.data.length) break
       }
       const response = pages.at(-1)!
       const source = pages.flatMap((page) => page.data).toReversed()
+      if (keyedRoot) {
+        source.push(keyedRoot)
+        source.sort(compareMessages)
+      }
       const normalized = normalizeSessionMessages(sessionID, source)
       return {
         session: normalized.messages.sort(compareMessages),
@@ -773,28 +875,39 @@ export function createServerSession(
       if (!messageIDs.has(item.id)) continue
       const fetched = load?.clearedMessageParts.has(item.id)
         ? []
-        : item.part.filter((part) => !SKIP_PARTS.has(part.type))
+        : item.part.filter((part) => !SKIP_PARTS.has(part.type)).map(runningToolPartPreview)
       const fetchedIDs = new Set(fetched.map((part) => part.id))
       const pending = pendingParts.get(sessionID)?.get(item.id)
       const touched = new Set([...(load?.touchedParts.get(item.id) ?? []), ...(pending ?? [])])
       const currentParts = data.part[item.id] ?? []
+      const deltaValue = (part: Part | undefined) => {
+        if (!part) return undefined
+        if ("text" in part && typeof part.text === "string") return part.text
+        if (part.type !== "tool") return undefined
+        const value =
+          part.state.status === "completed"
+            ? part.state.output
+            : part.state.status === "running" || part.state.status === "error"
+              ? part.state.metadata?.output
+              : undefined
+        return typeof value === "string" ? value : undefined
+      }
       for (const part of fetched) {
         const existingResult = Binary.search(currentParts, part.id, (value) => value.id)
         const existing = existingResult.found ? currentParts[existingResult.index] : undefined
-        // The canonical Part is already updated on every live delta. Reading
-        // that value here avoids retaining a second growing full-text copy in
-        // part_text_accum_delta solely for hydration reconciliation.
-        const accumulated =
-          existing && "text" in existing && typeof existing.text === "string" ? existing.text : undefined
+        // The canonical Part is updated in place by live deltas, so hydration
+        // reconciliation can compare it directly without retaining a second
+        // growing full-text copy.
+        const accumulated = deltaValue(existing)
         const base = deltaBases.get(part.id)?.base
+        const fetchedValue = deltaValue(part)
         const preserveDelta =
           base !== undefined &&
           accumulated !== undefined &&
-          "text" in part &&
-          typeof part.text === "string" &&
-          part.text.startsWith(base) &&
-          accumulated.startsWith(part.text) &&
-          accumulated !== part.text
+          fetchedValue !== undefined &&
+          fetchedValue.startsWith(base) &&
+          accumulated.startsWith(fetchedValue) &&
+          accumulated !== fetchedValue
         if (preserveDelta) touched.add(part.id)
         if (load?.carriedDeltaParts.get(item.id)?.has(part.id) && !preserveDelta) touched.delete(part.id)
       }
@@ -1033,6 +1146,7 @@ export function createServerSession(
     const foreground = options?.activate !== false
     const priority = options?.priority ?? (foreground ? "critical" : "background")
     let force = options?.force === true
+    let repairAttempted = false
 
     // A foreground repair is stronger than an ordinary cache sync. If another
     // operation (prefetch/history/background sync) already owns this session's
@@ -1051,6 +1165,11 @@ export function createServerSession(
 
       await runInflight(inflight, sessionID, async () => {
           const repairing = foreground && activated.has(sessionID) && stale.has(sessionID)
+          const repairGeneration = repairing ? staleGeneration.get(sessionID) : undefined
+          if (repairing) {
+            repairAttempted = true
+            repairingSessions.add(sessionID)
+          }
           const effectiveForce = force || repairing
           const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
           if (cached && data.info[sessionID] && !effectiveForce) return
@@ -1074,16 +1193,31 @@ export function createServerSession(
             suspended.delete(sessionID)
           }
 
-          await Promise.all([
-            resolve(sessionID, { force: effectiveForce, priority }),
-            messagePromise,
-          ])
+          try {
+            await Promise.all([
+              resolve(sessionID, { force: effectiveForce, priority }),
+              messagePromise,
+            ])
+          } finally {
+            if (repairing) repairingSessions.delete(sessionID)
+          }
 
-          if (repairing) stale.delete(sessionID)
+          // An invalidation that lands after this request's snapshot means the
+          // loaded page cannot repair that newer gap. Leave it latched so the
+          // outer sync loop takes another authoritative snapshot.
+          if (repairing && staleGeneration.get(sessionID) === repairGeneration) {
+            stale.delete(sessionID)
+            staleGeneration.delete(sessionID)
+          }
           if (activated.has(sessionID) && !stale.has(sessionID)) suspended.delete(sessionID)
       })
 
       if (!foreground || !activated.has(sessionID) || !stale.has(sessionID)) return
+      // A repair gets one authoritative read per sync() call. If invalidations
+      // keep advancing the stale generation during that read, return control to
+      // runStreamRepair() so its shared exponential backoff can pace the next
+      // attempt instead of spinning through full history loads here.
+      if (repairAttempted) return
       force = true
     }
   }
@@ -1128,9 +1262,57 @@ export function createServerSession(
       messageLoads.has(sessionID)
     if (cached) {
       suspended.add(sessionID)
-      stale.add(sessionID)
+      markStale(sessionID)
     }
     return false
+  }
+
+  const runStreamRepair = (sessionID: string) => {
+    const existing = streamRepairs.get(sessionID)
+    if (existing) return existing
+    if (!activated.has(sessionID) || !stale.has(sessionID)) return Promise.resolve()
+    // Renderer queue loss is session-local. Repair only the affected active
+    // timeline and keep subsequent content gated until its authoritative page
+    // replacement has installed reconciliation state.
+    const repairAfter = (delay: number) => new Promise<void>((resolve) => window.setTimeout(resolve, delay))
+    const runRepair = async () => {
+      // A failed repair used to leave the session stale forever while its
+      // timeline stayed mounted. Tab navigation happened to retry it because
+      // it recreated the timeline resource. Retry with bounded exponential
+      // backoff until the active session converges, so recovery does not depend
+      // on another event or the user changing tabs. Request concurrency remains
+      // bounded by the shared server scheduler, and deactivation ends the loop.
+      let attempt = 0
+      while (activated.has(sessionID) && stale.has(sessionID)) {
+        const delay = attempt === 0 ? 0 : Math.min(15_000, 250 * 2 ** (attempt - 1))
+        if (delay) await repairAfter(delay)
+        if (!activated.has(sessionID) || !stale.has(sessionID)) return
+        try {
+          await sync(sessionID, { force: true, activate: true })
+          if (!stale.has(sessionID)) return
+        } catch (error) {
+          console.warn("[session-sync] stream repair failed", {
+            sessionID,
+            attempt,
+            error: error instanceof Error ? { name: error.name, message: error.message } : String(error),
+          })
+        }
+        attempt++
+      }
+    }
+    const pending = runRepair().finally(() => {
+      if (streamRepairs.get(sessionID) === pending) streamRepairs.delete(sessionID)
+    })
+    streamRepairs.set(sessionID, pending)
+    return pending
+  }
+
+  const repairStreamContent = (sessionID: string) => {
+    if (!stale.has(sessionID)) return Promise.resolve()
+    // A route activation owns this recovery. Re-advertise interest before the
+    // retry loop so it can resume delivery after the authoritative repair.
+    resume(sessionID)
+    return runStreamRepair(sessionID)
   }
 
   const invalidateStreamContent = (sessionID: string, repair = true) => {
@@ -1140,12 +1322,8 @@ export function createServerSession(
       messageLoads.has(sessionID)
     if (!cached) return
     suspended.add(sessionID)
-    stale.add(sessionID)
-    if (!repair || !activated.has(sessionID)) return
-    // Renderer queue loss is session-local. Repair only the affected active
-    // timeline and keep subsequent content gated until its authoritative page
-    // replacement has installed reconciliation state.
-    void sync(sessionID, { force: true, activate: true }).catch(() => {})
+    markStale(sessionID)
+    if (repair) void runStreamRepair(sessionID)
   }
 
   const prefetchNow = async (sessionID: string, limit: number) => {
@@ -1336,7 +1514,7 @@ export function createServerSession(
     const loaded = data.session_message[sessionID] !== undefined || data.message[sessionID] !== undefined
     const contentEvent = isSessionStreamContentEvent(event.type)
     if (suspended.has(sessionID) && contentEvent) {
-      stale.add(sessionID)
+      markStale(sessionID)
       return
     }
     if (!loaded && contentEvent) return
@@ -1419,7 +1597,7 @@ export function createServerSession(
       touch(eventID)
       const content = isSessionStreamContentEvent(event.type)
       if (content && suspended.has(eventID)) {
-        stale.add(eventID)
+        markStale(eventID)
         return
       }
       const loaded = data.message[eventID] !== undefined || data.session_message[eventID] !== undefined
@@ -1538,7 +1716,7 @@ export function createServerSession(
         return
       }
       case "message.part.updated": {
-        const part = (event.properties as { part: Part }).part
+        const part = runningToolPartPreview((event.properties as { part: Part }).part)
         if (SKIP_PARTS.has(part.type)) return
         const messages = data.message[part.sessionID]
         const load = messageLoads.get(part.sessionID)
@@ -1640,11 +1818,18 @@ export function createServerSession(
           partID: string
           field: string
           delta: string
+          offset?: number
         }
         const parts = data.part[props.messageID]
-        if (!parts) return
+        if (!parts) {
+          if (props.offset !== undefined) invalidateStreamContent(props.sessionID)
+          return
+        }
         const result = Binary.search(parts, props.partID, (part) => part.id)
-        if (!result.found) return
+        if (!result.found) {
+          if (props.offset !== undefined) invalidateStreamContent(props.sessionID)
+          return
+        }
         trackPartChange(props.sessionID, props.messageID, props.partID)
         const load = messageLoads.get(props.sessionID)
         if (load) {
@@ -1655,18 +1840,47 @@ export function createServerSession(
           carried?.delete(props.partID)
           if (carried?.size === 0) load.carriedDeltaParts.delete(props.messageID)
         }
-        const field = props.field as keyof (typeof parts)[number]
-        const current = parts[result.index]?.[field]
-        if (!deltaBases.has(props.partID) && typeof current === "string")
-          deltaBases.set(props.partID, { base: current, sessionID: props.sessionID })
+        const currentPart = parts[result.index]
+        const current =
+          props.field === "state.metadata.output" && currentPart?.type === "tool"
+            ? currentPart.state.status === "completed"
+              ? currentPart.state.output
+              : currentPart.state.status === "running"
+                ? currentPart.state.metadata?.output
+                : undefined
+            : props.field === "text"
+              ? currentPart && "text" in currentPart
+                ? currentPart.text
+                : undefined
+              : (currentPart as Record<string, unknown> | undefined)?.[props.field]
+        if (
+          (props.field === "text" || props.field === "state.metadata.output") &&
+          !deltaBases.has(props.partID) &&
+          (typeof current === "string" || props.field === "state.metadata.output")
+        )
+          deltaBases.set(props.partID, {
+            base: typeof current === "string" ? current : "",
+            sessionID: props.sessionID,
+          })
+        const applied = applyPartDelta(typeof current === "string" ? current : undefined, props.delta, props.offset)
+        if (!applied.applied) {
+          invalidateStreamContent(props.sessionID)
+          return
+        }
         setData(
           "part",
           props.messageID,
           produce((draft) => {
             if (!draft) return
             const part = draft[result.index]
+            if (props.field === "state.metadata.output" && part.type === "tool" && part.state.status === "running") {
+              part.state.metadata ??= {}
+              const existing = part.state.metadata.output
+              part.state.metadata.output = appendRunningToolOutputPreview(existing, props.delta)
+              return
+            }
             const field = props.field as keyof typeof part
-            ;(part[field] as string) = ((part[field] as string | undefined) ?? "") + props.delta
+            ;(part[field] as string) = applied.value
           }),
         )
         return
@@ -1754,6 +1968,7 @@ export function createServerSession(
     release,
     acceptStreamContent,
     invalidateStreamContent,
+    repairStreamContent,
     prefetch,
     shouldPrefetch(sessionID: string, limit: number) {
       if (data.message[sessionID] === undefined) return true

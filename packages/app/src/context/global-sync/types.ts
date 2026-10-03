@@ -44,6 +44,8 @@ export type State = {
   config: Config
   path: Path
   session: Session[]
+  /** Shared parent-to-child index for session-tree status projections. */
+  session_children: () => Map<string, string[]>
   sessionTotal: number
   session_status: {
     [sessionID: string]: SessionStatus

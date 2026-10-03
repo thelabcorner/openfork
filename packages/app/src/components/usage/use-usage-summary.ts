@@ -30,15 +30,23 @@ export function createUsageSummary(input: {
   windowDef: Accessor<UsageWindowDef>
   projectID: Accessor<string | null>
   refreshTick: Accessor<number>
+  active?: Accessor<boolean>
 }) {
   const serverSDK = useServerSDK()
   let activeController: AbortController | undefined
   let seenRefreshRevision = input.refreshTick()
   const [summary] = createResource(
-    () => ({
-      key: usageSummaryCacheKey(serverSDK().scope, input.windowDef().key, input.projectID()),
-      refresh: input.refreshTick(),
-    }),
+    () => {
+      if (input.active && !input.active()) return undefined
+      return {
+        key: usageSummaryCacheKey(
+          serverSDK().scope,
+          input.windowDef().key,
+          input.projectID(),
+        ),
+        refresh: input.refreshTick(),
+      }
+    },
     async ({ key, refresh }) => {
       activeController?.abort()
       const cached = clientCache.get(key)

@@ -109,12 +109,12 @@ function sameIdentities(
 export function createUsageValuation(
   rows: Accessor<readonly SubsidyUsageRow[]>,
   scopedProviders: Accessor<readonly ValuationProvider[]> = () => [],
-  options: { globalCatalog?: boolean } = {},
+  options: { globalCatalog?: boolean; enabled?: Accessor<boolean> } = {},
 ): UsageValuation {
   const serverSDK = useServerSDK()
   const pricingQuery = useQuery(() => ({
     queryKey: [serverSDK().scope, "usage", "pricing-catalog"],
-    enabled: options.globalCatalog !== false,
+    enabled: options.globalCatalog !== false && (options.enabled?.() ?? true),
     staleTime: 5 * 60_000,
     queryFn: async () =>
       (await serverSDK().client.usage.pricingCatalog({ throwOnError: true })).data ?? { models: [] },

@@ -24,12 +24,13 @@ import { showToast } from "@/utils/toast"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
-import { Spinner } from "@opencode-ai/ui/spinner"
+import { DenseWorkingIndicator } from "@opencode-ai/ui/spinner"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { useLanguage } from "@/context/language"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { getProjectAvatarVariant, useLayout, type LocalProject } from "@/context/layout"
+import { useGlobal } from "@/context/global"
 import { useServerSync } from "@/context/server-sync"
 import { useNotification } from "@/context/notification"
 import { useOxpActivity } from "@/context/oxp-activity"
@@ -38,12 +39,13 @@ import { usePlatform } from "@/context/platform"
 import { useServerSDK } from "@/context/server-sdk"
 import { ServerConnection } from "@/context/server"
 import { useSessionGroups } from "@/context/session-groups"
+import { SessionPreviewCard } from "@/components/session-preview/session-preview-card"
+import { sessionPreviewRelationships } from "@/components/session-preview/session-preview-model"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
 import { startupMark, startupTransportDiagnostic } from "@/utils/startup-perf"
 
 startupMark("sidebar.module-evaluated")
-import { buildChatSidebarSessionTreeRows } from "./chat-sidebar-session-tree"
 import {
   compareSessionTime,
   getProjectAvatarSource,
@@ -74,11 +76,14 @@ const loadChatSidebarSearchRuntime = () =>
 import {
   CHAT_SIDEBAR_RECENT_LIMIT_MIN,
   chatSidebarAggregateMetrics,
+  chatSidebarWorkingIndicatorAnimated,
+  uniqueSidebarSessions,
   chatSidebarRootSessionVisible,
   type ChatSidebarPaneState,
 } from "./chat-sidebar-pane-state"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
+import { sessionTelemetryClientNow, sessionTelemetryElapsedMs } from "@/utils/session-telemetry-time"
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import type { Info as SessionTelemetryInfo, Phase as SessionTelemetryPhase } from "@opencode-ai/schema/session-telemetry"
 
@@ -147,10 +152,20 @@ function telemetryContextPercent(value: SessionTelemetryInfo | undefined) {
  * spans incrementally; the shared pane clock contributes only the currently
  * open semantic phase. No message or Part[] reads occur here.
  */
-function telemetryLive(value: SessionTelemetryInfo | undefined, now: number): ChatRowLive | undefined {
+function telemetryLive(
+  value: SessionTelemetryInfo | undefined,
+  receivedAt: number | undefined,
+  clientNow: number,
+): ChatRowLive | undefined {
   if (!value || value.phase === "idle") return undefined
   const step = value.step
-  const openMs = value.phaseStartedAt === undefined ? 0 : Math.max(0, now - value.phaseStartedAt)
+  const openMs = sessionTelemetryElapsedMs({
+    startedAt: value.phaseStartedAt,
+    sampledAt: value.sampledAt,
+    updatedAt: value.updatedAt,
+    receivedAt,
+    now: clientNow,
+  })
   const generationOpen = value.phase === "generating" || value.phase === "reasoning" ? openMs : 0
   const toolOpen = value.phase === "tool" ? openMs : 0
   const stepGeneratedMs = (step?.generatedMs ?? 0) + generationOpen
@@ -260,6 +275,7 @@ export function ChatSidebarPane(props: {
   if (!paneOwner) throw new Error("ChatSidebarPane must be created within a reactive owner")
   const language = useLanguage()
   const layout = useLayout()
+  const global = useGlobal()
   const serverSync = useServerSync()
   const serverSDK = useServerSDK()
   const dialog = useDialog()
@@ -280,6 +296,25 @@ export function ChatSidebarPane(props: {
   const [now, setNow] = createSignal(Date.now())
   const tick = setInterval(() => setNow(Date.now()), 1000)
   onCleanup(() => clearInterval(tick))
+
+  // A single observer gates working-indicator animation for all rows in the pane.
+  const rowVisibility = new Map<Element, (visible: boolean) => void>()
+  let rowVisibilityObserver: IntersectionObserver | undefined
+  const observeRowVisibility = (element: Element, update: (visible: boolean) => void) => {
+    rowVisibilityObserver ??= new IntersectionObserver((entries) => {
+      for (const entry of entries) rowVisibility.get(entry.target)?.(entry.isIntersecting)
+    })
+    rowVisibility.set(element, update)
+    rowVisibilityObserver.observe(element)
+    return () => {
+      rowVisibility.delete(element)
+      rowVisibilityObserver?.unobserve(element)
+    }
+  }
+  onCleanup(() => {
+    rowVisibilityObserver?.disconnect()
+    rowVisibility.clear()
+  })
 
   // Relative timestamps ("2h", "3d") only change at minute granularity, so
   // they ride a slower shared ticker instead of the 1s one. This also makes
@@ -328,6 +363,13 @@ export function ChatSidebarPane(props: {
       return undefined
     }
   })
+  // Same per-server context the titlebar preview reads from — used only by
+  // the shared SessionPreviewCard rendered inside the pane's one pooled
+  // tooltip portal, for its O(1) peek/telemetry/permission reads.
+  const paneServerCtx = createMemo(() => {
+    const conn = serverSDK().server
+    return conn ? global.ensureServerCtx(conn) : undefined
+  })
 
   const isExpanded = (key: string) => !props.state.isGroupCollapsed(key)
   const toggleExpanded = (key: string) => props.state.toggleGroup(key)
@@ -338,11 +380,9 @@ export function ChatSidebarPane(props: {
   const workingArrival = new Map<string, number>()
   let arrivalSeq = 0
 
-  // Reads the global session store directly: the dir-context proxy routes
-  // session_working to this exact store regardless of directory
-  // (context/directory-sync.ts), so routing through ensureDirSyncContext here
-  // only added refcount churn per row per recompute — plus a dispose-thrash
-  // hazard when this pane was the context's sole holder.
+  // Reads the global session store directly: telemetry cold-start/live edges
+  // reconcile this canonical status projection in server-sync, so the sidebar
+  // does not own a second activity signal or any per-row transport.
   const isWorking = (session: Pick<Session, "id">) => {
     if (!session.id) return false
     return serverSync().session.data.session_working(session.id)
@@ -372,53 +412,64 @@ export function ChatSidebarPane(props: {
   // cannot make every other opened repository/sandbox filter + sort again.
   // Project aggregates are memoized on top of those slices; the only global
   // work left here is the cross-project Recent merge/sort.
-  const directorySlices = new Map<string, Accessor<Session[]>>()
-  const projectSlices = new Map<string, Accessor<Session[]>>()
-  const directorySlice = (dir: string, projectID?: string) => {
-    const key = `${pathKey(dir)}\u0000${projectID ?? ""}`
-    const cached = directorySlices.get(key)
-    if (cached) return cached
-    const created = runWithOwner(paneOwner, () =>
-      createMemo(() => {
-        const sessions = (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
-          withDirectory(session, dir),
-        )
-        return projectID
-          ? sessions.filter((session) => chatSidebarRootSessionVisible(session, dir, projectID)).sort(compareSessionTime)
-          : sortedRootSessions({ session: sessions, path: { directory: dir } }, 0)
-      }),
-    )!
-    directorySlices.set(key, created)
-    return created
-  }
-  const projectSlice = (project: LocalProject) => {
-    const key = [
+  type OwnedMemo<T> = { read: Accessor<T>; dispose: () => void }
+  const directorySlices = new Map<string, OwnedMemo<Session[]>>()
+  const projectSlices = new Map<string, OwnedMemo<Session[]>>()
+  const projectSliceKey = (project: LocalProject) =>
+    [
       pathKey(project.worktree),
       project.id ?? "",
       ...(project.sandboxes ?? []).map((sandbox) => pathKey(sandbox)),
     ].join("\u0000")
-    const cached = projectSlices.get(key)
-    if (cached) return cached
+  const directorySlice = (dir: string, projectID?: string) => {
+    const key = `${pathKey(dir)}\u0000${projectID ?? ""}`
+    const cached = directorySlices.get(key)
+    if (cached) return cached.read
     const created = runWithOwner(paneOwner, () =>
-      createMemo(() => {
-        // A known project's canonical worktree store is the project-wide,
-        // bootstrap-free root Session index. Do not merge sandbox stores back
-        // into it: project-scoped roots already include them, and doing so would
-        // duplicate the same Session in Recent/project groups. ID-less legacy
-        // projects retain the older exact-directory aggregation.
-        const rows = project.id
-          ? directorySlice(project.worktree, project.id)()
-          : [
-              ...directorySlice(project.worktree)(),
-              ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
-            ]
-        return rows.sort(compareSessionTime)
-      }),
+      createRoot((dispose) => ({
+        read: createMemo(() => {
+          const sessions = (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
+            withDirectory(session, dir),
+          )
+          return projectID
+            ? sessions.filter((session) => chatSidebarRootSessionVisible(session, dir, projectID)).sort(compareSessionTime)
+            : sortedRootSessions({ session: sessions, path: { directory: dir } }, 0)
+        }),
+        dispose,
+      })),
+    )!
+    directorySlices.set(key, created)
+    return created.read
+  }
+  const projectSlice = (project: LocalProject) => {
+    const key = projectSliceKey(project)
+    const cached = projectSlices.get(key)
+    if (cached) return cached.read
+    const created = runWithOwner(paneOwner, () =>
+      createRoot((dispose) => ({
+        read: createMemo(() => {
+          // A known project's canonical worktree store is the project-wide,
+          // bootstrap-free root Session index. Do not merge sandbox stores back
+          // into it: project-scoped roots already include them, and doing so would
+          // duplicate the same Session in Recent/project groups. ID-less legacy
+          // projects retain the older exact-directory aggregation.
+          const rows = project.id
+            ? directorySlice(project.worktree, project.id)()
+            : [
+                ...directorySlice(project.worktree)(),
+                ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
+              ]
+          return rows.sort(compareSessionTime)
+        }),
+        dispose,
+      })),
     )!
     projectSlices.set(key, created)
-    return created
+    return created.read
   }
   onCleanup(() => {
+    for (const entry of projectSlices.values()) entry.dispose()
+    for (const entry of directorySlices.values()) entry.dispose()
     directorySlices.clear()
     projectSlices.clear()
   })
@@ -436,8 +487,30 @@ export function ChatSidebarPane(props: {
             expanded: true,
           },
           ...opened.filter((project) => !isChatProjectAlias(project, canonicalChat)),
-        ]
+      ]
       : opened.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
+    // Projects/worktrees can be added, removed, and replaced while the sidebar
+    // stays mounted. Dispose obsolete memo roots so their child-store
+    // subscriptions do not continue reacting to session events forever.
+    const activeProjects = new Set(projects.map(projectSliceKey))
+    for (const [key, entry] of projectSlices) {
+      if (activeProjects.has(key)) continue
+      entry.dispose()
+      projectSlices.delete(key)
+    }
+    const activeDirectories = new Set<string>()
+    for (const project of projects) {
+      if (project.id) {
+        activeDirectories.add(`${pathKey(project.worktree)}\u0000${project.id}`)
+        continue
+      }
+      for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) activeDirectories.add(`${pathKey(dir)}\u0000`)
+    }
+    for (const [key, entry] of directorySlices) {
+      if (activeDirectories.has(key)) continue
+      entry.dispose()
+      directorySlices.delete(key)
+    }
     const recentPool: Session[] = []
     const projectRows = new Map<string, Session[]>()
     for (const project of projects) {
@@ -445,7 +518,7 @@ export function ChatSidebarPane(props: {
       recentPool.push(...rows)
       projectRows.set(project.worktree, rows)
     }
-    const recent = [...recentPool].sort(compareSessionTime)
+    const recent = uniqueSidebarSessions(recentPool).sort(compareSessionTime)
     if (recent.length > 0) {
       startupMark("sidebar.first-rows", { rows: recent.length, projects: projects.length })
       startupTransportDiagnostic("sidebar.first-rows.transport")
@@ -455,6 +528,13 @@ export function ChatSidebarPane(props: {
   })
 
   const visibleRootIDs = createMemo(() => new Set(baseGroups().recentPool.map((session) => session.id)))
+  // Hidden structural members (subagents, plugin/native-swarm workers) no
+  // longer render inline in the pane — they are reachable through the rich
+  // Session preview instead. This projection is still needed for the compact
+  // global working-count badge, which must include hidden workers without
+  // hydrating them. Legacy per-member resolve() compatibility fallback (for
+  // servers predating the lightweight session projection) now lives only in
+  // SessionPreviewCard, triggered on demand while a preview is actually open.
   const visibleStructuralGroups = createMemo(() => {
     const roots = visibleRootIDs()
     return sessionGroups
@@ -468,37 +548,16 @@ export function ChatSidebarPane(props: {
       )
   })
 
-  // Modern group-detail responses include a lightweight session projection, so
-  // structural children can render without turning a tiny navigation row into a
-  // full per-directory instance bootstrap. Keep the old resolve path only as a
-  // compatibility fallback for older servers whose group members lack that
-  // projection.
-  const treeInfoPending = new Set<string>()
-  const treeInfoFailedAt = new Map<string, number>()
-  createEffect(() => {
-    for (const group of visibleStructuralGroups()) {
-      for (const member of group.sessions) {
-        if (member.slug && member.projectID && member.directory && member.version && member.time) continue
-        if (serverSync().session.peek(member.id) || treeInfoPending.has(member.id)) continue
-        const failedAt = treeInfoFailedAt.get(member.id)
-        if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
-        treeInfoPending.add(member.id)
-        void serverSync().session.resolve(member.id, { priority: "background" })
-          .then(
-            () => treeInfoFailedAt.delete(member.id),
-            () => treeInfoFailedAt.set(member.id, Date.now()),
-          )
-          .finally(() => treeInfoPending.delete(member.id))
-      }
-    }
-  })
-
   // Stage 2 — pinning + assembly. The only stage that reads working state, so
   // a flip storm re-runs just this (~pin cost) while stage 1's sorts stay
   // cached; stableGroups below then finds nothing visibly changed and keeps
   // every row component alive.
   const groups = createMemo<ChatSessionGroup[]>(() => {
     const { projects, projectByID, recentPool, projectRows } = baseGroups()
+    const presentRoots = new Set(recentPool.map((session) => session.id))
+    for (const sessionID of workingArrival.keys()) {
+      if (!presentRoots.has(sessionID)) workingArrival.delete(sessionID)
+    }
     const result: ChatSessionGroup[] = []
 
     if (recentPool.length > 0) {
@@ -560,22 +619,20 @@ export function ChatSidebarPane(props: {
     })
   })
 
-  // Bootstrap compact metrics once for every session this pane can render.
-  // Duplicates across Recent/project/tree groups collapse in the server-scoped
-  // telemetry cache and its request batcher.
+  // Bootstrap compact metrics once for every session this pane actually
+  // renders. Hidden structural members are no longer rendered inline, so they
+  // are not warmed here — SessionPreviewCard ensures their telemetry in one
+  // coalesced batch only while a preview covering them is open.
   createEffect(() => {
     const ids = new Set<string>()
-    for (const group of stableGroups()) for (const session of group.sessions) ids.add(session.id)
-    for (const group of visibleStructuralGroups()) for (const member of group.sessions) ids.add(member.id)
+    for (const group of stableGroups()) {
+      // Collapsed groups have no mounted ChatRows. Avoid warming telemetry for
+      // their entire loaded session slice until the user expands that group.
+      if (!isExpanded(group.key)) continue
+      for (const session of group.sessions) ids.add(session.id)
+    }
     serverSync().telemetry.ensure(ids)
   })
-
-  const sessionTreeRows = (rows: Session[]) =>
-    buildChatSidebarSessionTreeRows({
-      roots: rows,
-      groups: sessionGroups.list(),
-      sessionByID: (sessionID) => serverSync().session.peek(sessionID),
-    })
 
   // Footer counts server-known roots per directory (sessionTotal estimates),
   // not loaded rows — loaded rows are capped per store and would undercount.
@@ -638,26 +695,24 @@ export function ChatSidebarPane(props: {
     const id = setTimeout(() => setPendingSessionId((key) => (key === pending ? null : key)), 4000)
     onCleanup(() => clearTimeout(id))
   })
+  // Reveal-once: expand the Recent/project section containing the navigated
+  // session. A hidden structural child (subagent/special agent) is not a root
+  // row itself, so fall back to its structural anchor's root — that anchor is
+  // always the one whose section actually needs expanding.
   let revealedFor: string | undefined
   createEffect(() => {
     const id = params.id
     if (!id || revealedFor === id) return
     const current = stableGroups()
-    const memberships = sessionGroups.list().filter((group) => group.sessionIds.includes(id))
-    const membership =
-      memberships.find((group) => group.kind === "swarm") ??
-      memberships.find((group) => !!group.anchorSessionID) ??
-      memberships[0]
-    const anchorID = membership?.anchorSessionID
+    const anchorID = sessionGroups
+      .list()
+      .find((group) => group.sessionIds.includes(id) && !!group.anchorSessionID)?.anchorSessionID
     const target =
       current.find((group) => group.sessions.some((session) => session.id === id || session.id === anchorID))?.key ??
       current.find((group) => group.directory && base64Encode(group.directory) === params.dir)?.key
     if (!target) return
     revealedFor = id
     props.state.revealGroup(target)
-    if (membership?.kind === "swarm") props.state.revealGroup(`session-group:${membership.id}`)
-    else if (anchorID) props.state.revealGroup(`session-tree:${anchorID}`)
-    else if (membership) props.state.revealGroup(`session-group:${membership.id}`)
   })
 
   const resizePair = createMemo(() => {
@@ -713,8 +768,11 @@ export function ChatSidebarPane(props: {
   // demand when the group is expanded, never merged into the active stores.
   const [archivedState, setArchivedState] = createStore({
     loading: false,
+    fetching: false,
     error: false,
     rows: [] as Session[],
+    more: false,
+    before: undefined as { archivedAt: number; id: string } | undefined,
   })
   let archivedFetchSeq = 0
 
@@ -735,37 +793,38 @@ export function ChatSidebarPane(props: {
     return dirs
   })
 
-  const fetchArchived = async () => {
+  const fetchArchived = async (reset = true) => {
     const dirs = archivedDirectories()
-    if (dirs.length === 0) return
     const seq = ++archivedFetchSeq
+    if (dirs.length === 0) {
+      setArchivedState({ loading: false, fetching: false, error: false, rows: [], more: false, before: undefined })
+      return
+    }
+    const cursor = reset ? undefined : archivedState.before
     // Stale-while-revalidate: keep cached rows visible on refetch, only show
     // the skeleton when there is nothing to paint yet.
-    setArchivedState({ loading: archivedState.rows.length === 0, error: false })
+    setArchivedState({ loading: archivedState.rows.length === 0, fetching: true, error: false })
     try {
-      const results = await Promise.all(
-        dirs.map(async (directory) => {
-          // The archived filter lives on the experimental session list
-          // (/experimental/session); the plain client.session.list has no
-          // archived param.
-          const result = await serverSDK().client?.experimental?.session?.list?.({ directory, archived: true })
-          return { directory, rows: result?.data ?? [] }
-        }),
-      )
+      const result = await serverSDK().client.global.archivedSessionRoots({
+        globalArchivedSessionRootsInput: {
+          directories: dirs,
+          limit: 50,
+          ...(cursor ? { before: cursor } : {}),
+        },
+      }, { throwOnError: true })
       if (seq !== archivedFetchSeq) return
-      // The server's archived:true only DROPS the "not archived" filter — it
-      // still returns active sessions — and spans child sessions, so keep just
-      // archived roots here.
-      const seen = new Set<string>()
-      const rows = results
-        .flatMap((entry) => entry.rows)
-        .filter((session) => !!session.id && session.time?.archived != null && !session.parentID)
-        .filter((session) => !seen.has(session.id) && seen.add(session.id))
-        .sort(compareSessionTime)
-      setArchivedState({ rows, loading: false, error: false })
+      const rows = cursor ? [...archivedState.rows, ...result.data.items] : result.data.items
+      setArchivedState({
+        rows: uniqueSidebarSessions(rows),
+        loading: false,
+        fetching: false,
+        error: false,
+        more: result.data.more,
+        before: result.data.before,
+      })
     } catch {
       if (seq !== archivedFetchSeq) return
-      setArchivedState({ loading: false, error: true })
+      setArchivedState({ loading: false, fetching: false, error: true })
     }
   }
 
@@ -775,6 +834,13 @@ export function ChatSidebarPane(props: {
     if (!props.state.isArchivedExpanded()) return
     void fetchArchived()
   })
+
+  const showMoreArchived = () => {
+    const nextLimit = props.state.archivedLimit() + 5
+    props.state.showMoreArchived()
+    if (nextLimit >= archivedState.rows.length && archivedState.more && !archivedState.fetching)
+      void fetchArchived(false)
+  }
 
   const unarchiveSession = async (session: Session) => {
     if (!session.id) return
@@ -885,7 +951,12 @@ export function ChatSidebarPane(props: {
       })
       const live = createMemo<ChatRowLive | undefined>(() => {
         if (!isWorking()) return undefined
-        return telemetryLive(telemetry(), now())
+        now()
+        return telemetryLive(
+          telemetry(),
+          serverSync().telemetry.receivedAt(sessionID),
+          sessionTelemetryClientNow(),
+        )
       })
 
       return {
@@ -952,6 +1023,7 @@ export function ChatSidebarPane(props: {
   let paneElement: HTMLDivElement | undefined
   let sharedTooltipElement: HTMLDivElement | undefined
   let tooltipOpenTimer: ReturnType<typeof setTimeout> | undefined
+  let tooltipCloseGraceTimer: ReturnType<typeof setTimeout> | undefined
   let tooltipPositionFrame = 0
   let pendingTooltip: ChatSidebarTooltipIntent | undefined
   let suppressedTooltipAnchor: HTMLElement | undefined
@@ -962,6 +1034,15 @@ export function ChatSidebarPane(props: {
   const [sharedTooltip, setSharedTooltip] = createSignal<ChatSidebarTooltipIntent>()
   const [sharedTooltipText, setSharedTooltipText] = createSignal("")
   const [sharedTooltipPosition, setSharedTooltipPosition] = createSignal<{ x: number; y: number }>()
+  // The rich card is a pane-scoped surface, not a free-floating window
+  // tooltip — it must never extend beyond the sidebar pane's own vertical
+  // extent, however tall the viewport is.
+  const [sharedTooltipMaxHeight, setSharedTooltipMaxHeight] = createSignal<number>()
+  // True while a row's context menu (rendered by the rich SessionPreviewCard)
+  // is open, or while the pointer is over the card itself — both must delay
+  // the normal pointerout-driven close for safe row<->card crossing.
+  const [sharedTooltipCardContextMenuOpen, setSharedTooltipCardContextMenuOpen] = createSignal(false)
+  let sharedTooltipCardHovered = false
 
   const clearTooltipDescription = () => {
     const anchor = describedTooltipAnchor
@@ -1012,13 +1093,23 @@ export function ChatSidebarPane(props: {
       clearTimeout(tooltipOpenTimer)
       tooltipOpenTimer = undefined
     }
+    if (tooltipCloseGraceTimer !== undefined) {
+      clearTimeout(tooltipCloseGraceTimer)
+      tooltipCloseGraceTimer = undefined
+    }
     const current = sharedTooltip()
     if (anchor && current?.anchor !== anchor) return
     if (!current) return
+    // A row's context menu is portalled outside this subtree. Keep the rich
+    // card mounted while it is open, or moving the pointer into the menu
+    // would dispose the row (and therefore the menu) underneath the user —
+    // mirrors the titlebar preview's own context-menu-open guard.
+    if (current.sessionID && sharedTooltipCardContextMenuOpen()) return
     clearTooltipDescription()
     stopTooltipTextObserver()
     setSharedTooltip(undefined)
     setSharedTooltipPosition(undefined)
+    setSharedTooltipMaxHeight(undefined)
     lastTooltipClosedAt = performance.now()
   }
 
@@ -1049,8 +1140,18 @@ export function ChatSidebarPane(props: {
     const height = Math.max(1, measured?.height || (intent.sessionID ? 150 : 24))
     const margin = 12
     const gutter = intent.sessionID ? 8 : 6
+
+    // Cap the rich card's own height to what actually fits inside the pane
+    // before using it for placement math, so a tall relationship list never
+    // pushes the card past the pane's top/bottom edge — it grows its own
+    // internal scroll region instead.
+    const paneMargin = 8
+    const maxHeight = intent.sessionID ? Math.max(120, paneRect.height - paneMargin * 2) : undefined
+    if (sharedTooltipMaxHeight() !== maxHeight) setSharedTooltipMaxHeight(maxHeight)
+    const cappedHeight = maxHeight !== undefined ? Math.min(height, maxHeight) : height
+
     let x = rect.left + (rect.width - width) / 2
-    let y = rect.top - height - gutter
+    let y = rect.top - cappedHeight - gutter
 
     if (intent.placement === "right") {
       x = rect.right + gutter
@@ -1058,13 +1159,21 @@ export function ChatSidebarPane(props: {
       if (x + width > window.innerWidth - margin) x = rect.left - width - gutter
     } else if (intent.placement === "bottom") {
       y = rect.bottom + gutter
-      if (y + height > window.innerHeight - margin) y = rect.top - height - gutter
+      if (y + cappedHeight > window.innerHeight - margin) y = rect.top - cappedHeight - gutter
     } else if (y < margin) {
       y = rect.bottom + gutter
     }
 
     x = Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - width - margin))
-    y = Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - height - margin))
+    // The rich card is clamped to the pane's own bounds — a pane-scoped
+    // surface, not a free-floating window tooltip. Plain-text micro-tooltips
+    // keep the ordinary viewport clamp.
+    y = intent.sessionID
+      ? Math.min(
+          Math.max(paneRect.top + paneMargin, y),
+          Math.max(paneRect.top + paneMargin, paneRect.bottom - paneMargin - cappedHeight),
+        )
+      : Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - cappedHeight - margin))
     const current = sharedTooltipPosition()
     const next = { x: Math.round(x), y: Math.round(y) }
     if (current?.x === next.x && current.y === next.y) return
@@ -1085,6 +1194,10 @@ export function ChatSidebarPane(props: {
     if (tooltipOpenTimer !== undefined) {
       clearTimeout(tooltipOpenTimer)
       tooltipOpenTimer = undefined
+    }
+    if (tooltipCloseGraceTimer !== undefined) {
+      clearTimeout(tooltipCloseGraceTimer)
+      tooltipCloseGraceTimer = undefined
     }
     const current = sharedTooltip()
     if (current?.anchor === intent.anchor && current.sessionID === intent.sessionID) {
@@ -1125,7 +1238,18 @@ export function ChatSidebarPane(props: {
 
   const tooltipAnchorFrom = (target: EventTarget | null) => {
     if (!(target instanceof Element)) return undefined
-    const anchor = target.closest<HTMLElement>("[data-chat-tooltip-text],[data-chat-tooltip-session]")
+    // A row's mini-tooltips (context %, cache hit, permission/question
+    // badges, archive button, ...) each carry their own data-chat-tooltip-text
+    // and live INSIDE that row's data-chat-tooltip-session wrapper. Plain
+    // closest() would resolve to whichever is nearer to the actual pointer
+    // target, so drifting over any of those nested elements swapped the
+    // "intent" out from under the rich card and tore it down. The row-level
+    // session anchor always wins over a nested text anchor: the whole row is
+    // one hover surface, and the rich card already supersedes these micro
+    // tooltips while it owns that surface.
+    const sessionAnchor = target.closest<HTMLElement>("[data-chat-tooltip-session]")
+    if (sessionAnchor && paneElement?.contains(sessionAnchor)) return sessionAnchor
+    const anchor = target.closest<HTMLElement>("[data-chat-tooltip-text]")
     if (!anchor || !paneElement?.contains(anchor)) return undefined
     return anchor
   }
@@ -1153,6 +1277,28 @@ export function ChatSidebarPane(props: {
     if (intent) scheduleSharedTooltip(intent)
   }
 
+  // The rich card is a `<Portal>` sibling, not a DOM descendant of the row —
+  // there is a real pixel gap between them. Closing synchronously the instant
+  // the pointer leaves the row (as plain-text tooltips do) means the card
+  // vanishes before the pointer can ever reach it. Give the rich card a short
+  // grace window instead, cancelled the moment the pointer actually reaches
+  // it (card's own onPointerEnter) or re-enters the row.
+  const scheduleCloseSharedTooltip = (anchor: HTMLElement) => {
+    const current = sharedTooltip()
+    if (current?.anchor !== anchor) return
+    if (!current.sessionID) {
+      closeSharedTooltip(anchor)
+      return
+    }
+    if (tooltipCloseGraceTimer !== undefined) clearTimeout(tooltipCloseGraceTimer)
+    tooltipCloseGraceTimer = setTimeout(() => {
+      tooltipCloseGraceTimer = undefined
+      if (sharedTooltipCardHovered || sharedTooltipCardContextMenuOpen()) return
+      if (anchor.matches(":hover")) return
+      closeSharedTooltip(anchor)
+    }, 200)
+  }
+
   const handleTooltipPointerOut = (event: PointerEvent) => {
     const previous = tooltipAnchorFrom(event.target)
     const next = tooltipAnchorFrom(event.relatedTarget)
@@ -1163,7 +1309,7 @@ export function ChatSidebarPane(props: {
       if (intent) scheduleSharedTooltip(intent)
       return
     }
-    closeSharedTooltip(previous)
+    scheduleCloseSharedTooltip(previous)
   }
 
   const handleTooltipFocusIn = (event: FocusEvent) => {
@@ -1207,14 +1353,76 @@ export function ChatSidebarPane(props: {
     const segs = dir.replace(/\\/g, "/").split("/").filter(Boolean)
     return segs[segs.length - 1] ?? dir
   }
-  const sharedTooltipBranch = () => {
-    const session = sharedTooltipSession() as (Session & { branch?: string; vcsBranch?: string }) | undefined
-    return session?.branch ?? session?.vcsBranch ?? "main"
-  }
+  // Feeds the shared rich SessionPreviewCard — same canonical card/model the
+  // titlebar tab popover renders. Computed only while the rich branch of the
+  // pooled tooltip is actually showing (sharedTooltip()?.sessionID set).
+  const sharedTooltipData = createMemo(() => {
+    const session = sharedTooltipSession()
+    if (!session) return undefined
+    const branch = (session as Session & { branch?: string; vcsBranch?: string }).branch ?? undefined
+    return {
+      project: projectForSession(session, layout.projects.list()),
+      directory: session.directory,
+      projectName: sharedTooltipProjectName(),
+      title: sessionTitle(session.title),
+      path: session.directory,
+      branch,
+    }
+  })
+  const sharedTooltipRelationships = createMemo(() => {
+    const sessionID = sharedTooltip()?.sessionID
+    return sessionID ? sessionPreviewRelationships({ sessionID, groups: sessionGroups.list() }) : undefined
+  })
 
   createEffect(() => {
     void sharedTooltip()
     queueSharedTooltipPosition()
+  })
+
+  // Safety net: every close path above depends on a specific event actually
+  // arriving (pointerout on the row, pointerleave on the portalled card, a
+  // context menu announcing its own close). Any one of those can be missed —
+  // a fast pointer exit past the OS window edge routinely drops the trailing
+  // pointerout/pointerleave in Electron/Windows — and once that happens the
+  // rich card is stuck open with no future event left to close it. Poll the
+  // authoritative `:hover` pseudo-state instead of trusting only tracked
+  // flags, and force-close (bypassing every other guard, including a
+  // context-menu-open flag that itself may be the thing that desynced) once
+  // the pointer has genuinely been away for a short window.
+  createEffect(() => {
+    const intent = sharedTooltip()
+    if (!intent?.sessionID) return
+    let awayTicks = 0
+    const POLL_MS = 400
+    const AWAY_TICKS_TO_CLOSE = 3
+    const timer = setInterval(() => {
+      const stillNear = intent.anchor.matches(":hover") || !!sharedTooltipElement?.matches(":hover")
+      if (stillNear) {
+        awayTicks = 0
+        return
+      }
+      awayTicks += 1
+      if (awayTicks < AWAY_TICKS_TO_CLOSE) return
+      clearTooltipDescription()
+      stopTooltipTextObserver()
+      setSharedTooltip(undefined)
+      setSharedTooltipPosition(undefined)
+      setSharedTooltipMaxHeight(undefined)
+      setSharedTooltipCardContextMenuOpen(false)
+      sharedTooltipCardHovered = false
+      lastTooltipClosedAt = performance.now()
+    }, POLL_MS)
+    onCleanup(() => clearInterval(timer))
+  })
+
+  // Electron/OS focus loss (alt-tab, clicking another window) is another
+  // event class that can leave the pointer state stale — the watchdog above
+  // still catches it within ~1.2s, but closing immediately on blur is both
+  // cheap and the behavior users actually expect.
+  onMount(() => {
+    const onBlur = () => closeSharedTooltip()
+    window.addEventListener("blur", onBlur)
+    onCleanup(() => window.removeEventListener("blur", onBlur))
   })
 
   onMount(() => {
@@ -1229,6 +1437,7 @@ export function ChatSidebarPane(props: {
 
   onCleanup(() => {
     if (tooltipOpenTimer !== undefined) clearTimeout(tooltipOpenTimer)
+    if (tooltipCloseGraceTimer !== undefined) clearTimeout(tooltipCloseGraceTimer)
     if (tooltipPositionFrame) cancelAnimationFrame(tooltipPositionFrame)
     clearTooltipDescription()
     stopTooltipTextObserver()
@@ -1666,118 +1875,48 @@ export function ChatSidebarPane(props: {
                     </Show>
                   </button>
 
+                  {/* Root Sessions are the primary sidebar rows. SessionGroup
+                      topology (subagents, delegations, plugin/manual groups,
+                      Swarms, special agents) is inspectable through the rich
+                      Session preview instead of an inline expandable tree —
+                      see session-preview/session-preview-model.ts. */}
                   <Show when={isExpanded(group.key)}>
                     <nav id={`chats-group-${index()}`} class="flex flex-col gap-px px-1 pb-1.5 pt-0.5">
-                      <For each={sessionTreeRows(group.sessions)}>
-                        {(item) => {
-                          const session = () => item.session
-                          const groupEntry = () => item.group
-                          const collapseKey = () => item.treeKey ?? (groupEntry() ? `session-group:${groupEntry()!.id}` : "")
-                          const isStructuralTree = () => !!item.treeKey
-                          const isStructuralAnchor = () => !!item.first && isStructuralTree()
-                          const working = () => !!groupEntry()?.sessions.some((member) => isWorking(member))
-                          const locked = () => !!groupEntry()?.sessions.some((member) => member.locked)
-                          const visibleCount = () => item.visibleCount ?? groupEntry()?.sessions.length ?? 0
-                          return (
-                            <>
-                              {/* Anchored subagent/plugin groups are structural
-                                  lineage, not a second folder above the parent. Their
-                                  anchor row owns disclosure directly. This
-                                  removes the duplicate "group title → same
-                                  session title" layer and leaves the useful
-                                  parent → indented-child hierarchy intact. */}
-                              <Show when={item.first && !isStructuralTree() ? groupEntry() : undefined} keyed>
-                                {(entry) => (
-                                  <button
-                                    type="button"
-                                    class="group/session-collection flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-start text-[10px] text-v2-text-text-muted transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
-                                    aria-expanded={isExpanded(collapseKey())}
-                                    aria-label={`${entry.name}, ${visibleCount()} sessions`}
-                                    onClick={() => toggleExpanded(collapseKey())}
-                                  >
-                                    <IconV2
-                                      name="chevron-down"
-                                      size="small"
-                                      aria-hidden="true"
-                                      class={`size-3 shrink-0 text-v2-icon-icon-muted transition-transform duration-150 ${isExpanded(collapseKey()) ? "" : "-rotate-90"}`}
-                                    />
-                                    <IconV2 name="layers" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted opacity-70" />
-                                    <span class="min-w-0 flex-1 truncate font-[560] text-v2-text-text-muted transition-colors group-hover/session-collection:text-v2-text-text-base">
-                                      {entry.name}
-                                    </span>
-                                    <Show when={working()}>
-                                      <span
-                                        class="flex size-3 shrink-0 items-center justify-center"
-                                        aria-label={language.t("sessionGroup.working")}
-                                      >
-                                        <span class="size-1.5 animate-pulse rounded-full bg-v2-state-fg-success" />
-                                      </span>
-                                    </Show>
-                                    <Show when={locked()}>
-                                      <span
-                                        class="flex size-4 shrink-0 items-center justify-center rounded-[4px] bg-v2-background-bg-layer-02 text-v2-icon-icon-muted"
-                                        aria-label={language.t("sessionGroup.locked")}
-                                      >
-                                        <IconV2 name="shield" size="small" class="size-2.5" />
-                                      </span>
-                                    </Show>
-                                    <span class="shrink-0 tabular-nums text-v2-text-text-faint">
-                                      {visibleCount()}
-                                    </span>
-                                  </button>
-                                )}
-                              </Show>
-                              <Show
-                                when={
-                                  !groupEntry() ||
-                                  (isStructuralTree()
-                                    ? isStructuralAnchor() || isExpanded(collapseKey())
-                                    : isExpanded(collapseKey()))
-                                }
-                              >
-                                <ChatRow
-                                  session={session()}
-                                  directory={group.directory}
-                                  inGroupId={groupEntry()?.id}
-                                  depth={item.depth}
-                                  treeExpanded={isStructuralAnchor() ? isExpanded(collapseKey()) : undefined}
-                                  treeCount={isStructuralAnchor() ? visibleCount() : undefined}
-                                  onToggleTree={
-                                    isStructuralAnchor()
-                                      ? () => toggleExpanded(collapseKey())
-                                      : undefined
-                                  }
-                                  selected={activeSessionId() === session().id}
-                                  minuteNow={minuteNow}
-                                  runtimeLease={leaseRowRuntime}
-                                  pending={pendingSessionId() === session().id}
-                                  onPending={(id) => {
-                                    if (params.id !== id) setPendingSessionId(id)
-                                  }}
-                                  archiveSession={() => archiveSession(session())}
-                                  prefetchSession={() => prefetchSession(session())}
-                                  onChangeModel={openModelPicker}
-                                  onNewSessionInProject={() =>
-                                    navigateToNewSession(session().directory || group.directory)
-                                  }
-                                  onOpenProjectInExplorer={() => {
-                                    const directory = session().directory || group.directory
-                                    if (directory) void platform.revealPath?.(directory)
-                                  }}
-                                  onCopyProjectPath={() => {
-                                    const directory = session().directory || group.directory
-                                    if (directory) void navigator.clipboard.writeText(directory)
-                                  }}
-                                  onForkConversation={() => {
-                                    void import("@/components/dialog-fork").then(({ DialogFork }) =>
-                                      dialog.show(() => <DialogFork sessionID={session().id} />),
-                                    )
-                                  }}
-                                />
-                              </Show>
-                            </>
-                          )
-                        }}
+                      <For each={group.sessions}>
+                        {(session) => (
+                          <ChatRow
+                            session={session}
+                            directory={group.directory}
+                            animateWorkingIndicator={!group.directory}
+                            observeVisibility={observeRowVisibility}
+                            relatedCount={sessionGroups.groupForSession(session.id)?.sessionIds.length}
+                            inGroupId={sessionGroups.groupForSession(session.id)?.id}
+                            selected={activeSessionId() === session.id}
+                            minuteNow={minuteNow}
+                            runtimeLease={leaseRowRuntime}
+                            pending={pendingSessionId() === session.id}
+                            onPending={(id) => {
+                              if (params.id !== id) setPendingSessionId(id)
+                            }}
+                            archiveSession={() => archiveSession(session)}
+                            prefetchSession={() => prefetchSession(session)}
+                            onChangeModel={openModelPicker}
+                            onNewSessionInProject={() => navigateToNewSession(session.directory || group.directory)}
+                            onOpenProjectInExplorer={() => {
+                              const directory = session.directory || group.directory
+                              if (directory) void platform.revealPath?.(directory)
+                            }}
+                            onCopyProjectPath={() => {
+                              const directory = session.directory || group.directory
+                              if (directory) void navigator.clipboard.writeText(directory)
+                            }}
+                            onForkConversation={() => {
+                              void import("@/components/dialog-fork").then(({ DialogFork }) =>
+                                dialog.show(() => <DialogFork sessionID={session.id} />),
+                              )
+                            }}
+                          />
+                        )}
                       </For>
                       <Show when={group.total > group.sessions.length}>
                         <button
@@ -1889,6 +2028,7 @@ export function ChatSidebarPane(props: {
                 rows={archivedState.rows}
                 loading={archivedState.loading}
                 error={archivedState.error}
+                more={archivedState.more}
                 limit={props.state.archivedLimit()}
                 minuteNow={minuteNow}
                 activeSessionId={activeSessionId() ?? undefined}
@@ -1898,7 +2038,7 @@ export function ChatSidebarPane(props: {
                 }}
                 onRetry={() => void fetchArchived()}
                 onUnarchive={unarchiveSession}
-                onShowMore={props.state.showMoreArchived}
+                onShowMore={showMoreArchived}
                 onShowLess={props.state.showLessArchived}
               />
             </Suspense>
@@ -1947,113 +2087,53 @@ export function ChatSidebarPane(props: {
                   role="tooltip"
                   data-component="tooltip-v2"
                   data-chat-sidebar-shared-tooltip
-                  class={
-                    intent().sessionID
-                      ? "!p-0 overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-layer-01 shadow-[var(--v2-elevation-floating)]"
-                      : undefined
-                  }
+                  class={intent().sessionID ? "!p-0 overflow-hidden" : undefined}
                   style={
                     {
                       position: "fixed",
                       left: `${position().x}px`,
                       top: `${position().y}px`,
-                      "pointer-events": "none",
+                      // The rich Session preview is interactive (row clicks,
+                      // context menu, keyboard); plain-text tooltips stay
+                      // decorative and click-through.
+                      "pointer-events": intent().sessionID ? "auto" : "none",
                       "z-index": 1000,
                       "max-width": "calc(100vw - 30px)",
                       "max-height": "calc(100vh - 30px)",
                     } as JSX.CSSProperties
                   }
+                  onPointerEnter={() => {
+                    if (!intent().sessionID) return
+                    sharedTooltipCardHovered = true
+                    if (tooltipCloseGraceTimer !== undefined) {
+                      clearTimeout(tooltipCloseGraceTimer)
+                      tooltipCloseGraceTimer = undefined
+                    }
+                  }}
+                  onPointerLeave={() => {
+                    if (!intent().sessionID) return
+                    sharedTooltipCardHovered = false
+                    requestAnimationFrame(() => {
+                      if (sharedTooltipCardHovered || sharedTooltipCardContextMenuOpen()) return
+                      if (sharedTooltip()?.anchor?.matches(":hover")) return
+                      closeSharedTooltip()
+                    })
+                  }}
                 >
-                  <Show when={intent().sessionID && sharedTooltipRuntime()} fallback={sharedTooltipText()}>
-                    <Show when={sharedTooltipRuntime()}>
-                      {(runtime) => {
-                        const session = () => runtime().session()
-                        const currentDir = () => runtime().currentDir()
-                        const totals = runtime().totals
-                        const contextPercent = runtime().contextPercent
-                        const modelInfo = runtime().modelInfo
-                        const modelLabel = runtime().modelLabel
-                        const isAutoAccepting = runtime().isAutoAccepting
-                        return (
-                          <div class="flex w-[260px] flex-col gap-2.5 px-3 py-2.5">
-                            <div class="flex min-w-0 items-center gap-2">
-                              <span class="flex size-5 shrink-0 items-center justify-center rounded-md bg-v2-background-bg-layer-02 text-[10px] font-[700] leading-none text-v2-text-text-muted">
-                                {(sharedTooltipProjectName()[0] ?? "•").toUpperCase()}
-                              </span>
-                              <span class="min-w-0 flex-1 truncate text-[12px] font-[600] leading-4 tracking-[-0.01em] text-v2-text-text-base">
-                                {sessionTitle(session().title) || sharedTooltipProjectName()}
-                              </span>
-                              <span class="shrink-0 text-[11px] leading-none tabular-nums text-v2-text-text-faint">
-                                {relativeLabel(session(), minuteNow())}
-                              </span>
-                            </div>
-                            <div class="h-px bg-v2-border-border-muted" />
-                            <div class="flex flex-col gap-1.5">
-                              <div class="flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
-                                <IconV2 name="folder" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
-                                <span class="min-w-0 flex-1 truncate text-v2-text-text-muted">
-                                  {sharedTooltipProjectName()}
-                                </span>
-                                <span class="shrink-0 truncate text-[11px] text-v2-text-text-faint">
-                                  {currentDir() ? currentDir().replace(/\\/g, "/").split("/").slice(-2).join("/") : ""}
-                                </span>
-                              </div>
-                              <div class="flex items-center gap-1.5 text-[11px] leading-4">
-                                <IconV2 name="branch" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
-                                <span class="text-v2-text-text-muted">{sharedTooltipBranch()}</span>
-                                <Show when={modelInfo()}>
-                                  {(info) => (
-                                    <span class="ml-auto flex min-w-0 items-center gap-1 truncate text-v2-text-text-faint">
-                                      <IconV2 name="cache" size="small" class="size-2.5 shrink-0 opacity-60" />
-                                      <span class="truncate">{modelLabel()}</span>
-                                      <Show when={info().variant}>{(variant) => <span class="shrink-0">· {variant()}</span>}</Show>
-                                    </span>
-                                  )}
-                                </Show>
-                              </div>
-                            </div>
-                            <Show
-                              when={
-                                totals() &&
-                                ((totals()!.cost ?? 0) > 0 ||
-                                  contextPercent() !== null ||
-                                  totals()!.cacheHitPercent !== null)
-                              }
-                            >
-                              <div class="h-px bg-v2-border-border-muted" />
-                              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-none tabular-nums">
-                                <Show when={(totals()?.cost ?? 0) > 0}>
-                                  <span class="text-v2-text-text-base">{formatCost(totals()!.cost)}</span>
-                                </Show>
-                                <Show when={contextPercent() !== null}>
-                                  <span class="flex items-center gap-1 text-v2-text-text-muted">
-                                    <span class="h-[3px] w-8 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-                                      <span
-                                        class={`block h-full rounded-full ${contextTone(contextPercent()!).bar}`}
-                                        style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
-                                      />
-                                    </span>
-                                    {contextPercent()}%
-                                  </span>
-                                </Show>
-                                <Show when={totals()?.cacheHitPercent !== null}>
-                                  <span class="flex items-center gap-1 text-v2-text-text-faint">
-                                    <IconV2 name="cache" size="small" class="size-3 opacity-60" />
-                                    {totals()!.cacheHitPercent}%
-                                  </span>
-                                </Show>
-                                <Show when={isAutoAccepting()}>
-                                  <span class="ml-auto flex items-center gap-1 rounded-[3.5px] bg-v2-state-bg-info px-1 py-0.5 text-[9px] font-[600] leading-none text-v2-state-fg-info">
-                                    <IconV2 name="shield-check" size="small" class="size-2.5" />
-                                    Auto
-                                  </span>
-                                </Show>
-                              </div>
-                            </Show>
-                          </div>
-                        )
-                      }}
-                    </Show>
+                  <Show when={intent().sessionID} fallback={sharedTooltipText()}>
+                    {(sessionID) => (
+                      <SessionPreviewCard
+                        data={sharedTooltipData() ?? {}}
+                        relationships={sharedTooltipRelationships}
+                        currentSessionID={sessionID()}
+                        server={paneServerKey()}
+                        serverCtx={paneServerCtx}
+                        active={() => sharedTooltip()?.sessionID === sessionID()}
+                        onOpenSession={() => closeSharedTooltip()}
+                        onRowContextMenuOpenChange={setSharedTooltipCardContextMenuOpen}
+                        maxHeight={sharedTooltipMaxHeight}
+                      />
+                    )}
                   </Show>
                 </div>
               )}
@@ -2068,11 +2148,15 @@ export function ChatSidebarPane(props: {
 function ChatRow(props: {
   session: Session
   directory: string
+  /** Cheap O(1) related-session count from the compact SessionGroup
+   * membership index (subagents/delegations/plugin/manual/Swarm) — the
+   * topology itself is only expandable through the rich Session preview. */
+  relatedCount?: number
+  /** First SessionGroup this root belongs to, if any — powers the context
+   * menu's "remove from group" affordance (unrelated to relatedCount). */
   inGroupId?: string
-  depth?: number
-  treeExpanded?: boolean
-  treeCount?: number
-  onToggleTree?: () => void
+  animateWorkingIndicator?: boolean
+  observeVisibility: (element: Element, update: (visible: boolean) => void) => () => void
   selected?: boolean
   minuteNow: () => number
   runtimeLease: (session: Session) => ChatRowRuntimeLease
@@ -2110,8 +2194,13 @@ function ChatRow(props: {
   const modelInfo = runtime.modelInfo
   const modelLabel = runtime.modelLabel
   const live = runtime.live
-  const hasTreeDisclosure = createMemo(() => props.treeExpanded !== undefined && !!props.onToggleTree)
-  const rowIndent = () => Math.min(Math.max(props.depth ?? 0, 0), 8) * 14
+  const [rowVisible, setRowVisible] = createSignal(false)
+  // Timer text is useful only while a row is on screen. Keep hidden rows out of
+  // the shared 1 Hz clock's reactive subscriber set; they recompute immediately
+  // when IntersectionObserver reports them visible again.
+  const rowLive = () => (rowVisible() ? live() : undefined)
+  let stopObserving: (() => void) | undefined
+  onCleanup(() => stopObserving?.())
 
   const slug = () => base64Encode(currentDir || props.session.directory || "")
   const warm = () => props.prefetchSession()
@@ -2139,30 +2228,18 @@ function ChatRow(props: {
   return (
     <>
       <div
+          ref={(element) => {
+            stopObserving?.()
+            stopObserving = props.observeVisibility(element, setRowVisible)
+          }}
           data-chat-tooltip-session={props.session.id}
           data-chat-tooltip-placement="right"
           class="group/session relative min-w-0 rounded-[5px] transition-[background-color,box-shadow] duration-100 hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[.active]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
-          style={{
-            "margin-inline-start": `${rowIndent()}px`,
-            width: `calc(100% - ${rowIndent()}px)`,
-          }}
           onContextMenu={(event) => {
             event.preventDefault()
             setContextMenu({ x: event.clientX, y: event.clientY })
           }}
         >
-          <Show when={(props.depth ?? 0) > 0}>
-            <span
-              aria-hidden="true"
-              class="pointer-events-none absolute inset-y-0 w-px bg-v2-border-border-muted opacity-60"
-              style={{ "inset-inline-start": "-6px" }}
-            />
-            <span
-              aria-hidden="true"
-              class="pointer-events-none absolute top-[15px] h-px w-[6px] bg-v2-border-border-muted opacity-60"
-              style={{ "inset-inline-start": "-6px" }}
-            />
-          </Show>
           <A
             href={`/${slug()}/session/${props.session.id}`}
             class="relative flex w-full min-w-0 flex-col gap-[2px] rounded-[5px] py-[4px] pe-1.5 ps-1.5 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[3px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-e-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[3px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-e-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] data-[selected]:before:content-['']"
@@ -2178,78 +2255,18 @@ function ChatRow(props: {
             {/* Line 1 — status, title, attention, hover actions */}
             <div class="flex min-w-0 items-center gap-1.5">
               <span class="flex size-3 shrink-0 items-center justify-center">
-                <Show when={hasTreeDisclosure()} fallback={
-                  <Show
-                    when={props.pending}
-                    fallback={
-                      <Show
-                        when={isWorking()}
-                        fallback={
-                          <Show
-                            when={needsAttention() || hasError() || unseenCount() > 0}
-                            fallback={
-                              <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
-                            }
-                          >
-                            <span
-                              class={`size-1.5 rounded-full ${
-                                hasError()
-                                  ? "bg-v2-state-fg-danger"
-                                  : needsAttention()
-                                    ? "bg-v2-state-fg-warning"
-                                    : "bg-v2-background-bg-accent"
-                              }`}
-                            />
-                          </Show>
-                        }
-                      >
-                        <Spinner class="size-3 text-v2-icon-icon-base" />
-                      </Show>
-                    }
-                  >
-                    <LoaderV2 class="size-3" aria-hidden="true" />
-                  </Show>
-                }>
-                  <button
-                    type="button"
-                    class="flex size-4 -m-0.5 items-center justify-center rounded-[4px] text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
-                    aria-expanded={props.treeExpanded}
-                    aria-label={props.treeExpanded ? language.t("home.server.collapse") : language.t("home.server.expand")}
-                    onClick={(event) => {
-                      event.preventDefault()
-                      event.stopPropagation()
-                      props.onToggleTree?.()
-                    }}
-                  >
-                    <IconV2
-                      name="chevron-down"
-                      size="small"
-                      class={`size-3 transition-transform duration-150 ${props.treeExpanded ? "" : "-rotate-90"}`}
-                    />
-                  </button>
-                </Show>
-              </span>
-
-              <span class="min-w-0 flex-1 truncate text-[11.5px] font-[460] leading-[15px] tracking-[-0.01em] group-has-[data-selected]/session:font-[560]">{title()}</span>
-
-              <Show when={hasTreeDisclosure() && (props.treeCount ?? 0) > 1}>
-                <span
-                  aria-label={language.plural("sessionGroup.sessions", Math.max((props.treeCount ?? 1) - 1, 0))}
-                  class="flex shrink-0 items-center gap-0.5 rounded-[4px] bg-v2-background-bg-layer-02 px-1 py-[1px] text-[9px] font-[520] leading-none tabular-nums text-v2-text-text-faint"
-                >
-                  <IconV2 name="branch" size="small" class="size-2.5 opacity-70" />
-                  {Math.max((props.treeCount ?? 1) - 1, 0)}
-                </span>
-              </Show>
-
-              <Show when={hasTreeDisclosure() && (props.pending || isWorking() || needsAttention() || hasError() || unseenCount() > 0)}>
-                <span class="flex size-2.5 shrink-0 items-center justify-center" aria-hidden="true">
-                  <Show
-                    when={props.pending}
-                    fallback={
-                      <Show
-                        when={isWorking()}
-                        fallback={
+                <Show
+                  when={props.pending}
+                  fallback={
+                    <Show
+                      when={isWorking()}
+                      fallback={
+                        <Show
+                          when={needsAttention() || hasError() || unseenCount() > 0}
+                          fallback={
+                            <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
+                          }
+                        >
                           <span
                             class={`size-1.5 rounded-full ${
                               hasError()
@@ -2259,14 +2276,34 @@ function ChatRow(props: {
                                   : "bg-v2-background-bg-accent"
                             }`}
                           />
-                        }
-                      >
-                        <Spinner class="size-2.5 text-v2-icon-icon-base" />
-                      </Show>
-                    }
-                  >
-                    <LoaderV2 class="size-2.5" />
-                  </Show>
+                        </Show>
+                      }
+                    >
+                      <DenseWorkingIndicator
+                        class="text-v2-icon-icon-base"
+                        animated={chatSidebarWorkingIndicatorAnimated(
+                          props.animateWorkingIndicator === true,
+                          true,
+                          rowVisible(),
+                        )}
+                      />
+                    </Show>
+                  }
+                >
+                  <LoaderV2 class="size-3" aria-hidden="true" />
+                </Show>
+              </span>
+
+              <span class="min-w-0 flex-1 truncate text-[11.5px] font-[460] leading-[15px] tracking-[-0.01em] group-has-[data-selected]/session:font-[560]">{title()}</span>
+
+              <Show when={(props.relatedCount ?? 0) > 1}>
+                <span
+                  data-chat-tooltip-text={language.plural("sessionGroup.sessions", Math.max((props.relatedCount ?? 1) - 1, 0))}
+                  data-chat-tooltip-placement="top"
+                  class="flex shrink-0 items-center gap-0.5 rounded-[4px] bg-v2-background-bg-layer-02 px-1 py-[1px] text-[9px] font-[520] leading-none tabular-nums text-v2-text-text-faint"
+                >
+                  <IconV2 name="branch" size="small" class="size-2.5 opacity-70" />
+                  {Math.max((props.relatedCount ?? 1) - 1, 0)}
                 </span>
               </Show>
 
@@ -2393,7 +2430,6 @@ function ChatRow(props: {
                  between generating / tools / waiting premium states instead of
                  showing 0s. */}
                 <span
-                  data-chat-tooltip-text={`${language.t("chats.timer.accumulated")} · ${formatDuration(live()?.accumulatedSeconds ?? 0)}`}
                   data-chat-tooltip-placement="top"
                   class="flex shrink-0"
                 >
@@ -2402,27 +2438,27 @@ function ChatRow(props: {
                       <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-state-fg-warning">
                         <IconV2 name="hourglass" size="small" class="size-3 animate-pulse" />
                         <span class="font-[560]">{language.t("chats.timer.waiting")}</span>
-                        <Show when={(live()?.turnSeconds ?? 0) > 1}>
-                          <span class="font-[560] opacity-70">{formatDuration(live()!.turnSeconds)}</span>
+                        <Show when={(rowLive()?.turnSeconds ?? 0) > 1}>
+                          <span class="font-[560] opacity-70">{formatDuration(rowLive()!.turnSeconds)}</span>
                         </Show>
                       </span>
                     </Match>
-                    <Match when={(live()?.rate ?? null) !== null}>
+                    <Match when={(rowLive()?.rate ?? null) !== null}>
                       <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums">
                         <span class="text-v2-text-text-accent opacity-80">
-                          {language.t("chats.metric.rate", { rate: live()?.rate?.toFixed(0) ?? "0" })}
+                          {language.t("chats.metric.rate", { rate: rowLive()?.rate?.toFixed(0) ?? "0" })}
                         </span>
                         <span class="font-[560] text-v2-text-text-accent">
-                          {formatDuration(live()?.turnSeconds ?? 0)}
+                          {formatDuration(rowLive()?.turnSeconds ?? 0)}
                         </span>
                       </span>
                     </Match>
-                    <Match when={(live()?.turnSeconds ?? 0) > 1}>
+                    <Match when={(rowLive()?.turnSeconds ?? 0) > 1}>
                       <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-muted">
                         <IconV2 name="layers" size="small" class="size-2.5 opacity-70" />
                         <span>{language.t("chats.timer.tools")}</span>
                         <span class="opacity-40">·</span>
-                        <span class="font-[560] opacity-80">{formatDuration(live()!.turnSeconds)}</span>
+                        <span class="font-[560] opacity-80">{formatDuration(rowLive()!.turnSeconds)}</span>
                       </span>
                     </Match>
                     <Match when={true}>

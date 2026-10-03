@@ -243,55 +243,59 @@ const WorkspaceSessionList = (props: {
   showNew: Accessor<boolean>
   loading: Accessor<boolean>
   sessions: Accessor<Session[]>
+  sessionIndex: Accessor<ReadonlyMap<string, Session>>
   hasMore: Accessor<boolean>
   loadMore: () => Promise<void>
   language: ReturnType<typeof useLanguage>
-}): JSX.Element => (
-  <nav class="flex flex-col gap-1">
-    <Show when={props.showNew()}>
-      <NewSessionItem
-        slug={props.slug()}
-        mobile={props.mobile}
-        sidebarExpanded={props.ctx.sidebarExpanded}
-        clearHoverProjectSoon={props.ctx.clearHoverProjectSoon}
-      />
-    </Show>
-    <Show when={props.loading()}>
-      <SessionSkeleton />
-    </Show>
-    <For each={props.sessions()}>
-      {(session) => (
-        <SessionItem
-          session={session}
-          list={props.sessions()}
-          navList={props.ctx.navList}
+}): JSX.Element => {
+  return (
+    <nav class="flex flex-col gap-1">
+      <Show when={props.showNew()}>
+        <NewSessionItem
           slug={props.slug()}
           mobile={props.mobile}
-          showChild
           sidebarExpanded={props.ctx.sidebarExpanded}
           clearHoverProjectSoon={props.ctx.clearHoverProjectSoon}
-          prefetchSession={props.ctx.prefetchSession}
-          archiveSession={props.ctx.archiveSession}
         />
-      )}
-    </For>
-    <Show when={props.hasMore()}>
-      <div class="relative w-full py-1">
-        <Button
-          variant="ghost"
-          class="flex w-full text-left justify-start text-14-regular text-text-weak pl-2 pr-10"
-          size="large"
-          onClick={(e: MouseEvent) => {
-            void props.loadMore()
-            ;(e.currentTarget as HTMLButtonElement).blur()
-          }}
-        >
-          {props.language.t("common.loadMore")}
-        </Button>
-      </div>
-    </Show>
-  </nav>
-)
+      </Show>
+      <Show when={props.loading()}>
+        <SessionSkeleton />
+      </Show>
+      <For each={props.sessions()}>
+        {(session) => (
+          <SessionItem
+            session={session}
+            list={props.sessions()}
+            sessionIndex={props.sessionIndex}
+            navList={props.ctx.navList}
+            slug={props.slug()}
+            mobile={props.mobile}
+            showChild
+            sidebarExpanded={props.ctx.sidebarExpanded}
+            clearHoverProjectSoon={props.ctx.clearHoverProjectSoon}
+            prefetchSession={props.ctx.prefetchSession}
+            archiveSession={props.ctx.archiveSession}
+          />
+        )}
+      </For>
+      <Show when={props.hasMore()}>
+        <div class="relative w-full py-1">
+          <Button
+            variant="ghost"
+            class="flex w-full text-left justify-start text-14-regular text-text-weak pl-2 pr-10"
+            size="large"
+            onClick={(e: MouseEvent) => {
+              void props.loadMore()
+              ;(e.currentTarget as HTMLButtonElement).blur()
+            }}
+          >
+            {props.language.t("common.loadMore")}
+          </Button>
+        </div>
+      </Show>
+    </nav>
+  )
+}
 
 export const SortableWorkspace = (props: {
   ctx: WorkspaceSidebarContext
@@ -313,6 +317,7 @@ export const SortableWorkspace = (props: {
   })
   const slug = createMemo(() => base64Encode(props.directory))
   const sessions = createMemo(() => sortedRootSessions(workspaceStore, props.sortNow()))
+  const sessionIndex = createMemo(() => new Map((workspaceStore.session ?? []).map((session) => [session.id, session])))
   const local = createMemo(() => props.directory === props.project.worktree)
   const active = createMemo(() => pathKey(props.ctx.currentDir()) === pathKey(props.directory))
   const workspaceValue = createMemo(() => {
@@ -435,6 +440,7 @@ export const SortableWorkspace = (props: {
             showNew={showNew}
             loading={loading}
             sessions={sessions}
+            sessionIndex={sessionIndex}
             hasMore={hasMore}
             loadMore={loadMore}
             language={language}
@@ -460,6 +466,7 @@ export const LocalWorkspace = (props: {
   })
   const slug = createMemo(() => base64Encode(props.project.worktree))
   const sessions = createMemo(() => sortedRootSessions(workspace().store, props.sortNow()))
+  const sessionIndex = createMemo(() => new Map((workspace().store.session ?? []).map((session) => [session.id, session])))
   const count = createMemo(() => sessions()?.length ?? 0)
   const fetching = useIsFetching(() => queryOptions().sessions(pathKey(props.project.worktree)))
   const hasMore = createMemo(() => workspace().store.sessionTotal > count())
@@ -481,6 +488,7 @@ export const LocalWorkspace = (props: {
         showNew={() => false}
         loading={loading}
         sessions={sessions}
+        sessionIndex={sessionIndex}
         hasMore={hasMore}
         loadMore={loadMore}
         language={language}

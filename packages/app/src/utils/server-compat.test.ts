@@ -13,6 +13,7 @@ function setup(
     reviseError?: Response
     reviseResult?: unknown
     revisionDraft?: unknown
+    abortAccepted?: boolean
   },
 ) {
   const requests: Request[] = []
@@ -33,6 +34,8 @@ function setup(
       }
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
+      if (request.method === "POST" && request.url.endsWith("/abort"))
+        return Response.json(responses?.abortAccepted ?? true)
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
         return Response.json({
           admittedSeq: 1,
@@ -79,6 +82,11 @@ function setup(
 }
 
 describe("createCompatibleApi", () => {
+  test("rejects a V1 interrupt when generation fencing supersedes the abort", async () => {
+    const { api } = setup("v1", { abortAccepted: false })
+    await expect(api.session.interrupt({ sessionID: "ses_1" })).rejects.toThrow("superseded by a newer execution")
+  })
+
   test("preserves structured question details on current protocol", async () => {
     const { api, requests } = setup("v2")
     await api.question.reply({

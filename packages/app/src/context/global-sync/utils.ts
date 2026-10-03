@@ -22,13 +22,17 @@ function primitiveOf(model: { id: string; providerID: string } & Record<string, 
 export function normalizeAgentList(input: AgentListOutput["data"] | Agent[]): Agent[] {
   if (input.every((agent) => !("request" in agent))) return input as Agent[]
   return (input as AgentListOutput["data"]).map((agent) => ({
+    ...(() => {
+      const body = agent.request.body ?? {}
+      const temperature = typeof body.temperature === "number" ? body.temperature : undefined
+      const topP =
+        typeof body.top_p === "number" ? body.top_p : typeof body.topP === "number" ? body.topP : undefined
+      return { temperature, topP, options: body }
+    })(),
     name: agent.id,
     description: agent.description,
     mode: agent.mode,
     hidden: agent.hidden,
-    temperature:
-      typeof agent.request.settings.temperature === "number" ? agent.request.settings.temperature : undefined,
-    topP: typeof agent.request.settings.topP === "number" ? agent.request.settings.topP : undefined,
     color: agent.color,
     permission: agent.permissions.map((rule) => ({
       permission: rule.action,
@@ -38,7 +42,6 @@ export function normalizeAgentList(input: AgentListOutput["data"] | Agent[]): Ag
     model: agent.model && { providerID: agent.model.providerID, modelID: agent.model.id },
     variant: agent.model?.variant,
     prompt: agent.system,
-    options: agent.request.settings,
     steps: agent.steps,
   }))
 }

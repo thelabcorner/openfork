@@ -77,7 +77,7 @@ import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { sessionTitle } from "@/utils/session-title"
-import { isSemanticUserMessage } from "@/utils/session-message"
+import { isSemanticUserMessage, userTurnPresentation } from "@/utils/session-message"
 import { scheduleConnectedMeasure } from "./measure"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
@@ -396,17 +396,30 @@ export function MessageTimeline(props: {
       let text: string | undefined
       if (row._tag === "UserMessage") {
         const parts = getMsgParts(row.userMessageID)
-        text =
-          parts
-            // Synthetic parts are server injections: the bubble has never drawn
-            // them, and they now own a row of their own, so folding their text
-            // into this estimate only over-predicts the bubble's height.
-            .filter(
-              (part): part is Extract<PartType, { type: "text" }> =>
-                part.type === "text" && !!part.text && !part.synthetic,
-            )
-            .map((part) => part.text)
-            .join("\n") || undefined
+        const message = messageByID().get(row.userMessageID)
+        const presentation = message?.role === "user" ? userTurnPresentation(message) : undefined
+        if (presentation === "host" || presentation === "synthetic") {
+          // Automation cards are collapsed to one preview line by default; use
+          // the same bounded shape for the virtualizer prior instead of treating
+          // a 20k prompt as a fully-expanded markdown bubble.
+          text = parts
+            .flatMap((part) => (part.type === "text" && part.text ? part.text.split("\n") : []))
+            .map((line) => line.trim())
+            .find(Boolean)
+        } else {
+          text =
+            parts
+              // Synthetic parts appended to a genuine user prompt own the
+              // dedicated SystemInjection row and are not part of the bubble.
+              .filter(
+                (part): part is Extract<PartType, { type: "text" }> =>
+                  part.type === "text" && !!part.text && !part.synthetic,
+              )
+              .map((part) => part.text)
+              .join("\n") || undefined
+        }
+      } else if (row._tag === "ContextMessage") {
+        text = row.preview || undefined
       } else if (row._tag === "AssistantPart" && row.group.type === "part") {
         const part = getMsgPart(row.group.ref.messageID, row.group.ref.partID)
         if (part?.type === "text" && part.text) text = part.text
@@ -418,7 +431,10 @@ export function MessageTimeline(props: {
       cached = { key: TimelineRow.key(row), text, heightHint: row._tag === "AssistantPart" ? row.heightHint : undefined }
       estimateInputCache.set(row, cached)
     }
-    const streaming = sessionStatus().type !== "idle" && activeMessageID() === row.userMessageID
+    const streaming =
+      "userMessageID" in row &&
+      sessionStatus().type !== "idle" &&
+      activeMessageID() === row.userMessageID
     return {
       ...cached,
       row,
@@ -1289,11 +1305,21 @@ export function MessageTimeline(props: {
       const row = input.row()
       return row._tag === "AssistantPart" && row.previousAssistantPart
     }
+    const messageID = () => {
+      const row = input.row()
+      return row._tag === "ContextMessage" ? row.messageID : row.userMessageID
+    }
+    const anchorID = () => {
+      if (!anchor()) return
+      const row = input.row()
+      if (!("userMessageID" in row)) return
+      return props.anchor(row.userMessageID)
+    }
 
     return (
       <div
-        id={anchor() ? props.anchor(input.row().userMessageID) : undefined}
-        data-message-id={input.row().userMessageID}
+        id={anchorID()}
+        data-message-id={messageID()}
         data-timeline-row={input.row()._tag}
         classList={{
           "min-w-0 w-full max-w-full": true,
@@ -1361,7 +1387,7 @@ export function MessageTimeline(props: {
         const userMessageRow = row as Accessor<TimelineRowByTag<"UserMessage">>
         const message = createMemo(() => {
           const m = messageByID().get(userMessageRow().userMessageID)
-          if (m && isSemanticUserMessage(m)) return m
+          if (m?.role === "user") return m
         })
         const messageComments = createMemo(() => {
           if (!settings.general.newLayoutDesigns()) return []
@@ -1387,6 +1413,46 @@ export function MessageTimeline(props: {
           </TimelineRowFrame>
         )
       }
+      case "ContextMessage": {
+        const contextMessageRow = row as Accessor<TimelineRowByTag<"ContextMessage">>
+        const rowKey = createMemo(() => TimelineRow.key(contextMessageRow()))
+        const segments = createMemo(() => [
+          { id: contextMessageRow().messageID, text: contextMessageRow().text },
+        ])
+        const open = () => injectionOpen[rowKey()] === true
+        const badge = () =>
+          language.t(
+            contextMessageRow().kind === "skill"
+              ? "session.messages.context.skill.badge"
+              : "session.messages.context.system.badge",
+          )
+        return (
+          <TimelineRowFrame row={contextMessageRow}>
+            <div data-slot="session-turn-context-message" class="w-full px-4 md:px-5 pt-1.5">
+              <SystemInjectionCardV2
+                badge={badge()}
+                kind={contextMessageRow().kind === "skill" ? "skill" : "system"}
+                preview={contextMessageRow().preview}
+                segments={segments()}
+                open={open()}
+                onOpenChange={(next) => {
+                  setInjectionOpen(rowKey(), next)
+                  onSizeChange?.()
+                }}
+                onContentResize={() => onSizeChange?.()}
+                expandLabel={language.t("session.messages.context.expand")}
+                collapseLabel={language.t("session.messages.context.collapse")}
+                copyLabel={language.t("session.messages.systemInjection.copy")}
+                copiedLabel={language.t("session.messages.systemInjection.copied")}
+                rawLabel={language.t("ui.message.injection.raw")}
+                richLabel={language.t("ui.message.injection.rich")}
+                copied={injectionCopied() === rowKey()}
+                onCopy={(text) => copyInjection(rowKey(), text)}
+              />
+            </div>
+          </TimelineRowFrame>
+        )
+      }
       case "SystemInjection": {
         const injectionRow = row as Accessor<TimelineRowByTag<"SystemInjection">>
         const rowKey = createMemo(() => TimelineRow.key(injectionRow()))
@@ -1403,6 +1469,7 @@ export function MessageTimeline(props: {
             <div data-slot="session-turn-system-injection" class="w-full px-4 md:px-5 pt-1.5">
               <SystemInjectionCardV2
                 badge={language.t("session.messages.systemInjection.badge")}
+                kind="system"
                 preview={systemInjectionPreview(segments())}
                 segments={segments()}
                 open={open()}
@@ -1410,10 +1477,13 @@ export function MessageTimeline(props: {
                   setInjectionOpen(rowKey(), next)
                   onSizeChange?.()
                 }}
+                onContentResize={() => onSizeChange?.()}
                 expandLabel={language.t("session.messages.systemInjection.expand")}
                 collapseLabel={language.t("session.messages.systemInjection.collapse")}
                 copyLabel={language.t("session.messages.systemInjection.copy")}
                 copiedLabel={language.t("session.messages.systemInjection.copied")}
+                rawLabel={language.t("ui.message.injection.raw")}
+                richLabel={language.t("ui.message.injection.rich")}
                 copied={injectionCopied() === rowKey()}
                 onCopy={(text) => copyInjection(rowKey(), text)}
               />

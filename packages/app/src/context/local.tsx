@@ -8,7 +8,7 @@ import { useSettings } from "@/context/settings"
 import { useProviders } from "@/hooks/use-providers"
 import { resolveDefaultModel } from "@/hooks/provider-catalog"
 import { Persist, persisted } from "@/utils/persist"
-import { hasCustomAgent, resolveAgent } from "./local-agent"
+import { hasCustomAgent, isPrimarySelectableAgent, resolveAgent } from "./local-agent"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./model-variant"
 import { useSDK } from "./sdk"
 import { useSync } from "./sync"
@@ -70,7 +70,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const settings = useSettings()
 
     const id = createMemo(() => params.id || undefined)
-    const list = createMemo(() => sync().data.agent.filter((item) => item.mode !== "subagent" && !item.hidden))
+    const list = createMemo(() => sync().data.agent.filter(isPrimarySelectableAgent))
     const agentsVisible = createMemo(() => settings.visibility.customAgents() || hasCustomAgent(list()))
     const connected = createMemo(() => new Set(providers.connected().map((item) => item.id)))
 
@@ -105,8 +105,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       if (!provider || !connected().has(model.providerID)) return false
       const exact = provider.models[model.modelID]
       if (exact) return ModelContract.isLanguageModel(provider.id, exact)
-      // Account-qualified ids (`model@vd-…`, `model@zen-…`) are routing
-      // metadata decoded server-side (verdent proxy, zen fetch wrapper);
+      // Account-qualified ids (for example `model@zen-…`) are routing
+      // metadata decoded server-side by provider-specific routing;
       // validate the base model id so a pinned account isn't silently
       // snapped back to the previous model. Unknown providers return the id
       // unchanged, preserving the strict check for everyone else.

@@ -40,7 +40,7 @@ import { SessionGroupsProvider } from "@/context/session-groups"
 import { GoalsProvider } from "@/context/goals"
 import { OxpActivityProvider } from "@/context/oxp-activity"
 import { ScheduledTasksProvider } from "@/context/scheduled-tasks"
-import { ServerSDKProvider } from "@/context/server-sdk"
+import { ServerSDKProvider } from "@/context/server-sdk-provider"
 import { OfxpServerSeedBridge } from "@/context/ofxp-server-seed-bridge"
 import { ServerSyncProvider } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
@@ -86,6 +86,7 @@ const OxpActivityLandingPage = lazy(() =>
   import("@/pages/oxp-activity-page").then((m) => ({ default: m.OxpActivityLandingPage })),
 )
 const ScheduledPage = lazy(() => import("@/pages/scheduled-page").then((m) => ({ default: m.ScheduledPage })))
+const AgentsPage = lazy(() => import("@/pages/agents-page").then((m) => ({ default: m.AgentsPage })))
 const SettingsPage = lazy(() =>
   import("@/components/settings-v2/settings-screen").then((m) => ({ default: m.SettingsScreen })),
 )
@@ -229,11 +230,11 @@ function LayoutCompatibility(props: ParentProps) {
     if (platform.platform === "pwa" || settings.general.newLayoutDesigns()) return
     const current = server.current
     if (!current) return
-    const protocol = global.ensureServerCtx(current).sdk.protocolKind()
+    const protocol = global.ensureServerSdk(current).protocolKind()
     if (protocol !== "v2") return
     const next = global.servers.list().find((s) => {
       if (ServerConnection.key(s) === ServerConnection.key(current)) return false
-      return global.ensureServerCtx(s).sdk.protocolKind() !== "v2"
+      return global.ensureServerSdk(s).protocolKind() !== "v2"
     })
     if (!next) return
     navigate("/")
@@ -681,6 +682,7 @@ function Routes(props: { serverScoped?: JSX.Element }) {
         <Route path="/oxp" component={OxpActivityLandingPage} />
         <Route path="/oxp/activity/:activityID" component={OxpActivityPage} />
         <Route path="/scheduled" component={ScheduledPage} />
+        <Route path="/agents" component={AgentsPage} />
         <Route path="/:dir/session/:id" component={NewLayoutLegacySessionRedirect} />
         <Route
           path="/server/:serverKey/session/:id"

@@ -64,7 +64,10 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
     const tabs = useTabs()
     const settings = useSettings()
     const owner = getOwner()
-    const states = new Map<ServerScope, { key: ServerConnection.Key; dispose: () => void; state: PermissionState }>()
+    const states = new Map<
+      ServerScope,
+      { key: ServerConnection.Key; url: string; dispose: () => void; state: PermissionState }
+    >()
 
     const activeDraft = createMemo(() => {
       if (!search.draftId) return
@@ -79,24 +82,29 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
     const ensure = (key: ServerConnection.Key) => {
       const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       if (!conn) throw new Error(`Permission server not found: ${key}`)
-      const ctx = global.ensureServerCtx(conn)
-      const existing = states.get(ctx.sdk.scope)
-      if (existing && global.servers.list().some((item) => ServerConnection.key(item) === existing.key)) {
+      const sdk = global.ensureServerSdk(conn)
+      const existing = states.get(sdk.scope)
+      if (
+        existing &&
+        existing.url === sdk.url &&
+        global.servers.list().some((item) => ServerConnection.key(item) === existing.key)
+      ) {
         return existing.state
       }
       if (existing) {
         existing.dispose()
-        states.delete(ctx.sdk.scope)
+        states.delete(sdk.scope)
       }
       const root = createRoot(
         (dispose) => ({
           key,
+          url: sdk.url,
           dispose,
-          state: createServerPermissionState({ sdk: ctx.sdk, sync: ctx.sync }),
+          state: createServerPermissionState({ sdk, sync: () => global.ensureServerCtx(conn).sync }),
         }),
         owner ?? undefined,
       )
-      states.set(ctx.sdk.scope, root)
+      states.set(sdk.scope, root)
       return root.state
     }
 
@@ -191,7 +199,8 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
 type PermissionState = ReturnType<typeof createServerPermissionState>
 type PermissionEvent = Parameters<Parameters<ServerSDK["event"]["listen"]>[0]>[0]
 
-function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }) {
+function createServerPermissionState(input: { sdk: ServerSDK; sync: () => ServerSync }) {
+  const serverSync = () => input.sync()
   const [store, setStore, _, ready] = persisted(
     {
       ...Persist.serverGlobal(input.sdk.scope, "permission", ["permission.v3"]),
@@ -228,7 +237,7 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     // Permission is an observer of directory config, not a directory lifecycle
     // owner. The active route/bootstrap path populates config; reading the
     // preference here must not initialize plugins/LSP/config for a workspace.
-    const [childStore] = input.sync.child(directory, { bootstrap: false })
+    const [childStore] = serverSync().child(directory, { bootstrap: false })
     if (childStore.config.permission !== "allow") return
     const key = directoryAcceptKey(directory)
     if (store.autoAccept[key] !== undefined) return
@@ -296,9 +305,9 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
   }
 
   function sessions(directory?: string) {
-    const info = Object.values(input.sync.session.data.info).filter((session) => !!session)
+    const info = Object.values(serverSync().session.data.info).filter((session) => !!session)
     if (!directory) return info
-    return [...info, ...input.sync.child(directory, { bootstrap: false })[0].session]
+    return [...info, ...serverSync().child(directory, { bootstrap: false })[0].session]
   }
 
   function isAutoAccepting(sessionID: string, directory?: string) {
@@ -314,15 +323,15 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
   }
 
   function isPending(permission: PermissionRequest) {
-    const pending = input.sync.session.data.permission[permission.sessionID]
+    const pending = serverSync().session.data.permission[permission.sessionID]
     return pending === undefined || pending.some((item) => item.id === permission.id)
   }
 
   async function shouldAutoRespondResolved(permission: PermissionRequest, directory?: string) {
     const override = sessionAutoAccept(store.autoAccept, sessions(directory), permission, directory)
     if (override !== undefined) return override
-    if (input.sync.session.lineage.peek(permission.sessionID)) return shouldAutoRespond(permission, directory)
-    const lineage = await input.sync.session.lineage.resolve(permission.sessionID).catch(() => undefined)
+    if (serverSync().session.lineage.peek(permission.sessionID)) return shouldAutoRespond(permission, directory)
+    const lineage = await serverSync().session.lineage.resolve(permission.sessionID).catch(() => undefined)
     if (meta.disposed || !lineage) return false
     return shouldAutoRespond(permission, directory)
   }
@@ -503,7 +512,7 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     },
     isPermissionAllowAll(directory: string) {
       if (meta.disposed) return false
-      const [childStore] = input.sync.child(directory, { bootstrap: false })
+      const [childStore] = serverSync().child(directory, { bootstrap: false })
       return childStore.config.permission === "allow"
     },
   }
@@ -511,11 +520,13 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
   return {
     ...api,
     api,
-    sync: input.sync,
+    get sync() {
+      return serverSync()
+    },
     enableConfiguredDirectory,
     permissionsEnabled(directory: string) {
       if (meta.disposed) return false
-      const [childStore] = input.sync.child(directory, { bootstrap: false })
+      const [childStore] = serverSync().child(directory, { bootstrap: false })
       return hasPermissionPromptRules(childStore.config.permission)
     },
   }

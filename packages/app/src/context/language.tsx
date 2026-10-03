@@ -33,6 +33,8 @@ type PluralKey =
   | "home.sessions.search.messagesResult"
   | "home.sessions.archived.count"
   | "sessionGroup.sessions"
+  | "groupTab.summary.running"
+  | "groupTab.summary.waiting"
   | "chats.metric.messages"
   | "chats.showMoreCount"
   | "chats.footer.sessions"

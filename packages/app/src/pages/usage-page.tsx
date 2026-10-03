@@ -14,10 +14,11 @@ import { UsageSubsidyPanel } from "@/pages/usage/usage-page-subsidy"
 import { UsagePageModels } from "@/pages/usage/usage-page-models"
 import { UsagePageActivity } from "@/pages/usage/usage-page-activity"
 import { UsagePageMaintenance } from "@/pages/usage/usage-page-maintenance"
+import { UsagePageOxp } from "@/pages/usage/usage-page-oxp"
 import { createUsageValuation } from "@/pages/usage/use-usage-valuation"
 
 type Metric = "cost" | "tokens"
-type Section = "overview" | "models" | "activity" | "maintenance"
+type Section = "overview" | "models" | "activity" | "oxp" | "maintenance"
 
 export function UsagePage() {
   const language = useLanguage()
@@ -29,7 +30,21 @@ export function UsagePage() {
   const [section, setSection] = createSignal<Section>("overview")
 
   const windowDef = createMemo(() => USAGE_WINDOWS.find((w) => w.key === windowKey()) ?? USAGE_WINDOWS[5])
-  const summary = createUsageSummary({ windowDef, projectID, refreshTick })
+  const summary = createUsageSummary({
+    windowDef,
+    projectID,
+    refreshTick,
+    active: () => section() !== "oxp",
+  })
+  const oxpRange = createMemo(() => {
+    refreshTick()
+    const win = windowDef()
+    const until = Date.now()
+    return {
+      since: win.ms === 0 ? 0 : until - win.ms,
+      until,
+    }
+  })
 
   // The usage-summary response's own `projects[]` field is scoped by the
   // active project filter (collapses to <=1 entry once a project is
@@ -102,6 +117,31 @@ export function UsagePage() {
     }
   }
 
+  const UsageNavigation = () => (
+    <TabsV2.List>
+      <TabsV2.Trigger value="overview">
+        <Icon name="status" />
+        {language.t("usage.nav.overview")}
+      </TabsV2.Trigger>
+      <TabsV2.Trigger value="models">
+        <Icon name="models" />
+        {language.t("usage.nav.models")}
+      </TabsV2.Trigger>
+      <TabsV2.Trigger value="activity">
+        <Icon name="usage" />
+        {language.t("usage.nav.activity")}
+      </TabsV2.Trigger>
+      <TabsV2.Trigger value="oxp">
+        <Icon name="usage" />
+        {language.t("usage.nav.oxp")}
+      </TabsV2.Trigger>
+      <TabsV2.Trigger value="maintenance">
+        <Icon name="settings-gear" />
+        {language.t("usage.nav.maintenance")}
+      </TabsV2.Trigger>
+    </TabsV2.List>
+  )
+
   return (
     <div
       data-component="usage-dashboard"
@@ -134,16 +174,48 @@ export function UsagePage() {
             projectID={projectID()}
             onProjectChange={(id) => void startTransition(() => setProjectID(id))}
             projects={projectOptions()}
-            since={data()?.since ?? Date.now()}
-            until={data()?.until ?? Date.now()}
+            since={
+              section() === "oxp"
+                ? oxpRange().since
+                : (data()?.since ?? Date.now())
+            }
+            until={
+              section() === "oxp"
+                ? oxpRange().until
+                : (data()?.until ?? Date.now())
+            }
             isAllTime={isAllTime()}
             onRefresh={() => void startTransition(() => setRefreshTick((value) => value + 1))}
-            loading={summary.loading}
+            loading={section() === "oxp" ? false : summary.loading}
+            contextMode={section() === "oxp"}
           />
         </div>
 
         <div class="min-h-0 flex-1">
           <Switch>
+            <Match when={section() === "oxp"}>
+              <TabsV2
+                orientation="vertical"
+                variant="settings"
+                value={section()}
+                onChange={(value) =>
+                  void startTransition(() => setSection(value as Section))
+                }
+                class="h-full"
+              >
+                <UsageNavigation />
+                <TabsV2.Content value="oxp">
+                  <div class="mx-auto flex h-full w-full max-w-[1400px] flex-col gap-3 p-4">
+                    <UsagePageOxp
+                      active
+                      since={oxpRange().since}
+                      until={oxpRange().until}
+                      refreshTick={refreshTick()}
+                    />
+                  </div>
+                </TabsV2.Content>
+              </TabsV2>
+            </Match>
             <Match when={summary.error}>
               <div class="flex h-full items-center justify-center py-16 text-center text-[11px] font-[440] text-v2-text-text-faint">
                 {language.t("usage.error")}
@@ -163,24 +235,7 @@ export function UsagePage() {
                 onChange={(value) => void startTransition(() => setSection(value as Section))}
                 class="h-full"
               >
-                <TabsV2.List>
-                  <TabsV2.Trigger value="overview">
-                    <Icon name="status" />
-                    {language.t("usage.nav.overview")}
-                  </TabsV2.Trigger>
-                  <TabsV2.Trigger value="models">
-                    <Icon name="models" />
-                    {language.t("usage.nav.models")}
-                  </TabsV2.Trigger>
-                  <TabsV2.Trigger value="activity">
-                    <Icon name="usage" />
-                    {language.t("usage.nav.activity")}
-                  </TabsV2.Trigger>
-                  <TabsV2.Trigger value="maintenance">
-                    <Icon name="settings-gear" />
-                    {language.t("usage.nav.maintenance")}
-                  </TabsV2.Trigger>
-                </TabsV2.List>
+                <UsageNavigation />
 
                 <TabsV2.Content value="overview">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
@@ -217,6 +272,7 @@ export function UsagePage() {
                     <UsagePageActivity data={data()!} metric={metric()} projectID={projectID()} />
                   </div>
                 </TabsV2.Content>
+
 
                 <TabsV2.Content value="maintenance">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">

@@ -16,6 +16,8 @@ import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
 import { diffs as list, message as clean } from "@/utils/diffs"
 import { messageKey } from "@/utils/session-message"
+import { appendRunningToolOutputPreview, runningToolPartPreview } from "@/utils/tool-output-preview"
+import { applyPartDelta } from "../session-part-delta"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const SESSION_CONTENT_EVENTS = new Set([
@@ -87,17 +89,20 @@ export function cleanupDroppedSessionCaches(
   setSessionTodo?: (sessionID: string, todos: Todo[] | undefined) => void,
 ) {
   const keep = new Set(next.map((item) => item.id))
-  const stale = [
-    ...Object.keys(store.message),
-    ...Object.keys(store.session_diff),
-    ...Object.keys(store.todo),
-    ...Object.keys(store.permission),
-    ...Object.keys(store.question),
-    ...Object.keys(store.session_status),
-    ...Object.values(store.part)
-      .map((parts) => parts?.find((part) => !!part?.sessionID)?.sessionID)
-      .filter((sessionID): sessionID is string => !!sessionID),
-  ].filter((sessionID, index, list) => !keep.has(sessionID) && list.indexOf(sessionID) === index)
+  const seen = new Set<string>()
+  const stale: string[] = []
+  const consider = (sessionID: string | undefined) => {
+    if (!sessionID || keep.has(sessionID) || seen.has(sessionID)) return
+    seen.add(sessionID)
+    stale.push(sessionID)
+  }
+  Object.keys(store.message).forEach(consider)
+  Object.keys(store.session_diff).forEach(consider)
+  Object.keys(store.todo).forEach(consider)
+  Object.keys(store.permission).forEach(consider)
+  Object.keys(store.question).forEach(consider)
+  Object.keys(store.session_status).forEach(consider)
+  Object.values(store.part).forEach((parts) => consider(parts?.find((part) => !!part?.sessionID)?.sessionID))
   if (stale.length === 0) return
   for (const sessionID of stale) {
     setSessionTodo?.(sessionID, undefined)
@@ -314,7 +319,7 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "message.part.updated": {
-      const part = (event.properties as { part: Part }).part
+      const part = runningToolPartPreview((event.properties as { part: Part }).part)
       if (SKIP_PARTS.has(part.type)) break
       input.setStore(
         produce((draft) => {
@@ -365,21 +370,32 @@ export function applyDirectoryEvent(input: {
       break
     }
     case "message.part.delta": {
-      const props = event.properties as { messageID: string; partID: string; field: string; delta: string }
+      const props = event.properties as {
+        messageID: string
+        partID: string
+        field: string
+        delta: string
+        offset?: number
+      }
       const parts = input.store.part[props.messageID]
       if (!parts) break
       const result = Binary.search(parts, props.partID, (part) => part.id)
       if (!result.found) break
-      const field = props.field as keyof (typeof parts)[number]
-      const current = parts[result.index]?.[field]
       input.setStore(
         "part",
         props.messageID,
         produce((draft) => {
           const part = draft[result.index]
+          if (props.field === "state.metadata.output" && part.type === "tool" && part.state.status === "running") {
+            part.state.metadata ??= {}
+            const existing = part.state.metadata.output
+            part.state.metadata.output = appendRunningToolOutputPreview(existing, props.delta)
+            return
+          }
           const field = props.field as keyof typeof part
-          const existing = part[field] as string | undefined
-          ;(part[field] as string) = (existing ?? "") + props.delta
+          const applied = applyPartDelta(part[field] as string | undefined, props.delta, props.offset)
+          if (!applied.applied) return
+          ;(part[field] as string) = applied.value
         }),
       )
       break

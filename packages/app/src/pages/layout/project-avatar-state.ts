@@ -24,15 +24,18 @@ export function useSessionTabAvatarState(
     if (!serverSync) return false
     const permissionState = permission.ensureServerState(server())
     const [store] = serverSync.child(directory(), { bootstrap: false })
-    return !!sessionPermissionRequest(store.session, serverSync.session.data.permission, sessionId(), (item) => {
-      return !permissionState.autoResponds(item, directory())
-    })
+    return !!sessionPermissionRequest(
+      store.session_children(),
+      serverSync.session.data.permission,
+      sessionId(),
+      (item) => !permissionState.autoResponds(item, directory()),
+    )
   })
   const hasQuestions = createMemo(() => {
     const serverSync = sync()
     if (!serverSync) return false
     const [store] = serverSync.child(directory(), { bootstrap: false })
-    return !!sessionQuestionRequest(store.session, serverSync.session.data.question, sessionId())
+    return !!sessionQuestionRequest(store.session_children(), serverSync.session.data.question, sessionId())
   })
   const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
   const notificationState = createMemo(() => {

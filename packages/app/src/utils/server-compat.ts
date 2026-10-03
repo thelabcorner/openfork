@@ -485,7 +485,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         return sessionInfo(result.data)
       },
       async interrupt(value: Parameters<ServerApi["session"]["interrupt"]>[0]) {
-        await legacy().session.abort(value)
+        const result = await legacy().session.abort(value)
+        if (result.data !== true) throw new Error("Session abort was superseded by a newer execution")
       },
       async pause(value: Parameters<CompatibleSessionApi["pause"]>[0]) {
         await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)

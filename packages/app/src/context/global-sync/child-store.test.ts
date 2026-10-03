@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, mock, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test"
 import { createRoot, getOwner, type Owner } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -7,6 +7,7 @@ import type { QueryOptionsApi } from "../server-sync"
 import { ServerScope } from "@/utils/server-scope"
 
 let createChildStoreManager: typeof import("./child-store").createChildStoreManager
+let queryExports: typeof import("@tanstack/solid-query")
 const querySingles: Array<() => { queryKey?: unknown[]; enabled?: boolean }> = []
 const persist: typeof import("@/utils/persist").persisted = (_target, store) => [
   store[0],
@@ -52,7 +53,9 @@ function createOwner(callback: (owner: Owner) => void) {
 }
 
 beforeAll(async () => {
+  queryExports = { ...await import("@tanstack/solid-query") }
   mock.module("@tanstack/solid-query", () => ({
+    ...queryExports,
     useQuery: (options: () => { queryKey?: unknown[]; enabled?: boolean }) => {
       querySingles.push(options)
       return {
@@ -71,6 +74,10 @@ beforeAll(async () => {
   }))
 
   createChildStoreManager = (await import("./child-store")).createChildStoreManager
+})
+
+afterAll(() => {
+  mock.module("@tanstack/solid-query", () => queryExports)
 })
 
 describe("createChildStoreManager", () => {
@@ -319,12 +326,18 @@ describe("createChildStoreManager", () => {
       expect(store.lsp_ready).toBe(false)
       expect(bootstraps).toEqual([])
 
-      manager.child("/project")
-      // A real route access starts directory bootstrap, but auxiliary query
-      // observers stay passive until the bootstrap's critical/background seam.
+      manager.enableProviderQueries("/project")
+      expect(queries[4]?.().enabled).toBe(true)
       expect(queries[0]?.().enabled).toBe(false)
       expect(queries[3]?.().enabled).toBe(false)
-      expect(queries[4]?.().enabled).toBe(false)
+      expect(queries[5]?.().enabled).toBe(false)
+      expect(bootstraps).toEqual([])
+
+      manager.child("/project")
+      // The narrow catalog can run while runtime auxiliary queries stay gated.
+      expect(queries[0]?.().enabled).toBe(false)
+      expect(queries[3]?.().enabled).toBe(false)
+      expect(queries[4]?.().enabled).toBe(true)
       expect(queries[5]?.().enabled).toBe(false)
       expect(bootstraps).toEqual(["/project"])
 

@@ -1,25 +1,29 @@
 import type { PermissionRequest, QuestionRequest, Session } from "@opencode-ai/sdk/v2/client"
 
+function indexSessionChildren(session: Session[]) {
+  const children = new Map<string, string[]>()
+  for (const item of session) {
+    if (!item.parentID) continue
+    const siblings = children.get(item.parentID)
+    if (siblings) siblings.push(item.id)
+    else children.set(item.parentID, [item.id])
+  }
+  return children
+}
+
 function sessionTreeRequest<T>(
-  session: Session[],
+  session: Session[] | ReadonlyMap<string, string[]>,
   request: Record<string, T[] | undefined>,
   sessionID?: string,
   include: (item: T) => boolean = () => true,
 ) {
   if (!sessionID) return
-
-  const map = session.reduce((acc, item) => {
-    if (!item.parentID) return acc
-    const list = acc.get(item.parentID)
-    if (list) list.push(item.id)
-    if (!list) acc.set(item.parentID, [item.id])
-    return acc
-  }, new Map<string, string[]>())
+  const children = Array.isArray(session) ? indexSessionChildren(session) : session
 
   const seen = new Set([sessionID])
   const ids = [sessionID]
   for (const id of ids) {
-    const list = map.get(id)
+    const list = children.get(id)
     if (!list) continue
     for (const child of list) {
       if (seen.has(child)) continue
@@ -34,7 +38,7 @@ function sessionTreeRequest<T>(
 }
 
 export function sessionPermissionRequest(
-  session: Session[],
+  session: Session[] | ReadonlyMap<string, string[]>,
   request: Record<string, PermissionRequest[] | undefined>,
   sessionID?: string,
   include?: (item: PermissionRequest) => boolean,
@@ -43,7 +47,7 @@ export function sessionPermissionRequest(
 }
 
 export function sessionQuestionRequest(
-  session: Session[],
+  session: Session[] | ReadonlyMap<string, string[]>,
   request: Record<string, QuestionRequest[] | undefined>,
   sessionID?: string,
   include?: (item: QuestionRequest) => boolean,

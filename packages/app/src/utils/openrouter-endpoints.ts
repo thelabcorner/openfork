@@ -36,9 +36,33 @@ export type OpenRouterEndpoint = {
   }
 }
 
+export type OpenRouterEndpointWire = {
+  providerName: string
+  tag: string
+  provider: string
+  pricing: { prompt: number | string; completion: number | string; cacheRead: number | string }
+  uptime?: number | string
+  quantization?: string
+  contextLength?: number | string
+  maxCompletionTokens?: number | string
+  maxPromptTokens?: number | string
+  supportedParameters?: readonly string[]
+  supportsImplicitCaching?: boolean
+  latencyP50?: number | string
+  throughputP50?: number | string
+  uptime5m?: number | string
+  uptime1d?: number | string
+  status?: number | string
+}
+
 type CacheEntry = { version: number; fetchedAt: number; endpoints: OpenRouterEndpoint[] }
 
 const CACHE_TTL_MS = 60 * 60 * 1000
+const WARM_TTL_MS = 24 * 60 * 60 * 1000
+const WARM_CONCURRENCY = 3
+const WARM_SCAN_BATCH = 8
+const WARM_FAILURE_LIMIT = 3
+const WARM_FAILURE_BACKOFF_MS = 5 * 60 * 1000
 
 // Bump both the payload version and storage namespace whenever the persisted
 // endpoint schema changes. v5 adds endpoint capabilities/quantization and the
@@ -48,9 +72,48 @@ const CACHE_VERSION = 2
 const memoryCache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<OpenRouterEndpoint[] | undefined>>()
 const pendingWrites = new Map<string, CacheEntry>()
+const warmQueued = new Set<string>()
+const warmQueue: Array<{
+  modelID: string
+  fetchEndpoints: (model: string) => Promise<OpenRouterEndpoint[]>
+  ttlMs: number
+}> = []
+let warmActive = 0
+let warmScheduled = false
+let warmFailureStreak = 0
+let warmRetryAfter = 0
 let persistHandle: number | ReturnType<typeof setTimeout> | undefined
 
 const cacheKey = (id: string) => `opencode.openrouter-endpoints.v5.${id}`
+
+export function normalizeOpenRouterEndpoints(entries: readonly OpenRouterEndpointWire[]): OpenRouterEndpoint[] {
+  return entries.map((entry) => ({
+    providerName: entry.providerName,
+    tag: entry.tag,
+    provider: entry.provider,
+    pricing: {
+      // The local Tier-0 proxy is the normalization boundary and already
+      // converts OpenRouter's per-token wire prices to $/M. Renderer consumers
+      // only coerce defensive string payloads; never infer units from magnitude
+      // or ultra-cheap endpoint prices can be multiplied twice.
+      prompt: Number(entry.pricing.prompt),
+      completion: Number(entry.pricing.completion),
+      cacheRead: Number(entry.pricing.cacheRead),
+    },
+    uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
+    quantization: entry.quantization,
+    contextLength: entry.contextLength === undefined ? undefined : Number(entry.contextLength),
+    maxCompletionTokens: entry.maxCompletionTokens === undefined ? undefined : Number(entry.maxCompletionTokens),
+    maxPromptTokens: entry.maxPromptTokens === undefined ? undefined : Number(entry.maxPromptTokens),
+    supportedParameters: entry.supportedParameters ? [...entry.supportedParameters] : undefined,
+    supportsImplicitCaching: entry.supportsImplicitCaching,
+    latencyP50: entry.latencyP50 === undefined ? undefined : Number(entry.latencyP50),
+    throughputP50: entry.throughputP50 === undefined ? undefined : Number(entry.throughputP50),
+    uptime5m: entry.uptime5m === undefined ? undefined : Number(entry.uptime5m),
+    uptime1d: entry.uptime1d === undefined ? undefined : Number(entry.uptime1d),
+    status: entry.status === undefined ? undefined : Number(entry.status),
+  }))
+}
 
 function readCache(id: string): CacheEntry | undefined {
   const mem = memoryCache.get(id)
@@ -73,6 +136,99 @@ function writeCache(id: string, entry: CacheEntry) {
   if (typeof localStorage === "undefined") return
   pendingWrites.set(cacheKey(id), entry)
   schedulePersist()
+}
+
+/** Synchronous stale-ok read for latency-sensitive provider submenus. */
+export function peekOpenRouterEndpoints(modelID: string): OpenRouterEndpoint[] | undefined {
+  return readCache(modelID)?.endpoints
+}
+
+function scheduleWarmPump() {
+  if (warmScheduled || warmQueue.length === 0 || warmActive >= WARM_CONCURRENCY) return
+  warmScheduled = true
+  const pump = () => {
+    warmScheduled = false
+    let scanned = 0
+    while (warmActive < WARM_CONCURRENCY && warmQueue.length > 0 && scanned < WARM_SCAN_BATCH) {
+      const job = warmQueue.shift()!
+      scanned++
+      const cached = readCache(job.modelID)
+      if (cached && Date.now() - cached.fetchedAt < job.ttlMs) {
+        warmQueued.delete(job.modelID)
+        continue
+      }
+      // A foreground hover/open that got here first already owns the same-model
+      // refresh. Do not spend one of the bounded background slots waiting on it.
+      if (inflight.has(job.modelID)) {
+        warmQueued.delete(job.modelID)
+        continue
+      }
+      warmActive++
+      const guardedFetch = async (modelID: string) => {
+        try {
+          const endpoints = await job.fetchEndpoints(modelID)
+          warmFailureStreak = 0
+          warmRetryAfter = 0
+          return endpoints
+        } catch (error) {
+          warmFailureStreak++
+          if (warmFailureStreak >= WARM_FAILURE_LIMIT) {
+            // An outage should cost a few probes, not one timeout per visible
+            // model. Drop only the queued background sweep; foreground fetches
+            // remain available. Back off before accepting another sweep so a
+            // reactive provider/catalog update cannot immediately recreate the
+            // timeout fan-out while OpenRouter or the local proxy is unhealthy.
+            for (const queued of warmQueue) warmQueued.delete(queued.modelID)
+            warmQueue.length = 0
+            warmFailureStreak = 0
+            warmRetryAfter = Date.now() + WARM_FAILURE_BACKOFF_MS
+          }
+          throw error
+        }
+      }
+      void getOpenRouterEndpoints(job.modelID, guardedFetch).finally(() => {
+        warmActive--
+        warmQueued.delete(job.modelID)
+        scheduleWarmPump()
+      })
+    }
+    // Cache admission itself touches synchronous localStorage on a cold renderer.
+    // Bound those reads per idle slice just like network concurrency, otherwise a
+    // several-hundred-model catalog can still produce a long task before any HTTP
+    // request starts.
+    if (warmQueue.length > 0 && warmActive < WARM_CONCURRENCY) scheduleWarmPump()
+  }
+  if (typeof requestIdleCallback === "function") requestIdleCallback(pump, { timeout: 1_500 })
+  else setTimeout(pump, 100)
+}
+
+/**
+ * Low-priority daily warmer. IDs are consumed in caller-supplied priority
+ * order and coalesced module-wide, so several model-aware surfaces cannot
+ * create duplicate OpenRouter fan-out.
+ */
+export function warmOpenRouterEndpoints(
+  modelIDs: readonly string[],
+  fetchEndpoints: (model: string) => Promise<OpenRouterEndpoint[]>,
+  options: { ttlMs?: number } = {},
+) {
+  if (Date.now() < warmRetryAfter) return
+  const ttlMs = options.ttlMs ?? WARM_TTL_MS
+  const seen = new Set<string>()
+  for (const modelID of modelIDs) {
+    if (!modelID || seen.has(modelID)) continue
+    seen.add(modelID)
+    // Reactive recents/favorites/provider updates can invoke the warmer many
+    // times per day. Once a model has been admitted into the in-memory index,
+    // skip it here in O(1) rather than enqueueing hundreds of fresh rows only
+    // to rediscover their TTL through synchronous localStorage in idle slices.
+    const cached = memoryCache.get(modelID)
+    if (cached && Date.now() - cached.fetchedAt < ttlMs) continue
+    if (warmQueued.has(modelID) || inflight.has(modelID)) continue
+    warmQueued.add(modelID)
+    warmQueue.push({ modelID, fetchEndpoints, ttlMs })
+  }
+  scheduleWarmPump()
 }
 
 // localStorage serialization and writes are synchronous. Keep them out of the
@@ -114,7 +270,10 @@ export async function getOpenRouterEndpoints(
   if (!inflight.has(modelID)) {
     const promise = fetchEndpoints(modelID)
       .then((endpoints) => {
-        if (endpoints.length === 0 && cached) return cached.endpoints
+        // `[]` is a successful authoritative response (the model currently has
+        // no pin-able upstreams), not a transport failure. Persist it so removed
+        // providers do not survive forever in stale cache. Only the catch path
+        // below falls back to the previous value.
         writeCache(modelID, { version: CACHE_VERSION, fetchedAt: Date.now(), endpoints })
         return endpoints
       })

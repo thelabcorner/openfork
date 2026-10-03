@@ -1,0 +1,184 @@
+[data-component="agents-page"] {
+  --agent-studio-control-bg: var(--v2-background-bg-layer-01);
+  --agent-studio-control-bg-hover: var(--v2-background-bg-layer-02);
+  --agent-studio-control-border: var(--v2-border-border-muted);
+}
+
+/*
+ * Agent Studio deliberately owns its editing controls instead of inheriting the
+ * generic V2 input treatment. The Studio is an IDE inspector/editor surface:
+ * flat zinc fills, hairline borders, compact 26px controls, zero gradients.
+ */
+[data-component="agents-page"] .agent-studio-search,
+[data-component="agents-page"] .agent-studio-field,
+[data-component="agents-page"] .agent-studio-prompt {
+  box-sizing: border-box;
+  min-width: 0;
+  border: 1px solid var(--agent-studio-control-border);
+  border-radius: 4px;
+  background-color: var(--agent-studio-control-bg);
+  background-image: none;
+  box-shadow: none;
+  transition:
+    border-color 90ms ease,
+    background-color 90ms ease;
+}
+
+[data-component="agents-page"] .agent-studio-search:hover,
+[data-component="agents-page"] .agent-studio-field:hover:not(:disabled):not([data-invalid]),
+[data-component="agents-page"] .agent-studio-prompt:hover {
+  background-color: var(--agent-studio-control-bg-hover);
+}
+
+[data-component="agents-page"] .agent-studio-search:focus-within,
+[data-component="agents-page"] .agent-studio-field:focus,
+[data-component="agents-page"] .agent-studio-prompt:focus-within {
+  border-color: var(--v2-border-border-focus);
+  background-color: var(--v2-background-bg-base);
+  outline: none;
+}
+
+[data-component="agents-page"] .agent-studio-search {
+  display: flex;
+  width: 100%;
+  height: 26px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 7px;
+}
+
+[data-component="agents-page"] .agent-studio-search-icon {
+  flex: none;
+  color: var(--v2-icon-icon-muted);
+  opacity: 0.8;
+}
+
+[data-component="agents-page"] .agent-studio-search-input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 24px;
+  letter-spacing: -0.02px;
+  appearance: none;
+}
+
+[data-component="agents-page"] .agent-studio-search-input::placeholder {
+  color: var(--v2-text-text-faint);
+}
+
+[data-component="agents-page"] .agent-studio-search-input::-webkit-search-cancel-button {
+  display: none;
+  appearance: none;
+}
+
+[data-component="agents-page"] .agent-studio-field {
+  display: block;
+  width: 100%;
+  height: 26px;
+  padding: 0 7px;
+  outline: 0;
+  color: var(--v2-text-text-base);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 24px;
+  letter-spacing: -0.02px;
+}
+
+[data-component="agents-page"] .agent-studio-field::placeholder {
+  color: var(--v2-text-text-faint);
+}
+
+[data-component="agents-page"] .agent-studio-field:disabled {
+  cursor: default;
+  color: var(--v2-text-text-muted);
+  background-color: var(--v2-background-bg-layer-01);
+  opacity: 0.72;
+}
+
+[data-component="agents-page"] .agent-studio-field[data-invalid] {
+  border-color: var(--v2-state-fg-danger);
+  color: var(--v2-state-fg-danger);
+}
+
+[data-component="agents-page"] .agent-studio-field-numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+[data-component="agents-page"] .agent-studio-field-numeric::-webkit-inner-spin-button,
+[data-component="agents-page"] .agent-studio-field-numeric::-webkit-outer-spin-button {
+  margin: 0;
+}
+
+/*
+ * This is the primary work surface, not a textarea-shaped settings control.
+ * It expands across the complete editor column and consumes the available
+ * vertical room on large displays.
+ */
+[data-component="agents-page"] .agent-studio-prompt {
+  display: flex;
+  width: 100%;
+  min-height: 500px;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border-radius: 5px;
+}
+
+[data-component="agents-page"] .agent-studio-prompt-input {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 500px;
+  height: 100%;
+  flex: 1 1 auto;
+  resize: vertical;
+  padding: 12px 14px 18px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--v2-text-text-base);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
+  font-size: 12.5px;
+  font-weight: 430;
+  line-height: 1.55;
+  letter-spacing: -0.015em;
+  tab-size: 2;
+}
+
+[data-component="agents-page"] .agent-studio-prompt-input::placeholder {
+  color: var(--v2-text-text-faint);
+}
+
+/* The generic V2 button primitive uses decorative gradients. Agent Studio does not. */
+[data-component="agents-page"] [data-component="button-v2"] {
+  background-image: none !important;
+  text-shadow: none !important;
+  box-shadow: none;
+}
+
+[data-component="agents-page"] [data-component="button-v2"][data-variant="contrast"] {
+  background-color: var(--v2-background-bg-contrast);
+}
+
+[data-component="agents-page"] [data-component="button-v2"][data-variant="contrast"]:hover:not(:disabled) {
+  background-color: var(--v2-background-bg-contrast);
+  opacity: 0.92;
+}
+
+[data-component="agents-page"] [data-component="button-v2"][data-variant="contrast"]:active:not(:disabled) {
+  background-color: var(--v2-background-bg-contrast);
+  opacity: 0.84;
+}
+
+/* Keep the inspector's model trigger flat even if its surrounding primitive changes. */
+[data-component="agents-page"] [data-action="agents-model"] {
+  background-image: none !important;
+  box-shadow: none !important;
+}

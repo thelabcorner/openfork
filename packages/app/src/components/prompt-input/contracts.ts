@@ -18,6 +18,7 @@ export type PromptInputControls = {
     loading: boolean
     visible: boolean
     select: (name: string | undefined) => void
+    manage?: () => void
   }
   model: {
     selection: ReturnType<typeof useLocal>["model"]

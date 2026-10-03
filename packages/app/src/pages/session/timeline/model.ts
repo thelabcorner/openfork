@@ -25,7 +25,14 @@ export function createTimelineModel(input: {
       // on route activation independently of session.sync(): cached timelines
       // intentionally skip sync for immediate paint, and must still consume
       // the live stream rather than waiting for a later tab revisit/hydration.
-      if (id) serverSync().session.resume(id)
+      if (id) {
+        const session = serverSync().session
+        session.resume(id)
+        // Re-activation is itself a recovery boundary. The resource can keep
+        // its cached value when only stream freshness changed, so do not rely
+        // on a resource-key change to restart an already-latched repair.
+        void session.repairStreamContent(id)
+      }
     }),
   )
   onCleanup(() => {
@@ -54,7 +61,7 @@ export function createTimelineModel(input: {
         const markStart = `${label}.start`
         const markEnd = `${label}.end`
         performance.mark(markStart)
-        void Promise.resolve(sync().session.sync(id, { force: true })).finally(() => {
+        void serverSync().session.repairStreamContent(id).finally(() => {
           performance.mark(markEnd)
           try {
             performance.measure(label, markStart, markEnd)

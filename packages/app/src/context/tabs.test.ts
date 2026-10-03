@@ -36,6 +36,7 @@ describe("tab migration", () => {
         [
           { type: "app", page: "settings", href: "/settings?tab=models" },
           { type: "app", page: "usage", href: "/usage" },
+          { type: "app", page: "agents", href: "/agents" },
           { type: "app", page: "oxp", href: "/oxp/activity/oxpa_example" },
           { type: "app", page: "unknown", href: "/unknown" },
         ],
@@ -44,6 +45,7 @@ describe("tab migration", () => {
     ).toEqual([
       { type: "app", page: "settings", href: "/settings?tab=models" },
       { type: "app", page: "usage", href: "/usage" },
+      { type: "app", page: "agents", href: "/agents" },
       { type: "app", page: "oxp", href: "/oxp/activity/oxpa_example" },
     ])
   })
@@ -54,6 +56,7 @@ describe("application tab routes", () => {
     expect(appTabPageFromPathname("/settings")).toBe("settings")
     expect(appTabPageFromPathname("/usage")).toBe("usage")
     expect(appTabPageFromPathname("/scheduled")).toBe("scheduled")
+    expect(appTabPageFromPathname("/agents")).toBe("agents")
     expect(appTabPageFromPathname("/oxp")).toBe("oxp")
     expect(appTabPageFromPathname("/oxp/activity/abc")).toBe("oxp")
     expect(appTabPageFromPathname("/oxp/activity")).toBeUndefined()
@@ -63,6 +66,7 @@ describe("application tab routes", () => {
     expect(normalizeAppTabHref("settings", "/settings?tab=providers#local")).toBe("/settings?tab=providers#local")
     expect(normalizeAppTabHref("settings", "/usage")).toBe("/settings")
     expect(normalizeAppTabHref("usage", "https://example.com/usage")).toBe("/usage")
+    expect(normalizeAppTabHref("agents", "/agents?selected=review")).toBe("/agents?selected=review")
     expect(normalizeAppTabHref("oxp", "/oxp/activity/oxpa_example")).toBe("/oxp/activity/oxpa_example")
     expect(normalizeAppTabHref("oxp", "/settings")).toBe("/oxp")
   })

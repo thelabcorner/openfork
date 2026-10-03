@@ -20,14 +20,14 @@ import { createPathHelpers } from "./file/path"
 import type { ProjectAvatarVariant } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { migrateLegacySessionStateKeys, ServerScope, SessionStateKey } from "@/utils/server-scope"
 import { createSessionKeyReader, ensureSessionKey, pruneSessionKeys } from "./layout-helpers"
-import { requireServerKey } from "@/utils/session-route"
 import { type DraftTab, useTabs } from "./tabs"
 import { closeSessionTab, openSessionTab, previewSessionTab, type SessionTabs } from "./layout-tabs"
 import { planStartupSessionHydration } from "./startup-session-hydration"
 import { startupMark, startupSpan } from "@/utils/startup-perf"
 import { loadChatSidebarPane } from "@/pages/session/v2/chat-sidebar-preload"
 import { findChatProject } from "@/utils/chat-project"
-import { isAppTabPage, type AppTabPage } from "./app-tabs"
+import { isAppTabPage } from "./app-tabs"
+import { currentRoute, type LayoutRoute } from "./layout-route"
 import { isOxpPlatform } from "@/oxp/platform"
 
 export { createSessionKeyReader, ensureSessionKey, pruneSessionKeys }
@@ -115,13 +115,9 @@ type TabHandoff = {
 export type LocalProject = Partial<Project> & { worktree: string; expanded: boolean }
 export type HomeProjectSelection = { server: ServerConnection.Key; directory?: string }
 
-export type LayoutRoute =
-  | { type: "home" }
-  | { type: AppTabPage }
-  | { type: "draft"; draftID: string; server?: ServerConnection.Key }
-  | { type: "dir-new-sesssion"; dir: string; dirBase64: string; server?: ServerConnection.Key }
-  | { type: "session"; sessionId: string; server?: ServerConnection.Key }
-  | { type: "group"; groupId: string; server?: ServerConnection.Key }
+// Route parsing is pure and has no business dragging this module's provider
+// graph into anything that only needs to read a pathname.
+export { currentRoute, type LayoutRoute }
 
 const sessionPath = (key: string) => {
   const dir = SessionStateKey.route(key).split("/")[0]
@@ -153,44 +149,6 @@ const normalizeStoredSessionTabs = (key: string, tabs: SessionTabs) => {
     all: normalizeSessionTabList(path, tabs.all),
     active: tabs.active ? normalizeSessionTab(path, tabs.active) : tabs.active,
   }
-}
-
-export const currentRoute = (pathname: string, search: string): LayoutRoute => {
-  const parts = pathname.split("/").filter(Boolean)
-  if (parts.length === 0) return { type: "home" }
-  if (parts.length === 1 && parts[0] && isAppTabPage(parts[0])) return { type: parts[0] }
-
-  if (parts[0] === "new-session") {
-    const draftID = new URLSearchParams(search).get("draftId")
-    if (!draftID) return { type: "home" }
-    return { type: "draft", draftID }
-  }
-
-  if (parts[0] === "server" && parts[2] === "session" && parts[3]) {
-    return {
-      type: "session",
-      sessionId: parts[3],
-      server: requireServerKey(parts[1]),
-    }
-  }
-
-  if (parts[0] === "server" && parts[2] === "group" && parts[3]) {
-    return {
-      type: "group",
-      groupId: parts[3],
-      server: requireServerKey(parts[1]),
-    }
-  }
-
-  const dirBase64 = parts[0]
-  const dir = decode64(dirBase64)
-  if (!dir) return { type: "home" }
-
-  if (parts[1] !== "session") return { type: "home" }
-
-  const id = parts[2]
-  if (id) return { type: "session", sessionId: id }
-  return { type: "dir-new-sesssion", dir, dirBase64 }
 }
 
 export const { use: useLayout, provider: LayoutProvider } = createSimpleContext({

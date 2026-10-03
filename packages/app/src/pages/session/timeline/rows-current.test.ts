@@ -26,10 +26,86 @@ mock.module("@/lib/text-layout", () => ({
   textLayoutMode: () => textLayoutModeValue,
 }))
 
-const { Timeline, TimelineRow } = await import("./rows")
+const { Timeline, TimelineRow, sessionMessageTimelineDisposition } = await import("./rows")
 
 describe("current session timeline rows", () => {
-  test("keeps a Goal continuation out of the human timeline root while attaching its assistant to the prior user turn", () => {
+  test("classifies every current SessionMessageInfo variant into an explicit timeline disposition", () => {
+    const messages = [
+      { id: "agent", type: "agent-switched", agent: "build", time: { created: 1 } },
+      {
+        id: "model",
+        type: "model-switched",
+        model: { id: "model", providerID: "provider" },
+        time: { created: 2 },
+      },
+      { id: "user", type: "user", text: "human prompt", time: { created: 3 } },
+      { id: "synthetic", type: "synthetic", text: "host prompt", time: { created: 4 } },
+      { id: "system", type: "system", text: "privileged context", time: { created: 5 } },
+      {
+        id: "skill",
+        type: "skill",
+        skill: "verification",
+        name: "Verification",
+        text: "skill context",
+        time: { created: 6 },
+      },
+      {
+        id: "shell",
+        type: "shell",
+        shellID: "shell_1",
+        command: "echo hi",
+        status: "exited",
+        time: { created: 7, completed: 8 },
+      },
+      {
+        id: "assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [],
+        time: { created: 9 },
+      },
+      {
+        id: "compaction",
+        type: "compaction",
+        status: "completed",
+        reason: "auto",
+        summary: "summary",
+        recent: "recent",
+        time: { created: 10 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    expect(messages.map((message) => sessionMessageTimelineDisposition(message))).toEqual([
+      "metadata-only",
+      "metadata-only",
+      "turn-root",
+      "turn-root",
+      "context-message",
+      "context-message",
+      "turn-root",
+      "assistant-child",
+      "turn-decoration",
+    ])
+
+    const liveState = {
+      id: "goal_state",
+      type: "synthetic",
+      text: "<goal_progress />",
+      provenance: { owner: "host" as const, source: UserTurnSource.GoalProgress },
+      time: { created: 11 },
+    } satisfies SessionMessageInfo
+    const historicalState = {
+      ...liveState,
+      id: "goal_state_history",
+      provenance: { ...liveState.provenance, lifetime: "historical" as const },
+    } satisfies SessionMessageInfo
+
+    expect(sessionMessageTimelineDisposition(liveState)).toBe("state-projection")
+    expect(sessionMessageTimelineDisposition(historicalState)).toBe("turn-root")
+  })
+
+  test("renders a Goal continuation as its own automation boundary before the continued assistant output", () => {
     const source = [
       { id: "msg_user", type: "user", text: "do the work", time: { created: 1 } },
       { id: "msg_goal", type: "synthetic", text: "continue after audit", time: { created: 2 } },
@@ -109,14 +185,16 @@ describe("current session timeline rows", () => {
       [...messages.values()].filter(isSemanticUserMessage),
     )
 
-    expect(result.activeMessageID).toBe(user.id)
+    expect(result.activeMessageID).toBe(continuation.id)
     expect(result.rows.map(TimelineRow.key)).toEqual([
       "user-message:msg_user",
-      "assistant-part:msg_user:part_answer",
+      "turn-gap:msg_goal",
+      "user-message:msg_goal",
+      "assistant-part:msg_goal:part_answer",
     ])
   })
 
-  test("uses explicit continuation lineage instead of the nearest adjacent user turn", () => {
+  test("keeps continuation lineage in provenance while rendering the actual chronological automation boundary", () => {
     const source = [
       {
         id: "msg_root_a",
@@ -170,9 +248,11 @@ describe("current session timeline rows", () => {
 
     expect(result.rows.map(TimelineRow.key)).toEqual([
       "user-message:msg_root_a",
-      "assistant-part:msg_root_a:msg_goal_assistant:text:0",
       "turn-gap:msg_root_b",
       "user-message:msg_root_b",
+      "turn-gap:msg_goal",
+      "user-message:msg_goal",
+      "assistant-part:msg_goal:msg_goal_assistant:text:0",
     ])
   })
 
@@ -217,7 +297,109 @@ describe("current session timeline rows", () => {
     expect(grouped.turnByUserID.has("msg_state")).toBe(false)
   })
 
-  test("renders host-originated work without a human user row", () => {
+  test("renders historical Goal state as inspectable history instead of treating it as live mutable state", () => {
+    const source = [
+      {
+        id: "msg_state_history",
+        type: "synthetic",
+        sessionID: "ses_1",
+        text: '<goal_progress state="historical" />',
+        provenance: {
+          owner: "host" as const,
+          source: UserTurnSource.GoalProgress,
+          ref: "goal-state:history",
+          lifetime: "historical" as const,
+        },
+        time: { created: 1 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (messageID) => messages.get(messageID),
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      true,
+      "idle",
+      false,
+      [],
+    )
+
+    expect(result.rows.map(TimelineRow.key)).toEqual(["user-message:msg_state_history"])
+  })
+
+  test("renders user-owned synthetic plan approval as an automation boundary", () => {
+    const source = [
+      {
+        id: "msg_plan_approval",
+        type: "user",
+        text: "Proceed with the approved plan.",
+        provenance: { owner: "user" as const, source: UserTurnSource.PlanApproval },
+        time: { created: 1 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (messageID) => messages.get(messageID),
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      true,
+      "idle",
+      false,
+      [],
+    )
+
+    expect(result.rows.map(TimelineRow.key)).toEqual(["user-message:msg_plan_approval"])
+  })
+
+  test("does not duplicate a synthetic root as both Automation and System injection", () => {
+    const root = {
+      id: "msg_goal_continuation",
+      sessionID: "ses_1",
+      role: "user" as const,
+      time: { created: 1 },
+      agent: "build",
+      model: { providerID: "provider", modelID: "model" },
+      provenance: {
+        owner: "host" as const,
+        source: UserTurnSource.GoalContinuation,
+        sourceMessageID: "msg_user",
+      },
+    } as UserMessage
+    const rootParts: Part[] = [
+      {
+        id: "part_goal_continuation",
+        sessionID: "ses_1",
+        messageID: root.id,
+        type: "text",
+        text: "Continue the Goal after audit.",
+        synthetic: true,
+      },
+    ]
+
+    const rows = Timeline.constructMessageRows(
+      root,
+      () => rootParts,
+      [],
+      0,
+      true,
+      true,
+      "idle",
+      true,
+      false,
+      undefined,
+      { showUserMessage: true },
+    )
+
+    expect(rows.map(TimelineRow.key)).toEqual(["user-message:msg_goal_continuation"])
+  })
+
+  test("renders host-originated work with an explicit automation prompt row", () => {
     const source = [
       { id: "msg_host", type: "synthetic", text: "scheduled work", time: { created: 1 } },
       {
@@ -273,10 +455,13 @@ describe("current session timeline rows", () => {
     )
 
     expect(result.activeMessageID).toBe(host.id)
-    expect(result.rows.map(TimelineRow.key)).toEqual(["assistant-part:msg_host:part_answer"])
+    expect(result.rows.map(TimelineRow.key)).toEqual([
+      "user-message:msg_host",
+      "assistant-part:msg_host:part_answer",
+    ])
   })
 
-  test("renders a Goal Auditor assistant under its hidden synthetic root", () => {
+  test("renders the Goal Auditor prompt before its assistant output", () => {
     const source = [
       {
         id: "msg_auditor_prompt",
@@ -309,11 +494,12 @@ describe("current session timeline rows", () => {
     )
 
     expect(result.rows.map(TimelineRow.key)).toEqual([
+      "user-message:msg_auditor_prompt",
       "assistant-part:msg_auditor_prompt:msg_auditor_assistant:text:0",
     ])
   })
 
-  test("treats a V1 scheduled-task Synthetic provenance turn as a hidden worker root", () => {
+  test("renders a V1 scheduled-task Synthetic provenance turn as an automation prompt", () => {
     const source = [
       { id: "msg_scheduled", type: "user", text: "scheduled work", time: { created: 1 } },
       {
@@ -372,7 +558,10 @@ describe("current session timeline rows", () => {
     )
 
     expect(result.activeMessageID).toBe(scheduled.id)
-    expect(result.rows.map(TimelineRow.key)).toEqual(["assistant-part:msg_scheduled:part_answer"])
+    expect(result.rows.map(TimelineRow.key)).toEqual([
+      "user-message:msg_scheduled",
+      "assistant-part:msg_scheduled:part_answer",
+    ])
   })
 
   test("derives turns and tagged rows from chronological current messages", () => {
@@ -495,6 +684,41 @@ describe("current session timeline rows", () => {
       "turn-gap:msg_user_2",
       "user-message:msg_user_2",
       "assistant-part:msg_user_2:msg_assistant_2:text:0",
+    ])
+  })
+
+  test("resolves an assistant's loaded parent before falling back to transcript adjacency", () => {
+    const source = [
+      { id: "msg_parent", type: "user", text: "parent", time: { created: 1 } },
+      {
+        id: "msg_parent_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "belongs to parent" }],
+        time: { created: 2, completed: 3 },
+      },
+      { id: "msg_adjacent", type: "user", text: "adjacent", time: { created: 4 } },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    const result = Timeline.constructSessionMessageRows(
+      [source[2]!, source[1]!],
+      (messageID) => messages.get(messageID),
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      false,
+      "idle",
+      true,
+      [],
+    )
+
+    expect(result.rows.map(TimelineRow.key)).toEqual([
+      "user-message:msg_parent",
+      "assistant-part:msg_parent:msg_parent_assistant:text:0",
+      "turn-gap:msg_adjacent",
+      "user-message:msg_adjacent",
     ])
   })
 

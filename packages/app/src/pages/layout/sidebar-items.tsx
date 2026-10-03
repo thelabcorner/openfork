@@ -3,7 +3,7 @@ import { Avatar } from "@opencode-ai/ui/avatar"
 import { Icon } from "@opencode-ai/ui/icon"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
-import { Spinner } from "@opencode-ai/ui/spinner"
+import { DenseWorkingIndicator } from "@opencode-ai/ui/spinner"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { A, useParams } from "@solidjs/router"
@@ -66,7 +66,7 @@ export const ProjectIcon = (props: {
       </Show>
       <Show when={props.working}>
         <div class="absolute bottom-px right-px size-3 rounded-full bg-background-base z-10 flex items-center justify-center">
-          <Spinner class="size-[9px]" />
+          <DenseWorkingIndicator class="size-[9px]" />
         </div>
       </Show>
     </div>
@@ -76,6 +76,7 @@ export const ProjectIcon = (props: {
 export type SessionItemProps = {
   session: Session
   list: Session[]
+  sessionIndex?: Accessor<ReadonlyMap<string, Session>>
   navList?: Accessor<Session[]>
   slug: string
   mobile?: boolean
@@ -124,7 +125,7 @@ const SessionRow = (props: {
         >
           <Switch>
             <Match when={props.isWorking()}>
-              <Spinner class="size-[15px]" />
+              <DenseWorkingIndicator class="size-[15px]" />
             </Match>
             <Match when={props.hasPermissions()}>
               <div class="size-1.5 rounded-full bg-surface-warning-strong" />
@@ -155,7 +156,7 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
   const [sessionStore] = serverSync().child(props.session.directory)
   const hasPermissions = createMemo(() => {
     return !!sessionPermissionRequest(
-      sessionStore.session,
+      sessionStore.session_children(),
       serverSync().session.data.permission,
       props.session.id,
       (item) => {
@@ -174,7 +175,7 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
   const tooltip = createMemo(() => props.showTooltip ?? (props.mobile || !props.sidebarExpanded()))
   const currentChild = createMemo(() => {
     if (!props.showChild) return
-    return childSessionOnPath(sessionStore.session, props.session.id, params.id)
+    return childSessionOnPath(props.sessionIndex?.() ?? sessionStore.session, props.session.id, params.id)
   })
 
   const warm = (span: number, priority: "high" | "low") => {

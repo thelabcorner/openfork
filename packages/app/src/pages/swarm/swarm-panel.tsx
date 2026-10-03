@@ -8,6 +8,7 @@ import {
   onCleanup,
 } from "solid-js"
 import { createStore } from "solid-js/store"
+import { Schema } from "effect"
 import type {
   SwarmBlackboardEntry,
   SwarmClaim,
@@ -20,6 +21,7 @@ import type {
   SwarmTaskRun,
   SwarmWorkspacePolicy,
 } from "@opencode-ai/sdk/v2/client"
+import { Swarm as SwarmSchema } from "@opencode-ai/schema/swarm"
 import type { Phase as SessionTelemetryPhase } from "@opencode-ai/schema/session-telemetry"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
@@ -344,7 +346,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
     workspaceMode: "shared-read" as "shared-read" | "shared-write" | "worktree",
     baseRef: "",
     tags: "",
-    requestedCapabilities: "",
+    modelRequirements: "",
   })
   const configMember = createMemo(() => detail()?.members.find((member) => member.id === configMemberID()))
   const beginConfigure = (member: SwarmMember) => {
@@ -359,7 +361,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
       workspaceMode: member.workspacePolicy.mode,
       baseRef: member.workspacePolicy.mode === "worktree" ? (member.workspacePolicy.baseRef ?? "") : "",
       tags: member.capabilities?.tags.join(", ") ?? "",
-      requestedCapabilities: profile.requestedCapabilities?.join(", ") ?? "",
+      modelRequirements: profile.modelRequirements?.join(", ") ?? "",
     })
     setConfigMemberID(member.id)
   }
@@ -373,6 +375,17 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
     const member = configMember()
     const previous = member?.desiredProfile
     if (!member || !previous) return
+    const modelRequirements = config.modelRequirements.split(",").map((item) => item.trim()).filter(Boolean)
+    const isModelRequirement = Schema.is(SwarmSchema.ModelRequirement)
+    const invalidRequirements = modelRequirements.filter((item) => !isModelRequirement(item))
+    if (invalidRequirements.length > 0) {
+      showToast({
+        variant: "error",
+        title: language.t("swarm.panel.loadFailed"),
+        description: `Unknown model requirements: ${invalidRequirements.join(", ")}`,
+      })
+      return
+    }
     const workspacePolicy: SwarmWorkspacePolicy =
       config.workspaceMode === "worktree"
         ? { mode: "worktree", ...(config.baseRef.trim() ? { baseRef: config.baseRef.trim() } : {}) }
@@ -386,8 +399,8 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
         ...(config.variant.trim() ? { variant: config.variant.trim() } : {}),
       },
       permissionBoundary: previous.permissionBoundary,
-      ...(config.requestedCapabilities.trim()
-        ? { requestedCapabilities: config.requestedCapabilities.split(",").map((item) => item.trim()).filter(Boolean) }
+      ...(modelRequirements.length > 0
+        ? { modelRequirements: modelRequirements.filter(isModelRequirement) }
         : {}),
     }
     void action(async () => {
@@ -724,7 +737,7 @@ export function SwarmPanel(props: { swarmID: string; onClose: () => void }) {
                                 </label>
                                 <Show when={config.workspaceMode === "worktree"}><Field label={language.t("swarm.panel.baseRef")} value={config.baseRef} onInput={(value) => setConfig("baseRef", value)} /></Show>
                                 <Field label={language.t("swarm.panel.capabilities")} value={config.tags} onInput={(value) => setConfig("tags", value)} />
-                                <Field label={language.t("swarm.panel.requestedCapabilities")} value={config.requestedCapabilities} onInput={(value) => setConfig("requestedCapabilities", value)} />
+                                <Field label={language.t("swarm.panel.requestedCapabilities")} value={config.modelRequirements} onInput={(value) => setConfig("modelRequirements", value)} />
                               </div>
                               <div class="mt-2 flex justify-end gap-1">
                                 <button type="button" class="panel-action" onClick={() => setConfigMemberID(undefined)}>{language.t("swarm.panel.cancel")}</button>

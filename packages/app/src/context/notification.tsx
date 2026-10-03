@@ -10,6 +10,7 @@ import { useSettings } from "@/context/settings"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { decode64 } from "@/utils/base64"
 import { EventSessionError } from "@opencode-ai/sdk/v2"
+import { SessionError } from "@opencode-ai/schema/session-error"
 import { Persist, persisted } from "@/utils/persist"
 import { playSoundById } from "@/utils/sound"
 import { showToast } from "@/utils/toast"
@@ -24,13 +25,8 @@ let lastErrorSoundTime = 0
 let lastErrorToastTime = 0
 
 function sessionErrorMessage(error: unknown) {
-  if (typeof error === "string") return error
-  if (error && typeof error === "object" && "data" in error) {
-    const data = (error as { data?: { message?: string } }).data
-    if (data?.message) return data.message
-  }
-  if (error instanceof Error) return error.message
-  return
+  if (error === undefined || error === null) return
+  return SessionError.summary(error).message
 }
 
 function isBenignSessionError(error: unknown) {
@@ -160,7 +156,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     const settings = useSettings()
     const language = useLanguage()
     const owner = getOwner()
-    const states = new Map<ServerScope, { dispose: () => void; state: NotificationState }>()
+    const states = new Map<ServerScope, { key: ServerConnection.Key; url: string; dispose: () => void; state: NotificationState }>()
 
     const activeServer = createMemo(() => {
       if (params.serverKey) return requireServerKey(params.serverKey)
@@ -176,16 +172,22 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     const ensure = (key: ServerConnection.Key) => {
       const conn = global.servers.list().find((item) => ServerConnection.key(item) === key)
       if (!conn) throw new Error(`Notification server not found: ${key}`)
-      const ctx = global.ensureServerCtx(conn)
-      const existing = states.get(ctx.sdk.scope)
-      if (existing) return existing.state
+      const sdk = global.ensureServerSdk(conn)
+      const existing = states.get(sdk.scope)
+      if (existing?.url === sdk.url && existing.key === key) return existing.state
+      if (existing) {
+        existing.dispose()
+        states.delete(sdk.scope)
+      }
       const root = createRoot(
         (dispose) => ({
+          key,
+          url: sdk.url,
           dispose,
           state: createServerNotificationState({
-            sdk: ctx.sdk,
-            sync: ctx.sync,
-            active: () => server.scope(activeServer()) === ctx.sdk.scope,
+            sdk,
+            sync: () => global.ensureServerCtx(conn).sync,
+            active: () => server.scope(activeServer()) === sdk.scope,
             directory: activeDirectory,
             sessionID: activeSession,
             platform,
@@ -196,7 +198,7 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
         }),
         owner ?? undefined,
       )
-      states.set(ctx.sdk.scope, root)
+      states.set(sdk.scope, root)
       return root.state
     }
 
@@ -258,7 +260,7 @@ type NotificationState = ReturnType<typeof createServerNotificationState>
 
 function createServerNotificationState(input: {
   sdk: ServerSDK
-  sync: ServerSync
+  sync: () => ServerSync
   active: Accessor<boolean>
   directory: Accessor<string | undefined>
   sessionID: Accessor<string | undefined>
@@ -268,7 +270,7 @@ function createServerNotificationState(input: {
   navigate: (href: string) => void
 }) {
   const serverSDK = () => input.sdk
-  const serverSync = () => input.sync
+  const serverSync = () => input.sync()
   const platform = input.platform
   const settings = input.settings
   const language = input.language
@@ -432,7 +434,7 @@ function createServerNotificationState(input: {
   ) => {
     const sessionID = event.properties.sessionID
     const error = "error" in event.properties ? event.properties.error : undefined
-    console.error("[session.error]", { directory, sessionID, error })
+    console.error("[session.error] " + JSON.stringify({ directory, sessionID, error: SessionError.summary(error) }))
     if (!sessionID) return
     if (isBenignSessionError(error)) return
 

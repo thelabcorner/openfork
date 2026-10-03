@@ -27,10 +27,8 @@ type Detail = {
     status: "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
     revision: number
     auditorRuns: number
-    continuationPolicy: { maxConsecutiveTurns?: number; maxNoProgressTurns?: number; maxDurationMs?: number; tokenBudget?: number }
     auditorPolicy: {
       model?: { providerID: string; id: string }
-      blockedThreshold?: number
       maxAttempts?: number
     }
     blocker?: string
@@ -161,7 +159,6 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
     }
     const now = Date.now()
@@ -176,7 +173,6 @@ class GoalServer {
         status: "draft",
         revision: 0,
         auditorRuns: 0,
-        continuationPolicy: body.continuationPolicy ?? {},
         auditorPolicy: body.auditorPolicy ?? {},
         time: { created: now, updated: now },
       },
@@ -208,7 +204,6 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
       start?: boolean
     }
@@ -225,7 +220,6 @@ class GoalServer {
         status: started ? "active" : "draft",
         revision: started ? 1 : 0,
         auditorRuns: 0,
-        continuationPolicy: body.continuationPolicy ?? {},
         auditorPolicy: body.auditorPolicy ?? {},
         time: { created: now, updated: now },
       },
@@ -273,13 +267,11 @@ class GoalServer {
       criteria?: string[]
       constraints?: string[]
       steps?: Array<{ title: string; description?: string }>
-      continuationPolicy?: Detail["goal"]["continuationPolicy"]
       auditorPolicy?: Detail["goal"]["auditorPolicy"]
     }
     if (body.title !== undefined) this.detail.goal.title = body.title
     if (body.objective !== undefined) this.detail.goal.objective = body.objective
     if (body.constraints !== undefined) this.detail.goal.constraints = body.constraints
-    if (body.continuationPolicy !== undefined) this.detail.goal.continuationPolicy = body.continuationPolicy
     if (body.auditorPolicy !== undefined) this.detail.goal.auditorPolicy = body.auditorPolicy
     if (body.criteria !== undefined) {
       this.detail.criteria = body.criteria.map((description, position) => ({
@@ -556,7 +548,6 @@ test("quick Goal arming prepares durable Goal state before the first worker prom
   expect(server.detail?.goal).toMatchObject({
     objective: "Implement the quick Goal ordering contract",
     status: "active",
-    continuationPolicy: {},
   })
   expect(server.detail?.criteria).toHaveLength(1)
   await expect(page.locator('[data-component="goal-composer-shelf"]')).toContainText("Implement the quick Goal ordering contract")
@@ -574,7 +565,6 @@ test("persists the auditor model per Goal through the real model picker", async 
       status: "active",
       revision: 3,
       auditorRuns: 2,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 60_000, updated: now },
     },
@@ -628,7 +618,6 @@ test("shows AUDITING from the session-local runtime projection while the durable
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -666,7 +655,6 @@ test("enters the live Goal Auditor Session while it is working and keeps the sam
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -684,6 +672,12 @@ test("enters the live Goal Auditor Session while it is working and keeps the sam
       items:
         requestedSessionID === auditorSessionID
           ? [
+              {
+                id: "msg_auditor_system_context",
+                type: "system",
+                text: "[GOAL AUDIT CYCLE] Verify the latest worker cycle independently.",
+                time: { created: now - 1_500 },
+              },
               {
                 id: auditorPromptMessageID,
                 type: "synthetic",
@@ -725,6 +719,15 @@ test("enters the live Goal Auditor Session while it is working and keeps the sam
       ),
     )
     .toBeGreaterThan(0)
+  await expect(
+    page.getByText(
+      "Audit the latest Goal worker cycle and determine whether the acceptance criteria are satisfied.",
+      { exact: true },
+    ),
+  ).toBeVisible()
+  await expect(
+    page.getByText("[GOAL AUDIT CYCLE] Verify the latest worker cycle independently.", { exact: true }),
+  ).toBeVisible()
 
   // The Goal Auditor publishes through the ordinary SessionEvent stream. Once
   // the child is foregrounded, its in-flight provider output must render through
@@ -792,7 +795,6 @@ test("shows AUDIT REQUESTED while the automatic Goal Mode audit is pending and n
       status: "active",
       revision: 2,
       auditorRuns: 0,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -827,7 +829,6 @@ test("never presents orphaned verifying or auditor failure as a running auditor"
       status: "verifying",
       revision: 4,
       auditorRuns: 0,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 30_000, updated: now },
     },
@@ -874,7 +875,6 @@ test("Goal Mode exposes one automatic audit-and-continue behavior with no manual
       status: "active",
       revision: 8,
       auditorRuns: 4,
-      continuationPolicy: {},
       auditorPolicy: {},
       time: { created: now - 60_000, updated: now },
     },

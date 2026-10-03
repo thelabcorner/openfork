@@ -10,25 +10,38 @@ import { useLimits, type LimitsState } from "@/hooks/use-limits"
  * Verified live: `ses_fa420c096ffedHcSjgzWc59E30` (deep-seek-v4-flash on
  * genspark) burned 12 credits for 53,044 tokens (53,009 in + 11 out + 24
  * reasoning) — file `Downloads/new-session---2026-09-01t07-29-12-553z.json.br:1`.
- * That is 12/53.044 ≈ 226 credits/M, i.e. 226/375 ≈ $0.603/M, which matches a
- * flash-model $0.60/M tier. We therefore derive credits/M as $/M * 375 and
- * fall back to $0.60/M (225 credits/M) when published pricing is absent so the
- * picker never shows "—" for Genspark.
+ * That is 12/53.044 ≈ 226 credits/M, i.e. 226/375 ≈ $0.603/M, which is what a
+ * flash-model $0.60/M tier would cost.
+ *
+ * That observation is evidence about ONE model, not a published rate, so it is
+ * deliberately NOT used as a fallback. The published-price conversion below is
+ * the only rate this module will report: credits/M = $/M * 375 when Genspark
+ * (or its catalog) publishes a price, and NO rate at all when it does not.
+ * Callers must render "—" for an unknown rate rather than substitute a plausible
+ * dollar figure — an invented $/M silently becomes an invented "requests left".
  */
 const CREDITS_PER_DOLLAR = 7500 / 20 // 375
 
+export type GensparkRate = {
+  creditsPerM: number
+  dollarsPerM: number
+}
+
 export type GensparkModelUsage = {
-  estimatedRequests: number
   remainingCredits: number
-  rateCreditsPerM: number
-  rateDollarsPerM: number
+  /** Undefined when no published rate exists for this model. */
+  rateCreditsPerM?: number
+  rateDollarsPerM?: number
 }
 
 /**
  * Genspark stretch estimates for the model picker.
  * Genspark bills in credits, not dollars: 7500 credits = $20 => 375 credits per $1.
- * We derive credits/M from the model's dollar cost (via pricing fallback) and
- * estimate remaining requests as remainingCredits / creditsPerRequest.
+   * We derive credits/M from the model's published dollar cost. Request-count
+   * capacity deliberately does NOT live here: the shared server Capacity owner
+   * already has the user's request-size posterior and the provider resource
+   * denominator. A local 1k-token heuristic would create a second, weaker source
+   * of truth for the same number.
  */
 export function useGensparkUsage(options?: { limits?: LimitsState }) {
   let limits: LimitsState | undefined = options?.limits
@@ -64,33 +77,31 @@ export function useGensparkUsage(options?: { limits?: LimitsState }) {
     return num
   })
 
-  const rateFor = (dollarCostPerM: number | undefined) => {
-    let cost = dollarCostPerM
-    // Genspark models currently have cost 0 in the static catalog, but we still
-    // want to show a stretch bar. Use observed 226/M for deep-seek-v4-flash
-    // (12 credits for 53k tokens) or a generic $0.60/M fallback.
-    if (cost === undefined || !Number.isFinite(cost) || cost <= 0) cost = 0.6
-    const creditsPerM = cost * CREDITS_PER_DOLLAR
-    return { creditsPerM, dollarsPerM: cost }
+  /**
+   * Published price -> credit rate, or nothing.
+   *
+   * There is intentionally no fallback tier here. A catalog that reports `0`
+   * for Genspark models means "Genspark publishes no token price", not "the
+   * price is zero", and answering 0 would render a free-model claim; answering
+   * $0.60/M would render an invented one. Both are lies, so the only honest
+   * answer without a real rate is `undefined`.
+   */
+  const rateFor = (dollarCostPerM: number | undefined | null): GensparkRate | undefined => {
+    if (dollarCostPerM === undefined || dollarCostPerM === null) return undefined
+    if (!Number.isFinite(dollarCostPerM) || dollarCostPerM <= 0) return undefined
+    const creditsPerM = dollarCostPerM * CREDITS_PER_DOLLAR
+    if (!Number.isFinite(creditsPerM) || creditsPerM <= 0) return undefined
+    return { creditsPerM, dollarsPerM: dollarCostPerM }
   }
 
-  const forModel = (dollarCostPerM: number | undefined): GensparkModelUsage | undefined => {
+  const forModel = (dollarCostPerM: number | undefined | null): GensparkModelUsage | undefined => {
     const remaining = remainingCredits()
     if (remaining === undefined) return undefined
     const rate = rateFor(dollarCostPerM)
-    if (!rate) return undefined
-    // Provider-local request-size heuristic for Genspark credits only. This is
-    // unrelated to OpenCode Go Capacity, whose request projection is server-owned.
-    const profile = { input: 800, cached: 65_000, output: 220 }
-    // We need per-token cost breakdown, but we only have blended $/M.
-    // Approximate: blended $/M = (input+output)/M avg, so credits per request ≈ creditsPerM * avgTokens / 1M
-    // Use a simple average of 1k tokens per request as heuristic.
-    const avgTokensPerRequest = 1000
-    const creditsPerRequest = (rate.creditsPerM * avgTokensPerRequest) / 1_000_000
-    if (!(creditsPerRequest > 0)) return undefined
-    const estimatedRequests = Math.max(0, Math.floor(remaining / creditsPerRequest))
+    // No published rate: the balance is still a real measurement, so keep it and
+    // report no rate. Consumers dash the rate cell rather than invent one.
+    if (!rate) return { remainingCredits: remaining }
     return {
-      estimatedRequests,
       remainingCredits: remaining,
       rateCreditsPerM: rate.creditsPerM,
       rateDollarsPerM: rate.dollarsPerM,

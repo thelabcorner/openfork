@@ -10,7 +10,6 @@ import { arrayMove } from "@dnd-kit/helpers"
 import { tabHref, tabKey, type AppTab, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
 import { ServerConnection, serverName } from "@/context/server"
 import { AppTabItem, DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
-import type { TabPreviewGroupSession } from "@/components/titlebar-tab-popover"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
 import { useGlobal, type ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
@@ -18,7 +17,6 @@ import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
 import { showToast } from "@/utils/toast"
 import { useSessionGroups } from "@/context/session-groups"
-import { groupedSessionsForTabPreview, indexTabPreviewMemberships } from "./titlebar-tab-group-preview"
 import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
 import type { Session } from "@opencode-ai/sdk/v2"
@@ -33,7 +31,6 @@ function SessionTabSlot(props: {
   session: () => Session | undefined
   serverCtx: () => ServerCtx | undefined
   serverLabel: () => string | undefined
-  groupSessions: () => TabPreviewGroupSession[] | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
   onPrefetch: () => void
@@ -56,7 +53,7 @@ function SessionTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-0 max-w-56 flex-1 flex-shrink"
       onPointerEnter={props.onPrefetch}
     >
       <TitlebarTabContextMenu id={props.id} session={props.session} server={props.tab.server}>
@@ -68,7 +65,6 @@ function SessionTabSlot(props: {
           server={props.tab.server}
           serverCtx={props.serverCtx}
           serverLabel={props.serverLabel}
-          groupSessions={props.groupSessions}
           session={props.session}
           fallbackTitle={props.fallbackTitle}
           onRename={props.onRename}
@@ -93,7 +89,6 @@ function SessionTabEntry(props: {
   pending: boolean
   serverCtx: () => ServerCtx | undefined
   serverLabel: () => string | undefined
-  groupSessions: () => TabPreviewGroupSession[] | undefined
   onVisibleChange: (visible: boolean) => void
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
@@ -167,7 +162,6 @@ function SessionTabEntry(props: {
         session={session}
         serverCtx={props.serverCtx}
         serverLabel={props.serverLabel}
-        groupSessions={props.groupSessions}
         fallbackTitle={persisted()?.title ?? (missingSession() ? language.t("session.tab.unknown") : undefined)}
         onRename={rename}
         onPrefetch={prefetch}
@@ -204,7 +198,7 @@ function DraftTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-0 max-w-56 flex-1 flex-shrink"
     >
       <TitlebarTabContextMenu id={props.id}>
         <DraftTabItem
@@ -250,7 +244,7 @@ function AppTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-0 max-w-56 flex-1 flex-shrink"
     >
       <TitlebarTabContextMenu id={props.id}>
         <AppTabItem
@@ -279,7 +273,6 @@ function GroupTabSlot(props: {
   pending: boolean
   title: string
   sessionCount?: number
-  sessions?: TabPreviewGroupSession[]
   serverCtx: () => ServerCtx | undefined
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
@@ -300,7 +293,7 @@ function GroupTabSlot(props: {
       data-titlebar-tab-slot
       data-tab-key={props.id}
       data-active={props.active()}
-      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      class="relative flex min-w-0 max-w-56 flex-1 flex-shrink"
     >
       <TitlebarTabContextMenu id={props.id} isGroup groupId={props.tab.groupId} server={props.tab.server}>
         <GroupTabNavItem
@@ -311,7 +304,6 @@ function GroupTabSlot(props: {
           tab={props.tab}
           title={props.title}
           sessionCount={props.sessionCount}
-          sessions={props.sessions}
           serverCtx={props.serverCtx}
           onNavigate={() => props.onNavigate(ref)}
           onClose={props.onClose}
@@ -346,13 +338,12 @@ function GroupTabEntry(props: {
     return group()?.name ?? tabs.info[key]?.title ?? language.t("sessionGroup.name.placeholder")
   })
 
-  const sessions = createMemo<TabPreviewGroupSession[] | undefined>(() =>
-    group()?.sessions.map((session) => ({ id: session.id, title: session.title })),
-  )
   // Membership-empty groups are invalid at the data layer. An unresolved group
   // tab is therefore loading, not a real "0 sessions" group; keep the count
   // absent until detail hydration completes instead of flashing misleading 0.
-  const sessionCount = createMemo(() => sessions()?.length)
+  // The cheap sessionIds array (already populated by the batched detail
+  // fetch) is enough for this visible badge — no row projection needed.
+  const sessionCount = createMemo(() => group()?.sessionIds.length)
 
   createEffect(() => props.onVisibleChange(true))
 
@@ -365,7 +356,6 @@ function GroupTabEntry(props: {
       pending={props.pending}
       title={title()}
       sessionCount={sessionCount()}
-      sessions={sessions()}
       serverCtx={props.serverCtx}
       onNavigate={props.onNavigate}
       onClose={props.onClose}
@@ -386,7 +376,6 @@ export function TitlebarTabStrip(props: {
   const global = useGlobal()
   const language = useLanguage()
   const command = useCommand()
-  const sessionGroups = useSessionGroups()
   let scrollRef!: HTMLDivElement
   let listRef!: HTMLDivElement
   let resizeFrame: number | undefined
@@ -406,7 +395,6 @@ export function TitlebarTabStrip(props: {
     return map
   })
   const multipleServers = createMemo(() => serverConnections().size > 1)
-  const previewMemberships = createMemo(() => indexTabPreviewMemberships(sessionGroups.list()))
 
   command.register("titlebar-tab-cycle", () => [
     {
@@ -483,10 +471,10 @@ export function TitlebarTabStrip(props: {
   })
 
   return (
-    <div data-slot="titlebar-tabs" class="relative min-w-0">
+    <div data-slot="titlebar-tabs" class="relative min-w-0 flex-1 overflow-hidden">
       <div
         data-slot="titlebar-tabs-scroll"
-        class="flex min-w-0 flex-row items-center gap-1.5 overflow-x-auto no-scrollbar [app-region:no-drag]"
+        class="flex min-w-0 h-full flex-row items-center gap-1.5 overflow-x-auto no-scrollbar [app-region:no-drag]"
         ref={scrollRef}
       >
         <DragDropProvider
@@ -554,6 +542,7 @@ export function TitlebarTabStrip(props: {
                     if (tab.page === "settings") return language.t("sidebar.settings")
                     if (tab.page === "usage") return language.t("usage.panel.title")
                     if (tab.page === "oxp") return language.t("oxpActivity.tab.title")
+                    if (tab.page === "agents") return language.t("agents.title")
                     return language.t("scheduledTasks.title")
                   }
                   return (
@@ -584,9 +573,6 @@ export function TitlebarTabStrip(props: {
                       pending={pending()}
                       serverCtx={serverCtx}
                       serverLabel={serverLabel}
-                      groupSessions={() =>
-                        groupedSessionsForTabPreview(sessionGroups.list(), tab.sessionId, previewMemberships())
-                      }
                       onVisibleChange={(visible) => setVisibility(id, visible)}
                       onNavigate={(element) => {
                         ref = element

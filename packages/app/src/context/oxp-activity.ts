@@ -6,7 +6,7 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createStore, reconcile } from "solid-js/store"
 import { useServerSDK } from "./server-sdk"
 
 type InvocationDetailState = {
@@ -30,6 +30,19 @@ const MAX_CACHED_ACTIVITY_DETAILS = 8
 const MAX_CACHED_INVOCATIONS_PER_ACTIVITY = 2_000
 const MAX_CACHED_INVOCATION_DETAILS = 128
 
+// Live refresh cadence for an open activity.
+//
+// `oxpActivity.invocation.*` is published on the OXP host runtime's in-memory
+// bus, and that runtime lives in the desktop sidecar — a different process from
+// the server whose SSE stream this client consumes. Those frames therefore can
+// never arrive here, which is why an open transcript used to sit still until it
+// was remounted or refreshed by hand. SQLite is the authority the HTTP reads
+// already go through, so an open transcript polls it while it is on screen; the
+// event subscription below stays for the same-process activity events (rename,
+// archive, delete) it does receive.
+const LIVE_INVOCATION_INTERVAL_MS = 2_000
+const LIVE_SUMMARY_INTERVAL_MS = 8_000
+
 const emptyDetail = (): DetailState => ({
   items: [],
   more: false,
@@ -40,6 +53,17 @@ const emptyDetail = (): DetailState => ({
 function messageOf(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
+
+/**
+ * Replace the cached page without replacing the rows inside it.
+ *
+ * Every consumer of this list renders through `<For>`, which keys on object
+ * identity — so handing it a freshly built array would dispose and rebuild
+ * every tool row, collapsing whatever the reader had expanded, each time a
+ * single call settles. Reconciling by `id` patches rows in place instead, and
+ * a poll that found nothing new writes nothing at all.
+ */
+const sameRows = (items: OxpInvocationInfo[]) => reconcile(items, { key: "id" })
 
 function finite(value: unknown, fallback = 0) {
   const number = Number(value)
@@ -144,19 +168,38 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       if (recency >= 0) detailRecency.splice(recency, 1)
     }
 
-    const refresh = async () => {
+    let backgroundSummaryRefresh: Promise<void> | undefined
+
+    /**
+     * @param options.background Poll on behalf of an on-screen surface: never
+     *   raises the shared loading flag, never replaces already-paged summaries,
+     *   and never paints a transient network error over data that is already
+     *   good. Explicit refreshes keep the actionable states.
+     */
+    const refresh = async (options?: { background?: boolean }) => {
+      const background = options?.background === true
       if (state.loading) return
-      setState("loading", true)
-      try {
-        const response = await sdk().oxpActivities(
-          { limit: "100", includeArchived: "false" },
-          { throwOnError: true },
-        )
-        const summaries: Record<string, OxpParentActivitySummary> = {}
-        const rows = response.data ?? []
-        for (const summary of rows) summaries[summary.id] = summary
-        const tail = rows.at(-1)
-        if (!disposed) {
+      if (background && backgroundSummaryRefresh) return backgroundSummaryRefresh
+      if (!background) setState("loading", true)
+      const run = (async () => {
+        try {
+          const response = await sdk().oxpActivities(
+            { limit: "100", includeArchived: "false" },
+            { throwOnError: true },
+          )
+          const rows = response.data ?? []
+          const tail = rows.at(-1)
+          if (disposed) return
+          if (background) {
+            // A poll only ever sees the newest page. Merging keeps whatever
+            // older pages the reader already asked for, and leaves their
+            // cursor alone; removals arrive as `oxpActivity.removed`.
+            for (const summary of rows) upsertSummary(summary)
+            setState("loaded", true)
+            return
+          }
+          const summaries: Record<string, OxpParentActivitySummary> = {}
+          for (const summary of rows) summaries[summary.id] = summary
           setState("summaries", summaries)
           setState("moreSummaries", rows.length === 100)
           setState(
@@ -166,12 +209,18 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
           setState("summaryBeforeID", tail?.id)
           setState("error", undefined)
           setState("loaded", true)
+        } catch (error) {
+          if (disposed || background) return
+          setState("error", messageOf(error))
+        } finally {
+          if (!disposed && !background) setState("loading", false)
         }
-      } catch (error) {
-        if (!disposed) setState("error", messageOf(error))
-      } finally {
-        if (!disposed) setState("loading", false)
-      }
+      })()
+      if (!background) return run
+      backgroundSummaryRefresh = run.finally(() => {
+        backgroundSummaryRefresh = undefined
+      })
+      return backgroundSummaryRefresh
     }
 
     const ensureLoaded = () => {
@@ -245,16 +294,29 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       return run
     }
 
-    const refreshInvocations = (activityID: string): Promise<void> => {
+    /**
+     * @param options.background Poll on behalf of an on-screen transcript. A
+     *   two-second tick must not flicker the timeline's loading affordances or
+     *   replace a rendered transcript with an error banner, so a background
+     *   pass leaves `loading` alone and only reports failure while there is
+     *   still nothing to show.
+     */
+    const refreshInvocations = (
+      activityID: string,
+      options?: { background?: boolean },
+    ): Promise<void> => {
+      const background = options?.background === true
       touchDetail(activityID)
       const pending = detailRefreshes.get(activityID)
       if (pending) {
-        detailDirty.add(activityID)
+        // A background poll is satisfied by whatever pass is already running;
+        // marking it dirty would queue a redundant round trip every tick.
+        if (!background) detailDirty.add(activityID)
         return pending
       }
       if (!state.details[activityID])
         setState("details", activityID, emptyDetail())
-      setState("details", activityID, "loading", true)
+      if (!background) setState("details", activityID, "loading", true)
       const run = (async () => {
         try {
           const response = await sdk().oxpInvocations(
@@ -277,8 +339,8 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
           const capped =
             fresh.size > MAX_CACHED_INVOCATIONS_PER_ACTIVITY ||
             previous.capped === true
+          setState("details", activityID, "items", sameRows(items))
           setState("details", activityID, {
-            items,
             more: capped ? false : hadOlderPages ? previous.more : page.more,
             before: hadOlderPages ? previous.before : page.before,
             capped,
@@ -287,10 +349,10 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
             error: undefined,
           })
         } catch (error) {
-          if (!disposed && detailRecency.includes(activityID)) {
-            setState("details", activityID, "loading", false)
-            setState("details", activityID, "error", messageOf(error))
-          }
+          if (disposed || !detailRecency.includes(activityID)) return
+          if (background && state.details[activityID]?.loaded) return
+          setState("details", activityID, "loading", false)
+          setState("details", activityID, "error", messageOf(error))
         }
       })().finally(() => {
         detailRefreshes.delete(activityID)
@@ -311,6 +373,81 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       const detail = state.details[activityID]
       if (detail?.loaded || detail?.loading) return
       void refreshInvocations(activityID)
+    }
+
+    // ── Live refresh ───────────────────────────────────────────────────────
+    //
+    // One shared timer for every mounted OXP surface, ref-counted per activity,
+    // so two windows onto the same transcript cost one poll. It runs only while
+    // a surface is actually watching and the document is visible: a backgrounded
+    // window must not keep a 2s round trip alive, and there is nothing to repaint
+    // while it is occluded.
+    const watched = new Map<string, number>()
+    let watchers = 0
+    let liveTimer: number | undefined
+    let liveVisibility: (() => void) | undefined
+    let summariesPolledAt = 0
+
+    const liveTick = () => {
+      if (disposed || !watchers) return
+      if (typeof document !== "undefined" && document.hidden) return
+      for (const activityID of watched.keys()) {
+        void refreshOne(activityID)
+        void refreshInvocations(activityID, { background: true })
+      }
+      const now = Date.now()
+      if (now - summariesPolledAt < LIVE_SUMMARY_INTERVAL_MS) return
+      summariesPolledAt = now
+      void refresh({ background: true })
+    }
+
+    const stopLive = () => {
+      if (liveTimer !== undefined) window.clearInterval(liveTimer)
+      liveTimer = undefined
+      liveVisibility?.()
+      liveVisibility = undefined
+    }
+
+    const startLive = () => {
+      if (liveTimer !== undefined || typeof window === "undefined") return
+      liveTimer = window.setInterval(liveTick, LIVE_INVOCATION_INTERVAL_MS)
+      if (typeof document === "undefined") return
+      // Returning to an occluded window should show current state immediately
+      // rather than after the next tick.
+      const onVisibility = () => {
+        if (document.hidden) return
+        liveTick()
+      }
+      document.addEventListener("visibilitychange", onVisibility)
+      liveVisibility = () => document.removeEventListener("visibilitychange", onVisibility)
+    }
+
+    /**
+     * Follow an activity while a surface is showing it.
+     *
+     * Pass no ID to follow only the activity list (the landing page waiting for
+     * a first conversation to appear). Returns the release function; callers are
+     * expected to hand it straight to `onCleanup`.
+     */
+    const watch = (activityID?: string) => {
+      watchers += 1
+      if (activityID) {
+        watched.set(activityID, (watched.get(activityID) ?? 0) + 1)
+        void refreshInvocations(activityID, { background: true })
+      }
+      startLive()
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        watchers = Math.max(0, watchers - 1)
+        if (activityID) {
+          const remaining = (watched.get(activityID) ?? 0) - 1
+          if (remaining > 0) watched.set(activityID, remaining)
+          else watched.delete(activityID)
+        }
+        if (watchers === 0) stopLive()
+      }
     }
 
     const ensureInvocationDetail = (invocationID: string) => {
@@ -375,8 +512,13 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
               right.id.localeCompare(left.id),
           )
         const capped = sorted.length > MAX_CACHED_INVOCATIONS_PER_ACTIVITY
+        setState(
+          "details",
+          activityID,
+          "items",
+          sameRows(sorted.slice(0, MAX_CACHED_INVOCATIONS_PER_ACTIVITY)),
+        )
         setState("details", activityID, {
-          items: sorted.slice(0, MAX_CACHED_INVOCATIONS_PER_ACTIVITY),
           more: capped ? false : page.more,
           before: page.before,
           capped,
@@ -465,6 +607,9 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
 
     onCleanup(() => {
       disposed = true
+      stopLive()
+      watched.clear()
+      watchers = 0
       summaryQueue.clear()
       detailQueue.clear()
       summaryDirty.clear()
@@ -501,6 +646,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       loadOlderActivities,
       ensureInvocations,
       ensureInvocationDetail,
+      watch,
       refresh,
       refreshOne,
       refreshInvocations,

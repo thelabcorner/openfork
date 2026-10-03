@@ -184,12 +184,28 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
       })
     })
 
+    // Dense surfaces (home rows, tabs, and the session sidebar) ask for group
+    // membership many times per render. Keep the materialized navigation
+    // projection indexed once when authoritative group details change instead
+    // of rescanning every group's member list for each row.
+    const bySession = createMemo(() => {
+      const index = new Map<string, SessionGroupEntry>()
+      for (const group of list()) {
+        for (const sessionID of group.sessionIds) {
+          // Preserve list().find() semantics if legacy data places a session
+          // in more than one group: the first group remains authoritative here.
+          if (!index.has(sessionID)) index.set(sessionID, group)
+        }
+      }
+      return index
+    })
+
     const byID = (groupId: string): SessionGroupEntry | undefined => {
       return list().find((g) => g.id === groupId)
     }
 
     const groupForSession = (sessionId: string): SessionGroupEntry | undefined => {
-      return list().find((g) => g.sessionIds.includes(sessionId))
+      return bySession().get(sessionId)
     }
 
     // `groupId` is accepted for call-site compatibility but no longer scopes

@@ -91,6 +91,9 @@ export type ForkCapacityPredictiveRange =
       status: "learning"
       effectiveSamples: number
       matureAt: number
+      // Additive: the sample budget this range is calibrating toward. Absent on
+      // servers that only publish maturity as a timestamp.
+      calibrationBudget?: 5 | 20 | 100
     }
   | {
       status: "calibrated"
@@ -107,7 +110,44 @@ export type ForkCapacityPredictiveRange =
       effectiveSamples: number
       matureAt: number
       reason: "incomplete-local-accounting"
+      // Additive, same reason as the learning variant.
+      calibrationBudget?: 5 | 20 | 100
     }
+
+/**
+ * Requests still available in ONE published quota window.
+ *
+ * Published only where the official snapshot really reported that window's
+ * consumption. An absent window or absent row means "unknown", never zero.
+ */
+export type ForkCapacityWindowRemaining = {
+  remainingPercent: number
+  /** Requests left; null when local accounting could not be normalized. */
+  remainingRequests: number | null
+  resetAt?: number
+  status: "ready" | "unavailable"
+}
+
+/**
+ * Full-window request capacity for one published quota window.
+ *
+ * A DIFFERENT quantity from `estimatedRequests` on the same estimate: that one is
+ * requests remaining in the current 5h window, this one is how many requests of
+ * the target's typical size the WHOLE window affords. There is deliberately no
+ * predictive range on these rows — the deployed range is a 5h
+ * remaining/stopping-time calibration and was never validated for window totals.
+ *
+ * Additive: absent on older servers, in which case the client presents the
+ * single 5-hour estimate alone rather than synthesizing a weekly total.
+ */
+export type ForkCapacityWindowCapacity = {
+  window: "5h" | "week" | "month"
+  /** Published full-window limit, in typical request-equivalents. */
+  baselineRequests: number
+  /** Full-window capacity under the server's workload posterior. */
+  pointRequests: number
+  remaining?: ForkCapacityWindowRemaining
+}
 
 export type ForkCapacityEstimate = {
   modelID: string
@@ -127,6 +167,9 @@ export type ForkCapacityEstimate = {
   // Additive for compatibility with older servers. New servers expose either a
   // calibrated mature-evidence range or an explicit learning/unavailable state.
   predictiveRange?: ForkCapacityPredictiveRange
+  // Additive full-window capacity per published window. Absent on older servers;
+  // consumers must fall back to `estimatedRequests` rather than inventing a week.
+  windowCapacity?: ForkCapacityWindowCapacity[]
   evidence: ForkCapacityEvidence
 }
 
@@ -136,6 +179,27 @@ export type ForkProviderCapacityEvidence = {
   observations: number
   requestEffectiveSamples: number
   sessionEffectiveSamples: number
+}
+
+/**
+ * One independent provider usage window in the generalized projection.
+ *
+ * `basis` decides what `estimatedRequests` means. Everything else here is a real
+ * provider fact or absent — never inferred by the client.
+ */
+export type ForkProviderCapacityWindow = {
+  /** Stable provider window key; joins to the provider's own usage windows. */
+  id: string
+  /** Short display label derived from a real window duration, else the id. */
+  label: string
+  basis: "observed-remaining" | "personalized-total-capacity"
+  status: "ready" | "learning" | "unavailable" | "unlimited"
+  source: string
+  personalized: boolean
+  /** REMAINDER on `observed-remaining`; window TOTAL on `personalized-total-capacity`. */
+  estimatedRequests: number | null
+  remainingPercent: number | null
+  resetAt: number | null
 }
 
 export type ForkProviderCapacityEstimate = {
@@ -159,6 +223,16 @@ export type ForkProviderCapacityEstimate = {
   personalized: boolean
   limitingWindow?: string
   reason?: string
+  /**
+   * Additive bounded per-window projection. Absent on older servers, and absent
+   * for providers that only meter one entitlement.
+   *
+   * `basis` is load-bearing, not decorative: on `observed-remaining`,
+   * `estimatedRequests` is a REMAINDER and must never be read as a total; on
+   * `personalized-total-capacity` it IS the window total. See
+   * `normalizeCapacityWindow` at the fork-usage boundary.
+   */
+  windows?: ForkProviderCapacityWindow[]
   evidence: ForkProviderCapacityEvidence
 }
 
@@ -178,6 +252,59 @@ export type ForkProviderCapacity = {
   }>
 }
 
+export type ForkGeneralUsageWorkload = {
+  inputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  contextTokens: number
+  generationTokens: number
+  totalTokens: number
+}
+
+export type ForkGeneralUsageModel = {
+  providerID: string
+  modelID: string
+  source: "personal-model"
+  personalized: true
+  workload: ForkGeneralUsageWorkload
+  evidence: {
+    observations: number
+    requestEffectiveSamples: number
+    sessionEffectiveSamples: number
+  }
+}
+
+export type ForkGeneralUsageSnapshot = {
+  source: "personal-general" | "standardized-workload-prior"
+  fingerprint: string
+  fallback: ForkGeneralUsageWorkload
+  typical: ForkGeneralUsageWorkload
+  corpus: ForkGeneralUsageWorkload[]
+  evidence: {
+    observations: number
+    requestEffectiveSamples: number
+    sessionEffectiveSamples: number
+  }
+  observedModelScopes: number
+  models: ForkGeneralUsageModel[]
+  observedRequestBand?: {
+    requests: number
+    lowerContextTokens: number
+    upperContextTokens: number
+    lowerGenerationTokens: number
+    upperGenerationTokens: number
+  }
+  observedScopeBand?: {
+    scopeCount: number
+    lowerContextTokens: number
+    upperContextTokens: number
+    lowerGenerationTokens: number
+    upperGenerationTokens: number
+  }
+}
+
 export type ForkCapacityResult = {
   providerID: "opencode-go"
   priorStatus: "ok" | "stale" | "error"
@@ -190,6 +317,8 @@ export type ForkCapacityResult = {
   }>
   /** Additive generalized provider projections; absent on older servers. */
   providers?: ForkProviderCapacity[]
+  /** Additive compact workload projection; absent on older servers. */
+  generalUsage?: ForkGeneralUsageSnapshot
 }
 
 function authHeader(server: ForkServer): Record<string, string> {
@@ -206,7 +335,13 @@ async function request<T>(server: ForkServer, path: string, init?: RequestInit):
       ...init?.headers,
     },
   })
-  if (!response.ok) throw new Error(`${init?.method ?? "GET"} ${path} failed: ${response.status}`)
+  if (!response.ok) {
+    const error = new Error(`${init?.method ?? "GET"} ${path} failed: ${response.status}`) as Error & {
+      status: number
+    }
+    error.status = response.status
+    throw error
+  }
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
@@ -237,5 +372,6 @@ export const ForkClient = {
       { method: "DELETE" },
     ),
   usage: (server: ForkServer) => request<ForkUsageResult>(server, "/fork/usage"),
+  generalUsage: (server: ForkServer) => request<ForkGeneralUsageSnapshot>(server, "/fork/general-usage"),
   capacity: (server: ForkServer) => request<ForkCapacityResult>(server, "/fork/capacity"),
 }

@@ -1,5 +1,5 @@
-import { createEffect, createResource, createRoot, onCleanup, type Resource } from "solid-js"
-import { useSDK } from "@/context/sdk"
+import { createEffect, createResource, createRoot, createSignal, onCleanup, type Accessor, type Resource } from "solid-js"
+import { useServerSDK, type ServerSDK } from "@/context/server-sdk"
 import { clearOpenRouterFreeUsageCache, getOpenRouterFreeUsage, type FreeUsageReport } from "@/utils/openrouter-free-usage"
 
 /**
@@ -22,11 +22,12 @@ const BREAKER_MS = 10 * 60_000
 
 let failures = 0
 let pausedUntil = 0
-let subscribers = 0
+const [activeSubscribers, setActiveSubscribers] = createSignal(0)
 let interval: ReturnType<typeof setInterval> | undefined
 let visibilityTimer: ReturnType<typeof setTimeout> | undefined
-// Set by the first subscriber so the singleton uses the unified directory client.
-let sdkClient: (() => any) | undefined
+// Account usage belongs to the server, independently of a selected directory.
+let sdkClient: Accessor<ServerSDK> | undefined
+let stopVisibility: (() => void) | undefined
 
 function networkFetch(): Promise<FreeUsageReport> {
   if (!sdkClient) return Promise.reject(new Error("no-sdk"))
@@ -62,7 +63,7 @@ let shared: ReturnType<typeof createResource<FreeUsageReport | undefined>> | und
 function getShared() {
   if (!shared) {
     shared = createRoot((dispose) => {
-      const resource = createResource(fetchShared)
+      const resource = createResource(() => activeSubscribers() > 0, fetchShared)
       onCleanup(dispose)
       return resource
     })
@@ -77,6 +78,23 @@ function startPolling(refetch: () => void) {
     if (Date.now() < pausedUntil) return
     void refetch()
   }, POLL_MS)
+  const onVisibility = () => {
+    if (visibilityTimer) clearTimeout(visibilityTimer)
+    visibilityTimer = undefined
+    if (document.hidden) return
+    visibilityTimer = setTimeout(() => {
+      visibilityTimer = undefined
+      if (activeSubscribers() > 0) void refetch()
+    }, 2_000)
+  }
+  document.addEventListener("visibilitychange", onVisibility)
+  window.addEventListener("focus", onVisibility)
+  stopVisibility = () => {
+    document.removeEventListener("visibilitychange", onVisibility)
+    window.removeEventListener("focus", onVisibility)
+    if (visibilityTimer) clearTimeout(visibilityTimer)
+    visibilityTimer = undefined
+  }
 }
 
 function stopPolling() {
@@ -84,46 +102,25 @@ function stopPolling() {
     clearInterval(interval)
     interval = undefined
   }
+  stopVisibility?.()
+  stopVisibility = undefined
 }
 
-export function useOpenRouterFreeUsage(_options?: { includeValue?: boolean; enabled?: boolean }) {
-  const sdk = useSDK()
-  if (!sdkClient) {
-    sdkClient = sdk
-    // The module-level resource fires its first fetch at import time, before
-    // any SDK context exists — kick an immediate refetch now that one does.
-    const [data, { refetch }] = getShared() as unknown as [Resource<FreeUsageReport | undefined>, { refetch: () => void }]
-    setTimeout(() => {
-      if (subscribers > 0 && data() === undefined && !data.loading && Date.now() >= pausedUntil) void refetch()
-    }, 0)
-  }
+export function useOpenRouterFreeUsage(options?: { includeValue?: boolean; enabled?: boolean | Accessor<boolean> }) {
+  const sdk = useServerSDK()
 
   const [data, { refetch }] = getShared() as unknown as [Resource<FreeUsageReport | undefined>, { refetch: () => void }]
 
-  subscribers += 1
-  startPolling(refetch)
-  onCleanup(() => {
-    subscribers -= 1
-    if (subscribers <= 0) stopPolling()
-  })
-
-  const onVisibility = () => {
-    if (visibilityTimer) clearTimeout(visibilityTimer)
-    if (document.hidden) return
-    visibilityTimer = setTimeout(() => {
-      if (subscribers > 0) void refetch()
-    }, 2_000)
-  }
-  document.addEventListener("visibilitychange", onVisibility)
-  window.addEventListener("focus", onVisibility)
-  onCleanup(() => {
-    document.removeEventListener("visibilitychange", onVisibility)
-    window.removeEventListener("focus", onVisibility)
-    if (visibilityTimer) clearTimeout(visibilityTimer)
-  })
-
   createEffect(() => {
-    void sdk()
+    const enabled = typeof options?.enabled === "function" ? options.enabled() : options?.enabled !== false
+    if (!enabled) return
+    sdkClient = sdk
+    setActiveSubscribers((count) => count + 1)
+    startPolling(refetch)
+    onCleanup(() => {
+      setActiveSubscribers((count) => Math.max(0, count - 1))
+      if (activeSubscribers() === 0) stopPolling()
+    })
   })
 
   const safeData = () => {
@@ -133,10 +130,10 @@ export function useOpenRouterFreeUsage(_options?: { includeValue?: boolean; enab
 
   return {
     data: safeData,
-    refetch,
+    refetch: () => activeSubscribers() > 0 ? refetch() : undefined,
     refresh: () => {
       clearOpenRouterFreeUsageCache()
-      void refetch()
+      if (activeSubscribers() > 0) void refetch()
     },
     loading: () => data.loading,
   }

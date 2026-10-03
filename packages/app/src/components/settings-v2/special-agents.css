@@ -1,0 +1,256 @@
+/* Special agents ---------------------------------------------------------- */
+
+.settings-v2-special-agents-header {
+  padding-bottom: 24px;
+}
+
+.settings-v2-special-agents-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-v2-special-agents-intro {
+  max-width: 700px;
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 20px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-special-agents {
+  gap: 28px;
+}
+
+.settings-v2-special-agents-hero {
+  overflow: hidden;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 12px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: var(--v2-elevation-raised);
+}
+
+.settings-v2-special-agents-hero-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 14px;
+  padding: 20px;
+}
+
+.settings-v2-special-agents-hero-mark,
+.settings-v2-special-agent-card-mark,
+.settings-v2-special-agents-topology-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0.5px solid var(--v2-border-border-muted);
+  background: var(--v2-background-bg-layer-02);
+  color: var(--v2-icon-icon-muted);
+}
+
+.settings-v2-special-agents-hero-mark {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  border-radius: 10px;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-special-agents-hero-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-v2-special-agents-hero-eyebrow,
+.settings-v2-special-agent-card-kicker {
+  font-size: 11px;
+  font-weight: 560;
+  line-height: 14px;
+  color: var(--v2-text-text-faint);
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+}
+
+.settings-v2-special-agents-hero-title {
+  font-size: 16px;
+  font-weight: 640;
+  line-height: 20px;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-special-agents-hero-copy p {
+  max-width: 680px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 440;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-special-agents-topology {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  border-top: 0.5px solid var(--v2-border-border-muted);
+  background: var(--v2-background-bg-base);
+}
+
+.settings-v2-special-agents-topology-node {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 12px;
+  border-inline-end: 0.5px solid var(--v2-border-border-muted);
+}
+
+.settings-v2-special-agents-topology-node:last-child {
+  border-inline-end: 0;
+}
+
+.settings-v2-special-agents-topology-icon {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  border-radius: 7px;
+}
+
+.settings-v2-special-agents-topology-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-v2-special-agents-topology-copy strong,
+.settings-v2-special-agents-topology-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-v2-special-agents-topology-copy strong {
+  font-size: 11px;
+  font-weight: 590;
+  line-height: 14px;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-special-agents-topology-copy span {
+  font-size: 10px;
+  font-weight: 440;
+  line-height: 13px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-special-agents-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.settings-v2-special-agent-card {
+  overflow: hidden;
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 10px;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: var(--v2-elevation-raised);
+}
+
+.settings-v2-special-agent-card-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px 14px;
+  border-bottom: 0.5px solid var(--v2-border-border-muted);
+  background: var(--v2-background-bg-base);
+}
+
+.settings-v2-special-agent-card-lead {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.settings-v2-special-agent-card-mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 8px;
+}
+
+.settings-v2-special-agent-card-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-v2-special-agent-card-copy h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 640;
+  line-height: 18px;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-special-agent-card-copy p {
+  max-width: 680px;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 440;
+  line-height: 18px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-special-agent-card > [data-component="settings-v2-list"] {
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+@media (max-width: 900px) {
+  .settings-v2-special-agents-topology {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-v2-special-agents-topology-node:nth-child(even) {
+    border-inline-end: 0;
+  }
+
+  .settings-v2-special-agents-topology-node {
+    border-bottom: 0.5px solid var(--v2-border-border-muted);
+  }
+
+  .settings-v2-special-agents-topology-node:last-child {
+    grid-column: 1 / -1;
+    border-bottom: 0;
+  }
+}
+
+@media (max-width: 639px) {
+  .settings-v2-special-agents-topology {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-v2-special-agents-topology-node,
+  .settings-v2-special-agents-topology-node:nth-child(even) {
+    grid-column: auto;
+    border-inline-end: 0;
+    border-bottom: 0.5px solid var(--v2-border-border-muted);
+  }
+
+  .settings-v2-special-agents-topology-node:last-child {
+    border-bottom: 0;
+  }
+
+  .settings-v2-special-agent-card-header {
+    flex-direction: column;
+  }
+}

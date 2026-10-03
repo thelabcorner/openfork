@@ -1,4 +1,5 @@
 import type {
+  AgentConfig,
   Config,
   OpencodeClient,
   Path,
@@ -13,7 +14,7 @@ import { type Accessor, batch, createMemo, createSignal, getOwner, onCleanup, on
 import { createStore, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
-import { ServerSDK } from "./server-sdk"
+import { ServerSDK, type ServerEvent } from "./server-sdk"
 import {
   bootstrapDirectory,
   bootstrapGlobal,
@@ -28,6 +29,9 @@ import {
 } from "./global-sync/bootstrap"
 import { createChildStoreManager } from "./global-sync/child-store"
 import { applyDirectoryEvent, applyGlobalEvent } from "./global-sync/event-reducer"
+import { reconcilePendingBySession } from "./global-sync/pending-response-snapshot"
+import { createPendingResponseRepairOwner } from "./global-sync/pending-response-repair"
+import { createProviderCatalogRefresh, providerCatalogQueryMatches, providerCatalogRevision } from "./global-sync/provider-catalog-events"
 import {
   estimateRootSessionTotal,
   loadRootSessions,
@@ -38,7 +42,8 @@ import {
 import { trimSessions } from "./global-sync/session-trim"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
-import { formatServerError, isCancelledRequestError } from "@/utils/server-errors"
+import { formatServerError, isCancelledRequestError, sessionNotFoundError } from "@/utils/server-errors"
+import { normalizeSessionInfo } from "@/utils/session"
 import { safeQueryData } from "@/utils/safe-query-data"
 import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/solid-query"
 import type { SolidQueryOptions } from "@tanstack/solid-query"
@@ -71,9 +76,11 @@ import type {
 } from "@opencode-ai/client/promise"
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
+import { applySessionActivityRepair, shouldApplyTelemetrySnapshot } from "./session-activity-repair"
 import { perf } from "./perf"
 import { phaseTrace } from "./phase-trace"
 import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
+import { sessionTelemetryClientNow } from "@/utils/session-telemetry-time"
 import type { Info as SessionTelemetryInfo } from "@opencode-ai/schema/session-telemetry"
 
 type GlobalStore = {
@@ -148,6 +155,20 @@ const isNativeStreamDelta = (type: string | undefined) =>
 
 type SessionActiveApi = {
   readonly active: () => Promise<SessionActiveOutput>
+}
+
+export function telemetryStatusTransition(input: {
+  previous: SessionTelemetryInfo["phase"] | undefined
+  next: SessionTelemetryInfo["phase"]
+  statusWorking: boolean
+  paused: boolean
+}): "busy" | "idle" | undefined {
+  const wasActive = input.previous !== undefined && input.previous !== "idle"
+  const isActive = input.next !== "idle"
+  if (isActive) return !input.statusWorking && !input.paused ? "busy" : undefined
+  // An initial settled/idle snapshot must not erase a real pre-provider busy
+  // status. Only a live -> idle telemetry edge owns status reconciliation.
+  return wasActive ? "idle" : undefined
 }
 
 export const loadMcpQuery = (
@@ -247,14 +268,18 @@ export const loadLspQuery = (
 export const loadActiveSessionsQuery = (
   scope: ServerScope,
   api: SessionActiveApi,
+  session: Pick<ServerSession, "data" | "set">,
   requests?: ServerRequestScheduler,
 ): ApiQueryOptions<SessionActiveOutput, readonly [ServerScope, "activeSessions"]> =>
   queryOptions<SessionActiveOutput, Error, SessionActiveOutput, readonly [ServerScope, "activeSessions"]>({
     queryKey: [scope, "activeSessions"] as const,
-    queryFn: () =>
-      requests
-        ? requests.schedule("interactive", () => api.active(), { kind: "session-active" })
-        : api.active(),
+    queryFn: async () => {
+      const active = requests
+        ? await requests.schedule("interactive", () => api.active(), { kind: "session-active" })
+        : await api.active()
+      seedActiveSessionStatuses(session, active)
+      return active
+    },
     enabled: true,
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: Number.POSITIVE_INFINITY,
@@ -271,28 +296,6 @@ export function seedActiveSessionStatuses(
     if (session.data.session_status[sessionID] !== undefined) continue
     const status = normalizeActiveSessionStatus(active[sessionID])
     if (status) session.set("session_status", sessionID, status)
-  }
-}
-
-export function createActiveSessionInfoWarmup(resolve: (sessionID: string) => Promise<unknown>) {
-  const pending = new Set<string>()
-  let tail = Promise.resolve()
-  return {
-    push(sessionIDs: Iterable<string>) {
-      for (const sessionID of sessionIDs) {
-        if (!sessionID || pending.has(sessionID)) continue
-        pending.add(sessionID)
-        tail = tail
-          .then(() => resolve(sessionID))
-          .catch(() => undefined)
-          .finally(() => pending.delete(sessionID))
-          .then(() => undefined)
-      }
-      return tail
-    },
-    pending() {
-      return pending.size
-    },
   }
 }
 
@@ -391,6 +394,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const booting = new Map<string, Promise<void>>()
   const sessionLoads = new Map<string, Promise<void>>()
   const sessionMeta = new Map<string, { limit: number; projectID?: string }>()
+  const staleSessionLists = new Map<string, number>()
   const sessionProjectScope = new Map<string, string>()
   const directoryBootstrapGate = createDirectoryBootstrapGate()
 
@@ -409,11 +413,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const session = createServerSession(serverSDK.client, serverSDK.api.session, serverSDK.api.message, {
     protocol: serverSDK.protocol,
     requests: serverSDK.requests,
+    getSessionInfo: async (sessionID) => {
+      try {
+        const result = await serverSDK.client.global.sessionGet({ sessionID })
+        if (!result.data) throw sessionNotFoundError(sessionID)
+        return normalizeSessionInfo(result.data)
+      } catch (error) {
+        // Session info is Tier 1 metadata. Keep it on the global, bootstrap-free
+        // route whenever supported; old sidecars may only expose the
+        // instance-scoped compatibility route.
+        if (!rootSessionFastPathUnavailable(error)) throw error
+        return serverSDK.api.session.get({ sessionID }).then(normalizeSessionInfo)
+      }
+    },
     onStreamInterestChanged: serverSDK.event.setStreamContentSessions,
   })
-  const activeSessionInfoWarmup = createActiveSessionInfoWarmup((sessionID) =>
-    session.resolve(sessionID, { priority: "background" }),
-  )
   // Push the foreground-content gate up to the SSE reader. The session store is
   // still the authority: rejecting a cached background delta marks that session
   // stale so resume()/sync() repairs exactly what was skipped.
@@ -444,14 +458,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     ],
   }))
   const activeSessionsQuery = useQuery(() =>
-    loadActiveSessionsQuery(serverSDK.scope, {
-      active: async () => {
-        const active = await serverSDK.api.session.active()
-        seedActiveSessionStatuses(session, active)
-        void activeSessionInfoWarmup.push(Object.keys(active))
-        return active
-      },
-    }, serverSDK.requests),
+    loadActiveSessionsQuery(
+      serverSDK.scope,
+      { active: () => serverSDK.api.session.active() },
+      session,
+      serverSDK.requests,
+    ),
   )
 
   const [globalStore, setGlobalStore] = createStore<GlobalStore>({
@@ -490,11 +502,25 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   // sidebars should own one telemetry transport and expose O(1) lookups.
   const telemetryKnown = new Set<string>()
   const telemetryPending = new Set<string>()
+  // Local monotonic receipt anchors are deliberately kept out of the wire
+  // contract/store. They let consumers continue producer-measured durations
+  // without ever mixing the producer wall clock with the renderer wall clock.
+  const telemetryReceivedAt = new Map<string, number>()
   let telemetryFlushTimer: ReturnType<typeof setTimeout> | undefined
   let telemetryUnsupported = false
+  // Bumps only at an explicit transport repair barrier. Snapshot requests
+  // capture this generation so an HTTP response issued before a dropped-event
+  // repair can never resurrect stale live telemetry afterward.
+  let telemetrySnapshotGeneration = 0
+  let activityRepairChanged: Set<string> | undefined
+  let activityRepairRunning = false
+  let activityRepairQueued = false
+  let activityRepairDisposed = false
 
   type SessionTelemetryWire = Omit<SessionTelemetryInfo, "sessionID"> & { sessionID: string }
-  const applyTelemetry = (items: Iterable<SessionTelemetryWire>) => {
+  type TelemetryApplySource = "event" | "snapshot" | "repair"
+  const applyTelemetry = (items: Iterable<SessionTelemetryWire>, source: TelemetryApplySource = "event") => {
+    const receivedAt = sessionTelemetryClientNow()
     batch(() => {
       for (const wire of items) {
         // SessionID's runtime schema only enforces the stable "ses" prefix.
@@ -503,7 +529,32 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         if (!wire.sessionID.startsWith("ses")) continue
         const sessionID = wire.sessionID as SessionTelemetryInfo["sessionID"]
         const item: SessionTelemetryInfo = { ...wire, sessionID }
+        const previous = globalStore.telemetry[wire.sessionID]
+        // A cold snapshot can race a newer SSE event. Event order is already
+        // authoritative, so only snapshot reads need a timestamp freshness
+        // guard. Explicit repair snapshots bypass it because they intentionally
+        // replace state from the pre-repair transport generation.
+        if (source === "snapshot" && !shouldApplyTelemetrySnapshot(previous, item)) {
+          telemetryKnown.add(wire.sessionID)
+          continue
+        }
+        const transition =
+          source === "repair"
+            ? undefined
+            : telemetryStatusTransition({
+                previous: previous?.phase,
+                next: item.phase,
+                statusWorking: session.data.session_working(wire.sessionID),
+                paused: session.data.session_paused(wire.sessionID),
+              })
+        if (transition) {
+          session.apply({
+            type: "session.status",
+            properties: { sessionID: wire.sessionID, status: { type: transition } },
+          })
+        }
         telemetryKnown.add(wire.sessionID)
+        telemetryReceivedAt.set(wire.sessionID, receivedAt)
         setGlobalStore("telemetry", wire.sessionID, reconcile(item))
       }
     })
@@ -512,7 +563,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const flushTelemetry = async () => {
     telemetryFlushTimer = undefined
     if (telemetryUnsupported || telemetryPending.size === 0) return
+    const generation = telemetrySnapshotGeneration
     const ids = Array.from(telemetryPending)
+    let superseded = false
     telemetryPending.clear()
     for (let offset = 0; offset < ids.length; offset += 500) {
       const sessions = ids.slice(offset, offset + 500)
@@ -526,7 +579,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
           { key: `session-telemetry:${sessions.join(",")}`, kind: "session-telemetry" },
         )
         const data = response.data ?? {}
-        applyTelemetry(Object.values(data))
+        if (generation !== telemetrySnapshotGeneration) {
+          for (const id of sessions) if (!telemetryKnown.has(id)) telemetryPending.add(id)
+          superseded = true
+          continue
+        }
+        applyTelemetry(Object.values(data), "snapshot")
         // Missing rows are still a completed lookup (new/never-run sessions).
         for (const id of sessions) telemetryKnown.add(id)
       } catch (error) {
@@ -542,6 +600,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         for (const id of sessions) telemetryPending.add(id)
       }
     }
+    if (superseded && telemetryPending.size > 0 && telemetryFlushTimer === undefined) {
+      telemetryFlushTimer = setTimeout(() => void flushTelemetry(), 0)
+    }
   }
 
   const ensureTelemetry = (sessionIDs: Iterable<string>) => {
@@ -556,13 +617,63 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     telemetryFlushTimer = setTimeout(() => void flushTelemetry(), 0)
   }
   onCleanup(() => {
+    activityRepairDisposed = true
     if (telemetryFlushTimer !== undefined) clearTimeout(telemetryFlushTimer)
     telemetryPending.clear()
+    telemetryReceivedAt.clear()
   })
   const refreshProviders = () =>
     queryClient.refetchQueries({
       predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
     })
+
+  const repairPendingResponses = async (directory: string) => {
+    const key = directoryKey(directory)
+    const child = children.children[key]
+    if (!key || !child || !children.active(key)) return
+    const sdk = serverSDK.createClient({ directory, throwOnError: true })
+    const [permission, question] = await Promise.all([
+      serverSDK.requests.schedule("critical", () => sdk.permission.list(), {
+        key: `pending-response-repair:permission:${key}`,
+        kind: "permission-list",
+      }),
+      serverSDK.requests.schedule("critical", () => sdk.question.list(), {
+        key: `pending-response-repair:question:${key}`,
+        kind: "question-list",
+      }),
+    ])
+    const permissions = permission.data ?? []
+    const questions = question.data ?? []
+    const [store, setStore] = child
+    batch(() => {
+      const groupedPermission = reconcilePendingBySession(store.permission, permissions)
+      const groupedQuestion = reconcilePendingBySession(store.question, questions)
+      setStore("permission", groupedPermission)
+      setStore("question", groupedQuestion)
+      for (const sessionID of Object.keys(session.data.permission)) {
+        if (session.get(sessionID)?.directory === directory)
+          session.set("permission", sessionID, groupedPermission[sessionID] ?? [])
+      }
+      for (const sessionID of Object.keys(session.data.question)) {
+        if (session.get(sessionID)?.directory === directory)
+          session.set("question", sessionID, groupedQuestion[sessionID] ?? [])
+      }
+      for (const [sessionID, items] of Object.entries(groupedPermission)) session.set("permission", sessionID, items)
+      for (const [sessionID, items] of Object.entries(groupedQuestion)) session.set("question", sessionID, items)
+    })
+  }
+  const pendingResponseRepair = createPendingResponseRepairOwner({
+    directories: () => Object.keys(children.children),
+    active: (directory) => children.active(directory),
+    repair: repairPendingResponses,
+  })
+  onCleanup(pendingResponseRepair.dispose)
+
+  // Query objects leave this weak map when the query cache evicts them. The
+  // event channel owns one invalidation per catalog revision, not per model.
+  const refreshProviderCatalogRevision = createProviderCatalogRefresh()
+  let providerCatalogDisposed = false
+  onCleanup(() => { providerCatalogDisposed = true })
 
   let bootedAt = 0
   let bootingRoot = false
@@ -580,6 +691,123 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
           ? (props as Record<string, unknown>).sessionID
           : undefined
     return typeof candidate === "string" ? candidate : undefined
+  }
+
+  const markActivityRepairEvent = (event: ServerEvent, eventType: string) => {
+    const changed = activityRepairChanged
+    if (!changed) return
+    if (eventType === "session.telemetry.updated") {
+      const items = (event.properties as { items?: SessionTelemetryInfo[] } | undefined)?.items ?? []
+      for (const item of items) if (item.sessionID) changed.add(item.sessionID)
+      return
+    }
+    // Raw content deltas cannot change the working/paused authority and are the
+    // hottest path in the app. Never add repair bookkeeping to that fan-out.
+    if (isNativeStreamDelta(event.current?.type)) return
+    const sessionID = sessionOf(event.current) ?? sessionOf(event)
+    if (sessionID) changed.add(sessionID)
+  }
+
+  const runActivityRepair = async (changed: ReadonlySet<string>, generation: number) => {
+    let active: SessionActiveOutput
+    try {
+      active = await serverSDK.requests.schedule(
+        "critical",
+        () => serverSDK.api.session.active(),
+        { key: "session-activity-repair:active", kind: "session-activity-repair" },
+      )
+    } catch {
+      return
+    }
+    if (activityRepairDisposed || generation !== telemetrySnapshotGeneration) return
+
+    const candidates = new Set<string>([
+      ...Object.entries(globalStore.telemetry)
+        .filter(([, value]) => value !== undefined && value.phase !== "idle")
+        .map(([sessionID]) => sessionID),
+      ...Object.keys(session.data.session_status),
+      ...Object.entries(session.data.paused)
+        .filter(([, paused]) => paused)
+        .map(([sessionID]) => sessionID),
+      ...Object.keys(active),
+    ])
+    const ids = Array.from(candidates)
+    const telemetryData: Record<string, SessionTelemetryWire | undefined> = {}
+    let telemetryRead = !telemetryUnsupported
+
+    if (telemetryRead && ids.length > 0) {
+      try {
+        for (let offset = 0; offset < ids.length; offset += 500) {
+          const sessions = ids.slice(offset, offset + 500)
+          const response = await serverSDK.requests.schedule(
+            "interactive",
+            () =>
+              serverSDK.client.global.sessionTelemetry({
+                globalSessionTelemetryInput: { sessions },
+              }),
+            { key: `session-activity-repair:telemetry:${offset}`, kind: "session-activity-repair" },
+          )
+          Object.assign(telemetryData, response.data ?? {})
+        }
+      } catch (error) {
+        const status = Number(
+          (error as { status?: unknown })?.status ??
+            (error as { response?: { status?: unknown } })?.response?.status ??
+            (error as { cause?: { status?: unknown } })?.cause?.status,
+        )
+        if (status === 404 || status === 405) telemetryUnsupported = true
+        telemetryRead = false
+      }
+    }
+
+    if (activityRepairDisposed || generation !== telemetrySnapshotGeneration) return
+    queryClient.setQueryData([serverSDK.scope, "activeSessions"], active)
+    batch(() => {
+      if (telemetryRead) {
+        const items: SessionTelemetryWire[] = []
+        for (const sessionID of ids) {
+          if (changed.has(sessionID)) continue
+          telemetryPending.delete(sessionID)
+          telemetryKnown.add(sessionID)
+          const item = telemetryData[sessionID]
+          if (item) {
+            items.push(item)
+            continue
+          }
+          // Missing means this process has no live/durable telemetry for the
+          // session. At a repair barrier that is meaningful: discard any
+          // pre-repair client clock rather than letting it tick indefinitely.
+          telemetryReceivedAt.delete(sessionID)
+          setGlobalStore("telemetry", sessionID, undefined)
+        }
+        applyTelemetry(items, "repair")
+      }
+      applySessionActivityRepair(session, active, candidates, changed)
+    })
+  }
+
+  const scheduleActivityRepair = () => {
+    // Invalidate every ordinary telemetry snapshot already in flight before
+    // scheduling the authoritative repair pass.
+    telemetrySnapshotGeneration += 1
+    activityRepairQueued = true
+    if (activityRepairRunning || activityRepairDisposed) return
+    activityRepairRunning = true
+    void (async () => {
+      try {
+        while (activityRepairQueued && !activityRepairDisposed) {
+          activityRepairQueued = false
+          const generation = telemetrySnapshotGeneration
+          const changed = new Set<string>()
+          activityRepairChanged = changed
+          await runActivityRepair(changed, generation)
+          if (activityRepairChanged === changed) activityRepairChanged = undefined
+        }
+      } finally {
+        activityRepairChanged = undefined
+        activityRepairRunning = false
+      }
+    })()
   }
 
   const time = (name: "applyV2" | "apply" | "dir" | "home" | "invalid", fn: () => void, sessionID?: string) => {
@@ -709,6 +937,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       const key = directoryKey(directory)
       queue.clear(key)
       sessionMeta.delete(key)
+      staleSessionLists.delete(key)
       sdkCache.delete(key)
       clearProviderRev(serverSDK.scope, key)
     },
@@ -724,6 +953,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     options?: { limit?: number; shrinkTo?: number; priority?: ServerRequestPriority; projectID?: string },
   ) {
     const key = directoryKey(directory)
+    const staleGeneration = staleSessionLists.get(key)
     const priority = options?.priority ?? "interactive"
     // Scope is part of the cache contract. A directory-only root snapshot and
     // a project-wide root snapshot may share the same canonical child store,
@@ -780,7 +1010,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     }
     const meta = sessionMeta.get(key)
     const retainedLimit = Math.max(store.limit, options?.limit ?? 0, meta?.limit ?? 0)
-    if (meta && meta.projectID === projectID && meta.limit >= retainedLimit) {
+    if (staleGeneration === undefined && meta && meta.projectID === projectID && meta.limit >= retainedLimit) {
       const next = trimSessions(store.session, {
         limit: retainedLimit,
         permission: session.data.permission,
@@ -843,6 +1073,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
                 setStore("session", reconcile(next, { key: "id" }))
               })
               sessionMeta.set(key, { limit, projectID })
+              if (staleGeneration !== undefined && staleSessionLists.get(key) === staleGeneration) {
+                staleSessionLists.delete(key)
+              }
             })
             .catch((err) => {
               if (isCancelledRequestError(err)) return
@@ -889,6 +1122,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
           provider: globalStore.provider,
         },
         sdk,
+        serverSDK: serverSDK.client,
         api: serverSDK.api,
         store: child[0],
         setStore: child[1],
@@ -999,15 +1233,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const directory = e.name
     const event = e.details
     const eventType: string = event.type
+    if (eventType === "server.pending-response-state-invalidated") {
+      pendingResponseRepair.invalidate(directory, (event.properties as { all?: boolean } | undefined)?.all === true)
+      return
+    }
     const connectedRepair =
       eventType === "server.connected" &&
       !!(event.properties as { repair?: boolean } | undefined)?.repair
     const recent = bootingRoot || Date.now() - bootedAt < 1500
     const nativeMove = event.current?.type === "session.next.moved" ? event.current : undefined
+    const nativeRename = event.current?.type === "session.next.renamed" ? event.current : undefined
     // Capture before applyV2: the server-scoped cache can legitimately evict
     // cold metadata while a still-visible directory row remains materialized.
     const moveSource = nativeMove ? findLoadedSession(nativeMove.data.sessionID) : undefined
     perf.event()
+    markActivityRepairEvent(event, eventType)
 
     if (event.current) {
       const current = event.current
@@ -1031,6 +1271,29 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       if (info) reindexSession(info)
     }
 
+    // Native rename events carry only the changed title and timestamp. The
+    // detail cache reducer above can update a loaded Session, but the Home and
+    // directory indexes consume compatibility Session events. Project that
+    // compact producer event into the already-known metadata once here so all
+    // materialized consumers converge without a per-rename fetch.
+    let indexEvent: ServerEvent = event
+    let renamedInfo: Session | undefined
+    if (nativeRename) {
+      const previous = session.get(nativeRename.data.sessionID) ?? findLoadedSession(nativeRename.data.sessionID)
+      if (previous) {
+        renamedInfo = session.remember({
+          ...previous,
+          title: nativeRename.data.title,
+          time: { ...previous.time, updated: nativeRename.data.timestamp },
+        })
+        indexEvent = {
+          ...event,
+          type: "session.updated",
+          properties: { sessionID: renamedInfo.id, info: renamedInfo },
+        } as ServerEvent
+      }
+    }
+
     // Stream deltas have already been reduced into the shared session store.
     // They cannot affect directory metadata, home indexing, invalidation, or
     // any other legacy event path, so stop here after the one necessary V2
@@ -1038,14 +1301,38 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     // fan-out work across every directory store.
     if (isNativeStreamDelta(event.current?.type)) return
 
-    if (homeSessions.live()) {
-      if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
-        time("home", () => homeSessions.apply(event))
-      }
-      if (homeSessionIndexRefreshRelevant(event.type))
-        time("home", () => homeSessions.refresh(event.type, connectedRepair))
+    const homeSessionChanged =
+      indexEvent.type === "session.created" || indexEvent.type === "session.updated" || indexEvent.type === "session.deleted" || !!nativeRename
+    if (homeSessions.live() && homeSessionChanged) {
+      time("home", () => {
+        if (nativeRename && !renamedInfo) {
+          homeSessions.apply({
+            type: "session.renamed",
+            properties: {
+              sessionID: nativeRename.data.sessionID,
+              title: nativeRename.data.title,
+              updated: nativeRename.data.timestamp,
+            },
+          })
+          return
+        }
+        homeSessions.apply(indexEvent as Parameters<typeof homeSessions.apply>[0])
+      })
     }
+    if (homeSessionIndexRefreshRelevant(event.type) || homeSessionChanged)
+      time("home", () => homeSessions.refresh(homeSessionChanged ? "session.updated" : indexEvent.type, connectedRepair))
     if (eventType === "integration.connection.updated") void refreshProviders()
+    if (eventType === "provider.catalog.updated") {
+      const revision = providerCatalogRevision(event.properties)
+      if (revision) for (const query of queryClient.getQueryCache().findAll({
+        predicate: (query) => providerCatalogQueryMatches(query.queryKey, serverSDK.scope, revision.directory),
+      })) void refreshProviderCatalogRevision(query, revision.revision, {
+        pending: () => query.state.fetchStatus === "fetching" ? query.promise : undefined,
+        refresh: () => providerCatalogDisposed
+          ? Promise.resolve()
+          : queryClient.invalidateQueries({ queryKey: query.queryKey, exact: true }, { throwOnError: true }),
+      }).catch(() => {})
+    }
 
     const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
     const isGroupEvent =
@@ -1065,6 +1352,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     // JSDOC: Read `.data` only after confirming `!isPending`, else the
     // internal `createResource()` suspends and the route hangs.
     if (directory === "global") {
+      if (connectedRepair) scheduleActivityRepair()
       if (eventType === "session.telemetry.updated") {
         const items = (event.properties as { items?: SessionTelemetryInfo[] } | undefined)?.items ?? []
         applyTelemetry(items)
@@ -1088,10 +1376,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       )
         bootstrap.refetch()
       if (connectedRepair || eventType === "global.disposed") {
-        if (recent) return
         for (const directory of Object.keys(children.children)) {
-          if (!children.active(directory)) continue
-          queue.push(directory)
+          const key = directoryKey(directory)
+          staleSessionLists.set(key, (staleSessionLists.get(key) ?? 0) + 1)
+          if (!recent && children.active(directory)) queue.push(directory)
         }
       }
       return
@@ -1111,8 +1399,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         .catch(() => {})
 
     const rootInfo =
-      eventType === "session.created" || eventType === "session.updated" || eventType === "session.deleted"
-        ? (event.properties as { info?: Session } | undefined)?.info
+      indexEvent.type === "session.created" || indexEvent.type === "session.updated" || indexEvent.type === "session.deleted"
+        ? (indexEvent.properties as { info?: Session } | undefined)?.info
         : undefined
     const eventDirectories = rootInfo
       ? sessionEventIndexDirectories(rootInfo, directory, globalStore.project)
@@ -1145,7 +1433,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       const [store, setStore] = existing
       time("dir", () =>
         applyDirectoryEvent({
-          event,
+          event: indexEvent,
           directory: eventDirectory,
           store,
           setStore,
@@ -1214,14 +1502,66 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const updateConfigMutation = useMutation(() => ({
     mutationFn: (config: Config) => serverSDK.client.global.config.update({ config }),
-    onSuccess: () => {
+    onSuccess: (_data, config) => {
       bootstrap.refetch()
+      if (config.agent) {
+        void queryClient
+          .invalidateQueries({
+            predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "agents",
+          })
+          .then(() => {
+            for (const directory of Object.keys(children.children)) {
+              if (!children.active(directory)) continue
+              queue.push(directory)
+            }
+          })
+      }
       // Invalidate all provider queries so newly configured custom providers
       // appear immediately in the available provider list across all directories.
       queryClient.invalidateQueries({ queryKey: [serverSDK.scope, null, "providers"] })
       queryClient.invalidateQueries({
         predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
       })
+    },
+  }))
+
+  /**
+   * Exact per-agent global config mutation.
+   *
+   * `PUT /global/config/agent/:agentID` replaces one agent definition and
+   * `DELETE` removes it, both Tier-0 and bootstrap-free. The previous
+   * whole-config `config.update` shim could not express "delete this key":
+   * JSON has no `undefined`, so clearing nested fields required either a
+   * deep-merge that kept stale values or a whole-file rewrite from the client.
+   * `value: null` is the only honest delete signal, and the server owns the
+   * resulting file shape.
+   */
+  const updateAgentConfigMutation = useMutation(() => ({
+    mutationFn: (input: { id: string; value: AgentConfig | null }) =>
+      input.value === null
+        ? serverSDK.client.global.configAgentDelete({ agentID: input.id }, { throwOnError: true })
+        : serverSDK.client.global.configAgentSet(
+            { agentID: input.id, agentConfig: input.value },
+            { throwOnError: true },
+          ),
+    onSuccess: () => {
+      // The route disposes every workspace Instance (agent definitions are
+      // instance config), so the global config snapshot the Studio renders from
+      // and every active workspace's resolved `agent` catalog both have to be
+      // re-read. Invalidate first, then replay the directory bootstrap wave:
+      // `ensureQueryData` only refetches because the invalidation marked the
+      // per-directory `agents` query stale.
+      void bootstrap.refetch()
+      void queryClient
+        .invalidateQueries({
+          predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "agents",
+        })
+        .then(() => {
+          for (const directory of Object.keys(children.children)) {
+            if (!children.active(directory)) continue
+            queue.push(directory)
+          }
+        })
     },
   }))
 
@@ -1241,13 +1581,16 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     refreshProviders,
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
+    updateAgentConfig: updateAgentConfigMutation.mutateAsync,
     project: projectApi,
     providers: {
       ensure: ensureProviderCatalog,
+      ensureDirectory: children.enableProviderQueries,
     },
     telemetry: {
       ensure: ensureTelemetry,
       get: (sessionID: string) => globalStore.telemetry[sessionID],
+      receivedAt: (sessionID: string) => telemetryReceivedAt.get(sessionID),
       get unsupported() {
         return telemetryUnsupported
       },

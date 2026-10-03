@@ -16,6 +16,7 @@ import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
 import { useProviders } from "@/hooks/use-providers"
 import { pathKey } from "@/utils/path-key"
+import { agentStudioHref } from "@/pages/agents/agent-studio-model"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import {
   findChatProject,
@@ -31,6 +32,7 @@ export function createPromptInputController(input: {
   model?: ModelSelection
 }) {
   const layout = useLayout()
+  const navigate = useNavigate()
   const local = useLocal()
   const sdk = useSDK()
   const sync = useSync()
@@ -61,6 +63,9 @@ export function createPromptInputController(input: {
         loading: agentsQuery.isLoading,
         visible: local.agent.visible(),
         select: local.agent.set,
+        // The reusable prompt input only receives a `manage` callback; the app
+        // owns the navigation target so session-ui never learns about routes.
+        manage: () => navigate(agentStudioHref(local.agent.current()?.name, sdk().directory)),
       },
       model: {
         selection: input.model ?? local.model,

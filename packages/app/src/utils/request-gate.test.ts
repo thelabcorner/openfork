@@ -1,9 +1,8 @@
 import { expect, test } from "bun:test"
 import { createRequestGate } from "./request-gate"
-import { GROUP_PREVIEW_PAGE, TAB_PREVIEW_RESOLVE_CONCURRENCY } from "../components/titlebar-tab-popover"
 
-test("tab-preview global lane keeps 100 rapid hydration requests bounded", async () => {
-  const gate = createRequestGate(TAB_PREVIEW_RESOLVE_CONCURRENCY)
+test("request gate keeps 100 rapid requests bounded", async () => {
+  const gate = createRequestGate(4)
   let active = 0
   let maxActive = 0
   const tasks = Array.from({ length: 100 }, (_, index) =>
@@ -18,5 +17,4 @@ test("tab-preview global lane keeps 100 rapid hydration requests bounded", async
   const results = await Promise.all(tasks)
   expect(maxActive).toBe(4)
   expect(results).toHaveLength(100)
-  expect(GROUP_PREVIEW_PAGE).toBe(80)
 })

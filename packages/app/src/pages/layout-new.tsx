@@ -25,6 +25,34 @@ const LimitsPanel = lazy(() =>
 const DebugBar = lazy(() => import("@/components/debug-bar").then((m) => ({ default: m.DebugBar })))
 const TabsInfoPopup = lazy(() => import("@/components/help-button").then((m) => ({ default: m.TabsInfoPopup })))
 
+/**
+ * Primary desktop application shell.
+ *
+ * ## Raised route-pane geometry contract — DO NOT DRIFT
+ *
+ * Direct route children rendered inside this layout's `<main>` participate in
+ * a parent-owned flex column. A normal raised page surface must therefore use
+ * the established outer geometry:
+ *
+ * `m-2 min-h-0 min-w-0 flex-1 self-stretch overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict`
+ *
+ * Add `flex` / `flex-col` as the page needs internally, but do **not**
+ * hand-roll the outer sizing contract:
+ *
+ * - Do not replace `m-2` with `m-1` or another bespoke gutter. The margin is
+ *   part of the pane's effective height as well as its visual spacing; changing
+ *   it makes the route pane visibly taller/shorter than neighboring surfaces.
+ * - Do not add `h-full` or `w-full` to a direct route pane. This `<main>`
+ *   owns the available dimensions; a child that independently claims 100%
+ *   width/height double-counts the gutter and causes overflow/clipping.
+ * - Do not substitute bespoke outer borders/radii/elevation for the canonical
+ *   raised-pane shell. Put feature-specific framing *inside* the pane instead.
+ *
+ * Canonical examples include Agent Studio, Scheduled Tasks, Usage, and Home.
+ * If a new route genuinely needs different outer geometry, document why rather
+ * than silently copying a near-match. This has been a recurring source of UI
+ * drift, so future agents should treat the shell geometry as an invariant.
+ */
 export default function NewLayout(props: ParentProps) {
   const platform = usePlatform()
   const layout = useLayout()
@@ -79,9 +107,17 @@ export default function NewLayout(props: ParentProps) {
   // browser pane graph with it); the subscription is torn down via a
   // synchronous onCleanup because the async body runs outside any owner.
   createEffect(() => {
+    let disposed = false
     let disposeHostClient = () => {}
-    onCleanup(() => disposeHostClient())
+    onCleanup(() => {
+      disposed = true
+      disposeHostClient()
+    })
     void import("@/pages/session/v2/browser/browserHostClient").then(({ browserHostClient }) => {
+      // Dynamic imports cannot be cancelled. If the layout unmounts while the
+      // chunk is loading, do not initialize the browser host or attach global
+      // listeners after its owner has already gone away.
+      if (disposed) return
       void browserHostClient.init()
       const unsubscribeRequest = browserHostClient.onTabRequest(() => {
         if (layout.browser.opened()) return

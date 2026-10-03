@@ -1,5 +1,6 @@
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 import { useServerSync } from "@/context/server-sync"
+import { sessionTelemetryClientNow, sessionTelemetryElapsedMs } from "@/utils/session-telemetry-time"
 import {
   CHARS_PER_TOKEN,
   MIN_WINDOW_MS,
@@ -21,7 +22,7 @@ export const TICK_MS = 200
 // telemetry consumers in the selected composer. The old implementation created
 // this 200ms interval inside `createLiveGenerationRate`; exposing the same clock
 // lets the turn elapsed display reuse it rather than adding a second timer.
-const [telemetryNow, setTelemetryNow] = createSignal(Date.now(), { name: "liveTelemetryNow" })
+const [telemetryNow, setTelemetryNow] = createSignal(sessionTelemetryClientNow(), { name: "liveTelemetryNow" })
 let telemetryTimer: ReturnType<typeof setInterval> | undefined
 let telemetrySubscribers = 0
 
@@ -44,8 +45,8 @@ export function useLiveTelemetryNow(enabled: () => boolean) {
     }
     if (subscribed) return
     if (telemetrySubscribers === 0) {
-      setTelemetryNow(Date.now())
-      telemetryTimer = setInterval(() => setTelemetryNow(Date.now()), TICK_MS)
+      setTelemetryNow(sessionTelemetryClientNow())
+      telemetryTimer = setInterval(() => setTelemetryNow(sessionTelemetryClientNow()), TICK_MS)
     }
     telemetrySubscribers += 1
     subscribed = true
@@ -82,7 +83,13 @@ export function createLiveGenerationRate(args: { sessionID: () => string | undef
     if (telemetry.phase === "requesting" || telemetry.phase === "tool" || telemetry.phase === "retrying") return "paused"
     if (telemetry.phase !== "generating" && telemetry.phase !== "reasoning") return null
 
-    const liveMs = telemetry.phaseStartedAt === undefined ? 0 : Math.max(0, now() - telemetry.phaseStartedAt)
+    const liveMs = sessionTelemetryElapsedMs({
+      startedAt: telemetry.phaseStartedAt,
+      sampledAt: telemetry.sampledAt,
+      updatedAt: telemetry.updatedAt,
+      receivedAt: serverSync().telemetry.receivedAt(id),
+      now: now(),
+    })
     const elapsedMs = telemetry.step.generatedMs + liveMs
     if (elapsedMs < MIN_WINDOW_MS) return null
     const chars = telemetry.step.visibleChars + telemetry.step.reasoningChars

@@ -534,7 +534,6 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                     aria-label={language.t("command.session.new")}
                   />
                 </TooltipV2>
-                <div class="flex-1" />
                 <TitlebarV2Right state={v2RightState()} />
               </div>
             )

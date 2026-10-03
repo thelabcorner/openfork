@@ -43,7 +43,6 @@ import {
   parseWorkBuddyKey,
   aggregateWorkbuddyModels,
   workbuddyModelDisplayName,
-  verdentModelDisplayName,
   type TierGate,
   type UsageWindow,
   type WorkBuddyAccountLimits,
@@ -52,9 +51,8 @@ import {
 } from "@/utils/limits-format"
 import type { ForkCredentialInfo, ForkCredentialUsage, ForkWindowUsage } from "@/utils/fork-client"
 import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
-import { useVerdentFreeUsage } from "@/hooks/use-verdent-free-usage"
-import type { VerdentFreeReport } from "@/utils/verdent-free-usage"
 import { DrainMeter, ToneDot, type Tone } from "@/components/limits/limit-meter"
+import { reuseStableEntries } from "./limits-panel-entry-identity"
 
 /**
  * One continuous, column-aligned list — the same six-column rhythm (dot ·
@@ -85,12 +83,6 @@ function remainingOf(w: { remainingPercent: number | null; usedPercent: number |
  */
 function openRouterFreeResetAt(report: FreeUsageReport): number | null {
   const ms = new Date(report.free.window.resetsAt).getTime()
-  return Number.isFinite(ms) ? ms : null
-}
-
-// Verdent free — same pattern as OpenRouter free: window.resetsAt is ISO, tick via shared `now`.
-function verdentFreeResetAt(report: VerdentFreeReport): number | null {
-  const ms = new Date(report.window.resetsAt).getTime()
   return Number.isFinite(ms) ? ms : null
 }
 
@@ -665,265 +657,6 @@ function WorkBuddyBody(props: {
   )
 }
 
-/**
- * Verdent — multi-account free tier (400/5h, ~650/week) with per-model
- * entitlement windows. Mirrors WorkBuddy's aggregate + per-account shape:
- *  - Top `All accounts` aggregate (worst 5h/weekly across every enrolled
- *    account, plus the global `windows` windows)
- *  - Per-account collapsible: each account's own 5h/weekly (worst of its
- *    models) + its model rows, each with a stretch bar.
- */
-function VerdentBody(props: {
-  windows: [string, UsageWindow][]
-  verdentAccounts?: WorkBuddyAccountLimits[]
-  verdentFree?: VerdentFreeReport
-  now: number
-  accountsExpanded: boolean
-  onToggleAccountsExpanded: () => void
-}) {
-  const language = useLanguage()
-  const accounts = createMemo(() => props.verdentAccounts ?? [])
-  const gate = createMemo(() => resolveTierGate(props.windows))
-  const visibleModels = (account: WorkBuddyAccountLimits) =>
-    account.models.filter((model) => model.usedObserved > 0 || model.exhaustedObserved)
-
-  // Per-account worst 5h/weekly derived from that account's model reports.
-  // The global `props.windows` are the server's `verdentFreeProviderResult`
-  // estimate (global), not per-account, so use the account-local model
-  // reports (governor) for per-account headroom.
-  const accountWorst = (account: WorkBuddyAccountLimits): number | null => {
-    const vals = account.models
-      .map((m) => m.remainingPercent)
-      .filter((v): v is number => v !== null && Number.isFinite(v))
-    return vals.length ? Math.min(...vals) : null
-  }
-  const allAccountsWorst = createMemo(() => {
-    const vals = accounts()
-      .flatMap((a) => a.models.map((m) => m.remainingPercent))
-      .filter((v): v is number => v !== null && Number.isFinite(v))
-    if (vals.length) return Math.min(...vals)
-    const globalVals = props.windows.map(([, w]) => remainingOf(w)).filter((v): v is number => v !== null)
-    return globalVals.length ? Math.min(...globalVals) : null
-  })
-
-  return (
-    <>
-      {/* Aggregate — all accounts */}
-      <div class="flex flex-col divide-y divide-v2-border-border-muted/50 border-t border-v2-border-border-muted/50">
-        <Show
-          when={accounts().length > 1}
-          fallback={
-            <For each={props.windows}>
-              {([key, window], index) => {
-                const remaining = remainingOf(window)
-                const tone = toneForRemaining(remaining)
-                const state = tierGateState(key, remaining, gate())
-                const isLast = () => index() === props.windows.length - 1 && !props.verdentFree
-                return (
-                  <WindowRow
-                    now={props.now}
-                    guide={isLast() ? "leaf" : "branch"}
-                    label={displayWindowLabel(key, language.t)}
-                    tag={
-                      <Show when={state === "binding"}>
-                        <StatePill tone={tone}>{language.t("limits.gate.limiting")}</StatePill>
-                      </Show>
-                    }
-                    remaining={remaining}
-                    valueLabel={window.valueLabel}
-                    used={window.usedPercent}
-                    tone={tone}
-                    resetAt={window.resetAt}
-                    resetAfterSeconds={window.resetAfterSeconds}
-                    dim={state === "gated"}
-                  />
-                )
-              }}
-            </For>
-          }
-        >
-          <WindowRow
-            now={props.now}
-            guide={props.windows.length > 0 ? "branch" : "leaf"}
-            label={language.t("limits.verdent.aggregate")}
-            remaining={allAccountsWorst()}
-            tone={toneForRemaining(allAccountsWorst())}
-            resetAt={props.windows[0]?.[1]?.resetAt ?? null}
-            valueLabel={accounts().length > 0 ? `${accounts().length} ${language.t("limits.verdent.accounts")}` : null}
-          />
-          <For each={props.windows}>
-            {([key, window], index) => {
-              const remaining = remainingOf(window)
-              const tone = toneForRemaining(remaining)
-              const state = tierGateState(key, remaining, gate())
-              const isLast = () => index() === props.windows.length - 1 && !props.verdentFree
-              return (
-                <WindowRow
-                  now={props.now}
-                  guide={isLast() ? "leaf" : "branch"}
-                  depth={2}
-                  label={displayWindowLabel(key, language.t)}
-                  tag={
-                    <Show when={state === "binding"}>
-                      <StatePill tone={tone}>{language.t("limits.gate.limiting")}</StatePill>
-                    </Show>
-                  }
-                  remaining={remaining}
-                  valueLabel={window.valueLabel}
-                  used={window.usedPercent}
-                  tone={tone}
-                  resetAt={window.resetAt}
-                  resetAfterSeconds={window.resetAfterSeconds}
-                  dim={state === "gated"}
-                />
-              )
-            }}
-          </For>
-        </Show>
-        <Show when={props.verdentFree}>
-          {(free) => (
-            <WindowRow
-              now={props.now}
-              guide="leaf"
-              label={language.t("limits.verdent.free")}
-              remaining={Math.round(free().remainingPercent * 10) / 10}
-              used={free().usedPercent}
-              tone={toneForRemaining(free().remainingPercent)}
-              resetAt={verdentFreeResetAt(free())}
-            />
-          )}
-        </Show>
-      </div>
-
-      <Show when={accounts().length > 0}>
-        <div class="border-t border-v2-border-border-muted/50">
-          <button
-            type="button"
-            class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[9px] font-[600] uppercase leading-3 tracking-[0.04em] text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover"
-            aria-expanded={props.accountsExpanded}
-            onClick={props.onToggleAccountsExpanded}
-          >
-            <Icon
-              name="chevron-down"
-              size="small"
-              class="size-2.5 transition-transform"
-              classList={{ "-rotate-90": !props.accountsExpanded }}
-            />
-            {language.t("limits.verdent.perAccount")}
-            <span class="font-[440] normal-case tracking-normal">{accounts().length}</span>
-          </button>
-          <Show when={props.accountsExpanded}>
-            <For each={accounts()}>
-              {(account) => {
-                const models = visibleModels(account)
-                const worst = accountWorst(account)
-                const worstTone = toneForRemaining(worst)
-                const limiting = worst !== null && worst <= 0
-                // Per-account 5h/weekly derived from this account's models.
-                // WorkBuddy has explicit Basic/Gift/Extra windows per account;
-                // Verdent's free tier is 5h/weekly per account. Use the worst
-                // model headroom for each window as the account-level signal.
-                const hasModels = models.length > 0
-                return (
-                  <div class="flex flex-col">
-                    <WindowRow
-                      now={props.now}
-                      guide="branch"
-                      label={account.label}
-                      remaining={worst}
-                      tone={worstTone}
-                      resetAt={models[0]?.resetAt ?? null}
-                      tag={
-                        <Show when={limiting}>
-                          <StatePill tone="danger">{language.t("limits.gate.limiting")}</StatePill>
-                        </Show>
-                      }
-                    />
-                    <WindowRow
-                      now={props.now}
-                      guide={hasModels ? "branch" : "leaf"}
-                      depth={2}
-                      label={language.t("limits.window.5h.short")}
-                      remaining={worst}
-                      tone={worstTone}
-                      resetAt={models[0]?.resetAt ?? null}
-                    />
-                    <WindowRow
-                      now={props.now}
-                      guide={hasModels ? "branch" : "leaf"}
-                      depth={2}
-                      label={language.t("limits.window.weekly")}
-                      remaining={worst}
-                      tone={worstTone}
-                      resetAt={models[0]?.resetAt ?? null}
-                    />
-                    <For each={models}>
-                      {(model, index) => {
-                        const remaining = model.remainingPercent
-                        const modelTone = toneForRemaining(remaining)
-                        const isLimiting = model.exhaustedObserved || (remaining !== null && remaining <= 0)
-                        return (
-                          <WindowRow
-                            now={props.now}
-                            guide={index() === models.length - 1 ? "leaf" : "branch"}
-                            depth={2}
-                            label={verdentModelDisplayName(model.model)}
-                            tag={
-                              <Show when={isLimiting}>
-                                <StatePill tone="danger">{language.t("limits.gate.limiting")}</StatePill>
-                              </Show>
-                            }
-                            remaining={remaining}
-                            valueLabel={
-                              model.limitEstimate !== null
-                                ? language.t("limits.verdent.estimated", {
-                                    used: model.usedObserved,
-                                    limit: model.limitEstimate,
-                                    unit: model.unit,
-                                  })
-                                : language.t("limits.verdent.observed", {
-                                    used: model.usedObserved,
-                                    unit: model.unit,
-                                  })
-                            }
-                            used={remaining !== null ? 100 - remaining : null}
-                            tone={modelTone}
-                            resetAt={model.resetAt}
-                            resetAfterSeconds={model.secondsUntilReset}
-                          />
-                        )
-                      }}
-                    </For>
-                    <Show when={models.length === 0}>
-                      <WindowRow
-                        now={props.now}
-                        guide="leaf"
-                        depth={2}
-                        label={language.t("limits.verdent.noObservedUsage")}
-                        remaining={null}
-                        tone="muted"
-                        resetAt={null}
-                        noMeter
-                      />
-                    </Show>
-                  </div>
-                )
-              }}
-            </For>
-          </Show>
-        </div>
-      </Show>
-    </>
-  )
-}
-
-/**
- * OpenCode Zen per-key rows. The aggregate daily window row stays on top —
- * the same local free-tier estimate shown today. Each configured API key
- * (env or vault) renders underneath with its best-effort 402/429 state. With
- * a single key there is nothing new to show, so the section only renders for
- * more than one key and the card stays identical to the generic one.
- */
 function ZenBody(props: {
   windows: [string, UsageWindow][]
   zenKeys?: ZenKeyLimits[]
@@ -1055,11 +788,8 @@ function ProviderGroup(props: {
   provider: LimitProvider
   now: number
   openRouterFree?: FreeUsageReport
-  verdentFree?: VerdentFreeReport
   workbuddyAccountsExpanded: boolean
   onToggleWorkbuddyAccountsExpanded: () => void
-  verdentAccountsExpanded: boolean
-  onToggleVerdentAccountsExpanded: () => void
   zenKeysExpanded: boolean
   onToggleZenKeysExpanded: () => void
 }) {
@@ -1085,14 +815,12 @@ function ProviderGroup(props: {
   const hardError = createMemo(() => {
     const usage = result().usage as unknown as {
       workbuddyAccounts?: unknown[]
-      verdentAccounts?: unknown[]
       zenAccounts?: unknown[]
     } | null
     return (
       !result().ok &&
       windows().length === 0 &&
       !usage?.workbuddyAccounts?.length &&
-      !usage?.verdentAccounts?.length &&
       !usage?.zenAccounts?.length
     )
   })
@@ -1149,11 +877,10 @@ function ProviderGroup(props: {
       </Show>
 
       {/*
-        Same dispatch as nested `Show` fallbacks, just flat: workbuddy and
-        verdent have dedicated account drill-downs, Zen adds the per-key
-        failover queue, and every other provider takes the generic window
-        list. Conditions are mutually exclusive on providerId, so order is
-        only about which Match wins.
+        Same dispatch as nested `Show` fallbacks, just flat: WorkBuddy has an
+        account drill-down, Zen adds the per-key failover queue, and every
+        other provider takes the generic window list. Conditions are mutually
+        exclusive on providerId, so order is only about which Match wins.
       */}
       <Switch>
         <Match when={result().providerId === "workbuddy"}>
@@ -1163,16 +890,6 @@ function ProviderGroup(props: {
             now={props.now}
             accountsExpanded={props.workbuddyAccountsExpanded}
             onToggleAccountsExpanded={props.onToggleWorkbuddyAccountsExpanded}
-          />
-        </Match>
-        <Match when={result().providerId === "verdent"}>
-          <VerdentBody
-            windows={windows()}
-            verdentAccounts={result().usage?.verdentAccounts}
-            verdentFree={props.verdentFree}
-            now={props.now}
-            accountsExpanded={props.verdentAccountsExpanded}
-            onToggleAccountsExpanded={props.onToggleVerdentAccountsExpanded}
           />
         </Match>
         <Match when={result().providerId === "opencode-zen"}>
@@ -1191,7 +908,7 @@ function ProviderGroup(props: {
                 const remaining = remainingOf(w)
                 const rTone = toneForRemaining(remaining)
                 const state = tierGateState(key, remaining, gate())
-                const isLast = () => index() === windows().length - 1 && !props.openRouterFree && !props.verdentFree
+                const isLast = () => index() === windows().length - 1 && !props.openRouterFree
                 return (
                   <WindowRow
                     now={props.now}
@@ -1216,7 +933,7 @@ function ProviderGroup(props: {
             <Show when={!!props.openRouterFree}>
               <WindowRow
                 now={props.now}
-                guide={props.verdentFree ? "branch" : "leaf"}
+                guide="leaf"
                 label={language.t("openrouter.free.title")}
                 remaining={Math.round(props.openRouterFree!.free.remainingPercent * 10) / 10}
                 used={100 - props.openRouterFree!.free.remainingPercent}
@@ -1224,69 +941,9 @@ function ProviderGroup(props: {
                 resetAt={openRouterFreeResetAt(props.openRouterFree!)}
               />
             </Show>
-            {/* Verdent free — local daily estimator (providerId verdent, *-free models). */}
-            <Show when={!!props.verdentFree}>
-              <WindowRow
-                now={props.now}
-                guide="leaf"
-                label={language.t("limits.verdent.free")}
-                remaining={Math.round(props.verdentFree!.remainingPercent * 10) / 10}
-                used={props.verdentFree!.usedPercent}
-                tone={toneForRemaining(props.verdentFree!.remainingPercent)}
-                resetAt={verdentFreeResetAt(props.verdentFree!)}
-              />
-            </Show>
           </div>
         </Match>
       </Switch>
-    </div>
-  )
-}
-
-// Verdent free — standalone card when the provider has no server quota entry
-// (verdent is not in Quota.adapters). Mirrors the Zen card shape.
-function VerdentFreeGroup(props: { report: VerdentFreeReport; now: number }) {
-  const language = useLanguage()
-  const tone = () => toneForRemaining(props.report.remainingPercent)
-  const blocked = () => props.report.remainingPercent <= 0
-  return (
-    <div
-      data-limits-provider="verdent"
-      class="overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-base"
-    >
-      <div class={`grid ${GRID_COLS} items-center gap-2 bg-v2-background-bg-layer-01 px-2.5 py-2`}>
-        <ToneDot tone={tone()} pulse={blocked()} />
-        <div class="flex min-w-0 items-center gap-1.5">
-          <ProviderIcon id="verdent" class="size-3.5 shrink-0 opacity-85" />
-          <span class="min-w-0 truncate text-[11px] font-[650] leading-3 text-v2-text-text-base">
-            {language.t("limits.verdent.name")}
-          </span>
-          <span class="hidden shrink-0 truncate text-[8px] font-[560] uppercase leading-none tracking-[0.03em] text-v2-text-text-faint sm:inline">
-            {language.t("limits.verdent.requests", {
-              used: props.report.used,
-              limit: props.report.limit,
-            })}
-          </span>
-          <Show when={blocked()}>
-            <StatePill tone="danger">{language.t("limits.gate.limiting")}</StatePill>
-          </Show>
-        </div>
-        <span />
-        <span />
-        <span />
-        <span />
-      </div>
-      <div class="flex flex-col divide-y divide-v2-border-border-muted/50 border-t border-v2-border-border-muted/50">
-        <WindowRow
-          now={props.now}
-          guide="leaf"
-          label={language.t("limits.verdent.free")}
-          remaining={Math.round(props.report.remainingPercent * 10) / 10}
-          used={props.report.usedPercent}
-          tone={tone()}
-          resetAt={verdentFreeResetAt(props.report)}
-        />
-      </div>
     </div>
   )
 }
@@ -1446,7 +1103,6 @@ function stableOrderKey(id: string): number {
 type Entry =
   | { key: string; sort: number; kind: "provider"; provider: LimitProvider }
   | { key: string; sort: number; kind: "go" }
-  | { key: string; sort: number; kind: "verdent-free" }
 
 const LIMITS_INITIAL_ENTRIES = 8
 const LIMITS_PAGE_ENTRIES = 16
@@ -1467,17 +1123,13 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
     isCoolingDown,
     cooldownRemainingMs,
   } = useLimits({ now, active: props.active })
-  // Verdent free — client-side only (no server quota adapter). Count today's
-  // verdent/*-free assistant messages from synced history; see utils/verdent-free-usage.ts.
-  const verdentFreeHook = useVerdentFreeUsage({ now })
-
   const showGoAggregate = createMemo(() => goAggregate().length > 0 || goByCredential().length > 0)
 
   // Fixed order: OpenCode Zen (the only automatic/IP-based free quota) pinned
   // first so it's visible without scrolling, everything else ordered by a
   // deterministic hash of its id — NOT by live worst-remaining%, which used
   // to reshuffle the whole list on every usage tick (see `stableOrderKey`).
-  const entries = createMemo<Entry[]>(() => {
+  const entries = createMemo<Entry[]>((previous) => {
     const list = providers()
     if (!list) return []
     const items: Entry[] = list
@@ -1491,16 +1143,13 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
     if (showGoAggregate()) {
       items.push({ key: "go", sort: stableOrderKey("opencode-go"), kind: "go" as const })
     }
-    // Verdent free — synthetic entry when the provider has no server quota row.
-    // If a real `verdent` provider row appears later this becomes a no-op
-    // (the in-card WindowRow above handles that case instead).
-    const hasVerdentProvider = list.some((p) => p.result.providerId === "verdent")
-    const vf = verdentFreeHook.data()
-    if (vf && !hasVerdentProvider) {
-      items.push({ key: "p:verdent-free", sort: stableOrderKey("verdent"), kind: "verdent-free" as const })
-    }
-    return items.sort((a, b) => a.sort - b.sort)
-  })
+    const next = items.sort((a, b) => a.sort - b.sort)
+    return reuseStableEntries(previous, next, (left, right) => {
+      if (left.key !== right.key || left.kind !== right.kind) return false
+      if (left.kind === "provider" && right.kind === "provider") return left.provider.result === right.provider.result
+      return true
+    })
+  }, [])
   // A normal account has only a handful of providers, but stress/dev setups can
   // expose dozens. Mounting every provider card means hundreds of countdown,
   // meter, and label nodes all become subscribers to the 1s display clock.
@@ -1519,7 +1168,7 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
     const index = entries().findIndex((entry) => {
       if (entry.kind === "provider") return entry.provider.result.providerId === request.providerId
       if (entry.kind === "go") return request.providerId === "opencode-go"
-      return request.providerId === "verdent"
+      return false
     })
     if (index < 0 || index < entryLimit()) return
     setEntryLimit(Math.ceil((index + 1) / LIMITS_PAGE_ENTRIES) * LIMITS_PAGE_ENTRIES)
@@ -1568,12 +1217,6 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
     const free = openRouterFree()
     if (free) {
       accumulateBucket(acc["5h"], free.free.remainingPercent, 0.2, openRouterFreeResetAt(free))
-    }
-    // Verdent free — daily UTC window, contributes to weekly at 0.8 weight
-    // (mirrors WorkBuddy promo daily windows).
-    const vf2 = verdentFreeHook.data()
-    if (vf2) {
-      accumulateBucket(acc["weekly"], vf2.remainingPercent, 0.8, verdentFreeResetAt(vf2))
     }
     return acc
   })
@@ -1642,7 +1285,6 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
   // Lifted above the `<For each={entries()}>` list — see WorkBuddyBody's prop
   // doc for why local state inside a keyed-list child doesn't survive a poll.
   const [workbuddyAccountsExpanded, setWorkbuddyAccountsExpanded] = createSignal(false)
-  const [verdentAccountsExpanded, setVerdentAccountsExpanded] = createSignal(false)
   // Zen per-key queue is the whole point of the section — default it open.
   const [zenKeysExpanded, setZenKeysExpanded] = createSignal(true)
 
@@ -1770,10 +1412,6 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
                       />
                     )
                   }
-                  if (entry.kind === "verdent-free") {
-                    const vf3 = verdentFreeHook.data()
-                    return vf3 ? <VerdentFreeGroup report={vf3} now={now()} /> : null
-                  }
                   // entry.kind === "provider" here — narrow for TS
                   const provEntry = entry as Extract<Entry, { kind: "provider" }>
                   return (
@@ -1783,13 +1421,8 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
                       openRouterFree={
                         provEntry.provider.result.providerId === "openrouter" ? openRouterFree() : undefined
                       }
-                      verdentFree={
-                        provEntry.provider.result.providerId === "verdent" ? verdentFreeHook.data() : undefined
-                      }
                       workbuddyAccountsExpanded={workbuddyAccountsExpanded()}
                       onToggleWorkbuddyAccountsExpanded={() => setWorkbuddyAccountsExpanded((v) => !v)}
-                      verdentAccountsExpanded={verdentAccountsExpanded()}
-                      onToggleVerdentAccountsExpanded={() => setVerdentAccountsExpanded((v) => !v)}
                       zenKeysExpanded={zenKeysExpanded()}
                       onToggleZenKeysExpanded={() => setZenKeysExpanded((v) => !v)}
                     />

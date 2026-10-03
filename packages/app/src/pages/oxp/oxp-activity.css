@@ -22,6 +22,10 @@
   min-width: 0;
   flex: 1;
   align-self: stretch;
+  /* Same inset every other full-pane route uses (`m-2` on home/usage/scheduled),
+     so the raised surface floats off the shell instead of butting against the
+     titlebar and the neighbouring chat/browser panes. */
+  margin: 8px;
   overflow: hidden;
   border-radius: 10px;
   background: var(--v2-background-bg-base);
@@ -264,9 +268,14 @@
   padding: 6px calc(var(--oxp-gutter) - 2px) 24px;
 }
 
+/* The session timeline interleaves tool rows with prose, which supplies its own
+   rhythm. A transcript is tool rows all the way down, so each one buys 2px of
+   vertical air — a collapsed call lands at ~33px instead of 29px, dense but not
+   cramped, without changing the row anatomy the live timeline uses. */
 [data-slot="oxp-row"] {
   position: relative;
   min-width: 0;
+  padding-block: 2px;
   padding-left: 6px;
   border-left: 1px solid transparent;
 }
@@ -506,4 +515,60 @@
 [data-component="oxp-link-row"][aria-disabled="true"] {
   cursor: default;
   opacity: 0.6;
+}
+
+[data-slot="oxp-view-switch"] {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 1px;
+  min-height: 29px;
+  padding: 3px var(--oxp-gutter);
+  border-bottom: 1px solid var(--oxp-rule);
+  background: color-mix(
+    in oklab,
+    var(--v2-background-bg-layer-01) 55%,
+    var(--v2-background-bg-base)
+  );
+}
+
+[data-slot="oxp-view-switch"] button {
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 8px;
+  background: transparent;
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+  font-weight: 560;
+  line-height: 22px;
+}
+
+[data-slot="oxp-view-switch"] button:hover {
+  color: var(--v2-text-text-muted);
+  background: var(--v2-background-bg-layer-02);
+}
+
+[data-slot="oxp-view-switch"] button[data-active="true"] {
+  color: var(--v2-text-text-base);
+  background: var(--v2-background-bg-base);
+  box-shadow: var(--v2-elevation-switch-on);
+}
+
+@media (max-width: 640px) {
+  [data-component="oxp-activity"] {
+    --oxp-gutter: 10px;
+    margin: 4px;
+    border-radius: 8px;
+  }
+
+  [data-slot="oxp-view-switch"] {
+    min-height: 35px;
+  }
+
+  [data-slot="oxp-view-switch"] button {
+    min-width: 64px;
+    height: 28px;
+    line-height: 28px;
+  }
 }

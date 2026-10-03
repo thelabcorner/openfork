@@ -1,4 +1,4 @@
-import type { IntegrationMethod, IntegrationOauthConnectOutput } from "@opencode-ai/client/promise"
+import type { IntegrationOauthConnectOutput } from "@opencode-ai/client/promise"
 import { Button } from "@opencode-ai/ui/button"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { Dialog } from "@opencode-ai/ui/dialog"
@@ -36,12 +36,12 @@ import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
-import { useProviderSettings } from "@/hooks/use-provider-settings"
+import { type ProviderSettingsConnectMethod, useProviderSettings } from "@/hooks/use-provider-settings"
 import { CustomProviderForm } from "./dialog-custom-provider"
 import { decode64 } from "@/utils/base64"
 
 const CUSTOM_ID = "_custom"
-type ConnectMethod = Extract<IntegrationMethod, { type: "key" | "oauth" }>
+type ConnectMethod = ProviderSettingsConnectMethod
 
 const providerDisplayName = (id: string, fallback: string) => {
   if (id === "claude") return "Claude Subscription"
@@ -467,9 +467,9 @@ function ProviderConnection(props: {
         })
         .then((result) => result.data),
   )
-  const loading = createMemo(() => integration.loading)
+  const loading = createMemo(() => (directory() ? integration.loading : providerSettings.auth.loading()))
   const methods = createMemo<ConnectMethod[]>(() => {
-    if (!directory()) return fallback()
+    if (!directory()) return [...providerSettings.auth.methods(props.provider)]
     const values = integration.latest?.methods.filter(
       (method): method is ConnectMethod => method.type === "key" || method.type === "oauth",
     )
@@ -580,6 +580,40 @@ function ProviderConnection(props: {
     return fallback
   }
 
+  const missingOAuthLocation = () => Promise.reject(new Error(language.t("common.requestFailed")))
+
+  const oauthConnect = (method: Extract<ConnectMethod, { type: "oauth" }>, inputs: Record<string, string>) => {
+    const scopedLocation = location()
+    if (!scopedLocation) return missingOAuthLocation()
+    return serverSDK().api.integration.oauth.connect({
+      integrationID: props.provider,
+      methodID: method.id,
+      inputs,
+      location: scopedLocation,
+    })
+  }
+
+  const oauthComplete = (attemptID: string, code: string) => {
+    const scopedLocation = location()
+    if (!scopedLocation) return missingOAuthLocation()
+    return serverSDK().api.integration.oauth.complete({
+      integrationID: props.provider,
+      attemptID,
+      location: scopedLocation,
+      code,
+    })
+  }
+
+  const oauthStatus = (attemptID: string) => {
+    const scopedLocation = location()
+    if (!scopedLocation) return missingOAuthLocation()
+    return serverSDK().api.integration.oauth.status({
+      integrationID: props.provider,
+      attemptID,
+      location: scopedLocation,
+    })
+  }
+
   async function selectMethod(index: number, inputs?: Record<string, string>) {
     if (timer.current !== undefined) {
       clearTimeout(timer.current)
@@ -590,23 +624,12 @@ function ProviderConnection(props: {
     dispatch({ type: "method.select", index })
 
     if (method.type === "oauth") {
-      const scopedLocation = location()
-      if (!scopedLocation) {
-        dispatch({ type: "auth.error", error: language.t("common.requestFailed") })
-        return
-      }
       if (method.prompts?.length && !inputs) {
         dispatch({ type: "auth.prompt" })
         return
       }
       dispatch({ type: "auth.pending" })
-      await serverSDK()
-        .api.integration.oauth.connect({
-          integrationID: props.provider,
-          methodID: method.id,
-          inputs: inputs ?? {},
-          location: scopedLocation,
-        })
+      await oauthConnect(method, inputs ?? {})
         .then((x) => {
           if (!alive.value) return
           if (props.provider === "opencode" && platform.platform === "desktop") {
@@ -1047,18 +1070,7 @@ function ProviderConnection(props: {
       }
 
       setFormStore("error", undefined)
-      const scopedLocation = location()
-      if (!scopedLocation) {
-        setFormStore("error", language.t("common.requestFailed"))
-        return
-      }
-      const result = await serverSDK()
-        .api.integration.oauth.complete({
-          integrationID: props.provider,
-          attemptID: store.authorization!.attemptID,
-          location: scopedLocation,
-          code,
-        })
+      const result = await oauthComplete(store.authorization!.attemptID, code)
         .then(() => ({ ok: true as const }))
         .catch((error) => ({ ok: false as const, error }))
       if (result.ok) {
@@ -1151,14 +1163,7 @@ function ProviderConnection(props: {
       const poll = async () => {
         const authorization = store.authorization
         if (!authorization || !alive.value) return
-        const scopedLocation = location()
-        if (!scopedLocation) return
-        const result = await serverSDK()
-          .api.integration.oauth.status({
-            integrationID: props.provider,
-            attemptID: authorization.attemptID,
-            location: scopedLocation,
-          })
+        const result = await oauthStatus(authorization.attemptID)
           .then((value) => ({ ok: true as const, status: value.data }))
           .catch((error) => ({ ok: false as const, error }))
         if (!alive.value) return

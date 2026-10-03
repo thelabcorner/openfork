@@ -13,7 +13,6 @@ const vectors = [
   ["hy4-preview@wb-3f1c9a", "hy4-preview", "wb-3f1c9a"],
   ["hy4-preview#ctx-262144@wb-3f1c9a", "hy4-preview#ctx-262144", "wb-3f1c9a"],
   ["hy4-preview@wb-auto:headroom", "hy4-preview", "wb-auto:headroom"],
-  ["glm-5.3-flash-free@vd-ab12cd", "glm-5.3-flash-free", "vd-ab12cd"],
   ["weird@model-name", "weird@model-name", undefined],
   ["a@wb-", "a@wb-", undefined],
   ["@wb-x", "@wb-x", undefined],

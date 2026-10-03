@@ -6,7 +6,6 @@ import { createEffect, createMemo, startTransition } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { useCommand } from "@/context/command"
 import {
-  loadHomeSessionIndex,
   retainHomeSessions,
   type HomeSessionEvents,
 } from "@/context/global-sync/home-session-index"
@@ -49,6 +48,14 @@ export function createHomeSessionsController(home: HomeController) {
   const projectByID = createMemo(
     () => new Map(home.project.list().flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
   )
+  const projectByDirectory = createMemo(
+    () =>
+      new Map(
+        home.project.list().flatMap((project) =>
+          directories(project).map((directory) => [pathKey(directory), project] as const),
+        ),
+      ),
+  )
   const homeSessions = () => home.server.focusedSync().homeSessions
   const sessionEventLoad = useQuery(() => ({
     queryKey: homeSessions().eventsKey,
@@ -64,21 +71,56 @@ export function createHomeSessionsController(home: HomeController) {
       if (!ctx) return { sessions: [], eventSequence: 0 }
       const cache = homeSessions()
       const eventSequence = cache.eventSequence()
-      const index = await loadHomeSessionIndex(
-        (input, options) => ctx.sdk.client.v2.session.list(input, options),
-        eventSequence,
-        signal,
-      )
-      cache.complete(eventSequence)
+      // Home needs a small root-session summary per known project directory.
+      // Scanning up to 5,256 V2 rows and discarding children/archives in the
+      // renderer was expensive and repeatedly parsed history-sized indexes.
+      // The Tier 1 global projection already filters roots and archives in SQL.
+      const rootDirectories = [...new Set(home.project.list().flatMap(directories).map(pathKey).filter(Boolean))]
+      const sessions: Session[][] = new Array(rootDirectories.length)
+      let next = 0
+      let failed = false
+      const workers = Array.from({ length: Math.min(4, rootDirectories.length) }, async () => {
+        while (!failed && next < rootDirectories.length) {
+          const index = next++
+          try {
+            const response = await ctx.sdk.client.global.sessionRoots(
+              { directory: rootDirectories[index], limit: String(HOME_SESSION_LIMIT) },
+              { signal },
+            )
+            sessions[index] = response.data ?? []
+          } catch (error) {
+            failed = true
+            throw error
+          }
+        }
+      })
+      await Promise.all(workers)
+      const index = { sessions: sessions.flat(), eventSequence }
+      cache.complete(eventSequence, index.sessions)
       return index
     },
     retry: false,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
-    refetchOnMount: false,
+    refetchOnMount: true,
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
   }))
+  // The index is server-scoped, while its query function discovers sessions
+  // from the current project directory set. Keep those inputs coherent: a
+  // newly added project can contain existing sessions without producing a
+  // session event, and a removed project otherwise leaves stale rows cached.
+  let indexedDirectories: string | undefined
+  createEffect(() => {
+    const current = [...new Set(home.project.list().flatMap(directories).map(pathKey).filter(Boolean))].sort().join("\0")
+    if (indexedDirectories === undefined) {
+      indexedDirectories = current
+      return
+    }
+    if (indexedDirectories === current) return
+    indexedDirectories = current
+    void queryClient.invalidateQueries({ queryKey: homeSessions().indexKey, exact: true })
+  })
   const indexedSessions = createMemo(() =>
     retainHomeSessions(
       homeSessions().sessions(sessionLoad.data, sessionEventLoad.data),
@@ -86,12 +128,19 @@ export function createHomeSessionsController(home: HomeController) {
       Date.now(),
     ),
   )
+  createEffect(() => {
+    if (!sessionLoad.isSuccess || sessionLoad.isFetching) return
+    const cache = homeSessions()
+    if (!cache.claimOverflowRepair()) return
+    void queryClient.invalidateQueries({ queryKey: cache.indexKey, exact: true })
+  })
   const allRecords = createMemo(() =>
     buildHomeSessionRecords({
       sessions: indexedSessions,
       projectDirectories,
       projects: home.project.list,
       projectByID,
+      projectByDirectory,
     }),
   )
   const records = createMemo(() => allRecords().slice(0, HOME_SESSION_LIMIT))
@@ -125,6 +174,7 @@ export function createHomeSessionsController(home: HomeController) {
       projectDirectories,
       projects: home.project.list,
       projectByID,
+      projectByDirectory,
     }),
   )
   // Optimistically drop an unarchived row; live sync re-adds it to the active
@@ -411,6 +461,7 @@ function buildHomeSessionRecords(input: {
   projectDirectories: () => string[]
   projects: () => LocalProject[]
   projectByID: () => Map<string, LocalProject>
+  projectByDirectory: () => Map<string, LocalProject>
 }) {
   const directories = new Set(input.projectDirectories().map(pathKey))
   const sessions = input.sessions().filter((session) => directories.has(pathKey(session.directory)))
@@ -418,13 +469,8 @@ function buildHomeSessionRecords(input: {
     .sort(compareSessionTime)
     .flatMap((session) => {
       const directory = pathKey(session.directory)
-      const project =
-        input
-          .projects()
-          .find(
-            (item) =>
-              pathKey(item.worktree) === directory || item.sandboxes?.some((sandbox) => pathKey(sandbox) === directory),
-          ) ?? projectForSession(session, input.projects(), input.projectByID())
+      const projects = input.projects()
+      const project = input.projectByDirectory().get(directory) ?? projectForSession(session, projects, input.projectByID())
       if (!project) return []
       return { session, project, projectName: displayName(project) }
     })

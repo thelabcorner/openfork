@@ -17,7 +17,12 @@ import { createPromptSession } from "@/context/prompt-state"
 import { showToast } from "@/utils/toast"
 import { popularProviders } from "@/hooks/use-providers"
 import { isUnlimitedModel, stripUnlimitedSuffix } from "@/utils/model-badges"
-import { getOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import {
+  getOpenRouterEndpoints,
+  normalizeOpenRouterEndpoints,
+  peekOpenRouterEndpoints,
+  type OpenRouterEndpoint,
+} from "@/utils/openrouter-endpoints"
 import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 
 const favoritesRailKey = "favorites"
@@ -129,23 +134,17 @@ function DialogSessionModelPickerInner(props: { session: Session; server?: Serve
       : global.servers.list()[0]
     const sdk = conn ? global.ensureServerCtx(conn).sdk : undefined
     if (!sdk) return
-    setOpenRouterStore((prev) => ({ ...prev, [modelId]: { loading: true, endpoints: undefined } }))
+    const cached = peekOpenRouterEndpoints(modelId)
+    setOpenRouterStore((prev) => ({
+      ...prev,
+      [modelId]: { loading: cached === undefined, endpoints: cached },
+    }))
     void getOpenRouterEndpoints(modelId, async (m) => {
       const res = await (sdk as any).client.experimental.openrouterEndpoints.get(
         { model: m } as any,
         { throwOnError: true } as any,
       )
-      return (res.data as any[]).map((e: any) => ({
-        providerName: e.providerName,
-        tag: e.tag,
-        provider: e.provider,
-        pricing: {
-          prompt: Number(e.pricing.prompt) * 1_000_000,
-          completion: Number(e.pricing.completion) * 1_000_000,
-          cacheRead: Number(e.pricing.cacheRead) * 1_000_000,
-        },
-        uptime: e.uptime !== undefined ? Number(e.uptime) : undefined,
-      }))
+      return normalizeOpenRouterEndpoints(res.data as any[])
     }).then((result) => {
       setOpenRouterStore((prev) => ({ ...prev, [modelId]: { loading: false, endpoints: result ?? undefined } }))
     })
@@ -222,7 +221,7 @@ function DialogSessionModelPickerInner(props: { session: Session; server?: Serve
                   each={favorites()}
                   fallback={
                     <div class="px-3 py-4 text-center text-sm text-v2-text-text-muted">
-                      {language.t("dialog.model.empty")}
+                      {language.t(models.catalogStatus() === "pending" ? "common.loading" : "dialog.model.empty")}
                     </div>
                   }
                 >
@@ -246,7 +245,7 @@ function DialogSessionModelPickerInner(props: { session: Session; server?: Serve
                   each={groups()}
                   fallback={
                     <div class="px-3 py-8 text-center text-sm text-v2-text-text-muted">
-                      {language.t("dialog.model.empty")}
+                      {language.t(models.catalogStatus() === "pending" ? "common.loading" : "dialog.model.empty")}
                     </div>
                   }
                 >
@@ -315,6 +314,7 @@ function ModelRow(props: {
       placement="right-start"
       gutter={12}
       openDelay={400}
+      contentClass="model-inspector-host"
       value={
         <ModelTooltip
           model={props.item as any}

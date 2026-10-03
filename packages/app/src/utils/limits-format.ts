@@ -100,7 +100,6 @@ export interface ProviderResult {
     /** Stable account key -> the label used in `windows` keys. See the schema note. */
     accountLabels?: Record<string, string>
     workbuddyAccounts?: WorkBuddyAccountLimits[]
-    verdentAccounts?: WorkBuddyAccountLimits[]
     zenAccounts?: ZenKeyLimits[]
   } | null
   fetchedAt: number
@@ -430,13 +429,6 @@ export function workbuddyModelDisplayName(model: string): string {
   const lower = model.toLowerCase()
   if (lower === "hy3" || lower.startsWith("hy3")) return "Hy3"
   if (lower === "hy4-preview" || lower.startsWith("hy4-preview")) return "Hy4 Preview"
-  return model
-}
-
-export function verdentModelDisplayName(model: string): string {
-  const lower = model.toLowerCase()
-  if (lower === "deepseek-v4-flash-free") return "DeepSeek-V4-Flash-0731"
-  if (lower === "glm-5.3-flash-free") return "GLM-5.3-Flash"
   return model
 }
 

@@ -1,85 +1,62 @@
 import { describe, expect, test } from "bun:test"
-import type { Message, Part } from "@opencode-ai/sdk/v2/client"
-import { estimateSessionContextBreakdown } from "./session-context-breakdown"
+import { projectSessionContextBreakdown } from "./session-context-breakdown"
 
-const user = (id: string) => {
-  return {
-    id,
-    role: "user",
-    time: { created: 1 },
-  } as unknown as Message
-}
-
-const synthetic = (id: string) => {
-  return {
-    id,
-    role: "user",
-    provenance: { owner: "host", source: "goal.continuation" },
-    time: { created: 1 },
-  } as unknown as Message
-}
-
-const assistant = (id: string) => {
-  return {
-    id,
-    role: "assistant",
-    time: { created: 1 },
-  } as unknown as Message
-}
-
-describe("estimateSessionContextBreakdown", () => {
-  test("estimates tokens and keeps remaining tokens as other", () => {
-    const messages = [user("u1"), assistant("a1")]
-    const parts = {
-      u1: [{ type: "text", text: "hello world" }] as unknown as Part[],
-      a1: [{ type: "text", text: "assistant response" }] as unknown as Part[],
-    }
-
-    const output = estimateSessionContextBreakdown({
-      messages,
-      parts,
-      input: 20,
-      systemPrompt: "system prompt",
-    })
-
+describe("projectSessionContextBreakdown", () => {
+  test("normalizes server scalar categories against authoritative occupancy without a transcript", () => {
+    const output = projectSessionContextBreakdown(
+      { system: 4, user: 3, synthetic: 5, shell: 0, compaction: 0, assistant: 5, tool: 1, other: 0 },
+      20,
+    )
     const map = Object.fromEntries(output.map((segment) => [segment.key, segment.tokens]))
+
     expect(map.system).toBe(4)
-    expect(map.user).toBe(3)
-    expect(map.assistant).toBe(5)
-    expect(map.other).toBe(8)
+    expect(map.synthetic).toBe(5)
+    expect(map.other).toBe(2)
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(20)
   })
 
-  test("scales segments when estimates exceed input", () => {
-    const messages = [user("u1"), assistant("a1")]
-    const parts = {
-      u1: [{ type: "text", text: "x".repeat(400) }] as unknown as Part[],
-      a1: [{ type: "text", text: "y".repeat(400) }] as unknown as Part[],
-    }
+  test("scales server estimates when current occupancy is smaller than historical estimates", () => {
+    const output = projectSessionContextBreakdown(
+      { system: 50, user: 100, synthetic: 20, shell: 10, compaction: 30, assistant: 200, tool: 300, other: 0 },
+      100,
+    )
 
-    const output = estimateSessionContextBreakdown({
-      messages,
-      parts,
-      input: 10,
-      systemPrompt: "z".repeat(200),
-    })
-
-    const total = output.reduce((sum, segment) => sum + segment.tokens, 0)
-    expect(total).toBeLessThanOrEqual(10)
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBeLessThanOrEqual(100)
     expect(output.every((segment) => segment.width <= 100)).toBeTrue()
   })
 
-  test("separates host synthetic input from human user input without changing totals", () => {
-    const messages = [user("u1"), synthetic("s1")]
-    const parts = {
-      u1: [{ type: "text", text: "human prompt" }] as unknown as Part[],
-      s1: [{ type: "text", text: "host continuation" }] as unknown as Part[],
-    }
+  test("never presents cumulative session usage as current context occupancy", () => {
+    // Regression for a long session that has processed >600k tokens cumulatively
+    // while the provider reports only ~39k tokens resident in the current 128k
+    // context. Composition is a current-footprint visualization, not spend.
+    const currentContextTokens = 39_258
+    const output = projectSessionContextBreakdown(
+      {
+        system: 9_500,
+        user: 65_000,
+        synthetic: 8_000,
+        shell: 1_500,
+        compaction: 10_000,
+        assistant: 160_000,
+        tool: 255_000,
+        other: 102_851,
+      },
+      currentContextTokens,
+    )
 
-    const output = estimateSessionContextBreakdown({ messages, parts, input: 20 })
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(currentContextTokens)
+    expect(output.reduce((sum, segment) => sum + segment.width, 0)).toBeCloseTo(100, 6)
+    expect(output.every((segment) => segment.tokens <= currentContextTokens)).toBeTrue()
+  })
+
+  test("uses the full authoritative footprint, including cached and generated tokens, as its denominator", () => {
+    const output = projectSessionContextBreakdown(
+      { system: 5, user: 10, synthetic: 0, shell: 0, compaction: 0, assistant: 10, tool: 5, other: 0 },
+      60,
+    )
+
     const map = Object.fromEntries(output.map((segment) => [segment.key, segment.tokens]))
-
-    expect(map.user).toBe(3)
-    expect(map.synthetic).toBe(5)
-    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(20)
+    expect(map.other).toBe(30)
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(60)
   })
 })

@@ -52,6 +52,7 @@ function directoryState() {
     config: {},
     path: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
     session: [],
+    session_children: () => new Map(),
     sessionTotal: 0,
     session_status: {},
     session_working(id: string) {
@@ -94,6 +95,7 @@ describe("bootstrapDirectory", () => {
         provider,
       },
       sdk: {} as OpencodeClient,
+      serverSDK: {} as OpencodeClient,
       api,
       store,
       setStore,
@@ -173,6 +175,7 @@ describe("bootstrapDirectory", () => {
         },
         provider: { list: async () => ({ data: { all: [], connected: [], default: {} } }) },
       } as unknown as OpencodeClient,
+      serverSDK: {} as OpencodeClient,
       api,
       store,
       setStore,
@@ -212,6 +215,7 @@ describe("bootstrapDirectory", () => {
           },
         },
       } as unknown as OpencodeClient,
+      serverSDK: {} as OpencodeClient,
       api,
       store,
       setStore,
@@ -272,6 +276,57 @@ describe("config queries", () => {
   })
 })
 
+describe("global path ownership", () => {
+  const path = { home: "/home", state: "/state", config: "/config", worktree: "", directory: "" }
+
+  test("reads global metadata without requesting an instance path", async () => {
+    let instanceReads = 0
+    const sdk = {
+      global: { health: async () => ({ data: { healthy: true, path } }) },
+      path: { get: async () => { instanceReads++; return { data: path } } },
+    } as unknown as OpencodeClient
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    expect(await query.fetchQuery(loadPathQuery(ServerScope.local, null, sdk, Promise.resolve("v1")))).toEqual(path)
+    expect(instanceReads).toBe(0)
+  })
+
+  test.each([404, 405, 503])("health failure %s cannot bootstrap a default workspace", async (status) => {
+    let instanceReads = 0
+    const error = Object.assign(new Error(`health status ${status}`), { status })
+    const sdk = {
+      global: { health: async () => { throw error } },
+      path: { get: async () => { instanceReads++; return { data: path } } },
+    } as unknown as OpencodeClient
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await expect(query.fetchQuery(loadPathQuery(ServerScope.local, null, sdk, Promise.resolve("v1")))).rejects.toBe(error)
+    expect(instanceReads).toBe(0)
+  })
+
+  test("missing health metadata cannot fall through to a directory-less path read", async () => {
+    let instanceReads = 0
+    const sdk = {
+      global: { health: async () => ({ data: { healthy: true } }) },
+      path: { get: async () => { instanceReads++; return { data: path } } },
+    } as unknown as OpencodeClient
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await expect(query.fetchQuery(loadPathQuery(ServerScope.local, null, sdk, Promise.resolve("v1")))).rejects.toThrow(
+      "global path metadata",
+    )
+    expect(instanceReads).toBe(0)
+  })
+
+  test("location path reads retain their explicit directory", async () => {
+    const locations: unknown[] = []
+    const sdk = {
+      global: { health: async () => { throw new Error("global health is not required for an explicit location") } },
+      path: { get: async (input: unknown) => { locations.push(input); return { data: { ...path, directory: "/repo" } } } },
+    } as unknown as OpencodeClient
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    expect((await query.fetchQuery(loadPathQuery(ServerScope.local, "/repo", sdk, Promise.resolve("v1")))).directory).toBe("/repo")
+    expect(locations).toEqual([{ directory: "/repo" }])
+  })
+})
+
 describe("query keys", () => {
   test("partitions identical directories by server scope", () => {
     const client = {} as Parameters<typeof loadPathQuery>[2]
@@ -313,6 +368,20 @@ describe("query keys", () => {
     ])
   })
 
+  test("the fork V1 catalog preserves explicit location and progressive status", async () => {
+    const calls: unknown[] = []
+    const legacy = { provider: { list: async (input: unknown) => {
+      calls.push(input)
+      return { data: { all: [], connected: [], default: {}, catalog: { status: "partial", revision: 3 } } }
+    } } } as unknown as OpencodeClient
+    const queryClient = new QueryClient()
+    const result = await queryClient.fetchQuery(loadProvidersQuery(ServerScope.local, "/repo", {} as CatalogApi, legacy, Promise.resolve("v1")))
+    expect(calls).toEqual([{ directory: "/repo" }])
+    expect(result.catalog).toEqual({ status: "partial", revision: 3 })
+    await queryClient.fetchQuery(loadProvidersQuery(ServerScope.local, null, {} as CatalogApi, legacy, Promise.resolve("v1")))
+    expect(calls).toEqual([{ directory: "/repo" }, undefined])
+  })
+
   test("loads the current provider and model catalog", async () => {
     const calls: unknown[] = []
     const api = {
@@ -349,14 +418,116 @@ describe("query keys", () => {
     const api = {
       list: async (input: unknown) => {
         calls.push(input)
-        return { location: {}, data: [] }
+        return {
+          location: {},
+          data: [
+            {
+              id: "explore",
+              request: { headers: {}, body: {} },
+              system: "resolved runtime prompt",
+              description: "Explore files",
+              mode: "subagent",
+              hidden: false,
+              permissions: [],
+            },
+          ],
+        }
       },
     } as unknown as AgentApi
 
     const result = await new QueryClient().fetchQuery(loadAgentsQuery(ServerScope.local, "/repo", api))
 
     expect(calls).toEqual([{ location: { directory: "/repo" } }])
-    expect(result).toEqual([])
+    expect(result).toHaveLength(1)
+    expect(result[0]?.name).toBe("explore")
+    expect(result[0]?.prompt).toBe("resolved runtime prompt")
+  })
+
+  test("uses the fork V1 agent catalog on a server classified as v1", async () => {
+    const currentCalls: unknown[] = []
+    const legacyCalls: unknown[] = []
+    const current = {
+      list: async (input: unknown) => {
+        currentCalls.push(input)
+        return {
+          location: {},
+          data: [
+            {
+              id: "build",
+              request: { headers: {}, body: {} },
+              system: "resolved build system",
+              mode: "primary",
+              hidden: false,
+              permissions: [],
+            },
+          ],
+        }
+      },
+    } as unknown as AgentApi
+    const legacy = {
+      app: {
+        agents: async (input: unknown) => {
+          legacyCalls.push(input)
+          return {
+            data: [
+              {
+                name: "build",
+                prompt: "resolved build system",
+                mode: "primary",
+                permission: [],
+                options: {},
+              },
+            ],
+          }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await new QueryClient().fetchQuery(
+      loadAgentsQuery(ServerScope.local, "/repo", current, legacy, Promise.resolve("v1")),
+    )
+
+    expect(currentCalls).toEqual([])
+    expect(legacyCalls).toEqual([{ directory: "/repo" }])
+    expect(result[0]?.name).toBe("build")
+    expect(result[0]?.prompt).toBe("resolved build system")
+  })
+
+  test("does not schedule the current catalog behind a V1 agent read", async () => {
+    let currentCalls = 0
+    const legacyCalls: unknown[] = []
+    const current = {
+      list: async () => {
+        currentCalls++
+        throw { status: 404 }
+      },
+    } as unknown as AgentApi
+    const legacy = {
+      app: {
+        agents: async (input: unknown) => {
+          legacyCalls.push(input)
+          return {
+            data: [
+              {
+                name: "explore",
+                prompt: "legacy prompt",
+                mode: "subagent",
+                permission: [],
+                options: {},
+              },
+            ],
+          }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await new QueryClient().fetchQuery(
+      loadAgentsQuery(ServerScope.local, "/repo", current, legacy, Promise.resolve("v1")),
+    )
+
+    expect(currentCalls).toBe(0)
+    expect(legacyCalls).toEqual([{ directory: "/repo" }])
+    expect(result[0]?.prompt).toBe("legacy prompt")
   })
 
   test("loads commands from the current location-scoped endpoint", async () => {
@@ -419,7 +590,7 @@ describe("query keys", () => {
     expect(instanceCalls).toBe(0)
   })
 
-  test("falls back to the instance project endpoint on older servers", async () => {
+  test.each([404, 405, 503])("global project failure %s cannot acquire an implicit workspace", async (status) => {
     let instanceCalls = 0
     const projectApi = {
       list: async () => {
@@ -430,17 +601,16 @@ describe("query keys", () => {
     const globalClient = {
       global: {
         projects: async () => {
-          throw { status: 404 }
+          throw { status }
         },
       },
     } as unknown as OpencodeClient
 
-    const result = await new QueryClient().fetchQuery(
+    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    await expect(query.fetchQuery(
       loadProjectsQuery(ServerScope.local, projectApi, undefined, "critical", globalClient),
-    )
-
-    expect(result.map((project) => project.id)).toEqual(["fallback"])
-    expect(instanceCalls).toBe(1)
+    )).rejects.toEqual({ status })
+    expect(instanceCalls).toBe(0)
   })
 
   test("loads references from the current location-scoped endpoint", async () => {

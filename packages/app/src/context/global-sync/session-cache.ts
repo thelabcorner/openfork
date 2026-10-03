@@ -61,10 +61,25 @@ export function estimateSessionCacheBytes(store: SessionCache, sessionID: string
   const messageIDs = new Set<string>()
   for (const message of store.message[sessionID] ?? []) messageIDs.add(message.id)
   for (const message of store.session_message[sessionID] ?? []) messageIDs.add(message.id)
-  for (const [messageID, parts] of Object.entries(store.part)) {
-    if (messageIDs.has(messageID) || parts?.some((part) => part.sessionID === sessionID)) {
+  if (messageIDs.size > 0) {
+    // The part cache is keyed by message ID. Walk this session's known messages
+    // instead of scanning every cached part array and checking its owner. This
+    // estimator runs at timeline release and background-prefetch boundaries,
+    // so a global scan here made ordinary tab changes scale with all cached
+    // history across every session.
+    for (const messageID of messageIDs) {
+      const parts = store.part[messageID]
+      if (!parts) continue
       bytes += roughValueBytes(parts, seen)
-      for (const part of parts ?? []) bytes += roughValueBytes(store.part_text_accum_delta[part.id], seen)
+      for (const part of parts) bytes += roughValueBytes(store.part_text_accum_delta[part.id], seen)
+    }
+  } else {
+    // Preserve accounting for orphaned part entries when the session's message
+    // index has already been evicted or has not been populated yet.
+    for (const parts of Object.values(store.part)) {
+      if (!parts?.some((part) => part.sessionID === sessionID)) continue
+      bytes += roughValueBytes(parts, seen)
+      for (const part of parts) bytes += roughValueBytes(store.part_text_accum_delta[part.id], seen)
     }
   }
   return bytes

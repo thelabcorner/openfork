@@ -7,7 +7,6 @@ import type {
   GoalFocus,
   GoalFocusedGoal,
   GoalInfo,
-  GoalContinuationPolicy,
 } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
@@ -45,7 +44,6 @@ export type GoalCreateAndFocusInput = {
   criteria: string[]
   constraints?: string[]
   steps?: Array<{ title: string; description?: string }>
-  continuationPolicy?: GoalContinuationPolicy
   auditorPolicy?: GoalAuditorPolicy
   start?: boolean
 }
@@ -288,7 +286,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         objective: string
         criteria: string[]
         constraints?: string[]
-        continuationPolicy?: GoalContinuationPolicy
         auditorPolicy?: GoalAuditorPolicy
       }) {
         const response = await sdk().create(input, { throwOnError: true })

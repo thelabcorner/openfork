@@ -23,16 +23,30 @@ mock.module("@/lib/text-layout", () => ({
 const { createTimelineProjection } = await import("./projection")
 const { TimelineRow } = await import("./rows")
 
-test("reactive projection renders Goal Auditor output under a hidden synthetic root", () => {
+test("reactive projection renders the Goal Auditor prompt before its output", () => {
   createRoot((dispose) => {
     try {
       const source = [
+        {
+          id: "msg_auditor_system",
+          type: "system",
+          text: "[GOAL AUDIT CYCLE] Verify the worker result independently.",
+          time: { created: 1 },
+        },
+        {
+          id: "msg_auditor_skill",
+          type: "skill",
+          skill: "goal-verification",
+          name: "Goal verification",
+          text: "Apply the Goal verification rubric to the current worker result.",
+          time: { created: 2 },
+        },
         {
           id: "msg_auditor_prompt",
           type: "synthetic",
           text: "audit the latest Goal worker cycle",
           provenance: { owner: "host" as const, source: "special-agent.goal-auditor" },
-          time: { created: 1 },
+          time: { created: 3 },
         },
         {
           id: "msg_auditor_assistant",
@@ -40,15 +54,15 @@ test("reactive projection renders Goal Auditor output under a hidden synthetic r
           agent: "goal_auditor",
           model: { id: "auditor-model", providerID: "opencode" },
           content: [{ type: "text" as const, text: "Live auditor output" }],
-          time: { created: 2 },
+          time: { created: 4 },
         },
       ] satisfies SessionMessageInfo[]
       const normalized = normalizeSessionMessages("ses_goal_auditor", source)
       const projection = createTimelineProjection({
         messages: () => normalized.messages,
         // There is deliberately no semantic human-user turn. The canonical
-        // Current synthetic root is the structural parent for this special
-        // agent provider turn and must remain inspectable.
+        // Current synthetic root is both the structural parent and the visible
+        // automation boundary for this special-agent provider turn.
         userMessages: () => [],
         sessionMessages: () => source,
         parts: (messageID) => normalized.parts.get(messageID) ?? [],
@@ -59,6 +73,9 @@ test("reactive projection renders Goal Auditor output under a hidden synthetic r
       })
 
       expect(projection.rows().map(TimelineRow.key)).toEqual([
+        "context-message:msg_auditor_system",
+        "context-message:msg_auditor_skill",
+        "user-message:msg_auditor_prompt",
         "assistant-part:msg_auditor_prompt:msg_auditor_assistant:text:0",
       ])
     } finally {

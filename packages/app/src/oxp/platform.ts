@@ -24,6 +24,38 @@ export type OxpGrant = {
   nestedDelegation: boolean
 }
 
+export type OxpModelSelection = {
+  providerID: string
+  modelID: string
+  accountID?: string
+  variant?: string
+}
+
+export type OxpWorkerPolicy = {
+  /** Compatibility-only remnants of the retired OXP selection allowlist. */
+  models: OxpModelSelection[]
+  /** Compatibility-only remnants of the retired OXP selection allowlist. */
+  agents: string[]
+  defaultModel?: OxpModelSelection
+  defaultAgent?: string
+  agentRoots?: Array<{
+    rootID: string
+    agents: string[]
+    defaultAgent?: string
+  }>
+}
+
+export type OxpAgentCatalog = {
+  rootID: string
+  rootAlias: string
+  agents: Array<{
+    id: string
+    description?: string
+    mode: "subagent" | "primary" | "all"
+  }>
+  nativeDefaultAgent: string
+}
+
 
 export type OxpLifecycle = {
   autoConnect: boolean
@@ -46,6 +78,7 @@ export type OxpDesktopState = {
     managedByProject: boolean
   }>
   grant: OxpGrant
+  workerPolicy: OxpWorkerPolicy
   endpoint: {
     state: OxpEndpointState
     generation?: number
@@ -93,6 +126,9 @@ export interface OxpPlatform {
   subscribe(cb: (state: OxpDesktopState) => void): Promise<() => void> | (() => void)
   setEnabled(enabled: boolean): Promise<OxpDesktopState>
   setGrant(patch: Partial<OxpGrant>): Promise<OxpDesktopState>
+  setWorkerDefaultModel(model?: OxpModelSelection): Promise<OxpDesktopState>
+  listWorkerAgents(rootID: string): Promise<OxpAgentCatalog>
+  setWorkerDefaultAgent(rootID: string, agent?: string): Promise<OxpDesktopState>
   addRoot(): Promise<OxpDesktopState>
   syncProjectRoots(paths: string[]): Promise<OxpDesktopState>
   renameRoot(rootID: string, alias: string): Promise<OxpDesktopState>
@@ -116,6 +152,9 @@ const requiredOxpPlatformMethods = [
   "subscribe",
   "setEnabled",
   "setGrant",
+  "setWorkerDefaultModel",
+  "listWorkerAgents",
+  "setWorkerDefaultAgent",
   "addRoot",
   "syncProjectRoots",
   "renameRoot",

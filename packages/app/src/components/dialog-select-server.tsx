@@ -364,7 +364,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
     const raw = items()
     const list = settings.general.newLayoutDesigns()
       ? raw
-      : raw.filter((x) => global.ensureServerCtx(x).sdk.protocolKind() !== "v2")
+      : raw.filter((x) => global.ensureServerSdk(x).protocolKind() !== "v2")
     if (!list.length) return list
     const active = current()
     const order = new Map(list.map((url, index) => [url, index] as const))

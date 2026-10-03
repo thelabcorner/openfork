@@ -7,11 +7,9 @@ import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { type Accessor, batch, createMemo, createResource, onCleanup, onMount } from "solid-js"
 import { authTokenFromCredentials, createApiForServer, createSdkForServer, type ServerApi } from "@/utils/server"
-import { useLanguage } from "./language"
 import { usePlatform } from "./platform"
-import { ServerConnection, useServer } from "./server"
+import { ServerConnection } from "./server"
 import { createRefCountMap } from "@/utils/refcount"
-import { useGlobal } from "./global"
 import { ServerScope } from "@/utils/server-scope"
 import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
@@ -27,6 +25,7 @@ import {
   type ServerRequestPriority,
   type ServerRequestScheduler,
 } from "@/utils/server-request-scheduler"
+import { createLatestStateRequest } from "./latest-state-request"
 import {
   STREAM_PROGRESS_EVENT,
   STREAM_SESSION_STALE_EVENT,
@@ -75,6 +74,7 @@ type QueuedDeltaAccumulator = {
   readonly fragments: string[]
   chars: number
   bytes: number
+  readonly offset?: number
 }
 
 // Queue-local rope metadata. A paused renderer can accumulate thousands of
@@ -177,6 +177,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
   let sizes: number[] = []
   let head = 0
   let bytes = 0
+  let queuedContentCount = 0
   let maxSize = 0
   let maxBytes = 0
   let pushed = 0
@@ -210,6 +211,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
     }
     sizes.push(size)
     bytes += size
+    if (contentSessionID(event)) queuedContentCount++
     observeWatermarks()
   }
   const contentSessionID = (event: QueuedServerEvent) => {
@@ -228,6 +230,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
     sizes = retainedSizes
     head = 0
     bytes = retainedSizes.reduce((total, size) => total + size, 0)
+    queuedContentCount = queue.reduce((total, event) => total + Number(!!contentSessionID(event)), 0)
     pendingDeltas.clear()
     for (let index = 0; index < queue.length; index++) {
       const key = queueDeltaKey(queue[index]!)
@@ -237,7 +240,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
   }
   const shedQueuedContent = () => {
     const dropped = new Set<string>()
-    if (queue.length === head) return dropped
+    if (queue.length === head || queuedContentCount === 0) return dropped
     const retained: QueuedServerEvent[] = []
     const retainedSizes: number[] = []
     for (let index = head; index < queue.length; index++) {
@@ -259,6 +262,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
     sizes = []
     head = 0
     bytes = 0
+    queuedContentCount = 0
     pendingDeltas.clear()
     append({
       // Only GLOBAL server.connected is a hydration barrier in server-sync:
@@ -294,6 +298,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
       sizes = []
       head = 0
       bytes = 0
+      queuedContentCount = 0
       pendingDeltas.clear()
       return
     }
@@ -371,7 +376,10 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
       // animation frame.
       const result = queue.slice(head, end).map(materializeQueuedDelta)
       drained += result.length
-      for (let index = head; index < end; index++) bytes -= sizes[index] ?? 0
+      for (let index = head; index < end; index++) {
+        bytes -= sizes[index] ?? 0
+        if (contentSessionID(queue[index]!)) queuedContentCount--
+      }
       head = end
       for (const [key, index] of pendingDeltas) {
         if (index < head) pendingDeltas.delete(key)
@@ -385,6 +393,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
       if (!event) return
       drained += 1
       bytes -= sizes[head] ?? 0
+      if (contentSessionID(queued)) queuedContentCount--
       const oldHead = head++
       const key = queueDeltaKey(event)
       if (key && pendingDeltas.get(key) === oldHead) pendingDeltas.delete(key)
@@ -396,6 +405,7 @@ export function createServerEventQueue(options: { onSessionContentDropped?: (ses
       sizes = []
       head = 0
       bytes = 0
+      queuedContentCount = 0
       pendingDeltas.clear()
     },
     dropWhere(predicate: (event: QueuedServerEvent) => boolean, onDrop?: (event: QueuedServerEvent) => void) {
@@ -494,6 +504,13 @@ function mergeQueuedDeltaEvents(previous: QueuedServerEvent, event: QueuedServer
   const nextFragment = queuedDeltaFragment(event)
   if (previousFragment === undefined || nextFragment === undefined) return undefined
   const prior = queuedDeltaAccumulators.get(previous)
+  if (previous.payload.type === "message.part.delta" && event.payload.type === "message.part.delta") {
+    const previousOffset = prior?.offset ?? previous.payload.properties.offset
+    const nextOffset = event.payload.properties.offset
+    const coveredChars = prior?.chars ?? previous.payload.properties.delta.length
+    if ((previousOffset === undefined) !== (nextOffset === undefined)) return undefined
+    if (previousOffset !== undefined && nextOffset !== previousOffset + coveredChars) return undefined
+  }
   const chars = (prior?.chars ?? previousFragment.length) + nextFragment.length
   if (chars > MAX_COALESCED_DELTA_CHARS) return undefined
 
@@ -501,6 +518,9 @@ function mergeQueuedDeltaEvents(previous: QueuedServerEvent, event: QueuedServer
     fragments: [previousFragment],
     chars: previousFragment.length,
     bytes: utf8StringBytes(previousFragment),
+    ...(previous.payload.type === "message.part.delta" && previous.payload.properties.offset !== undefined
+      ? { offset: previous.payload.properties.offset }
+      : {}),
   }
   accumulator.fragments.push(nextFragment)
   accumulator.chars = chars
@@ -534,7 +554,11 @@ function materializeQueuedDelta(event: QueuedServerEvent): QueuedServerEvent {
     directory: event.directory,
     payload: {
       ...event.payload,
-      properties: { ...event.payload.properties, delta: fragment },
+      properties: {
+        ...event.payload.properties,
+        delta: fragment,
+        ...(accumulator.offset === undefined ? {} : { offset: accumulator.offset }),
+      },
     },
   }
 }
@@ -619,12 +643,19 @@ function mergeDeltaEvents(previous: QueuedServerEvent, event: QueuedServerEvent)
   if (previous.payload.type !== "message.part.delta" || event.payload.type !== "message.part.delta") return undefined
   const previousProps = previous.payload.properties
   const nextProps = event.payload.properties
+  if ((previousProps.offset === undefined) !== (nextProps.offset === undefined)) return undefined
+  if (previousProps.offset !== undefined && nextProps.offset !== previousProps.offset + previousProps.delta.length)
+    return undefined
   if (previousProps.delta.length + nextProps.delta.length > MAX_COALESCED_DELTA_CHARS) return undefined
   return {
     directory: event.directory,
     payload: {
       ...event.payload,
-      properties: { ...nextProps, delta: previousProps.delta + nextProps.delta },
+      properties: {
+        ...nextProps,
+        delta: previousProps.delta + nextProps.delta,
+        ...(previousProps.offset === undefined ? {} : { offset: previousProps.offset }),
+      },
     },
   }
 }
@@ -709,8 +740,10 @@ export function streamContentSessionsForVisibility(sessions: readonly string[], 
   return hidden ? [] : sessions
 }
 
-export function streamInterestUpdatePriority(sessions: readonly string[]): ServerRequestPriority {
-  return sessions.length > 0 ? "interactive" : "background"
+export function streamInterestUpdatePriority(_sessions: readonly string[]): ServerRequestPriority {
+  // Both directions are control: activation starts visible content; clearing
+  // interest releases server/event work on hide, stop or timeline teardown.
+  return "critical"
 }
 
 type ServerEventEmitter = ReturnType<typeof createGlobalEmitter<{ [key: string]: ServerEvent }>>
@@ -789,15 +822,10 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   const requests = createServerRequestScheduler({ concurrency: 5, backgroundConcurrency: 2 })
   const streamSubscriber = createStreamSubscriberID()
   let streamSessions: string[] = []
+  let streamSessionSet = new Set<string>()
   let streamSessionsKey = "[]"
   let hidden = typeof document !== "undefined" && document.visibilityState === "hidden"
   const effectiveStreamSessions = () => streamContentSessionsForVisibility(streamSessions, hidden)
-  const effectiveStreamSessionsKey = () => (hidden ? "[]" : streamSessionsKey)
-  let remoteInterestReady = false
-  let remoteInterestUnsupported = false
-  let remoteInterestAck: string | undefined
-  let remoteInterestQueued = false
-  let remoteInterestInflight: Promise<void> | undefined
   let remoteInterestFailures = 0
   let remoteInterestRetry: ReturnType<typeof setTimeout> | undefined
   const qosEntry = { origin: serverOrigin(server.http.url), scheduler: requests }
@@ -815,17 +843,22 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     }
   })()
 
-  const queueRemoteInterest = () => {
-    if (!remoteInterestReady || remoteInterestUnsupported || abort.signal.aborted) return
-    if (remoteInterestQueued || remoteInterestInflight) return
-    remoteInterestQueued = true
-    queueMicrotask(() => {
-      remoteInterestQueued = false
-      if (!remoteInterestReady || remoteInterestUnsupported || abort.signal.aborted || remoteInterestInflight) return
-      const key = effectiveStreamSessionsKey()
-      if (remoteInterestAck === key) return
-      const sessions = effectiveStreamSessions()
-      const priority = streamInterestUpdatePriority(sessions)
+  let streamInterestGeneration = 0
+  let effectiveInterestKey = "[]"
+  const remoteInterest = createLatestStateRequest<{ generation: number; sessions: readonly string[] }>({
+    kind: "stream-interest",
+    key: (value) => `${value.generation}:${JSON.stringify(value.sessions)}`,
+    signal: abort.signal,
+    promote: () => requests.promote("stream-interest", "critical"),
+    schedule: (run, options) => requests.schedule(streamInterestUpdatePriority(effectiveStreamSessions()), run, options),
+    rebase: (value, generation) => {
+      if (!Number.isSafeInteger(generation) || generation < 0) return undefined
+      const next = Math.max(streamInterestGeneration, value.generation, generation) + 1
+      if (!Number.isSafeInteger(next)) return undefined
+      streamInterestGeneration = next
+      return { ...value, generation: next }
+    },
+    send: async (value, signal) => {
       const headers = new Headers({ "content-type": "application/json" })
       if (server.http.password) {
         headers.set(
@@ -834,48 +867,57 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
         )
       }
       const fetcher = platform.fetch ?? globalThis.fetch
-      remoteInterestInflight = requests
-        .schedule(
-          priority,
-          async () => {
-            const response = await fetcher(interestURL, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({ subscriber: streamSubscriber, sessions }),
-              signal: abort.signal,
-            })
-            if (response.status === 404 || response.status === 405) {
-              remoteInterestUnsupported = true
-              return
-            }
-            if (!response.ok) throw new Error(`stream interest update failed (${response.status})`)
-            const result = await response.json().catch(() => undefined)
-            if (!result || typeof result !== "object" || (result as { updated?: unknown }).updated !== true) {
-              // Older servers can route an unknown POST to an HTML/UI fallback.
-              // Treat that as unsupported rather than retrying forever.
-              remoteInterestUnsupported = true
-              return
-            }
-            remoteInterestFailures = 0
-            if (remoteInterestReady && effectiveStreamSessionsKey() === key) remoteInterestAck = key
-          },
-          { signal: abort.signal, kind: "stream-interest", key: "stream-interest" },
-        )
-        .catch(() => {
-          if (abort.signal.aborted || remoteInterestUnsupported || !remoteInterestReady) return
-          remoteInterestFailures++
-          if (remoteInterestRetry !== undefined) return
-          const delay = Math.min(2_000, 100 * 2 ** Math.min(remoteInterestFailures, 4))
-          remoteInterestRetry = setTimeout(() => {
-            remoteInterestRetry = undefined
-            queueRemoteInterest()
-          }, delay)
-        })
-        .finally(() => {
-          remoteInterestInflight = undefined
-          if (effectiveStreamSessionsKey() !== key) queueRemoteInterest()
-        })
-    })
+      const response = await fetcher(interestURL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ subscriber: streamSubscriber, ...value }),
+        signal,
+      })
+      if (response.status === 404 || response.status === 405) return { status: "unsupported" }
+      if (!response.ok) throw new Error(`stream interest update failed (${response.status})`)
+      const result = await response.json().catch(() => undefined)
+      if (!result || typeof result !== "object") return { status: "unsupported" }
+      const applied = result as { updated?: unknown; generation?: unknown }
+      if (applied.generation !== undefined && (!Number.isSafeInteger(applied.generation) || (applied.generation as number) < 0))
+        throw new Error("stream interest response had an invalid generation")
+      if (applied.updated !== true) {
+        if (typeof applied.generation === "number" && applied.generation >= value.generation)
+          return { status: "superseded", generation: applied.generation }
+        if (typeof applied.generation === "number")
+          throw new Error(`stream interest generation ${value.generation} was not applied`)
+        return { status: "deferred" }
+      }
+      if (typeof applied.generation === "number" && applied.generation !== value.generation) {
+        if (applied.generation > value.generation) return { status: "superseded", generation: applied.generation }
+        throw new Error(`stream interest generation ${value.generation} received older acknowledgement`)
+      }
+      remoteInterestFailures = 0
+      return { status: "updated" }
+    },
+    onBlocked: (reason) => console.warn("[event-stream] stream interest control blocked", { reason }),
+    onFailure: () => {
+      if (abort.signal.aborted || remoteInterest.snapshot().unsupported || !remoteInterest.snapshot().ready) return
+      remoteInterestFailures++
+      if (remoteInterestRetry !== undefined) return
+      const delay = Math.min(2_000, 100 * 2 ** Math.min(remoteInterestFailures, 4))
+      remoteInterestRetry = setTimeout(() => {
+        remoteInterestRetry = undefined
+        remoteInterest.retry()
+      }, delay)
+    },
+  })
+  remoteInterest.setDesired({ generation: streamInterestGeneration, sessions: [] })
+  const updateEffectiveStreamInterest = () => {
+    const sessions = effectiveStreamSessions()
+    const key = JSON.stringify(sessions)
+    if (key === effectiveInterestKey) return
+    effectiveInterestKey = key
+    if (streamInterestGeneration >= Number.MAX_SAFE_INTEGER) {
+      remoteInterest.block("stream interest generation exhausted")
+      return
+    }
+    streamInterestGeneration++
+    remoteInterest.setDesired({ generation: streamInterestGeneration, sessions })
   }
 
   const setStreamContentSessions = (sessions: Iterable<string>) => {
@@ -883,8 +925,17 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     const key = JSON.stringify(next)
     if (key === streamSessionsKey) return
     streamSessions = next
+    streamSessionSet = new Set(next)
+    // A hidden session removed from active timeline interest keeps its stale
+    // latch in ServerSession and repairs on its next activation. It no longer
+    // needs a visibility-restore repair now. Prune old IDs here so repeatedly
+    // switching sessions while hidden cannot grow this set across the lifetime
+    // of a hidden window.
+    for (const sessionID of hiddenDirtySessions) {
+      if (!streamSessionSet.has(sessionID)) hiddenDirtySessions.delete(sessionID)
+    }
     streamSessionsKey = key
-    queueRemoteInterest()
+    updateEffectiveStreamInterest()
   }
 
   const eventFetch = (() => {
@@ -907,6 +958,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   const sseFetch = eventStreamFetch(eventFetch ?? globalThis.fetch, server.http, {
     subscriber: streamSubscriber,
     sessions: effectiveStreamSessions,
+    generation: () => streamInterestGeneration,
   })
   const streamCursor: ServerEventStreamCursor = {}
   const streamURL = (path: string) => {
@@ -953,6 +1005,14 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   })
   let hiddenDirtyGlobal = false
   const hiddenDirtySessions = new Set<string>()
+  // The server can report suppression for any busy session while the page is
+  // hidden, but only locally advertised timelines need an eager visibility
+  // repair. Other cached sessions retain their stale latch in ServerSession and
+  // repair when activated. Keep this set within the stream-interest cap instead
+  // of growing with every session running on the server.
+  const markHiddenDirtySession = (sessionID: string) => {
+    if (streamSessionSet.has(sessionID)) hiddenDirtySessions.add(sessionID)
+  }
   let reconnectFailures = 0
   const streamStats = {
     framesRead: 0,
@@ -971,8 +1031,8 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     snapshot: () => ({
       hidden,
       advertisedSessions: effectiveStreamSessions().length,
-      remoteInterestReady,
-      remoteInterestUnsupported,
+       remoteInterestReady: remoteInterest.snapshot().ready,
+       remoteInterestUnsupported: remoteInterest.snapshot().unsupported,
       remoteInterestFailures,
       reconnectFailures,
       hiddenDirtySessions: hiddenDirtySessions.size,
@@ -1064,8 +1124,9 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
       // oxlint-disable-next-line no-unmodified-loop-condition -- `started` is set to false by stop() which also aborts; both flags are checked to allow graceful exit
       while (!abort.signal.aborted && started && generation === active) {
         attempt = new AbortController()
-        remoteInterestReady = false
-        remoteInterestAck = undefined
+        const attemptStartedAt = Date.now()
+        const attemptFramesBefore = streamStats.framesRead
+        remoteInterest.setReady(false)
         const onAbort = () => {
           attempt?.abort()
         }
@@ -1103,15 +1164,13 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               // The server registers the subscriber state before this frame can
               // become observable. Re-assert the latest active set to cover a
               // tab switch that raced with construction of the request headers.
-              remoteInterestReady = true
-              remoteInterestAck = undefined
-              queueRemoteInterest()
+              remoteInterest.setReady(true)
             }
             if (frameKind === STREAM_SESSION_STALE_EVENT) {
               streamStats.controlFramesSkipped += 1
               if (typeof frameSession === "string") {
                 if (hidden) {
-                  hiddenDirtySessions.add(frameSession)
+                  markHiddenDirtySession(frameSession)
                   // A hidden renderer intentionally advertised zero timeline
                   // interest. Remember the stale fact, but do not launch an HTTP
                   // repair that cannot produce visible UI until the page returns.
@@ -1167,7 +1226,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               // reducer fan-out; visible restoration hydrates only these exact
               // sessions from authoritative history.
               if (typeof frameSession === "string") {
-                hiddenDirtySessions.add(frameSession)
+                markHiddenDirtySession(frameSession)
                 streamContentInvalidator?.(frameSession, false)
               } else hiddenDirtyGlobal = true
               if (Date.now() - yielded >= STREAM_YIELD_MS) {
@@ -1214,6 +1273,21 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
             await wait(0)
           }
           if (!attempt.signal.aborted) {
+            console.warn("[global-sdk] event stream ended", JSON.stringify({
+              subscriber: streamSubscriber,
+              protocol: kind,
+              origin: (() => {
+                try {
+                  return new URL(server.http.url).origin
+                } catch {
+                  return "invalid-url"
+                }
+              })(),
+              durationMs: Date.now() - attemptStartedAt,
+              framesRead: streamStats.framesRead - attemptFramesBefore,
+              cursorPresent: streamCursor.lastEventID !== undefined,
+              reconnectAttempt: reconnectFailures + 1,
+            }))
             markServerStreamDead(streamKey)
             reconnectFailures++
             phaseTrace.reconnect({ failures: reconnectFailures })
@@ -1221,11 +1295,33 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
         } catch (error) {
           if (!isStreamClosed(error, attempt?.signal) && !streamErrorLogged) {
             streamErrorLogged = true
-            console.error("[global-sdk] event stream failed", {
-              url: server.http.url,
+            const errorDetails =
+              error instanceof Error
+                ? { name: error.name }
+                : error && typeof error === "object"
+                  ? Object.fromEntries(
+                      Object.entries(error).filter(([key]) => /^(name|code|status|statusText)$/i.test(key)),
+                    )
+                  : { name: typeof error }
+            // Renderer console spying stringifies extra arguments as
+            // `[object Object]`; emit a bounded JSON string so transport
+            // failures remain diagnosable in the desktop log. Keep raw error
+            // messages out because fetch errors can contain the secret SSE URL.
+            console.error("[global-sdk] event stream failed", JSON.stringify({
+              // Keep the origin for server correlation without logging URL
+              // paths, query parameters, or any configured credentials.
+              origin: (() => {
+                try {
+                  return new URL(server.http.url).origin
+                } catch {
+                  return "invalid-url"
+                }
+              })(),
               fetch: eventFetch ? "platform" : "webview",
-              error,
-            })
+              reconnectAttempt: reconnectFailures + 1,
+              cursorPresent: streamCursor.lastEventID !== undefined,
+              error: errorDetails,
+            }))
           }
           // A genuine failure (not an intentional stop/abort) means the server is
           // unreachable: drop liveness so the health poll resumes its checks.
@@ -1237,8 +1333,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
         } finally {
           abort.signal.removeEventListener("abort", onAbort)
           attempt = undefined
-          remoteInterestReady = false
-          remoteInterestAck = undefined
+          remoteInterest.setReady(false)
         }
 
         if (abort.signal.aborted || !started || generation !== active) return
@@ -1267,7 +1362,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
       // Visibility changes the EFFECTIVE transport interest even when the set
       // of mounted/active timelines itself did not change. Keep lifecycle/status
       // frames flowing, but stop timeline bytes at the server while occluded.
-      queueRemoteInterest()
+      updateEffectiveStreamInterest()
       if (hidden) {
         // Keep the stream alive, but do not spend renderer work reducing token
         // fragments while Chromium has throttled the window. Record exactly
@@ -1278,7 +1373,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           (event) => {
             const sessionID = serverEventSessionID(event.payload)
             if (sessionID) {
-              hiddenDirtySessions.add(sessionID)
+              markHiddenDirtySession(sessionID)
               streamContentInvalidator?.(sessionID, false)
             } else hiddenDirtyGlobal = true
           },
@@ -1314,6 +1409,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     queue.clear()
     if (remoteInterestRetry !== undefined) clearTimeout(remoteInterestRetry)
     remoteInterestRetry = undefined
+    remoteInterest.dispose()
   })
 
   const sdk = createSdkForServer({
@@ -1377,21 +1473,9 @@ export function createServerSdkContext(server: ServerConnection.Any, scope: Serv
   })
 }
 
-export const { use: useServerSDK, provider: ServerSDKProvider } = createSimpleContext({
+export const { use: useServerSDK, provider: ServerSDKValueProvider } = createSimpleContext({
   name: "ServerSDK",
-  // Returns an accessor so the resolved server can change reactively (e.g. a
-  // /new-session draft retargeting its server) without re-instantiating the subtree.
-  init: (props: { server?: Accessor<ServerConnection.Any | undefined> }) => {
-    const global = useGlobal()
-    const language = useLanguage()
-    const server = useServer()
-
-    return createMemo<ServerSDK>(() => {
-      const conn = props.server?.() ?? server.current
-      if (!conn) throw new Error(language.t("error.serverSDK.noServerAvailable"))
-      return global.ensureServerCtx(conn).sdk
-    })
-  },
+  init: (props: { value: Accessor<ServerSDK> }) => props.value,
 })
 
 export function useServerProtocol() {

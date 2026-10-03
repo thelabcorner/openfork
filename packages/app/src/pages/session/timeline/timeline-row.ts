@@ -15,6 +15,15 @@ export namespace TimelineRow {
     userMessageID: string
     anchor: boolean
   }> {}
+  /** First-class current context events that are not provider-user turns.
+   * These stay outside SDK user-message normalization so System/skill
+   * semantics are never misrepresented as human input. */
+  export class ContextMessage extends Data.TaggedClass("ContextMessage")<{
+    messageID: string
+    kind: "system" | "skill"
+    preview: string
+    text: string
+  }> {}
   /**
    * Server-injected context attached to this turn (`synthetic: true` text
    * parts). Carries only SCALARS: the segment texts live in the part store and
@@ -64,6 +73,7 @@ export namespace TimelineRow {
     | TurnGap
     | CommentStrip
     | UserMessage
+    | ContextMessage
     | SystemInjection
     | TurnDivider
     | AssistantPart
@@ -95,6 +105,8 @@ export namespace TimelineRow {
         return `comment-strip:${row.userMessageID}`
       case "UserMessage":
         return `user-message:${row.userMessageID}`
+      case "ContextMessage":
+        return `context-message:${row.messageID}`
       case "SystemInjection":
         return `system-injection:${row.userMessageID}`
       case "TurnDivider":

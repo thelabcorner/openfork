@@ -105,8 +105,6 @@ const QUOTA_PROVIDER_ALIASES: Record<string, string> = {
   openrouter: "openrouter",
   workbuddy: "workbuddy",
   codebuddy: "workbuddy",
-  verdent: "verdent",
-  "verdent-free": "verdent",
   kimi: "kimi-for-coding",
   "kimi-for-coding": "kimi-for-coding",
   moonshot: "kimi-for-coding",
@@ -260,7 +258,7 @@ export function segmentsFromFork(windows: ReadonlyArray<ForkWindowUsage>): ArcSe
 }
 
 /**
- * WorkBuddy/Verdent: credits are per-request, per-account, and the promotional
+ * WorkBuddy: credits are per-request, per-account, and the promotional
  * models carry their own rolling window. The composer's question is "can I send
  * this model on this account", which needs all three of: the model's own
  * window, the account's total package balance (Tencent balance-checks before
@@ -273,7 +271,7 @@ export function segmentsFromCreditProvider(
 ): { segments: ArcSegment[]; scope: string | null } {
   const usage = result.usage
   if (!usage) return { segments: [], scope: null }
-  const accounts: WorkBuddyAccountLimits[] = usage.workbuddyAccounts ?? usage.verdentAccounts ?? []
+  const accounts: WorkBuddyAccountLimits[] = usage.workbuddyAccounts ?? []
   const labels = usage.accountLabels ?? {}
   const split: AccountModelParts = splitMultiAccountModelID(options.modelID ?? "")
   const bare = split.baseModelID ? split.baseModelID.replace(/#ctx-\d+$/, "") : undefined
@@ -460,7 +458,7 @@ export function buildArcModel(input: ArcInput): ArcModel {
     }
   }
 
-  const isCredit = result.providerId === "workbuddy" || result.providerId === "verdent"
+  const isCredit = result.providerId === "workbuddy"
   const free = result.providerId === "openrouter" ? openRouterFreeSegment(input.modelID, input.openRouterFree) : null
   const built = isCredit
     ? segmentsFromCreditProvider(result, { modelID: input.modelID, modelName: input.modelName })

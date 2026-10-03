@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2/client"
-import { aggregateSessionContextByModel, liveGenerationProgress } from "./session-context-model-metrics"
+import type { AssistantMessage, Message, Part, UsageSessionContextResponse } from "@opencode-ai/sdk/v2/client"
+import { aggregateSessionContextByModel, liveGenerationProgress, projectSessionContextSnapshot } from "./session-context-model-metrics"
 
 const assistant = (
   id: string,
@@ -1172,5 +1172,88 @@ describe("liveGenerationProgress", () => {
   test("never goes negative when now is very close to firstTokenAt", () => {
     const msg = inFlight({ created: 0, firstTokenAt: 1000 })
     expect(liveGenerationProgress(msg, undefined, 1000).generatedSeconds).toBe(0)
+  })
+})
+
+
+describe("projectSessionContextSnapshot", () => {
+  const snapshot = (telemetryMs = 0) =>
+    ({
+      history: {
+        sessionID: "ses_test",
+        createdAt: 1,
+        updatedAt: 9,
+        counts: { all: 20, user: 9, assistant: 11 },
+        systemPrompt: "system",
+        totals: {
+          messages: 11,
+          toolCalls: 4,
+          cost: 1.25,
+          freeMessages: 1,
+          tokens: { input: 1000, cacheRead: 2000, cacheWrite: 30, output: 400, reasoning: 100 },
+          freeTokens: { input: 10, cacheRead: 20, cacheWrite: 0, output: 5, reasoning: 0 },
+          generatedMs: 5000,
+          toolMs: 3000,
+          ttftMs: 2400,
+          ttftRecords: 4,
+          upstreamTTFTMs: 1200,
+          upstreamTTFTRecords: 4,
+        },
+        models: [
+          {
+            providerID: "openai",
+            modelID: "gpt-test",
+            variant: null,
+            providerName: "OpenAI",
+            modelName: "GPT Test",
+            messages: 11,
+            toolCalls: 4,
+            cost: 1.25,
+            freeMessages: 1,
+            tokens: { input: 1000, cacheRead: 2000, cacheWrite: 30, output: 400, reasoning: 100 },
+            freeTokens: { input: 10, cacheRead: 20, cacheWrite: 0, output: 5, reasoning: 0 },
+            generatedMs: 5000,
+            toolMs: 3000,
+            ttftMs: 2400,
+            ttftRecords: 4,
+            upstreamTTFTMs: 1200,
+            upstreamTTFTRecords: 4,
+            firstMessageTime: 2,
+            lastMessageTime: 8,
+            costRate: { input: 1, output: 2, cache: { read: 0.1, write: 1.2 } },
+          },
+        ],
+        breakdown: { system: 10, user: 100, synthetic: 20, shell: 0, compaction: 0, assistant: 200, tool: 300, other: 0 },
+      },
+      telemetry: {
+        sessionID: "ses_test",
+        phase: "idle",
+        updatedAt: 10,
+        generatedMs: telemetryMs,
+        toolMs: telemetryMs ? 4000 : 0,
+      },
+    }) as unknown as UsageSessionContextResponse
+
+  test("projects whole-session analytics without any client transcript input", () => {
+    const result = projectSessionContextSnapshot(snapshot())
+
+    expect(result.session.messageCount).toBe(11)
+    expect(result.session.total).toBe(3530)
+    expect(result.session.cost).toBe(1.25)
+    expect(result.session.cacheHitPercent).toBe(66.7)
+    expect(result.session.ttftSeconds).toBe(0.6)
+    expect(result.models).toHaveLength(1)
+    expect(result.models[0].providerLabel).toBe("OpenAI")
+    expect(result.models[0].modelLabel).toBe("GPT Test")
+    expect(result.models[0].messageCount).toBe(11)
+    expect(result.models[0].freeTokens.input).toBe(10)
+  })
+
+  test("uses the bounded live telemetry overlay for accumulated session timing", () => {
+    const result = projectSessionContextSnapshot(snapshot(9000))
+
+    expect(result.session.generatedSeconds).toBe(9)
+    expect(result.session.toolSeconds).toBe(4)
+    expect(result.models[0].generatedSeconds).toBe(5)
   })
 })

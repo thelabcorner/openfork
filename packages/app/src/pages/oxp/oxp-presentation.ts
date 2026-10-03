@@ -569,9 +569,15 @@ export function timelineEntries(ordered: readonly OxpInvocationInfo[]): Timeline
       entries.push({ kind: "marker", id: `handoff:${item.id}`, label: t("oxpActivity.divider.handoff") })
     }
 
+    // A still-running call is open-ended, so letting it extend the overlap
+    // window would paint every row beneath a long-lived background process with
+    // a concurrency rail forever. A running row already reads as running; only
+    // settled spans decide whether a *later* call overlapped something.
     const concurrent = startedAt < furthestEnd
-    const end = item.completedAt === undefined ? Number.POSITIVE_INFINITY : numeric(item.completedAt, startedAt)
-    if (end > furthestEnd) furthestEnd = end
+    if (item.completedAt !== undefined) {
+      const end = numeric(item.completedAt, startedAt)
+      if (end > furthestEnd) furthestEnd = end
+    }
 
     entries.push({ kind: "invocation", id: item.id, item, concurrent })
   }

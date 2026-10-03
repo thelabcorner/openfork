@@ -32,7 +32,11 @@ export function useProviders(
   // The compatibility global catalog is opt-in only; new server-level UI uses
   // the Tier-0 provider-settings / usage-pricing surfaces instead.
   createEffect(() => {
-    if (dir()) return
+    const directory = dir()
+    if (directory) {
+      serverSync().providers.ensureDirectory(directory)
+      return
+    }
     if (!options.allowGlobal) return
     serverSync().providers.ensure()
   })
@@ -56,6 +60,7 @@ export function useProviders(
 
   return {
     all: () => providers().all,
+    catalogStatus: () => providers().catalog?.status,
     default: () => providers().default,
     defaultModel: () => providers().defaultModel,
     popular: () =>

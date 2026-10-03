@@ -16,13 +16,13 @@ import {
   rootSessionFastPathUnavailable,
 } from "./global-sync/session-load"
 import {
-  createActiveSessionInfoWarmup,
   createDirectoryBootstrapGate,
   loadActiveSessionsQuery,
   loadMcpQuery,
   loadMcpResourcesQuery,
   seedActiveSessionStatuses,
   sessionIndexDirectory,
+  telemetryStatusTransition,
 } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
@@ -129,55 +129,50 @@ describe("MCP queries", () => {
 })
 
 describe("active session query", () => {
-  test("serializes background active-session info hydration", async () => {
-    const first = deferred<void>()
-    const calls: string[] = []
-    const warmup = createActiveSessionInfoWarmup(async (sessionID) => {
-      calls.push(`${sessionID}:start`)
-      if (sessionID === "a") await first.promise
-      calls.push(`${sessionID}:end`)
-    })
-
-    const done = warmup.push(["a", "b", "a"])
-
-    await Promise.resolve()
-    await Promise.resolve()
-    expect(calls).toEqual(["a:start"])
-    expect(warmup.pending()).toBe(2)
-
-    first.resolve()
-    await done
-
-    expect(calls).toEqual(["a:start", "a:end", "b:start", "b:end"])
-    expect(warmup.pending()).toBe(0)
+  test("reconciles status only on telemetry activity edges", () => {
+    expect(
+      telemetryStatusTransition({ previous: undefined, next: "generating", statusWorking: false, paused: false }),
+    ).toBe("busy")
+    expect(
+      telemetryStatusTransition({ previous: "reasoning", next: "generating", statusWorking: true, paused: false }),
+    ).toBeUndefined()
+    expect(
+      telemetryStatusTransition({ previous: "tool", next: "idle", statusWorking: true, paused: false }),
+    ).toBe("idle")
+    expect(
+      telemetryStatusTransition({ previous: undefined, next: "idle", statusWorking: true, paused: false }),
+    ).toBeUndefined()
+    expect(
+      telemetryStatusTransition({ previous: undefined, next: "generating", statusWorking: false, paused: true }),
+    ).toBeUndefined()
   })
 
-  test("continues active-session info hydration after an error", async () => {
-    const calls: string[] = []
-    const warmup = createActiveSessionInfoWarmup(async (sessionID) => {
-      calls.push(sessionID)
-      if (sessionID === "a") throw new Error("expected")
-    })
-
-    await warmup.push(["a", "b"])
-
-    expect(calls).toEqual(["a", "b"])
-    expect(warmup.pending()).toBe(0)
-  })
-
-  test("loads active sessions immediately and once per server cache", async () => {
+  test("loads active sessions once and seeds status without resolving info", async () => {
     let calls = 0
+    const session = createServerSession({} as OpencodeClient)
+    let resolveCalls = 0
+    const originalResolve = session.resolve
+    session.resolve = (...args) => {
+      resolveCalls += 1
+      return originalResolve(...args)
+    }
     const queryClient = new QueryClient()
-    const options = loadActiveSessionsQuery(ServerScope.local, {
-      active: async () => {
-        calls++
-        return { ses_running: { type: "running" } }
+    const options = loadActiveSessionsQuery(
+      ServerScope.local,
+      {
+        active: async () => {
+          calls++
+          return { ses_running: { type: "running" } }
+        },
       },
-    })
+      session,
+    )
 
     expect(await queryClient.fetchQuery(options)).toEqual({ ses_running: { type: "running" } })
     expect(await queryClient.fetchQuery(options)).toEqual({ ses_running: { type: "running" } })
     expect(calls).toBe(1)
+    expect(resolveCalls).toBe(0)
+    expect(session.data.session_status.ses_running).toEqual({ type: "busy" })
     expect(options.enabled).toBe(true)
     expect([...options.queryKey]).toEqual([ServerScope.local, "activeSessions"])
   })

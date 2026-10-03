@@ -22,6 +22,7 @@ import { popularProviders } from "@/hooks/use-providers"
 import { Button } from "@opencode-ai/ui/button"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
+import { Spinner } from "@opencode-ai/ui/spinner"
 import { Tag } from "@opencode-ai/ui/tag"
 import { Dialog } from "@opencode-ai/ui/dialog"
 import { List } from "@opencode-ai/ui/list"
@@ -32,7 +33,12 @@ import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ModelTooltip, formatCostPerMillion } from "./model-tooltip"
-import { getOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import {
+  getOpenRouterEndpoints,
+  normalizeOpenRouterEndpoints,
+  peekOpenRouterEndpoints,
+  type OpenRouterEndpoint,
+} from "@/utils/openrouter-endpoints"
 import {
   endpointCacheHit,
   endpointHeadlinePrice,
@@ -59,10 +65,9 @@ import {
   type ModelSectionSelection,
 } from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
-import { useForkUsage } from "@/context/fork-usage"
-import type { ForkCapacityPredictiveRange } from "@/utils/fork-client"
+import { useForkUsage, type CapacityWindow, type GeneralUsageView } from "@/context/fork-usage"
+import type { ForkCapacityPredictiveRange, ForkCapacityWindowCapacity } from "@/utils/fork-client"
 import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
-import { useVerdentUsage } from "@/hooks/use-verdent-usage"
 import { useGensparkUsage, formatCreditsPerMillion, type GensparkModelUsage } from "@/hooks/use-genspark-usage"
 import { WorkBuddyFreeBadge, workBuddyFreeLabel } from "./workbuddy-free-badge"
 import { useLayout } from "@/context/layout"
@@ -103,6 +108,7 @@ import {
   isFreeModel,
 } from "@/utils/model-cost"
 import { buildStandardWorkloadCorpus, type CorpusBands } from "@/utils/model-usage-yield"
+import { evaluateGeneralUsageYield } from "@/utils/model-general-yield"
 
 type LocalModelState = ReturnType<typeof useLocal>["model"]
 export type ModelSelectorModelState = Pick<
@@ -115,11 +121,35 @@ export type ModelSelectorModelState = Pick<
 type ModelState = ModelSelectorModelState
 type ModelItem = ReturnType<ModelState["list"]>[number]
 type UsageTone = "danger" | "warning" | "success"
+type ThresholdPricing = Array<{
+  thresholdTokens: number
+  operator: "<=" | ">"
+  cost: { input: number; output: number; cache: { read: number; write: number } }
+}>
 type ModelUsage = {
-  percent: number
+  /** Present only when an actual quota/resource denominator supplied usage %. */
+  percent?: number
+  general?: GeneralUsageView
+  /**
+   * Requests per $1 this model would buy for the user's own recent workload,
+   * priced through this model's current tiers. Supplementary economics, NOT a
+   * remaining-request count — only rendered when Capacity has no direct
+   * estimate for the row.
+   */
+  generalYieldPerDollar?: number
+  /** Typical generalized request context as a fraction of this model's limit. */
+  generalContextLoad?: number
   estimatedRequests?: number
   personalized?: boolean
   predictiveRange?: ForkCapacityPredictiveRange
+  /**
+   * Additive full-window capacity per published window, carried straight off the
+   * server projection. The inspector draws its headline 5h/Week range from these
+   * point totals repriced through the user's own workload; when they are absent
+   * it falls back to the single 5-hour remaining estimate. Never derived here: a
+   * window total is a server-owned fact.
+   */
+  capacityWindows?: CapacityWindow[]
   remainingPercent?: number
   capacityStatus?: "ready" | "learning" | "unavailable" | "unlimited"
   capacityReason?: string
@@ -294,35 +324,40 @@ const ModelList: Component<{
             const usage = () => forkUsage.capacityFor(i.provider.id, i.id, split.accountID)
             return (
               <Show when={usage()}>
-                {(value) => (
-                  <Show
-                    when={
-                      value().estimatedRequests !== undefined ||
-                      value().remainingPercent !== undefined ||
-                      value().status === "learning"
-                    }
-                  >
-                    <ModelStretchBar
-                      requests={value().estimatedRequests ?? 0}
-                      remainingPercent={value().remainingPercent}
-                      tone={
-                        value().remainingPercent !== undefined
-                          ? (toneForRemaining(value().remainingPercent ?? null) as UsageTone)
-                          : (stretchTone(value().estimatedRequests ?? 0) as UsageTone)
-                      }
-                    />
-                    <span
-                      class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint"
-                      title={value().reason}
+                {(value) => {
+                  // Read each optional fact once: `value()` is an accessor, so
+                  // a second call gives no narrowing and a `?? 0` here would
+                  // fabricate a depleted quota out of an unknown estimate.
+                  const remainingPercent = value().remainingPercent
+                  const estimatedRequests = value().estimatedRequests
+                  return (
+                    <Show
+                      when={estimatedRequests !== undefined || remainingPercent !== undefined || value().status === "learning"}
                     >
-                      {value().estimatedRequests !== undefined
-                        ? `~${Math.round(value().estimatedRequests ?? 0).toLocaleString()}`
-                        : value().status === "learning"
-                          ? "Learning"
-                          : "—"}
-                    </span>
-                  </Show>
-                )}
+                      <ModelStretchBar
+                        requests={estimatedRequests}
+                        remainingPercent={remainingPercent}
+                        tone={
+                          remainingPercent !== undefined
+                            ? (toneForRemaining(remainingPercent) as UsageTone)
+                            : estimatedRequests !== undefined
+                              ? (stretchTone(estimatedRequests) as UsageTone)
+                              : undefined
+                        }
+                      />
+                      <span
+                        class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint"
+                        title={value().reason}
+                      >
+                        {estimatedRequests !== undefined
+                          ? `~${Math.round(estimatedRequests).toLocaleString()}`
+                          : value().status === "learning"
+                            ? "Learning"
+                            : "—"}
+                      </span>
+                    </Show>
+                  )
+                }}
               </Show>
             )
           })()}
@@ -347,12 +382,34 @@ function ModelRowMeta(props: { item: ModelItem; usage?: ModelUsage; price: JSX.E
   return (
     <Show
       when={props.usage?.estimatedRequests !== undefined || props.usage?.remainingPercent !== undefined}
-      fallback={<span class="shrink-0 tabular-nums text-v2-text-text-faint">{props.price}</span>}
+      fallback={
+        <div class="flex shrink-0 items-center gap-1.5 tabular-nums text-v2-text-text-faint">
+          {props.price}
+          {/* Only reached when Capacity had no direct estimate for this model.
+              Deliberately a $/request yield, never a fake "~N left": there is
+              no quota denominator to divide by here. */}
+          <Show when={props.usage?.generalYieldPerDollar}>
+            {(perDollar) => (
+              <span
+                class="text-[9px] leading-5"
+                title={language.t("model.tooltip.generalUsage.requestsPerDollar")}
+              >
+                {Math.round(perDollar()).toLocaleString()} / $1
+              </span>
+            )}
+          </Show>
+          <Show when={props.usage?.generalYieldPerDollar === undefined && props.usage?.generalContextLoad !== undefined}>
+            <span class="text-[9px] leading-5" title={language.t("model.tooltip.generalUsage.contextLoad")}>
+              {Math.round((props.usage?.generalContextLoad ?? 0) * 100)}% ctx
+            </span>
+          </Show>
+        </div>
+      }
     >
       <ModelStretchBar
-        requests={props.usage?.estimatedRequests ?? 0}
+        requests={props.usage?.estimatedRequests}
         remainingPercent={props.usage?.remainingPercent}
-        tone={props.usage?.tone}
+        tone={props.usage?.tone as UsageTone | undefined}
       />
       <Show when={props.usage?.workbuddy}>
         {(workbuddy) => (
@@ -365,13 +422,17 @@ function ModelRowMeta(props: { item: ModelItem; usage?: ModelUsage; price: JSX.E
             title={
               workbuddy().creditsExhausted
                 ? `${workbuddy().account} · ${language.t("model.tooltip.workbuddy.noCredits")}`
-                : `${workbuddy().account} · ${workbuddy().rate > 0 ? `x${workbuddy().rate} credits/request` : "Free now"}`
+                : `${workbuddy().account} · ${
+                    workbuddy().rate > 0
+                      ? language.t("model.tooltip.workbuddy.rateValue", { rate: `x${workbuddy().rate}` })
+                      : language.t("model.tooltip.workbuddy.free")
+                  }`
             }
           >
             {workbuddy().creditsExhausted
               ? language.t("model.tag.noCredits")
               : workbuddy().free
-                ? "Free"
+                ? language.t("model.tag.free")
                 : `~${Number.isFinite(workbuddy().estimatedRequests) ? Math.round(workbuddy().estimatedRequests).toLocaleString() : "∞"}`}
           </span>
         )}
@@ -468,8 +529,9 @@ function OpenRouterEndpointList(props: {
       return ranked().length
     },
     getScrollElement: () => scrollRoot() ?? null,
-    initialRect: { width: 340, height: 360 },
-    estimateSize: () => 60,
+    initialRect: { width: 332, height: 336 },
+    // Rows are a fixed 46px (model-inspector.css `[data-endpoint]`) + 2px rhythm.
+    estimateSize: () => 48,
     overscan: 4,
     get getItemKey() {
       const snapshot = ranked()
@@ -494,8 +556,12 @@ function OpenRouterEndpointList(props: {
   }
 
   return (
-    <ScrollView class="max-h-[360px] w-full [&_.scroll-view__viewport]:overscroll-contain" viewportRef={setScrollRoot}>
-      <div class="relative" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+    <ScrollView
+      data-slot="pick-scroll"
+      class="max-h-[336px] w-full [&_.scroll-view__viewport]:overscroll-contain"
+      viewportRef={setScrollRoot}
+    >
+      <div class="relative mx-1 mb-1" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         <For each={virtualizer.getVirtualItems()}>
           {(virtualRow) => {
             const rankedEntry = ranked()[virtualRow.index]
@@ -513,11 +579,19 @@ function OpenRouterEndpointList(props: {
               entry.maxPromptTokens !== undefined && entry.maxPromptTokens !== entry.contextLength
                 ? entry.maxPromptTokens
                 : undefined
+            const hasLimits =
+              entry.contextLength !== undefined ||
+              maxPrompt !== undefined ||
+              entry.maxCompletionTokens !== undefined ||
+              entry.supportsImplicitCaching ||
+              supportedParameters.length > 0
             return (
               <div class="absolute inset-x-0 top-0" style={{ transform: `translateY(${virtualRow.start}px)` }}>
                 <MenuV2.Item
+                  data-slot="pick-row"
+                  data-endpoint
                   data-endpoint-index={virtualRow.index}
-                  class="w-full !h-auto !min-h-[60px] !items-stretch !gap-0 !p-0 [&_[data-slot=menu-v2-item-content]]:!flex [&_[data-slot=menu-v2-item-content]]:!flex-col [&_[data-slot=menu-v2-item-content]]:!items-stretch [&_[data-slot=menu-v2-item-content]]:!gap-0 [&_[data-slot=menu-v2-item-content]]:!p-0 [&_[data-slot=menu-v2-item-content]]:!flex-1"
+                  class="w-full"
                   data-selected={isSelected ? true : undefined}
                   tabIndex={
                     focusedIndex() === virtualRow.index || (focusedIndex() < 0 && virtualRow.index === 0) ? 0 : -1
@@ -531,160 +605,146 @@ function OpenRouterEndpointList(props: {
                   }}
                   onSelect={() => props.onPickProvider(entry.provider)}
                 >
-                  <div class="flex w-full flex-col justify-center gap-1 px-2 py-1.5">
-                    <div class="flex w-full items-center gap-1.5">
-                      <ProviderIcon
-                        id={providerIconId(entry.provider, entry.providerName)}
-                        class="size-3.5 shrink-0 opacity-70"
-                      />
-                      <span class="min-w-0 flex-1 truncate text-[12px] font-[450] leading-none tracking-[-0.02px] text-v2-text-text-base">
-                        {entry.providerName}
-                      </span>
-                      <Show when={quantization}>
-                        {(value) => (
-                          <TagV2
-                            variant="accent"
-                            class="!h-3.5 shrink-0 !px-1 !text-[9px] !font-[600] !leading-3"
-                            title={language.t("dialog.model.subprovider.quantization", { value: value() })}
-                          >
-                            {value()}
-                          </TagV2>
-                        )}
-                      </Show>
-                      <Show when={isBest}>
+                  {/* Identity, rank badges, headline price. */}
+                  <div data-slot="ep-line">
+                    <ProviderIcon
+                      id={providerIconId(entry.provider, entry.providerName)}
+                      class="size-3.5 shrink-0 opacity-75"
+                    />
+                    <span data-slot="ep-name">{entry.providerName}</span>
+                    <Show when={quantization}>
+                      {(value) => (
                         <span
-                          class="shrink-0 rounded-[3px] bg-v2-state-bg-success/10 px-1 py-0 text-[9px] font-[600] leading-3 tracking-[0.04px] text-v2-state-fg-success"
-                          title={language.t("dialog.model.subprovider.score", { score: Math.round(rankedEntry.score) })}
+                          data-slot="chip"
+                          data-tone="accent"
+                          title={language.t("dialog.model.subprovider.quantization", { value: value() })}
                         >
-                          {language.t("dialog.model.subprovider.best")}
+                          {value()}
                         </span>
-                      </Show>
+                      )}
+                    </Show>
+                    <Show when={isBest}>
                       <span
-                        class="shrink-0 text-[11px] font-[500] tabular-nums leading-none"
-                        classList={{
-                          "text-v2-state-fg-success": rankedEntry.cheapest,
-                          "text-v2-text-text-muted": !rankedEntry.cheapest,
-                        }}
-                        title={language.t("dialog.model.subprovider.priceBreakdown", {
-                          input: formatPricePerM(entry.pricing.prompt),
-                          output: formatPricePerM(entry.pricing.completion),
-                          cache: formatPricePerM(entry.pricing.cacheRead),
+                        data-slot="chip"
+                        data-tone="success"
+                        title={language.t("dialog.model.subprovider.score", { score: Math.round(rankedEntry.score) })}
+                      >
+                        {language.t("dialog.model.subprovider.best")}
+                      </span>
+                    </Show>
+                    <span
+                      data-slot="ep-price"
+                      data-tone={rankedEntry.cheapest ? "success" : undefined}
+                      title={language.t("dialog.model.subprovider.priceBreakdown", {
+                        input: formatPricePerM(entry.pricing.prompt),
+                        output: formatPricePerM(entry.pricing.completion),
+                        cache: formatPricePerM(entry.pricing.cacheRead),
+                      })}
+                    >
+                      {price}
+                    </span>
+                    <Show when={isSelected}>
+                      <Icon name="check" size="small" data-slot="pick-check" />
+                    </Show>
+                  </div>
+                  {/* Live quality: reliability, speed, cache, latency. */}
+                  <div data-slot="ep-line" data-level="2">
+                    <span data-slot="ep-metric" data-shrink>
+                      {entry.tag}
+                    </span>
+                    <Show when={uptime !== undefined}>
+                      <span
+                        data-slot="ep-metric"
+                        title={endpointUptimeTitle(entry, language)}
+                        style={{ color: colorFor(uptimeTone(uptime!)) }}
+                      >
+                        <span data-slot="uptime-dot" />
+                        {uptime!.toFixed(1)}%
+                      </span>
+                    </Show>
+                    <Show when={throughput !== undefined}>
+                      <span
+                        data-slot="ep-metric"
+                        data-tone={rankedEntry.fastest ? "success" : undefined}
+                        title={
+                          rankedEntry.fastest
+                            ? language.t("dialog.model.subprovider.fastest")
+                            : language.t("dialog.model.subprovider.throughput", {
+                                value: formatEndpointThroughput(throughput!),
+                              })
+                        }
+                      >
+                        {language.t("dialog.model.subprovider.throughput", {
+                          value: formatEndpointThroughput(throughput!),
+                        })}
+                      </span>
+                    </Show>
+                    <Show when={cacheHit !== undefined}>
+                      <span
+                        data-slot="ep-metric"
+                        data-tone={rankedEntry.bestCache ? "success" : undefined}
+                        title={
+                          rankedEntry.bestCache
+                            ? language.t("dialog.model.subprovider.bestCache")
+                            : language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })
+                        }
+                      >
+                        {language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })}
+                      </span>
+                    </Show>
+                    <Show when={entry.latencyP50 !== undefined}>
+                      <span
+                        data-slot="ep-metric"
+                        title={language.t("dialog.model.subprovider.latency", {
+                          value: formatEndpointLatency(entry.latencyP50!),
                         })}
                       >
-                        {price}
+                        {formatEndpointLatency(entry.latencyP50!)}
                       </span>
-                      <Show when={isSelected}>
-                        <Icon name="check" size="small" class="size-3 shrink-0 text-v2-text-text-accent" />
-                      </Show>
-                    </div>
-                    <div class="flex min-w-0 items-center gap-1 pl-5 text-[10px] font-[450] leading-none text-v2-text-text-faint">
-                      <span class="min-w-0 truncate tabular-nums">{entry.tag}</span>
-                      <Show when={uptime !== undefined}>
-                        <span
-                          class="inline-flex shrink-0 items-center gap-1 tabular-nums"
-                          title={endpointUptimeTitle(entry, language)}
-                        >
-                          <span
-                            class="size-1 shrink-0 rounded-full"
-                            style={{ "background-color": colorFor(uptimeTone(uptime!)) }}
-                          />
-                          <span style={{ color: colorFor(uptimeTone(uptime!)) }}>{uptime!.toFixed(1)}%</span>
-                        </span>
-                      </Show>
-                      <Show when={throughput !== undefined}>
-                        <span
-                          class="shrink-0 tabular-nums"
-                          classList={{ "text-v2-state-fg-success": rankedEntry.fastest }}
-                          title={
-                            rankedEntry.fastest
-                              ? language.t("dialog.model.subprovider.fastest")
-                              : language.t("dialog.model.subprovider.throughput", {
-                                  value: formatEndpointThroughput(throughput!),
-                                })
-                          }
-                        >
-                          ·{" "}
-                          {language.t("dialog.model.subprovider.throughput", {
-                            value: formatEndpointThroughput(throughput!),
+                    </Show>
+                  </div>
+                  {/* Static limits and capabilities. */}
+                  <Show when={hasLimits}>
+                    <div data-slot="ep-line" data-level="3">
+                      <Show when={entry.contextLength !== undefined}>
+                        <span data-slot="ep-metric">
+                          {language.t("dialog.model.subprovider.context", {
+                            value: formatEndpointTokens(entry.contextLength!),
                           })}
                         </span>
                       </Show>
-                      <Show when={cacheHit !== undefined}>
+                      <Show when={maxPrompt !== undefined}>
+                        <span data-slot="ep-metric">
+                          {language.t("dialog.model.subprovider.maxPrompt", {
+                            value: formatEndpointTokens(maxPrompt!),
+                          })}
+                        </span>
+                      </Show>
+                      <Show when={entry.maxCompletionTokens !== undefined}>
+                        <span data-slot="ep-metric">
+                          {language.t("dialog.model.subprovider.maxOutput", {
+                            value: formatEndpointTokens(entry.maxCompletionTokens!),
+                          })}
+                        </span>
+                      </Show>
+                      <Show when={entry.supportsImplicitCaching}>
+                        <span data-slot="ep-metric" title={language.t("dialog.model.subprovider.implicitCache")}>
+                          {language.t("dialog.model.subprovider.implicitCache")}
+                        </span>
+                      </Show>
+                      <Show when={supportedParameters.length > 0}>
                         <span
-                          class="shrink-0 tabular-nums"
-                          classList={{ "text-v2-state-fg-success": rankedEntry.bestCache }}
-                          title={
-                            rankedEntry.bestCache
-                              ? language.t("dialog.model.subprovider.bestCache")
-                              : language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })
-                          }
+                          data-slot="ep-metric"
+                          data-shrink
+                          title={language.t("dialog.model.subprovider.parameters.title", {
+                            list: supportedParameters.join(", "),
+                          })}
                         >
-                          · {language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })}
+                          {language.t("dialog.model.subprovider.parameters", { count: supportedParameters.length })}
                         </span>
                       </Show>
                     </div>
-                    <Show
-                      when={
-                        entry.contextLength !== undefined ||
-                        maxPrompt !== undefined ||
-                        entry.maxCompletionTokens !== undefined ||
-                        entry.latencyP50 !== undefined ||
-                        entry.supportsImplicitCaching ||
-                        supportedParameters.length > 0
-                      }
-                    >
-                      <div class="flex min-w-0 items-center gap-1 pl-5 text-[9px] font-[440] leading-none text-v2-text-text-faint">
-                        <Show when={entry.contextLength !== undefined}>
-                          <span class="shrink-0 tabular-nums">
-                            {language.t("dialog.model.subprovider.context", {
-                              value: formatEndpointTokens(entry.contextLength!),
-                            })}
-                          </span>
-                        </Show>
-                        <Show when={maxPrompt !== undefined}>
-                          <span class="shrink-0 tabular-nums">
-                            ·{" "}
-                            {language.t("dialog.model.subprovider.maxPrompt", {
-                              value: formatEndpointTokens(maxPrompt!),
-                            })}
-                          </span>
-                        </Show>
-                        <Show when={entry.maxCompletionTokens !== undefined}>
-                          <span class="shrink-0 tabular-nums">
-                            ·{" "}
-                            {language.t("dialog.model.subprovider.maxOutput", {
-                              value: formatEndpointTokens(entry.maxCompletionTokens!),
-                            })}
-                          </span>
-                        </Show>
-                        <Show when={entry.latencyP50 !== undefined}>
-                          <span
-                            class="shrink-0 tabular-nums"
-                            title={language.t("dialog.model.subprovider.latency", {
-                              value: formatEndpointLatency(entry.latencyP50!),
-                            })}
-                          >
-                            · {formatEndpointLatency(entry.latencyP50!)}
-                          </span>
-                        </Show>
-                        <Show when={entry.supportsImplicitCaching}>
-                          <span class="shrink-0" title={language.t("dialog.model.subprovider.implicitCache")}>
-                            · {language.t("dialog.model.subprovider.implicitCache")}
-                          </span>
-                        </Show>
-                        <Show when={supportedParameters.length > 0}>
-                          <span
-                            class="min-w-0 truncate"
-                            title={language.t("dialog.model.subprovider.parameters.title", {
-                              list: supportedParameters.join(", "),
-                            })}
-                          >
-                            · {language.t("dialog.model.subprovider.parameters", { count: supportedParameters.length })}
-                          </span>
-                        </Show>
-                      </div>
-                    </Show>
-                  </div>
+                  </Show>
                 </MenuV2.Item>
               </div>
             )
@@ -716,6 +776,7 @@ function OpenRouterRow(props: {
   loading: boolean
   period?: ReturnType<typeof deepSeekRatePeriod>
   hitRate?: number
+  thresholdPricing?: ThresholdPricing
   onActivate: () => void
   onDeactivate: () => void
   onToggleFavorite: () => void
@@ -783,77 +844,92 @@ function OpenRouterRow(props: {
         <MenuV2.Portal>
           <MenuV2.SubContent
             data-model-selector-submenu
-            class="overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
-            style={{ width: "348px", "min-width": "348px", "max-width": "calc(100vw - 24px)" }}
+            data-model-picker-sub
+            style={{ width: "340px", "min-width": "340px", "max-width": "calc(100vw - 24px)" }}
           >
-            <div
-              class="mb-1 border-b border-v2-border-border-muted px-3 pb-1.5"
-              style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
-            >
-              <ModelTooltip
-                model={props.item}
-                latest={props.item.latest}
-                free={isFreeModel(props.item as never)}
-                unlimited={isUnlimitedModel(props.item)}
-                usage={props.usage}
-                period={props.period}
-                hitRate={props.hitRate}
-                v2
-              />
-            </div>
-            <MenuV2.Item
-              data-selected={!props.pinned ? true : undefined}
-              onSelect={() => props.onPickProvider(undefined)}
-            >
-              <div class="min-w-0 flex-1">
-                <div class="truncate">{language.t("dialog.model.subprovider.auto")}</div>
-                <div class="truncate text-[9px] leading-3 text-v2-text-text-faint">
-                  {language.t("dialog.model.subprovider.auto.hint")}
+            <ModelTooltip
+              model={props.item}
+              latest={props.item.latest}
+              free={isFreeModel(props.item as never)}
+              unlimited={isUnlimitedModel(props.item)}
+              usage={props.usage}
+              period={props.period}
+              hitRate={props.hitRate}
+              thresholdPricing={props.thresholdPricing}
+              v2
+              embedded
+            />
+            <div data-slot="pick-section" data-grow>
+              <div data-slot="section-head">
+                <Icon name="globe" size="small" class="size-3 shrink-0" />
+                <span data-slot="section-label">{language.t("dialog.model.subprovider.providers")}</span>
+                <Show when={props.endpoints && props.endpoints.length > 0}>
+                  <span data-slot="count">{props.endpoints!.length}</span>
+                </Show>
+                <Show when={pinnedName()}>
+                  {(name) => (
+                    <span data-slot="section-aside" data-tone="accent" title={language.t("dialog.model.subprovider.pinned")}>
+                      <i aria-hidden="true" />
+                      <span>{name()}</span>
+                    </span>
+                  )}
+                </Show>
+              </div>
+              <div data-slot="pick-list">
+                <MenuV2.Item
+                  data-slot="pick-row"
+                  data-tall
+                  data-selected={!props.pinned ? true : undefined}
+                  onSelect={() => props.onPickProvider(undefined)}
+                >
+                  <span data-slot="pick-state" aria-hidden="true">
+                    <i data-slot="dot" />
+                  </span>
+                  <span data-slot="pick-stack">
+                    <span data-slot="pick-title">{language.t("dialog.model.subprovider.auto")}</span>
+                    <span data-slot="pick-hint">{language.t("dialog.model.subprovider.auto.hint")}</span>
+                  </span>
+                  <Show when={!props.pinned}>
+                    <Icon name="check" size="small" data-slot="pick-check" />
+                  </Show>
+                </MenuV2.Item>
+              </div>
+              <Show when={!props.loading && props.endpoints && props.endpoints.length > 0}>
+                <div data-slot="pick-divider" title={language.t("dialog.model.subprovider.balanced.hint")}>
+                  <span data-slot="section-label">{language.t("dialog.model.subprovider.balanced")}</span>
+                  <span data-slot="section-aside">
+                    <span>{language.t("dialog.model.subprovider.balanced.metrics")}</span>
+                  </span>
                 </div>
-              </div>
-              <Show when={!props.pinned}>
-                <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
               </Show>
-            </MenuV2.Item>
-            <MenuV2.Separator class="my-0.5" />
-            <Show when={props.endpoints && props.endpoints.length > 0}>
-              <div
-                class="flex h-5 items-center gap-1.5 px-2 text-[9px] font-[550] uppercase tracking-[0.055em] text-v2-text-text-faint"
-                title={language.t("dialog.model.subprovider.balanced.hint")}
-              >
-                <span>{language.t("dialog.model.subprovider.balanced")}</span>
-                <span class="ml-auto normal-case tabular-nums tracking-normal">
-                  {language.t("dialog.model.subprovider.balanced.metrics")}
-                </span>
-              </div>
-            </Show>
-            <Show
-              when={props.loading}
-              fallback={
-                <Show
-                  when={props.endpoints && props.endpoints.length > 0}
-                  fallback={
-                    <MenuV2.Item disabled>
-                      <span class="min-w-0 flex-1 truncate">
+              <Show
+                when={props.loading}
+                fallback={
+                  <Show
+                    when={props.endpoints && props.endpoints.length > 0}
+                    fallback={
+                      <div data-slot="pick-empty">
+                        <Icon name={props.endpoints === undefined ? "warning" : "status"} size="small" class="size-3" />
                         {props.endpoints === undefined
                           ? language.t("dialog.model.subprovider.error")
                           : language.t("dialog.model.subprovider.empty")}
-                      </span>
-                    </MenuV2.Item>
-                  }
-                >
-                  <OpenRouterEndpointList
-                    endpoints={props.endpoints!}
-                    pinned={props.pinned}
-                    onPickProvider={props.onPickProvider}
-                  />
-                </Show>
-              }
-            >
-              <MenuV2.Item disabled>
-                <span class="min-w-0 flex-1 truncate">{language.t("common.loading")}</span>
-              </MenuV2.Item>
-            </Show>
+                      </div>
+                    }
+                  >
+                    <OpenRouterEndpointList
+                      endpoints={props.endpoints!}
+                      pinned={props.pinned}
+                      onPickProvider={props.onPickProvider}
+                    />
+                  </Show>
+                }
+              >
+                <div data-slot="pick-empty">
+                  <Spinner class="size-3" />
+                  {language.t("common.loading")}
+                </div>
+              </Show>
+            </div>
           </MenuV2.SubContent>
         </MenuV2.Portal>
       </Show>
@@ -874,6 +950,14 @@ function MultiAccountRow(props: {
   usage?: ModelUsage
   priceLabel: string
   freeLabel?: string
+  /**
+   * Cache hit rate for this row's model, resolved once by the view from the
+   * already-materialized hit-rate maps. Passed down because a multi-account row
+   * is excluded from the shared floating card, so its embedded tooltip has no
+   * other source for this number.
+   */
+  hitRate?: number
+  thresholdPricing?: ThresholdPricing
   accountLabels?: Readonly<Record<string, string>> | ReadonlyMap<string, string>
   rowRef: (element: HTMLElement | undefined) => void
   onActivate: () => void
@@ -946,22 +1030,20 @@ function MultiAccountRow(props: {
         <MenuV2.Portal>
           <MenuV2.SubContent
             data-model-selector-submenu
-            class="overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
-            style={{ width: "300px", "min-width": "300px", "max-width": "calc(100vw - 24px)" }}
+            data-model-picker-sub
+            style={{ width: "320px", "min-width": "320px", "max-width": "calc(100vw - 24px)" }}
           >
-            <div
-              class="mb-1 min-w-0 w-full overflow-hidden border-b border-v2-border-border-muted px-2.5 pb-1 [&>div]:!w-full [&>div]:!max-w-full"
-              style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
-            >
-              <ModelTooltip
-                model={props.item}
-                latest={props.item.latest}
-                free={isFreeModel(props.item as never)}
-                unlimited={isUnlimitedModel(props.item)}
-                usage={props.usage}
-                v2
-              />
-            </div>
+            <ModelTooltip
+              model={props.item}
+              latest={props.item.latest}
+              free={isFreeModel(props.item as never)}
+              unlimited={isUnlimitedModel(props.item)}
+              usage={props.usage}
+              thresholdPricing={props.thresholdPricing}
+              hitRate={props.hitRate}
+              v2
+              embedded
+            />
             <AccountOptionList
               variants={props.variants}
               auto={props.auto}
@@ -1817,7 +1899,7 @@ function createModelSelectorController(input: {
   })
   // Account pinned on the current model, including ids the group index never
   // saw (synthesized submenu rows). Falls back to parsing the transport
-  // suffix (`model@vd-…`, `model@zen-…`) so the checkmark survives.
+  // suffix (for example `model@zen-…`) so the checkmark survives.
   const currentAccountID = createMemo(() => {
     const value = model.current()
     if (!value) return undefined
@@ -1918,7 +2000,7 @@ function ModelSelectorPopoverV2View(props: {
   current: () => string | undefined
   currentVariant: () => { accountID: string; item: ModelItem } | undefined
   /** Account id parsed from the current model's transport suffix (`@zen-…`,
-   * `@vd-…`) when the pinned variant is not in the group index (e.g. a
+   * account suffix when the pinned variant is not in the group index (e.g. a
    * synthesized submenu for go keys the catalog cache hasn't refreshed). */
   currentAccountID?: () => string | undefined
   groupOf: (item: ModelItem) => ModelGroup<ModelItem> | undefined
@@ -1963,8 +2045,8 @@ function ModelSelectorPopoverV2View(props: {
     modelState()?.order?.set("rail", ids)
   }
   const forkUsage = useForkUsage()
-  // Provider catalog refresh (see selectAccount step 2b): the Verdent/Zen
-  // models hooks emit per-account ids at provider-load time, but the app
+  // Provider catalog refresh (see selectAccount step 2b): multi-account
+  // provider hooks emit per-account ids at provider-load time, but the app
   // caches that catalog while quota reads the vault live — accounts enrolled
   // after load (vault edit) appear in the submenu but not the catalog until
   // the `providers` queries are refetched. Same degrade-on-missing pattern.
@@ -1985,7 +2067,10 @@ function ModelSelectorPopoverV2View(props: {
   createEffect(() => {
     if (props.lightweight || !store.open) return
     void personal?.ensure()
-    void forkUsage.ensureCapacity()
+    // Land the local generalized projection first so every row can show a
+    // useful workload/cost estimate without waiting on remote provider quota
+    // fan-out. Direct quota-backed capacity follows immediately afterward.
+    void forkUsage.ensureGeneralUsage().finally(() => void forkUsage.ensureCapacity())
   })
   const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
   const limits = props.lightweight
@@ -2004,9 +2089,6 @@ function ModelSelectorPopoverV2View(props: {
         result: () => undefined,
       } as ReturnType<typeof useWorkBuddyUsage>)
     : useWorkBuddyUsage({ limits })
-  const verdent = props.lightweight
-    ? ({ forModel: () => undefined, result: () => undefined } as ReturnType<typeof useVerdentUsage>)
-    : useVerdentUsage({ limits })
   const genspark = props.lightweight
     ? ({
         remainingCredits: () => undefined,
@@ -2017,14 +2099,12 @@ function ModelSelectorPopoverV2View(props: {
     : useGensparkUsage({ limits })
   // Account labels for the model picker — the server's model names are cached
   // in Provider.list() and still carry the old numeric label until the cache is
-  // invalidated after a vault edit. Quota's `verdentAccounts`/`workbuddyAccounts`
-  // are live (read directly from the vault on every poll), so prefer those.
+  // invalidated after a vault edit. Quota's `workbuddyAccounts` rows are
+  // live (read directly from the vault on every poll), so prefer those.
   const accountLabels = createMemo(() => {
     const map = new Map<string, string>()
     for (const p of limits.providers() ?? []) {
       const usage = (p as any).result?.usage
-      for (const acct of usage?.verdentAccounts ?? [])
-        if (acct.accountId && acct.label) map.set(acct.accountId, acct.label)
       for (const acct of usage?.workbuddyAccounts ?? [])
         if (acct.accountId && acct.label) map.set(acct.accountId, acct.label)
       for (const acct of usage?.zenAccounts ?? []) if (acct.keyId && acct.label) map.set(acct.keyId, acct.label)
@@ -2036,22 +2116,6 @@ function ModelSelectorPopoverV2View(props: {
     // the zenAccounts rows above.
     for (const cred of forkUsage.credentials.latest ?? []) if (cred.id && cred.label) map.set(cred.id, cred.label)
     return map.size > 0 ? map : undefined
-  })
-  // Verdent accounts as reported live by the quota adapter (`verdentAccounts`),
-  // used to synthesize the account submenu when the catalog exposes no
-  // per-account model variants.
-  const verdentAccounts = createMemo<{ accountId: string; label: string }[]>(() => {
-    const out: { accountId: string; label: string }[] = []
-    const seen = new Set<string>()
-    for (const p of limits.providers() ?? []) {
-      const usage = (p as any).result?.usage
-      for (const acct of usage?.verdentAccounts ?? []) {
-        if (!acct?.accountId || seen.has(acct.accountId)) continue
-        seen.add(acct.accountId)
-        out.push({ accountId: acct.accountId, label: acct.label ?? acct.accountId })
-      }
-    }
-    return out
   })
   const zenKeyLimits = createMemo(() => {
     const map = new Map<
@@ -2071,7 +2135,7 @@ function ModelSelectorPopoverV2View(props: {
     return map
   })
   // Backend variants exist only for providers whose plugin emits them
-  // (workbuddy, verdent, and Zen's `opencode`). opencode-go keys live in the
+  // (WorkBuddy and Zen's `opencode`). opencode-go keys live in the
   // fork credential store, so they never arrive as catalog variants. When a
   // provider has >1 key/credential but no collapsed group, synthesize a
   // display-only group so the row renders the account submenu (which embeds
@@ -2116,15 +2180,6 @@ function ModelSelectorPopoverV2View(props: {
           item: labeledClone(keyId, info.label),
         })),
       )
-    // Verdent: fall back to the quota-reported account list when the catalog
-    // exposes no per-account variants.
-    if (item.provider.id === "verdent" && verdentAccounts().length > 1)
-      return build(
-        verdentAccounts().map((acct) => ({
-          accountID: acct.accountId,
-          item: labeledClone(acct.accountId, acct.label),
-        })),
-      )
     // Suppress "unused param" for plainClone — kept for any future source
     // that needs the un-labeled shape.
     void plainClone
@@ -2135,7 +2190,6 @@ function ModelSelectorPopoverV2View(props: {
     {
       sourceGroup: ModelGroup<ModelItem> | undefined
       zenSize: number
-      verdentLen: number
       result: ModelGroup<ModelItem> | undefined
     }
   >()
@@ -2144,12 +2198,10 @@ function ModelSelectorPopoverV2View(props: {
     const key = modelKey(item)
     const sourceGroup = props.groupOf(item)
     const zenSize = zenKeyLimits().size
-    const verdentLen = verdentAccounts().length
     const cached = accountGroupCache.get(key)
-    if (cached && cached.sourceGroup === sourceGroup && cached.zenSize === zenSize && cached.verdentLen === verdentLen)
-      return cached.result
+    if (cached && cached.sourceGroup === sourceGroup && cached.zenSize === zenSize) return cached.result
     const result = buildAccountGroup(item, sourceGroup)
-    accountGroupCache.set(key, { sourceGroup, zenSize, verdentLen, result })
+    accountGroupCache.set(key, { sourceGroup, zenSize, result })
     return result
   }
 
@@ -2160,6 +2212,19 @@ function ModelSelectorPopoverV2View(props: {
   const tablesLatest = () => props.tables?.() ?? localTables.latest
   const profileTable = () => tablesLatest()?.profile ?? []
   const pricingTable = () => tablesLatest()?.pricing ?? []
+  const preparedThresholdPricing = createMemo(() => {
+    const pricing = pricingTable()
+    return pricing.length > 0 ? prepareThresholdIndex(pricing) : undefined
+  })
+  const thresholdPricingFor = (item: ModelItem): ThresholdPricing | undefined => {
+    const prepared = preparedThresholdPricing()
+    if (!prepared) return undefined
+    return collectThresholdPricingFromIndex(prepared, {
+      name: item.name,
+      family: (item as unknown as { family?: string }).family,
+      id: item.id,
+    }) as ThresholdPricing | undefined
+  }
   // OpenRouter endpoint metadata is server-scoped. Do not acquire the
   // directory-owned SDK merely to reach these unified-SDK routes; global
   // surfaces such as /scheduled intentionally have no ambient SDKProvider.
@@ -2305,6 +2370,16 @@ function ModelSelectorPopoverV2View(props: {
     if (openRouterFb) for (const [k, v] of openRouterFb.entries()) if (!combined.has(k)) combined.set(k, v)
     return combined
   })
+  // O(1) per-row hit rate: the provider:model key first, then the cross-provider
+  // model-id average. Both inputs are Maps already materialized above, so this is
+  // two map hits per render — no new fetch, scan, or history work. Embedded
+  // submenu tooltips (multi-account rows included) read it through here instead
+  // of the durable personal store, which V2 hover must never bind.
+  const hitRateForItem = (item: ModelItem): number | undefined => {
+    const direct = combinedHitRates()?.get(modelKey(item))
+    if (direct !== undefined) return direct
+    return combinedHitRateFallback()?.get(item.id)
+  }
   let searchRef: HTMLInputElement | undefined
   let contentRef: HTMLDivElement | undefined
   let railListRef: HTMLDivElement | undefined
@@ -2327,31 +2402,7 @@ function ModelSelectorPopoverV2View(props: {
       { model },
       { throwOnError: true },
     )
-    const perMillion = (value: number) => (Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value)
-    const endpoints: OpenRouterEndpoint[] = endpointsResponse.data.map((entry) => {
-      return {
-        providerName: entry.providerName,
-        tag: entry.tag,
-        provider: entry.provider,
-        pricing: {
-          prompt: perMillion(Number(entry.pricing.prompt)),
-          completion: perMillion(Number(entry.pricing.completion)),
-          cacheRead: perMillion(Number(entry.pricing.cacheRead)),
-        },
-        uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
-        quantization: entry.quantization,
-        contextLength: entry.contextLength === undefined ? undefined : Number(entry.contextLength),
-        maxCompletionTokens: entry.maxCompletionTokens === undefined ? undefined : Number(entry.maxCompletionTokens),
-        maxPromptTokens: entry.maxPromptTokens === undefined ? undefined : Number(entry.maxPromptTokens),
-        supportedParameters: entry.supportedParameters ? [...entry.supportedParameters] : undefined,
-        supportsImplicitCaching: entry.supportsImplicitCaching,
-        latencyP50: entry.latencyP50 === undefined ? undefined : Number(entry.latencyP50),
-        throughputP50: entry.throughputP50 === undefined ? undefined : Number(entry.throughputP50),
-        uptime5m: entry.uptime5m === undefined ? undefined : Number(entry.uptime5m),
-        uptime1d: entry.uptime1d === undefined ? undefined : Number(entry.uptime1d),
-        status: entry.status === undefined ? undefined : Number(entry.status),
-      }
-    })
+    const endpoints = normalizeOpenRouterEndpoints(endpointsResponse.data)
     // Before the slower historical telemetry arrives, 30m endpoint throughput
     // can already participate in ranking; missing cache-hit simply removes that
     // dimension until enrichment rather than inventing a value.
@@ -2409,9 +2460,18 @@ function ModelSelectorPopoverV2View(props: {
   const ensureOpenRouter = (modelID: string) => {
     const existing = openRouterStore[modelID]
     if (existing?.loading || existing?.endpoints !== undefined) return
-    setOpenRouterStore(modelID, { loading: true, endpoints: undefined })
-    void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then(async (result) => {
-      const endpoints = result ? await addOpenRouterTelemetry(modelID, result) : result
+    const cached = peekOpenRouterEndpoints(modelID)
+    // Stale endpoint topology is still much more useful than a spinner. The
+    // normal fetch below refreshes it, but submenu paint never waits on the
+    // network once this model has been observed or background-warmed.
+    setOpenRouterStore(modelID, {
+      loading: cached === undefined,
+      endpoints: cached,
+    })
+    void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then((endpoints) => {
+      // Endpoint topology is the critical-path answer. Publish it immediately;
+      // the independent 1w telemetry request is enrichment and must never hold
+      // the provider submenu behind another network round-trip.
       if (!disposed) setOpenRouterStore(modelID, { loading: false, endpoints })
       // Prune a stale pinned upstream provider that would brick the model.
       // OpenRouter returns 404 "No allowed providers are available" when
@@ -2425,6 +2485,14 @@ function ModelSelectorPopoverV2View(props: {
           local.model.subProvider.set(key, undefined)
         }
       }
+
+      // Empty is an authoritative topology result (aliases/removed models can
+      // legitimately have no pin-able upstream). Do not spend a second request
+      // on telemetry when there is nothing to enrich.
+      if (!endpoints || endpoints.length === 0) return
+      void addOpenRouterTelemetry(modelID, endpoints).then((enriched) => {
+        if (!disposed) setOpenRouterStore(modelID, { loading: false, endpoints: enriched })
+      })
     })
   }
 
@@ -2432,6 +2500,13 @@ function ModelSelectorPopoverV2View(props: {
   // Scanning across rows should stay entirely CSS-only; only a row that remains
   // hovered long enough gets a tooltip/submenu and the associated reactive work.
   const TOOLTIP_INTENT_DELAY = 64
+  // Kobalte focuses a menu item and writes the menu selection manager on every
+  // mouse `pointermove`, so scanning a catalog paid real DOM focus per pointer
+  // event. An ordinary row cancels that move and marks itself with this value;
+  // the admitted hover intent then pays that focus once, on the row the pointer
+  // actually settled on. Only ordinary rows carry the marker, so SubTrigger
+  // rows keep owning their own 100ms submenu-intent path untouched.
+  const DEFERRED_POINTER_FOCUS = "deferred"
   let hoverRaf = 0
   let hoverTimer: ReturnType<typeof setTimeout> | undefined
   let pendingActive: string | null = null
@@ -2439,10 +2514,13 @@ function ModelSelectorPopoverV2View(props: {
     hoverRaf = 0
     const next = pendingActive
     pendingActive = null
-    if (next !== null) {
-      if (store.active !== next) setStore("active", next)
-      setStore("tooltip", next)
-    }
+    if (next === null) return
+    if (store.active !== next) setStore("active", next)
+    setStore("tooltip", next)
+    const element = rowRefs.get(next)
+    if (element?.dataset.pointerFocus !== DEFERRED_POINTER_FOCUS) return
+    if (document.activeElement === element) return
+    element.focus({ preventScroll: true })
   }
   const cancelHoverIntent = () => {
     pendingActive = null
@@ -2568,16 +2646,50 @@ function ModelSelectorPopoverV2View(props: {
     }
     return map
   })
+  /**
+   * Requests per $1 this model would buy for the workload the user actually
+   * sends, derived from the server-owned general usage projection.
+   *
+   * This is a $/request yield, NOT a remaining-request count: there is no quota
+   * or resource denominator here, so it must never be rendered as
+   * "~N requests left". The row only shows it when Capacity has no direct
+   * estimate, and the tooltip carries the full detail.
+   */
+  const generalYieldPerDollar = (item: ModelItem, general: GeneralUsageView | undefined) => {
+    if (!general || !item.cost || isFreeModel(item as never) || isUnlimitedModel(item)) return undefined
+    const priced = evaluateGeneralUsageYield({
+      model: { id: item.id, name: item.name, provider: { id: item.provider.id } },
+      cost: item.cost,
+      general: general.workload,
+      source: general.source,
+      contextLimit: item.limit.context,
+      thresholdPricing: thresholdPricingFor(item),
+    })
+    if (!priced.priced || !priced.equivalentRequestsPerDollar) return undefined
+    return priced.equivalentRequestsPerDollar
+  }
+  const generalContextLoad = (item: ModelItem, general: GeneralUsageView | undefined) => {
+    const limit = item.limit.context
+    if (!general || !(Number.isFinite(limit) && limit > 0)) return undefined
+    return general.workload.contextTokens / limit
+  }
   const usageFor = (item: ModelItem): ModelUsage | undefined => {
+    const general = forkUsage.generalFor(item.provider.id, item.id)
+    const contextLoad = generalContextLoad(item, general)
     // OpenRouter's free-model allowance is a distinct provider-side quota pool,
     // not the paid model's monetary Capacity resource. Preserve that raw
     // telemetry for :free rows; every request-count projection below comes from
     // the shared server Capacity owner.
     if (isOpenRouterFreeModel(item)) {
       const report = freeUsage.data()
-      if (!report) return undefined
+      if (!report)
+        return general
+          ? { general, ...(contextLoad !== undefined ? { generalContextLoad: contextLoad } : {}) }
+          : undefined
       return {
         percent: report.free.usedPercent,
+        ...(general ? { general } : {}),
+        ...(contextLoad !== undefined ? { generalContextLoad: contextLoad } : {}),
         remainingPercent: report.free.remainingPercent,
         tone: openRouterFreeUsageTone(report.free.status),
       }
@@ -2585,16 +2697,31 @@ function ModelSelectorPopoverV2View(props: {
 
     const split = splitModelIDForProvider(item.id, item.provider.id)
     const estimate = forkUsage.capacityFor(item.provider.id, item.id, split.accountID)
-    if (!estimate) return undefined
+    // No direct capacity at all: the generalized yield is the only economic
+    // signal this row has, so compute it here (once, inside the idle-gated
+    // `usageMap` memo that already owns per-row work).
+    if (!estimate) {
+      const perDollar = generalYieldPerDollar(item, general)
+      return general
+        ? {
+            general,
+            ...(perDollar ? { generalYieldPerDollar: perDollar } : {}),
+            ...(contextLoad !== undefined ? { generalContextLoad: contextLoad } : {}),
+          }
+        : undefined
+    }
 
     const remainingPercent = estimate.remainingPercent
     const estimatedRequests = estimate.estimatedRequests
     return {
-      percent: remainingPercent !== undefined ? 100 - remainingPercent : 0,
+      ...(remainingPercent !== undefined ? { percent: 100 - remainingPercent } : {}),
+      ...(general ? { general } : {}),
+      ...(contextLoad !== undefined ? { generalContextLoad: contextLoad } : {}),
       ...(estimatedRequests !== undefined ? { estimatedRequests } : {}),
       ...(remainingPercent !== undefined ? { remainingPercent } : {}),
       personalized: estimate.personalized,
       ...(estimate.predictiveRange ? { predictiveRange: estimate.predictiveRange } : {}),
+      ...(estimate.capacityWindows ? { capacityWindows: estimate.capacityWindows } : {}),
       capacityStatus: estimate.status,
       ...(estimate.reason ? { capacityReason: estimate.reason } : {}),
       tone:
@@ -2645,16 +2772,34 @@ function ModelSelectorPopoverV2View(props: {
   })
   const tooltipUsage = createMemo(() => {
     const item = tooltipModel()
-    return item ? usageMap().get(modelKey(item)) : undefined
+    if (!item) return undefined
+    return usageMap().get(modelKey(item)) ?? (usageReady() && store.open ? usageFor(item) : undefined)
   })
   const tooltipHitRate = createMemo(() => {
     const item = tooltipModel()
     if (!item) return undefined
-    const key = modelKey(item)
-    const direct = combinedHitRates()?.get(key)
-    if (direct !== undefined) return direct
-    const fb = combinedHitRateFallback()?.get(item.id)
-    return fb
+    return hitRateForItem(item)
+  })
+  /**
+   * The pooled card's price, with its provenance attached.
+   *
+   * `resolveEffectiveCost` returns a substituted sibling-provider rate whenever
+   * the hovered provider published none, and the card needs that rate to explain
+   * the row — so the cost travels, and `inferred` travels with it. Resolving once
+   * here is what keeps the two in sync: they used to be two independent
+   * lookups, and when only the cost was threaded across, the card printed an
+   * inference as if this provider had published it. Provenance is per-hover
+   * display state, so it stays beside the price instead of being written onto
+   * the shared model object.
+   */
+  const tooltipPricing = createMemo(() => {
+    const item = tooltipModel()
+    if (!item) return undefined
+    const effective = resolveEffectiveCost(item, mergedPricingFallbackForDisplay())
+    return {
+      model: effective.borrowed ? ({ ...item, cost: effective.cost } as never) : item,
+      inferred: effective.borrowed,
+    }
   })
   const updateTooltipPosition = () => {
     const active = store.tooltip
@@ -2686,13 +2831,14 @@ function ModelSelectorPopoverV2View(props: {
       return
     }
     const MARGIN = 15
-    // Measure the tooltip container if it exists; fall back to estimates.
-    let measuredWidth = 236
-    let measuredHeight = 280
+    // Measure the card if it exists; fall back to the inspector's own width
+    // (model-inspector.css) plus its 1px border, and a typical height.
+    let measuredWidth = 302
+    let measuredHeight = 360
     if (tooltipEl) {
       const tooltipRect = tooltipEl.getBoundingClientRect()
-      measuredWidth = Math.round(tooltipRect.width) || 236
-      measuredHeight = Math.round(tooltipRect.height) || 280
+      measuredWidth = Math.round(tooltipRect.width) || 302
+      measuredHeight = Math.round(tooltipRect.height) || 360
     }
     const width = measuredWidth
     const height = measuredHeight
@@ -3273,6 +3419,8 @@ function ModelSelectorPopoverV2View(props: {
           endpoints={cached()?.endpoints}
           loading={cached()?.loading ?? false}
           period={deepSeekPeriod()}
+          hitRate={hitRateForItem(item)}
+          thresholdPricing={thresholdPricingFor(effectiveItem())}
           onActivate={() => {
             activate(navKey)
           }}
@@ -3302,6 +3450,8 @@ function ModelSelectorPopoverV2View(props: {
           usage={usage()}
           priceLabel={price()}
           freeLabel={workBuddyFreeLabel(workbuddy.rateFor(item.id))}
+          hitRate={hitRateForItem(item)}
+          thresholdPricing={thresholdPricingFor(effectiveItem())}
           accountLabels={accountLabels()}
           // View-level cached picker (`usageForAccountFor`, defined once
           // above): the 4-branch closure tree used to be rebuilt per row per
@@ -3331,11 +3481,17 @@ function ModelSelectorPopoverV2View(props: {
       <MenuV2.Item
         ref={setRowRef(navKey)}
         data-option-key={navKey}
+        data-pointer-focus={DEFERRED_POINTER_FOCUS}
         data-selected-model={current() ? true : undefined}
         classList={{ "!bg-v2-overlay-simple-overlay-hover": current() }}
         class="scroll-my-6 w-full hover:bg-v2-overlay-simple-overlay-hover"
         onMouseEnter={() => activate(navKey)}
         onMouseLeave={() => deactivate(navKey)}
+        // `MenuItemBase` runs this first, then focuses the row and updates the
+        // selection manager unless the move was cancelled. Cancelling keeps a
+        // fast scan CSS-only and costs no hover paint: `:hover` and
+        // `data-highlighted` resolve to the same overlay-hover token.
+        onPointerMove={(event) => event.preventDefault()}
         onSelect={() => selectModel(item)}
       >
         <ProviderIcon id={item.provider.id} class="size-3.5 shrink-0 opacity-60" />
@@ -3687,31 +3843,19 @@ function ModelSelectorPopoverV2View(props: {
                       updateTooltipPosition()
                     })
                   }}
-                  data-component="tooltip-v2"
-                  style={
-                    {
-                      position: "fixed",
-                      left: `${position().x}px`,
-                      top: `${position().y}px`,
-                      "pointer-events": "none",
-                      "z-index": 1000,
-                      "max-width": "calc(100vw - 30px)",
-                      "max-height": "calc(100vh - 30px)",
-                    } as never
-                  }
+                  data-component="model-inspector-float"
+                  style={{ transform: `translate3d(${position().x}px, ${position().y}px, 0)` }}
                 >
                   <ModelTooltip
-                    model={(() => {
-                      const m = item()
-                      const effective = resolveEffectiveCost(m, mergedPricingFallbackForDisplay())
-                      return effective.borrowed ? ({ ...m, cost: effective.cost } as never) : m
-                    })()}
+                    model={tooltipPricing()!.model}
+                    pricingInferred={tooltipPricing()!.inferred}
                     latest={item().latest}
                     free={isFreeModel(item() as never)}
                     unlimited={isUnlimitedModel(item())}
                     usage={tooltipUsage()}
                     period={deepSeekPeriod()}
                     hitRate={tooltipHitRate()}
+                    thresholdPricing={thresholdPricingFor(item())}
                     v2
                   />
                 </div>

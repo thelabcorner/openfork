@@ -11,6 +11,7 @@ const parentTitle = "Parent session"
 const childTitle = "Subagent child session"
 // Child session pages derive their heading from the task part that spawned them.
 const taskDescription = "Inspect child navigation"
+const childPrompt = "Inspect the child navigation flow and report what you find."
 
 type EventPayload = { directory: string; payload: Record<string, unknown> }
 
@@ -22,9 +23,14 @@ test("navigates to a subagent child session missing from the session list", asyn
 
   await expectSessionTitle(page, taskDescription)
   await expect(page.getByRole("heading", { name: parentTitle })).toHaveCount(0)
+  await expect(page).toHaveURL(new RegExp(`/server/.+/session/${childID}$`))
+})
 
-  const titlebarRight = page.locator("#opencode-titlebar-right")
-  await expect(titlebarRight.getByRole("button", { name: "Toggle review" })).toHaveCount(1)
+test("renders the delegated subagent host prompt in the child timeline", async ({ page }) => {
+  await setup(page, undefined, true)
+  await openChildFromParent(page)
+
+  await expect(page.getByText(childPrompt, { exact: true })).toBeVisible()
 })
 
 test("shows the not found fallback when the viewed session is deleted", async ({ page }) => {
@@ -43,7 +49,7 @@ test("shows the not found fallback when the viewed session is deleted", async ({
   await expect(page.getByRole("heading", { name: taskDescription })).toHaveCount(0)
 })
 
-async function setup(page: Page, events?: () => EventPayload[]) {
+async function setup(page: Page, events?: () => EventPayload[], includeChildPrompt = false) {
   await mockOpenCodeServer(page, {
     directory,
     project: {
@@ -68,7 +74,14 @@ async function setup(page: Page, events?: () => EventPayload[]) {
       default: { providerID: "opencode", modelID: "claude-opus-4-6" },
     },
     sessions: [session(parentID, parentTitle, 1700000000000), childSession()],
-    pageMessages: (sessionID) => ({ items: sessionID === parentID ? parentMessages() : [] }),
+    pageMessages: (sessionID) => ({
+      items:
+        sessionID === parentID
+          ? parentMessages()
+          : includeChildPrompt && sessionID === childID
+            ? childMessages()
+            : [],
+    }),
     events,
     eventRetry: events ? 16 : undefined,
   })
@@ -173,6 +186,33 @@ function parentMessages() {
             metadata: { sessionId: childID },
             time: { start: 1700000001000, end: 1700000002000 },
           },
+        },
+      ],
+    },
+  ]
+}
+
+function childMessages() {
+  const promptID = "msg_child_prompt_0001"
+  return [
+    {
+      info: {
+        id: promptID,
+        sessionID: childID,
+        role: "user",
+        time: { created: 1700000001000 },
+        agent: "explore",
+        model: { providerID: "opencode", modelID: "claude-opus-4-6" },
+        provenance: { owner: "host", source: "host.prompt" },
+      },
+      parts: [
+        {
+          id: "prt_child_prompt_text_0001",
+          sessionID: childID,
+          messageID: promptID,
+          type: "text",
+          text: childPrompt,
+          synthetic: true,
         },
       ],
     },

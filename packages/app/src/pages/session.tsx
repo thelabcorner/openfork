@@ -1990,9 +1990,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
 
   const halt = (sessionID: string) =>
     busy(sessionID)
-      ? sdk()
-          .api.session.interrupt({ sessionID })
-          .catch(() => {})
+      ? sdk().api.session.interrupt({ sessionID })
       : Promise.resolve()
 
   const revertMutation = useMutation(() => ({

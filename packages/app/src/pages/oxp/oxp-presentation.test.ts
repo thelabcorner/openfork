@@ -331,13 +331,55 @@ describe("timeline", () => {
     expect(rows.map((row) => (row as { concurrent: boolean }).concurrent)).toEqual([false, true, false])
   })
 
-  test("a still-running call marks everything after it as concurrent", () => {
+  test("a long-lived running call does not paint the rest of the transcript", () => {
+    // A background process that never settles would otherwise flag every row
+    // beneath it forever; the running row already reads as running.
     const base = new Date(2026, 0, 1, 10).getTime()
     const entries = timelineEntries([
       invocation({ id: "a", startedAt: base, completedAt: undefined, status: "running" }),
       invocation({ id: "b", startedAt: base + 500, completedAt: base + 900 }),
+      invocation({ id: "c", startedAt: base + 5_000, completedAt: base + 5_100 }),
     ])
     const rows = entries.filter((entry) => entry.kind === "invocation")
-    expect((rows[1] as { concurrent: boolean }).concurrent).toBe(true)
+    expect(rows.map((row) => (row as { concurrent: boolean }).concurrent)).toEqual([false, false, false])
+  })
+
+  test("a settled long call still flags the calls that overlapped it", () => {
+    const base = new Date(2026, 0, 1, 10).getTime()
+    const entries = timelineEntries([
+      invocation({ id: "a", startedAt: base, completedAt: base + 6_000 }),
+      invocation({ id: "b", startedAt: base + 900, completedAt: base + 1_100 }),
+      invocation({ id: "c", startedAt: base + 7_000, completedAt: base + 7_100 }),
+    ])
+    const rows = entries.filter((entry) => entry.kind === "invocation")
+    expect(rows.map((row) => (row as { concurrent: boolean }).concurrent)).toEqual([false, true, false])
+  })
+
+  // The timeline caches entry wrappers by id so a live refresh re-creates only
+  // the rows that actually changed instead of collapsing every expanded call.
+  // That cache is only sound while ids are unique within a render and stable
+  // across renders of the same transcript.
+  test("entry ids are unique and stable across renders", () => {
+    const base = new Date(2026, 0, 1, 10).getTime()
+    const items = [
+      invocation({ id: "a", startedAt: base, completedAt: base + 10, observedEpoch: 1 }),
+      invocation({
+        id: "b",
+        startedAt: base + 20,
+        completedAt: base + 30,
+        observedEpoch: 2,
+        continuityMarker: "handoff_advisory",
+      }),
+      invocation({ id: "c", startedAt: base + 40, hostRunID: "run_2", status: "running", completedAt: undefined }),
+    ]
+    const ids = timelineEntries(items).map((entry) => entry.id)
+
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(timelineEntries(items).map((entry) => entry.id)).toEqual(ids)
+    // A call settling must not renumber the entries around it.
+    const settled = items.map((item) =>
+      item.id === "c" ? invocation({ ...item, status: "success", completedAt: base + 60 }) : item,
+    )
+    expect(timelineEntries(settled).map((entry) => entry.id)).toEqual(ids)
   })
 })

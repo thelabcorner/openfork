@@ -1,4 +1,4 @@
-import { createRoot, createSignal, getOwner, onCleanup, runWithOwner, type Owner } from "solid-js"
+import { createMemo, createRoot, createSignal, getOwner, onCleanup, runWithOwner, type Owner } from "solid-js"
 import { createStore, type SetStoreFunction, type Store } from "solid-js/store"
 import { Persist, persisted } from "@/utils/persist"
 import type { VcsInfo } from "@opencode-ai/sdk/v2/client"
@@ -49,6 +49,7 @@ export function createChildStoreManager(input: {
   const mcpQueryToggles = new Map<string, (enabled: boolean) => void>()
   const activeDirectories = new Set<string>()
   const activationToggles = new Map<string, (enabled: boolean) => void>()
+  const catalogToggles = new Map<string, (enabled: boolean) => void>()
 
   const markKey = (key: DirectoryKey) => {
     if (!key) return
@@ -125,6 +126,7 @@ export function createChildStoreManager(input: {
     mcpQueryToggles.delete(key)
     activeDirectories.delete(key)
     activationToggles.delete(key)
+    catalogToggles.delete(key)
     const dispose = disposers.get(key)
     if (dispose) {
       dispose()
@@ -191,10 +193,16 @@ export function createChildStoreManager(input: {
           const [mcpRequested, setMcpRequested] = createSignal(false)
           const [mcpEnabled, setMcpEnabled] = createSignal(false)
           const [instanceQueriesEnabled, setInstanceQueriesEnabled] = createSignal(false)
+          const [catalogQueriesEnabled, setCatalogQueriesEnabled] = createSignal(false)
           // Deferred tier: lsp + references are not on critical paint and can
           // idle-delay to avoid the 36-request burst. They auto-enable after
           // instanceQueriesEnabled has been true for one idle callback.
           const [deferredQueriesEnabled, setDeferredQueriesEnabled] = createSignal(false)
+          // Keep the memo behind a stable method on the store. Solid's store
+          // setter treats a function value as an updater, so passing the memo
+          // itself to setStore would store its current Map instead of the
+          // accessor and make session_children() fail at render time.
+          let sessionChildren = () => new Map<string, string[]>()
 
           const pathQuery = useQuery(() => ({ ...input.queryOptions.path(key), enabled: instanceQueriesEnabled() }))
           const mcpQuery = useQuery(() => ({ ...input.queryOptions.mcp(key), enabled: mcpEnabled() }))
@@ -202,7 +210,7 @@ export function createChildStoreManager(input: {
           const lspQuery = useQuery(() => ({ ...input.queryOptions.lsp(key), enabled: deferredQueriesEnabled() }))
           const providerQuery = useQuery(() => ({
             ...input.queryOptions.providers(key),
-            enabled: instanceQueriesEnabled(),
+            enabled: catalogQueriesEnabled(),
           }))
           const referenceQuery = useQuery(() => ({
             ...input.queryOptions.references(key),
@@ -214,12 +222,11 @@ export function createChildStoreManager(input: {
             projectMeta: initialMeta,
             icon: initialIcon,
             get provider_ready() {
-              return instanceQueriesEnabled() && !providerQuery.isLoading
+              return catalogQueriesEnabled() && !providerQuery.isLoading
             },
             get provider() {
               const EMPTY = { all: new Map(), connected: [], default: {} }
               const catalog = safeQueryData(providerQuery, EMPTY)
-              if (catalog.all.size === 0 && input.global.provider.all.size > 0) return input.global.provider
               return catalog
             },
             config: {},
@@ -235,6 +242,7 @@ export function createChildStoreManager(input: {
               return referenceQuery.isLoading ? [] : (referenceQuery.data ?? [])
             },
             session: [],
+            session_children: () => sessionChildren(),
             sessionTotal: 0,
             session_status: {},
             session_working(id: string) {
@@ -267,10 +275,21 @@ export function createChildStoreManager(input: {
             part: {},
             part_text_accum_delta: {},
           })
+          sessionChildren = createMemo(() => {
+            const children = new Map<string, string[]>()
+            for (const item of child[0].session) {
+              if (!item.parentID) continue
+              const siblings = children.get(item.parentID)
+              if (siblings) siblings.push(item.id)
+              else children.set(item.parentID, [item.id])
+            }
+            return children
+          })
           children[key] = child
           disposers.set(key, dispose)
           mcpRequestToggles.set(key, setMcpRequested)
           mcpQueryToggles.set(key, setMcpEnabled)
+          catalogToggles.set(key, setCatalogQueriesEnabled)
           activationToggles.set(key, (value: boolean) => {
             setInstanceQueriesEnabled(value)
             if (!value) {
@@ -378,6 +397,14 @@ export function createChildStoreManager(input: {
   function activate(key: DirectoryKey) {
     if (activeDirectories.has(key)) return
     activeDirectories.add(key)
+    catalogToggles.get(key)?.(true)
+  }
+
+  // Catalog intent is Tier 2 and independent of execution/auxiliary bootstrap.
+  // A picker may ask for this without activating a directory session index.
+  function enableProviderQueries(directory: string) {
+    ensureChild(directory)
+    catalogToggles.get(directoryKey(directory))?.(true)
   }
 
   /**
@@ -441,6 +468,7 @@ export function createChildStoreManager(input: {
     mcp: (directory: string) => mcpDirectories.has(directoryKey(directory)),
     active: (directory: string) => activeDirectories.has(directoryKey(directory)),
     enableQueries,
+    enableProviderQueries,
     enableMcpQueries,
     disableMcp,
     disposeDirectory,

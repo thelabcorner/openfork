@@ -97,6 +97,7 @@ function errors(list: PromiseSettledResult<unknown>[]) {
 }
 
 const providerRev = new Map<string, number>()
+const SESSION_METADATA_BATCH_SIZE = 500
 
 export function clearProviderRev(scope: ServerScope, directory: string) {
   providerRev.delete(ScopedKey.from(scope, directory))
@@ -126,17 +127,6 @@ const scheduleRequest = <T>(
   run: () => Promise<T>,
   key?: string,
 ) => (requests ? requests.schedule(priority, run, { kind, key }) : Promise.resolve().then(run))
-
-function endpointStatus(error: unknown) {
-  if (!error || typeof error !== "object") return undefined
-  if ("status" in error) return Number((error as { status?: unknown }).status)
-  const response = "response" in error ? (error as { response?: unknown }).response : undefined
-  if (response && typeof response === "object" && "status" in response)
-    return Number((response as { status?: unknown }).status)
-  const cause = error instanceof Error && error.cause && typeof error.cause === "object" ? error.cause : undefined
-  if (cause && "status" in cause) return Number((cause as { status?: unknown }).status)
-  return undefined
-}
 
 // Concurrency-limited variant: a flat Promise.allSettled of 15 fetches per
 // directory × 6 active directories = 90 concurrent requests, saturating the
@@ -248,12 +238,9 @@ export const loadProjectsQuery = (
       retry(() =>
         scheduleRequest(requests, priority, "project-list", async () => {
           if (globalClient) {
-            try {
-              return (await globalClient.global.projects()).data ?? []
-            } catch (error) {
-              const status = endpointStatus(error)
-              if (status !== 404 && status !== 405) throw error
-            }
+            // The global catalog is Tier 0. Unsupported or failed reads must
+            // not fall through to the Instance-scoped legacy project group.
+            return (await globalClient.global.projects()).data ?? []
           }
           return api.list()
         }).then((projects) => {
@@ -374,7 +361,9 @@ export const loadProvidersQuery = (
     queryFn: () =>
       retry(async () => {
         if ((await protocol) === "v1" && legacy) {
-          const result = await scheduleRequest(requests, priority, "provider-list", () => legacy.provider.list())
+          const result = await scheduleRequest(requests, priority, "provider-list", () =>
+            legacy.provider.list(directory ? { directory } : undefined),
+          )
           return normalizeProviderList(result.data!)
         }
         const location = directory ? { location: { directory } } : undefined
@@ -423,13 +412,18 @@ export const loadAgentsQuery = (
     retry: 1,
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy)
-          return scheduleRequest(requests, priority, "agent-list", () => legacy.app.agents()).then((result) =>
+        const current = () =>
+          scheduleRequest(requests, priority, "agent-list", () => sdk.list({ location: { directory } })).then((result) =>
+            normalizeAgentList(result.data),
+          )
+
+        if ((await protocol) === "v1" && legacy) {
+          return scheduleRequest(requests, priority, "agent-list", () => legacy.app.agents({ directory })).then((result) =>
             normalizeAgentList(result.data ?? []),
           )
-        return scheduleRequest(requests, priority, "agent-list", () => sdk.list({ location: { directory } })).then(
-          (result) => normalizeAgentList(result.data),
-        )
+        }
+
+        return current()
       }),
   })
 
@@ -479,23 +473,20 @@ export const loadPathQuery = (
       // fall back to process.cwd(), which on desktop is commonly $HOME; that
       // used to bootstrap config/plugins/watchers for an otherwise unused home
       // instance before the real project even opened. Newer servers expose the
-      // same metadata on bootstrap-free /global/health. Keep /path as a strict
-      // compatibility fallback for older servers.
+      // same metadata on bootstrap-free /global/health. A failed or unsupported
+      // global read must never acquire a workspace as a fallback.
       if (directory === null) {
-        try {
+        return retry(async () => {
           const health = await scheduleRequest(requests, priority, "global-path", () => sdk.global.health())
           const path = (health.data as { path?: Path } | undefined)?.path
-          if (path?.home) return path
-        } catch (error) {
-          const status = endpointStatus(error)
-          if (status !== 404 && status !== 405) {
-            // A malformed/old health payload is equivalent to unsupported here;
-            // the compatibility /path call below remains authoritative.
+          if (!path?.home) {
+            throw new Error("OpenFork server did not provide global path metadata")
           }
-        }
+          return path
+        })
       }
       return retry(() =>
-        scheduleRequest(requests, priority, "path-get", () => sdk.path.get({ directory: directory ?? undefined })).then(
+        scheduleRequest(requests, priority, "path-get", () => sdk.path.get({ directory })).then(
           (result) => result.data!,
         ),
       )
@@ -531,6 +522,7 @@ export async function bootstrapDirectory(input: {
   scope: ServerScope
   mcp: boolean
   sdk: OpencodeClient
+  serverSDK: OpencodeClient
   api: CatalogApi & {
     readonly agent: AgentListApi
     readonly command: CommandListApi
@@ -621,7 +613,9 @@ export async function bootstrapDirectory(input: {
         retry(() =>
           (async () => {
             if ((await input.protocol) !== "v1") return
-            const x = await scheduleRequest(input.requests, "background", "session-status", () => input.sdk.session.status())
+            const x = await scheduleRequest(input.requests, "background", "session-status", () =>
+              input.sdk.session.status({ directory: input.directory }),
+            )
             if (!input.session) {
               input.setStore("session_status", x.data!)
               return
@@ -639,9 +633,26 @@ export async function bootstrapDirectory(input: {
             for (const [sessionID, status] of Object.entries(statuses)) {
               input.session.set("session_status", sessionID, reconcile(status))
             }
-            await resolveSessionsLimited(Object.keys(statuses), (sessionID) =>
-              input.session!.resolve(sessionID, { priority: "background" }).catch(() => undefined),
-            )
+            const missing = Object.keys(statuses).filter((sessionID) => !input.session!.get(sessionID))
+            for (let offset = 0; offset < missing.length; offset += SESSION_METADATA_BATCH_SIZE) {
+              const sessions = missing.slice(offset, offset + SESSION_METADATA_BATCH_SIZE)
+              const result = await scheduleRequest(
+                input.requests,
+                "background",
+                "session-metadata-batch",
+                () => input.serverSDK.global.sessionMetadata({ globalSessionMetadataInput: { sessions } }),
+              ).catch(() => undefined)
+              batch(() => {
+                // Status is authoritative even if a metadata row disappeared or
+                // this optional decoration request failed, matching the prior
+                // per-session best-effort hydration behavior.
+                for (const session of result?.data ?? []) {
+                  // A session event may have populated fresher metadata while
+                  // this background snapshot was in flight. Never replace it.
+                  if (!input.session!.get(session.id)) input.session!.remember(normalizeSessionInfo(session))
+                }
+              })
+            }
           })(),
         ),
       !seededProject &&

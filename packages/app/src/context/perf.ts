@@ -42,15 +42,41 @@ const FRAME_STALL_MS = 50
 let frameMonitorStarted = false
 let frameMonitorRefs = 0
 let frameHandle: number | undefined
-let longTaskObserver: PerformanceObserver | undefined
+let longFrameObserver: PerformanceObserver | undefined
+let frameWasHidden = typeof document !== "undefined" && document.hidden
+
+function resetFrameBaseline() {
+  frameLast = performance.now()
+  frameWasHidden = typeof document !== "undefined" && document.hidden
+}
+
+type LongAnimationFrameScript = {
+  duration?: number
+  invoker?: string
+  sourceURL?: string
+  sourceFunctionName?: string
+}
+
+export type LongAnimationFrameEntry = PerformanceEntry & {
+  blockingDuration?: number
+  renderStart?: number
+  styleAndLayoutStart?: number
+  scripts?: LongAnimationFrameScript[]
+}
 
 function frameLoop() {
   if (!ENABLED || !frameMonitorStarted) return
   const now = performance.now()
   const dt = now - frameLast
   frameLast = now
-  if (dt > acc.frameMax) acc.frameMax = dt
-  if (dt > FRAME_STALL_MS) acc.frameStalls++
+  const hidden = typeof document !== "undefined" && document.hidden
+  // Chromium throttles or suspends requestAnimationFrame for an occluded
+  // renderer. Those gaps are visibility transitions, not main-thread stalls.
+  if (!hidden && !frameWasHidden) {
+    if (dt > acc.frameMax) acc.frameMax = dt
+    if (dt > FRAME_STALL_MS) acc.frameStalls++
+  }
+  frameWasHidden = hidden
   frameHandle = requestAnimationFrame(frameLoop)
 }
 
@@ -58,21 +84,93 @@ function frameLoop() {
 // events/s) that dominate perceived jank. These are NOT in the SSE/reducer path.
 // Attribution container tells us whether the block is in the app bundle vs an
 // iframe/extension; a CPU profile in DevTools gives the exact function.
-function observeLongTasks() {
-  if (!ENABLED || typeof PerformanceObserver === "undefined") return
-  try {
-    const obs = new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) {
-        if (entry.duration < 100) continue
-        const attr = (entry as { attribution?: Array<{ containerSrc?: string; containerId?: string; name?: string }> }).attribution
-        const where = attr?.[0]?.containerSrc ?? attr?.[0]?.containerId ?? attr?.[0]?.name ?? "unknown"
-        console.warn(`[perf-longtask] ${entry.duration.toFixed(0)}ms · ${where}`)
-      }
+function finite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
+}
+
+const ATTRIBUTION_LOGS_PER_SECOND = 3
+const LOAF_MIN_MS = 50
+let attributionLogWindow = 0
+let attributionLogCount = 0
+
+export function longFrameEntryType(supported: readonly string[] | undefined): "long-animation-frame" | "longtask" {
+  return supported?.includes("long-animation-frame") ? "long-animation-frame" : "longtask"
+}
+
+function shortLabel(value: string | undefined, limit = 64) {
+  if (!value) return ""
+  const clipped = value.slice(0, 256)
+  const leaf = clipped.split(/[?#]/, 1)[0]!.split(/[\\/]/).at(-1) ?? clipped
+  return leaf.length > limit ? `${leaf.slice(0, limit - 1)}…` : leaf
+}
+
+export function formatLongAnimationFrame(entry: LongAnimationFrameEntry): string | undefined {
+  if (!finite(entry.duration) || entry.duration < LOAF_MIN_MS) return undefined
+  const end = entry.startTime + entry.duration
+  const renderMs = finite(entry.renderStart) ? Math.max(0, end - entry.renderStart) : undefined
+  const styleLayoutMs = finite(entry.styleAndLayoutStart) ? Math.max(0, end - entry.styleAndLayoutStart) : undefined
+  const topScripts = (entry.scripts ?? [])
+    .slice(0, 12)
+    .filter((script) => finite(script.duration) && script.duration > 0)
+    .sort((left, right) => (right.duration ?? 0) - (left.duration ?? 0))
+    .slice(0, 3)
+    .map((script) => {
+      const label = shortLabel(script.invoker || script.sourceFunctionName || script.sourceURL)
+      const file = script.sourceURL ? shortLabel(script.sourceURL, 48) : ""
+      return `${label || "script"} ${(script.duration ?? 0).toFixed(0)}ms${file && file !== label ? ` (${file})` : ""}`
     })
-    obs.observe({ entryTypes: ["longtask"] })
-    longTaskObserver = obs
+  return (
+    `[perf-loaf] ${entry.duration.toFixed(0)}ms` +
+    (finite(entry.blockingDuration) ? ` · blocking ${entry.blockingDuration.toFixed(0)}ms` : "") +
+    (renderMs !== undefined ? ` · render ${renderMs.toFixed(0)}ms` : "") +
+    (styleLayoutMs !== undefined ? ` · style/layout ${styleLayoutMs.toFixed(0)}ms` : "") +
+    (topScripts.length ? ` · scripts: ${topScripts.join(", ")}` : "")
+  )
+}
+
+function allowAttributionLog(now: number) {
+  if (now - attributionLogWindow >= 1000) {
+    attributionLogWindow = now
+    attributionLogCount = 0
+  }
+  if (attributionLogCount >= ATTRIBUTION_LOGS_PER_SECOND) return false
+  attributionLogCount++
+  return true
+}
+
+function observeLongFrames() {
+  if (!ENABLED || typeof PerformanceObserver === "undefined") return
+  const preferred = longFrameEntryType(PerformanceObserver.supportedEntryTypes)
+  const onEntry = (list: PerformanceObserverEntryList) => {
+    for (const entry of list.getEntries()) {
+      if (entry.entryType === "long-animation-frame") {
+        if (entry.duration < LOAF_MIN_MS || !allowAttributionLog(performance.now())) continue
+        const message = formatLongAnimationFrame(entry as LongAnimationFrameEntry)
+        if (message) console.warn(message)
+        continue
+      }
+      if (entry.duration < 100 || !allowAttributionLog(performance.now())) continue
+      const attr = (entry as PerformanceEntry & { attribution?: Array<{ containerSrc?: string; containerId?: string; name?: string }> }).attribution
+      const where = shortLabel(attr?.[0]?.containerSrc ?? attr?.[0]?.containerId ?? attr?.[0]?.name) || "unknown"
+      console.warn(`[perf-longtask] ${entry.duration.toFixed(0)}ms · ${where}`)
+    }
+  }
+  try {
+    let observer = new PerformanceObserver(onEntry)
+    if (preferred === "long-animation-frame") {
+      try {
+        observer.observe({ type: "long-animation-frame", buffered: false })
+      } catch {
+        observer.disconnect()
+        observer = new PerformanceObserver(onEntry)
+        observer.observe({ entryTypes: ["longtask"] })
+      }
+    } else {
+      observer.observe({ entryTypes: ["longtask"] })
+    }
+    longFrameObserver = observer
   } catch {
-    /* longtask unsupported */
+    /* Neither long-animation-frame nor the longtask fallback is supported. */
   }
 }
 
@@ -92,8 +190,12 @@ export const perf = {
     frameMonitorRefs += 1
     if (!frameMonitorStarted) {
       frameMonitorStarted = true
+      if (typeof document !== "undefined") {
+        resetFrameBaseline()
+        document.addEventListener("visibilitychange", resetFrameBaseline)
+      }
       if (typeof requestAnimationFrame === "function") frameLoop()
-      observeLongTasks()
+      observeLongFrames()
     }
     let released = false
     return () => {
@@ -104,8 +206,9 @@ export const perf = {
       frameMonitorStarted = false
       if (frameHandle !== undefined && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frameHandle)
       frameHandle = undefined
-      longTaskObserver?.disconnect()
-      longTaskObserver = undefined
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", resetFrameBaseline)
+      longFrameObserver?.disconnect()
+      longFrameObserver = undefined
     }
   },
   tick() {

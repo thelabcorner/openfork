@@ -1,0 +1,645 @@
+/*
+ * Canonical rich Session preview card. Dense, JetBrains-style: one floating
+ * surface, hairline section rules, 24px rows, 9-12px type. Color is reserved
+ * for state (live / waiting / context pressure); everything else stays
+ * neutral. Positioning, animation, and open/close lifecycle belong to the
+ * surface-specific adapter (titlebar Kobalte popover / sidebar pooled
+ * tooltip) — this file owns presentation only.
+ */
+[data-component="session-preview-card"] {
+  box-sizing: border-box;
+  width: 320px;
+  max-width: calc(100vw - 16px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  color: var(--v2-text-text-base);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+
+  &[data-interactive] {
+    width: 340px;
+  }
+
+  /* ---- Header -------------------------------------------------------- */
+
+  [data-slot="head"] {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 9px 10px 8px;
+    min-width: 0;
+  }
+
+  [data-slot="head-row"] {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  [data-slot="head-icon"] {
+    display: flex;
+    flex: 0 0 16px;
+    width: 16px;
+    height: 16px;
+    align-items: center;
+    justify-content: center;
+  }
+
+  [data-slot="head-title"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--v2-text-text-base);
+  }
+
+  [data-slot="head-meta"] {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding-inline-start: 23px;
+    font-size: 10.5px;
+    line-height: 14px;
+    white-space: nowrap;
+  }
+
+  [data-slot="head-project"] {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 560;
+    color: var(--v2-text-text-muted);
+  }
+
+  /* Start-ellipsis: the tail of a path is the part that identifies it. */
+  [data-slot="head-path"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: left;
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="head-stats"] {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding-inline-start: 23px;
+    padding-top: 1px;
+    font-size: 10.5px;
+    line-height: 14px;
+    white-space: nowrap;
+  }
+
+  [data-slot="stat"] {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    color: var(--v2-text-text-muted);
+
+    &[data-grow] {
+      flex: 0 1 auto;
+      overflow: hidden;
+    }
+    &[data-tone="faint"] {
+      color: var(--v2-text-text-faint);
+    }
+    &[data-tone="warning"] {
+      color: var(--v2-state-fg-warning);
+    }
+    &[data-tone="danger"] {
+      color: var(--v2-state-fg-danger);
+    }
+  }
+
+  [data-slot="stat-dim"] {
+    flex: 0 0 auto;
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="meter"] {
+    position: relative;
+    display: block;
+    width: 22px;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 9999px;
+    background: var(--v2-background-bg-layer-03);
+
+    > span {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--v2-icon-icon-muted);
+    }
+  }
+
+  [data-slot="stat"][data-tone="warning"] [data-slot="meter"] > span {
+    background: var(--v2-state-fg-warning);
+  }
+
+  [data-slot="stat"][data-tone="danger"] [data-slot="meter"] > span {
+    background: var(--v2-state-fg-danger);
+  }
+
+  [data-slot="status-pill"] {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 4px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 560;
+    line-height: 1;
+    background: var(--v2-background-bg-layer-02);
+    color: var(--v2-text-text-muted);
+
+    &[data-status="working"] {
+      color: var(--v2-text-text-accent);
+      background: color-mix(in srgb, var(--v2-background-bg-accent) 12%, transparent);
+    }
+    &[data-status="waiting"] {
+      color: var(--v2-state-fg-warning);
+      background: var(--v2-state-bg-warning);
+    }
+  }
+
+  [data-slot="status-time"] {
+    font-weight: 600;
+    opacity: 0.75;
+  }
+
+  [data-slot="count"] {
+    flex: 0 0 auto;
+    min-width: 16px;
+    height: 14px;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: var(--v2-background-bg-layer-02);
+    font-size: 9.5px;
+    font-weight: 560;
+    line-height: 14px;
+    letter-spacing: 0;
+    text-align: center;
+    text-transform: none;
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="head-row"] > [data-slot="count"] {
+    margin-top: 1px;
+  }
+
+  [data-slot="chip"] {
+    display: inline-flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: 3px;
+    min-width: 0;
+    max-width: 96px;
+    height: 14px;
+    padding: 0 4px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--v2-background-bg-layer-02);
+    font-size: 9.5px;
+    font-weight: 520;
+    line-height: 14px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--v2-text-text-faint);
+
+    &[data-slim] {
+      flex: 0 0 auto;
+      max-width: 88px;
+      display: block;
+    }
+    &[data-tone="special"] {
+      background: color-mix(in srgb, var(--v2-text-text-accent) 14%, transparent);
+      color: var(--v2-text-text-accent);
+    }
+  }
+
+  /* ---- Relationships --------------------------------------------------- */
+
+  [data-slot="section"] {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    /* Shrinks to fit when the card's own max-height is constrained (e.g. the
+       Chat Sidebar clamping the card to its own pane bounds), instead of
+       pushing the card past that bound. No-op when the card is unconstrained
+       (its height is intrinsic, so flex-grow has nothing extra to claim). */
+    flex: 1 1 auto;
+    min-height: 0;
+    border-top: 1px solid var(--v2-border-border-muted);
+  }
+
+  [data-slot="section-head"] {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 10px;
+    color: var(--v2-icon-icon-muted);
+  }
+
+  [data-slot="section-label"] {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9.5px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--v2-text-text-faint);
+  }
+
+  /* Section-scoped bulk action. Appears in the header only while there is at
+     least one unopened row, so it never sits dead. Reads as a quiet affordance
+     until hovered, matching the section head's own weight. */
+  [data-slot="open-all"] {
+    appearance: none;
+    border: 0;
+    outline: none;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 4px;
+    height: 18px;
+    margin-inline-start: auto;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: transparent;
+    font-size: 9.5px;
+    font-weight: 560;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    color: var(--v2-text-text-muted);
+    cursor: default;
+    transition:
+      background-color 80ms ease,
+      color 80ms ease;
+
+    &:is(:hover, :focus-visible) {
+      background: var(--v2-background-bg-layer-02);
+      color: var(--v2-text-text-base);
+    }
+    &:focus-visible {
+      box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+    }
+    &:active {
+      background: var(--v2-background-bg-layer-03);
+    }
+  }
+
+  [data-slot="section-summary"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    font-weight: 520;
+    line-height: 1;
+    white-space: nowrap;
+
+    > span {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    i {
+      width: 5px;
+      height: 5px;
+      border-radius: 9999px;
+      background: currentColor;
+    }
+    [data-tone="accent"] {
+      color: var(--v2-text-text-accent);
+    }
+    [data-tone="accent"] i {
+      box-shadow: 0 0 5px var(--v2-background-bg-accent);
+    }
+    [data-tone="warning"] {
+      color: var(--v2-state-fg-warning);
+    }
+  }
+
+  [data-slot="section-scroll"] {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: min(360px, 54vh);
+  }
+
+  [data-slot="members"] {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 0 4px 4px;
+  }
+
+  /* Sub-group divider: separates subagents / delegations / plugin groups /
+     manual folders / Swarms / Special Agents inside the one shared scroll
+     region, without paying for N nested ScrollViews. */
+  [data-slot="section-divider"] {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    height: 20px;
+    margin-top: 3px;
+    padding: 0 6px;
+    color: var(--v2-icon-icon-muted);
+
+    &:first-child {
+      margin-top: 1px;
+    }
+    [data-slot="section-divider-label"] {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 9px;
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--v2-text-text-faint);
+    }
+    /* Special Agents are host-owned/internal, not ordinary delegated workers
+       — read visually distinct from structural sections. */
+    &[data-tone="special"] {
+      margin-top: 6px;
+      padding-top: 5px;
+      border-top: 1px dashed var(--v2-border-border-muted);
+      color: var(--v2-text-text-accent);
+
+      [data-slot="section-divider-label"] {
+        color: var(--v2-text-text-accent);
+        opacity: 0.85;
+      }
+    }
+  }
+
+  [data-slot="member"] {
+    --indent: 12px;
+    position: relative;
+    appearance: none;
+    border: 0;
+    outline: none;
+    width: 100%;
+    min-width: 0;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 6px 0 calc(6px + var(--depth, 0) * var(--indent));
+    border-radius: 5px;
+    background: transparent;
+    color: var(--v2-text-text-muted);
+    text-align: start;
+    cursor: default;
+    transition: background-color 80ms ease;
+
+    &:hover {
+      background: var(--v2-background-bg-layer-02);
+      color: var(--v2-text-text-base);
+    }
+    &:focus-visible {
+      background: var(--v2-background-bg-layer-02);
+      color: var(--v2-text-text-base);
+      box-shadow: inset 0 0 0 1px var(--v2-border-border-base);
+    }
+    &:active {
+      background: var(--v2-background-bg-layer-03);
+    }
+    &[data-open-tab] {
+      color: var(--v2-text-text-base);
+    }
+
+    /* Current session: same accent rail as the chat sidebar's selected row. */
+    &[data-current] {
+      background: var(--v2-background-bg-layer-02);
+      box-shadow: inset 0 0 0 0.5px var(--v2-alpha-dark-8);
+      color: var(--v2-text-text-base);
+    }
+    &[data-current]::before {
+      content: "";
+      position: absolute;
+      inset-block: 4px;
+      inset-inline-start: 0;
+      width: 2px;
+      border-radius: 0 9999px 9999px 0;
+      background: var(--v2-background-bg-accent);
+      box-shadow: 0 0 6px var(--v2-background-bg-accent);
+    }
+
+    /* Special agents read as muted/host-owned rows, distinct from ordinary
+       delegated workers, even outside their dedicated dashed section. */
+    &[data-special] [data-slot="member-title"] {
+      color: var(--v2-text-text-muted);
+    }
+  }
+
+  /* Indent guides, drawn like the project explorer's tree. */
+  [data-slot="guide"] {
+    position: absolute;
+    inset-block: -1px;
+    inset-inline-start: calc(12px + var(--level) * var(--indent));
+    width: 1px;
+    background: var(--v2-border-border-muted);
+    pointer-events: none;
+
+    &[data-last] {
+      bottom: 50%;
+    }
+    &[data-elbow]::after {
+      content: "";
+      position: absolute;
+      top: 12.5px;
+      inset-inline-start: 0;
+      width: 7px;
+      height: 1px;
+      background: var(--v2-border-border-muted);
+    }
+  }
+
+  [data-slot="member-state"] {
+    position: relative;
+    display: flex;
+    flex: 0 0 12px;
+    width: 12px;
+    height: 12px;
+    align-items: center;
+    justify-content: center;
+    color: var(--v2-icon-icon-muted);
+  }
+
+  [data-slot="dot"] {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    border: 1px solid var(--v2-border-border-strong);
+  }
+
+  [data-slot="member"]:hover [data-slot="dot"] {
+    border-color: var(--v2-icon-icon-muted);
+  }
+
+  [data-slot="member"][data-status="working"] [data-slot="member-state"] {
+    color: var(--v2-text-text-accent);
+  }
+
+  [data-slot="member"][data-status="waiting"] [data-slot="dot"] {
+    border: 0;
+    background: var(--v2-state-fg-warning);
+  }
+
+  [data-slot="member-title"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    line-height: 15px;
+    font-weight: 460;
+    letter-spacing: -0.01em;
+  }
+
+  [data-slot="member"][data-current] [data-slot="member-title"] {
+    font-weight: 560;
+  }
+
+  [data-slot="badge"] {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 2px;
+    height: 14px;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-size: 9px;
+    font-weight: 560;
+    line-height: 1;
+
+    &[data-tone="warning"] {
+      color: var(--v2-state-fg-warning);
+      background: var(--v2-state-bg-warning);
+    }
+    &[data-tone="info"] {
+      color: var(--v2-state-fg-info);
+      background: var(--v2-state-bg-info);
+    }
+  }
+
+  [data-slot="member-trail"] {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    line-height: 1;
+    white-space: nowrap;
+    color: var(--v2-text-text-faint);
+
+    > span {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    b {
+      font-weight: 600;
+    }
+    [data-tone="accent"] {
+      color: var(--v2-text-text-accent);
+    }
+    [data-tone="warning"] {
+      font-weight: 560;
+      color: var(--v2-state-fg-warning);
+    }
+  }
+
+  [data-slot="more"] {
+    appearance: none;
+    border: 0;
+    outline: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 6px;
+    border-radius: 5px;
+    background: transparent;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--v2-text-text-muted);
+    cursor: default;
+
+    &:is(:hover, :focus-visible) {
+      background: var(--v2-background-bg-layer-02);
+      color: var(--v2-text-text-base);
+    }
+  }
+
+  /* ---- Footer -------------------------------------------------------- */
+
+  [data-slot="foot"] {
+    display: flex;
+    align-items: center;
+    height: 24px;
+    padding: 0 10px;
+    border-top: 1px solid var(--v2-border-border-muted);
+    background: color-mix(in srgb, var(--v2-background-bg-layer-02) 45%, transparent);
+    font-size: 10px;
+    line-height: 1;
+    white-space: nowrap;
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="foot-pointer"] {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Keyboard hints replace pointer hints only once focus is actually inside
+     the navigator — before that, arrow keys would not reach it. */
+  [data-slot="foot-keys"] {
+    display: none;
+    align-items: center;
+    gap: 4px;
+
+    > span {
+      margin-inline-end: 6px;
+    }
+    > span:last-child {
+      margin-inline-end: 0;
+    }
+  }
+
+  &:has([data-slot="member"]:focus-visible) {
+    [data-slot="foot-pointer"] {
+      display: none;
+    }
+    [data-slot="foot-keys"] {
+      display: inline-flex;
+    }
+  }
+}

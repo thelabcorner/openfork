@@ -317,6 +317,29 @@ describe("workers", () => {
     expect(rows?.rows[0]).toMatchObject({ primary: "Implement foo", trailing: "running", sessionID: "ses_1" })
   })
 
+  test("durable ownership is not rendered as live execution", () => {
+    const model = buildDetail(
+      invocation({ tool: "openfork_worker", plane: "delegation" }),
+      detail(
+        { args: { action: "list" } },
+        {
+          structured: {
+            workers: [
+              {
+                workerID: "ses_1",
+                title: "Implement foo",
+                agent: "build",
+                execution: { owned: true, generation: 3 },
+              },
+            ],
+          },
+        },
+      ),
+    )
+    const rows = find(model.sections, "rows")
+    expect(rows?.rows[0]).toMatchObject({ primary: "Implement foo", trailing: "owned", sessionID: "ses_1" })
+  })
+
   test("a start request shows its prompt as prose", () => {
     const model = buildDetail(
       invocation({ tool: "openfork_worker" }),

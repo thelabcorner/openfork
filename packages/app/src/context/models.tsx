@@ -1,4 +1,4 @@
-import { type Accessor, createMemo, createResource } from "solid-js"
+import { type Accessor, createEffect, createMemo, createResource } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createModelPreferencesSync } from "./model-preferences-sync"
 import { useServerSDK } from "./server-sdk"
@@ -9,6 +9,8 @@ import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
 import { getUsageTables } from "@/utils/model-usage-profile"
 import { isRecentModelRelease, withinRecentWindow } from "@/utils/model-recency"
+import { normalizeOpenRouterEndpoints, warmOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import { rankOpenRouterEndpoints } from "@/utils/openrouter-endpoint-ranking"
 import { Model as ModelContract } from "@opencode-ai/schema/model"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 
@@ -287,6 +289,76 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         return undefined
       }
     }
+    const openRouterEndpointsClient = () => {
+      try {
+        return serverSDK?.()?.client.experimental.openrouterEndpoints
+      } catch {
+        return undefined
+      }
+    }
+    const fetchOpenRouterEndpoints = async (modelID: string): Promise<OpenRouterEndpoint[]> => {
+      const client = openRouterEndpointsClient()
+      if (!client) throw new Error("OpenRouter endpoint client unavailable")
+      const response = await client.get({ model: modelID }, { throwOnError: true })
+      return rankOpenRouterEndpoints(normalizeOpenRouterEndpoints(response.data)).map((entry) => entry.endpoint)
+    }
+
+    // The selector itself is mounted only after the user opens it, which is too
+    // late to hide OpenRouter endpoint latency. Warm high-probability models as
+    // soon as persisted model preferences + the Tier-0 client are available;
+    // this does NOT require a workspace provider catalog.
+    //
+    // Once a catalog is already available, append the remaining visible
+    // OpenRouter language models. This deliberately does not force lazy
+    // settings/scheduled-task scopes to fetch Tier-2 catalog state merely for a
+    // speculative warmup. The cache utility owns the 24h admission TTL,
+    // module-wide dedup, idle slicing and bounded concurrency, so several
+    // ModelsProvider mounts still collapse into one background producer.
+    createEffect(() => {
+      if (!ready() || !openRouterEndpointsClient()) return
+
+      const prioritized: string[] = []
+      const seen = new Set<string>()
+      const push = (modelID: string | undefined) => {
+        if (!modelID || seen.has(modelID)) return
+        seen.add(modelID)
+        prioritized.push(modelID)
+      }
+
+      // Recents are the strongest predictor of the next submenu the user will
+      // inspect and are capped at RECENT_LIMIT.
+      for (const item of store.recent) {
+        if (item.providerID === "openrouter") push(item.modelID)
+      }
+
+      // Explicit favorites/visibility survive app restarts and should be warm
+      // before a lazy settings catalog has even been admitted.
+      for (const item of store.user) {
+        if (item.providerID !== "openrouter") continue
+        if (item.favorite || item.visibility === "show") push(item.modelID)
+      }
+
+      // A persisted provider pin is both high-intent and correctness-sensitive:
+      // warming it early lets the selector validate a provider that disappeared
+      // upstream without waiting for the submenu interaction.
+      for (const [key, value] of Object.entries(store.subProvider ?? {})) {
+        if (!value || !key.startsWith("openrouter:")) continue
+        push(key.slice("openrouter:".length))
+      }
+
+      const provider = connectedProviders().find((item) => item.id === "openrouter")
+      if (provider) {
+        const languageModels = Object.values(provider.models).filter((model) =>
+          ModelContract.isLanguageModel(provider.id, model),
+        )
+        for (const model of languageModels) {
+          if (visible({ providerID: "openrouter", modelID: model.id })) push(model.id)
+        }
+      }
+
+      if (prioritized.length === 0) return
+      warmOpenRouterEndpoints(prioritized, fetchOpenRouterEndpoints)
+    })
     createModelPreferencesSync({
       client: preferencesClient,
       ready: () => ready(),
@@ -313,6 +385,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     )
     return {
       ready,
+      catalogStatus: () => props.catalog?.()?.catalog?.status ?? providers?.catalogStatus(),
       list,
       find,
       visible,

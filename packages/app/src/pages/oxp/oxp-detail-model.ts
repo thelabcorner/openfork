@@ -758,12 +758,19 @@ function workerOutcome(build: Build) {
         if (!id) return []
         const execution = asRecord(row?.execution)
         const running = bool(execution, "running") === true
+        const owned = bool(execution, "owned") === true
         return [
           {
             id,
             primary: str(row, "title") ?? id,
             secondary: str(row, "agent") ?? modelLabel(row),
-            trailing: running ? "running" : bool(row, "archived") === true ? "archived" : "idle",
+            trailing: running
+              ? "running"
+              : owned
+                ? "owned"
+                : bool(row, "archived") === true
+                  ? "archived"
+                  : "idle",
             tone: running ? ("accent" as const) : undefined,
             mono: false,
             sessionID: id,

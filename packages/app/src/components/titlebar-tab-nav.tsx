@@ -15,7 +15,6 @@ import type { AppTabPage } from "@/context/app-tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
-import type { TabPreviewGroupSession } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
 
 const PREVIEW_BOOTSTRAP_DELAY = 450
@@ -32,7 +31,6 @@ export function TabNavItem(props: {
   server: ServerConnection.Key
   serverCtx?: () => ServerCtx | undefined
   serverLabel?: () => string | undefined
-  groupSessions?: () => TabPreviewGroupSession[] | undefined
   session: () => Session | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
@@ -59,7 +57,6 @@ export function TabNavItem(props: {
   const language = useLanguage()
   const serverCtx = () => props.serverCtx?.()
   const sessionID = createMemo(() => props.session()?.id)
-  const groupSessions = () => props.groupSessions?.()
   // Derivation lives in titlebar-tab-state: working from session_working(id),
   // paused from the session_paused sidecar (never from !session_working — the
   // interrupt-cleanup window would flicker paused -> working -> paused).
@@ -105,11 +102,11 @@ export function TabNavItem(props: {
   }
 
   const bootstrapPreview = () => {
-    if (previewRuntimeRequested() || previewBlocked() || !groupSessions()?.length) return
+    if (previewRuntimeRequested() || previewBlocked()) return
     cancelPreviewBootstrap()
     previewBootstrapTimer = setTimeout(() => {
       previewBootstrapTimer = undefined
-      if (previewBlocked() || !groupSessions()?.length || !tabRoot?.matches(":hover")) return
+      if (previewBlocked() || !tabRoot?.matches(":hover")) return
       setPreviewRuntimeRequested(true)
       setPopoverOpen(true)
     }, PREVIEW_BOOTSTRAP_DELAY)
@@ -365,17 +362,18 @@ export function TabNavItem(props: {
       <Suspense fallback={tab}>
         <TabPreviewPopover
           trigger={tab}
-          open={popoverOpen() && !previewBlocked() && !!groupSessions()?.length}
+          open={popoverOpen() && !previewBlocked()}
           onOpenChange={(value) => {
             if (value && previewBlocked()) return
             setPopoverOpen(value)
           }}
           data={{
+            project: project(),
+            directory: props.session()?.directory,
             projectName: projectName(),
             title: props.session()?.title,
             path: previewPath(),
             serverName: serverLabel(),
-            groupSessions: groupSessions(),
           }}
           server={props.server}
           serverCtx={props.serverCtx}
@@ -506,6 +504,7 @@ export function AppTabItem(props: {
     if (props.page === "settings") return "settings-gear" as const
     if (props.page === "usage") return "usage" as const
     if (props.page === "oxp") return "chats" as const
+    if (props.page === "agents") return "brain" as const
     return "clock" as const
   }
 
@@ -592,7 +591,6 @@ export function GroupTabNavItem(props: {
   serverCtx?: () => ServerCtx | undefined
   title: string
   sessionCount?: number
-  sessions?: TabPreviewGroupSession[]
   onClose: () => void
   onNavigate: () => void
   active?: boolean
@@ -702,10 +700,10 @@ export function GroupTabNavItem(props: {
       }}
       data={{
         title: props.title,
-        groupSessions: props.sessions,
       }}
       server={props.tab.server}
       serverCtx={props.serverCtx}
+      groupID={props.tab.groupId}
     />
   )
 }

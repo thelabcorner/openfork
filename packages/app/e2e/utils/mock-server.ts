@@ -40,6 +40,10 @@ export interface MockServerConfig {
   fileContent?: (path: string) => unknown | Promise<unknown>
   findFiles?: (input: { query: string; dirs?: string; limit?: number }) => unknown | Promise<unknown>
   sessionStatus?: Record<string, unknown> | (() => Record<string, unknown>)
+  /** Optional fork-owned generalized workload fixture for model-selector tests. */
+  forkGeneralUsage?: unknown | (() => unknown)
+  /** Optional fork-owned direct capacity fixture for model-selector tests. */
+  forkCapacity?: unknown | (() => unknown)
   /**
    * Only treat PLAYWRIGHT_SERVER_PORT as an OpenCode backend. Performance
    * preview builds run on a separate Vite origin; allowing that origin to
@@ -132,6 +136,31 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
       )
     }
     if (path === "/fork/usage") return json(route, { aggregate: [], byCredential: [] })
+    if (path === "/fork/general-usage" && config.forkGeneralUsage !== undefined)
+      return json(route, typeof config.forkGeneralUsage === "function" ? config.forkGeneralUsage() : config.forkGeneralUsage)
+    if (path === "/fork/capacity" && config.forkCapacity !== undefined)
+      return json(route, typeof config.forkCapacity === "function" ? config.forkCapacity() : config.forkCapacity)
+    // Bootstrap-free session metadata is now the primary desktop path. Mock
+    // these Tier-1 global reads explicitly rather than forcing the client down
+    // the legacy instance-scoped fallback (or, worse, letting them escape to a
+    // nonexistent backend during performance tests).
+    if (path === "/global/session/roots") {
+      const directory = url.searchParams.get("directory")
+      const projectID = url.searchParams.get("projectID")
+      const limit = Math.max(1, Number(url.searchParams.get("limit") ?? 50))
+      const sessions = config.sessions
+        .filter((session) => !session.parentID)
+        .filter((session) => !directory || session.directory === directory)
+        .filter((session) => !projectID || session.projectID === projectID)
+        .slice(0, limit)
+        .map((session) => currentSession(session, config.directory))
+      return json(route, sessions)
+    }
+    const globalSessionMatch = path.match(/^\/global\/session\/([^/]+)$/)
+    if (globalSessionMatch) {
+      const session = config.sessions.find((item) => item.id === globalSessionMatch[1])
+      return json(route, session ? currentSession(session, config.directory) : null)
+    }
     if (path === "/global/health")
       return config.protocol === "v2" ? json(route, {}, undefined, 404) : json(route, { healthy: true })
     if (path === "/api/health")
@@ -430,10 +459,19 @@ function currentPermission(value: unknown) {
 
 export function currentSession(session: { id: string } & Record<string, unknown>, fallbackDirectory?: string) {
   const time = session.time && typeof session.time === "object" ? session.time : {}
+  const directory = typeof session.directory === "string" ? session.directory : fallbackDirectory
+  const workspaceID = typeof session.workspaceID === "string" ? session.workspaceID : undefined
   return {
     id: session.id,
+    // Current/V2 consumers read these fields directly. Keep the legacy
+    // location/subpath projection below as well so one fixture can exercise
+    // both protocol families without producing a directory-less tab/session.
+    slug: session.slug ?? session.id,
     parentID: session.parentID,
     projectID: session.projectID ?? "project",
+    ...(workspaceID ? { workspaceID } : {}),
+    directory,
+    path: session.path,
     agent: session.agent ?? "build",
     model: session.model ?? { id: "mock-model", providerID: "mock-provider" },
     cost: session.cost ?? 0,
@@ -446,9 +484,10 @@ export function currentSession(session: { id: string } & Record<string, unknown>
         : {}),
     },
     title: session.title ?? session.id,
+    version: session.version ?? "dev",
     location: {
-      directory: typeof session.directory === "string" ? session.directory : fallbackDirectory,
-      ...(typeof session.workspaceID === "string" ? { workspaceID: session.workspaceID } : {}),
+      directory,
+      ...(workspaceID ? { workspaceID } : {}),
     },
     subpath: session.path,
     revert: session.revert,

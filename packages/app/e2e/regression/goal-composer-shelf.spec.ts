@@ -18,7 +18,6 @@ const detail = {
     constraints: ["Preserve upstream composer behavior", "Keep the UI dense"],
     status: "active",
     revision: 7,
-    continuationPolicy: { maxConsecutiveTurns: 8, maxNoProgressTurns: 2 },
     auditorPolicy: {},
     time: { created: now - 2_730_000, updated: now - 14_000 },
   },

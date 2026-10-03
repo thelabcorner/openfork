@@ -41,6 +41,12 @@ import {
   type LiveGenerationRateState,
   useLiveTelemetryNow,
 } from "@/components/prompt-input/live-generation-rate"
+import {
+  promptTurnElapsedLabel,
+  promptTurnElapsedMs,
+  promptTurnLocalStartedAt,
+} from "@/components/prompt-input/send-turn-lane-time"
+import { sessionTelemetryClientNow } from "@/utils/session-telemetry-time"
 import "@/components/prompt-input/send-turn-lane.css"
 import {
   isPromptTextRevisable,
@@ -71,6 +77,7 @@ import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
 import { useSettings } from "@/context/settings"
 import { useServerSync } from "@/context/server-sync"
+import { isSubagentMentionableAgent } from "@/context/local-agent"
 import { SessionUsageWarningBanner } from "@/components/session-usage-warning-banner"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
@@ -855,14 +862,6 @@ const PROMPT_SETTLED_VISIBLE_MS = 900
 
 type PromptTurnBaton = "none" | "arming" | "stop" | "stopping" | "settled"
 
-function promptTurnElapsedLabel(ms: number) {
-  if (ms < 1000) return `${Math.max(0, Math.round(ms / 100) * 100) / 1000}s`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  const minutes = Math.floor(ms / 60_000)
-  const seconds = Math.floor((ms % 60_000) / 1000)
-  return `${minutes}m ${String(seconds).padStart(2, "0")}s`
-}
-
 function PromptQueueGlyph() {
   return (
     <svg data-slot="icon-svg" width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -953,41 +952,124 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
     const id = props.controller.sessionID()
     return id ? serverSync().telemetry.get(id) : undefined
   }
+  const telemetryReceivedAt = () => {
+    const id = props.controller.sessionID()
+    return id ? serverSync().telemetry.receivedAt(id) : undefined
+  }
   createEffect(() => {
     const id = props.controller.sessionID()
     if (!id || !working()) return
     serverSync().telemetry.ensure([id])
   })
 
-  const [presentation, setPresentation] = createSignal<{ startedAt?: number; completedAt?: number }>()
+  const [presentation, setPresentation] = createSignal<{
+    sourceStartedAt?: number
+    startedAt?: number
+    completedAt?: number
+  }>()
   const [stopping, setStopping] = createSignal(false)
   const [launchAt, setLaunchAt] = createSignal<number>()
   const now = useLiveTelemetryNow(() => working() || presentation()?.completedAt !== undefined)
 
   createEffect(() => {
-    const startedAt = telemetry()?.turnStartedAt
-    if (startedAt === undefined) return
+    const currentTelemetry = telemetry()
+    const sourceStartedAt = currentTelemetry?.turnStartedAt
+    if (sourceStartedAt === undefined) {
+      // Core clears turnStartedAt at a semantic turn boundary even when the
+      // session stays working because another queued turn is about to start.
+      // Drop the previous presentation latch so its clock cannot leak forward.
+      if (working()) {
+        setPresentation((current) => {
+          if (
+            current?.sourceStartedAt === undefined &&
+            current?.startedAt === undefined &&
+            current?.completedAt === undefined
+          )
+            return current
+          return {}
+        })
+      }
+      return
+    }
+    const observedAt = sessionTelemetryClientNow()
     setPresentation((current) => {
-      if (current?.startedAt === startedAt) return current
-      return { startedAt, ...(working() ? {} : current?.completedAt === undefined ? {} : { completedAt: current.completedAt }) }
+      const startedAt = promptTurnLocalStartedAt({
+        turnStartedAt: sourceStartedAt,
+        sampledAt: currentTelemetry?.sampledAt,
+        updatedAt: currentTelemetry?.updatedAt,
+        receivedAt: telemetryReceivedAt(),
+        observedAt,
+        previousTurnStartedAt: current?.sourceStartedAt,
+        previousLocalStartedAt: current?.startedAt,
+      })
+      if (
+        current?.sourceStartedAt === sourceStartedAt &&
+        current?.startedAt === startedAt &&
+        (working() || current?.completedAt === undefined)
+      )
+        return current
+      return {
+        sourceStartedAt,
+        startedAt,
+        ...(working() ? {} : current?.completedAt === undefined ? {} : { completedAt: current.completedAt }),
+      }
     })
   })
 
   createEffect(
     on(
-      working,
-      (next, previous) => {
-        if (next) {
+      () => [props.controller.sessionID(), working()] as const,
+      ([sessionID, next], previous) => {
+        const [previousSessionID, previousWorking] = previous ?? [undefined, undefined]
+        if (sessionID !== previousSessionID) {
+          // This control survives route/session switches. Never interpret a
+          // different Session's busy/idle value as a lifecycle edge for the
+          // current one or carry its stop/settled presentation across tabs.
           setStopping(false)
-          setPresentation({ startedAt: telemetry()?.turnStartedAt })
-          if (previous === false) setLaunchAt(Date.now())
+          if (!next) {
+            setLaunchAt(undefined)
+            setPresentation(undefined)
+            return
+          }
+          const observedAt = sessionTelemetryClientNow()
+          const currentTelemetry = telemetry()
+          setLaunchAt(observedAt)
+          setPresentation({
+            sourceStartedAt: currentTelemetry?.turnStartedAt,
+            startedAt: promptTurnLocalStartedAt({
+              turnStartedAt: currentTelemetry?.turnStartedAt,
+              sampledAt: currentTelemetry?.sampledAt,
+              updatedAt: currentTelemetry?.updatedAt,
+              receivedAt: telemetryReceivedAt(),
+              observedAt,
+            }),
+          })
           return
         }
-        if (!previous) return
+        if (next) {
+          setStopping(false)
+          const observedAt = sessionTelemetryClientNow()
+          // A same-Session idle -> busy edge can arrive before the new turn's
+          // telemetry frame. Never seed it from the previous settled turn.
+          setPresentation({})
+          if (previousWorking === false) setLaunchAt(observedAt)
+          return
+        }
+        if (!previousWorking) return
         setStopping(false)
-        const completedAt = Date.now()
+        const completedAt = sessionTelemetryClientNow()
+        const currentTelemetry = telemetry()
         setPresentation((current) => ({
-          startedAt: current?.startedAt ?? telemetry()?.turnStartedAt,
+          sourceStartedAt: current?.sourceStartedAt ?? currentTelemetry?.turnStartedAt,
+          startedAt:
+            current?.startedAt ??
+            promptTurnLocalStartedAt({
+              turnStartedAt: currentTelemetry?.turnStartedAt,
+              sampledAt: currentTelemetry?.sampledAt,
+              updatedAt: currentTelemetry?.updatedAt,
+              receivedAt: telemetryReceivedAt(),
+              observedAt: completedAt,
+            }),
           completedAt,
         }))
       },
@@ -1022,10 +1104,13 @@ function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerCont
   const interruptible = () => working() && !stopping()
   const elapsedMs = createMemo(() => {
     const current = presentation()
-    const startedAt = telemetry()?.turnStartedAt ?? current?.startedAt
-    if (startedAt === undefined) return 0
-    const end = working() ? now() : (current?.completedAt ?? now())
-    return Math.max(0, end - startedAt)
+    return promptTurnElapsedMs({
+      working: working(),
+      liveStartedAt: current?.startedAt,
+      presentationStartedAt: current?.startedAt,
+      completedAt: current?.completedAt,
+      now: now(),
+    })
   })
   const batonLabel = () => {
     if (baton() === "stopping") return language.t("prompt.turnLane.stopping")
@@ -1959,7 +2044,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     ...references(),
     ...skills(),
     ...props.controls.agents.available
-      .filter((agent) => !agent.hidden && agent.mode !== "primary")
+      .filter(isSubagentMentionableAgent)
       .map((agent) => ({
         id: `agent:${agent.name}`,
         kind: "agent" as const,
@@ -2109,6 +2194,12 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
               current: () => props.controls.agents.current,
               onSelect: (value: string) => props.controls.agents.select(value),
               keybind: () => command.keybindParts("agent.cycle"),
+              manage: props.controls.agents.manage
+                ? {
+                    label: language.t("agents.manage"),
+                    onSelect: props.controls.agents.manage,
+                  }
+                : undefined,
             }
           : undefined
       },

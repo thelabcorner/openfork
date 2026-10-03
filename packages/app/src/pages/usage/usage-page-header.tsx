@@ -29,6 +29,7 @@ export function UsagePageHeader(props: {
   isAllTime: boolean
   onRefresh: () => void
   loading: boolean
+  contextMode?: boolean
 }) {
   const language = useLanguage()
   const rangeLabel = () => {
@@ -46,30 +47,32 @@ export function UsagePageHeader(props: {
       </div>
 
       <div class="flex flex-1 flex-wrap items-center justify-end gap-1.5">
-        <div class="flex items-center rounded-md bg-v2-background-bg-layer-02 p-0.5">
-          <button
-            type="button"
-            class="h-6 rounded-[5px] px-2.5 text-[11px] font-[560] leading-6 transition-colors"
-            classList={{
-              "bg-v2-background-bg-base text-v2-text-text-base shadow-[var(--v2-elevation-switch-on)]": props.metric === "cost",
-              "text-v2-text-text-muted": props.metric !== "cost",
-            }}
-            onClick={() => props.onMetricChange("cost")}
-          >
-            {language.t("usage.metric.cost")}
-          </button>
-          <button
-            type="button"
-            class="h-6 rounded-[5px] px-2.5 text-[11px] font-[560] leading-6 transition-colors"
-            classList={{
-              "bg-v2-background-bg-base text-v2-text-text-base shadow-[var(--v2-elevation-switch-on)]": props.metric === "tokens",
-              "text-v2-text-text-muted": props.metric !== "tokens",
-            }}
-            onClick={() => props.onMetricChange("tokens")}
-          >
-            {language.t("usage.metric.tokens")}
-          </button>
-        </div>
+        <Show when={!props.contextMode}>
+          <div class="flex items-center rounded-md bg-v2-background-bg-layer-02 p-0.5">
+            <button
+              type="button"
+              class="h-6 rounded-[5px] px-2.5 text-[11px] font-[560] leading-6 transition-colors"
+              classList={{
+                "bg-v2-background-bg-base text-v2-text-text-base shadow-[var(--v2-elevation-switch-on)]": props.metric === "cost",
+                "text-v2-text-text-muted": props.metric !== "cost",
+              }}
+              onClick={() => props.onMetricChange("cost")}
+            >
+              {language.t("usage.metric.cost")}
+            </button>
+            <button
+              type="button"
+              class="h-6 rounded-[5px] px-2.5 text-[11px] font-[560] leading-6 transition-colors"
+              classList={{
+                "bg-v2-background-bg-base text-v2-text-text-base shadow-[var(--v2-elevation-switch-on)]": props.metric === "tokens",
+                "text-v2-text-text-muted": props.metric !== "tokens",
+              }}
+              onClick={() => props.onMetricChange("tokens")}
+            >
+              {language.t("usage.metric.tokens")}
+            </button>
+          </div>
+        </Show>
 
         <div class="flex items-center gap-0.5 rounded-md bg-v2-background-bg-layer-02 p-0.5">
           <For each={USAGE_WINDOWS}>
@@ -89,7 +92,13 @@ export function UsagePageHeader(props: {
           </For>
         </div>
 
-        <UsageProjectMenu projectID={props.projectID} projects={props.projects} onChange={props.onProjectChange} />
+        <Show when={!props.contextMode}>
+          <UsageProjectMenu
+            projectID={props.projectID}
+            projects={props.projects}
+            onChange={props.onProjectChange}
+          />
+        </Show>
 
         <TooltipV2 value={language.t("common.refresh")}>
           <IconButtonV2

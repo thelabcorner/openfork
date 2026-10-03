@@ -1,6 +1,7 @@
 import { authTokenFromCredentials } from "@/utils/server"
 import { DEVICE_AUTH_USERNAME } from "@/utils/pwa-pairing"
 import {
+  STREAM_INTEREST_GENERATION_HEADER,
   STREAM_INTEREST_SESSIONS_HEADER,
   STREAM_INTEREST_SUBSCRIBER_HEADER,
   normalizeStreamInterestSessions,
@@ -51,7 +52,7 @@ export function appendEventStreamAuthToken(
 export function eventStreamFetch(
   base: typeof globalThis.fetch,
   credentials: { username?: string; password?: string },
-  interest?: { subscriber: string; sessions: () => Iterable<string> },
+  interest?: { subscriber: string; sessions: () => Iterable<string>; generation?: () => number },
 ) {
   const baseWithPreconnect = base as typeof globalThis.fetch & { preconnect?: () => unknown }
   const interestHeaders = (pathname: string, source?: HeadersInit) => {
@@ -62,6 +63,7 @@ export function eventStreamFetch(
       STREAM_INTEREST_SESSIONS_HEADER,
       JSON.stringify(normalizeStreamInterestSessions(interest.sessions())),
     )
+    if (interest.generation) headers.set(STREAM_INTEREST_GENERATION_HEADER, String(interest.generation()))
     return headers
   }
   const fetcher = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {

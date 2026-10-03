@@ -37,9 +37,9 @@ describe("streamContentSessionsForVisibility", () => {
 })
 
 describe("streamInterestUpdatePriority", () => {
-  test("does not spend the critical reserve on stream-interest bookkeeping", () => {
-    expect(streamInterestUpdatePriority(["ses_visible"])).toBe("interactive")
-    expect(streamInterestUpdatePriority([])).toBe("background")
+  test("reserves critical admission for activation and interest release", () => {
+    expect(streamInterestUpdatePriority(["ses_visible"])).toBe("critical")
+    expect(streamInterestUpdatePriority([])).toBe("critical")
   })
 })
 
@@ -175,11 +175,18 @@ describe("coalesceServerEvents", () => {
     expect(coalesceServerEvents(events)).toEqual(events)
   })
 
-  const delta = (value: string, field = "text", partID = "part") => ({
+  const delta = (value: string, field = "text", partID = "part", offset?: number) => ({
     directory: "/repo",
     payload: {
       type: "message.part.delta",
-      properties: { messageID: "msg", partID, field, delta: value },
+      properties: {
+        sessionID: "ses",
+        messageID: "msg",
+        partID,
+        field,
+        delta: value,
+        ...(offset === undefined ? {} : { offset }),
+      },
     } as Event,
   })
 
@@ -284,6 +291,51 @@ describe("coalesceServerEvents", () => {
     expect(result).toHaveLength(2)
     expect(result[0]?.payload).toMatchObject({ id: "3", properties: { partID: "part", delta: "ac" } })
     expect(result[1]?.payload).toMatchObject({ id: "2", properties: { partID: "other", delta: "b" } })
+  })
+
+  test("preserves the earliest contiguous legacy delta offset", () => {
+    const result = coalesceServerEvents([delta("ab", "text", "part", 8), delta("cd", "text", "part", 10)])
+    expect(result).toHaveLength(1)
+    expect(result[0]?.payload).toMatchObject({ properties: { delta: "abcd", offset: 8 } })
+  })
+
+  test("preserves the earliest contiguous legacy delta offset in the paused event queue", () => {
+    const queue = createServerEventQueue()
+    queue.push(delta("ab", "text", "part", 8))
+    queue.push(delta("cd", "text", "part", 10))
+    const result = queue.take(8)
+    expect(result).toHaveLength(1)
+    expect(result[0]?.payload).toMatchObject({ properties: { delta: "abcd", offset: 8 } })
+  })
+
+  test("keeps legacy offset gaps and mixed compatibility deltas separate in the paused queue", () => {
+    for (const sample of [
+      [delta("ab", "text", "part", 8), delta("cd", "text", "part", 11)],
+      [delta("ab", "text", "part", 8), delta("cd")],
+      [delta("ab"), delta("cd", "text", "part", 2)],
+    ]) {
+      const queue = createServerEventQueue()
+      sample.forEach((event) => queue.push(event))
+      const result = queue.take(8)
+      expect(result).toHaveLength(2)
+      expect(result[0]?.payload).toMatchObject({ properties: { delta: "ab" } })
+      expect(result[1]?.payload).toMatchObject({ properties: { delta: "cd" } })
+    }
+  })
+
+  test("keeps gaps, overlaps, and mixed offset compatibility deltas separate", () => {
+    for (const sample of [
+      { events: [delta("ab", "text", "part", 8), delta("cd", "text", "part", 11)], first: 8, second: 11 },
+      { events: [delta("ab", "text", "part", 8), delta("cd", "text", "part", 7)], first: 8, second: 7 },
+      { events: [delta("ab", "text", "part", 8), delta("cd")], first: 8 },
+      { events: [delta("ab"), delta("cd", "text", "part", 2)], second: 2 },
+    ]) {
+      const result = coalesceServerEvents(sample.events)
+      expect(result).toHaveLength(2)
+      const [first, second] = result.map((event) => (event.payload as Event).properties)
+      expect(first).toMatchObject({ delta: "ab", ...(sample.first === undefined ? {} : { offset: sample.first }) })
+      expect(second).toMatchObject({ delta: "cd", ...(sample.second === undefined ? {} : { offset: sample.second }) })
+    }
   })
 
   test("does not merge deltas across a non-delta barrier", () => {

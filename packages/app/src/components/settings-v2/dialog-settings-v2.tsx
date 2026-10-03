@@ -19,6 +19,7 @@ import { useTabs } from "@/context/tabs"
 import { useServerSync } from "@/context/server-sync"
 import { normalizeSettingsTab, useSettingsNavigation, type SettingsTab } from "./navigation"
 
+const SettingsSpecialAgentsV2 = lazy(() => import("./special-agents"))
 const SettingsWakaTimeV2 = lazy(() => import("./wakatime"))
 
 type SettingsViewProps = {
@@ -91,6 +92,10 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
                     <Icon name="models" />
                     {language.t("settings.models.title")}
                   </TabsV2.Trigger>
+                  <TabsV2.Trigger value="special-agents">
+                    <Icon name="brain" />
+                    {language.t("settings.specialAgents.nav")}
+                  </TabsV2.Trigger>
                   <TabsV2.Trigger value="wakatime">
                     <Icon name="code" />
                     {language.t("settings.wakatime.nav")}
@@ -127,6 +132,11 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
       <TabsV2.Content value="models" class="settings-v2-panel">
         <Show when={props.tab() === "models"}>
           <SettingsModelsV2 />
+        </Show>
+      </TabsV2.Content>
+      <TabsV2.Content value="special-agents" class="settings-v2-panel">
+        <Show when={props.tab() === "special-agents"}>
+          <SettingsSpecialAgentsV2 />
         </Show>
       </TabsV2.Content>
       <TabsV2.Content value="wakatime" class="settings-v2-panel">

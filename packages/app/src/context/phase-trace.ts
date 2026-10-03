@@ -227,15 +227,25 @@ function ensureTimer() {
   if (!enabled || summaryTimer !== undefined) return
   if (typeof setInterval !== "function") return
   summaryTimer = setInterval(summarize, SUMMARY_MS)
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", resetFrameBaseline)
   if (typeof requestAnimationFrame === "function") requestAnimationFrame(frameLoop)
 }
 
 let frameLast = 0
+const resetFrameBaseline = () => {
+  frameLast = 0
+}
 
-// Independent worst-gap sampler. rAF stops while hidden, so a multi-second gap
-// is a visibility return, not a stall, and is skipped rather than recorded.
+// Independent worst-gap sampler. Chromium throttles or suspends rAF for hidden
+// renderers, so reset the baseline at visibility transitions and ignore hidden
+// intervals rather than recording them as main-thread stalls.
 function frameLoop() {
   if (!enabled) return
+  if (typeof document !== "undefined" && document.hidden) {
+    frameLast = 0
+    requestAnimationFrame(frameLoop)
+    return
+  }
   const now = performance.now()
   if (frameLast !== 0) {
     const dt = now - frameLast
@@ -266,6 +276,7 @@ export const phaseTrace = {
     if (!enabled && summaryTimer !== undefined) {
       clearInterval(summaryTimer)
       summaryTimer = undefined
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", resetFrameBaseline)
     }
     frameLast = 0
   },

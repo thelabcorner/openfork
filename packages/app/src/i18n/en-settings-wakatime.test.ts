@@ -10,7 +10,8 @@ const panel = new URL("../components/settings-v2/wakatime.tsx", import.meta.url)
  * read/write, time, and a trustworthy `ai_line_changes`; `heartbeatArgs` and
  * `extraHeartbeat` carry the project folder when the producer knows one, and
  * every delivery carries `--plugin` via `pluginIdentifier`, which is OpenFork's
- * own identity (`openfork-<client>/<version>`), not anything about the user.
+ * own producer bucket plus stable first-party WakaTime integration identity, not
+ * anything about the user.
  */
 const SUPPLIED = [
   "file or entity path",
@@ -40,6 +41,7 @@ const NEVER_SENT = [
   "model",
   "session",
   "source reference",
+  "replay reference",
 ] as const
 
 /**
@@ -128,13 +130,16 @@ describe("WakaTime settings copy", () => {
 
   test("the sent paragraph discloses OpenFork's own WakaTime plugin identity", () => {
     const sent = settingsWakaTimeDict["settings.wakatime.privacy.sent"]
-    // `--plugin openfork-<client>/<version>` reaches WakaTime on every
-    // delivery, so the user must be told the client surface and the OpenFork
-    // version are both part of what gets sent.
+    // `--plugin` carries a first-party attribution token plus one stable
+    // integration token; carrier-client detail is deliberately not a dimension.
     expect(sent).toContain("plugin identity")
     expect(sent.toLowerCase()).toContain("wakatime plugin")
     expect(sent).toContain("OpenFork version")
-    expect(sent.toLowerCase()).toMatch(/client/)
+    expect(sent).toContain("stable token")
+    expect(sent).toContain("OpenFork OXP")
+    expect(sent).toContain("OpenFork OFXP")
+    expect(sent).toContain("attributed to OpenFork")
+    expect(sent).toContain("is not sent as a separate WakaTime attribution dimension")
   })
 
   test("the disclosed version is OpenFork's own, never the user's model", () => {
@@ -174,18 +179,26 @@ describe("WakaTime settings copy", () => {
   test("the credentials paragraph keeps auth in WakaTime's own configuration", () => {
     const credentials = settingsWakaTimeDict["settings.wakatime.privacy.credentials"]
     expect(credentials).toContain("~/.wakatime.cfg")
+    expect(credentials).toContain("WAKATIME_HOME")
     expect(credentials).toContain("WAKATIME_API_KEY")
-    expect(credentials.toLowerCase()).toContain("never a wakatime credential")
+    expect(credentials.toLowerCase()).toContain("never stores a wakatime credential")
   })
 
-  test("the storage claim covers the opt-in and the managed CLI's non-secret metadata", () => {
+  test("the storage claim covers every non-secret WakaTime state family without exposing project paths", () => {
     const credentials = settingsWakaTimeDict["settings.wakatime.privacy.credentials"]
     const storage = credentials.slice(credentials.indexOf("OpenFork stores"))
     expect(storage).toContain("opt-in")
     expect(storage.toLowerCase()).toContain("non-secret")
     expect(storage.toLowerCase()).toContain("command line")
-    // Core also persists non-secret maintenance metadata for the CLI it
-    // manages, so "stores only the opt-in" would be a false narrower claim.
+    expect(storage).toContain("SHA-256 project fingerprints")
+    expect(storage).toContain("last-delivery timestamps")
+    expect(storage).toContain("does not store raw project paths")
+    // Core persists several non-secret operational documents, so "stores only
+    // the opt-in" would be a false narrower claim.
     expect(storage).not.toMatch(/\bonly\b/)
+  })
+
+  test("an operator-forced effective state is explainable from the toggle error", () => {
+    expect(settingsWakaTimeDict["settings.wakatime.error.notApplied"]).toContain("OPENFORK_WAKATIME")
   })
 })

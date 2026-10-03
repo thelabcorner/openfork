@@ -1,10 +1,9 @@
-import { createMemo, createEffect, createSignal, on, onCleanup, untrack, For, Show } from "solid-js"
+import { createMemo, createEffect, createSignal, on, onCleanup, For, Show } from "solid-js"
 import type { Accessor, JSX } from "solid-js"
 import { useNavigate } from "@solidjs/router"
 import { useSync } from "@/context/sync"
 import { useServerSync } from "@/context/server-sync"
 import { sampledChecksum } from "@opencode-ai/core/util/encode"
-import { findLast } from "@opencode-ai/core/util/array"
 import { same } from "@/utils/same"
 import { Icon } from "@opencode-ai/ui/icon"
 import { Accordion } from "@opencode-ai/ui/accordion"
@@ -25,14 +24,13 @@ import type {
   Message,
   OxpResourceProvenanceInfo,
   Part,
-  UserMessage,
 } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
+import { sessionTelemetryClientNow, sessionTelemetryElapsedMs } from "@/utils/session-telemetry-time"
 import { useLanguage } from "@/context/language"
 import { useLocal } from "@/context/local"
 import { usePlatform } from "@/context/platform"
-import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
 import { useServerSDK } from "@/context/server-sdk"
 import { useSessionLayout } from "@/pages/session/session-layout"
@@ -40,29 +38,36 @@ import { formatCostPerMillion } from "@/components/model-tooltip"
 import { formatPercent } from "@/components/usage/usage-format"
 import { createUsageValuation } from "@/components/usage/use-usage-valuation"
 import { subsidyShare, type SubsidyUsageRow } from "@/utils/usage-subsidy"
-import { getSessionContext } from "./session-context-metrics"
-import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
+import { projectSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import {
   aggregateSessionContextByModel,
-  modelKey,
+  projectSessionContextSnapshot,
   type CostBreakdown,
   type LiveGenerationProgress,
   type ModelContextMetrics,
   type ModelCostRate,
 } from "./session-context-model-metrics"
 import { createSessionContextFormatter } from "./session-context-format"
-import { isSemanticUserMessage } from "@/utils/session-message"
 import {
   boundedPartsText,
   newestRawMessages,
   RAW_MESSAGE_PAGE_SIZE,
 } from "./session-context-raw"
 import { MetricCell, Section } from "./insights-primitives"
+import { shouldRefreshSessionContext, type SessionContextRefreshState } from "./session-context-refresh"
+import {
+  newestSessionContextTelemetry,
+  normalizeSessionContextResponse,
+  projectSessionContextOccupancy,
+  type SessionContextTelemetry,
+} from "./session-context-occupancy"
+import { useQuery } from "@tanstack/solid-query"
 
 const emptyLiveProgress: LiveGenerationProgress = { generatedSeconds: 0, toolSeconds: 0 }
-const emptySessionParts: Record<string, Part[] | undefined> = {}
+const SESSION_CONTEXT_QUERY_VERSION = 3
 type SessionProviderList = NonNullable<Parameters<typeof aggregateSessionContextByModel>[2]>
 const emptyProviderList: SessionProviderList = []
+const emptyAggregate = aggregateSessionContextByModel()
 
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
   system: "var(--syntax-info)",
@@ -217,7 +222,6 @@ function partSummaryText(part: Part): string | undefined {
 }
 
 const emptyMessages: Message[] = []
-const emptyUserMessages: UserMessage[] = []
 
 type ContextLedgerEntry = {
   messageID: string
@@ -254,11 +258,90 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const navigate = useNavigate()
   const platform = usePlatform()
   const local = useLocal()
-  const providers = useProviders(() => sdk().directory)
   const { params, view } = useSessionLayout()
   const active = () => props.active?.() ?? true
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
+  const specialAgentReadOnly = createMemo(() => typeof info()?.metadata?.specialAgent === "string")
+  const contextQuery = useQuery(() => ({
+    // Version the projection contract explicitly. Solid Query survives renderer
+    // HMR, so an older response can otherwise remain resident after the server
+    // projection shape/semantics change.
+    queryKey: [serverSDK().scope, "usage", "session-context", SESSION_CONTEXT_QUERY_VERSION, params.id] as const,
+    enabled: active() && !!params.id,
+    staleTime: 2_000,
+    gcTime: 5 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
+    queryFn: async () => {
+      const sessionID = params.id
+      if (!sessionID) throw new Error("Missing session")
+      const response = await serverSDK().client.usage.sessionContext({ sessionID }, { throwOnError: true })
+      return normalizeSessionContextResponse(response.data)
+    },
+  }))
+  const streamedContextTelemetry = createMemo(() =>
+    params.id ? serverSync().telemetry.get(params.id) : undefined,
+  )
+  const contextTelemetry = createMemo(() =>
+    newestSessionContextTelemetry(contextQuery.data?.telemetry, streamedContextTelemetry()),
+  )
+  const snapshotTelemetryReceivedAt = new WeakMap<object, number>()
+  const contextTelemetryReceivedAt = (value: SessionContextTelemetry | undefined) => {
+    if (!value) return undefined
+    const sessionID = params.id
+    const streamed = streamedContextTelemetry()
+    if (sessionID && value === streamed) return serverSync().telemetry.receivedAt(sessionID)
+    const key = value as object
+    const existing = snapshotTelemetryReceivedAt.get(key)
+    if (existing !== undefined) return existing
+    const receivedAt = sessionTelemetryClientNow()
+    snapshotTelemetryReceivedAt.set(key, receivedAt)
+    return receivedAt
+  }
+  const contextSnapshot = createMemo(() => {
+    if (contextQuery.isPending) return undefined
+    const raw = contextQuery.data
+    if (!raw) return undefined
+
+    // Solid Query survives renderer HMR and can still hold the previous
+    // bare-history payload under this query key. Normalize at consumption as
+    // well as fetch time so cached pre-migration data can never reach the pane.
+    const snapshot = normalizeSessionContextResponse(raw)
+    const telemetry = contextTelemetry()
+    if (!telemetry || telemetry === snapshot.telemetry) return snapshot
+    return { ...snapshot, telemetry }
+  })
+  // A zero projection is impossible when the durable Session scalar already
+  // records provider usage. Repair that state once per mounted session. This is
+  // specifically a cache/version-skew safety net, not a polling path.
+  let zeroProjectionRepairFor: string | undefined
+  createEffect(() => {
+    const sessionID = params.id
+    if (!active() || !sessionID || contextQuery.isPending || contextQuery.isFetching) return
+    const session = info()
+    const snapshot = contextSnapshot()
+    if (!session || !snapshot) return
+
+    const durable = session.tokens
+    if (!durable) return
+    const durableTokens =
+      durable.input +
+      durable.output +
+      durable.reasoning +
+      durable.cache.read +
+      durable.cache.write
+    const tokens = snapshot.history.totals.tokens
+    const projectedTokens = tokens.input + tokens.output + tokens.reasoning + tokens.cacheRead + tokens.cacheWrite
+
+    if (durableTokens <= 0 || projectedTokens > 0 || zeroProjectionRepairFor === sessionID) return
+    zeroProjectionRepairFor = sessionID
+    void contextQuery.refetch()
+  })
+
+  const ctx = createMemo(() => projectSessionContextOccupancy(contextSnapshot()))
   const [oxpOrigins, setOxpOrigins] = createSignal<OxpResourceProvenanceInfo[]>([])
   let oxpOriginRequest = 0
 
@@ -319,25 +402,30 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   )
   const getParts = (id: string) => (sync().data.part[id] ?? []) as Part[]
 
-  const userMessages = createMemo(() => messages().filter(isSemanticUserMessage), emptyUserMessages, { equals: same })
-
-  const visibleUserMessages = createMemo(
-    () => {
-      const revert = info()?.revert?.messageID
-      if (!revert) return userMessages()
-      const boundary = userMessages().findIndex((message) => message.id === revert)
-      return boundary < 0 ? userMessages() : userMessages().slice(0, boundary)
-    },
-    emptyUserMessages,
-    { equals: same },
-  )
-
-  const providerList = createMemo<SessionProviderList>((previous) => {
-    if (!active()) return previous
-    return [...providers.all().values()]
-  }, emptyProviderList)
-
-  const ctx = createMemo(() => getSessionContext(messages(), providerList()))
+  // Raw-message expansion still uses the existing single-message
+  // presentation aggregator, but its provider metadata comes from the compact
+  // server projection rather than hydrating workspace provider state.
+  const providerList = createMemo<SessionProviderList>(() => {
+    const snapshot = contextSnapshot()
+    if (!snapshot) return emptyProviderList
+    const byProvider = new Map<string, SessionProviderList[number]>()
+    for (const model of snapshot.history.models) {
+      const provider =
+        byProvider.get(model.providerID) ??
+        ({
+          id: model.providerID,
+          name: model.providerName,
+          models: {},
+        } satisfies SessionProviderList[number])
+      provider.models[model.modelID] = {
+        name: model.modelName,
+        limit: { context: 0 },
+        cost: model.costRate,
+      }
+      byProvider.set(model.providerID, provider)
+    }
+    return [...byProvider.values()]
+  })
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
   const [rawOpen, setRawOpen] = createSignal<string[]>([])
   const [rawLimit, setRawLimit] = createSignal(RAW_MESSAGE_PAGE_SIZE)
@@ -358,10 +446,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     ),
   )
 
-  // The turn currently streaming (if any) — last assistant message without
-  // `time.completed`. Drives the faux-realtime timing ticker below; a stable
-  // primitive id (not the message object) is what the effect tracks, so a
-  // mid-turn token-count update doesn't tear down and restart the interval.
+  // Raw transcript state is used here only for compaction-control UX.
+  // Authoritative live timing below is driven exclusively by SessionTelemetry,
+  // so transcript virtualization cannot alter any displayed usage metric.
   const liveMessage = createMemo(() => {
     const list = messages()
     for (let i = list.length - 1; i >= 0; i--) {
@@ -371,7 +458,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     }
     return undefined
   })
-  const liveMessageID = createMemo(() => liveMessage()?.id)
+  const liveTelemetryTickKey = createMemo(() => {
+    const telemetry = contextTelemetry()
+    if (!telemetry || telemetry.phase === "idle") return undefined
+    return `${telemetry.step?.assistantMessageID ?? ""}:${telemetry.phase}`
+  })
   createEffect(() => {
     if (!active() || !params.id) return
     serverSync().telemetry.ensure([params.id])
@@ -440,14 +531,14 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     }
   }
 
-  const compactDisabled = () => !params.id || visibleUserMessages().length === 0 || compactBusy()
+  const compactDisabled = () => !params.id || specialAgentReadOnly() || counts().user === 0 || compactBusy()
 
   const [now, setNow] = createSignal(Date.now())
   createEffect(
     on(
-      () => [active(), liveMessageID()] as const,
-      ([isActive, id]) => {
-        if (!isActive || !id) return
+      () => [active(), liveTelemetryTickKey()] as const,
+      ([isActive, key]) => {
+        if (!isActive || !key) return
         setNow(Date.now())
         const interval = setInterval(() => setNow(Date.now()), 1000)
         onCleanup(() => clearInterval(interval))
@@ -456,10 +547,18 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   )
 
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
-    if (!params.id || !liveMessage()) return emptyLiveProgress
-    const telemetry = serverSync().telemetry.get(params.id)
-    if (!telemetry?.step || telemetry.phase === "idle") return emptyLiveProgress
-    const openMs = telemetry.phaseStartedAt === undefined ? 0 : Math.max(0, now() - telemetry.phaseStartedAt)
+    const telemetry = contextTelemetry()
+    if (!params.id || !telemetry?.step || telemetry.phase === "idle") return emptyLiveProgress
+    // Keep the existing 1s reactive tick, but measure the open phase across
+    // producer/client clock domains explicitly.
+    now()
+    const openMs = sessionTelemetryElapsedMs({
+      startedAt: telemetry.phaseStartedAt,
+      sampledAt: telemetry.sampledAt,
+      updatedAt: telemetry.updatedAt,
+      receivedAt: contextTelemetryReceivedAt(telemetry),
+      now: sessionTelemetryClientNow(),
+    })
     return {
       generatedSeconds:
         (telemetry.step.generatedMs +
@@ -470,67 +569,21 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   })
 
   const liveDeltaFor = (metrics: ModelContextMetrics): LiveGenerationProgress => {
-    const msg = liveMessage()
-    if (!msg || modelKey(msg) !== metrics.key) return emptyLiveProgress
+    const model = contextTelemetry()?.model
+    if (!model || `${model.providerID}:${model.modelID}` !== metrics.key) return emptyLiveProgress
     return liveDelta()
   }
 
-  const counts = createMemo(() => {
-    const all = messages()
-    const user = all.reduce((count, x) => count + (isSemanticUserMessage(x) ? 1 : 0), 0)
-    const assistant = all.reduce((count, x) => count + (x.role === "assistant" ? 1 : 0), 0)
-    return {
-      all: all.length,
-      user,
-      assistant,
-    }
-  })
+  const counts = createMemo(
+    () => contextSnapshot()?.history.counts ?? { all: 0, user: 0, assistant: 0 },
+  )
 
   const systemPrompt = createMemo(() => {
-    const msg = findLast(visibleUserMessages(), (m) => !!m.system)
-    const system = msg?.system
-    if (!system) return
-    const trimmed = system.trim()
-    if (!trimmed) return
-    return trimmed
+    const prompt = contextSnapshot()?.history.systemPrompt
+    if (!prompt) return undefined
+    const trimmed = prompt.trim()
+    return trimmed || undefined
   })
-
-  // Context analytics need full historical parts, but not at token frequency.
-  // Snapshot part-array references at message-metadata boundaries only. The
-  // callback is untracked so text/reasoning deltas in one live part do not
-  // trigger O(history) cost/timing/breakdown scans on the renderer thread.
-  const metricsStamp = createMemo(() =>
-    messages()
-      .map((message) => {
-        if (message.role !== "assistant") return `${message.id}:${message.role}:${message.time.created}`
-        return [
-          message.id,
-          message.role,
-          message.providerID,
-          message.modelID,
-          message.cost,
-          message.tokens.input,
-          message.tokens.output,
-          message.tokens.reasoning,
-          message.tokens.cache.read,
-          message.tokens.cache.write,
-          message.time.created,
-          message.time.completed ?? "",
-          message.time.firstTokenAt ?? "",
-          message.time.requestSentAt ?? "",
-        ].join(":")
-      })
-      .join("|"),
-  )
-  const analyticsParts = createMemo<Record<string, Part[] | undefined>>(
-    on(metricsStamp, () => {
-      if (!active()) return emptySessionParts
-      const result: Record<string, Part[] | undefined> = {}
-      for (const message of untrack(messages)) result[message.id] = untrack(() => getParts(message.id))
-      return result
-    }),
-    emptySessionParts,
-  )
 
   const providerLabel = createMemo(() => {
     const c = ctx()
@@ -544,21 +597,12 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     return c.modelLabel
   })
 
-  const breakdown = createMemo(
-    on(
-      () => [ctx()?.message.id, ctx()?.input, metricsStamp(), systemPrompt(), analyticsParts()] as const,
-      () => {
-        const c = ctx()
-        if (!c?.input) return []
-        return estimateSessionContextBreakdown({
-          messages: messages(),
-          parts: analyticsParts(),
-          input: c.input,
-          systemPrompt: systemPrompt(),
-        })
-      },
-    ),
-  )
+  const breakdown = createMemo(() => {
+    const snapshot = contextSnapshot()
+    const total = ctx()?.total
+    if (!snapshot || !total) return []
+    return projectSessionContextBreakdown(snapshot.history.breakdown, total)
+  })
 
   const breakdownLabel = (key: SessionContextBreakdownKey) => {
     if (key === "system") return language.t("context.breakdown.system")
@@ -577,17 +621,15 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     { label: "context.stats.model", value: modelLabel },
     { label: "context.stats.limit", value: () => formatter().number(ctx()?.limit) },
     { label: "context.stats.sessionCreated", value: () => formatter().time(info()?.time.created) },
-    { label: "context.stats.lastActivity", value: () => formatter().time(ctx()?.message.time.created) },
+    { label: "context.stats.lastActivity", value: () => formatter().time(ctx()?.updatedAt ?? contextSnapshot()?.history.updatedAt ?? info()?.time.updated) },
   ] satisfies { label: string; value: () => JSX.Element }[]
 
   const usagePercent = createMemo(() => ctx()?.usage ?? null)
 
-  const aggregate = createMemo(
-    on(
-      () => [metricsStamp(), analyticsParts(), providerList()] as const,
-      ([, parts, list]) => aggregateSessionContextByModel(untrack(messages), parts, list),
-    ),
-  )
+  const aggregate = createMemo(() => {
+    const snapshot = contextSnapshot()
+    return snapshot ? projectSessionContextSnapshot(snapshot) : emptyAggregate
+  })
 
   const session = createMemo(() => aggregate().session)
   const models = createMemo(() => aggregate().models)
@@ -638,13 +680,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       ]
     }),
   )
-  // The session's directory-scoped provider catalog is authoritative for the
-  // models this view can execute. Do not start a second directory-less global
-  // provider query merely for valuation; on legacy compatibility routes that
-  // request falls back to process.cwd() and boots an unrelated $HOME instance.
-  const valuation = createUsageValuation(valuationRows, () => providerList() ?? emptyProviderList, {
-    globalCatalog: false,
-  })
+  // Usage valuation is process-global and bootstrap-free. Keep rate-card
+  // inference on the same owner as the session projection instead of hydrating
+  // workspace provider state solely for this pane.
+  const valuation = createUsageValuation(valuationRows, () => [], { enabled: active })
   const subsidy = () => valuation.subsidy()
   const subsidyByModel = createMemo(
     () => new Map(subsidy().rows.map((row) => [`${row.providerID}:${row.modelID}`, row])),
@@ -782,6 +821,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   let scroll: HTMLDivElement | undefined
   let frame: number | undefined
   let pending: { x: number; y: number } | undefined
+  const [scrollElement, setScrollElement] = createSignal<HTMLDivElement>()
+  const [ledgerElement, setLedgerElement] = createSignal<HTMLElement>()
+  const [ledgerVisible, setLedgerVisible] = createSignal(false)
   const [ledger, setLedger] = createSignal<ContextLedger | null>(null)
   const [ledgerBusy, setLedgerBusy] = createSignal<string | null>(null)
   const [ledgerError, setLedgerError] = createSignal<string | null>(null)
@@ -808,25 +850,81 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     on(
       () => [active(), params.id] as const,
       ([isActive, sessionID]) => {
-        if (!isActive || !sessionID) return
         setLedger(null)
         setLedgerError(null)
+        setLedgerVisible(false)
+        if (!isActive || !sessionID) return
+      },
+    ),
+  )
+
+  // The actionable ledger is intentionally O(messages), unlike the fixed-size
+  // analytics projection above. Prefetch it only when the user approaches the
+  // ledger section so opening the Context pane never hydrates the full
+  // transcript just to render summary metrics.
+  createEffect(
+    on(
+      () => [active(), params.id, scrollElement(), ledgerElement()] as const,
+      ([isActive, sessionID, root, target]) => {
+        if (!isActive || !sessionID || !root || !target) return
+        if (typeof IntersectionObserver === "undefined") {
+          setLedgerVisible(true)
+          return
+        }
+        const observer = new IntersectionObserver(
+          (entries) => {
+            if (!entries.some((entry) => entry.isIntersecting)) return
+            setLedgerVisible(true)
+            observer.disconnect()
+          },
+          { root, rootMargin: "600px 0px" },
+        )
+        observer.observe(target)
+        onCleanup(() => observer.disconnect())
+      },
+    ),
+  )
+
+  createEffect(
+    on(
+      () => [active(), params.id, ledgerVisible()] as const,
+      ([isActive, sessionID, visible]) => {
+        if (!isActive || !sessionID || !visible || ledger()) return
         void fetchLedger(sessionID)
       },
     ),
   )
+  // Provider-step completion is intentionally NOT the durable-history
+  // watermark: telemetry settles at the step boundary, while UsageRecord is
+  // committed later during processor cleanup. SessionStatus publishes the
+  // shared telemetry idle watermark only after that cleanup has drained, so
+  // refresh when the same session's idle updatedAt advances instead of racing
+  // storage behind an arbitrary timeout. This also catches turns shorter than
+  // the telemetry coalescing window (idle -> idle with a newer watermark).
+  // Do not use the endpoint's own idle snapshot here: its arrival on first open
+  // would otherwise trigger an immediate duplicate query.
+  // Reactivating the pane remains the catch-up path for mutations that landed
+  // while this keep-mounted panel was inactive.
   createEffect(
     on(
-      () => messages().length,
       () => {
-        if (active()) void fetchLedger()
+        const telemetry = params.id ? serverSync().telemetry.get(params.id) : undefined
+        return [active(), params.id, telemetry?.phase, telemetry?.updatedAt] as SessionContextRefreshState
       },
+      (next, previous) => {
+        if (!shouldRefreshSessionContext(next, previous)) return
+        const sessionID = next[1]
+        if (!sessionID) return
+        if (!contextQuery.isFetching) void contextQuery.refetch()
+        if (ledgerVisible() || ledger()) void fetchLedger(sessionID)
+      },
+      { defer: true },
     ),
   )
 
   const applyLedgerOperation = async (op: Record<string, unknown>) => {
     const sessionID = params.id
-    if (!sessionID) return
+    if (!sessionID || specialAgentReadOnly()) return
     const key = `${op.type}:${op.messageID}`
     setLedgerBusy(key)
     try {
@@ -835,6 +933,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
         }
       ).sessionContext.applyOps({ sessionID, operations: [op] })
+      // Context operations mutate the prospective effective ledger only.
+      // Historical usage and provider-reported occupancy do not change until a
+      // later generation settles, so do not force an O(history) projection scan.
       await fetchLedger(sessionID)
       showToast({ variant: "success", title: language.t("context.ledger.applied") })
     } catch (e) {
@@ -1054,10 +1155,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   }
 
   const RawMessageSummary = (props: { message: Message; parts: Part[] }) => {
-    // A single-message call into the exact same aggregator that powers the
-    // Session Totals / Per-Model sections above — the per-message numbers
-    // are guaranteed consistent with the rest of the pane because they're
-    // literally the same math, not a re-derivation of it.
+    // Raw inspection is deliberately presentation-local. The authoritative
+    // Session Totals / Per-Model sections above come from the server projection;
+    // this single-message aggregator exists only to annotate the optional raw
+    // message viewer without reconstructing whole-history metrics client-side.
     const metrics = createMemo(() => {
       if (props.message.role !== "assistant") return undefined
       const result = aggregateSessionContextByModel(
@@ -1253,7 +1354,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
               </div>
             </div>
           </Accordion.Trigger>
-          <Show when={entry()}>
+          <Show when={!specialAgentReadOnly() ? entry() : undefined}>
             {(item) => (
               <div class="absolute right-1 top-1/2 z-[1] flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-v2-background-bg-base/95 pl-1 shadow-[-8px_0_12px_-8px_var(--v2-background-bg-base)]">
                 <Show
@@ -1373,6 +1474,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
         class="min-h-0 flex-1"
         viewportRef={(el) => {
           scroll = el
+          setScrollElement(el)
           restoreScroll()
         }}
         onScroll={handleScroll}
@@ -1599,8 +1701,18 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
           <Show when={breakdown().length > 0}>
             <div class="flex flex-col gap-2">
-              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
-                {language.t("context.breakdown.title")}
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex min-w-0 items-center gap-1 text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+                  <span>{language.t("context.breakdown.title")}</span>
+                  <TooltipV2 value={<div class="max-w-72 text-11-regular">{language.t("context.breakdown.note")}</div>}>
+                    <span class="inline-flex text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
+                      <IconV2 name="help" size="small" />
+                    </span>
+                  </TooltipV2>
+                </div>
+                <span class="shrink-0 text-[10px] font-[520] tabular-nums leading-3 text-v2-text-text-faint">
+                  {formatter().number(ctx()?.total)} {language.t("context.ledger.tokens")}
+                </span>
               </div>
               <div class="flex h-2 w-full overflow-hidden rounded-full bg-v2-background-bg-layer-03">
                 <For each={breakdown()}>
@@ -1642,7 +1754,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
             )}
           </Show>
 
-          <section class="flex flex-col gap-2">
+          <section ref={setLedgerElement} class="flex flex-col gap-2">
             <div class="flex items-baseline justify-between gap-2">
               <div class="min-w-0">
                 <h3 class="flex items-center gap-1 text-[10px] font-[600] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
@@ -1658,7 +1770,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                 </p>
               </div>
               <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
-                {messages().length.toLocaleString(language.intl())}
+                {counts().all.toLocaleString(language.intl())}
               </span>
             </div>
 

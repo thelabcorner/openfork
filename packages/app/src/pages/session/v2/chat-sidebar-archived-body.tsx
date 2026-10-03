@@ -13,6 +13,7 @@ export function ChatSidebarArchivedBody(props: {
   rows: Session[]
   loading: boolean
   error: boolean
+  more: boolean
   limit: number
   minuteNow: () => number
   activeSessionId?: string
@@ -51,7 +52,7 @@ export function ChatSidebarArchivedBody(props: {
                 />
               )}
             </For>
-            <Show when={props.rows.length > props.limit}>
+            <Show when={props.rows.length > props.limit || props.more}>
               <button
                 type="button"
                 class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"

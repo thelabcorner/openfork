@@ -128,7 +128,7 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
   const sdk = useServerSDK()
   const forkUsage = useForkUsage()
   // Shared singleton poller — adds no extra network traffic.
-  const freeUsage = useOpenRouterFreeUsage()
+  const freeUsage = useOpenRouterFreeUsage({ enabled: active })
 
   const [tick, setTick] = createSignal(0)
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)

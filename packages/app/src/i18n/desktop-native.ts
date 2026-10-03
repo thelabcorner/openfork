@@ -98,6 +98,11 @@ export const DESKTOP_NATIVE_ENGLISH = {
   "desktop.dialog.saveFile": "Save file",
   "desktop.dialog.files": "Files",
   "desktop.server.local": "Local Server",
+  "desktop.sidecar.unresponsive.title": "Local server is unresponsive",
+  "desktop.sidecar.unresponsive.description":
+    "OpenFork detected that the local runtime stopped responding. Diagnostics are available while OpenFork waits for recovery.",
+  "desktop.sidecar.recovered.title": "Local server recovered",
+  "desktop.sidecar.recovered.description": "The local runtime is responding again.",
   "desktop.oxp.tray.open": "Open OpenFork",
   "desktop.oxp.tray.quit": "Quit OpenFork",
   "desktop.oxp.dialog.chooseFolder": "Choose an approved OXP folder",

@@ -87,23 +87,36 @@
 }
 
 [data-titlebar-tab-list] {
-  gap: 6px;
+  /* Tighter gap: reclaims ~4px per tab boundary, giving more real estate
+     to tab content when many tabs are open. Separator dots still visible. */
+  gap: 2px;
 }
 
 [data-titlebar-tab-slot] {
   --tab-separator: var(--v2-background-bg-layer-03);
   position: relative;
+  /* Hard floor: icon (16px) + horizontal padding (2×6px) = 28px.
+     Tabs never fully collapse — always at least an icon remains tappable. */
+  min-width: 28px;
 }
 
 [data-color-scheme="dark"] [data-titlebar-tab-slot] {
   --tab-separator: var(--v2-background-bg-layer-02);
 }
 
+/* Active tab claims 2× flex share vs inactive tabs (each flex-grow: 1).
+   With 10 tabs this keeps the active tab ~2× wider than any single inactive
+   tab, preserving title legibility while the rest compress to icon+partial-text. */
+[data-titlebar-tab-slot][data-active="true"] {
+  flex-grow: 2;
+}
+
 [data-titlebar-tab-slot]:not(:first-child):not([data-active="true"])::before {
   content: "";
   position: absolute;
   top: 8px;
-  inset-inline-start: -3.75px;
+  /* Inset adjusted for tighter 2px gap (was -3.75px for 6px gap) */
+  inset-inline-start: -1.75px;
   width: 1.5px;
   height: 12px;
   border-radius: 9999px;
@@ -184,7 +197,10 @@
   display: none;
 }
 
-@container (max-width: 64px) {
+/* Icon-only mode: title collapses at 52px (was 64px).
+   Triggering slightly earlier gives inactive tabs more room before they need
+   to scroll — they show icon only at ~52px wide, which is still a clean tap target. */
+@container (max-width: 52px) {
   [data-titlebar-tab-link] {
     justify-content: center;
     gap: 0;

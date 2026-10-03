@@ -4,7 +4,7 @@ import { createStore } from "solid-js/store"
 import { createServerProjects, RECENTLY_CLOSED_DISPLAY_LIMIT, ServerConnection, useServer } from "./server"
 import { pathKey } from "@/utils/path-key"
 import { useServerHealth } from "@/utils/server-health"
-import { createServerSdkContext } from "./server-sdk"
+import { createServerSdkContext, type ServerSDK } from "./server-sdk"
 import { createServerSyncContext } from "./server-sync"
 import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
@@ -40,8 +40,30 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       ServerConnection.Key,
       { dispose: () => void; serverCtx: ReturnType<typeof createServerCtx> }
     >()
+    const serverSDKs = new Map<ServerConnection.Key, { dispose: () => void; sdk: ServerSDK }>()
 
     const owner = getOwner()
+
+    // Protocol checks and server selection need a client, not a full sync owner.
+    // Keep that lightweight lifetime separate so probing an inactive connection
+    // does not also start global queries and a persistent event stream.
+    const ensureServerSdk = (conn: ServerConnection.Any) => {
+      const key = ServerConnection.key(conn)
+      const existing = serverSDKs.get(key)
+      if (existing && existing.sdk.url === conn.http.url) return existing.sdk
+      if (existing) {
+        serverCtxs.get(key)?.dispose()
+        serverCtxs.delete(key)
+        existing.dispose()
+        serverSDKs.delete(key)
+      }
+      const root = createRoot((dispose) => {
+        const sdk = createServerSdkContext(conn, server.scope(key))
+        return { dispose, sdk }
+      }, owner as never)
+      serverSDKs.set(key, root)
+      return root.sdk
+    }
 
     const ensureServerCtx = (conn: ServerConnection.Any) => {
       const key = ServerConnection.key(conn)
@@ -52,7 +74,11 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
         serverCtxs.delete(key)
       }
       const root = createRoot((dispose) => {
-        const serverCtx = createServerCtx(conn, server.scope(key), server.projects.forServer(key))
+        const serverCtx = createServerCtx(
+          conn,
+          server.projects.forServer(key),
+          ensureServerSdk(conn),
+        )
         return { dispose, serverCtx }
       }, owner as never)
       serverCtxs.set(key, root)
@@ -65,19 +91,24 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       for (const conn of list) {
         if (ServerConnection.key(conn) === active) ensureServerCtx(conn)
       }
-      queueMicrotask(() => {
-        for (const conn of list) {
-          if (ServerConnection.key(conn) !== active) ensureServerCtx(conn)
-        }
-      })
     })
 
     createEffect(() => {
-      for (const [key] of serverCtxs) {
-        if (!server.list.find((conn) => ServerConnection.key(conn) === key)) {
-          const { dispose } = serverCtxs.get(key)!
+      const list = server.list
+      for (const [key, context] of serverCtxs) {
+        const conn = list.find((item) => ServerConnection.key(item) === key)
+        if (!conn || context.serverCtx.sdk.url !== conn.http.url) {
+          const { dispose } = context
           dispose()
           serverCtxs.delete(key)
+        }
+      }
+      for (const [key, context] of serverSDKs) {
+        const conn = list.find((item) => ServerConnection.key(item) === key)
+        if (!conn || context.sdk.url !== conn.http.url) {
+          const { dispose } = context
+          dispose()
+          serverSDKs.delete(key)
         }
       }
     })
@@ -101,14 +132,17 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       ensureServerCtx(conn: ServerConnection.Any) {
         return ensureServerCtx(conn)
       },
+      ensureServerSdk(conn: ServerConnection.Any) {
+        return ensureServerSdk(conn)
+      },
     }
   },
 })
 
 function createServerCtx(
   conn: ServerConnection.Any,
-  scope: ServerScope,
   projects: ReturnType<typeof createServerProjects>,
+  sdk: ServerSDK,
 ) {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -119,7 +153,6 @@ function createServerCtx(
       },
     },
   })
-  const sdk = createServerSdkContext(conn, scope)
   const sync = createServerSyncContext(sdk)
 
   const projectMeta = createMemo(() => {

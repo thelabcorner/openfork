@@ -17,11 +17,11 @@ describe("normalizeAgentList", () => {
         hidden: false,
         color: "primary",
         model: { id: "gpt-5", providerID: "openai", variant: "high" },
-        request: { settings: { temperature: 0.2, topP: 0.9 }, headers: {}, body: {} },
+        request: { headers: {}, body: { temperature: 0.2, top_p: 0.9 } },
         system: "Build software",
         permissions: [{ action: "read", resource: "*", effect: "allow" }],
       },
-    ] as AgentListOutput["data"])
+    ] as unknown as AgentListOutput["data"])
 
     expect(result).toEqual([
       {
@@ -36,10 +36,30 @@ describe("normalizeAgentList", () => {
         model: { providerID: "openai", modelID: "gpt-5" },
         variant: "high",
         prompt: "Build software",
-        options: { temperature: 0.2, topP: 0.9 },
+        options: { temperature: 0.2, top_p: 0.9 },
         steps: undefined,
       },
     ])
+  })
+
+  test("preserves resolved built-in system prompts when request body is empty", () => {
+    const result = normalizeAgentList([
+      {
+        id: "build",
+        mode: "primary",
+        hidden: false,
+        request: { headers: {}, body: {} },
+        system:
+          "You are an AI coding agent. Help the user accomplish software engineering tasks by inspecting the workspace.",
+        permissions: [],
+      },
+    ] as unknown as AgentListOutput["data"])
+
+    expect(result[0]?.name).toBe("build")
+    expect(result[0]?.prompt).toStartWith("You are an AI coding agent.")
+    expect(result[0]?.options).toEqual({})
+    expect(result[0]?.temperature).toBeUndefined()
+    expect(result[0]?.topP).toBeUndefined()
   })
 })
 

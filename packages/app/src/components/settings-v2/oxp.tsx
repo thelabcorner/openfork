@@ -3,20 +3,24 @@ import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
+import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
 import { Switch } from "@opencode-ai/ui/v2/switch-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { For, Show, createMemo, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
+import { providerModelID, splitModelIDForProvider } from "@/utils/model-account-identity"
 import {
   isOxpPlatform,
+  type OxpAgentCatalog,
   type OxpDesktopState,
   type OxpGrant,
   type OxpLifecycle,
 } from "@/oxp/platform"
 import { showToast } from "@/utils/toast"
 import { SettingsListV2 } from "./parts/list"
+import { SettingsModelPickerV2 } from "./parts/model-picker"
 import { SettingsRowV2 } from "./parts/row"
 import "./settings-v2.css"
 
@@ -28,6 +32,9 @@ type BusyAction =
   | "openai-key"
   | "openai-key-reset"
   | "migration"
+  | "worker-default-model"
+  | "worker-agent-catalog"
+  | "worker-default-agent"
   | "diagnostics"
   | `root:${string}`
   | `grant:${keyof OxpGrant}`
@@ -78,10 +85,13 @@ export const SettingsOxpV2 = () => {
     tunnelID: string
     editingRootID?: string
     rootAlias: string
+    agentRootID: string
+    agentCatalog?: OxpAgentCatalog
   }>({
     loading: true,
     tunnelID: "",
     rootAlias: "",
+    agentRootID: "",
   })
   let disposed = false
   let unsubscribe: (() => void) | undefined
@@ -94,6 +104,13 @@ export const SettingsOxpV2 = () => {
     setStore("state", next)
     setStore("error", undefined)
     if (document.activeElement !== tunnelInput) setStore("tunnelID", next.tunnel.tunnelID)
+    if (
+      store.agentRootID &&
+      !next.roots.some((root) => root.id === store.agentRootID)
+    ) {
+      setStore("agentRootID", "")
+      setStore("agentCatalog", undefined)
+    }
   }
 
   onMount(() => {
@@ -177,6 +194,79 @@ export const SettingsOxpV2 = () => {
     )
   })
 
+  const workerDefaultModel = createMemo(
+    () => state()?.workerPolicy.defaultModel,
+  )
+  const workerDefaultModelPickerValue = createMemo(() => {
+    const value = workerDefaultModel()
+    if (!value) return undefined
+    return {
+      providerID: value.providerID,
+      modelID: providerModelID(
+        value.modelID,
+        value.providerID,
+        value.accountID,
+      ),
+    }
+  })
+  const workerAgentRootOptions = createMemo(() => [
+    {
+      id: "",
+      label: language.t(
+        "settings.oxp.agentSupport.defaultAgent.chooseRoot",
+      ),
+    },
+    ...(state()?.roots ?? []).map((root) => ({
+      id: root.id,
+      label: `/${root.alias}`,
+    })),
+  ])
+  const workerAgentRoot = createMemo(
+    () =>
+      workerAgentRootOptions().find(
+        (option) => option.id === store.agentRootID,
+      ) ?? workerAgentRootOptions()[0],
+  )
+  const scopedWorkerAgentPolicy = createMemo(() => {
+    const policy = state()?.workerPolicy
+    if (!policy || !store.agentRootID) return
+    const scoped = policy.agentRoots?.find(
+      (entry) => entry.rootID === store.agentRootID,
+    )
+    if (scoped) return scoped
+    if (policy.agentRoots === undefined) {
+      return {
+        rootID: store.agentRootID,
+        agents: policy.agents,
+        ...(policy.defaultAgent
+          ? { defaultAgent: policy.defaultAgent }
+          : {}),
+      }
+    }
+  })
+  const workerDefaultAgent = createMemo(
+    () => scopedWorkerAgentPolicy()?.defaultAgent,
+  )
+  const workerAgentOptions = createMemo(() => [
+    {
+      id: "",
+      label: language.t("settings.oxp.agentSupport.defaultAgent.none"),
+    },
+    ...(store.agentCatalog?.agents ?? []).map((agent) => ({
+      id: agent.id,
+      label:
+        agent.id === store.agentCatalog?.nativeDefaultAgent
+          ? `${agent.id} (${language.t("settings.oxp.agentSupport.defaultAgent.native")})`
+          : agent.id,
+    })),
+  ])
+  const workerAgentOption = createMemo(
+    () =>
+      workerAgentOptions().find(
+        (option) => option.id === (workerDefaultAgent() ?? ""),
+      ) ?? workerAgentOptions()[0],
+  )
+
 
   const setGrant = (key: keyof OxpGrant, value: boolean) => {
     const current = state()
@@ -196,6 +286,53 @@ export const SettingsOxpV2 = () => {
   const setLifecycle = (key: keyof OxpLifecycle, value: boolean) => {
     if (!api) return
     void run(`lifecycle:${key}`, () => api.setLifecycle({ [key]: value }))
+  }
+
+  const setWorkerDefaultModel = (
+    value: { providerID: string; modelID: string } | undefined,
+  ) => {
+    if (!api || store.busy) return
+    if (!value) {
+      void run("worker-default-model", () => api.setWorkerDefaultModel())
+      return
+    }
+    const split = splitModelIDForProvider(value.modelID, value.providerID)
+    void run("worker-default-model", () =>
+      api.setWorkerDefaultModel({
+        providerID: value.providerID,
+        modelID: split.baseModelID,
+        ...(split.accountID ? { accountID: split.accountID } : {}),
+      }),
+    )
+  }
+
+  const loadWorkerAgentRoot = async (rootID: string) => {
+    if (!api || store.busy) return
+    setStore("agentRootID", rootID)
+    setStore("agentCatalog", undefined)
+    if (!rootID) return
+    setStore("busy", "worker-agent-catalog")
+    try {
+      const catalog = await api.listWorkerAgents(rootID)
+      if (!disposed && store.agentRootID === rootID) {
+        setStore("agentCatalog", catalog)
+      }
+    } catch (error) {
+      showToast({
+        variant: "error",
+        title: language.t("settings.oxp.actionFailed"),
+        description: error instanceof Error ? error.message : undefined,
+      })
+    } finally {
+      if (!disposed) setStore("busy", undefined)
+    }
+  }
+
+  const setWorkerDefaultAgent = (agent: string | undefined) => {
+    if (!api || !store.agentRootID || store.busy) return
+    void run("worker-default-agent", () =>
+      api.setWorkerDefaultAgent(store.agentRootID, agent),
+    )
   }
 
 
@@ -568,6 +705,66 @@ export const SettingsOxpV2 = () => {
                       />
                     </SettingsRowV2>
 
+                    <SettingsRowV2
+                      title={language.t("settings.oxp.agentSupport.defaultModel.title")}
+                      description={language.t("settings.oxp.agentSupport.defaultModel.description")}
+                    >
+                      <div class="flex min-w-0 items-center gap-2">
+                        <SettingsModelPickerV2
+                          value={workerDefaultModelPickerValue()}
+                          defaultLabel={language.t("settings.oxp.agentSupport.defaultModel.none")}
+                          action="oxp-worker-default-model"
+                          onChange={setWorkerDefaultModel}
+                        />
+                        <Show when={workerDefaultModel()?.accountID}>
+                          {(accountID) => <Tag>{accountID()}</Tag>}
+                        </Show>
+                      </div>
+                    </SettingsRowV2>
+                    <SettingsRowV2
+                      title={language.t("settings.oxp.agentSupport.defaultAgent.title")}
+                      description={language.t("settings.oxp.agentSupport.defaultAgent.description")}
+                    >
+                      <div class="flex min-w-0 items-center gap-2">
+                        <SelectV2
+                          appearance="inline"
+                          data-action="oxp-worker-agent-root"
+                          options={workerAgentRootOptions()}
+                          current={workerAgentRoot()}
+                          placement="bottom-end"
+                          gutter={6}
+                          value={(option) => option.id}
+                          label={(option) => option.label}
+                          disabled={
+                            !!store.busy ||
+                            !current().enabled ||
+                            current().roots.length === 0
+                          }
+                          onSelect={(option) =>
+                            option && void loadWorkerAgentRoot(option.id)
+                          }
+                        />
+                        <SelectV2
+                          appearance="inline"
+                          data-action="oxp-worker-default-agent"
+                          options={workerAgentOptions()}
+                          current={workerAgentOption()}
+                          placement="bottom-end"
+                          gutter={6}
+                          value={(option) => option.id}
+                          label={(option) => option.label}
+                          disabled={
+                            !!store.busy ||
+                            !store.agentRootID ||
+                            !store.agentCatalog
+                          }
+                          onSelect={(option) =>
+                            option &&
+                            setWorkerDefaultAgent(option.id || undefined)
+                          }
+                        />
+                      </div>
+                    </SettingsRowV2>
                     <SettingsRowV2 title={language.t("settings.oxp.agentSupport.nested.title")} description={language.t("settings.oxp.agentSupport.nested.description")}>
                       <Switch
                         checked={current().grant.nestedDelegation}

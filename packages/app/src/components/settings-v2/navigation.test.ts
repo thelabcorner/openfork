@@ -6,6 +6,7 @@ describe("routed settings navigation", () => {
     expect(normalizeSettingsTab(undefined)).toBe("general")
     expect(normalizeSettingsTab("providers")).toBe("providers")
     expect(normalizeSettingsTab("oxp")).toBe("oxp")
+    expect(normalizeSettingsTab("special-agents")).toBe("special-agents")
     expect(normalizeSettingsTab("wakatime")).toBe("wakatime")
     expect(normalizeSettingsTab("not-a-tab")).toBe("general")
   })

@@ -104,11 +104,12 @@ describe("eventStreamFetch", () => {
       return Promise.resolve(new Response("ok"))
     }) as typeof fetch
     const sessions = new Set(["ses_b", "ses_a", "ses_b"])
-    await eventStreamFetch(base, credentials, { subscriber: "sub_1", sessions: () => sessions })(
+    await eventStreamFetch(base, credentials, { subscriber: "sub_1", sessions: () => sessions, generation: () => 17 })(
       "http://localhost:4096/api/event",
     )
     expect(received?.headers.get("x-opencode-stream-subscriber")).toBe("sub_1")
     expect(JSON.parse(received?.headers.get("x-opencode-stream-sessions") ?? "null")).toEqual(["ses_a", "ses_b"])
+    expect(received?.headers.get("x-opencode-stream-generation")).toBe("17")
   })
 
   test("never adds stream-interest headers to ordinary API traffic", async () => {
@@ -122,5 +123,6 @@ describe("eventStreamFetch", () => {
     )
     expect(received?.headers.has("x-opencode-stream-subscriber")).toBe(false)
     expect(received?.headers.has("x-opencode-stream-sessions")).toBe(false)
+    expect(received?.headers.has("x-opencode-stream-generation")).toBe(false)
   })
 })

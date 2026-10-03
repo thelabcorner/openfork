@@ -41,6 +41,14 @@ export function chatSidebarAggregateMetrics(
 export const shouldAutoHydrateChatSidebarMetrics = (input: { selected?: boolean; working: boolean }) =>
   !!input.selected || input.working
 
+/** The Recent row is the sole animated slot; project/group duplicates stay static. */
+export const chatSidebarWorkingIndicatorAnimated = (recent: boolean, primary: boolean, visible: boolean) =>
+  recent && primary && visible
+
+export function uniqueSidebarSessions<T extends { id: string }>(sessions: T[]): T[] {
+  return [...new Map(sessions.map((session) => [session.id, session])).values()]
+}
+
 /**
  * A canonical project root owns sessions associated with that project even
  * when their physical working directory is intentionally project-local (for

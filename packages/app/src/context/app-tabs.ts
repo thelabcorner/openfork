@@ -1,4 +1,4 @@
-export const APP_TAB_PAGES = ["settings", "usage", "scheduled", "oxp"] as const
+export const APP_TAB_PAGES = ["settings", "usage", "scheduled", "oxp", "agents"] as const
 
 export type AppTabPage = (typeof APP_TAB_PAGES)[number]
 

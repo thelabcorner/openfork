@@ -75,13 +75,13 @@ export async function loadRootSessionsV1(input: {
   directory: string
   limit: number
 }): Promise<RootSessions> {
-  try {
-    const result = await input.client.session.list({ directory: input.directory, roots: true, limit: input.limit })
-    return { data: (result.data ?? []).map(normalizeSessionInfo), limit: input.limit, limited: true }
-  } catch {
-    const result = await input.client.session.list({ directory: input.directory, roots: true })
-    return { data: (result.data ?? []).map(normalizeSessionInfo), limit: input.limit, limited: false }
-  }
+  // A transient failure, cancellation, or authorization error must not trigger
+  // a second request that silently drops the caller's bound and scans every
+  // root session in the workspace. Older servers may reject the `roots` query,
+  // but the explicit-location Tier 1 `sessionRoots` route is the preferred
+  // compatibility fallback and owns that case; this helper remains bounded.
+  const result = await input.client.session.list({ directory: input.directory, roots: true, limit: input.limit })
+  return { data: (result.data ?? []).map(normalizeSessionInfo), limit: input.limit, limited: true }
 }
 
 export function estimateRootSessionTotal(input: { count: number; limit: number; limited: boolean }) {
