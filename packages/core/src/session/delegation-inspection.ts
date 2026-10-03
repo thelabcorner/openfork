@@ -33,7 +33,8 @@ export interface WorkerRow {
   readonly malformedOrigin: boolean
   readonly execution: {
     readonly generation: number
-    readonly running: boolean
+    /** Durable execution-owner fence; this is authority, not proof of a live runtime fiber/job. */
+    readonly owned: boolean
     readonly acquiredAt?: number
     readonly interruptRequestedAt?: number
   }
@@ -115,7 +116,7 @@ function projectWorker(input: {
     malformedOrigin: protectedOrigin && !origin,
     execution: {
       generation: input.generation ?? 0,
-      running: input.ownerID !== null,
+      owned: input.ownerID !== null,
       ...(input.acquiredAt === null ? {} : { acquiredAt: input.acquiredAt }),
       ...(input.interruptRequestedAt === null
         ? {}

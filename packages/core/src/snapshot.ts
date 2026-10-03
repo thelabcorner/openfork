@@ -395,39 +395,54 @@ const layer = Layer.effect(
       const limit = Math.min(512, Math.max(1, Math.floor(input.limit)))
       const root = retainedPrefix(input.prefix ?? "")
       const after = input.after ? retainedRef(input.after) : undefined
-      const result = yield* appProcess
-        .run(
-          ChildProcess.make(
-            "git",
-            GitRuntime.args([
-              "--git-dir",
-              repo.gitDirectory,
-              "for-each-ref",
-              `--count=${limit}`,
-              "--format=%(refname)",
-              ...(after ? [`--start-after=${after}`] : []),
-              root,
-            ]),
-          ),
-          { stdin: "ignore" },
-        )
-        .pipe(
-          Effect.mapError(
-            (cause) => new Error({ operation: "capture", message: "failed to list retained refs", cause }),
-          ),
-        )
-      if (result.exitCode !== 0)
-        return yield* new Error({
-          operation: "capture",
-          message: `for-each-ref failed: ${result.stderr.toString("utf8").trim()}`,
-        })
       const refRoot = "refs/opencode/retained/"
-      const keys = result.stdout
-        .toString("utf8")
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter((value) => value.startsWith(refRoot))
-        .map((value) => value.slice(refRoot.length))
+      const keys: string[] = []
+      let cursor = after
+      while (keys.length < limit) {
+        // Git rejects --start-after when any ref patterns are supplied. Page
+        // the ordered full ref list instead, then keep only our namespace;
+        // this preserves bounded reads without passing a pattern to Git.
+        const result = yield* appProcess
+          .run(
+            ChildProcess.make(
+              "git",
+              GitRuntime.args([
+                "--git-dir",
+                repo.gitDirectory,
+                "for-each-ref",
+                `--count=${limit}`,
+                "--format=%(refname)",
+                ...(cursor ? [`--start-after=${cursor}`] : []),
+              ]),
+            ),
+            { stdin: "ignore" },
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) => new Error({ operation: "capture", message: "failed to list retained refs", cause }),
+            ),
+          )
+        if (result.exitCode !== 0)
+          return yield* new Error({
+            operation: "capture",
+            message: `for-each-ref failed: ${result.stderr.toString("utf8").trim()}`,
+          })
+        const refs = result.stdout
+          .toString("utf8")
+          .split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+        if (refs.length === 0) break
+        cursor = refs[refs.length - 1]
+        for (const ref of refs) {
+          if (!ref.startsWith(root) || !ref.startsWith(refRoot)) continue
+          const key = ref.slice(refRoot.length)
+          if (after && retainedRef(key) <= after) continue
+          keys.push(key)
+          if (keys.length === limit) break
+        }
+        if (refs.length < limit) break
+      }
       return {
         keys,
         ...(keys.length === limit ? { next: keys[keys.length - 1] } : {}),

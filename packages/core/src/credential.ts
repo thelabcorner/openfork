@@ -1,7 +1,7 @@
 export * as Credential from "./credential"
 
-import { asc, eq } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { and, asc, eq, sql } from "drizzle-orm"
+import { Context, Effect, Layer, PubSub, Schema, Stream } from "effect"
 import { Credential } from "@opencode-ai/schema/credential"
 import { Integration } from "@opencode-ai/schema/integration"
 import { Database } from "./database/database"
@@ -26,9 +26,12 @@ export class Info extends Schema.Class<Info>("Credential.Info")({
   label: Schema.String,
   value: Value,
   active: Schema.optional(Schema.Boolean),
+  revision: Schema.Number,
 }) {}
 
 export interface Interface {
+  /** Secret-free notification emitted after a credential write commits. */
+  readonly changes: Stream.Stream<{ readonly integrationID: Integration.ID }>
   /** Returns every stored credential. */
   readonly all: () => Effect.Effect<Info[]>
   /** Returns stored credentials belonging to one integration. */
@@ -49,6 +52,12 @@ export interface Interface {
   }) => Effect.Effect<Info>
   /** Updates the label or secret value of a stored credential. */
   readonly update: (id: ID, updates: Partial<Pick<Info, "label" | "value">>) => Effect.Effect<void>
+  /**
+   * Replaces secret material only when the caller still owns the observed
+   * revision. A successful write increments the trusted secret revision and
+   * returns the committed row; a stale/deleted row returns undefined.
+   */
+  readonly compareAndSwapValue: (id: ID, revision: number, value: Value) => Effect.Effect<Info | undefined>
   /** Marks one credential as the active selection for its integration, clearing any other. */
   readonly select: (id: ID) => Effect.Effect<void>
   /** Removes a stored credential. */
@@ -61,6 +70,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db, readDb } = yield* Database.Service
+    const changes = yield* PubSub.sliding<{ readonly integrationID: Integration.ID }>(128)
     const decode = Schema.decodeUnknownSync(Value)
     const stored = (row: typeof CredentialTable.$inferSelect) => {
       if (!row.integration_id) return
@@ -70,10 +80,12 @@ const layer = Layer.effect(
         label: row.label,
         value: decode(row.value),
         active: row.active ?? undefined,
+        revision: row.revision,
       })
     }
 
     return Service.of({
+      changes: Stream.fromPubSub(changes),
       all: Effect.fn("Credential.all")(function* () {
         return (yield* readDb
           .select()
@@ -112,6 +124,7 @@ const layer = Layer.effect(
           integrationID: input.integrationID,
           label: input.label ?? "default",
           value: input.value,
+          revision: 1,
         })
         yield* db
           .transaction((tx) =>
@@ -132,6 +145,7 @@ const layer = Layer.effect(
             }),
           )
           .pipe(Effect.orDie)
+        yield* PubSub.publish(changes, { integrationID: credential.integrationID })
         return credential
       }),
       add: Effect.fn("Credential.add")(function* (input) {
@@ -140,6 +154,7 @@ const layer = Layer.effect(
           integrationID: input.integrationID,
           label: input.label ?? "default",
           value: input.value,
+          revision: 1,
         })
         yield* db
           .insert(CredentialTable)
@@ -151,16 +166,43 @@ const layer = Layer.effect(
           })
           .run()
           .pipe(Effect.orDie)
+        yield* PubSub.publish(changes, { integrationID: credential.integrationID })
         return credential
       }),
       update: Effect.fn("Credential.update")(function* (id, updates) {
         if (!updates.label && !updates.value) return
+        const prior = yield* db
+          .select({ integration_id: CredentialTable.integration_id })
+          .from(CredentialTable)
+          .where(eq(CredentialTable.id, id))
+          .get()
+          .pipe(Effect.orDie)
+        const secret = updates.value !== undefined
         yield* db
           .update(CredentialTable)
-          .set({ label: updates.label, value: updates.value })
+          .set({
+            label: updates.label,
+            value: updates.value,
+            ...(secret ? { revision: sql`${CredentialTable.revision} + 1` } : {}),
+          })
           .where(eq(CredentialTable.id, id))
           .run()
           .pipe(Effect.orDie)
+        if (prior?.integration_id) yield* PubSub.publish(changes, { integrationID: prior.integration_id })
+      }),
+      compareAndSwapValue: Effect.fn("Credential.compareAndSwapValue")(function* (id, revision, value) {
+        const row = yield* db
+          .update(CredentialTable)
+          .set({
+            value,
+            revision: sql`${CredentialTable.revision} + 1`,
+          })
+          .where(and(eq(CredentialTable.id, id), eq(CredentialTable.revision, revision)))
+          .returning()
+          .get()
+          .pipe(Effect.orDie)
+        if (row?.integration_id) yield* PubSub.publish(changes, { integrationID: row.integration_id })
+        return row ? stored(row) : undefined
       }),
       select: Effect.fn("Credential.select")(function* (id) {
         const row = yield* db.select().from(CredentialTable).where(eq(CredentialTable.id, id)).get().pipe(Effect.orDie)
@@ -180,7 +222,14 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
       }),
       remove: Effect.fn("Credential.remove")(function* (id) {
+        const row = yield* db
+          .select({ integration_id: CredentialTable.integration_id })
+          .from(CredentialTable)
+          .where(eq(CredentialTable.id, id))
+          .get()
+          .pipe(Effect.orDie)
         yield* db.delete(CredentialTable).where(eq(CredentialTable.id, id)).run().pipe(Effect.orDie)
+        if (row?.integration_id) yield* PubSub.publish(changes, { integrationID: row.integration_id })
       }),
     })
   }),

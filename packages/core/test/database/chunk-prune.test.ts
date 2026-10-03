@@ -628,7 +628,12 @@ describe("ChunkDB semantic prune", () => {
           // This fixture owns one manually constructed handle. Projection replay
           // does not need the production query-only connection, so alias the
           // read surface exactly as Database.layerFromPath does for :memory:.
-          const database = Layer.succeed(Database.Service, { db, readDb: db, filename: path })
+          const database = Layer.succeed(Database.Service, {
+            db,
+            readDb: db,
+            scanDb: () => Effect.succeed(db),
+            filename: path,
+          })
           const layer = AppNodeBuilder.build(
             LayerNode.group([EventV2.node, SessionProjector.node]),
             [[Database.node, database]],

@@ -2,7 +2,7 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Duration, Effect, Layer } from "effect"
+import { Context, Duration, Effect, Exit, Layer, Scope, Semaphore } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { dirname, isAbsolute, join, resolve } from "path"
@@ -30,10 +30,39 @@ export interface Interface {
    * independent databases.
    */
   readDb: DatabaseShape
+  /**
+   * Lazily-created persistent query-only lane for expensive analytical scans.
+   * It stays separate from readDb so aggregation cannot monopolize the
+   * latency-sensitive reader's single SQLite permit.
+   */
+  scanDb: () => Effect.Effect<DatabaseShape>
   filename: string
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/storage/Database") {}
+
+/**
+ * Stage a lazily acquired resource in a private scope. Failed or interrupted
+ * setup closes partial acquisitions immediately; successful setup transfers
+ * cleanup to the owner scope.
+ */
+export function acquireScopedResource<A, E, R>(
+  owner: Scope.Scope,
+  acquire: (candidate: Scope.Closeable) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> {
+  return Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const candidate = yield* Scope.make()
+      const result = yield* Effect.exit(restore(acquire(candidate)))
+      if (Exit.isFailure(result)) {
+        yield* Scope.close(candidate, result)
+        return yield* Effect.failCause(result.cause)
+      }
+      yield* Scope.addFinalizer(owner, Scope.close(candidate, Exit.void))
+      return result.value
+    }),
+  )
+}
 
 const layer = (filename: string) =>
   Layer.effect(
@@ -104,6 +133,42 @@ const layer = (filename: string) =>
         yield* readDb.run("PRAGMA cache_size = -32000")
         yield* readDb.run("PRAGMA foreign_keys = ON")
       }
+      // Heavy analytics need queue isolation without paying a fresh native
+      // worker/open/configure cost on every request. Keep this lane lazy so
+      // ordinary startup still creates only primary + interactive reader.
+      // Binding the lazy layer to this service scope prevents the first caller's
+      // request scope from owning (and prematurely closing) the connection.
+      const lifetimeScope = yield* Effect.scope
+      const scanAdmission = yield* Semaphore.make(1)
+      let scanConnection: DatabaseShape | undefined
+      const scanDb = Effect.fn("Database.scanDb")(function* () {
+        if (filename === ":memory:") return db
+        if (scanConnection) return scanConnection
+        return yield* scanAdmission.withPermits(1)(
+          Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
+            if (scanConnection) return scanConnection
+            // Scope transfer and cache publication are one ownership handoff.
+            // Cancellation after setup must not strand a ready but uncached
+            // connection in the service scope and let a retry open another.
+            const connection = yield* acquireScopedResource<DatabaseShape, never, never>(lifetimeScope, (candidate) =>
+              restore(Effect.gen(function* () {
+                const scanContext = yield* Layer.buildWithScope(
+                  sqliteLayer({ filename, disableWAL: true, checkpointOnClose: false }),
+                  candidate,
+                )
+                const connection = yield* makeDatabase.pipe(Effect.provide(scanContext))
+                yield* connection.run("PRAGMA query_only = ON")
+                yield* connection.run("PRAGMA busy_timeout = 250")
+                yield* connection.run("PRAGMA cache_size = -32000")
+                yield* connection.run("PRAGMA foreign_keys = ON")
+                return connection
+              }).pipe(Effect.orDie, Effect.provideService(Scope.Scope, candidate))),
+            )
+            scanConnection = connection
+            return connection
+          })).pipe(Effect.orDie),
+        )
+      })
       // The sealer intentionally owns a second SQLite connection so maintenance
       // cannot monopolize the foreground client's single permit. Plain
       // `:memory:` handles are independent databases, not shared connections;
@@ -113,41 +178,29 @@ const layer = (filename: string) =>
         yield* Effect.forkScoped(runSealerLoop(filename).pipe(Effect.ignore))
       }
 
-      // Periodically checkpoint the WAL so it doesn't grow unbounded during
-      // long runs. PASSIVE checkpoints whatever frames it can WITHOUT taking
-      // the EXCLUSIVE lock, so it can never stall live queries: the native
-      // driver calls are synchronous (they block the single event loop), and
-      // a TRUNCATE checkpoint contending with concurrent sessions' writes can
-      // hold the shared connection — bounded only by the 5s busy_timeout —
-      // long enough to starve the 10s SSE heartbeat and flip the UI red.
-      // PASSIVE still bounds WAL growth (idle moments between queries let it
-      // make progress). Multiple ACP/Desktop hosts can share this exact DB, so
+      // Checkpointing is maintenance owned by this database lifetime. Even a
+      // PASSIVE checkpoint can copy many frames: never occupy the foreground
+      // connection's admission permit while doing that work. A separate native
+      // handle isolates its queue, and zero busy timeout makes maintenance yield
+      // instead of waiting on an interactive writer. In-memory databases have
+      // no WAL file and must not open a second unrelated database.
+      // Multiple ACP/Desktop hosts can share this exact DB, so
       // elect one checkpoint owner per pass instead of multiplying identical
       // housekeeping by host count. The DB-local lock path deliberately avoids
       // XDG_STATE_HOME because Desktop and ACP may use different state roots.
-      const checkpointLockDir = join(dirname(filename), RUNTIME_LOCK_DIRNAME)
-      const checkpoint = Effect.scoped(
-        Effect.gen(function* () {
-          yield* Flock.effect(`wal-checkpoint:${filename}`, {
-            dir: checkpointLockDir,
-            staleMs: 30_000,
-            timeoutMs: 100,
-            baseDelayMs: 25,
-            maxDelayMs: 50,
-          })
-          yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
-        }),
-      ).pipe(Effect.ignore)
-      yield* Effect.forkScoped(
-        Effect.gen(function* () {
-          for (;;) {
-            yield* Effect.sleep(Duration.minutes(5))
-            yield* checkpoint
-          }
-        }),
-      )
+      const checkpoint = checkpointWal(filename).pipe(Effect.ignore)
+      if (filename !== ":memory:") {
+        yield* Effect.forkScoped(
+          Effect.gen(function* () {
+            for (;;) {
+              yield* Effect.sleep(Duration.minutes(5))
+              yield* checkpoint
+            }
+          }),
+        )
+      }
 
-      return { db, readDb, filename }
+      return { db, readDb, scanDb, filename }
     }).pipe(Effect.orDie),
   )
 
@@ -237,6 +290,27 @@ export function withBackfillDb<A, E, R>(
     yield* db.run("PRAGMA foreign_keys = ON")
     return yield* body(db)
   }).pipe(Effect.provide(sqliteLayer({ filename, disableWAL: true, checkpointOnClose: false })))
+}
+
+/** Database-owned maintenance; never acquires the foreground connection. */
+export function checkpointWal(filename: string) {
+  if (filename === ":memory:") return Effect.void
+  return Effect.scoped(
+    Effect.gen(function* () {
+      yield* Flock.effect(`wal-checkpoint:${filename}`, {
+        dir: join(dirname(filename), RUNTIME_LOCK_DIRNAME),
+        staleMs: 30_000,
+        timeoutMs: 100,
+        baseDelayMs: 25,
+        maxDelayMs: 50,
+      })
+      yield* withBackfillDb(
+        filename,
+        (maintenance) => maintenance.run("PRAGMA wal_checkpoint(PASSIVE)"),
+        { busyTimeoutMs: 0 },
+      )
+    }),
+  )
 }
 
 export function path() {

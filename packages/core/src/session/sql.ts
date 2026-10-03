@@ -114,6 +114,18 @@ export const SessionTable = sqliteTable(
     index("session_directory_root_created_id_idx")
       .on(table.directory, table.time_created, table.id)
       .where(isNull(table.parent_id)),
+    // OpenFork Home's global Tier 1 projection uses this exact active-root
+    // access path, ordered by the last session update rather than creation.
+    // This lets SQLite stop after the requested root rows instead of sorting
+    // every session for the directory into a temporary B-tree.
+    index("session_directory_root_updated_id_idx")
+      .on(table.directory, table.time_updated, table.id)
+      .where(sql`${table.parent_id} IS NULL AND ${table.time_archived} IS NULL`),
+    // Archived sidebar projection: filter a bounded directory set and page
+    // root rows by archive time without walking every session in those dirs.
+    index("session_directory_root_archived_id_idx")
+      .on(table.directory, table.time_archived, table.id)
+      .where(sql`${table.parent_id} IS NULL AND ${table.time_archived} IS NOT NULL`),
     index("session_workspace_idx").on(table.workspace_id),
     index("session_parent_idx").on(table.parent_id),
     index("session_group_idx").on(table.group_id),
@@ -351,6 +363,12 @@ export const SessionInputTable = sqliteTable(
     promoted_seq: integer(),
     revoked_seq: integer(),
     revoked_reason: text().$type<SessionInput.RevocationReason>(),
+    /**
+     * Sequence of the InputCompleted event that proved this exact input ran a
+     * successful provider cycle. Nullable with no default so pre-migration rows
+     * stay honestly "never proven complete".
+     */
+    completed_seq: integer(),
     time_created: integer()
       .notNull()
       .$default(() => Date.now()),

@@ -6,6 +6,8 @@ import { makeGlobalNode } from "../effect/app-node"
 import { SessionSchema } from "../session/schema"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { MaintenanceUsageTable, UsageRecordTable } from "./sql"
+import { UsageRevision } from "./revision"
+import { UsageRouteAttribution } from "./route-attribution"
 import { UsageYield } from "./yield"
 
 export interface RecordInput {
@@ -13,7 +15,17 @@ export interface RecordInput {
   readonly sessionID: string
   readonly providerID: string
   readonly modelID: string
-  /** Authoritative routed account when the provider/router exposes it. */
+  /**
+   * Committed provider route attribution for this generation.
+   *
+   * Secret-free by contract: a `public` route carries no account, an `account`
+   * route carries its stable account ID, and neither carries a credential handle
+   * or revision. When present this is the settlement authority; `accountID` and
+   * the model id account suffix become compatibility/validation data. Omit it
+   * only for settlements that have no committed route binding.
+   */
+  readonly route?: UsageRouteAttribution.Committed
+  /** Transport-observed routed account. Validation only, never settlement authority. */
   readonly accountID?: string
   readonly variant?: string
   readonly agent?: string
@@ -37,6 +49,13 @@ export interface MaintenanceRecordInput {
   readonly agent: string
   readonly providerID: string
   readonly modelID: string
+  /**
+   * Committed provider route for this maintenance/support-agent call.
+   * Credential handles/revisions are intentionally not part of this contract.
+   */
+  readonly route?: UsageRouteAttribution.Committed
+  /** Transport-observed account, validation/legacy metadata only. */
+  readonly accountID?: string
   readonly variant?: string
   readonly sessionID?: string
   readonly projectID?: string
@@ -71,8 +90,12 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/co
 // O(1) cache watermark instead of issuing a MAX(rowid)/mtime query on every
 // analytics request. Only a successfully committed scalar settlement advances
 // the revision; observability storage failures remain fail-open to execution.
-let historyRevision = 0
-export const revision = () => historyRevision
+//
+// The counter lives in a leaf module so the other durable projection writer
+// (`UsageYield`) can advance it without importing this module. It is the local
+// half of a usage watermark only: readers that memoize durable usage state must
+// pair it with `PRAGMA data_version` to see another process's settlements.
+export const revision = () => UsageRevision.current()
 
 const layer = Layer.effect(
   Service,
@@ -83,13 +106,25 @@ const layer = Layer.effect(
     const record = Effect.fnUntraced(function* (input: RecordInput) {
       const sessionID = SessionSchema.ID.make(input.sessionID)
       const modelIdentity = splitAccountModelID(input.modelID)
-      const accountID = input.accountID ?? modelIdentity.accountID
+      // Committed route authority when present; otherwise the exact legacy
+      // derivation. A public route must never inherit an account from a
+      // transport observation or a legacy model-id suffix.
+      const settled = UsageRouteAttribution.settle({
+        route: input.route,
+        observedAccountID: input.accountID,
+        modelAccountID: modelIdentity.accountID,
+      })
+      const accountID = settled.accountID
       const row: typeof UsageRecordTable.$inferInsert = {
         message_id: input.messageID,
         session_id: sessionID,
         provider_id: input.providerID,
         model_id: input.modelID,
         base_model_id: modelIdentity.baseModelID,
+        // Only a committed route may claim public/account route authority.
+        // Legacy account suffixes remain useful account attribution, but their
+        // route provenance is explicitly unknown.
+        route_kind: input.route === undefined ? "unknown" : settled.attribution.kind,
         account_id: accountID,
         variant: input.variant,
         agent: input.agent,
@@ -137,16 +172,22 @@ const layer = Layer.effect(
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
-      if (inserted) historyRevision += 1
+      if (inserted) UsageRevision.advance()
     })
 
     const recordMaintenance = Effect.fnUntraced(function* (input: MaintenanceRecordInput) {
+      const settled = UsageRouteAttribution.settle({
+        route: input.route,
+        observedAccountID: input.accountID,
+      })
       yield* db
         .insert(MaintenanceUsageTable)
         .values({
           agent: input.agent,
           provider_id: input.providerID,
           model_id: input.modelID,
+          route_kind: input.route === undefined ? "unknown" : settled.attribution.kind,
+          account_id: settled.accountID,
           variant: input.variant,
           session_id: input.sessionID,
           project_id: input.projectID,
@@ -164,7 +205,7 @@ const layer = Layer.effect(
         })
         .run()
         .pipe(Effect.orDie)
-      historyRevision += 1
+      UsageRevision.advance()
     })
 
     // Usage accounting is observability, not execution authority. A storage

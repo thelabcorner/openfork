@@ -10,7 +10,6 @@ import { CodingActivity } from "./coding-activity"
 import { makeGlobalNode } from "./effect/app-node"
 import { httpClient } from "./effect/app-node-platform"
 import { FSUtil } from "./fs-util"
-import { Flag } from "./flag/flag"
 import { Global } from "./global"
 import { InstallationVersion } from "./installation/version"
 import { AppProcess } from "./process"
@@ -70,6 +69,15 @@ export const REPLAY_DEDUPE_BOUND = 2_048
 export const DELIVERY_PROJECT_BOUND = 512
 
 /**
+ * Automatic delivery yields between projects instead of draining an arbitrarily
+ * wide multi-project queue in one scheduler turn. One selected project may have
+ * at most the three OpenFork/OXP/OFXP attribution groups, so this also gives a
+ * hard <=3 CLI-attempt bound per automatic turn. Explicit flushes remain full
+ * settlement operations and are intentionally not sliced by this fairness cap.
+ */
+export const MAX_AUTOMATIC_PROJECTS_PER_RUN = 1
+
+/**
  * Hard cap on pending session urgency markers. Markers are best-effort
  * telemetry: evicting the oldest is acceptable because the scheduler consumes
  * them promptly, and a hard bound is what keeps N sessions from accumulating N
@@ -79,6 +87,9 @@ export const URGENT_SESSION_BOUND = 64
 
 /** Longest gap between two managed-CLI freshness checks. */
 export const MANAGED_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1_000
+// Official WakaTime CLI executables are multi-megabyte files. A tiny marker or
+// truncated file in the managed slot is corruption, not a usable executable.
+const MIN_MANAGED_BINARY_BYTES = 1_048_576n
 
 /**
  * The delivery-limiter bucket for observations whose project was never proven.
@@ -89,27 +100,41 @@ export const NO_PROJECT_KEY = "<no-project>"
 
 /** CodingActivity observation kind, retained as internal routing metadata. */
 export type ObservationKind = CodingActivity.Kind
+export type Attribution = "openfork" | "openfork-oxp" | "openfork-ofxp"
+
+const ATTRIBUTION_BY_SOURCE = {
+  session: "openfork",
+  "special-agent": "openfork",
+  oxp: "openfork-oxp",
+  ofxp: "openfork-ofxp",
+  http: "openfork",
+  core: "openfork",
+} as const satisfies Record<CodingActivity.Source, Attribution>
 
 /**
- * The identity WakaTime sees for a delivery.
+ * External attribution bucket for one observation.
  *
- * The client is part of the plugin identity because that is how WakaTime
- * attributes AI coding time (`openfork-cli/1.2.3`, `openfork-desktop/1.2.3`).
- * It is read from the process environment, which the host owns and sets before
- * Core initializes, and it is never derived per session: Core reports the
- * client it is actually running inside and claims nothing beyond that.
+ * `CodingActivity.source` is producer-owned semantic metadata, so Core can make
+ * this decision without inspecting sessions, paths, or UI state. OXP and OFXP
+ * are intentionally first-class buckets; every other producer remains normal
+ * OpenFork activity.
  */
-export function pluginIdentifier(client = Flag.OPENCODE_CLIENT) {
-  // WakaTime parses this as `name/version`, so a client value carrying a
-  // separator or whitespace would corrupt that grammar and split the identity
-  // into something the dashboard cannot attribute. Collapse anything outside a
-  // stable token alphabet to a dash, then fall back rather than emit an empty
-  // segment.
-  const token = (client ?? "")
-    .trim()
-    .replace(/[^A-Za-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-  return `openfork-${token || "cli"}/${InstallationVersion}`
+export function attribution(activity: Pick<Activity, "source">): Attribution {
+  return activity.source === undefined ? "openfork" : ATTRIBUTION_BY_SOURCE[activity.source]
+}
+
+/**
+ * The ordered User-Agent fragment WakaTime sees for a delivery.
+ *
+ * The first token is the coarse producer attribution bucket: OpenFork,
+ * OpenFork OXP, or OpenFork OFXP. The second token is the stable first-party
+ * integration identity, mirroring WakaTime's ordinary `editor plugin` token
+ * shape. Carrier details such as desktop/CLI/ACP are intentionally omitted:
+ * they describe which OpenFork host transported the activity, not who produced
+ * it, and would fragment the three requested attribution buckets.
+ */
+export function pluginIdentifier(owner: Attribution = "openfork") {
+  return `${owner}/${InstallationVersion} openfork-wakatime/${InstallationVersion}`
 }
 
 export type EntityType = "file" | "app"
@@ -135,16 +160,38 @@ export interface Activity {
    * is never serialized onto the wire.
    */
   readonly aiSession?: string
-  /** INTERNAL. Producer that produced the observation. Never sent to the CLI. */
+  /**
+   * INTERNAL. Producer that produced the observation. The raw source token is
+   * never serialized; Core projects it into the bounded OpenFork/OXP/OFXP
+   * WakaTime attribution bucket used for coalescing and `--plugin` identity.
+   */
   readonly source?: CodingActivity.Source
   /**
-   * INTERNAL. Authoritative producer reference for this observation. Its
-   * presence is what makes a record eligible for replay suppression; a record
-   * without one is never deduped. Never sent to the CLI.
+   * INTERNAL. Producer/actor attribution reference. This may be stable across
+   * many legitimate observations (OFXP principal identity is the canonical
+   * example), so it is never used as a replay key and never sent to the CLI.
    */
   readonly sourceRef?: string
+  /**
+   * INTERNAL. Producer-proven idempotency token for exactly one logical
+   * observation. Its presence makes a record eligible for replay suppression;
+   * absence means Core must keep repeated observations. Never sent to the CLI.
+   */
+  readonly replayToken?: string
   /** INTERNAL. Observation kind, used to scope replay suppression. Never sent to the CLI. */
   readonly kind?: ObservationKind
+}
+
+/**
+ * One queue entry after it leaves `pending` but before delivery settles it.
+ * Replay fingerprints move with the entry instead of remaining keyed by the
+ * now-free activity key, so a producer can enqueue new work for the same file
+ * while CLI delivery is in flight without the old batch stealing its replay
+ * ownership.
+ */
+interface TakenActivity {
+  readonly activity: Activity
+  readonly replayFingerprints: readonly string[]
 }
 
 export interface Status {
@@ -275,6 +322,63 @@ export function cliStateFile() {
   return path.join(Global.Path.state, "wakatime-cli.json")
 }
 
+export function deliveryStateFile() {
+  return path.join(Global.Path.state, "wakatime-delivery.json")
+}
+
+export interface DeliveryWindowState {
+  readonly key: string
+  readonly at: number
+}
+
+/**
+ * Stable, privacy-preserving persisted identity for one project limiter bucket.
+ * The raw canonical project folder is needed in memory for CLI scoping, but it
+ * does not need to survive on disk merely to enforce the restart window.
+ */
+export function deliveryWindowKey(scope: string) {
+  return createHash("sha256").update(scope).digest("hex")
+}
+
+export function normalizeDeliveryWindows(
+  windows: readonly DeliveryWindowState[],
+  now = Date.now(),
+  intervalMs = MIN_DELIVERY_INTERVAL_MS,
+  bound = DELIVERY_PROJECT_BOUND,
+) {
+  if (bound <= 0) return [] as DeliveryWindowState[]
+  const deduped = new Map<string, number>()
+  for (const window of windows) {
+    const key = typeof window?.key === "string" ? window.key.trim().toLowerCase() : ""
+    if (!/^[0-9a-f]{64}$/.test(key)) continue
+    if (typeof window.at !== "number" || !Number.isFinite(window.at) || window.at < 0) continue
+    // A clock rollback must never create a multi-minute or permanent hold. A
+    // future persisted stamp means "just delivered" at worst.
+    const at = Math.min(window.at, now)
+    if (now - at >= intervalMs) continue
+    const previous = deduped.get(key)
+    if (previous === undefined || at > previous) deduped.set(key, at)
+  }
+  return [...deduped]
+    .map(([key, at]) => ({ key, at }))
+    .sort((a, b) => a.at - b.at || a.key.localeCompare(b.key))
+    .slice(-bound)
+}
+
+export function parseDeliveryState(raw: unknown, now = Date.now()) {
+  if (typeof raw !== "object" || raw === null) return [] as DeliveryWindowState[]
+  const document = raw as { version?: unknown; windows?: unknown }
+  if (document.version !== 1 || !Array.isArray(document.windows)) return [] as DeliveryWindowState[]
+  const windows: DeliveryWindowState[] = []
+  for (const value of document.windows) {
+    if (typeof value !== "object" || value === null) continue
+    const entry = value as { key?: unknown; at?: unknown }
+    if (typeof entry.key !== "string" || typeof entry.at !== "number") continue
+    windows.push({ key: entry.key, at: entry.at })
+  }
+  return normalizeDeliveryWindows(windows, now)
+}
+
 export function parseManagedState(raw: unknown): ManagedState {
   if (typeof raw !== "object" || raw === null) return DEFAULT_MANAGED_STATE
   const document = raw as { checkedAt?: unknown; version?: unknown }
@@ -318,8 +422,35 @@ export function parseSettings(raw: unknown): Settings {
   return typeof enabled === "boolean" ? { enabled } : DEFAULT_SETTINGS
 }
 
+/**
+ * Resolve WakaTime's configuration home with the same tilde semantics as the
+ * official OpenCode WakaTime integration: `~` is the user's home, `~/...`
+ * (and the Windows spelling `~\\...`) is relative to it, and every other
+ * non-empty value is already an explicit path and is preserved verbatim.
+ *
+ * Keep this as a pure seam so path compatibility can be proved without tests
+ * ever writing into the operator's real home directory.
+ */
+export function resolveWakaTimeHome(value: string | undefined, home = Global.Path.home) {
+  const requested = value?.trim()
+  if (!requested || requested === "~") return home
+  if (requested.startsWith("~/") || requested.startsWith("~\\")) return path.join(home, requested.slice(2))
+  return requested
+}
+
+/**
+ * Neutral working directory for activity whose producer proved no project
+ * folder. Leaving cwd unset would let wakatime-cli inherit OpenFork's ambient
+ * checkout and silently attribute otherwise-unscoped activity to that project.
+ * A filesystem root is stable, already exists, and requires no hot-path I/O.
+ */
+export function neutralCwd(home = Global.Path.home) {
+  const root = path.parse(home).root
+  return root || home
+}
+
 function configHome() {
-  return process.env.WAKATIME_HOME?.trim() || Global.Path.home
+  return resolveWakaTimeHome(process.env.WAKATIME_HOME)
 }
 
 function managedBinary() {
@@ -481,6 +612,7 @@ function activityKey(activity: Activity) {
   // flush could not tell whose time it is delivering.
   return [
     activity.entityType ?? "file",
+    attribution(activity),
     activity.aiSession ?? "",
     activity.entity,
     activity.projectFolder ?? "",
@@ -490,7 +622,10 @@ function activityKey(activity: Activity) {
 /**
  * The delivery-limiter bucket for one observation. WakaTime organizes by
  * project, and a canonical project directory is the only identity a producer
- * can actually prove, so it is used verbatim when present.
+ * can actually prove, so it is used verbatim when present. Canonicalization is
+ * deliberately producer-owned: V1 instance roots and OXP/OFXP authority already
+ * resolve their filesystem identity before publishing. This Tier-0 path must not
+ * stat/realpath on each telemetry observation merely to second-guess them.
  */
 export function projectKey(activity: Activity) {
   const folder = activity.projectFolder?.trim()
@@ -498,22 +633,35 @@ export function projectKey(activity: Activity) {
 }
 
 /**
+ * One wakatime-cli invocation has exactly one `--plugin` User-Agent, including
+ * every extra heartbeat it reads from stdin. A delivery group therefore cannot
+ * mix producer attribution even when all observations belong to one project.
+ *
+ * This key is deliberately distinct from `projectKey`: the 60-second limiter
+ * remains project-scoped, so separating attribution cannot multiply independent
+ * rate windows for OXP/OFXP/native work in the same checkout.
+ */
+export function deliveryGroupKey(activity: Activity) {
+  return `${projectKey(activity)}\u0000${attribution(activity)}`
+}
+
+/**
  * Identity for replay suppression, or undefined when the record is not
  * eligible.
  *
- * Eligibility requires an authoritative producer reference. Without one there
+ * Eligibility requires an authoritative per-observation replay token. Without one there
  * is no proof that two records describe the same event, and dropping a
  * legitimate repeat would lose real coding time — so such records are always
- * kept. With one, the producer guarantees the reference identifies exactly one
+ * kept. With one, the producer guarantees the token identifies exactly one
  * observation, and the remaining dimensions keep distinct events apart.
  */
 export function replayKey(activity: Activity) {
-  const reference = activity.sourceRef?.trim()
-  if (!reference) return undefined
+  const token = activity.replayToken?.trim()
+  if (!token) return undefined
   return [
     activity.source ?? "",
     activity.aiSession ?? "",
-    reference,
+    token,
     activity.entity,
     activity.kind ?? (activity.isWrite ? "write" : "read"),
   ].join("\u0000")
@@ -554,12 +702,15 @@ export function fromCodingActivity(activity: CodingActivity.Activity): Activity 
     isWrite: activity.kind === "write",
     ...(activity.aiLineChanges === undefined ? {} : { aiLineChanges: activity.aiLineChanges }),
     ...(activity.projectFolder === undefined ? {} : { projectFolder: activity.projectFolder }),
-    // Internal routing metadata. Core needs the session, producer, authoritative
-    // reference, and kind to scope selective delivery and replay suppression;
-    // wakatime-cli has no field for them, so they stop here.
+    // Internal routing metadata. Core needs the session, producer/actor
+    // reference, producer-proven replay token, and kind to scope selective
+    // delivery and replay suppression.
+    // The raw producer token never reaches wakatime-cli; only its bounded
+    // OpenFork/OXP/OFXP attribution projection influences `--plugin`.
     aiSession: activity.aiSession,
     source: activity.source,
     sourceRef: activity.sourceRef,
+    replayToken: activity.replayToken,
     kind: activity.kind,
     // The observation's own moment, in millis. Never the send time: a coalesced
     // or delayed batch must still report when the work actually happened.
@@ -583,8 +734,8 @@ function extraHeartbeat(activity: Activity) {
     entity: activity.entity,
     entity_type: activity.entityType ?? "file",
     category: activity.category ?? "ai coding",
-    is_write: activity.isWrite ?? false,
-    is_unsaved_entity: activity.isUnsavedEntity ?? false,
+    ...(activity.isWrite ? { is_write: true } : {}),
+    ...(activity.isUnsavedEntity ? { is_unsaved_entity: true } : {}),
     ...(lineChanges === undefined ? {} : { ai_line_changes: lineChanges }),
     // Deliberately no project field. `alternate_project` is a project-NAME
     // override in the WakaTime CLI, not a project-folder field, so emitting it
@@ -609,7 +760,7 @@ function heartbeatArgs(activity: Activity, extras: boolean) {
     "--time",
     String((activity.time ?? Date.now()) / 1000),
     "--plugin",
-    pluginIdentifier(),
+    pluginIdentifier(attribution(activity)),
     // The official CLI now scans AI transcript stores automatically. OpenFork
     // owns its own activity producer and must never ingest/duplicate OpenCode or
     // other editor transcripts as a side effect of sending one heartbeat.
@@ -665,9 +816,10 @@ const buildRuntime = () =>
     const delivery = Semaphore.makeUnsafe(1)
     const resolveGate = Semaphore.makeUnsafe(1)
     const pending = new Map<string, Activity>()
-    // Process-side delivery budget. One wakatime-cli spawn per project per
-    // interval is the cost this bounds; a burst of edits must not become a
-    // burst of processes.
+    // Process-side projection of the restart-persistent delivery budget. Keys
+    // are SHA-256 project fingerprints, never raw project folders. One
+    // wakatime-cli spawn per project per interval is the cost this bounds; a
+    // burst of edits must not become a burst of processes.
     const lastDelivery = new Map<string, number>()
     // Bounded, insertion-ordered replay suppression. Only authoritative records
     // ever enter it, so eviction can only forget a replay window, never a
@@ -743,6 +895,54 @@ const buildRuntime = () =>
       return normalized
     })
 
+    const readDeliveryWindows = Effect.fn("WakaTime.readDeliveryWindows")(function* () {
+      const raw = yield* fs.readFileStringSafe(deliveryStateFile()).pipe(Effect.orElseSucceed(() => undefined))
+      if (raw === undefined) return [] as DeliveryWindowState[]
+      try {
+        return parseDeliveryState(JSON.parse(raw) as unknown)
+      } catch {
+        return [] as DeliveryWindowState[]
+      }
+    })
+
+    /**
+     * Persist the bounded restart window once per actual delivery batch. This is
+     * intentionally outside the producer hot path. The cross-process lock also
+     * merges any peer's latest document before publishing, so concurrent
+     * OpenFork processes do not erase each other's recent project windows.
+     */
+    const persistDeliveryWindows = Effect.fn("WakaTime.persistDeliveryWindows")(function* () {
+      const target = deliveryStateFile()
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Flock.effect(`wakatime-delivery:${target}`, { timeoutMs: WRITE_LOCK_TIMEOUT_MS })
+          const latest = yield* readDeliveryWindows()
+          const local = [...lastDelivery].map(([key, at]) => ({ key, at }))
+          const normalized = normalizeDeliveryWindows([...latest, ...local])
+          const content = `${JSON.stringify({ version: 1, windows: normalized }, null, 2)}\n`
+          const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`
+          yield* fs.writeWithDirs(temporary, content, 0o600).pipe(
+            Effect.onError(() => fs.remove(temporary).pipe(Effect.ignore)),
+          )
+          yield* fs.rename(temporary, target).pipe(Effect.onError(() => fs.remove(temporary).pipe(Effect.ignore)))
+          // Adopt the merged document so this process also learns windows a peer
+          // published before we acquired the lock.
+          lastDelivery.clear()
+          for (const window of normalized) lastDelivery.set(window.key, window.at)
+        }),
+      )
+    })
+
+    const clearPersistedDeliveryWindows = Effect.fn("WakaTime.clearPersistedDeliveryWindows")(function* () {
+      const target = deliveryStateFile()
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Flock.effect(`wakatime-delivery:${target}`, { timeoutMs: WRITE_LOCK_TIMEOUT_MS })
+          yield* fs.remove(target).pipe(Effect.ignore)
+        }),
+      )
+    })
+
     const loadManagedState = Effect.fn("WakaTime.loadManagedState")(function* () {
       const raw = yield* fs.readFileStringSafe(cliStateFile()).pipe(Effect.orElseSucceed(() => undefined))
       if (raw === undefined) return DEFAULT_MANAGED_STATE
@@ -784,6 +984,8 @@ const buildRuntime = () =>
       )
       yield* fs.rename(temporary, target).pipe(Effect.onError(() => fs.remove(temporary).pipe(Effect.ignore)))
     })
+
+    for (const window of yield* readDeliveryWindows()) lastDelivery.set(window.key, window.at)
 
     let persisted = (yield* loadSettings()).enabled
     const optedIn = () => envToggle(process.env.OPENFORK_WAKATIME) ?? persisted
@@ -920,10 +1122,24 @@ const buildRuntime = () =>
         if (candidate && (yield* isFile(candidate))) return { path: candidate, source: "override" } satisfies Binary
         return undefined
       }
-      const system = which(managedName())
-      if (system) return { path: system, source: "system" } satisfies Binary
       const target = managedBinary()
-      if (yield* isFile(target)) return { path: target, source: "managed" } satisfies Binary
+      const system = which(managedName())
+      // Core's shared `which()` deliberately appends Global.Path.bin after the
+      // operator PATH. That makes the managed WakaTime target discoverable
+      // through the same lookup on a later process start. Preserve the intended
+      // precedence (real system install > managed install) without misclassifying
+      // our own target as operator-owned, otherwise it would become ineligible
+      // for bounded managed freshness checks after restart.
+      if (system) {
+        const normalize = (value: string) => {
+          const resolved = path.resolve(value)
+          return process.platform === "win32" ? resolved.toLowerCase() : resolved
+        }
+        if (normalize(system) !== normalize(target)) return { path: system, source: "system" } satisfies Binary
+      }
+      const managedInfo = yield* fs.stat(target).pipe(Effect.orElseSucceed(() => undefined))
+      if (managedInfo?.type === "File" && managedInfo.size >= MIN_MANAGED_BINARY_BYTES)
+        return { path: target, source: "managed" } satisfies Binary
       return undefined
     })
 
@@ -1087,12 +1303,22 @@ const buildRuntime = () =>
       // is different: if any usable CLI already exists, use it immediately
       // rather than turning the settings mutation into an update check.
       if (probed && (forceInitialInstall || probed.source !== "managed")) return probed
+      // A managed file that exists but is too small to be the executable must
+      // bypass the freshness window once. This repairs test contamination and
+      // truncation without retrying failed downloads on every heartbeat;
+      // refreshManaged persists its normal backoff if repair fails.
+      const managedInfo = yield* fs.stat(managedBinary()).pipe(Effect.orElseSucceed(() => undefined))
+      const repairCorruptManaged =
+        managedInfo?.type === "File" && managedInfo.size < MIN_MANAGED_BINARY_BYTES
       // This is also the initial-install path. With no binary to probe, a due
       // check installs the exact release the metadata named and records its
       // normalized version. With no readable release there is nothing to install
       // without pinning to a pointer that can move mid-flight, so resolution
       // fails here rather than guessing a release.
-      const managed = yield* refreshManaged(probed, forceInitialInstall && probed === undefined)
+      const managed = yield* refreshManaged(
+        probed,
+        probed === undefined && (forceInitialInstall || repairCorruptManaged),
+      )
       if (managed) return managed
       return yield* Effect.fail(
         new Error(`WakaTime managed CLI is unavailable: no installable release was observed at ${managedBinary()}`),
@@ -1148,17 +1374,38 @@ const buildRuntime = () =>
         }),
       )
 
-    const send = Effect.fn("WakaTime.send")(function* (activities: readonly Activity[]) {
-      // The one place credential state is consulted on the delivery path: once
-      // per delivery attempt through the TTL cache, never once per observation.
-      if (activities.length === 0 || !(yield* deliverableCached())) return
-      const binary = yield* resolveBinary()
+    /**
+     * Resolve process-wide prerequisites before any observation is committed as
+     * a real WakaTime delivery attempt.
+     *
+     * A missing credential or unavailable CLI is "not attempted", not a failed
+     * heartbeat. Callers intentionally drop that best-effort batch, but release
+     * its replay tokens and leave the project delivery budget untouched.
+     */
+    const prepareDelivery = Effect.fn("WakaTime.prepareDelivery")(function* () {
+      if (!(yield* deliverableCached())) return undefined
+      return yield* resolveBinary().pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("WakaTime heartbeat delivery was not attempted because no usable CLI was available", {
+            cause,
+          }).pipe(Effect.as(undefined)),
+        ),
+      )
+    })
+
+    /**
+     * Send one already-prepared project+attribution group. Reaching this
+     * function is a real CLI attempt: a non-zero exit or process failure still
+     * consumes the project rate window even though the CLI may queue/fail it.
+     */
+    const send = Effect.fn("WakaTime.send")(function* (binary: Binary, activities: readonly Activity[]) {
+      if (activities.length === 0) return
       const [first, ...rest] = activities
       if (!first) return
       const stdin = rest.length > 0 ? JSON.stringify(rest.map(extraHeartbeat)) + "\n" : undefined
       const command = ChildProcess.make(binary.path, heartbeatArgs(first, rest.length > 0), {
         extendEnv: true,
-        ...(first.projectFolder ? { cwd: first.projectFolder } : {}),
+        cwd: first.projectFolder ?? neutralCwd(),
       })
       const result = yield* app.run(command, {
         ...(stdin ? { stdin } : {}),
@@ -1206,38 +1453,42 @@ const buildRuntime = () =>
      */
     const openWindow = (scope: string) => {
       const at = Date.now()
+      const key = deliveryWindowKey(scope)
       // Re-insert so insertion order stays least-recently-delivered first.
-      lastDelivery.delete(scope)
-      lastDelivery.set(scope, at)
+      lastDelivery.delete(key)
+      lastDelivery.set(key, at)
       // Enforced AFTER insertion, so the bound is a true hard cap and the map
       // never transiently exceeds it: prune what can no longer affect a
       // decision, then evict the oldest windows until it fits.
       pruneWindows(at)
     }
 
-    /**
-     * Release the replay bookkeeping for one pending entry.
-     *
-     * `delivered` distinguishes two cases that otherwise look identical. A TAKEN
-     * entry's work reached WakaTime, so its fingerprints must stay in the global
-     * recent set to keep suppressing replays. An EVICTED entry was never
-     * delivered — it was dropped only to keep the queue bounded — so every
-     * authoritative reference it coalesced has to be forgotten, or a producer
-     * replaying an older coalesced call could never recover that work.
-     *
-     * Bounded by construction: the loop is over that one entry's fingerprint set,
-     * which cannot exceed the global replay bound, and no ordinary record path
-     * calls this.
-     */
-    const releasePendingReplay = (key: string, delivered: boolean) => {
+    /** Detach one queued entry's replay ownership without deciding its outcome. */
+    const detachPendingReplay = (key: string) => {
       const owned = pendingReplay.get(key)
-      if (owned === undefined) return
+      if (owned === undefined) return [] as string[]
       pendingReplay.delete(key)
+      const fingerprints = [...owned]
       for (const fingerprint of owned) {
         replayOwner.delete(fingerprint)
-        if (!delivered) seen.delete(fingerprint)
       }
       owned.clear()
+      return fingerprints
+    }
+
+    /**
+     * Settle replay state after a detached entry either reaches a real CLI
+     * attempt or is dropped before any attempt happened.
+     */
+    const settleTakenReplay = (taken: TakenActivity, attempted: boolean) => {
+      if (attempted) return
+      for (const fingerprint of taken.replayFingerprints) {
+        // A fingerprint can leave the bounded `seen` window while an older
+        // detached batch is in flight, then be legitimately re-added and owned
+        // by a NEW pending entry. Rolling the old batch back must never delete
+        // that newer owner's suppression.
+        if (!replayOwner.has(fingerprint)) seen.delete(fingerprint)
+      }
     }
 
     /**
@@ -1286,27 +1537,30 @@ const buildRuntime = () =>
     }
 
     /**
-     * The one removal path for a queued entry.
-     *
-     * Deleting from `pending` has two consequences that must not be separable —
-     * retiring the session the entry owned and releasing the replay
-     * fingerprints it held — and a caller that did one without the other would
-     * leave either a permanently-counted session or a queued entry still
-     * suppressing a reference nothing can replay. So the entry's own activity is
-     * read first, then both are settled from it in one place.
+     * Detach one entry from the live queue. Replay state travels with the batch
+     * until delivery knows whether a real CLI attempt happened.
      */
-    const dropPending = (key: string, delivered: boolean) => {
+    const takePending = (key: string): TakenActivity | undefined => {
       const activity = pending.get(key)
+      if (activity === undefined) return undefined
       pending.delete(key)
-      releasePendingReplay(key, delivered)
-      if (activity === undefined) return
+      const replayFingerprints = detachPendingReplay(key)
       releasePendingSession(activity)
+      return { activity, replayFingerprints }
+    }
+
+    /** Drop one queued entry immediately, settling its replay state now. */
+    const dropPending = (key: string, attempted: boolean) => {
+      const taken = takePending(key)
+      if (taken !== undefined) settleTakenReplay(taken, attempted)
     }
 
     const takeAll = Effect.sync(() => {
-      const batch = [...pending.values()]
-      for (const key of pending.keys()) releasePendingReplay(key, true)
-      pending.clear()
+      const batch: TakenActivity[] = []
+      for (const key of [...pending.keys()]) {
+        const taken = takePending(key)
+        if (taken !== undefined) batch.push(taken)
+      }
       // The whole queue left at once, so the derived index is emptied with it
       // rather than walked entry by entry.
       pendingSessionCount.clear()
@@ -1324,8 +1578,9 @@ const buildRuntime = () =>
     /**
      * Take only what the delivery limiter currently allows. A held record is
      * left in `pending` untouched, so throttling delays work instead of
-     * discarding it. `heldUntil` is when the last held project becomes
-     * deliverable, which is exactly when the window has to be re-armed.
+     * discarding it. `heldUntil` is the earliest remaining delay among held
+     * projects, which is exactly when the scheduler has useful work to revisit.
+     * A later project must never extend an earlier project's 60-second floor.
      */
     const takeEligible = Effect.sync(() => {
       const now = Date.now()
@@ -1339,10 +1594,13 @@ const buildRuntime = () =>
       // accumulating behind it.
       const urgentNow = urgent.size > 0 ? new Set(urgent) : undefined
       if (urgentNow) urgent.clear()
-      const ready: Activity[] = []
+      const ready: TakenActivity[] = []
+      const selectedProjects = new Set<string>()
+      let moreReady = false
       let heldUntil = 0
       for (const [key, activity] of pending) {
-        const last = lastDelivery.get(projectKey(activity))
+        const project = projectKey(activity)
+        const last = lastDelivery.get(deliveryWindowKey(project))
         // A session that asked for prompt delivery is not held by the project
         // limiter. Everything else — including other sessions queued against
         // the same project — is still held and rescheduled, so accelerating one
@@ -1350,13 +1608,22 @@ const buildRuntime = () =>
         const bypass = urgentNow !== undefined && urgentNow.has((activity.aiSession ?? "").trim())
         const remaining = last === undefined || bypass ? 0 : last + MIN_DELIVERY_INTERVAL_MS - now
         if (remaining > 0) {
-          heldUntil = Math.max(heldUntil, remaining)
+          heldUntil = heldUntil === 0 ? remaining : Math.min(heldUntil, remaining)
           continue
         }
-        ready.push(activity)
-        dropPending(key, true)
+        // Once a project is selected, take every eligible attribution group for
+        // that project so source separation can never push a sibling bucket into
+        // the next 60-second window. A different ready project stays queued for
+        // the immediate continuation turn below.
+        if (!selectedProjects.has(project) && selectedProjects.size >= MAX_AUTOMATIC_PROJECTS_PER_RUN) {
+          moreReady = true
+          continue
+        }
+        selectedProjects.add(project)
+        const taken = takePending(key)
+        if (taken !== undefined) ready.push(taken)
       }
-      return { ready, heldUntil }
+      return { ready, heldUntil, moreReady }
     })
 
     /** Take exactly one session's queued work; every other session stays queued. */
@@ -1366,52 +1633,105 @@ const buildRuntime = () =>
         // A blank selector names no session, and an observation carrying no
         // session is not attributable to one. Fail closed rather than guess.
         if (!session) return []
-        const batch: Activity[] = []
+        // This explicit drain consumes the request marker for the same reason a
+        // full drain does: every queued entry for this session is about to leave.
+        // Leaving the marker behind would make the next legitimate request look
+        // like a duplicate and skip the scheduler re-arm.
+        urgent.delete(session)
+        const batch: TakenActivity[] = []
         for (const [key, activity] of pending) {
           if (activity.aiSession !== session) continue
-          batch.push(activity)
-          dropPending(key, true)
+          const taken = takePending(key)
+          if (taken !== undefined) batch.push(taken)
         }
         return batch
       })
 
     /**
-     * Deliver one batch and open the limiter window for the projects it touched.
-     * The stamp lands before the spawn and applies to forced flushes too: the
-     * window exists to bound how often a project can reach wakatime-cli, and a
-     * forced flush is a reach.
+     * Deliver one detached batch. Replay fingerprints remain provisional until
+     * each group is about to make a real CLI attempt; prerequisites that fail
+     * before that point release the fingerprints and open no project window.
      */
-    const deliver = Effect.fnUntraced(function* (batch: readonly Activity[]) {
+    const deliver = Effect.fnUntraced(function* (batch: readonly TakenActivity[]) {
       if (batch.length === 0) return
+      // Any entry left here when the effect exits never reached a real attempt —
+      // including interruption during a bounded shutdown flush — and must become
+      // replayable again rather than remaining permanently suppressed.
+      const unsettled = new Set(batch)
+      const settle = (items: readonly TakenActivity[], attempted: boolean) => {
+        for (const item of items) {
+          if (!unsettled.delete(item)) continue
+          settleTakenReplay(item, attempted)
+        }
+      }
       // Serialized on the delivery permit, not the queue lock. The timer, both
       // explicit flushes, and the finalizer can all reach delivery now that CLI
       // work happens outside the queue lock, and exactly one wakatime-cli
       // pipeline may be in flight at a time.
-      yield* delivery.withPermit(
-        Effect.gen(function* () {
-          // One spawn per project. `--project-folder` and the child working
-          // directory belong to the primary invocation and an extra heartbeat
-          // inherits both, so a batch may never mix projects: one project's time
-          // would otherwise be filed under another project's root.
-          const groups = new Map<string, Activity[]>()
-          for (const activity of batch) {
-            const scope = projectKey(activity)
+      yield* delivery
+        .withPermit(
+          Effect.gen(function* () {
+          const binary = yield* prepareDelivery()
+          if (binary === undefined) {
+            settle(batch, false)
+            return
+          }
+          // One spawn per project + attribution bucket. `--project-folder`, the
+          // child working directory, and `--plugin` all belong to the primary
+          // invocation and are inherited by its extra heartbeats, so neither a
+          // project boundary nor an OXP/OFXP attribution boundary may be mixed.
+          // The delivery limiter itself stays project-only (see `projectKey`).
+          const groups = new Map<string, { readonly project: string; readonly items: TakenActivity[] }>()
+          for (const item of batch) {
+            const activity = item.activity
+            const scope = deliveryGroupKey(activity)
             const group = groups.get(scope)
-            if (group) group.push(activity)
-            else groups.set(scope, [activity])
+            if (group) group.items.push(item)
+            else groups.set(scope, { project: projectKey(activity), items: [item] })
           }
           // Strictly sequential: one CLI process at a time, so a batch spanning
           // many projects can never fan out into N concurrent spawns and the
           // foreground runtime keeps priority. A failure is contained to its own
           // group, so one project's delivery problem cannot cost the others.
-          for (const [scope, group] of groups) {
-            openWindow(scope)
-            yield* send(group).pipe(
+          const openedProjects = new Set<string>()
+          for (const group of groups.values()) {
+            // A project may have several attribution groups in this batch, but
+            // they share one limiter window. Stamp it at the first subgroup only
+            // so adding OXP/OFXP attribution cannot extend the project's 60s
+            // hold merely because more source buckets were present.
+            if (!openedProjects.has(group.project)) {
+              openWindow(group.project)
+              openedProjects.add(group.project)
+              // Persist the attempt boundary before spawning. If this process
+              // exits while the CLI is in flight, the next OpenFork process must
+              // still inherit the one-minute project window.
+              yield* persistDeliveryWindows().pipe(
+                Effect.catchCause((cause) => Effect.logWarning("WakaTime delivery-window persistence failed", { cause })),
+              )
+            }
+            // The limiter attempt boundary is now established in memory and its
+            // restart-persistence attempt has completed. Only now commit replay
+            // suppression for this group, immediately before crossing into the
+            // CLI spawn. If interruption happened earlier, the outer finalizer
+            // would release these fingerprints as never attempted.
+            settle(group.items, true)
+            yield* send(binary, group.items.map((item) => item.activity)).pipe(
               Effect.catchCause((cause) => Effect.logWarning("WakaTime heartbeat delivery failed", { cause })),
             )
           }
-        }),
-      )
+          }),
+        )
+        .pipe(
+          // This finalizer wraps permit acquisition itself. If a flush is
+          // interrupted while waiting behind another delivery, its detached
+          // replay tokens are still released rather than remaining suppressed
+          // forever.
+          Effect.ensuring(
+            Effect.sync(() => {
+              settle([...unsettled], false)
+            }),
+          ),
+        )
     })
 
     const cancelTimer = Effect.fnUntraced(function* () {
@@ -1432,8 +1752,8 @@ const buildRuntime = () =>
     /**
      * The single decision about when this scheduler runs again.
      *
-     * Two independent reasons to wake: work the limiter is still holding, which
-     * becomes deliverable at a known time, and a request that arrived while this
+     * Two independent reasons to wake: the earliest work the limiter is still
+     * holding, which becomes deliverable at a known time, and a request that arrived while this
      * scheduler was delivering — a debounce for a new burst, or an urgent session
      * asking for prompt delivery. The earlier of the two wins, and a held deadline
      * is never pushed later merely because a record arrived: the new burst simply
@@ -1486,14 +1806,21 @@ const buildRuntime = () =>
         yield* mutex.withPermit(
           Effect.gen(function* () {
             if (epoch !== ownedEpoch) {
-              // An explicit flush or teardown invalidated this scheduler while it
-              // delivered. That already released the slot, so this fiber is done
-              // and must not resurrect itself.
+              // An explicit flush/teardown invalidated this scheduler while it
+              // delivered. A newer scheduler may already own `timer`; never
+              // erase it. But work recorded while the old delivery was in flight
+              // could only set `wake`, so if no replacement exists transfer that
+              // deferred wake into a fresh scheduler before retiring this fiber.
+              if (timer === undefined && wake !== undefined) {
+                const requestedWake = wake
+                wake = undefined
+                yield* armLocked(requestedWake)
+              }
               return
             }
             if (timer !== undefined) timer = undefined
             delivering = false
-            const requestedWake = wake
+            const requestedWake = taken.moreReady ? 0 : wake
             wake = undefined
             const delay = decideNextDelay(requestedWake, taken.heldUntil)
             if (delay === undefined) return
@@ -1693,8 +2020,9 @@ const buildRuntime = () =>
      * permanently suppressed. Delivery windows go too, so a re-enabled exporter
      * does not inherit throttling from a period in which it sent nothing.
      *
-     * Process memory only. The settings document was already written outside the
-     * lock, and no CLI, network, or filesystem work happens here.
+     * Process memory only. The persisted delivery-window document is removed by
+     * the caller after releasing the queue lock, so filesystem work never enters
+     * this critical section.
      */
     const clearTransientState = Effect.fnUntraced(function* () {
       yield* cancelTimer()
@@ -1711,9 +2039,20 @@ const buildRuntime = () =>
       Effect.gen(function* () {
         // Explicit enablement is the active preparation boundary. The env
         // override remains authoritative: OPENFORK_WAKATIME=0 means the
-        // persisted checkbox cannot effectively enable the exporter, so do not
-        // download anything merely because the lower-precedence setting changed.
-        const effectiveRequested = envToggle(process.env.OPENFORK_WAKATIME) ?? next
+        // persisted checkbox cannot effectively enable the exporter. More
+        // importantly, an Enable request while the operator has forced WakaTime
+        // off must not leave a latent `{ enabled: true }` preference that starts
+        // sending later merely because the env override disappears.
+        const envOverride = envToggle(process.env.OPENFORK_WAKATIME)
+        if (next && envOverride === false) {
+          yield* mutex.withPermit(clearTransientState())
+          yield* clearPersistedDeliveryWindows().pipe(
+            Effect.catchCause((cause) => Effect.logWarning("WakaTime delivery-window cleanup failed", { cause })),
+          )
+          return yield* status()
+        }
+
+        const effectiveRequested = envOverride ?? next
         if (next && effectiveRequested) yield* prepareBinary()
 
         const saved = yield* saveSettings({ enabled: next })
@@ -1728,6 +2067,11 @@ const buildRuntime = () =>
             if (!optedIn()) yield* clearTransientState()
           }),
         )
+        if (!optedIn()) {
+          yield* clearPersistedDeliveryWindows().pipe(
+            Effect.catchCause((cause) => Effect.logWarning("WakaTime delivery-window cleanup failed", { cause })),
+          )
+        }
         return yield* status()
       })
 

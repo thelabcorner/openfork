@@ -12,6 +12,7 @@ export type EventReplayFrame<T> = {
 }
 
 type StoredReplayFrame<T> = EventReplayFrame<T> & { readonly size: number }
+type SequenceRange = { start: number; end: number }
 
 export type EventReplayResult<T> =
   | {
@@ -34,6 +35,10 @@ export type EventReplayResult<T> =
       readonly requested: number
     }
 
+export type EventReplayHandoffResult<T> =
+  | { readonly kind: "ok"; readonly frames: readonly T[] }
+  | { readonly kind: "gap"; readonly latest: number }
+
 const DEFAULT_CAPACITY = 4096
 const DEFAULT_MAX_BYTES = Number.POSITIVE_INFINITY
 
@@ -54,6 +59,94 @@ export function parseEventSequence(value: string | undefined, epoch?: string): n
   return parsed
 }
 
+/**
+ * Bounded bridge between "subscribe live" and "finish replay snapshot".
+ *
+ * SSE transports subscribe before reading their replay ring so an event cannot
+ * fall into a replay/live race. That tiny handoff window still needs the same
+ * admission law as the live subscriber queue: retaining an unbounded Array
+ * here would let a hot producer bypass every downstream count/byte bound.
+ *
+ * On overflow we intentionally discard the temporary suffix and remember only
+ * its latest sequence. takeAfter() then either proves replay already covered
+ * the overflow or returns a gap so the client hydrates an authoritative
+ * snapshot. Missing content is never silently presented as complete.
+ */
+export class EventReplayHandoffBuffer<T extends { readonly sequence: number }> {
+  private frames: T[] = []
+  private bytes = 0
+  private largest = 0
+  private overflowLatest: number | undefined
+
+  constructor(
+    private readonly capacity: number,
+    private readonly options: {
+      readonly maxBytes: number
+      readonly maxSingleFrameBytes?: number
+      readonly sizeOf: (event: T) => number
+    },
+  ) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Event handoff capacity must be positive")
+    if (!Number.isFinite(options.maxBytes) || options.maxBytes <= 0) {
+      throw new Error("Event handoff byte capacity must be positive")
+    }
+    if (
+      options.maxSingleFrameBytes !== undefined &&
+      (!Number.isFinite(options.maxSingleFrameBytes) || options.maxSingleFrameBytes <= 0)
+    ) {
+      throw new Error("Event handoff single-frame byte capacity must be positive")
+    }
+  }
+
+  offer(event: T) {
+    if (this.overflowLatest !== undefined) {
+      this.overflowLatest = Math.max(this.overflowLatest, event.sequence)
+      return false
+    }
+    const rawSize = this.options.sizeOf(event)
+    const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
+    const largest = Math.max(this.largest, size)
+    const retained = this.bytes + size
+    const backlog =
+      this.options.maxSingleFrameBytes === undefined ? retained : retained - largest
+    const singleFrameLimit = this.options.maxSingleFrameBytes ?? this.options.maxBytes
+    if (this.frames.length >= this.capacity || size > singleFrameLimit || backlog > this.options.maxBytes) {
+      this.frames = []
+      this.bytes = 0
+      this.largest = 0
+      this.overflowLatest = event.sequence
+      return false
+    }
+    this.frames.push(event)
+    this.bytes = retained
+    this.largest = largest
+    return true
+  }
+
+  /**
+   * Consume the temporary handoff. An overflow matters only when it reaches
+   * beyond the replay cutoff; if replay already covered it, no repair is needed.
+   */
+  takeAfter(cutoff: number): EventReplayHandoffResult<T> {
+    const overflowLatest = this.overflowLatest
+    const frames = overflowLatest === undefined ? this.frames.filter((item) => item.sequence > cutoff) : []
+    this.frames = []
+    this.bytes = 0
+    this.largest = 0
+    this.overflowLatest = undefined
+    if (overflowLatest !== undefined && overflowLatest > cutoff) return { kind: "gap", latest: overflowLatest }
+    return { kind: "ok", frames }
+  }
+
+  get size() {
+    return this.frames.length
+  }
+
+  get byteSize() {
+    return this.bytes
+  }
+}
+
 export class EventReplayBuffer<T> {
   readonly epoch = crypto.randomUUID()
   private readonly frames: Array<StoredReplayFrame<T> | undefined>
@@ -63,12 +156,12 @@ export class EventReplayBuffer<T> {
   private firstSequence = 1
   private nextSequence = 1
   /**
-   * Sequences dropped because one payload exceeded the whole budget, ascending.
-   * They are not retained, so a replay spanning one is missing a position.
-   * Bounded by normal ring eviction: a hole older than the retained window is
-   * discarded because the ordinary `oldest` gap check already covers it.
+   * Ranges dropped because payloads exceeded the whole budget, ascending.
+   * Consecutive oversized sequences are coalesced, so a run of drops cannot
+   * grow this list. Once the retained window passes a range, ordinary `oldest`
+   * cursor repair covers it and it can be discarded.
    */
-  private holes: number[] = []
+  private holes: SequenceRange[] = []
 
   constructor(
     private readonly capacity = DEFAULT_CAPACITY,
@@ -94,7 +187,9 @@ export class EventReplayBuffer<T> {
     // instead of hiding the loss.
     if (size > maxBytes) {
       this.firstSequence = this.length > 0 ? this.frames[this.head]!.sequence : frame.sequence + 1
-      this.holes.push(frame.sequence)
+      const previous = this.holes[this.holes.length - 1]
+      if (previous && previous.end + 1 === frame.sequence) previous.end = frame.sequence
+      else this.holes.push({ start: frame.sequence, end: frame.sequence })
       return frame.sequence
     }
     if (this.length === this.capacity) {
@@ -129,7 +224,7 @@ export class EventReplayBuffer<T> {
   private pruneHoles() {
     if (this.holes.length === 0) return
     const oldest = this.length > 0 ? this.frames[this.head]!.sequence : this.firstSequence
-    while (this.holes.length > 0 && this.holes[0]! <= oldest) this.holes.shift()
+    while (this.holes.length > 0 && this.holes[0]!.end <= oldest) this.holes.shift()
   }
 
   latest() {
@@ -165,9 +260,9 @@ export class EventReplayBuffer<T> {
     // a gap for it -- but only for it. Cursors at or past the hole replay
     // normally, which is the whole point of not nuking the ring.
     for (const hole of this.holes) {
-      if (hole <= after) continue
-      if (hole > latest) break
-      return { kind: "gap", latest, oldest: hole, requested: after }
+      if (hole.end <= after) continue
+      if (hole.start > latest) break
+      return { kind: "gap", latest, oldest: Math.max(hole.start, after + 1), requested: after }
     }
     // If a dropped payload leaves the ring empty there is still a missing
     // sequence between the caller's cursor and the latest published sequence,

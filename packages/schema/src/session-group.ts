@@ -116,6 +116,11 @@ export const Member = Schema.Struct({
   origin: MemberOrigin,
   originPlugin: optional(Schema.String),
   originRef: optional(Schema.String),
+  /** Producer-owned special-agent kind (e.g. "goal_auditor", "prompt_revisor"),
+   * projected from the member Session's protected metadata. Optional for wire
+   * compatibility with servers that predate this projection; UI classification
+   * must fall back to `origin` rather than inferring from title/originRef. */
+  specialAgent: optional(Schema.String),
   position: Schema.Number,
   timeAdded: DateTimeUtcFromMillis,
 }).annotate({ identifier: "SessionGroup.Member" })

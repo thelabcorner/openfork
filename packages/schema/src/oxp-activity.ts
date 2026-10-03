@@ -21,18 +21,14 @@ export const InvocationID = Schema.String.check(Schema.isStartsWith("oxpi_")).pi
 )
 export type InvocationID = typeof InvocationID.Type
 
-export const Plane = Schema.Literals([
-  "augmentation",
-  "supervision",
-  "delegation",
-]).annotate({ identifier: "OxpActivity.Plane" })
+export const Plane = Schema.Literals(["augmentation", "supervision", "delegation"]).annotate({
+  identifier: "OxpActivity.Plane",
+})
 export type Plane = typeof Plane.Type
 
-export const CorrelationScope = Schema.Literals([
-  "unknown",
-  "parent_session",
-  "conversation",
-]).annotate({ identifier: "OxpActivity.CorrelationScope" })
+export const CorrelationScope = Schema.Literals(["unknown", "parent_session", "conversation"]).annotate({
+  identifier: "OxpActivity.CorrelationScope",
+})
 export type CorrelationScope = typeof CorrelationScope.Type
 
 export const Status = Schema.Literals([
@@ -49,10 +45,25 @@ export const Status = Schema.Literals([
 ]).annotate({ identifier: "OxpActivity.Status" })
 export type Status = typeof Status.Type
 
-export const ContinuityMarker = Schema.Literals([
-  "handoff_advisory",
-]).annotate({ identifier: "OxpActivity.ContinuityMarker" })
+export const ContinuityMarker = Schema.Literals(["handoff_advisory"]).annotate({
+  identifier: "OxpActivity.ContinuityMarker",
+})
 export type ContinuityMarker = typeof ContinuityMarker.Type
+
+// Durable token-attribution projections only persist observations that can be
+// reproduced without a calibration model. Approximate surrogate/donor sources
+// are derived by Core at read time so recalibration can never leave stale
+// estimates masquerading as durable facts.
+export const ContextExactSource = Schema.Literals(["observed_boundary", "historical_detail"]).annotate({
+  identifier: "OxpActivity.ContextExactSource",
+})
+export type ContextExactSource = typeof ContextExactSource.Type
+
+export const ContextSchema = Schema.Literals([
+  "oxp-boundary-primary-text/v1",
+  "oxp-primary-args-output-error/v1",
+]).annotate({ identifier: "OxpActivity.ContextSchema" })
+export type ContextSchema = typeof ContextSchema.Type
 
 export const LinkKind = Schema.Literals([
   "session",

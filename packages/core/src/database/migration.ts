@@ -10,6 +10,136 @@ type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
 const lock = Semaphore.makeUnsafe(1)
 
+const LEGACY_DIRECTORY_GUARD_MIGRATION = "20260924022626_directory_maintenance_guard"
+const DIRECTORY_GUARD_MIGRATION = "20260924042906_directory_maintenance_guard"
+
+const legacyDirectoryGuardColumns = [
+  "directory",
+  "guard_id",
+  "owner_id",
+  "generation",
+  "state",
+  "acquired_at",
+  "released_at",
+  "updated_at",
+] as const
+
+const canonicalDirectoryGuardColumns = [
+  "directory",
+  "guard_id",
+  "owner_id",
+  "acquisition_id",
+  "generation",
+  "state",
+  "acquired_at",
+  "released_at",
+  "updated_at",
+] as const
+
+function sameColumns(actual: readonly string[], expected: readonly string[]) {
+  if (actual.length !== expected.length) return false
+  const left = [...actual].sort()
+  const right = [...expected].sort()
+  return left.every((value, index) => value === right[index])
+}
+
+/**
+ * One pre-release database shape briefly shipped in the live dev channel with
+ * the predecessor migration id above. It predates acquisition_id, so replaying
+ * the canonical CREATE migration cannot work and, more importantly, blindly
+ * inventing an active acquisition would weaken the guard's authority model.
+ *
+ * Preserve every row and fail closed instead: released rows remain released;
+ * any held legacy row becomes reconcile_required under a deterministic,
+ * per-directory legacy acquisition identity. The target migration is journaled
+ * only after this transaction has produced the canonical table shape.
+ */
+function convergeLegacyDirectoryMaintenanceGuard(tx: Transaction) {
+  return Effect.gen(function* () {
+    const table = yield* tx.get<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'directory_maintenance_guard'",
+    )
+    if (!table) {
+      return yield* Effect.die(
+        new Error(
+          LEGACY_DIRECTORY_GUARD_MIGRATION +
+            " is journaled but directory_maintenance_guard is missing",
+        ),
+      )
+    }
+
+    const columns = (
+      yield* tx.all<{ name: string }>(
+        "SELECT name FROM pragma_table_info('directory_maintenance_guard')",
+      )
+    ).map((column) => column.name)
+
+    if (sameColumns(columns, canonicalDirectoryGuardColumns)) return
+    if (!sameColumns(columns, legacyDirectoryGuardColumns)) {
+      return yield* Effect.die(
+        new Error(
+          "Cannot converge unknown directory_maintenance_guard predecessor shape: " +
+            columns.join(","),
+        ),
+      )
+    }
+
+    yield* tx.run(
+      "ALTER TABLE directory_maintenance_guard RENAME TO directory_maintenance_guard_legacy_20260924",
+    )
+    yield* tx.run(
+      "CREATE TABLE directory_maintenance_guard (" +
+        "directory text PRIMARY KEY," +
+        "guard_id text NOT NULL," +
+        "owner_id text NOT NULL," +
+        "acquisition_id text NOT NULL," +
+        "generation integer NOT NULL," +
+        "state text NOT NULL," +
+        "acquired_at integer NOT NULL," +
+        "released_at integer," +
+        "updated_at integer NOT NULL," +
+        "CONSTRAINT fk_directory_maintenance_guard_owner_id_runtime_owner_id_fk " +
+          "FOREIGN KEY (owner_id) REFERENCES runtime_owner(id)," +
+        "CONSTRAINT directory_maintenance_guard_state_check " +
+          "CHECK(state in ('active', 'released', 'reconcile_required'))," +
+        "CONSTRAINT directory_maintenance_guard_release_check " +
+          "CHECK((state = 'released' and released_at is not null) " +
+            "or (state <> 'released' and released_at is null))," +
+        "CONSTRAINT directory_maintenance_guard_acquisition_check " +
+          "CHECK(length(acquisition_id) > 0)" +
+      ")",
+    )
+    yield* tx.run(
+      "INSERT INTO directory_maintenance_guard (" +
+        "directory,guard_id,owner_id,acquisition_id,generation,state," +
+        "acquired_at,released_at,updated_at" +
+      ") SELECT " +
+        "directory,guard_id,owner_id," +
+        "'directory-maintenance:legacy:' || lower(hex(directory))," +
+        "generation," +
+        "CASE WHEN state = 'released' THEN 'released' ELSE 'reconcile_required' END," +
+        "acquired_at,released_at,updated_at " +
+      "FROM directory_maintenance_guard_legacy_20260924",
+    )
+    // The renamed predecessor still owns the globally named legacy indexes.
+    // Drop it only after the data copy, then recreate indexes on the canonical
+    // table under their stable names.
+    yield* tx.run("DROP TABLE directory_maintenance_guard_legacy_20260924")
+    yield* tx.run(
+      "CREATE INDEX directory_maintenance_guard_guard_idx " +
+        "ON directory_maintenance_guard (guard_id,state)",
+    )
+    yield* tx.run(
+      "CREATE INDEX directory_maintenance_guard_owner_idx " +
+        "ON directory_maintenance_guard (owner_id,state)",
+    )
+    yield* tx.run(
+      "CREATE INDEX directory_maintenance_guard_acquisition_idx " +
+        "ON directory_maintenance_guard (acquisition_id,state)",
+    )
+  })
+}
+
 // The initial checksum rollout (5489cd7531) committed two registry fingerprints
 // that did not match the exact tracked migration source bytes. Databases opened
 // by that build correctly persisted those generated values, so treat only these
@@ -31,6 +161,19 @@ const checksumCorrections = new Map<string, ReadonlyMap<string, string>>([
       [
         "b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c",
         "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
+      ],
+    ]),
+  ],
+  [
+    "20260924060000_directory_maintenance_guard_triggers",
+    new Map([
+      // Pre-release hardening repair: a database that already reconciled the
+      // first (generation-too-strict, REPLACE-bypassable) trigger definitions
+      // while this migration was uncommitted journaled the replaced source.
+      // Only this exact stale pair is repaired; any other value still dies.
+      [
+        "d18299abd87cd4d189e1359ea07de03bdfc7513d709af8bc54fb76a60b0ba40d",
+        "dcc9e91d342605b0f833eebcd812daaf69e067f284b7c3d4c70567c40d16db93",
       ],
     ]),
   ],
@@ -172,6 +315,31 @@ export function applyOnly(db: Database, input: Migration[]) {
           sql`UPDATE ${sql.identifier("migration")} SET checksum = ${migration.checksum} WHERE id = ${row.id} AND checksum IS NULL`,
         )
       }
+    }
+
+    const directoryGuardTarget = byID.get(DIRECTORY_GUARD_MIGRATION)
+    if (
+      directoryGuardTarget &&
+      completed.has(LEGACY_DIRECTORY_GUARD_MIGRATION) &&
+      !completed.has(DIRECTORY_GUARD_MIGRATION)
+    ) {
+      if (!directoryGuardTarget.checksum) {
+        return yield* Effect.die(
+          new Error(
+            "Legacy directory-maintenance-guard convergence requires the canonical target checksum",
+          ),
+        )
+      }
+      yield* db.transaction((tx) =>
+        Effect.gen(function* () {
+          yield* convergeLegacyDirectoryMaintenanceGuard(tx)
+          yield* tx.run(
+            sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum)
+                VALUES (${directoryGuardTarget.id}, ${Date.now()}, ${directoryGuardTarget.checksum})`,
+          )
+        }),
+      )
+      completed.add(DIRECTORY_GUARD_MIGRATION)
     }
 
     for (const migration of input) {

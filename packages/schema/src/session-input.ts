@@ -4,6 +4,7 @@ import { Schema } from "effect"
 import { optional } from "./schema"
 import { Prompt } from "./prompt"
 import { Model } from "./model"
+import { ProviderRouteIntent } from "./model-select/provider-route-intent"
 import { DateTimeUtcFromMillis, NonNegativeInt } from "./schema"
 import { SessionDelivery } from "./session-delivery"
 import { SessionID } from "./session-id"
@@ -46,6 +47,8 @@ export interface SyntheticExecution extends Schema.Schema.Type<typeof SyntheticE
 export const SyntheticExecution = Schema.Struct({
   agent: Schema.String,
   model: Model.Ref,
+  /** Durable execution-route intent. Binding/resolution remains a Core runtime concern. */
+  routeIntent: ProviderRouteIntent.Info.pipe(optional),
 }).annotate({ identifier: "SessionInput.SyntheticExecution" })
 
 export interface UserItem extends Schema.Schema.Type<typeof UserItem> {}
@@ -82,6 +85,13 @@ export const Entry = Schema.Struct({
   promotedSeq: NonNegativeInt.pipe(optional),
   revokedSeq: NonNegativeInt.pipe(optional),
   revokedReason: RevocationReason.pipe(optional),
+  /**
+   * Session aggregate sequence of the InputCompleted event that proved this
+   * exact input reached a successful provider cycle. Absent means never proven
+   * complete; it is never inferred from Session ownership, a later cycle, or a
+   * newer execution generation.
+   */
+  completedSeq: NonNegativeInt.pipe(optional),
 }).annotate({ identifier: "SessionInput.Entry" })
 
 export interface Admitted extends Schema.Schema.Type<typeof Admitted> {}

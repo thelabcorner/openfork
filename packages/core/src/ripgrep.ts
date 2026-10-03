@@ -57,6 +57,7 @@ export interface FindInput {
   readonly cwd: string
   readonly pattern: string
   readonly limit: number
+  readonly offset?: number
   readonly hidden?: boolean
   readonly follow?: boolean
   readonly signal?: AbortSignal
@@ -67,6 +68,7 @@ export interface GlobInput {
   readonly cwd: string
   readonly pattern: string
   readonly limit: number
+  readonly offset?: number
   readonly hidden?: boolean
   readonly follow?: boolean
   readonly signal?: AbortSignal
@@ -75,6 +77,7 @@ export interface GlobInput {
 export interface GrepInput {
   readonly cwd: string
   readonly pattern: string
+  readonly offset?: number
   readonly file?: string
   readonly include?: string
   /** Treat pattern as a fixed string instead of a regular expression. */
@@ -106,6 +109,7 @@ const layer = Layer.effect(
       readonly cwd: string
       readonly args: string[]
       readonly limit: number
+      readonly offset?: number
       readonly signal?: AbortSignal
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
       readonly pattern?: string
@@ -126,6 +130,7 @@ const layer = Layer.effect(
             Stream.filter((line) => line.length > 0),
             Stream.mapEffect(input.parse),
             Stream.filter((row): row is A => row !== undefined),
+            Stream.drop(input.offset ?? 0),
             Stream.tap((row) => {
               if (!input.onItem || observed++ >= input.limit) return Effect.void
               return input.onItem(row)
@@ -163,6 +168,7 @@ const layer = Layer.effect(
         run<string>({
           cwd: input.cwd,
           limit: input.limit,
+          offset: input.offset,
           signal: input.signal,
           args: [
             "--no-config",
@@ -195,6 +201,7 @@ const layer = Layer.effect(
         run<Entry>({
           cwd: input.cwd,
           limit: input.limit,
+          offset: input.offset,
           signal: input.signal,
           args: [
             "--no-config",

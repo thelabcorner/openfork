@@ -28,6 +28,7 @@ import { upgradeIfNeeded } from "../../up-migrations/effect-sqlite"
 import { assertUnreachable, makeJitQueryMapper, type RowsMapper } from "drizzle-orm/utils"
 import { mapResultRow } from "../../internal/drizzle-utils"
 import { SQLiteEffectDatabase } from "./db"
+import { captureSqliteQuerySite, recordSqliteQuerySuccess } from "./profile"
 
 type MigrationConfigWithInit = MigrationConfig & { init?: boolean }
 
@@ -46,6 +47,7 @@ export class SQLiteEffectPreparedQuery<
   private jitMapper?: RowsMapper<any> | RelationalRowsMapper<any>
   private cacheConfig: WithCacheConfig | undefined
   private effectExecuteMethod: SQLiteExecuteMethod
+  private profileSite: ReturnType<typeof captureSqliteQuerySite>
 
   constructor(
     private executor: (
@@ -74,6 +76,7 @@ export class SQLiteEffectPreparedQuery<
     private isInTransaction: Effect.Effect<boolean> = Effect.succeed(false),
   ) {
     this.effectExecuteMethod = executeMethod
+    this.profileSite = captureSqliteQuerySite(query.sql, executeMethod, queryMetadata)
     this.cacheConfig =
       cache.strategy() === "all" && cacheConfig === undefined ? { enabled: true, autoInvalidate: true } : cacheConfig
     if (!this.cacheConfig?.enabled) {
@@ -218,7 +221,23 @@ export class SQLiteEffectPreparedQuery<
       return yield* this.queryWithCache(
         this.query.sql,
         params,
-        Effect.suspend(() => this.executor(params, executeMethod) as Effect.Effect<A, unknown, unknown>),
+        Effect.suspend(() => {
+          const profileSite = this.profileSite
+          if (!profileSite) return this.executor(params, executeMethod) as Effect.Effect<A, unknown, unknown>
+          const startedAt = performance.now()
+          return (this.executor(params, executeMethod) as Effect.Effect<A, unknown, unknown>).pipe(
+            Effect.tap((result) =>
+              Effect.sync(() => {
+                const rows = Array.isArray(result)
+                  ? result.length
+                  : profileSite.queryType === "select" && result !== undefined
+                    ? 1
+                    : 0
+                recordSqliteQuerySuccess(profileSite, performance.now() - startedAt, rows)
+              }),
+            ),
+          )
+        }),
         mapResult,
       )
     })

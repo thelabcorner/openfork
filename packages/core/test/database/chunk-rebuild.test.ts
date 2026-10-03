@@ -77,7 +77,7 @@ const seedLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, readDb: db, filename }
+      return { db, readDb: db, scanDb: () => Effect.succeed(db), filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(

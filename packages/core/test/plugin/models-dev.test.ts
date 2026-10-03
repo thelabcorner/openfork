@@ -43,6 +43,8 @@ describe("ModelsDevPlugin", () => {
       const integrations = yield* Integration.Service
       const catalog = yield* Catalog.Service
       const models = ModelsDev.Service.of({
+        getCached: () => Effect.succeed({}),
+        getForSelectedProvider: () => Effect.succeed({}),
         get: () =>
           Effect.succeed({
             acme: {

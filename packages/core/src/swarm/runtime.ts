@@ -37,6 +37,7 @@ export interface RetirementRun {
     readonly id: SessionMessage.ID
     readonly promotedSeq?: number
     readonly revokedSeq?: number
+    readonly completedSeq?: number
   }
 }
 
@@ -46,6 +47,15 @@ export interface RetirementTarget extends LeaseRuntimeTarget {
 
 export interface RetirementRequiredTarget extends LeaseRuntimeTarget {
   readonly reason: RetirementReason
+}
+
+/**
+ * One live lease whose execution demonstrably began (`running`) but has not
+ * been semantically settled. Discovered from durable rows only: the caller
+ * still has to prove canonical Session quiescence before closing anything.
+ */
+export interface UnsettledTarget extends LeaseRuntimeTarget {
+  readonly run: Swarm.TaskRun
 }
 
 export interface NextRuntimeDeadlineInput {
@@ -312,6 +322,7 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
               id: SessionInputTable.id,
               promotedSeq: SessionInputTable.promoted_seq,
               revokedSeq: SessionInputTable.revoked_seq,
+              completedSeq: SessionInputTable.completed_seq,
             })
             .from(SessionInputTable)
             .where(inArray(SessionInputTable.id, inputIDs))
@@ -340,6 +351,7 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
                     id: inputRow.id,
                     ...(inputRow.promotedSeq === null ? {} : { promotedSeq: inputRow.promotedSeq }),
                     ...(inputRow.revokedSeq === null ? {} : { revokedSeq: inputRow.revokedSeq }),
+                    ...(inputRow.completedSeq === null ? {} : { completedSeq: inputRow.completedSeq }),
                   },
                 }
               : {}),
@@ -391,6 +403,50 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
             ? ("member_stop" as const)
             : ("member_rebind" as const),
     }))
+  })
+
+  /**
+   * Active leases whose one authoritative run is `running`. This is the
+   * candidate set for "execution ended without semantic settlement"; it is
+   * deliberately not filtered by lease expiry so a long but legitimate
+   * execution is never mistaken for an unsettled one.
+   */
+  const unsettledExecutionTargets = Effect.fn("Swarm.unsettledExecutionTargets")(function* (request?: {
+    readonly limit?: number
+    /** Optional exact Session scope for event-driven execution closure. */
+    readonly sessionIDs?: readonly (typeof SwarmTaskLeaseTable.$inferSelect.owner_session_id)[]
+  }) {
+    const limit = Math.min(256, Math.max(1, Math.trunc(request?.limit ?? 64)))
+    const sessionIDs = request?.sessionIDs?.length ? [...request.sessionIDs] : undefined
+    const rows = yield* readDb
+      .select({ lease: SwarmTaskLeaseTable, swarmID: SwarmTaskTable.swarm_id, run: SwarmTaskRunTable })
+      .from(SwarmTaskLeaseTable)
+      .innerJoin(SwarmTaskTable, eq(SwarmTaskTable.id, SwarmTaskLeaseTable.task_id))
+      .innerJoin(
+        SwarmTaskRunTable,
+        and(
+          eq(SwarmTaskRunTable.task_id, SwarmTaskLeaseTable.task_id),
+          eq(SwarmTaskRunTable.member_id, SwarmTaskLeaseTable.owner_member_id),
+          eq(SwarmTaskRunTable.session_id, SwarmTaskLeaseTable.owner_session_id),
+          eq(SwarmTaskRunTable.binding_generation, SwarmTaskLeaseTable.owner_binding_generation),
+          eq(SwarmTaskRunTable.lease_generation, SwarmTaskLeaseTable.generation),
+          eq(SwarmTaskRunTable.status, "running"),
+        ),
+      )
+      .where(
+        and(
+          eq(SwarmTaskLeaseTable.state, "active"),
+          eq(SwarmTaskTable.status, "working"),
+          sessionIDs ? inArray(SwarmTaskLeaseTable.owner_session_id, sessionIDs) : undefined,
+        ),
+      )
+      .orderBy(asc(SwarmTaskLeaseTable.acquired_at), asc(SwarmTaskLeaseTable.task_id))
+      .limit(limit)
+      .all()
+      .pipe(Effect.orDie)
+    // The exact-lease running-run join happens in SQL, so `limit` bounds real
+    // candidates. Leading non-running leases can never starve later runs.
+    return rows.map((row) => ({ ...targetOf(row.swarmID, row.lease), run: hydrateTaskRun(row.run) })) as UnsettledTarget[]
   })
 
   const nextRuntimeDeadline = Effect.fn("Swarm.nextRuntimeDeadline")(function* (request: NextRuntimeDeadlineInput) {
@@ -534,6 +590,7 @@ export function makeRuntimeOperations(input: { readonly readDb: Db }) {
     dueHoldTargets,
     retirementRequiredTargets,
     retiringTargets,
+    unsettledExecutionTargets,
     nextRuntimeDeadline,
   }
 }

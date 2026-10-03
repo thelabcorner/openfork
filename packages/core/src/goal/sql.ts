@@ -21,7 +21,6 @@ export const GoalTable = sqliteTable(
     status: text().$type<Goal.Status>().notNull().default("draft"),
     revision: integer().notNull().default(0),
     auditor_runs: integer().notNull().default(0),
-    continuation_policy: text({ mode: "json" }).$type<Goal.ContinuationPolicy>().notNull().default({}),
     auditor_policy: text({ mode: "json" }).$type<Goal.AuditorPolicy>().notNull().default({}),
     blocker: text(),
     time_created: integer()
@@ -154,18 +153,10 @@ export const GoalAutomationTable = sqliteTable(
       .$type<Goal.ID>()
       .notNull()
       .references(() => GoalTable.id, { onDelete: "cascade" }),
-    started_at: integer().notNull(),
-    consecutive_turns: integer().notNull().default(0),
-    no_progress_turns: integer().notNull().default(0),
-    auditor_blocked_streak: integer().notNull().default(0),
-    consumed_tokens: integer().notNull().default(0),
-    last_auditor_decision: text().$type<Goal.AuditorDecision>(),
-    last_auditor_rationale: text(),
     audit_requested_at: integer(),
     auditing_at: integer(),
     auditor_session_id: text().$type<typeof SessionTable.$inferSelect.id>(),
     runtime_error: text(),
-    previous_revision: integer(),
     reservation_id: text(),
     reservation_owner: text(),
     reservation_created_at: integer(),

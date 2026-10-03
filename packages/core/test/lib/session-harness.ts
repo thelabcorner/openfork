@@ -120,7 +120,17 @@ export type Harness = {
   readonly reset: () => void
 }
 
-export const makeHarness = (options: { readonly snapshotLayer?: Layer.Layer<Snapshot.Service> } = {}): Harness => {
+export const makeHarness = (
+  options: {
+    readonly snapshotLayer?: Layer.Layer<Snapshot.Service>
+    /**
+     * Override the route-authority seam. Defaults to catalog-mirroring
+     * resolution with no committed route; route/wire/settlement proofs supply a
+     * seam that reports an exact committed attribution.
+     */
+    readonly sessionRunnerModel?: Layer.Layer<SessionRunnerModel.Service>
+  } = {},
+): Harness => {
   const requests: LLMRequest[] = []
   const titleRequests: LLMRequest[] = []
   const completions: LLMEvent[][] = []
@@ -190,7 +200,20 @@ export const makeHarness = (options: { readonly snapshotLayer?: Layer.Layer<Snap
     }),
   )
 
-  const models = SessionRunnerModel.layerWith(() => Effect.succeed(currentSessionModel))
+  // Mirror production candidate resolution: a requested model is looked up in
+  // the catalog and compiled, and only an unresolvable request falls back to the
+  // Session's current model. Title routes every cascade candidate through this
+  // service, so a seam that ignored the requested ref could not express the
+  // cascade order at all.
+  const models =
+    options.sessionRunnerModel ??
+    SessionRunnerModel.layerWith((session) => {
+      const key = session.model ? `${session.model.providerID}/${session.model.id}` : undefined
+      const requested = key === undefined ? undefined : catalogModels.get(key)
+      return requested === undefined
+        ? Effect.succeed(currentSessionModel)
+        : SessionRunnerModel.fromCatalogModel(requested, undefined)
+    })
 
   const systemContext = Layer.mock(SystemContextRegistry.Service, {
     register: () => Effect.void,

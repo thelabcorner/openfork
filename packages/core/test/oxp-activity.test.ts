@@ -157,6 +157,47 @@ describe("OxpActivity", () => {
   )
 
   it.live(
+    "recreates a deleted parent when the same correlation is observed again",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const correlation = {
+        scheme: "mcp-session-id",
+        digest: "digest-recreated-parent",
+        scope: "unknown",
+      } as const
+
+      const first = yield* activity.begin({
+        correlation,
+        hostRunID: "host-recreate",
+        observedEpoch: 1,
+        plane: "augmentation",
+        tool: "read",
+      })
+      yield* activity.settle({
+        invocationID: first.invocationID,
+        status: "success",
+      })
+      expect(yield* activity.deleteHistory(first.activityID)).toBe(true)
+
+      const second = yield* activity.begin({
+        correlation,
+        hostRunID: "host-recreate",
+        observedEpoch: 2,
+        plane: "augmentation",
+        tool: "read",
+      })
+
+      expect(second.activityID).not.toBe(first.activityID)
+      expect(second.activityCreated).toBe(true)
+      expect(yield* inspection.get(second.activityID)).toMatchObject({
+        id: second.activityID,
+        call_count: 1,
+      })
+    }),
+  )
+
+  it.live(
     "deduplicates one correlation into one durable parent while preserving concurrent spans",
     Effect.gen(function* () {
       const activity = yield* OxpActivity.Service

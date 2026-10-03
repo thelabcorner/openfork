@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { beforeEach, describe, expect } from "bun:test"
 import { Effect } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Catalog } from "@opencode-ai/core/catalog"
@@ -9,6 +9,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { PluginHost } from "@opencode-ai/core/plugin/host"
 import { OpencodePlugin } from "@opencode-ai/core/plugin/provider/opencode"
+import { setHostedCatalogForTest } from "@opencode-ai/core/plugin/provider/opencode-hosted"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
@@ -71,6 +72,8 @@ function withEnv<A, E, R>(vars: Record<string, string | undefined>, effect: () =
 const cost = (input: number, output = 0) => [{ input, output, cache: { read: 0, write: 0 } }]
 
 describe("OpencodePlugin", () => {
+  beforeEach(() => setHostedCatalogForTest([]))
+
   it.effect("registers account and service account methods", () =>
     Effect.gen(function* () {
       yield* addPlugin()
@@ -285,9 +288,10 @@ describe("OpencodePlugin", () => {
     ),
   )
 
-  it.effect("keeps free models without credentials", () =>
+  it.effect("keeps explicitly hosted zero-cost models without credentials", () =>
     withEnv({ OPENCODE_API_KEY: undefined }, () =>
       Effect.gen(function* () {
+        setHostedCatalogForTest(["free"])
         const catalog = yield* Catalog.Service
         yield* catalog.transform((catalog) => {
           const provider = ProviderV2.Info.make({
@@ -311,9 +315,10 @@ describe("OpencodePlugin", () => {
     ),
   )
 
-  it.effect("treats output-only cost as free without credentials", () =>
+  it.effect("rejects hosted models with output-only billing without credentials", () =>
     withEnv({ OPENCODE_API_KEY: undefined }, () =>
       Effect.gen(function* () {
+        setHostedCatalogForTest(["output-only"])
         const catalog = yield* Catalog.Service
         yield* catalog.transform((catalog) => {
           const provider = ProviderV2.Info.make({
@@ -333,7 +338,7 @@ describe("OpencodePlugin", () => {
         yield* addPlugin()
         expect(required(yield* catalog.provider.get(ProviderV2.ID.opencode)).request.body.apiKey).toBe("public")
         expect(required(yield* catalog.model.get(ProviderV2.ID.opencode, ModelV2.ID.make("output-only"))).enabled).toBe(
-          true,
+          false,
         )
       }),
     ),

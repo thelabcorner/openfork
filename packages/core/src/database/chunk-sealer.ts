@@ -1146,7 +1146,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               }
               const pruned = semanticOutcome.value
               backoffMs = BACKOFF_BASE_MS
-              if (pruned.inspected > 0) {
+              if (pruned.inspected > 0 || !pruned.indexComplete || !pruned.dependencyComplete) {
                 yield* Effect.logInfo("ChunkDB semantic prune pass complete", { filename, ...pruned })
               }
               const semanticProgress = semanticPruneProgress(pruned)

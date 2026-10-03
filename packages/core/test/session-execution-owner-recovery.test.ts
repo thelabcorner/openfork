@@ -27,9 +27,7 @@ let releases = 0
 
 const snapshots = new Map<RuntimeOwner.ID, RuntimeOwner.Snapshot>()
 
-const fakeRuntimeLayer = Layer.succeed(
-  RuntimeOwner.Service,
-  RuntimeOwner.Service.of({
+const fakeRuntime = RuntimeOwner.Service.of({
     id: recoveryOwnerID,
     pid: 222,
     startedAt: 200,
@@ -47,8 +45,8 @@ const fakeRuntimeLayer = Layer.succeed(
     snapshot: (id) => Effect.succeed(snapshots.get(id)),
     proveLocalDeath: (id) =>
       Effect.succeed(id === foreignRecoveryOwnerID ? recoveryProof : proof),
-  }),
-)
+  })
+const fakeRuntimeLayer = Layer.succeed(RuntimeOwner.Service, fakeRuntime)
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -90,7 +88,7 @@ beforeEach(() => {
 })
 
 const setup = Effect.gen(function* () {
-  const { db } = yield* Database.Service
+  const { db, readDb } = yield* Database.Service
   yield* db
     .insert(ProjectTable)
     .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
@@ -149,8 +147,11 @@ const setup = Effect.gen(function* () {
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie)
-  return { db, owner: yield* SessionExecutionOwner.Service }
+  return { db, readDb, owner: yield* SessionExecutionOwner.Service }
 })
+
+const reconcileAtStartup = (db: Effect.Success<typeof setup>["db"], readDb: Effect.Success<typeof setup>["readDb"]) =>
+  SessionExecutionOwner.reconcileDeadOwnersAtStartup(db, readDb, fakeRuntime)
 
 const row = (db: Effect.Success<typeof setup>["db"]) =>
   db
@@ -161,6 +162,190 @@ const row = (db: Effect.Success<typeof setup>["db"]) =>
     .pipe(Effect.orDie)
 
 describe("SessionExecutionOwner recovery", () => {
+  it.effect("startup clears a stale, proven-dead lease without changing its generation and drops its owner row", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(1)
+      expect(yield* row(state.db)).toMatchObject({
+        owner_id: null,
+        acquired_at: null,
+        generation: 7,
+        recovery_owner_id: null,
+      })
+      expect(yield* state.db.select().from(RuntimeOwnerTable).where(eq(RuntimeOwnerTable.id, oldOwnerID)).get()).toBe(
+        undefined,
+      )
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toEqual([])
+    }),
+  )
+
+  it.effect("startup preserves a stale-but-live execution lease", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "alive-or-unknown"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toHaveLength(1)
+    }),
+  )
+
+  it.effect("startup preserves a fresh lease even when death probing reports dead", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+      snapshots.set(oldOwnerID, { ...snapshots.get(oldOwnerID)!, heartbeatAt: Date.now() })
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
+    }),
+  )
+
+  it.effect("startup preserves stale leases with non-local or otherwise uncertain identity", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "not-local-or-unknown"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, generation: 7 })
+    }),
+  )
+
+  it.effect("a stale heartbeat with a PID that is still present (including PID reuse) is never stolen", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      // process.kill(pid, 0) can only establish that some process occupies the
+      // number; it cannot prove that it is the original owner. Treat that as
+      // alive/unknown even when the durable heartbeat is stale.
+      proof = "alive-or-unknown"
+
+      expect(yield* state.owner.tryClaimRecovery(sessionID)).toMatchObject({
+        state: "blocked",
+        proof: "alive-or-unknown",
+      })
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, recovery_owner_id: null })
+    }),
+  )
+
+  it.effect("a fresh heartbeat is not reclaimed even if a death probe reports dead", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      proof = "dead"
+      snapshots.set(oldOwnerID, { ...snapshots.get(oldOwnerID)!, heartbeatAt: Date.now() })
+
+      expect(yield* state.owner.tryClaimRecovery(sessionID)).toMatchObject({ state: "blocked" })
+      expect(yield* row(state.db)).toMatchObject({ owner_id: oldOwnerID, recovery_owner_id: null })
+    }),
+  )
+
+  it.effect("startup requires stale-and-dead proof for a recovery owner too", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ recovery_owner_id: foreignRecoveryOwnerID, recovery_started_at: 150 })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      proof = "dead"
+      recoveryProof = "alive-or-unknown"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(0)
+      expect(yield* row(state.db)).toMatchObject({
+        owner_id: oldOwnerID,
+        generation: 7,
+        recovery_owner_id: foreignRecoveryOwnerID,
+      })
+    }),
+  )
+
+  it.effect("startup clears a lease only after both execution and recovery owners are proven dead", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      yield* state.db
+        .update(SessionExecutionOwnerTable)
+        .set({ recovery_owner_id: foreignRecoveryOwnerID, recovery_started_at: 150 })
+        .where(eq(SessionExecutionOwnerTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+      proof = "dead"
+      recoveryProof = "dead"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(1)
+      expect(yield* row(state.db)).toMatchObject({
+        owner_id: null,
+        generation: 7,
+        recovery_owner_id: null,
+        recovery_started_at: null,
+      })
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toEqual([])
+    }),
+  )
+
+  it.effect("startup keyset pagination reclaims every lease beyond the first 128-row page", () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      const batch = Array.from({ length: 257 }, (_, index) =>
+        SessionSchema.ID.make(`ses_startup_batch_${String(index).padStart(3, "0")}`),
+      )
+      const garbageOwners = Array.from(
+        { length: 257 },
+        (_, index) => `runtime-owner:startup-gc-${String(index).padStart(3, "0")}` as RuntimeOwner.ID,
+      )
+      for (const id of garbageOwners) {
+        snapshots.set(id, { id, pid: 900, startedAt: 1, heartbeatAt: 1, controlEpoch: 0 })
+      }
+      yield* state.db
+        .insert(SessionTable)
+        .values(
+          batch.map((id, index) => ({
+            id,
+            project_id: Project.ID.global,
+            slug: `startup-batch-${index}`,
+            directory: "/project",
+            title: `startup batch ${index}`,
+            version: "test",
+          })),
+        )
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* state.db
+        .insert(RuntimeOwnerTable)
+        .values(
+          garbageOwners.map((id) => ({
+            id,
+            pid: 900,
+            started_at: 1,
+            heartbeat_at: 1,
+            control_epoch: 0,
+          })),
+        )
+        .run()
+        .pipe(Effect.orDie)
+      yield* state.db
+        .insert(SessionExecutionOwnerTable)
+        .values(batch.map((id) => ({ session_id: id, generation: 4, owner_id: oldOwnerID, acquired_at: 100 })))
+        .run()
+        .pipe(Effect.orDie)
+      proof = "dead"
+
+      expect(yield* reconcileAtStartup(state.db, state.readDb)).toBe(batch.length + 1)
+      const working = yield* state.owner.listWorking()
+      expect([...working]).toEqual([])
+      const remainingOwners = yield* state.db.select({ id: RuntimeOwnerTable.id }).from(RuntimeOwnerTable).all()
+      expect(remainingOwners.some((owner) => garbageOwners.includes(owner.id as RuntimeOwner.ID))).toBe(false)
+      expect(yield* state.db.select().from(RuntimeOwnerTable).where(eq(RuntimeOwnerTable.id, oldOwnerID)).get()).toBe(
+        undefined,
+      )
+    }),
+  )
+
   it.effect("heartbeat staleness alone cannot claim recovery", () =>
     Effect.gen(function* () {
       const state = yield* setup

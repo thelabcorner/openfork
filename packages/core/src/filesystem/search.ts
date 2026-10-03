@@ -20,32 +20,28 @@ import { SearchIndex } from "../search/index-service"
 import { ChunkStore } from "../search/chunk-store"
 import { Global } from "../global"
 
-// Mention-search session cache shared by backends that can enumerate paths:
-// the prepared index is keyed by a cheap revision stamp so watcher deltas
-// trigger a rebuild only when the candidate set actually changed.
+// Mention-search session cache shared by backends that can enumerate paths.
+// Its owner supplies a structural revision so watcher deltas rebuild the
+// prepared index exactly when the candidate set changes.
 const MENTION_BUILD_LIMIT = 100_000
 
-function mentionSessionKey(paths: readonly { path: string }[], symbols: readonly unknown[]): string {
-  return `${paths.length}:${symbols.length}:${paths.length > 0 ? (paths[0]!.path + "|" + paths[paths.length - 1]!.path) : ""}`
-}
-
-const mentionsState = new WeakMap<object, { key: string; session: Matcher.QuerySession }>()
+const mentionsState = new WeakMap<object, { revision: unknown; session: Matcher.QuerySession }>()
 
 function mentionsFromEntries(
   owner: object,
+  revision: unknown,
   paths: readonly Matcher.PathEntry[],
   symbols: readonly Matcher.SymbolEntry[],
   input: { query: string; limit: number; offset: number; symbols: boolean },
 ): Matcher.QueryPage {
-  const key = mentionSessionKey(paths, symbols)
   let state = mentionsState.get(owner)
-  if (!state || state.key !== key) {
+  if (!state || state.revision !== revision) {
     if (paths.length > MENTION_BUILD_LIMIT) {
       // oversized corpus without the byte-first store seam: fall back to
       // caller-provided ranking by returning an empty page (handler degrades)
       return { files: [], symbols: [], results: [], hasMore: false, total: 0 }
     }
-    state = { key, session: Matcher.createSession(Matcher.prepare({ paths, symbols })) }
+    state = { revision, session: Matcher.createSession(Matcher.prepare({ paths, symbols })) }
     mentionsState.set(owner, state)
   }
   return state.session.query(input.query, { limit: input.limit, offset: input.offset, symbols: input.symbols })
@@ -82,6 +78,7 @@ export const ripgrepLayer = Layer.effect(
     const state = {
       files: [] as string[],
       directories: [] as string[],
+      mentionRevision: 0,
     }
 
     // Register a relative path (seed or watcher event) with its ancestor dirs, so
@@ -91,6 +88,7 @@ export const ripgrepLayer = Layer.effect(
       if (known.has(rel)) return
       known.add(rel)
       state.files.push(rel)
+      state.mentionRevision++
       const parts = rel.split("/")
       parts.slice(0, -1).forEach((_, index) => {
         const key = parts.slice(0, index + 1).join("/")
@@ -101,9 +99,8 @@ export const ripgrepLayer = Layer.effect(
     }
 
     const unregisterFile = (rel: string) => {
-      if (!known.delete(rel)) return
-      const index = state.files.indexOf(rel)
-      if (index >= 0) state.files.splice(index, 1)
+      if (!known.delete(rel)) return false
+      state.mentionRevision++
       const parts = rel.split("/")
       parts.slice(0, -1).forEach((_, index) => {
         const key = parts.slice(0, index + 1).join("/")
@@ -115,6 +112,7 @@ export const ripgrepLayer = Layer.effect(
           dirCounts.set(key, count)
         }
       })
+      return true
     }
 
     // Watcher events carry absolute paths; skip anything outside the root, any
@@ -122,10 +120,11 @@ export const ripgrepLayer = Layer.effect(
     // and event types for paths the rg seed would never list.
     const applyEvent = (file: string, event: "add" | "change" | "unlink") => {
       const rel = path.relative(location.directory, file).replaceAll("\\", "/")
-      if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return
-      if (rel.split("/").some((segment) => segment === "" || segment.startsWith("."))) return
-      if (event === "unlink") unregisterFile(rel)
-      else registerFile(rel)
+      if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false
+      if (rel.split("/").some((segment) => segment === "" || segment.startsWith("."))) return false
+      if (event === "unlink") return unregisterFile(rel)
+      registerFile(rel)
+      return false
     }
 
     yield* ripgrep
@@ -170,7 +169,11 @@ export const ripgrepLayer = Layer.effect(
           if (Option.isNone(next)) break
           batch.set(next.value.file, next.value.event)
         }
-        for (const [file, event] of batch) applyEvent(file, event)
+        let removedFile = false
+        for (const [file, event] of batch) removedFile = applyEvent(file, event) || removedFile
+        // Preserve the original rg/watcher order, but compact at most once per
+        // coalesced batch instead of splicing the entire path array per unlink.
+        if (removedFile) state.files = state.files.filter((file) => known.has(file))
         state.directories = Array.from(directories)
       }
     }).pipe(Effect.forkScoped)
@@ -252,7 +255,7 @@ export const ripgrepLayer = Layer.effect(
             paths.push({ path: trimmed, isDir: true })
           }
           if (!input.symbols) return searchFileMentionsFast(paths, input)
-          return mentionsFromEntries(state, paths, [], input)
+          return mentionsFromEntries(state, state.mentionRevision, paths, [], input)
         }),
     })
   }),
@@ -472,7 +475,7 @@ const indexLayer = Layer.effect(
           // preserves the structural ranking users care about. Symbol-enabled
           // callers keep the richer prepared matcher/session.
           const page = input.symbols
-            ? mentionsFromEntries(index, snapshot.paths, snapshot.symbols, input)
+            ? mentionsFromEntries(index, snapshot.paths, snapshot.paths, snapshot.symbols, input)
             : searchFileMentionsFast(snapshot.paths, input)
           // Prompt Input V2 requests file-only results. Blend a bounded, live
           // mtime prior into those rows after lexical matching so ordinary saves

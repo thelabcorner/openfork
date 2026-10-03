@@ -1,9 +1,13 @@
 import { Duration, Effect } from "effect"
-import { sql } from "drizzle-orm"
+import { dataVersion } from "./data-version"
 import type { DatabaseShape } from "./database"
 
 export const SQLITE_MAINTENANCE_QUIET_MS = 100
-export const SQLITE_MAINTENANCE_POLL_MS = 10
+// This gate runs beside foreground session writes. A 10 ms PRAGMA poll could
+// prepare and execute the same no-op query 100 times per second while the DB
+// stays busy, adding synchronous SQLite work without making maintenance
+// eligible sooner than the quiet window allows.
+export const SQLITE_MAINTENANCE_POLL_MS = 50
 
 /**
  * Cross-process low-priority writer gate.
@@ -24,10 +28,7 @@ export function makeSqliteMaintenanceQuietGate(
 
   const wait = Effect.fnUntraced(function* () {
     for (;;) {
-      const row = yield* db
-        .get<{ data_version: number }>(sql`PRAGMA data_version`)
-        .pipe(Effect.orDie)
-      const version = Number(row?.data_version ?? 0)
+      const version = yield* dataVersion(db)
       const now = Date.now()
       if (observedVersion === undefined || version !== observedVersion) {
         observedVersion = version

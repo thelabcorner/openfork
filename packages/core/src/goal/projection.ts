@@ -54,7 +54,6 @@ function optionalAttribute(name: string, value: string | number | undefined) {
 }
 
 export function renderSpec(detail: Goal.Detail) {
-  const policy = detail.goal.continuationPolicy
   return [
     `<goal_spec state="current" goal_id="${escapeAttribute(detail.goal.id)}">`,
     `  <title>${escapeText(detail.goal.title)}</title>`,
@@ -73,7 +72,6 @@ export function renderSpec(detail: Goal.Detail) {
         `    <step id="${escapeAttribute(step.id)}" title="${escapeAttribute(step.title)}">${escapeText(step.description)}</step>`,
     ),
     "  </steps>",
-    `  <continuation_policy${optionalAttribute("max_consecutive_turns", policy.maxConsecutiveTurns)}${optionalAttribute("max_no_progress_turns", policy.maxNoProgressTurns)}${optionalAttribute("max_duration_ms", policy.maxDurationMs)}${optionalAttribute("token_budget", policy.tokenBudget)} />`,
     "</goal_spec>",
   ].join("\n")
 }

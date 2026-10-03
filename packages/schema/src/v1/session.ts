@@ -696,6 +696,9 @@ export const PartDelta = define({
     partID: PartID,
     field: Schema.String,
     delta: Schema.String,
+    // UTF-16 code-unit start in the producer's current part, allowing a live
+    // detail snapshot to cover a delta that arrives after reconciliation.
+    offset: Schema.optional(NonNegativeInt),
   },
 })
 

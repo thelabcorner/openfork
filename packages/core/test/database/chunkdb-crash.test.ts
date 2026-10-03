@@ -65,7 +65,7 @@ const crashLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, readDb: db, filename }
+      return { db, readDb: db, scanDb: () => Effect.succeed(db), filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(
@@ -99,7 +99,7 @@ const plainLayer = (filename: string) =>
       yield* db.run("PRAGMA cache_size = -64000")
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
-      return { db, readDb: db, filename }
+      return { db, readDb: db, scanDb: () => Effect.succeed(db), filename }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename })))
 

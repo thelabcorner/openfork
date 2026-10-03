@@ -269,6 +269,107 @@ describe("Swarm lease authority", () => {
     }),
   )
 
+  it.effect("persists a successful result on the exact TaskRun and refuses lossy no-run summaries", () =>
+    Effect.gen(function* () {
+      const { service, swarm, a, db } = yield* setup
+      const task = yield* service.createTask({ swarmID: swarm.id, title: "durable successful result", now: 100 })
+      const claimed = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: task.id,
+        memberID: a.id,
+        processOwner: "result-worker",
+        leaseMs: 1_000,
+        now: 110,
+      })
+      const run = yield* service.recordTaskRun({
+        token: claimed.token,
+        sessionInputID: SessionMessage.ID.make("msg_swarm_result_summary"),
+        now: 111,
+      })
+      yield* service.startTaskRun({ token: claimed.token, runID: run.id, now: 112 })
+
+      const settled = yield* service.settleTask({
+        token: claimed.token,
+        runID: run.id,
+        settlement: { type: "completed", summary: "  verified durable result  " },
+        now: 113,
+      })
+      expect(settled.task.status).toBe("completed")
+      expect(settled.run?.status).toBe("completed")
+      expect(settled.run?.resultSummary).toBe("verified durable result")
+      const persisted = yield* db
+        .select({ resultSummary: SwarmTaskRunTable.result_summary })
+        .from(SwarmTaskRunTable)
+        .where(eq(SwarmTaskRunTable.id, run.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(persisted?.resultSummary).toBe("verified durable result")
+
+      const noRunTask = yield* service.createTask({ swarmID: swarm.id, title: "no-run summary refusal", now: 120 })
+      const noRunLease = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: noRunTask.id,
+        memberID: a.id,
+        processOwner: "result-worker",
+        leaseMs: 1_000,
+        now: 121,
+      })
+      const refused = yield* service
+        .settleTask({
+          token: noRunLease.token,
+          settlement: { type: "completed", summary: "this would otherwise be dropped" },
+          now: 122,
+        })
+        .pipe(Effect.flip)
+      expect(refused._tag).toBe("Swarm.ValidationError")
+      expect((yield* service.get(swarm.id)).tasks.find((item) => item.id === noRunTask.id)?.status).toBe("working")
+
+      // Backward-compatible no-run completion stays legal only when there is no
+      // result payload to lose.
+      const legacy = yield* service.settleTask({
+        token: noRunLease.token,
+        settlement: { type: "completed" },
+        now: 123,
+      })
+      expect(legacy.task.status).toBe("completed")
+    }),
+  )
+
+  it.effect("normalizes whitespace-only successful summaries to durable absence", () =>
+    Effect.gen(function* () {
+      const { service, swarm, a, db } = yield* setup
+      const task = yield* service.createTask({ swarmID: swarm.id, title: "empty successful result", now: 100 })
+      const claimed = yield* service.claimTask({
+        swarmID: swarm.id,
+        taskID: task.id,
+        memberID: a.id,
+        processOwner: "result-worker",
+        leaseMs: 1_000,
+        now: 110,
+      })
+      const run = yield* service.recordTaskRun({
+        token: claimed.token,
+        sessionInputID: SessionMessage.ID.make("msg_swarm_empty_result_summary"),
+        now: 111,
+      })
+      yield* service.startTaskRun({ token: claimed.token, runID: run.id, now: 112 })
+      const settled = yield* service.settleTask({
+        token: claimed.token,
+        runID: run.id,
+        settlement: { type: "completed", summary: "   \n\t  " },
+        now: 113,
+      })
+      expect(settled.run?.resultSummary).toBeUndefined()
+      const persisted = yield* db
+        .select({ resultSummary: SwarmTaskRunTable.result_summary })
+        .from(SwarmTaskRunTable)
+        .where(eq(SwarmTaskRunTable.id, run.id))
+        .get()
+        .pipe(Effect.orDie)
+      expect(persisted?.resultSummary).toBeNull()
+    }),
+  )
+
   it.effect("commits assignment SessionInput and task-run admission atomically, rolling both back on stale binding", () =>
     Effect.gen(function* () {
       const { service, swarm, a, b, db } = yield* setup

@@ -300,6 +300,12 @@ Operational ownership:
   uses its own SQLite connection with effectively non-blocking writer admission,
   a cross-process `data_version` quiet gate, and bounded retry/yield. Foreground
   writers own priority.
+- Periodic WAL checkpoints use a separately acquired maintenance connection,
+  zero busy timeout, PASSIVE mode, and a DB-local cross-process checkpoint lease.
+  They never acquire the foreground connection permit. In-memory databases skip
+  file checkpointing. Node native SQLite runs in a worker per connection; this
+  isolates native CPU/lock waits from the control event loop without changing
+  SQLite's single-writer ownership or transaction ordering.
 - Any foreground transaction that reads before a possible write must reserve the
   writer with `BEGIN IMMEDIATE`; `busy_timeout` cannot repair
   `SQLITE_BUSY_SNAPSHOT` (extended code 517).

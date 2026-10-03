@@ -1,7 +1,9 @@
-import { and, asc, desc, eq, gt, isNull, lt, or } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm"
 import { DateTime, Effect } from "effect"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { EventV2 } from "../event"
+import { SwarmClaims } from "./claims"
+import { SwarmKnowledge } from "./knowledge"
 import {
   hydrateBlackboard,
   hydrateClaim,
@@ -18,6 +20,7 @@ import {
   SwarmBlackboardTable,
   SwarmClaimTable,
   SwarmDeliverableTable,
+  SwarmMemberTable,
   SwarmTaskRunTable,
   SwarmTaskTable,
 } from "./sql"
@@ -35,6 +38,24 @@ export interface PutBlackboardInput {
    */
   readonly expectedVersion?: number
   readonly now?: number
+}
+
+export interface BlackboardKnowledgeInput {
+  readonly swarmID: Swarm.ID
+  /** Task whose assignment receives the knowledge. */
+  readonly taskID?: Swarm.TaskID
+  /**
+   * Additional tasks whose filed knowledge is relevant to this handoff, for
+   * example DAG predecessors. Knowledge filed under a task that is neither the
+   * receiving task nor declared here is deliberately excluded.
+   *
+   * Deduplicated and capped at `SwarmKnowledge.MAX_RELATED_TASKS`; the digest
+   * reports how many were dropped so a caller cannot mistake a bounded read for
+   * the knowledge set it asked for.
+   */
+  readonly relatedTaskIDs?: ReadonlyArray<Swarm.TaskID>
+  /** Clamped into `SwarmKnowledge.MAX_LIMITS`; a caller cannot uncap the read. */
+  readonly limits?: Partial<SwarmKnowledge.KnowledgeLimits>
 }
 
 export interface ClaimToken {
@@ -56,6 +77,28 @@ export interface RenewClaimInput {
   readonly token: ClaimToken
   readonly expiresAt?: number
   readonly now?: number
+}
+
+/**
+ * Read-only conflict probe for mutation-tool boundaries.
+ *
+ * This is the primitive `edit`/`write`/`patch` consult to decide whether a
+ * target path is already claimed by another member. It is a pure read: it takes
+ * no lock, performs no write, and cannot block or deadlock. The caller owns the
+ * warn-vs-deny policy and any user override.
+ */
+export interface ClaimConflictInput {
+  readonly swarmID: Swarm.ID
+  /** Durable or typed scope string; opaque scopes always report no conflicts. */
+  readonly scope: string
+  /** Exclude this member's own claims from the result. */
+  readonly ownerMemberID?: Swarm.MemberID
+  readonly now?: number
+}
+
+export interface ClaimConflict {
+  readonly claim: Swarm.Claim
+  readonly memberLifecycle?: Swarm.MemberLifecycle
 }
 
 export interface PublishDeliverableInput {
@@ -93,12 +136,71 @@ function validExpiry(expiresAt: number | undefined, now: number) {
   return expiresAt === undefined || (Number.isFinite(expiresAt) && expiresAt > now)
 }
 
+function conflictError(requested: string, held: string, holderMemberID: string) {
+  return new SwarmSchema.ConflictError({
+    code: "swarm.claim_conflict",
+    reason: `Claim ${requested} overlaps live claim ${held} held by member ${holderMemberID}.`,
+  })
+}
+
 export function makeSharedStateOperations(input: {
   readonly db: Db
   readonly readDb: Db
   readonly events: EventV2.Interface
 }) {
   const { db, readDb, events } = input
+
+  /**
+   * Live typed-claim conflicts for a requested scope, resolved against member
+   * lifecycle. Bounded by the Swarm's claim count and one read snapshot; no
+   * locks, no writes, no waiting.
+   */
+  const conflictingClaims = Effect.fnUntraced(function* (request: {
+    readonly swarmID: Swarm.ID
+    readonly scope: SwarmClaims.ClaimScope
+    readonly ownerMemberID?: Swarm.MemberID
+    readonly now: number
+    /** Writer handle when the probe must observe the caller's own open transaction. */
+    readonly txDb?: Db
+  }) {
+    const source = request.txDb ?? readDb
+    const rows = yield* source
+      .select()
+      .from(SwarmClaimTable)
+      .where(eq(SwarmClaimTable.swarm_id, request.swarmID))
+      .all()
+      .pipe(Effect.orDie)
+    const ownerIDs = [...new Set(rows.map((row) => row.member_id))]
+    const lifecycles = new Map<string, Swarm.MemberLifecycle>()
+    if (ownerIDs.length > 0) {
+      const members = yield* source
+        .select({ id: SwarmMemberTable.id, lifecycle: SwarmMemberTable.lifecycle })
+        .from(SwarmMemberTable)
+        .where(and(eq(SwarmMemberTable.swarm_id, request.swarmID), inArray(SwarmMemberTable.id, ownerIDs)))
+        .all()
+        .pipe(Effect.orDie)
+      for (const member of members) lifecycles.set(member.id, member.lifecycle)
+    }
+    const conflicts = SwarmClaims.findConflicts(
+      request.scope,
+      rows.map((row) => ({
+        scope: row.scope,
+        memberID: row.member_id,
+        lifecycle: lifecycles.get(row.member_id),
+        releasedAt: row.released_at,
+        expiresAt: row.expires_at,
+      })),
+      { now: request.now, ownerMemberID: request.ownerMemberID },
+    )
+    const byMemberScope = new Map(rows.map((row) => [`${row.member_id}\u0000${row.scope}`, row]))
+    return conflicts.map((conflict) => {
+      const row = byMemberScope.get(`${conflict.memberID}\u0000${conflict.scope}`)!
+      return {
+        claim: hydrateClaim(row),
+        memberLifecycle: conflict.lifecycle as Swarm.MemberLifecycle | undefined,
+      } satisfies ClaimConflict
+    })
+  })
 
   const putBlackboard = Effect.fn("Swarm.putBlackboard")(function* (request: PutBlackboardInput) {
     const key = request.key.trim()
@@ -298,8 +400,64 @@ export function makeSharedStateOperations(input: {
     }
   })
 
+  /**
+   * Bounded, task-relevant shared-knowledge projection.
+   *
+   * This is the durable owner of "what shared working knowledge does this task
+   * need to start with". It reads only swarm-wide entries, entries filed under
+   * the receiving task, and entries filed under caller-declared related tasks,
+   * then applies a deterministic entry/byte budget. Cost is bounded in rows read
+   * and bytes returned, independent of total Swarm knowledge volume.
+   *
+   * Provenance (`authorMemberID`, `taskID`, `version`, `updatedAt`, `scope`) is
+   * carried per entry so a consumer can attribute knowledge without re-reading
+   * storage. Content is peer-authored collaboration data: the projection adds
+   * no host directive, and a renderer must fence it like a peer message body.
+   */
+  const blackboardKnowledge = Effect.fn("Swarm.blackboardKnowledge")(function* (
+    request: BlackboardKnowledgeInput,
+  ) {
+    // A caller-supplied related-task list becomes an IN (...) predicate, so it is
+    // deduplicated and bounded here rather than trusted to be small.
+    const related = SwarmKnowledge.selectRelatedTasks(request.taskID, request.relatedTaskIDs)
+    const scopes = [isNull(SwarmBlackboardTable.task_id)]
+    if (request.taskID !== undefined) scopes.push(eq(SwarmBlackboardTable.task_id, request.taskID))
+    if (related.tasks.length > 0) scopes.push(inArray(SwarmBlackboardTable.task_id, related.tasks))
+    // One statement, one Swarm predicate, one hard SQL LIMIT.
+    //
+    // `swarm_blackboard_task_idx (swarm_id, task_id)` serves the task predicates
+    // and treats `task_id IS NULL` as an equality seek, so no Session history and
+    // no other Swarm's Blackboard is touched. The row cap is applied in SQL so
+    // SQLite never materializes more than MAX_CANDIDATES entries for hydration.
+    const rows = yield* readDb
+      .select()
+      .from(SwarmBlackboardTable)
+      .where(and(eq(SwarmBlackboardTable.swarm_id, request.swarmID), or(...scopes)))
+      .orderBy(desc(SwarmBlackboardTable.time_updated), asc(SwarmBlackboardTable.key))
+      .limit(SwarmKnowledge.MAX_CANDIDATES)
+      .all()
+      .pipe(Effect.orDie)
+    const scopeOf = (taskID: Swarm.TaskID | null): SwarmKnowledge.KnowledgeScope => {
+      if (taskID === null) return "swarm"
+      return taskID === request.taskID ? "task" : "related"
+    }
+    return SwarmKnowledge.digest({
+      candidates: rows.map((row) => ({
+        scope: scopeOf(row.task_id ?? null),
+        updatedAt: row.time_updated,
+        entry: hydrateBlackboard(row),
+      })),
+      limits: request.limits,
+      // Conservative in the safe direction: a completely full window may be an
+      // exactly complete match set, but claiming completeness we cannot prove is
+      // how shared knowledge goes silently missing from a handoff.
+      storageTruncated: rows.length >= SwarmKnowledge.MAX_CANDIDATES,
+      droppedRelatedTasks: related.dropped,
+    })
+  })
+
   const acquireClaim = Effect.fn("Swarm.acquireClaim")(function* (request: AcquireClaimInput) {
-    const scope = request.scope.trim()
+    const scope = SwarmClaims.canonicalizeScope(request.scope)
     if (!scope) return yield* new SwarmSchema.ValidationError({ reason: "Claim scope is required." })
     const now = request.now ?? Date.now()
     if (!validExpiry(request.expiresAt, now))
@@ -309,6 +467,37 @@ export function makeSharedStateOperations(input: {
       return yield* new SwarmSchema.ValidationError({
         reason: `Member ${request.memberID} cannot acquire claims while ${member.lifecycle}.`,
       })
+    const parsed = SwarmClaims.parseScope(scope)
+    // A scope that cannot be parsed degrades to the documented opaque/advisory
+    // form instead of failing the write.
+    //
+    // `swarm_claim.scope` is an agent-facing free-text column that predates typed
+    // claims, and callers legitimately store labels that merely begin with
+    // "path:" (`path-ish`, `path:src/a.ts`). Hard-rejecting those would break a
+    // stable advisory surface for a purely additive feature, and it would reject
+    // the durable row the caller asked for over a coordination nicety.
+    //
+    // Degradation is fail-safe rather than silent: an unparseable scope also
+    // reports zero conflicts in `findConflicts`, so the claim protects nothing,
+    // and the raw value stays visible verbatim through `claims`/`claimPage` for
+    // an operator or a host that derives scopes to notice and correct it. Callers
+    // that construct scopes programmatically should validate with
+    // `SwarmClaims.parseScope` before calling, and fail there where the mistake
+    // is actually theirs.
+    const typedScope = parsed.ok && parsed.scope.kind !== "opaque" ? parsed.scope : undefined
+    if (typedScope) {
+      // Fast-path advisory check on a read snapshot so an obvious conflict
+      // fails cheaply. This is NOT the enforcement point: the authoritative
+      // re-check runs inside the writer transaction below.
+      const conflicts = yield* conflictingClaims({
+        swarmID: request.swarmID,
+        scope: typedScope,
+        ownerMemberID: request.memberID,
+        now,
+      })
+      const first = conflicts[0]
+      if (first) return yield* conflictError(scope, first.claim.scope, first.claim.memberID)
+    }
     const current = yield* readDb
       .select()
       .from(SwarmClaimTable)
@@ -384,6 +573,31 @@ export function makeSharedStateOperations(input: {
                 reason: `Claim ${scope} changed concurrently.`,
               }),
             )
+          // Authoritative typed overlap re-check, inside the writer transaction.
+          //
+          // The pre-flight check above runs on a read snapshot and would
+          // otherwise leave a TOCTOU window where two members both observe an
+          // empty scope and both commit. This re-reads claim rows through the
+          // SAME `db` writer transaction that performs the insert/update, so
+          // SQLite writer serialization makes the two attempts mutually
+          // exclusive: the loser's transaction observes the winner's committed
+          // row and fails closed.
+          //
+          // This is deliberately NOT an application-level lock. Mutual exclusion
+          // comes from the existing single-writer SQLite boundary, so there is
+          // no hidden global mutex, no lock ordering to violate, and no
+          // deadlock surface.
+          if (typedScope) {
+            const live = yield* conflictingClaims({
+              swarmID: request.swarmID,
+              scope: typedScope,
+              ownerMemberID: request.memberID,
+              now,
+              txDb: db,
+            })
+            const blocking = live[0]
+            if (blocking) return yield* commitFail(conflictError(scope, blocking.claim.scope, blocking.claim.memberID))
+          }
           if (!actual) {
             yield* db
               .insert(SwarmClaimTable)
@@ -538,8 +752,7 @@ export function makeSharedStateOperations(input: {
     return claim
   })
 
-  const claims = Effect.fn("Swarm.claims")(function* (swarmID: Swarm.ID) {
-    const rows = yield* readDb
+  const claims = Effect.fn("Swarm.claims")(function* (swarmID: Swarm.ID) {    const rows = yield* readDb
       .select()
       .from(SwarmClaimTable)
       .where(eq(SwarmClaimTable.swarm_id, swarmID))
@@ -547,6 +760,35 @@ export function makeSharedStateOperations(input: {
       .all()
       .pipe(Effect.orDie)
     return rows.map(hydrateClaim)
+  })
+
+  /**
+   * Read-only conflict probe for mutation-tool boundaries.
+   *
+   * Ownership note: this is deliberately a *pure read* against the claim
+   * projection. It holds no lock, writes nothing, and cannot block, so it can
+   * never deadlock a mutation path. It is also advisory-by-construction: it
+   * reports the current live holders, it does not reserve the scope. A caller
+   * that wants warn-vs-deny policy and user override authority must decide
+   * those itself; Core deliberately does not pick warn or deny for the model.
+   *
+   * Note the residual race: this probe and a subsequent `acquireClaim` are two
+   * separate read snapshots, so two members can still both acquire an
+   * overlapping typed claim if they interleave. The claim table's
+   * `(swarm_id, member_id, scope)` primary key intentionally does not serialize
+   * arbitrary path prefixes, because adding a hidden global lock over path
+   * ranges is exactly the failure mode this lane must avoid.
+   */
+  const claimConflictsFor = Effect.fn("Swarm.claimConflictsFor")(function* (request: ClaimConflictInput) {
+    const now = request.now ?? Date.now()
+    const parsed = SwarmClaims.parseScope(request.scope)
+    if (!parsed.ok || parsed.scope.kind === "opaque") return []
+    return yield* conflictingClaims({
+      swarmID: request.swarmID,
+      scope: parsed.scope,
+      ownerMemberID: request.ownerMemberID,
+      now,
+    })
   })
 
   const claimPage = Effect.fn("Swarm.claimPage")(function* (request: {
@@ -790,10 +1032,12 @@ export function makeSharedStateOperations(input: {
     putBlackboard,
     blackboard,
     blackboardPage,
+    blackboardKnowledge,
     acquireClaim,
     renewClaim,
     releaseClaim,
     claims,
+    claimConflictsFor,
     claimPage,
     publishDeliverable,
     verdictDeliverable,

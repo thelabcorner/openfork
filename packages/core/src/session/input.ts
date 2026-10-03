@@ -1,6 +1,6 @@
 export * as SessionInput from "./input"
 
-import { and, asc, desc, eq, isNotNull, isNull, lt, lte } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import {
   AdmissionClass,
@@ -20,6 +20,7 @@ import {
 } from "@opencode-ai/schema/session-input"
 import type { Database } from "../database/database"
 import type { EventV2 } from "../event"
+import { SessionV1 } from "../v1/session"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { Prompt } from "./prompt"
@@ -69,6 +70,7 @@ const entryFromRow = (row: Row): Entry =>
     ...(row.promoted_seq === null ? {} : { promotedSeq: row.promoted_seq }),
     ...(row.revoked_seq === null ? {} : { revokedSeq: row.revoked_seq }),
     ...(row.revoked_reason === null ? {} : { revokedReason: row.revoked_reason }),
+    ...(row.completed_seq === null ? {} : { completedSeq: row.completed_seq }),
   })
 
 const admittedFromRow = (row: Row): Admitted | undefined => {
@@ -409,6 +411,80 @@ export function provenanceForSynthetic(sessionID: SessionSchema.ID, item: Synthe
   })
 }
 
+function legacyProvenanceFor(provenance: SessionMessage.Provenance): SessionV1.UserTurnProvenance {
+  return provenance.owner === "user"
+    ? { owner: "user", source: provenance.source }
+    : {
+        owner: "host",
+        source: provenance.source,
+        ...(provenance.sourceMessageID
+          ? { sourceMessageID: SessionV1.MessageID.ascending(provenance.sourceMessageID) }
+          : {}),
+        ...(provenance.ref ? { ref: provenance.ref } : {}),
+      }
+}
+
+/**
+ * Deterministic legacy/V1 lowering of a durable Synthetic admission, without
+ * writing it. SessionProjector performs the authoritative write at PROMOTION
+ * (SyntheticPromoted -> projectLegacySynthetic), so the message row does not
+ * exist yet at admission time. Trusted host producers that admit a Synthetic
+ * turn and must synchronously return its `SessionV1.WithParts` (for example
+ * safe-boundary supervisory steering, which must not block on the child loop)
+ * use this to describe exactly the row that promotion will materialize.
+ *
+ * The id derivation and payload stay congruent with `projectLegacySynthetic`;
+ * both derive from the same durable item so a future consolidation has one
+ * obvious direction.
+ */
+export function legacyProjectionForSynthetic(
+  entry: Entry,
+  execution: { readonly agent: string; readonly model: SyntheticExecution["model"] },
+): SessionV1.WithParts {
+  if (entry.item.type !== "synthetic") {
+    throw new Error("legacyProjectionForSynthetic requires a synthetic SessionInput entry")
+  }
+  const item = entry.item
+  const provenance = legacyProvenanceFor(provenanceForSynthetic(entry.sessionID, item))
+  const info: SessionV1.User = {
+    id: SessionV1.MessageID.ascending(entry.id),
+    sessionID: entry.sessionID,
+    role: "user",
+    provenance,
+    time: { created: DateTime.toEpochMillis(entry.timeCreated) },
+    agent: execution.agent,
+    model: {
+      providerID: execution.model.providerID,
+      modelID: execution.model.id,
+      ...(execution.model.accountID ? { accountID: execution.model.accountID } : {}),
+      ...(execution.model.variant ? { variant: execution.model.variant } : {}),
+    },
+  }
+  const suffix = String(info.id).slice(4)
+  const parts: SessionV1.Part[] = [
+    {
+      id: SessionV1.PartID.ascending(`prt_synthetic_${suffix}_text`),
+      messageID: info.id,
+      sessionID: info.sessionID,
+      type: "text",
+      text: item.content.text,
+      synthetic: true,
+    },
+    ...(item.content.files ?? []).map(
+      (file, index): SessionV1.FilePart => ({
+        id: SessionV1.PartID.ascending(`prt_synthetic_${suffix}_file_${index}`),
+        messageID: info.id,
+        sessionID: info.sessionID,
+        type: "file",
+        mime: file.mime,
+        ...(file.name ? { filename: file.name } : {}),
+        url: file.uri,
+      }),
+    ),
+  ]
+  return { info, parts }
+}
+
 function syntheticMirrorPrompt(item: SyntheticItem): Prompt {
   return Prompt.make({
     text: item.content.text,
@@ -451,6 +527,35 @@ export const latestUserSeq = Effect.fn("SessionInput.latestUserSeq")(function* (
         eq(SessionInputTable.session_id, sessionID),
         eq(SessionInputTable.kind, "user"),
         eq(SessionInputTable.admission_class, "user"),
+      ),
+    )
+    .orderBy(desc(SessionInputTable.admitted_seq))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row?.admittedSeq
+})
+
+/**
+ * Latest genuine User admission that has actually entered execution.
+ *
+ * Unlike latestUserSeq(), this excludes newly admitted rows that are still
+ * waiting behind the current provider-cycle cutoff. Goal continuation uses
+ * this as the frozen user-authority frontier for the cycle being audited.
+ */
+export const latestPromotedUserSeq = Effect.fn("SessionInput.latestPromotedUserSeq")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const row = yield* db
+    .select({ admittedSeq: SessionInputTable.admitted_seq })
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        eq(SessionInputTable.kind, "user"),
+        eq(SessionInputTable.admission_class, "user"),
+        isNotNull(SessionInputTable.promoted_seq),
       ),
     )
     .orderBy(desc(SessionInputTable.admitted_seq))
@@ -772,6 +877,100 @@ export type RevokeResult =
   | { readonly state: "not-found" }
   | { readonly state: "not-revocable" }
 
+export class CompletionConflict extends Schema.TaggedErrorClass<CompletionConflict>()(
+  "SessionInput.CompletionConflict",
+  { id: SessionMessage.ID },
+) {}
+
+/**
+ * Exact per-input cycle completion.
+ *
+ * The SessionInput row is the worker root that actually reached a runner cycle,
+ * so this row - not Session ownership, not a later generation, and not the
+ * newest promoted input - is the only place completion may be recorded. The
+ * projection fails closed unless that exact row exists, was promoted, and is
+ * not revoked, and it is idempotent for repeated event replay.
+ */
+export const projectInputCompleted = Effect.fn("SessionInput.projectInputCompleted")(function* (
+  db: DatabaseService,
+  input: {
+    readonly completedSeq: number
+    readonly id: SessionMessage.ID
+    readonly sessionID: SessionSchema.ID
+  },
+) {
+  const updated = yield* db
+    .update(SessionInputTable)
+    .set({ completed_seq: input.completedSeq })
+    .where(
+      and(
+        eq(SessionInputTable.id, input.id),
+        eq(SessionInputTable.session_id, input.sessionID),
+        isNotNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+        isNull(SessionInputTable.completed_seq),
+      ),
+    )
+    .returning({ id: SessionInputTable.id })
+    .get()
+    .pipe(Effect.orDie)
+  if (updated) return
+
+  const stored = yield* findEntry(db, input.id)
+  if (stored?.promotedSeq !== undefined && stored.completedSeq === input.completedSeq) return
+  return yield* Effect.die(new CompletionConflict({ id: input.id }))
+})
+
+export type CompletionResult =
+  | { readonly state: "completed"; readonly completedSeq: number }
+  | { readonly state: "already-completed"; readonly completedSeq: number }
+  | { readonly state: "not-promoted" }
+  | { readonly state: "not-found" }
+
+function classifyCompletion(entry: Entry | undefined): CompletionResult {
+  if (!entry) return { state: "not-found" }
+  if (entry.completedSeq !== undefined) return { state: "already-completed", completedSeq: entry.completedSeq }
+  if (entry.promotedSeq === undefined) return { state: "not-promoted" }
+  return { state: "not-found" }
+}
+
+/**
+ * Publish cycle completion for one exact input.
+ *
+ * The projector stays the single authority for whether completion is
+ * recordable. This only classifies the durable outcome so a runner cycle is
+ * never torn down by a completion fact it legitimately cannot record.
+ */
+export const complete = Effect.fn("SessionInput.complete")(function* (
+  db: DatabaseService,
+  events: EventV2.Interface,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly id: SessionMessage.ID
+  },
+) {
+  const outcome = yield* events
+    .publish(SessionEvent.InputCompleted, {
+      sessionID: input.sessionID,
+      messageID: input.id,
+      timestamp: yield* DateTime.now,
+    })
+    .pipe(
+      Effect.map((event) => ({ type: "event" as const, event })),
+      Effect.catchDefect((defect) =>
+        defect instanceof CompletionConflict
+          ? findEntry(db, input.id).pipe(
+              Effect.map((entry) => ({ type: "result" as const, result: classifyCompletion(entry) })),
+            )
+          : Effect.die(defect),
+      ),
+    )
+  if (outcome.type === "result") return outcome.result
+  if (outcome.event.durable === undefined)
+    return yield* Effect.die("SessionInput completion event is missing aggregate sequence")
+  return { state: "completed" as const, completedSeq: outcome.event.durable.seq }
+})
+
 function classifyRevoke(entry: Entry | undefined): RevokeResult {
   if (!entry) return { state: "not-found" }
   if (entry.kind !== "synthetic") return { state: "not-revocable" }
@@ -886,6 +1085,67 @@ export const hasPendingLane = Effect.fn("SessionInput.hasPendingLane")(function*
   return row !== undefined
 })
 
+/** Resolve one pending lane for a bounded set of sessions in a single indexed read. */
+export const hasPendingLaneBatch = Effect.fn("SessionInput.hasPendingLaneBatch")(function* (
+  db: DatabaseService,
+  sessionIDs: readonly SessionSchema.ID[],
+  lane: PendingLane,
+) {
+  const ids = [...new Set(sessionIDs)]
+  if (ids.length === 0) return new Set<SessionSchema.ID>()
+  const rows = yield* db
+    .select({ sessionID: SessionInputTable.session_id })
+    .from(SessionInputTable)
+    .where(
+      and(
+        inArray(SessionInputTable.session_id, ids),
+        eq(SessionInputTable.admission_class, lane.admissionClass),
+        eq(SessionInputTable.delivery, lane.delivery),
+        isNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+      ),
+    )
+    .all()
+    .pipe(Effect.orDie)
+  return new Set(rows.map((row) => row.sessionID))
+})
+
+/** Resolve several lanes for one session with one indexed read. */
+export const pendingLanes = Effect.fn("SessionInput.pendingLanes")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  lanes: readonly PendingLane[],
+) {
+  const requested = new Set(lanes.map((lane) => `${lane.admissionClass}:${lane.delivery}`))
+  if (requested.size === 0) return new Set<string>()
+  const rows = yield* db
+    .select({ admissionClass: SessionInputTable.admission_class, delivery: SessionInputTable.delivery })
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+        or(
+          ...[...requested].map((key) => {
+            const [admissionClass, delivery] = key.split(":") as [AdmissionClass, Delivery]
+            return and(
+              eq(SessionInputTable.admission_class, admissionClass),
+              eq(SessionInputTable.delivery, delivery),
+            )
+          }),
+        ),
+      ),
+    )
+    .all()
+    .pipe(Effect.orDie)
+  return new Set(
+    rows
+      .map((row) => `${row.admissionClass}:${row.delivery}`)
+      .filter((lane) => requested.has(lane)),
+  )
+})
+
 export const firstPendingEntry = Effect.fn("SessionInput.firstPendingEntry")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
@@ -911,15 +1171,36 @@ export const firstPendingEntry = Effect.fn("SessionInput.firstPendingEntry")(fun
 })
 
 /**
- * Fixed five-lane priority as short-circuit indexed point lookups. This keeps
- * the authority ordering explicit and avoids an opaque numeric priority column.
+ * Resolve the fixed five-lane priority in one indexed read. The aggregate keeps
+ * the ordering explicit without issuing up to five serial point queries.
  */
 export const nextPendingLane = Effect.fn("SessionInput.nextPendingLane")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
 ) {
-  for (const lane of pendingLaneOrder) if (yield* hasPendingLane(db, sessionID, lane)) return lane
-  return undefined
+  const row = yield* db
+    .select({
+      priority: sql<number | null>`min(case
+        when ${SessionInputTable.admission_class} = 'user' and ${SessionInputTable.delivery} = 'steer' then 0
+        when ${SessionInputTable.admission_class} = 'user' and ${SessionInputTable.delivery} = 'queue' then 1
+        when ${SessionInputTable.admission_class} = 'host' and ${SessionInputTable.delivery} = 'steer' then 2
+        when ${SessionInputTable.admission_class} = 'host' and ${SessionInputTable.delivery} = 'queue' then 3
+        when ${SessionInputTable.admission_class} = 'automatic' and ${SessionInputTable.delivery} = 'queue' then 4
+      end)`,
+    })
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.session_id, sessionID),
+        isNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+      ),
+    )
+    .get()
+    .pipe(Effect.orDie)
+  const priority = row?.priority
+  if (priority === null || priority === undefined) return undefined
+  return pendingLaneOrder[priority]
 })
 
 export const hasHigherPriorityPending = Effect.fn("SessionInput.hasHigherPriorityPending")(function* (

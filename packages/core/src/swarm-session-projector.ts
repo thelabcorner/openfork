@@ -201,7 +201,6 @@ const layer = Layer.effectDiscard(
         member.binding_generation !== run.binding_generation
       )
         return yield* Effect.die(`Swarm assignment run ${run.id} lost member authority before promotion`)
-
       const updated = yield* db
         .update(SwarmTaskRunTable)
         .set({ status: "running", started_at: epoch(event.data.promotedAt ?? event.data.timestamp) })

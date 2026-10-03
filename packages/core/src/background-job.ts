@@ -34,7 +34,117 @@ type Active = {
   continueOnFailure: boolean
 }
 
+type OwnedHandle = {
+  readonly id: string
+  readonly generation: number
+  readonly sessionID?: string
+  readonly parentSessionID?: string
+  readonly admissionEpoch: bigint
+  background: boolean
+  readonly cancel: Effect.Effect<Info | undefined>
+}
+
+// An index of live job cancellation handles only. Unlike each instance's
+// retained status map, this process-level registry contains no completed jobs
+// and lets Tier 0/1 session control cancel work without booting an Instance.
+const ownedHandles = new Map<string, Set<OwnedHandle>>()
+const cancellationFences = new Map<string, Map<bigint, number>>()
+let admissionEpoch = 0n
+
+function retainCancellationFence(key: string, epoch: bigint) {
+  let fences = cancellationFences.get(key)
+  if (!fences) cancellationFences.set(key, (fences = new Map()))
+  fences.set(epoch, (fences.get(epoch) ?? 0) + 1)
+}
+
+function releaseCancellationFence(key: string, epoch: bigint) {
+  const fences = cancellationFences.get(key)
+  if (!fences) return
+  const count = fences.get(epoch) ?? 0
+  if (count <= 1) fences.delete(epoch)
+  else fences.set(epoch, count - 1)
+  if (fences.size === 0) cancellationFences.delete(key)
+}
+
+function oldestCancellationFence(keys: Iterable<string | undefined>) {
+  let oldest: bigint | undefined
+  for (const key of keys) {
+    if (!key) continue
+    for (const epoch of cancellationFences.get(key)?.keys() ?? []) {
+      if (oldest === undefined || epoch < oldest) oldest = epoch
+    }
+  }
+  return oldest
+}
+
+function ownerKeys(handle: OwnedHandle) {
+  return new Set([handle.id, handle.sessionID, handle.parentSessionID].filter((key): key is string => !!key))
+}
+
+function registerOwned(handle: OwnedHandle) {
+  for (const key of ownerKeys(handle)) {
+    let entries = ownedHandles.get(key)
+    if (!entries) ownedHandles.set(key, (entries = new Set()))
+    entries.add(handle)
+  }
+}
+
+function unregisterOwned(handle: OwnedHandle) {
+  for (const key of ownerKeys(handle)) {
+    const entries = ownedHandles.get(key)
+    entries?.delete(handle)
+    if (entries?.size === 0) ownedHandles.delete(key)
+  }
+}
+
+/** Cancel the live jobs owned by a session without loading an Instance. */
+export const cancelOwnedBySession = Effect.fn("BackgroundJob.cancelOwnedBySession")(function* (
+  sessionID: string,
+  afterCancel: Effect.Effect<void> = Effect.void,
+) {
+  return yield* Effect.uninterruptible(
+    Effect.gen(function* () {
+      const cancelled = new Set<OwnedHandle>()
+      const fence = ++admissionEpoch
+      const fenced = new Set<string>([sessionID])
+      for (const key of fenced) retainCancellationFence(key, fence)
+      try {
+        const drain = Effect.fn("BackgroundJob.cancelOwnedBySession.drain")(function* () {
+          const pending = new Set([sessionID])
+          while (pending.size > 0) {
+            const key = pending.values().next().value as string
+            pending.delete(key)
+            const candidates = [...(ownedHandles.get(key) ?? [])]
+            for (const handle of candidates) {
+              if (cancelled.has(handle) || handle.admissionEpoch >= fence) continue
+              const direct = handle.id === sessionID || handle.sessionID === sessionID
+              if (!direct && handle.background) continue
+              cancelled.add(handle)
+              for (const childKey of [handle.id, handle.sessionID]) {
+                if (!childKey || fenced.has(childKey)) continue
+                fenced.add(childKey)
+                retainCancellationFence(childKey, fence)
+              }
+              yield* handle.cancel
+              pending.add(handle.id)
+              if (handle.sessionID) pending.add(handle.sessionID)
+            }
+          }
+        })
+        yield* drain()
+        yield* afterCancel
+        yield* drain()
+      } finally {
+        for (const key of fenced) releaseCancellationFence(key, fence)
+      }
+    }),
+  )
+})
+
 type State = {
+  // The Map is private to this owner. Access it only inside SynchronizedRef
+  // operations and mutate it there; copying it on every progress update made
+  // one job completion cost O(all retained jobs).
   jobs: SynchronizedRef.SynchronizedRef<Map<string, Active>>
   scope: Scope.Scope
 }
@@ -52,6 +162,7 @@ type PromoteResult = {
 }
 
 type StartResult = { info: Info } | { info: Info; scope: Scope.Closeable; token: object }
+const ownedByToken = new WeakMap<object, OwnedHandle>()
 
 type ExtendResult =
   | { extended: false }
@@ -153,7 +264,8 @@ export const make = Effect.gen(function* () {
           : job.failure
 
       if (!interrupted && (Exit.isSuccess(exit) || job.continueOnFailure) && pending > 0) {
-        return [{}, new Map(jobs).set(id, { ...job, pending, output, failure })]
+        jobs.set(id, { ...job, pending, output, failure })
+        return [{}, jobs]
       }
 
       const failFast = Exit.isFailure(exit) && !interrupted && !job.continueOnFailure
@@ -176,10 +288,13 @@ export const make = Effect.gen(function* () {
           ...(status === "error" && terminalError ? { error: terminalError } : {}),
         },
       }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      jobs.set(id, next)
+      return [{ info: snapshot(next), done: job.done, scope: job.scope }, jobs]
     })
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
     if (result.scope) {
+      const handle = ownedByToken.get(token)
+      if (handle) unregisterOwned(handle)
       yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
     }
     return result.info
@@ -203,15 +318,38 @@ export const make = Effect.gen(function* () {
   })
 
   const list: Interface["list"] = Effect.fn("BackgroundJob.list")(function* () {
-    return Array.from((yield* SynchronizedRef.get(state.jobs)).values())
-      .map(snapshot)
-      .toSorted((a, b) => a.started_at - b.started_at)
+    return yield* SynchronizedRef.modify(state.jobs, (jobs) => [
+      Array.from(jobs.values())
+        .map(snapshot)
+        .toSorted((a, b) => a.started_at - b.started_at),
+      jobs,
+    ])
   })
 
   const get: Interface["get"] = Effect.fn("BackgroundJob.get")(function* (id) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job) return
-    return snapshot(job)
+    return yield* SynchronizedRef.modify(state.jobs, (jobs) => {
+      const job = jobs.get(id)
+      return [job ? snapshot(job) : undefined, jobs]
+    })
+  })
+
+  const cancelToken = Effect.fn("BackgroundJob.cancelToken")(function* (id: string, token: object) {
+    const completed_at = yield* Clock.currentTimeMillis
+    const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
+      const job = jobs.get(id)
+      if (!job || job.token !== token) return [{}, jobs]
+      if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
+      const next = { ...job, onPromote: undefined, pending: 0, info: { ...job.info, status: "cancelled" as const, completed_at } }
+      jobs.set(id, next)
+      return [{ info: snapshot(next), done: job.done, scope: job.scope }, jobs]
+    })
+    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
+    if (result.scope) {
+      const handle = ownedByToken.get(token)
+      if (handle) unregisterOwned(handle)
+      yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }), Effect.asVoid)
+    }
+    return result.info
   })
 
   const tryStart: Interface["tryStart"] = Effect.fn("BackgroundJob.tryStart")(function* (input) {
@@ -251,13 +389,32 @@ export const make = Effect.gen(function* () {
               onPromote: input.onPromote,
               continueOnFailure: input.continueOnFailure === true,
             }
-            return [{ info: snapshot(job), scope, token }, new Map(jobs).set(id, job)] as readonly [
-              StartResult,
-              Map<string, Active>,
-            ]
+            jobs.set(id, job)
+            return [{ info: snapshot(job), scope, token }, jobs] as readonly [StartResult, Map<string, Active>]
           }),
         )
-        if ("scope" in result)
+        if ("scope" in result) {
+          const metadata = result.info.metadata
+          const sessionID = typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
+          const parentSessionID = typeof metadata?.parentSessionId === "string" ? metadata.parentSessionId : undefined
+          const activeFence = oldestCancellationFence([id, sessionID, parentSessionID])
+          const handle: OwnedHandle = {
+            id,
+            generation: result.info.generation ?? 0,
+            sessionID,
+            parentSessionID,
+            // Work admitted while one or more matching cancellation fences are
+            // active must compare older than *every* such fence. Using the
+            // oldest matching epoch avoids cross-session interference when an
+            // unrelated cancellation advances the process-global admission
+            // clock between this fence's two drains.
+            admissionEpoch: activeFence === undefined ? admissionEpoch : activeFence - 1n,
+            background: metadata?.background === true,
+            cancel: Effect.suspend(() => cancelToken(id, result.token)),
+          }
+          ownedByToken.set(result.token, handle)
+          registerOwned(handle)
+          yield* Scope.addFinalizer(result.scope, Effect.sync(() => unregisterOwned(handle)))
           yield* fork(
             result.scope,
             id,
@@ -265,6 +422,7 @@ export const make = Effect.gen(function* () {
             0,
             restore(input.run).pipe(Effect.ensuring(Deferred.succeed(tail, undefined))),
           )
+        }
         return { info: result.info, started: "scope" in result }
       }),
     )
@@ -283,14 +441,15 @@ export const make = Effect.gen(function* () {
           (jobs): readonly [ExtendResult, Map<string, Active>] => {
             const job = jobs.get(input.id)
             if (!job || job.info.status !== "running") return [{ extended: false }, jobs]
+            jobs.set(input.id, {
+              ...job,
+              pending: job.pending + 1,
+              next: job.next + 1,
+              tail,
+            })
             return [
               { extended: true, previous: job.tail, scope: job.scope, tail, token: job.token, sequence: job.next },
-              new Map(jobs).set(input.id, {
-                ...job,
-                pending: job.pending + 1,
-                next: job.next + 1,
-                tail,
-              }),
+              jobs,
             ]
           },
         )
@@ -311,7 +470,7 @@ export const make = Effect.gen(function* () {
   })
 
   const wait: Interface["wait"] = Effect.fn("BackgroundJob.wait")(function* (input) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(input.id)
+    const job = yield* SynchronizedRef.modify(state.jobs, (jobs) => [jobs.get(input.id), jobs])
     if (!job) return { timedOut: false }
     if (job.info.status !== "running") return { info: snapshot(job), timedOut: false }
     if (input.timeout === undefined) return { info: yield* Deferred.await(job.done), timedOut: false }
@@ -322,7 +481,7 @@ export const make = Effect.gen(function* () {
   })
 
   const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
+    const job = yield* SynchronizedRef.modify(state.jobs, (jobs) => [jobs.get(id), jobs])
     if (!job || job.info.status !== "running") return yield* Effect.never
     if (job.info.metadata?.background === true) return snapshot(job)
     return yield* Deferred.await(job.promoted)
@@ -344,19 +503,21 @@ export const make = Effect.gen(function* () {
             metadata: { ...job.info.metadata, background: true },
           },
         }
-        return [
-          { info: snapshot(next), onPromote: job.onPromote, promoted: job.promoted },
-          new Map(jobs).set(id, next),
-        ] as readonly [PromoteResult, Map<string, Active>]
+        jobs.set(id, next)
+        return [{ info: snapshot(next), onPromote: job.onPromote, promoted: job.promoted }, jobs] as readonly [
+          PromoteResult,
+          Map<string, Active>,
+        ]
       }),
     )
     if (result.info && result.promoted) yield* Deferred.succeed(result.promoted, result.info).pipe(Effect.ignore)
+    if (result.info) for (const handle of ownedHandles.get(id) ?? []) handle.background = true
     if (result.onPromote) yield* result.onPromote.pipe(Effect.ignore)
     return result.info
   })
 
   const foreground: Interface["foreground"] = Effect.fn("BackgroundJob.foreground")(function* (id, onPromote) {
-    return yield* SynchronizedRef.modifyEffect(
+    const result = yield* SynchronizedRef.modifyEffect(
       state.jobs,
       Effect.fnUntraced(function* (jobs) {
         const job = jobs.get(id)
@@ -372,42 +533,18 @@ export const make = Effect.gen(function* () {
             metadata: { ...job.info.metadata, background: false },
           },
         }
-        return [snapshot(next), new Map(jobs).set(id, next)] as const
+        jobs.set(id, next)
+        return [snapshot(next), jobs] as const
       }),
     )
+    if (result) for (const handle of ownedHandles.get(id) ?? []) handle.background = false
+    return result
   })
 
   const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
-    const completed_at = yield* Clock.currentTimeMillis
-    const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
-      const job = jobs.get(id)
-      if (!job) return [{}, jobs]
-      if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
-      const next = {
-        ...job,
-        onPromote: undefined,
-        pending: 0,
-        info: {
-          ...job.info,
-          status: "cancelled" as const,
-          completed_at,
-        },
-      }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
-    })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-    // Cancellation is a state transition, not a teardown barrier. Mirror the
-    // normal settle path above: publish the terminal state immediately, then
-    // close the owned scope asynchronously. A child process or stream finalizer
-    // can otherwise make cancel() block even though the job is already marked
-    // cancelled, which is especially visible for event-driven monitor jobs.
-    if (result.scope) {
-      yield* Scope.close(result.scope, Exit.void).pipe(
-        Effect.forkIn(state.scope, { startImmediately: true }),
-        Effect.asVoid,
-      )
-    }
-    return result.info
+    const job = yield* SynchronizedRef.modify(state.jobs, (jobs) => [jobs.get(id), jobs])
+    if (!job) return undefined
+    return yield* cancelToken(id, job.token)
   })
 
   return Service.of({ list, get, start, tryStart, extend, wait, waitForPromotion, promote, foreground, cancel })

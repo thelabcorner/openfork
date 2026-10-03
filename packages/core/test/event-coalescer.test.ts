@@ -20,6 +20,26 @@ const delta = (value: string, id = value): TestEvent => ({
 })
 
 describe("event coalescer", () => {
+  test("preserves the first UTF-16 offset and refuses gaps or mixed legacy ranges", () => {
+    const first = { ...delta("😀"), data: { ...delta("😀").data, offset: 4 } }
+    const next = { ...delta("x"), data: { ...delta("x").data, offset: 6 } }
+    expect(mergeEventDeltas(first, next)?.data).toMatchObject({ delta: "😀x", offset: 4 })
+    expect(mergeEventDeltas(first, { ...next, data: { ...next.data, offset: 7 } })).toBeUndefined()
+    expect(mergeEventDeltas(first, delta("legacy"))).toBeUndefined()
+    expect(mergeEventDeltas(delta("legacy"), next)).toBeUndefined()
+  })
+
+  test("the accumulator carries original offset and treats missing ranges as barriers", () => {
+    const accumulator = createEventDeltaAccumulator<TestEvent>()
+    const first = { ...delta("ab"), data: { ...delta("ab").data, offset: 0 } }
+    const next = { ...delta("cd"), data: { ...delta("cd").data, offset: 2 } }
+    const state = accumulator.create(first)!
+    expect(accumulator.push(state, next)).toBe(true)
+    expect(accumulator.finalize(state, next).data).toMatchObject({ delta: "abcd", offset: 0 })
+    expect(accumulator.push(state, { ...next, data: { ...next.data, offset: 9 } })).toBe(false)
+    expect(accumulator.push(state, delta("legacy"))).toBe(false)
+  })
+
   test("coalesces live fragments and flushes them before a lifecycle barrier", () => {
     const output: TestEvent[] = []
     const coalescer = createEventCoalescer<TestEvent>((event) => {

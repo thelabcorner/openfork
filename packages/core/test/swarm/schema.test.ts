@@ -11,6 +11,7 @@ import swarmDeliveryDeadlines from "../../src/database/migration/20260919183345_
 import swarmRuntimeDeadlines from "../../src/database/migration/20260919204232_swarm_runtime_deadlines"
 import swarmRetirementScan from "../../src/database/migration/20260919205014_swarm_retirement_scan"
 import swarmRecoveryOwnerScan from "../../src/database/migration/20260919213551_swarm_recovery_owner_scan"
+import swarmTaskRunResultSummary from "../../src/database/migration/20261003041000_swarm_task_run_result_summary"
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 const run = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -110,6 +111,32 @@ describe("Swarm database foundation", () => {
         }),
       ),
     ).rejects.toThrow("refusing to discard durable data")
+  })
+
+  test("result-summary migration adds a nullable/no-default column for historical runs", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        yield* db.run(sql`CREATE TABLE project (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE workspace (id text PRIMARY KEY)`)
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY)`)
+        yield* DatabaseMigration.applyOnly(db, [swarmFoundation, swarmTaskRunResultSummary])
+
+        const columns = yield* db.all<{
+          name: string
+          type: string
+          notnull: number
+          dflt_value: string | null
+        }>(sql`PRAGMA table_info(swarm_task_run)`)
+        expect(columns.find((column) => column.name === "result_summary")).toMatchObject({
+          name: "result_summary",
+          type: "TEXT",
+          notnull: 0,
+          dflt_value: null,
+        })
+      }),
+    )
   })
 
   test("upgrade migration creates normalized tables, CHECK and hot-path indexes", async () => {

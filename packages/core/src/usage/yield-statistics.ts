@@ -1,3 +1,5 @@
+import { UsageClassification } from "./classification"
+
 export const YieldHalfLives = [8, 16, 32, 128, 512] as const
 export type YieldHalfLife = (typeof YieldHalfLives)[number]
 
@@ -70,7 +72,7 @@ export function isUserFacingYieldObservation(input: {
   readonly agent?: string | null
   readonly mode?: string | null
 }) {
-  return input.mode !== "compaction" && input.agent !== "compaction" && input.agent !== "summary"
+  return UsageClassification.isUserFacing(input)
 }
 
 export interface LinearProjection {

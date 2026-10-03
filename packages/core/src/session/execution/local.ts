@@ -24,10 +24,20 @@ const layer = Layer.effect(
       drain: Effect.fnUntraced(function* (sessionID: SessionSchema.ID, force) {
         const session = yield* store.get(sessionID)
         if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
-        let acquired = yield* ownership.tryAcquire(sessionID)
+        let acquired = yield* ownership.tryAcquireLocal(sessionID)
+        if (acquired.state === "maintenance-blocked") {
+          yield* Effect.logInfo("Session execution admission blocked by directory maintenance", {
+            sessionID,
+            reason: acquired.reason,
+            directory: acquired.directory,
+            directoryKey: acquired.directoryKey,
+            guards: acquired.guards,
+          })
+          return
+        }
         if (acquired.state === "busy") {
           const recovery = yield* SessionRecovery.recoverDeadOwnerIfQuiescent(db, ownership, sessionID)
-          if (recovery.state === "recovered") acquired = yield* ownership.tryAcquire(sessionID)
+          if (recovery.state === "recovered") acquired = yield* ownership.tryAcquireLocal(sessionID)
           else if (recovery.state === "effect-unknown")
             yield* Effect.logWarning("Session recovery remains fenced by unresolved execution effects", {
               sessionID,
@@ -35,33 +45,64 @@ const layer = Layer.effect(
               hazards: recovery.hazards,
             })
         }
+        if (acquired.state === "maintenance-blocked") {
+          yield* Effect.logInfo("Session execution admission became maintenance-blocked after recovery", {
+            sessionID,
+            reason: acquired.reason,
+            directory: acquired.directory,
+            directoryKey: acquired.directoryKey,
+            guards: acquired.guards,
+          })
+          return
+        }
         // Another process already owns this Session. The durable inbox is the
         // wake signal: that owner's release-if-drained transaction must observe
         // newly committed work and continue. Do not create a second runner.
         if (acquired.state === "busy") return
 
-        let nextForce = force
-        let firstFailure: Cause.Cause<SessionRunner.RunError> | undefined
-        while (true) {
-          const exit = yield* SessionRunner.Service.use((runner) => runner.run({ sessionID, force: nextForce })).pipe(
-            Effect.provide(locations.get(session.location)),
-            Effect.exit,
-          )
-          if (Exit.isFailure(exit) && firstFailure === undefined) firstFailure = exit.cause
+        const token = acquired.token
+        let ownershipSettled = false
+        return yield* Effect.gen(function* () {
+          let nextForce = force
+          let firstFailure: Cause.Cause<SessionRunner.RunError> | undefined
+          while (true) {
+            const exit = yield* SessionRunner.Service.use((runner) => runner.run({ sessionID, force: nextForce })).pipe(
+              Effect.provide(locations.get(session.location)),
+              Effect.exit,
+            )
+            if (Exit.isFailure(exit) && firstFailure === undefined) firstFailure = exit.cause
 
-          const release = yield* ownership.releaseIfDrained(acquired.token)
-          if (release === "continue") {
-            // New durable work committed before release. It is not an explicit
-            // forced run, even if the activation began through resume().
-            nextForce = false
-            continue
+
+            const release = yield* ownership.releaseIfDrained(token)
+            if (release === "continue") {
+              // New durable work committed before release. It is not an explicit
+              // forced run, even if the activation began through resume().
+              nextForce = false
+              continue
+            }
+            // "released" means this generation was cleared here; "stale"
+            // means another exact owner/generation is already authoritative.
+            // Either way this activation has no ownership left to clean up.
+            ownershipSettled = true
+            if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+              yield* Effect.logError("Failed to drain Session", exit.cause).pipe(Effect.annotateLogs({ sessionID }))
+            }
+            if (firstFailure) return yield* Effect.failCause(firstFailure)
+            return
           }
-          if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
-            yield* Effect.logError("Failed to drain Session", exit.cause).pipe(Effect.annotateLogs({ sessionID }))
-          }
-          if (firstFailure) return yield* Effect.failCause(firstFailure)
-          return
-        }
+        }).pipe(
+          // SessionRunCoordinator.interrupt() interrupts this outer drain
+          // fiber. An interrupt that lands while SessionRunner is active skips
+          // the statements after that yield, so releaseIfDrained() cannot be
+          // our cancellation barrier. Effect finalization first unwinds the
+          // runner/location scope, then exact-releases only this generation.
+          // Pending SessionInput is intentionally preserved for a later wake.
+          Effect.ensuring(
+            Effect.suspend(() =>
+              ownershipSettled ? Effect.void : ownership.release(token).pipe(Effect.asVoid),
+            ),
+          ),
+        )
       }),
     })
 

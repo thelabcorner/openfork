@@ -3,6 +3,31 @@ import type { SessionSchema } from "../session/schema"
 import type { YieldStatisticState } from "./yield-statistics"
 
 /**
+ * Usage-owned session dimension for historical analytics.
+ *
+ * Deliberately carries no foreign key to the live session/project tables:
+ * conversation lifecycle is disposable, accounting history is not. Rows are
+ * refreshed transactionally while Sessions are live and can survive deletion as
+ * tiny attribution tombstones so late settlements retain project/title identity.
+ */
+export const UsageSessionTable = sqliteTable(
+  "usage_session",
+  {
+    session_id: text().$type<SessionSchema.ID>().primaryKey(),
+    project_id: text().notNull(),
+    directory: text().notNull(),
+    title: text().notNull(),
+    project_name: text(),
+    session_created_at: integer().notNull(),
+    session_updated_at: integer().notNull(),
+    last_usage_at: integer().notNull(),
+  },
+  (table) => [
+    index("usage_session_project_last_usage_idx").on(table.project_id, table.last_usage_at),
+  ],
+)
+
+/**
  * Durable, scalar-only record of one settled user-facing model generation.
  *
  * This is historical analytics state owned by Usage, not live SessionTelemetry.
@@ -20,6 +45,13 @@ export const UsageRecordTable = sqliteTable(
     model_id: text().notNull(),
     /** Account-suffix-free model identity used by statistical projections. */
     base_model_id: text(),
+    /**
+     * Committed provider-route kind for this settlement.
+     *
+     * NULL is reserved for historical rows written before route attribution was
+     * persisted. New unattributed/legacy settlements write "unknown" explicitly.
+     */
+    route_kind: text().$type<"public" | "account" | "unknown">(),
     /** Physical/provider account that served the generation when known. */
     account_id: text(),
     variant: text(),
@@ -87,6 +119,13 @@ export const MaintenanceUsageTable = sqliteTable(
     agent: text().notNull(),
     provider_id: text().notNull(),
     model_id: text().notNull(),
+    /**
+     * Same route-attribution vocabulary as usage_record. NULL is historical
+     * pre-migration state; new unleased maintenance writes "unknown".
+     */
+    route_kind: text().$type<"public" | "account" | "unknown">(),
+    /** Stable ProviderAccount.accountID when a committed account route exists. */
+    account_id: text(),
     variant: text(),
     session_id: text(),
     project_id: text(),
@@ -106,5 +145,10 @@ export const MaintenanceUsageTable = sqliteTable(
     index("maintenance_usage_completed_idx").on(table.time_completed),
     index("maintenance_usage_project_completed_idx").on(table.project_id, table.time_completed),
     index("maintenance_usage_agent_completed_idx").on(table.agent, table.time_completed),
+    index("maintenance_usage_account_completed_idx").on(
+      table.provider_id,
+      table.account_id,
+      table.time_completed,
+    ),
   ],
 )

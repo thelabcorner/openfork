@@ -12,6 +12,19 @@ const SnippetWindow = 120
 
 const truncate = (input: string, max: number) => (input.length > max ? input.slice(0, max) : input)
 
+function toolSearchText(name: string, input: unknown): string {
+  const prefix = `tool:${name}`
+  const budget = Math.max(0, MaxToolInputLength - prefix.length - 1)
+  const payload = truncate(JSON.stringify(input), budget)
+  return payload ? `${prefix} ${payload}` : prefix
+}
+
+export function assistantPartSearchText(part: SessionMessage.AssistantContent): string {
+  if (part.type === "text" || part.type === "reasoning") return part.text
+  if (part.type === "tool") return toolSearchText(part.name, part.state.input)
+  return ""
+}
+
 export function searchText(message: SessionMessage.Message): string {
   // Replaceable domain STATE is durable so replay/idempotence can reconstruct
   // it, but it is not historical conversation. Indexing every publication
@@ -27,13 +40,7 @@ export function searchText(message: SessionMessage.Message): string {
     case "shell":
       return `${message.command} ${truncate(message.output, MaxShellOutputLength)}`.trim()
     case "assistant":
-      return message.content
-        .flatMap((part) => {
-          if (part.type === "text" || part.type === "reasoning") return [part.text]
-          if (part.type === "tool") return [truncate(JSON.stringify(part.state.input), MaxToolInputLength)]
-          return []
-        })
-        .join(" ")
+      return message.content.map(assistantPartSearchText).filter(Boolean).join(" ")
     default:
       // agent-switched and model-switched carry no searchable content.
       return ""
@@ -75,7 +82,7 @@ export function partSearchText(part: V1PartSearchable): string {
     case "reasoning":
       return part.text ?? ""
     case "tool":
-      return `tool:${part.tool ?? ""} ${truncate(JSON.stringify(part.state?.input ?? {}), MaxToolInputLength)}`.trim()
+      return toolSearchText(part.tool ?? "", part.state?.input ?? {})
     default:
       return ""
   }

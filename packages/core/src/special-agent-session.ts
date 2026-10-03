@@ -12,8 +12,10 @@ import { SessionHostChild } from "./session/host-child"
 import { SessionMessage } from "./session/message"
 import { SessionSchema } from "./session/schema"
 import { SessionMetadataOwnership } from "./session/metadata-ownership"
+import { SessionTelemetry } from "./session/telemetry"
 import { SessionTurnProvenance } from "./session/turn-provenance"
 import { SessionTable } from "./session/sql"
+import { UsageClassification } from "./usage/classification"
 import { UsageRecord } from "./usage/record"
 import { createLLMEventPublisher } from "./session/runner/publish-llm-event"
 import { Hash } from "./util/hash"
@@ -175,6 +177,7 @@ const layer = Layer.effect(
     const database = yield* Database.Service
     const events = yield* EventV2.Service
     const children = yield* SessionHostChild.Service
+    const telemetry = yield* SessionTelemetry.Service
     const usage = yield* UsageRecord.Service
 
     const sessionFor: Interface["sessionFor"] = (input) => sessionIDFor(input)
@@ -235,10 +238,62 @@ const layer = Layer.effect(
       return messageID
     })
 
-    const publisher: Interface["publisher"] = (input) =>
-      createLLMEventPublisher(events, { sessionID: input.sessionID, agent: input.agent, model: input.model })
-
     type Publisher = ReturnType<typeof createLLMEventPublisher>
+    type PublisherState = {
+      readonly sessionID: SessionSchema.ID
+      readonly agent: Kind
+      readonly model: ModelV2.Ref
+      requestSentAt?: number
+      firstTokenAt?: number
+      streamedAt?: number
+    }
+    const publisherStates = new WeakMap<Publisher, PublisherState>()
+
+    // Special agents bypass the normal Session runner, so the shared transcript
+    // publisher must also be their single telemetry seam. Tee already-produced
+    // provider events into SessionTelemetry here instead of teaching every title,
+    // revisor, auditor, and future special agent a second observability protocol.
+    const publisher: Interface["publisher"] = (input) => {
+      const raw = createLLMEventPublisher(events, {
+        sessionID: input.sessionID,
+        agent: input.agent,
+        model: input.model,
+      })
+      const state: PublisherState = {
+        sessionID: input.sessionID,
+        agent: input.agent,
+        model: input.model,
+      }
+      const wrapped: Publisher = {
+        ...raw,
+        publish: (event, outputPaths = []) => {
+          const at = Date.now()
+          if (
+            state.firstTokenAt === undefined &&
+            (event.type === "text-start" ||
+              event.type === "text-delta" ||
+              event.type === "reasoning-start" ||
+              event.type === "reasoning-delta")
+          )
+            state.firstTokenAt = at
+          return raw
+            .publish(event, outputPaths)
+            .pipe(Effect.tap(() => telemetry.observe({ sessionID: state.sessionID, event, at })))
+        },
+        streamed: () => {
+          const at = Date.now()
+          state.streamedAt ??= at
+          return raw.streamed().pipe(Effect.tap(() => telemetry.streamed(state.sessionID, at)))
+        },
+        setRequestSentAt: (value) => {
+          raw.setRequestSentAt(value)
+          state.requestSentAt = DateTime.toEpochMillis(value)
+        },
+      }
+      publisherStates.set(wrapped, state)
+      return wrapped
+    }
+
     const closedTurns = new WeakMap<Publisher, { readonly type: "ended"; readonly id: SessionMessage.ID } | { readonly type: "failed" }>()
 
     const failTurn = Effect.fn("SpecialAgentSession.failTurn")(function* (input: {
@@ -250,22 +305,44 @@ const layer = Layer.effect(
           if (closedTurns.has(input.publisher)) return
           yield* input.publisher.failUnsettledTools(input.message)
           yield* input.publisher.failAssistant(input.message)
+          const state = publisherStates.get(input.publisher)
+          if (state) yield* telemetry.fail(state.sessionID)
           closedTurns.set(input.publisher, { type: "failed" })
         }),
       )
     })
 
     const guardProviderTurn: Interface["guardProviderTurn"] = (input) =>
-      input.effect.pipe(
-        Effect.onExit((exit) =>
-          Exit.isFailure(exit)
-            ? failTurn({
-                publisher: input.publisher,
-                message: `${input.label} provider turn ${Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failed"}`,
-              })
-            : Effect.void,
-        ),
-      )
+      Effect.gen(function* () {
+        const state = publisherStates.get(input.publisher)
+        if (state) {
+          state.requestSentAt ??= Date.now()
+          yield* telemetry.begin({
+            sessionID: state.sessionID,
+            requestSentAt: state.requestSentAt,
+            model: {
+              providerID: state.model.providerID,
+              modelID: state.model.id,
+              ...(state.model.variant === undefined ? {} : { variant: state.model.variant }),
+            },
+          })
+        }
+
+        const exit = yield* Effect.exit(input.effect)
+        if (Exit.isFailure(exit)) {
+          yield* failTurn({
+            publisher: input.publisher,
+            message: `${input.label} provider turn ${Cause.hasInterruptsOnly(exit.cause) ? "interrupted" : "failed"}`,
+          })
+          return yield* Effect.failCause(exit.cause)
+        }
+
+        // Provider-body completion is known here for every special-agent caller.
+        // Centralizing it prevents titles/revisors/auditors from drifting on TPS
+        // and generated-vs-tool timing semantics.
+        if (input.publisher.hasAssistantStarted() && !input.publisher.hasProviderError()) yield* input.publisher.streamed()
+        return exit.value
+      })
 
     const settleTurn = Effect.fn("SpecialAgentSession.settleTurn")(function* (input: {
       readonly sessionID: SessionSchema.ID
@@ -304,14 +381,60 @@ const layer = Layer.effect(
           yield* input.publisher.flush()
           const assistantMessageID = yield* input.publisher.startAssistant()
           const settlement = input.publisher.stepSettlement()
+          // Tool-only/empty responses may not have started an assistant until
+          // settlement. Stamp the response-body boundary now so timing remains
+          // durable even for those turns.
+          yield* input.publisher.streamed()
+          const completedAt = yield* DateTime.now
+          const completedAtMs = DateTime.toEpochMillis(completedAt)
+          const settledTokens = settlement?.tokens ?? input.tokens
           yield* events.publish(SessionEvent.Step.Ended, {
             sessionID: input.sessionID,
-            timestamp: yield* DateTime.now,
+            timestamp: completedAt,
             assistantMessageID,
             finish: settlement?.finish ?? input.finish ?? input.response.finishReason,
             cost: input.cost ?? 0,
-            tokens: settlement?.tokens ?? input.tokens,
+            tokens: settledTokens,
           })
+
+          const state = publisherStates.get(input.publisher)
+          if (state) {
+            yield* telemetry.settle({
+              sessionID: input.sessionID,
+              assistantMessageID,
+              completedAt: completedAtMs,
+              cost: input.cost ?? 0,
+              tokens: settledTokens,
+            })
+            yield* telemetry.idle(input.sessionID, completedAtMs)
+
+            // `usage_record` is the Session-local settlement ledger consumed by
+            // the Context pane. Mark these rows as maintenance so global work
+            // analytics/yield statistics can exclude them while the dedicated
+            // maintenance_usage ledger remains the accounting authority.
+            yield* usage.record({
+              messageID: assistantMessageID,
+              sessionID: input.sessionID,
+              providerID: state.model.providerID,
+              modelID: state.model.id,
+              variant: state.model.variant,
+              agent: state.agent,
+              mode: UsageClassification.MAINTENANCE_MODE,
+              createdAt: state.requestSentAt,
+              requestSentAt: state.requestSentAt,
+              firstTokenAt: state.firstTokenAt,
+              streamedAt: state.streamedAt,
+              completedAt: completedAtMs,
+              cost: input.cost ?? 0,
+              tokens: {
+                input: settledTokens.input,
+                cacheRead: settledTokens.cache.read,
+                cacheWrite: settledTokens.cache.write,
+                output: settledTokens.output,
+                reasoning: settledTokens.reasoning,
+              },
+            })
+          }
           closedTurns.set(input.publisher, { type: "ended", id: assistantMessageID })
           return assistantMessageID
         }),
@@ -354,5 +477,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Database.node, EventV2.node, SessionHostChild.node, UsageRecord.node],
+  deps: [Database.node, EventV2.node, SessionHostChild.node, SessionTelemetry.node, UsageRecord.node],
 })

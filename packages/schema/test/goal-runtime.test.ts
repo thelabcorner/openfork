@@ -48,7 +48,6 @@ test("focused Goal projects a durable auditor child independently of live automa
         status: "active",
         revision: 1,
         auditorRuns: 1,
-        continuationPolicy: {},
         auditorPolicy: {},
         time: { created: now, updated: now },
       },

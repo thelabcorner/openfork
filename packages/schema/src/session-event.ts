@@ -148,6 +148,22 @@ export const SyntheticRevoked = Event.define({
 })
 export type SyntheticRevoked = typeof SyntheticRevoked.Type
 
+/**
+ * The exact SessionInput reached a successful provider cycle and that cycle
+ * settled. Execution-ended truth for one specific input row only: it is never
+ * a semantic Swarm settlement, and it can never be satisfied by a different
+ * input, a later generation, or a newer owner.
+ */
+export const InputCompleted = Event.define({
+  type: "session.next.input.completed",
+  ...options,
+  schema: {
+    ...Base,
+    messageID: SessionMessage.ID,
+  },
+})
+export type InputCompleted = typeof InputCompleted.Type
+
 export const ContextUpdated = Event.define({
   type: "session.next.context.updated",
   ...options,
@@ -573,6 +589,7 @@ export const DurableDefinitions = Event.inventory(
   SyntheticAdmitted,
   SyntheticPromoted,
   SyntheticRevoked,
+  InputCompleted,
   ContextUpdated,
   Synthetic,
   Shell.Started,
@@ -612,6 +629,7 @@ export const Definitions = Event.inventory(
   SyntheticAdmitted,
   SyntheticPromoted,
   SyntheticRevoked,
+  InputCompleted,
   ContextUpdated,
   Synthetic,
   Shell.Started,

@@ -1,5 +1,3 @@
-import { DatabaseSync, type SQLInputValue } from "node:sqlite"
-import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -14,6 +12,8 @@ import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
+import { sqliteExecutionFailureMessage, sqliteFailureLogFields } from "./sqlite-diagnostics"
+import { SqliteWorkerClient } from "./sqlite-worker-client"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -56,45 +56,43 @@ interface SqliteConnection extends Connection {
 
 const make = (options: Config) =>
   Effect.gen(function* () {
-    const native = (yield* Sqlite.Native) as DatabaseSync
+    const native = (yield* Sqlite.Native) as SqliteWorkerClient
 
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
       ? Statement.defaultTransforms(options.transformResultNames).array
       : undefined
+    const failStatement = (cause: unknown, query: string) => {
+      const error = new SqlError({
+        reason: classifySqliteError(cause, {
+          message: sqliteExecutionFailureMessage(cause, query),
+          operation: "execute",
+        }),
+      })
+      return Effect.logError("SQLite statement execution failed", sqliteFailureLogFields(cause, query)).pipe(
+        Effect.andThen(Effect.fail(error)),
+      )
+    }
 
+    const execute = (query: string, params: ReadonlyArray<unknown>, arrays: boolean) =>
+      Effect.withFiber<unknown, SqlError>((fiber) =>
+        Effect.tryPromise({
+          try: () => native.request({
+            kind: "query", query, params, arrays,
+            safeIntegers: Context.get(fiber.context, Client.SafeIntegers),
+          }),
+          catch: (cause) => cause,
+        }).pipe(Effect.catch((cause) => failStatement(cause, query))),
+      ).pipe(
+        // Native SQL cannot be cancelled halfway through execution. Wait for
+        // its acknowledgement before rollback/release, just as the synchronous
+        // driver did, while letting the sidecar event loop serve control work.
+        Effect.uninterruptible,
+      )
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
-      Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
-        } catch (cause) {
-          return Effect.fail(
-            new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
-            }),
-          )
-        }
-      })
-
+      execute(query, params, false) as Effect.Effect<Array<Record<string, unknown>>, SqlError>
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
-      Effect.withFiber<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>((fiber) => {
-        const statement = native.prepare(query)
-        statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
-        statement.setReturnArrays(true)
-        try {
-          return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
-          )
-        } catch (cause) {
-          return Effect.fail(
-            new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
-            }),
-          )
-        }
-      })
+      execute(query, params, true) as Effect.Effect<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>
 
     const connection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
@@ -113,17 +111,19 @@ const make = (options: Config) =>
         return Stream.die("executeStream not implemented")
       },
       loadExtension: (path) =>
-        Effect.try({
-          try: () => native.loadExtension(path),
+        Effect.tryPromise({
+          try: () => native.request({ kind: "extension", path }).then(() => undefined),
           catch: (cause) =>
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to load extension", operation: "loadExtension" }),
             }),
-        }),
+        }).pipe(Effect.uninterruptible),
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
+    // Statement acquisition is scoped by Effect SQL. Keep the permit through
+    // asynchronous execution; releasing it after merely returning the connection
+    // would allow another fiber's SQL to enter the same transaction.
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
@@ -132,6 +132,7 @@ const make = (options: Config) =>
         connection,
       )
     })
+    const acquirer = transactionAcquirer
 
     const client = Object.assign(
       (yield* Client.make({
@@ -147,7 +148,7 @@ const make = (options: Config) =>
       {
         [TypeId]: TypeId,
         config: options,
-        loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+        loadExtension: (path: string) => Effect.scoped(Effect.flatMap(acquirer, (_) => _.loadExtension(path))),
       },
     )
 
@@ -158,72 +159,23 @@ const nativeLayer = (config: Config) =>
   Layer.effect(
     Sqlite.Native,
     Effect.gen(function* () {
-      const native = new DatabaseSync(config.filename, {
-        readOnly: config.readonly,
-        timeout: config.timeout,
-        allowExtension: config.allowExtension,
-        enableForeignKeyConstraints: true,
-        open: true,
-      })
+      const native = new SqliteWorkerClient(config)
       yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          if (config.checkpointOnClose !== false) {
-            try {
-              native.exec("PRAGMA wal_checkpoint(TRUNCATE)")
-            } catch {}
-          }
-          try {
-            native.close()
-          } catch {}
-          try {
-            const maybeGc = (globalThis as unknown as { gc?: () => void }).gc
-            maybeGc?.()
-          } catch {}
-        }),
+        Effect.promise(() => native.close()).pipe(Effect.ignore),
       )
-      // Create-time-only pragmas MUST precede WAL: page_size/auto_vacuum are
-      // silent no-ops once WAL is enabled or any table exists. On existing DBs
-      // they are harmless no-ops, so applying unconditionally is safe. Multiple
-      // processes may still open the same brand-new file before the higher-level
-      // database bootstrap lock exists. These are storage-tuning writes rather
-      // than correctness writes, so match the Bun driver and let the winning
-      // initializer apply them instead of failing startup on SQLITE_BUSY.
-      if (config.createTimePragmas) {
-        const runCreateTime = (statement: string) => {
-          try {
-            native.exec(statement)
-          } catch (error) {
-            const sqlite = error as { code?: string; errcode?: number; errno?: number }
-            if (
-              sqlite?.code === "SQLITE_BUSY" ||
-              sqlite?.code === "ERR_SQLITE_ERROR" && (sqlite?.errcode === 5 || sqlite?.errno === 5) ||
-              sqlite?.errcode === 5 ||
-              sqlite?.errno === 5
-            )
-              return
-            throw error
-          }
-        }
-        runCreateTime(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
-        runCreateTime(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
-      }
-      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
+      yield* Effect.tryPromise({
+        try: () => native.ready,
+        catch: (cause) => new SqlError({ reason: classifySqliteError(cause, { message: "Failed to open SQLite worker", operation: "open" }) }),
+      })
       return native
     }),
   )
 
 const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(config))
 
-const drizzleLayer = Layer.effect(
-  Sqlite.Drizzle,
-  Effect.gen(function* () {
-    return drizzle({ client: (yield* Sqlite.Native) as DatabaseSync }) as unknown as Sqlite.DrizzleClient
-  }),
-)
-
 export const layer = (config: Config) => {
   const native = nativeLayer(config)
-  return Layer.merge(native, Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(native))).pipe(
+  return Layer.merge(native, sqliteLayer(config).pipe(Layer.provide(native))).pipe(
     Layer.provide(Reactivity.layer),
   )
 }

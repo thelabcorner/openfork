@@ -34,6 +34,7 @@ describe("CodingActivity", () => {
         model: { providerID: "anthropic", modelID: "claude-sonnet-4", variant: "high" },
         source: "session",
         sourceRef: "call_01",
+        replayToken: "event_01",
       }
 
       expect(yield* activity.record(input)).toBe(true)

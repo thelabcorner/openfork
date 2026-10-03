@@ -1,6 +1,6 @@
 export * as GoalAutomation from "./automation"
 
-import { and, eq, isNotNull, isNull, ne, or } from "drizzle-orm"
+import { and, asc, eq, gt, isNotNull, isNull, ne, or } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer } from "effect"
 import { Goal } from "./index"
 import { Goal as GoalModel } from "@opencode-ai/schema/goal"
@@ -8,21 +8,11 @@ import { GoalAutomationTable, GoalFocusTable, GoalTable } from "./sql"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { SessionSchema } from "../session/schema"
+import { SessionInput } from "../session/input"
 import { SessionTable } from "../session/sql"
 import { WorkspaceV2 } from "../workspace"
 import { makeGlobalNode } from "../effect/app-node"
 import type { ModelV2 } from "../model"
-
-export interface State {
-  readonly startedAt: number
-  readonly consecutiveTurns: number
-  readonly noProgressTurns: number
-  readonly auditorBlockedStreak: number
-  readonly consumedTokens: number
-  readonly previousRevision?: number
-  readonly lastAuditorDecision?: GoalModel.AuditorDecision
-  readonly lastAuditorRationale?: string
-}
 
 export type AuditOutcome =
   | {
@@ -44,21 +34,17 @@ export interface Reservation {
   /** Frozen latest semantic-User admission sequence at authorization time. */
   readonly expectedLatestUserSeq: number | undefined
   readonly prompt: string
-  readonly state: State
   readonly createdAt: number
 }
 
 export interface Decision {
   readonly continue: boolean
   readonly reason: string
-  readonly state: State
   readonly goal?: Goal.Detail
   readonly reservation?: Reservation
 }
 
 export interface Interface {
-  /** Pure fresh cursor, primarily useful to deterministic tests. */
-  readonly initial: () => State
   /** Whether this Session currently owns an active/verifying automated Goal. */
   readonly shouldAudit: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** Compact session-local runtime projection used by the Goal UI. */
@@ -80,11 +66,18 @@ export interface Interface {
   }) => Effect.Effect<GoalModel.AutomationRuntime | undefined>
   /** Releases the live auditor execution lease on every terminal path. */
   readonly endAudit: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  /**
+   * Converts an interrupted live auditor lease back into durable audit work.
+   * Any reservation for the already-completed worker cycle is preserved and
+   * released from its process owner so recovery re-audits instead of rerunning
+   * worker side effects.
+   */
+  readonly deferAudit: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** Stops autonomous continuation and exposes a non-domain auditor failure. */
   readonly failAudit: (input: { sessionID: SessionSchema.ID; error: string }) => Effect.Effect<void>
   /**
    * Completes one logical provider cycle and atomically reserves the next
-   * autonomous cycle when policy permits it.
+   * autonomous cycle whenever the Goal remains runnable.
    */
   readonly afterTurn: (input: {
     sessionID: SessionSchema.ID
@@ -104,11 +97,26 @@ export interface Interface {
      * manufacture another autonomous continuation or stale blocker.
      */
     supersededByUser?: boolean
-    tokens?: number
+    /**
+     * Production auditor paths set this once an auditor child was provisioned.
+     * A missing runtime cursor at settlement then proves that a concurrent
+     * user/control action cancelled or superseded the audit while it was
+     * running; its late verdict must not recreate automation state.
+     */
+    requireAuditCursor?: boolean
     audit?: AuditOutcome
   }) => Effect.Effect<Decision>
   /** Claims exactly one pending continuation for execution. */
   readonly claim: (sessionID: SessionSchema.ID) => Effect.Effect<Reservation | undefined>
+  /**
+   * Claims the reservation, if any, attached to a durable audit request. An
+   * empty object means a no-reservation audit request was claimed logically;
+   * undefined means there is no recoverable audit request or another worker
+   * already owns its reservation.
+   */
+  readonly claimAuditRecovery: (
+    sessionID: SessionSchema.ID,
+  ) => Effect.Effect<{ readonly reservation?: Reservation } | undefined>
   /** Releases an in-flight claim after interruption/failure so it is recoverable. */
   readonly release: (input: { sessionID: SessionSchema.ID; reservationID: string }) => Effect.Effect<void>
   /**
@@ -119,9 +127,12 @@ export interface Interface {
    */
   readonly requeueClaim: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   /** User input or an explicit control action invalidates outstanding autonomous work. */
-  readonly cancel: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  readonly cancel: (sessionID: SessionSchema.ID, reservationID?: string) => Effect.Effect<void>
   /** Unclaimed reservations used by runtime startup recovery. */
-  readonly pendingSessions: () => Effect.Effect<ReadonlyArray<SessionSchema.ID>>
+  readonly pendingSessions: (input?: {
+    readonly after?: SessionSchema.ID
+    readonly limit?: number
+  }) => Effect.Effect<ReadonlyArray<SessionSchema.ID>>
   /**
    * Focused automatic Goals stranded in durable `verifying` with no runtime
    * cursor at all. These are legacy/crash-recovery audit requests, not provider
@@ -162,20 +173,11 @@ export const CONTINUATION_PROMPT = [
  * to decide the task-specific next move; the harness retains authority over
  * provenance, user-preemption semantics, Goal bookkeeping, and prompt safety.
  */
-export function renderContinuationPrompt(
-  verdict: Extract<GoalModel.AuditorVerdict, { decision: "continue" | "blocked" }>,
-  blockedStreak: number,
-  blockedThreshold?: number,
-) {
-  const blocked = verdict.decision === "blocked"
+export function renderContinuationPrompt(verdict: Extract<GoalModel.AuditorVerdict, { decision: "continue" }>) {
   return [
     "[GOAL CONTINUATION — host-authored, not a new human request]",
     "There is no new user request. Continue the same focused Goal autonomously.",
-    blocked
-      ? blockedThreshold === undefined
-        ? "The independent Goal auditor suspects a blocker. Do not manufacture Goal lifecycle state from this diagnosis; resolve or verify the dependency only when orchestration explicitly authorizes another probe cycle."
-        : `The independent Goal auditor suspects a blocker, but the explicitly configured blocked-hysteresis threshold has not yet settled the Goal (${blockedStreak}/${blockedThreshold}). Use this cycle to resolve, work around, or conclusively verify the blocker rather than repeating the previous attempt.`
-      : "The independent Goal auditor reviewed the completed worker cycle and explicitly authorized another autonomous cycle.",
+    "The independent Goal auditor reviewed the completed worker cycle and explicitly authorized another autonomous cycle.",
     "You remain the Goal worker. Never adopt the auditor role, never perform an audit_verdict, and never stop merely to wait for the auditor. Finish concrete worker work; the host owns the later audit handoff outside this transcript.",
     `<auditor-assessment>\n${verdict.rationale}\n</auditor-assessment>`,
     `<auditor-continuation>\n${verdict.continuationPrompt}\n</auditor-continuation>`,
@@ -194,22 +196,19 @@ const layer = Layer.effect(
 
     // An audit lease belongs to one live Effect in one process. A persisted
     // lease at service construction therefore proves the previous process died
-    // before finalization. Surface that as an operational error and discard any
-    // associated autonomous reservation instead of telling the UI an auditor is
-    // still running or silently continuing work after a crash.
+    // before finalization. The worker cycle itself may already have committed
+    // irreversible side effects, so never discard or rerun its reservation.
+    // Convert the dead lease into a durable audit request and let recovery
+    // re-audit the already-completed cycle.
     const restartedAt = Date.now()
     yield* db
       .update(GoalAutomationTable)
       .set({
+        audit_requested_at: restartedAt,
         auditing_at: null,
         auditor_session_id: null,
-        runtime_error: "Goal auditor stopped because the OpenFork backend restarted before the audit finished.",
-        reservation_id: null,
+        runtime_error: null,
         reservation_owner: null,
-        reservation_created_at: null,
-        continuation_source_message_id: null,
-        continuation_expected_user_seq: null,
-        continuation_prompt: null,
         time_updated: restartedAt,
       })
       .where(or(isNotNull(GoalAutomationTable.auditing_at), isNotNull(GoalAutomationTable.auditor_session_id)))
@@ -232,14 +231,6 @@ const layer = Layer.effect(
       )
       .run()
       .pipe(Effect.orDie)
-
-    const initial = (): State => ({
-      startedAt: Date.now(),
-      consecutiveTurns: 0,
-      noProgressTurns: 0,
-      auditorBlockedStreak: 0,
-      consumedTokens: 0,
-    })
 
     const publishRuntime = Effect.fnUntraced(function* (
       sessionID: SessionSchema.ID,
@@ -264,10 +255,9 @@ const layer = Layer.effect(
     })
 
     const requestAudit = Effect.fn("GoalAutomation.requestAudit")(function* (sessionID: SessionSchema.ID) {
-      const focused = yield* goals.focused(sessionID)
+      const focused = yield* goals.focusedLifecycle(sessionID)
       if (!focused) return undefined
-      const goal = focused.detail.goal
-      if (goal.status !== "active" && goal.status !== "verifying") return undefined
+      if (focused.status !== "active" && focused.status !== "verifying") return undefined
 
       const existing = yield* db
         .select()
@@ -275,11 +265,19 @@ const layer = Layer.effect(
         .where(eq(GoalAutomationTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
-      if (existing?.goal_id === goal.id && existing.auditing_at !== null && existing.auditor_session_id !== null) {
+      if (
+        existing?.goal_id === focused.goalID &&
+        existing.auditing_at !== null &&
+        existing.auditor_session_id !== null
+      ) {
         return runtimeOf(existing)
       }
-      if (existing && existing.goal_id !== goal.id) {
-        yield* db.delete(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, sessionID)).run().pipe(Effect.orDie)
+      if (existing && existing.goal_id !== focused.goalID) {
+        yield* db
+          .delete(GoalAutomationTable)
+          .where(eq(GoalAutomationTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
         yield* publishRuntime(sessionID, existing.goal_id)
       }
 
@@ -288,8 +286,7 @@ const layer = Layer.effect(
         .insert(GoalAutomationTable)
         .values({
           session_id: sessionID,
-          goal_id: goal.id,
-          started_at: existing?.goal_id === goal.id ? existing.started_at : now,
+          goal_id: focused.goalID,
           audit_requested_at: now,
           auditing_at: null,
           auditor_session_id: null,
@@ -305,7 +302,7 @@ const layer = Layer.effect(
         .onConflictDoUpdate({
           target: GoalAutomationTable.session_id,
           set: {
-            goal_id: goal.id,
+            goal_id: focused.goalID,
             audit_requested_at: now,
             auditing_at: null,
             auditor_session_id: null,
@@ -323,26 +320,26 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       const automation = runtimeOf(row)
-      if (automation) yield* publishRuntime(sessionID, goal.id, automation)
+      if (automation) yield* publishRuntime(sessionID, focused.goalID, automation)
       return automation
     })
 
-    const cancel = Effect.fn("GoalAutomation.cancel")(function* (sessionID: SessionSchema.ID) {
+    const cancel = Effect.fn("GoalAutomation.cancel")(function* (sessionID: SessionSchema.ID, reservationID?: string) {
+      const conditions = [eq(GoalAutomationTable.session_id, sessionID)]
+      if (reservationID) conditions.push(eq(GoalAutomationTable.reservation_id, reservationID))
       const row = yield* db
-        .select({ goalID: GoalAutomationTable.goal_id })
-        .from(GoalAutomationTable)
-        .where(eq(GoalAutomationTable.session_id, sessionID))
+        .delete(GoalAutomationTable)
+        .where(and(...conditions))
+        .returning({ goalID: GoalAutomationTable.goal_id })
         .get()
         .pipe(Effect.orDie)
-      yield* db.delete(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, sessionID)).run().pipe(Effect.orDie)
       if (row) yield* publishRuntime(sessionID, row.goalID)
     })
 
     const shouldAudit = Effect.fn("GoalAutomation.shouldAudit")(function* (sessionID: SessionSchema.ID) {
-      const focused = yield* goals.focused(sessionID)
+      const focused = yield* goals.focusedLifecycle(sessionID)
       if (!focused) return false
-      const goal = focused.detail.goal
-      if (goal.status !== "active" && goal.status !== "verifying") return false
+      if (focused.status !== "active" && focused.status !== "verifying") return false
       return true
     })
 
@@ -351,11 +348,10 @@ const layer = Layer.effect(
       auditorSessionID: SessionSchema.ID
       reservationID?: string
     }) {
-      const focused = yield* goals.focused(input.sessionID)
+      const focused = yield* goals.focusedLifecycle(input.sessionID)
       if (!focused) return undefined
-      const goal = focused.detail.goal
-      if (goal.status !== "active" && goal.status !== "verifying") return undefined
-      const linkedAuditor = yield* goals.auditorSessionFor({ parentSessionID: input.sessionID, goalID: goal.id })
+      if (focused.status !== "active" && focused.status !== "verifying") return undefined
+      const linkedAuditor = yield* goals.auditorSessionFor({ parentSessionID: input.sessionID, goalID: focused.goalID })
       if (linkedAuditor !== input.auditorSessionID) return undefined
 
       const existing = yield* db
@@ -364,20 +360,24 @@ const layer = Layer.effect(
         .where(eq(GoalAutomationTable.session_id, input.sessionID))
         .get()
         .pipe(Effect.orDie)
-      if (existing && existing.goal_id !== goal.id) {
-        yield* db.delete(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, input.sessionID)).run().pipe(Effect.orDie)
+      if (existing && existing.goal_id !== focused.goalID) {
+        yield* db
+          .delete(GoalAutomationTable)
+          .where(eq(GoalAutomationTable.session_id, input.sessionID))
+          .run()
+          .pipe(Effect.orDie)
         yield* publishRuntime(input.sessionID, existing.goal_id)
       }
       const now = Date.now()
       const leaseWhere = input.reservationID
         ? and(
-            eq(GoalAutomationTable.goal_id, goal.id),
+            eq(GoalAutomationTable.goal_id, focused.goalID),
             eq(GoalAutomationTable.reservation_id, input.reservationID),
             eq(GoalAutomationTable.reservation_owner, PROCESS_OWNER_ID),
             isNull(GoalAutomationTable.auditing_at),
           )
         : and(
-            eq(GoalAutomationTable.goal_id, goal.id),
+            eq(GoalAutomationTable.goal_id, focused.goalID),
             isNull(GoalAutomationTable.auditing_at),
             isNull(GoalAutomationTable.reservation_id),
           )
@@ -386,8 +386,7 @@ const layer = Layer.effect(
         .insert(GoalAutomationTable)
         .values({
           session_id: input.sessionID,
-          goal_id: goal.id,
-          started_at: existing?.goal_id === goal.id ? existing.started_at : now,
+          goal_id: focused.goalID,
           audit_requested_at: null,
           auditing_at: now,
           auditor_session_id: input.auditorSessionID,
@@ -397,7 +396,7 @@ const layer = Layer.effect(
         .onConflictDoUpdate({
           target: GoalAutomationTable.session_id,
           set: {
-            goal_id: goal.id,
+            goal_id: focused.goalID,
             audit_requested_at: null,
             auditing_at: now,
             auditor_session_id: input.auditorSessionID,
@@ -416,7 +415,7 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (!row) return undefined
       const automation = runtimeOf(row)
-      if (automation) yield* publishRuntime(input.sessionID, goal.id, automation)
+      if (automation) yield* publishRuntime(input.sessionID, focused.goalID, automation)
       return automation
     })
 
@@ -431,6 +430,32 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (!row) return
       yield* publishRuntime(sessionID, row.goal_id, runtimeOf(row))
+    })
+
+    const deferAudit = Effect.fn("GoalAutomation.deferAudit")(function* (sessionID: SessionSchema.ID) {
+      const now = Date.now()
+      const row = yield* db
+        .update(GoalAutomationTable)
+        .set({
+          audit_requested_at: now,
+          auditing_at: null,
+          auditor_session_id: null,
+          runtime_error: null,
+          reservation_owner: null,
+          time_updated: now,
+        })
+        .where(
+          and(
+            eq(GoalAutomationTable.session_id, sessionID),
+            or(isNotNull(GoalAutomationTable.auditing_at), isNotNull(GoalAutomationTable.auditor_session_id)),
+          ),
+        )
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return false
+      yield* publishRuntime(sessionID, row.goal_id, runtimeOf(row))
+      return true
     })
 
     const failAudit = Effect.fn("GoalAutomation.failAudit")(function* (input: {
@@ -454,7 +479,11 @@ const layer = Layer.effect(
         return
       }
       if (existing && existing.goal_id !== goal.id) {
-        yield* db.delete(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, input.sessionID)).run().pipe(Effect.orDie)
+        yield* db
+          .delete(GoalAutomationTable)
+          .where(eq(GoalAutomationTable.session_id, input.sessionID))
+          .run()
+          .pipe(Effect.orDie)
         yield* publishRuntime(input.sessionID, existing.goal_id)
       }
       const now = Date.now()
@@ -464,7 +493,6 @@ const layer = Layer.effect(
         .values({
           session_id: input.sessionID,
           goal_id: goal.id,
-          started_at: existing?.goal_id === goal.id ? existing.started_at : now,
           audit_requested_at: null,
           auditing_at: null,
           auditor_session_id: null,
@@ -500,13 +528,23 @@ const layer = Layer.effect(
       yield* publishRuntime(input.sessionID, goal.id, runtimeOf(row))
     })
 
-    const pendingSessions = Effect.fn("GoalAutomation.pendingSessions")(function* () {
-      const rows = yield* db
+    const pendingSessions = Effect.fn("GoalAutomation.pendingSessions")(function* (input?: {
+      readonly after?: SessionSchema.ID
+      readonly limit?: number
+    }) {
+      const query = db
         .select({ sessionID: GoalAutomationTable.session_id })
         .from(GoalAutomationTable)
-        .where(and(isNotNull(GoalAutomationTable.reservation_id), isNull(GoalAutomationTable.reservation_owner)))
-        .all()
-        .pipe(Effect.orDie)
+        .where(
+          and(
+            isNotNull(GoalAutomationTable.reservation_id),
+            isNull(GoalAutomationTable.reservation_owner),
+            isNull(GoalAutomationTable.audit_requested_at),
+            input?.after ? gt(GoalAutomationTable.session_id, input.after) : undefined,
+          ),
+        )
+        .orderBy(asc(GoalAutomationTable.session_id))
+      const rows = yield* (input?.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(Effect.orDie)
       return rows.map((row) => SessionSchema.ID.make(row.sessionID))
     })
 
@@ -551,13 +589,34 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (!row?.reservation_id || row.reservation_owner || row.audit_requested_at !== null) return undefined
 
-      // Policy/lifecycle/focus may have changed after the reservation was
-      // created. Revalidate immediately before claiming provider work.
-      const focused = yield* goals.focused(sessionID)
+      // A continuation is authorized only for the User-admission frontier it
+      // captured. Check that frontier before loading Goal/focus details so a
+      // stale legacy reservation cannot churn through the expensive claim path
+      // on every runner retry. Materializers still verify the same fence inside
+      // their admission transaction to close the race with a User arriving now.
+      const latestUserSeq = yield* SessionInput.latestUserSeq(db, sessionID)
+      // The persisted fence uses SQL NULL for an absent sequence, while the
+      // query projection uses undefined. They represent the same frontier.
+      const expectedLatestUserSeq = row.continuation_expected_user_seq ?? undefined
+      if (latestUserSeq !== expectedLatestUserSeq) {
+        yield* Effect.logWarning("discarding stale Goal continuation reservation", {
+          sessionID,
+          goalID: row.goal_id,
+          expectedLatestUserSeq,
+          latestUserSeq,
+        })
+        yield* cancel(sessionID, row.reservation_id)
+        return undefined
+      }
+
+      // Lifecycle/focus or the user-authority frontier may have changed after
+      // the reservation was created. Revalidate immediately before claiming
+      // provider work. Goal Mode has no continuation policy to consult here.
+      const focused = yield* goals.focusedLifecycle(sessionID)
       if (
         !focused ||
-        focused.detail.goal.id !== row.goal_id ||
-        (focused.detail.goal.status !== "active" && focused.detail.goal.status !== "verifying")
+        focused.goalID !== row.goal_id ||
+        (focused.status !== "active" && focused.status !== "verifying")
       ) {
         yield* cancel(sessionID)
         return undefined
@@ -590,6 +649,48 @@ const layer = Layer.effect(
       return claimed ? reservation(claimed) : undefined
     })
 
+    const claimAuditRecovery = Effect.fn("GoalAutomation.claimAuditRecovery")(function* (sessionID: SessionSchema.ID) {
+      const row = yield* db
+        .select()
+        .from(GoalAutomationTable)
+        .where(eq(GoalAutomationTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row || row.audit_requested_at === null || row.auditing_at !== null || row.auditor_session_id !== null)
+        return undefined
+
+      const focused = yield* goals.focusedLifecycle(sessionID)
+      if (
+        !focused ||
+        focused.goalID !== row.goal_id ||
+        (focused.status !== "active" && focused.status !== "verifying")
+      ) {
+        yield* cancel(sessionID)
+        return undefined
+      }
+
+      if (!row.reservation_id) return {}
+      if (row.reservation_owner) return undefined
+
+      const claimed = yield* db
+        .update(GoalAutomationTable)
+        .set({ reservation_owner: PROCESS_OWNER_ID, time_updated: Date.now() })
+        .where(
+          and(
+            eq(GoalAutomationTable.session_id, sessionID),
+            eq(GoalAutomationTable.reservation_id, row.reservation_id),
+            isNotNull(GoalAutomationTable.audit_requested_at),
+            isNull(GoalAutomationTable.reservation_owner),
+            isNull(GoalAutomationTable.auditing_at),
+            isNull(GoalAutomationTable.auditor_session_id),
+          ),
+        )
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      return claimed ? { reservation: reservation(claimed)! } : undefined
+    })
+
     const release = Effect.fn("GoalAutomation.release")(function* (input: {
       sessionID: SessionSchema.ID
       reservationID: string
@@ -618,7 +719,7 @@ const layer = Layer.effect(
       const now = Date.now()
       const row = yield* db
         .update(GoalAutomationTable)
-        .set({ reservation_owner: null, auditing_at: null, time_updated: now })
+        .set({ reservation_owner: null, auditing_at: null, auditor_session_id: null, time_updated: now })
         .where(
           and(
             eq(GoalAutomationTable.session_id, sessionID),
@@ -642,13 +743,13 @@ const layer = Layer.effect(
       sourceMessageID?: string
       expectedLatestUserSeq?: number
       supersededByUser?: boolean
-      tokens?: number
+      requireAuditCursor?: boolean
       audit?: AuditOutcome
     }) {
       const focused = yield* goals.focused(input.sessionID)
       if (!focused) {
         yield* cancel(input.sessionID)
-        return stop("no_focused_goal", initial())
+        return stop("no_focused_goal")
       }
       let detail = focused.detail
 
@@ -658,6 +759,10 @@ const layer = Layer.effect(
         .where(eq(GoalAutomationTable.session_id, input.sessionID))
         .get()
         .pipe(Effect.orDie)
+
+      if (input.requireAuditCursor && (!stored || stored.goal_id !== detail.goal.id)) {
+        return stop("audit_superseded", detail)
+      }
 
       if (input.origin === "automatic") {
         if (
@@ -669,59 +774,31 @@ const layer = Layer.effect(
         ) {
           // Most commonly a real user prompt cancelled the chain while this
           // provider cycle was in flight. Never resurrect it from stale output.
-          return stop("reservation_superseded", stored ? stateOf(stored) : initial(), detail)
+          return stop("reservation_superseded", detail)
         }
       }
-
-      const policy = detail.goal.continuationPolicy
-      const base = stored && stored.goal_id === detail.goal.id ? stateOf(stored) : initial()
-      // Freeze the worker-visible Goal revision before the independent auditor
-      // reconciles its own findings. This boundary tells us whether the worker
-      // cycle changed durable Goal state. Auditor writes happen later and must
-      // become the next cycle's baseline without being credited to this one.
-      const workerRevision = detail.goal.revision
 
       if (detail.goal.status !== "active" && detail.goal.status !== "verifying") {
         yield* cancel(input.sessionID)
-        return stop(`goal_${detail.goal.status}`, base, detail)
+        return stop(`goal_${detail.goal.status}`, detail)
       }
 
       const audit = input.audit ?? ({ ok: false, error: "auditor result missing" } satisfies AuditOutcome)
-      const stateFor = (): State => {
-        const revisionProgressed = base.previousRevision === undefined || base.previousRevision !== workerRevision
-        const auditProgressed = audit.ok && audit.verdict.progressMade
-        const noProgressTurns =
-          revisionProgressed || auditProgressed
-            ? 0
-            : audit.ok && audit.verdict.decision === "continue"
-              ? base.noProgressTurns + 1
-              : base.noProgressTurns
-        const auditorBlockedStreak =
-          audit.ok && audit.verdict.decision === "blocked" ? base.auditorBlockedStreak + 1 : 0
-        return {
-          ...base,
-          consecutiveTurns: base.consecutiveTurns + 1,
-          noProgressTurns,
-          auditorBlockedStreak,
-          consumedTokens:
-            base.consumedTokens +
-            Math.max(0, Math.floor(input.tokens ?? 0)) +
-            Math.max(0, Math.floor(input.audit?.tokens ?? 0)),
-          // detail may now include auditor reconciliation. Persist the final
-          // revision as the next worker cycle's starting baseline.
-          previousRevision: detail.goal.revision,
-          lastAuditorDecision: audit.ok ? audit.verdict.decision : base.lastAuditorDecision,
-          lastAuditorRationale: audit.ok ? audit.verdict.rationale : audit.error,
-        }
-      }
 
       if (!audit.ok) {
-        const state = stateFor()
         yield* failAudit({ sessionID: input.sessionID, error: audit.error })
         // Auditor/provider infrastructure failure is not a domain blocker. Stop
         // Goal Mode execution safely, but leave the Goal lifecycle untouched
         // so a transient catalog/auth outage cannot manufacture `blocked` state.
-        return stop(`auditor_error:${audit.error}`, state, detail)
+        return stop(`auditor_error:${audit.error}`, detail)
+      }
+
+      // A newer human turn owns the next decision boundary. In particular, a
+      // late blocker diagnosis from the superseded worker cycle must not turn a
+      // Goal the user just resumed into blocked state again.
+      if (input.supersededByUser && audit.verdict.decision === "blocked") {
+        yield* cancel(input.sessionID)
+        return stop("superseded_by_user", detail)
       }
 
       const reconciled = yield* goals
@@ -737,108 +814,52 @@ const layer = Layer.effect(
         })
         .pipe(
           Effect.map((value) => ({ ok: true as const, value })),
-          Effect.catchTag("Goal.StaleRevisionError", () => Effect.succeed({ ok: false as const, stale: true as const })),
+          Effect.catchTag("Goal.StaleRevisionError", () =>
+            Effect.succeed({ ok: false as const, stale: true as const }),
+          ),
           Effect.catch(() => Effect.succeed({ ok: false as const, stale: false as const })),
         )
       if (!reconciled.ok) {
         yield* cancel(input.sessionID)
-        return stop(reconciled.stale ? "auditor_stale" : "auditor_reconciliation_failed", base, detail)
+        return stop(reconciled.stale ? "auditor_stale" : "auditor_reconciliation_failed", detail)
       }
       detail = reconciled.value.detail
-      // Auditor reconciliation is verifier bookkeeping, not evidence that the
-      // just-finished worker cycle made progress. Counting it here would let an
-      // auditor's own criterion/evidence writes defeat an explicitly configured
-      // no-progress policy bound.
-      // Worker progress is established only by Goal revision changes that
-      // happened before this audit and by the independent auditor's explicit
-      // progress judgment for this worker cycle.
-      const state = stateFor()
 
       if (audit.verdict.decision === "complete") {
         yield* cancel(input.sessionID)
-        return stop(reconciled.value.completed ? "auditor_complete_verified" : "auditor_complete", state, detail)
+        return stop(reconciled.value.completed ? "auditor_complete_verified" : "auditor_complete", detail)
       }
 
       // The older host/automatic cycle is legitimate history, but a newer
       // semantic User admission owns the next decision boundary. Do not let a
-      // stale non-user cycle emit another autonomous reservation or convert its
-      // stale diagnosis into a blocker after the human has taken control.
+      // stale non-user cycle emit another autonomous reservation after the
+      // human has taken control.
       if (input.supersededByUser) {
         yield* cancel(input.sessionID)
-        return stop("superseded_by_user", state, detail)
+        return stop("superseded_by_user", detail)
       }
 
-      const blockedThreshold =
-        detail.goal.auditorPolicy.blockedThreshold === undefined
-          ? undefined
-          : clamp(detail.goal.auditorPolicy.blockedThreshold, 1, 16)
       if (audit.verdict.decision === "blocked") {
-        if (blockedThreshold !== undefined && state.auditorBlockedStreak >= blockedThreshold) {
-          yield* cancel(input.sessionID)
-          yield* goals
-            .transition({
-              id: detail.goal.id,
-              expectedRevision: detail.goal.revision,
-              action: "block",
-              blocker: `Goal auditor: ${audit.verdict.blocker?.trim() || audit.verdict.rationale}`,
-              actor: "auditor",
-            })
-            .pipe(Effect.catch(() => Effect.void))
-          return stop(`auditor_blocked:${state.auditorBlockedStreak}`, state, detail)
-        }
-      }
-
-      // Goal automation has no host-invented turn/no-progress ceiling. Bounds
-      // are opt-in policy: if the user/owning producer did not configure one,
-      // the host does not manufacture one behind their back.
-      const maxTurns =
-        policy.maxConsecutiveTurns === undefined ? undefined : clamp(policy.maxConsecutiveTurns, 1, 128)
-      const maxNoProgress =
-        policy.maxNoProgressTurns === undefined ? undefined : clamp(policy.maxNoProgressTurns, 1, 16)
-      const maxDurationMs =
-        policy.maxDurationMs === undefined ? undefined : clamp(policy.maxDurationMs, 60_000, 24 * 60 * 60_000)
-      const tokenBudget = policy.tokenBudget === undefined ? undefined : clamp(policy.tokenBudget, 1_000, 100_000_000)
-
-      let policyLimit: string | undefined
-      if (maxTurns !== undefined && state.consecutiveTurns >= maxTurns)
-        policyLimit = `maximum automatic turns reached (${maxTurns})`
-      else if (maxNoProgress !== undefined && state.noProgressTurns >= maxNoProgress)
-        policyLimit = `no Goal-state progress for ${maxNoProgress} automatic turns`
-      else if (maxDurationMs !== undefined && Date.now() - state.startedAt >= maxDurationMs)
-        policyLimit = "automatic continuation duration limit reached"
-      else if (tokenBudget !== undefined && state.consumedTokens >= tokenBudget)
-        policyLimit = `automatic continuation token budget reached (${tokenBudget})`
-
-      if (policyLimit) {
-        // A continuation budget is orchestration state, not proof that the Goal
-        // itself is blocked. Stop autonomous re-entry without poisoning durable
-        // Goal lifecycle state; the next genuine user turn can continue normally.
         yield* cancel(input.sessionID)
-        return stop(`policy_limit:${policyLimit}`, state, detail)
+        return stop("auditor_blocked", detail)
       }
 
       const now = Date.now()
       const reservationID = crypto.randomUUID()
-      const continuationPrompt = renderContinuationPrompt(audit.verdict, state.auditorBlockedStreak, blockedThreshold)
+      const continuationPrompt = renderContinuationPrompt(audit.verdict)
       // The causal source is generic Goal orchestration state, not a V1 message
       // implementation detail. Automatic cycles inherit it defensively so a
       // caller cannot accidentally sever lineage after the first continuation.
       const continuationSourceMessageID =
-        input.sourceMessageID ?? (input.origin === "automatic" ? stored?.continuation_source_message_id ?? undefined : undefined)
+        input.sourceMessageID ??
+        (input.origin === "automatic" ? (stored?.continuation_source_message_id ?? undefined) : undefined)
       const row = {
         session_id: input.sessionID,
         goal_id: detail.goal.id,
-        started_at: state.startedAt,
-        consecutive_turns: state.consecutiveTurns,
-        no_progress_turns: state.noProgressTurns,
-        auditor_blocked_streak: state.auditorBlockedStreak,
-        consumed_tokens: state.consumedTokens,
-        last_auditor_decision: state.lastAuditorDecision ?? null,
-        last_auditor_rationale: state.lastAuditorRationale ?? null,
+        audit_requested_at: null,
         auditing_at: null,
         auditor_session_id: null,
         runtime_error: null,
-        previous_revision: state.previousRevision ?? null,
         reservation_id: reservationID,
         reservation_owner: null,
         reservation_created_at: now,
@@ -854,18 +875,10 @@ const layer = Layer.effect(
           target: GoalAutomationTable.session_id,
           set: {
             goal_id: row.goal_id,
-            started_at: row.started_at,
-            consecutive_turns: row.consecutive_turns,
-            no_progress_turns: row.no_progress_turns,
-            auditor_blocked_streak: row.auditor_blocked_streak,
-            consumed_tokens: row.consumed_tokens,
-        last_auditor_decision: row.last_auditor_decision,
-        last_auditor_rationale: row.last_auditor_rationale,
-        audit_requested_at: null,
-        auditing_at: null,
+            audit_requested_at: null,
+            auditing_at: null,
             auditor_session_id: null,
             runtime_error: null,
-            previous_revision: row.previous_revision,
             reservation_id: row.reservation_id,
             reservation_owner: null,
             reservation_created_at: row.reservation_created_at,
@@ -883,7 +896,6 @@ const layer = Layer.effect(
       return {
         continue: true,
         reason: "goal_mode",
-        state,
         goal: detail,
         reservation: {
           id: reservationID,
@@ -892,22 +904,22 @@ const layer = Layer.effect(
           ...(continuationSourceMessageID ? { sourceMessageID: continuationSourceMessageID } : {}),
           expectedLatestUserSeq: input.expectedLatestUserSeq,
           prompt: continuationPrompt,
-          state,
           createdAt: now,
         },
       } satisfies Decision
     })
 
     return Service.of({
-      initial,
       shouldAudit,
       runtime,
       requestAudit,
       beginAudit,
       endAudit,
+      deferAudit,
       failAudit,
       afterTurn,
       claim,
+      claimAuditRecovery,
       release,
       requeueClaim,
       cancel,
@@ -916,19 +928,6 @@ const layer = Layer.effect(
     })
   }),
 )
-
-function stateOf(row: typeof GoalAutomationTable.$inferSelect): State {
-  return {
-    startedAt: row.started_at,
-    consecutiveTurns: row.consecutive_turns,
-    noProgressTurns: row.no_progress_turns,
-    auditorBlockedStreak: row.auditor_blocked_streak,
-    consumedTokens: row.consumed_tokens,
-    previousRevision: row.previous_revision ?? undefined,
-    lastAuditorDecision: row.last_auditor_decision ?? undefined,
-    lastAuditorRationale: row.last_auditor_rationale ?? undefined,
-  }
-}
 
 function reservation(row: typeof GoalAutomationTable.$inferSelect): Reservation | undefined {
   if (!row.reservation_id || row.reservation_created_at === null) return undefined
@@ -942,7 +941,6 @@ function reservation(row: typeof GoalAutomationTable.$inferSelect): Reservation 
     // previous generic prompt only as a backward-compatible recovery fallback;
     // newly created reservations always persist the auditor-authored prompt.
     prompt: row.continuation_prompt?.trim() || CONTINUATION_PROMPT,
-    state: stateOf(row),
     createdAt: row.reservation_created_at,
   }
 }
@@ -980,13 +978,8 @@ function runtimeOf(row: typeof GoalAutomationTable.$inferSelect): GoalModel.Auto
   }
 }
 
-function stop(reason: string, state: State, goal?: Goal.Detail): Decision {
-  return { continue: false, reason, state, ...(goal ? { goal } : {}) }
-}
-
-function clamp(value: number, min: number, max: number) {
-  if (!Number.isFinite(value)) return max
-  return Math.min(Math.max(Math.floor(value), min), max)
+function stop(reason: string, goal?: Goal.Detail): Decision {
+  return { continue: false, reason, ...(goal ? { goal } : {}) }
 }
 
 export const node = makeGlobalNode({ service: Service, layer, deps: [Goal.node, Database.node, EventV2.node] })

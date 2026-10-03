@@ -831,6 +831,45 @@ export function makeMessagingOperations(input: {
     } satisfies MessageHistoryPage
   })
 
+  /**
+   * Bounded recipient-scoped inbox projection.
+   *
+   * The delivery row, not the message row, is the authority for "this mail is
+   * addressed to that member": a message carries immutable sender provenance
+   * only, and broadcast expansion creates one delivery per recipient. Reading
+   * through the delivery table keeps the worker inbox O(1) per call and lets a
+   * consumer filter on durable delivery state instead of reconstructing intent
+   * from a Swarm-wide message scan.
+   *
+   * This is a read projection only. It never grants membership, delivery
+   * admission, or task settlement authority to the caller.
+   */
+  const memberInbox = Effect.fn("Swarm.memberInbox")(function* (request: {
+    readonly swarmID: Swarm.ID
+    readonly memberID: Swarm.MemberID
+    readonly limit?: number
+    readonly states?: ReadonlyArray<Swarm.DeliveryState>
+  }) {
+    const limit = Math.min(200, Math.max(1, Math.trunc(request.limit ?? 20)))
+    const states = request.states ?? (["pending", "claimed", "admitted"] as const)
+    const rows = yield* readDb
+      .select({ message: SwarmMessageTable, delivery: SwarmMessageDeliveryTable })
+      .from(SwarmMessageDeliveryTable)
+      .innerJoin(SwarmMessageTable, eq(SwarmMessageTable.id, SwarmMessageDeliveryTable.message_id))
+      .where(
+        and(
+          eq(SwarmMessageTable.swarm_id, request.swarmID),
+          eq(SwarmMessageDeliveryTable.recipient_member_id, request.memberID),
+          inArray(SwarmMessageDeliveryTable.state, [...states]),
+        ),
+      )
+      .orderBy(desc(SwarmMessageDeliveryTable.time_created), desc(SwarmMessageDeliveryTable.id))
+      .limit(limit)
+      .all()
+      .pipe(Effect.orDie)
+    return rows.map((row) => ({ message: hydrateMessage(row.message), delivery: hydrateDelivery(row.delivery) }))
+  })
+
   const deliveriesForMessage = Effect.fn("Swarm.deliveriesForMessage")(function* (messageID: Swarm.MessageID) {
     const rows = yield* readDb
       .select()
@@ -851,6 +890,7 @@ export function makeMessagingOperations(input: {
     claimableDeliveryIDs,
     messages,
     messageHistory,
+    memberInbox,
     deliveriesForMessage,
   }
 }

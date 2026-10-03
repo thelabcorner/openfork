@@ -245,6 +245,17 @@ export type ProviderHook = {
   id: string
   models?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
   /**
+   * Optional demand-driven model discovery. Unlike `models`, this is not part
+   * of passive all-provider catalog initialization; the host invokes it when
+   * this provider is actually selected.
+   */
+  discoverModels?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
+  /**
+   * Whether a successful discovery augments the passive model set or replaces
+   * it. Replacement is useful when the upstream live catalog is authoritative.
+   */
+  discoveryMode?: "merge" | "replace"
+  /**
    * Live multi-account identity roster. Consumers resolve labels/aliases to the
    * stable id before persisting or routing a model selection.
    */

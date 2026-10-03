@@ -5,6 +5,7 @@ import { define } from "./event"
 import { DateTimeUtcFromMillis, optional } from "./schema"
 import { Goal } from "./goal"
 import { Model } from "./model"
+import { ProviderRouteIntent } from "./model-select/provider-route-intent"
 import { ProjectID } from "./project-id"
 import { SessionID } from "./session-id"
 import { WorkspaceID } from "./workspace-id"
@@ -121,8 +122,6 @@ export const GoalAction = Schema.Struct({
   title: Schema.String,
   objective: Schema.String,
   criteria: optional(Schema.Array(Schema.String)),
-  /** Bounds for the unattended run; core applies tighter scheduled defaults. */
-  continuationPolicy: optional(Goal.ContinuationPolicy),
 }).annotate({ identifier: "ScheduledTask.GoalAction" })
 export interface GoalAction extends Schema.Schema.Type<typeof GoalAction> {}
 
@@ -131,6 +130,11 @@ export const Action = Schema.Struct({
   prompt: Schema.String,
   agent: optional(Schema.String),
   model: optional(Model.Ref),
+  /**
+   * Explicit execution-route intent. Legacy actions may omit this and continue
+   * to derive account intent from model.accountID at the execution boundary.
+   */
+  routeIntent: optional(ProviderRouteIntent.Info),
   goal: optional(GoalAction),
 }).annotate({ identifier: "ScheduledTask.Action" })
 export interface Action extends Schema.Schema.Type<typeof Action> {}

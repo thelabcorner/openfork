@@ -3,7 +3,7 @@ import type { AccountModelProvider } from "../model-account-identity"
 export type AutoPolicy = "sticky" | "headroom" | "spread"
 
 export type MultiAccountProvider = AccountModelProvider & {
-  accountsField: "workbuddyAccounts" | "verdentAccounts" | "zenAccounts"
+  accountsField: "workbuddyAccounts" | "zenAccounts"
   aliasMarkers: readonly string[]
   policies: readonly AutoPolicy[]
   headroomKind: "credits" | "window"
@@ -18,15 +18,6 @@ export const MULTI_ACCOUNT_PROVIDERS = {
     aliasMarkers: ["#ctx-"],
     policies: ["sticky"],
     headroomKind: "credits",
-    autoLabelKey: "dialog.model.account.auto",
-  },
-  verdent: {
-    id: "verdent",
-    accountPrefix: "vd-",
-    accountsField: "verdentAccounts",
-    aliasMarkers: [],
-    policies: ["sticky"],
-    headroomKind: "window",
     autoLabelKey: "dialog.model.account.auto",
   },
   opencode: {

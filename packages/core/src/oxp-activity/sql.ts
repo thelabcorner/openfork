@@ -1,11 +1,4 @@
-import {
-  index,
-  integer,
-  primaryKey,
-  sqliteTable,
-  text,
-  uniqueIndex,
-} from "drizzle-orm/sqlite-core"
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core"
 import type { OxpActivitySchema } from "./schema"
 
 export const OxpParentActivityTable = sqliteTable(
@@ -25,13 +18,7 @@ export const OxpParentActivityTable = sqliteTable(
     last_root_alias: text(),
     time_archived: integer(),
   },
-  (table) => [
-    index("oxp_parent_activity_last_seen_idx").on(
-      table.time_archived,
-      table.last_seen_at,
-      table.id,
-    ),
-  ],
+  (table) => [index("oxp_parent_activity_last_seen_idx").on(table.time_archived, table.last_seen_at, table.id)],
 )
 export const OxpCorrelationRefTable = sqliteTable(
   "oxp_correlation_ref",
@@ -72,41 +59,32 @@ export const OxpInvocationTable = sqliteTable(
     mutation_attempted: integer({ mode: "boolean" }).notNull().default(false),
     mutation_committed: integer({ mode: "boolean" }).notNull().default(false),
     safe_summary: text({ mode: "json" }).$type<OxpActivitySchema.SafeSummary>(),
+    context_request_chars: integer(),
+    context_request_source: text().$type<OxpActivitySchema.ContextExactSource>(),
+    context_request_schema: text().$type<OxpActivitySchema.ContextSchema>(),
+    context_result_chars: integer(),
+    context_result_source: text().$type<OxpActivitySchema.ContextExactSource>(),
+    context_result_schema: text().$type<OxpActivitySchema.ContextSchema>(),
     time_started: integer().notNull(),
     time_completed: integer(),
   },
   (table) => [
-    index("oxp_invocation_activity_started_idx").on(
-      table.activity_id,
-      table.time_started,
-      table.id,
-    ),
-    index("oxp_invocation_activity_status_started_idx").on(
-      table.activity_id,
-      table.status,
-      table.time_started,
-    ),
-    index("oxp_invocation_activity_host_epoch_idx").on(
-      table.activity_id,
-      table.host_run_id,
-      table.observed_epoch,
-    ),
+    index("oxp_invocation_activity_started_idx").on(table.activity_id, table.time_started, table.id),
+    index("oxp_invocation_activity_status_started_idx").on(table.activity_id, table.status, table.time_started),
+    index("oxp_invocation_activity_host_epoch_idx").on(table.activity_id, table.host_run_id, table.observed_epoch),
     index("oxp_invocation_status_host_idx").on(table.status, table.host_run_id),
     index("oxp_invocation_started_idx").on(table.time_started),
   ],
 )
 
-export const OxpInvocationDetailTable = sqliteTable(
-  "oxp_invocation_detail",
-  {
-    invocation_id: text()
-      .$type<OxpActivitySchema.InvocationID>()
-      .primaryKey()
-      .references(() => OxpInvocationTable.id, { onDelete: "cascade" }),
-    request: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
-    outcome: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
-  },
-)
+export const OxpInvocationDetailTable = sqliteTable("oxp_invocation_detail", {
+  invocation_id: text()
+    .$type<OxpActivitySchema.InvocationID>()
+    .primaryKey()
+    .references(() => OxpInvocationTable.id, { onDelete: "cascade" }),
+  request: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
+  outcome: text({ mode: "json" }).$type<OxpActivitySchema.InvocationDetail>(),
+})
 
 export const OxpInvocationLinkTable = sqliteTable(
   "oxp_invocation_link",

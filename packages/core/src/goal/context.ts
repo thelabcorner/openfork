@@ -41,7 +41,9 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const goals = yield* Goal.Service
 
-    const focused = (sessionID: SessionSchema.ID) => goals.focused(sessionID).pipe(Effect.map((value) => value !== undefined))
+    // This surface only needs focus presence. Loading Goal criteria and steps
+    // here makes every runner context preparation hydrate the full Goal.
+    const focused = (sessionID: SessionSchema.ID) => goals.isFocused(sessionID)
 
     const render = Effect.fn("GoalContext.render")(function* (sessionID: SessionSchema.ID) {
       return (yield* focused(sessionID)) ? MECHANISM_POLICY : undefined

@@ -134,9 +134,23 @@ export function requireDeliverableRow(database: Db, deliverableID: Swarm.Deliver
   )
 }
 
-export const validateSessionScope = Effect.fnUntraced(function* (
+export interface SessionBindingScope {
+  readonly projectID: typeof SwarmTable.$inferSelect.project_id
+  readonly workspaceID?: typeof SwarmTable.$inferSelect.workspace_id
+}
+
+/**
+ * Core-owned, read-only eligibility check for binding an ordinary interactive
+ * Session into a Swarm scope.
+ *
+ * High-level creation flows may call this before their first durable Swarm write
+ * so deterministic binding failures do not strand a `creating` aggregate.
+ * The actual `addMember` / `rebindMember` commit paths must still call the same
+ * validator again inside their transaction to close TOCTOU races.
+ */
+export const validateSessionBindingScope = Effect.fnUntraced(function* (
   database: Db,
-  swarm: typeof SwarmTable.$inferSelect,
+  scope: SessionBindingScope,
   sessionID: typeof SessionTable.$inferSelect.id,
 ) {
   const session = yield* database
@@ -162,13 +176,25 @@ export const validateSessionScope = Effect.fnUntraced(function* (
     return yield* new SwarmSchema.ValidationError({
       reason: `Swarm members must bind ordinary interactive Sessions; ${sessionID} is producer-owned.`,
     })
-  if (session.projectID !== swarm.project_id)
+  if (session.projectID !== scope.projectID)
     return yield* new SwarmSchema.ValidationError({
-      reason: `Session ${sessionID} belongs to project ${session.projectID ?? "none"}, not Swarm project ${swarm.project_id}.`,
+      reason: `Session ${sessionID} belongs to project ${session.projectID ?? "none"}, not Swarm project ${scope.projectID}.`,
     })
-  if (swarm.workspace_id && session.workspaceID && session.workspaceID !== swarm.workspace_id)
+  if (scope.workspaceID && session.workspaceID && session.workspaceID !== scope.workspaceID)
     return yield* new SwarmSchema.ValidationError({
-      reason: `Session ${sessionID} belongs to workspace ${session.workspaceID}, not Swarm workspace ${swarm.workspace_id}.`,
+      reason: `Session ${sessionID} belongs to workspace ${session.workspaceID}, not Swarm workspace ${scope.workspaceID}.`,
     })
   return session
+})
+
+export const validateSessionScope = Effect.fnUntraced(function* (
+  database: Db,
+  swarm: typeof SwarmTable.$inferSelect,
+  sessionID: typeof SessionTable.$inferSelect.id,
+) {
+  return yield* validateSessionBindingScope(
+    database,
+    { projectID: swarm.project_id, workspaceID: swarm.workspace_id },
+    sessionID,
+  )
 })

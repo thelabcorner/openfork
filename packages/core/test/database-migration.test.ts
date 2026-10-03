@@ -202,6 +202,139 @@ function schemaShape(db: TestDatabase) {
 }
 
 describe("DatabaseMigration", () => {
+  test("converges the pre-acquisition directory guard without granting legacy authority", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const target = migrations.find((migration) => migration.id === "20260924042906_directory_maintenance_guard")
+        expect(target).toBeDefined()
+        if (!target) return
+
+        yield* db.run(sql`
+          CREATE TABLE runtime_owner (
+            id text PRIMARY KEY
+          )
+        `)
+        yield* db.run(sql`
+          CREATE TABLE directory_maintenance_guard (
+            directory text PRIMARY KEY,
+            guard_id text NOT NULL,
+            owner_id text NOT NULL,
+            generation integer NOT NULL,
+            state text NOT NULL,
+            acquired_at integer NOT NULL,
+            released_at integer,
+            updated_at integer NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES runtime_owner(id),
+            CHECK(state in ('active', 'released', 'reconcile_required')),
+            CHECK((state = 'released' and released_at is not null)
+              or (state <> 'released' and released_at is null))
+          )
+        `)
+        yield* db.run(sql`CREATE INDEX directory_maintenance_guard_guard_idx ON directory_maintenance_guard (guard_id,state)`)
+        yield* db.run(sql`CREATE INDEX directory_maintenance_guard_owner_idx ON directory_maintenance_guard (owner_id,state)`)
+        yield* db.run(sql`
+          CREATE TABLE migration (
+            id text PRIMARY KEY,
+            time_completed integer NOT NULL,
+            checksum text
+          )
+        `)
+        yield* db.run(sql`INSERT INTO runtime_owner (id) VALUES ('owner_legacy')`)
+        yield* db.run(sql`
+          INSERT INTO directory_maintenance_guard
+            (directory, guard_id, owner_id, generation, state, acquired_at, released_at, updated_at)
+          VALUES
+            ('/a', 'guard-a', 'owner_legacy', 3, 'active', 10, NULL, 12),
+            ('/b', 'guard-b', 'owner_legacy', 4, 'released', 20, 30, 31)
+        `)
+        yield* db.run(sql`
+          INSERT INTO migration (id, time_completed, checksum)
+          VALUES ('20260924022626_directory_maintenance_guard', 1, 'legacy-dev-checksum')
+        `)
+
+        yield* DatabaseMigration.applyOnly(db, [target])
+        yield* DatabaseMigration.applyOnly(db, [target])
+
+        const columns = (yield* db.all<{ name: string }>(sql`PRAGMA table_info(directory_maintenance_guard)`)).map(
+          (column) => column.name,
+        )
+        expect(columns).toEqual([
+          "directory",
+          "guard_id",
+          "owner_id",
+          "acquisition_id",
+          "generation",
+          "state",
+          "acquired_at",
+          "released_at",
+          "updated_at",
+        ])
+
+        expect(
+          yield* db.all(sql`
+            SELECT directory, guard_id, owner_id, acquisition_id, generation, state,
+                   acquired_at, released_at, updated_at
+            FROM directory_maintenance_guard
+            ORDER BY directory
+          `),
+        ).toEqual([
+          {
+            directory: "/a",
+            guard_id: "guard-a",
+            owner_id: "owner_legacy",
+            acquisition_id: "directory-maintenance:legacy:2f61",
+            generation: 3,
+            state: "reconcile_required",
+            acquired_at: 10,
+            released_at: null,
+            updated_at: 12,
+          },
+          {
+            directory: "/b",
+            guard_id: "guard-b",
+            owner_id: "owner_legacy",
+            acquisition_id: "directory-maintenance:legacy:2f62",
+            generation: 4,
+            state: "released",
+            acquired_at: 20,
+            released_at: 30,
+            updated_at: 31,
+          },
+        ])
+
+        expect(
+          yield* db.all<{ id: string; checksum: string | null }>(sql`
+            SELECT id, checksum
+            FROM migration
+            WHERE id IN (
+              '20260924022626_directory_maintenance_guard',
+              '20260924042906_directory_maintenance_guard'
+            )
+            ORDER BY id
+          `),
+        ).toEqual([
+          {
+            id: "20260924022626_directory_maintenance_guard",
+            checksum: "legacy-dev-checksum",
+          },
+          {
+            id: target.id,
+            checksum: target.checksum,
+          },
+        ])
+
+        const indexes = (yield* db.all<{ name: string }>(sql`
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = 'directory_maintenance_guard'
+          ORDER BY name
+        `)).map((row) => row.name)
+        expect(indexes).toContain("directory_maintenance_guard_acquisition_idx")
+      }),
+    )
+  })
+
   test("backfills session-group memberships and remains re-runnable", async () => {
     await run(
       Effect.gen(function* () {
@@ -776,7 +909,12 @@ describe("DatabaseMigration", () => {
         yield* db.run(sql`DELETE FROM migration WHERE id = ${simplifySessionInputMigration.id}`)
         yield* DatabaseMigration.applyOnly(db, [simplifySessionInputMigration])
 
-        const database = Layer.succeed(Database.Service, { db, readDb: db, filename: ":memory:" })
+        const database = Layer.succeed(Database.Service, {
+          db,
+          readDb: db,
+          scanDb: () => Effect.succeed(db),
+          filename: ":memory:",
+        })
         yield* EventV2.Service.use((service) =>
           service.publish(SessionV1.Event.Updated, {
             sessionID: SessionSchema.ID.make("session"),

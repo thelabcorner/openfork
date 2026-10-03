@@ -58,38 +58,19 @@ export const FocusRole = Schema.Literals(["owner", "worker", "verifier"]).annota
 export type FocusRole = typeof FocusRole.Type
 
 /**
- * Optional execution bounds for Goal Mode. Goal Mode itself has one behavior:
- * every settled worker cycle is independently audited and, unless the Goal is
- * complete or explicitly stopped/blocked, another worker cycle is authorized.
- *
- * Bounds are opt-in producer policy. Omitted values mean no host-invented turn,
- * no-progress, duration, or token ceiling.
- */
-export interface ContinuationPolicy extends Schema.Schema.Type<typeof ContinuationPolicy> {}
-export const ContinuationPolicy = Schema.Struct({
-  maxConsecutiveTurns: optional(Schema.Number),
-  maxNoProgressTurns: optional(Schema.Number),
-  maxDurationMs: optional(Schema.Number),
-  tokenBudget: optional(Schema.Number),
-}).annotate({ identifier: "Goal.ContinuationPolicy" })
-
-/**
  * Independent evaluator configuration for automatic Goal execution.
  *
  * `model` is intentionally optional: when omitted the runtime inherits the
  * worker Session model. Persisting the override on the Goal keeps auditor
  * choice stable across workers, app restarts, and delegated Sessions.
  *
- * `blockedThreshold` and `maxAttempts` are opt-in policy. Without a blocked
- * threshold, an auditor `blocked` verdict stops autonomous re-entry but does
- * not manufacture durable Goal `blocked` state. Without maxAttempts, one full
- * audit runs; bounded in-conversation protocol repair remains an internal
- * correctness mechanism rather than a second hidden audit attempt.
+ * maxAttempts only bounds auditor protocol repair. It is not a Goal
+ * continuation limit: Goal Mode continues by definition until completion or a
+ * real blocker.
  */
 export interface AuditorPolicy extends Schema.Schema.Type<typeof AuditorPolicy> {}
 export const AuditorPolicy = Schema.Struct({
   model: Model.Ref.pipe(optional),
-  blockedThreshold: Schema.Number.pipe(optional),
   maxAttempts: Schema.Number.pipe(optional),
 }).annotate({ identifier: "Goal.AuditorPolicy" })
 
@@ -159,7 +140,10 @@ const AuditorVerdictBase = {
  * authorizes more work, it must say what the next worker should actually do.
  * `criteria` is the auditor's independent criterion-by-criterion verification
  * result. Core, not the model, decides how those findings mutate durable Goal
- * state and whether they are sufficient to complete the verification gate.
+ * state and whether they are sufficient to complete successfully. Goal Mode is
+ * intrinsically autonomous: an auditor either authorizes the next worker cycle,
+ * verifies completion, or records a genuine blocker. It does not own a separate
+ * terminal-failure escape hatch.
  */
 export const AuditorVerdict = Schema.Union([
   Schema.Struct({
@@ -171,7 +155,6 @@ export const AuditorVerdict = Schema.Union([
     ...AuditorVerdictBase,
     decision: Schema.Literal("blocked"),
     blocker: Schema.String,
-    continuationPrompt: Schema.String,
   }),
   Schema.Struct({
     ...AuditorVerdictBase,
@@ -214,7 +197,6 @@ export const Info = Schema.Struct({
   status: Status,
   revision: Schema.Number,
   auditorRuns: Schema.Number,
-  continuationPolicy: ContinuationPolicy,
   auditorPolicy: AuditorPolicy,
   blocker: optional(Schema.String),
   time: Schema.Struct({
@@ -254,7 +236,9 @@ export const FocusedGoal = Schema.Struct({
   automation: AutomationRuntime.pipe(optional),
 }).annotate({ identifier: "Goal.FocusedGoal" })
 
-export const AuditActor = Schema.Literals(["user", "agent", "auditor", "system"]).annotate({ identifier: "Goal.AuditActor" })
+export const AuditActor = Schema.Literals(["user", "agent", "auditor", "system"]).annotate({
+  identifier: "Goal.AuditActor",
+})
 export type AuditActor = typeof AuditActor.Type
 
 export const AuditEventType = Schema.Literals([

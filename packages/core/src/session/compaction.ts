@@ -155,20 +155,38 @@ const select = (
 ): { readonly head: string; readonly recent: string } | undefined => {
   const conversation = entries
     .filter((entry) => entry.message.type !== "compaction")
-    .map((entry) => serialize(entry.message))
-    .filter(Boolean)
+    .map((entry) => ({
+      text: serialize(entry.message),
+      // The latest live Goal continuation is executable orchestration state,
+      // not lossy summary material. A user-configured tiny recent-tail budget
+      // must never turn the auditor's exact next-cycle handoff into a paraphrase.
+      pinRecent:
+        entry.message.type === "synthetic" &&
+        entry.message.provenance?.owner === "host" &&
+        entry.message.provenance.source === SessionTurnProvenance.Source.GoalContinuation &&
+        entry.message.provenance.lifetime !== "historical",
+    }))
+    .filter((entry) => Boolean(entry.text))
   if (conversation.length === 0) return
   let total = 0
   let split = conversation.length
   for (let index = conversation.length - 1; index >= 0; index--) {
-    const next = total + Token.estimate(conversation[index])
+    const next = total + Token.estimate(conversation[index]!.text)
     if (next > tokens) break
     total = next
     split = index
   }
+  const pinned = conversation.findLastIndex((entry) => entry.pinRecent)
+  if (pinned >= 0 && pinned < split) split = pinned
   return {
-    head: conversation.slice(0, split).join("\n\n"),
-    recent: conversation.slice(split).join("\n\n"),
+    head: conversation
+      .slice(0, split)
+      .map((entry) => entry.text)
+      .join("\n\n"),
+    recent: conversation
+      .slice(split)
+      .map((entry) => entry.text)
+      .join("\n\n"),
   }
 }
 

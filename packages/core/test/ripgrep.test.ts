@@ -83,6 +83,32 @@ describe("Ripgrep", () => {
     ),
   )
 
+  it.live("drops result offsets in-stream before collecting a bounded page", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            fs.writeFile(
+              path.join(tmp.path, "page.txt"),
+              Array.from({ length: 5 }, (_, index) => `needle ${index + 1}`).join("\n") + "\n",
+            ),
+          )
+
+          const matches = yield* (yield* Ripgrep.Service).grep({
+            cwd: tmp.path,
+            pattern: "needle",
+            offset: 2,
+            limit: 2,
+          })
+
+          expect(matches.map((item) => item.line)).toEqual([3, 4])
+          expect(matches.map((item) => item.text)).toEqual(["needle 3", "needle 4"])
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("handles valid ripgrep JSON records larger than 64 KiB without failing the search", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

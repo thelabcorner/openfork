@@ -54,6 +54,11 @@ import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
 import { UsageRecord } from "../../usage/record"
 
+import { providerRequestHeaders } from "./provider-request-headers"
+
+// Re-exported so existing runner-hosted-identity proof keeps its import path.
+export { providerRequestHeaders } from "./provider-request-headers"
+
 function tokenCount(tokens: {
   readonly input: number
   readonly output: number
@@ -401,6 +406,7 @@ const layer = Layer.effect(
       cycleSource: SessionInput.AdmissionClass,
       promotion: RunPromotion | undefined,
       step: number,
+      semanticStartedAt: number | undefined,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
       const session = yield* getSession(sessionID)
@@ -421,6 +427,9 @@ const layer = Layer.effect(
       // yet been promoted. Publish current mutable Goal state here so a later
       // real user steer remains the newer conversational instruction.
       yield* reconcileGoalProjection(state, session.id)
+      const pendingRouteEntry = promotion
+        ? yield* SessionInput.firstPendingEntry(db, session.id, promotion.lane)
+        : undefined
       if (promotion) {
         if (promotion.lane.admissionClass !== cycleSource)
           return yield* Effect.die(
@@ -432,7 +441,11 @@ const layer = Layer.effect(
           return { state: "yielded" as const, reason: "promotion-lost" as const }
         if (promoted.promoted > 0) currentStep = 1
       }
-      const resolvedModel = yield* models.resolveWithInfo(session)
+      const routeIntent =
+        pendingRouteEntry?.item.type === "synthetic"
+          ? pendingRouteEntry.item.execution?.routeIntent
+          : undefined
+      const resolvedModel = yield* models.resolveWithInfo(session, routeIntent)
       const model = resolvedModel.model
       const system =
         initialized ??
@@ -468,11 +481,13 @@ const layer = Layer.effect(
       const request = LLM.request({
         model,
         http: {
-          headers: {
-            "x-session-affinity": session.id,
-            "X-Session-Id": session.id,
-            ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),
-          },
+          headers: providerRequestHeaders({
+            providerID: model.provider,
+            projectID: session.projectID,
+            sessionID: session.id,
+            requestID: workerTurn.message.id,
+            parentSessionID: session.parentID,
+          }),
         },
         providerOptions: { openai: { promptCacheKey } },
         system: [agent.info?.system, system.baseline]
@@ -498,6 +513,13 @@ const layer = Layer.effect(
       // a User arriving after host/automatic selection wins the next safe cycle.
       if (yield* SessionInput.hasHigherPriorityPending(db, session.id, cycleSource))
         return { state: "yielded" as const, reason: "higher-priority-input" as const }
+
+      // Publish the semantic turn clock only after final admission revalidation,
+      // but preserve the timestamp captured before preflight/compaction so the
+      // user-visible elapsed time includes that accepted turn's preparation.
+      // Recursive compaction recovery carries the same timestamp and therefore
+      // cannot restart the clock.
+      if (semanticStartedAt !== undefined) yield* telemetry.startTurn(session.id, semanticStartedAt)
 
       // Start filesystem capture before consuming the provider, but do not make
       // network/model generation wait for Git. Bridge the child through a
@@ -707,6 +729,7 @@ const layer = Layer.effect(
               sessionID: session.id,
               providerID: model.provider,
               modelID: model.id,
+              ...(resolvedModel.route ? { route: resolvedModel.route } : {}),
               variant: session.model?.variant,
               agent: agent.id,
               createdAt: DateTime.toEpochMillis(requestSentAt),
@@ -742,6 +765,11 @@ const layer = Layer.effect(
             step: currentStep,
             tokens: stepSettlement ? tokenCount(stepSettlement.tokens) : 0,
             sourceMessageID: workerTurn.message.id,
+            // Authoritative success bit. `executed` alone is NOT proof of a
+            // successful provider cycle: a provider-error path still returns
+            // `executed` with continuation forced false. Only this bit may
+            // authorize recording cycle completion for the exact input.
+            completedWithoutProviderError: !publisher.hasProviderError(),
           }
         }),
       )
@@ -757,6 +785,7 @@ const layer = Layer.effect(
           readonly step: number
           readonly tokens: number
           readonly sourceMessageID: SessionMessage.ID
+          readonly completedWithoutProviderError: boolean
         }
 
     type RunTurn = (
@@ -765,11 +794,12 @@ const layer = Layer.effect(
       cycleSource: SessionInput.AdmissionClass,
       promotion: RunPromotion | undefined,
       step: number,
+      semanticStartedAt?: number,
     ) => Effect.Effect<RunTurnResult, RunError>
 
     const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(
-      function* (state, sessionID, cycleSource, promotion, step) {
-        return yield* runTurnAttempt(state, sessionID, cycleSource, promotion, step).pipe(
+      function* (state, sessionID, cycleSource, promotion, step, semanticStartedAt) {
+        return yield* runTurnAttempt(state, sessionID, cycleSource, promotion, step, semanticStartedAt).pipe(
           Effect.catchDefect(
             Effect.fnUntraced(function* (defect) {
               if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
@@ -782,6 +812,7 @@ const layer = Layer.effect(
                 cycleSource,
                 undefined,
                 defect.transition.step,
+                semanticStartedAt,
               )
             }),
           ),
@@ -789,13 +820,23 @@ const layer = Layer.effect(
       },
     )
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (state, sessionID, cycleSource, promotion, step) {
+    const runTurn: RunTurn = Effect.fnUntraced(function* (
+      state,
+      sessionID,
+      cycleSource,
+      promotion,
+      step,
+      semanticStartedAt,
+    ) {
+      const startedAt =
+        semanticStartedAt ?? (step === 1 ? DateTime.toEpochMillis(yield* DateTime.now) : undefined)
       return yield* runTurnAttempt(
         state,
         sessionID,
         cycleSource,
         promotion,
         step,
+        startedAt,
         compaction.compactAfterOverflow,
       ).pipe(
         Effect.catchDefect(
@@ -809,8 +850,9 @@ const layer = Layer.effect(
                 cycleSource,
                 undefined,
                 defect.transition.step,
+                startedAt,
               )
-            return yield* runTurn(state, sessionID, cycleSource, undefined, defect.transition.step)
+            return yield* runTurn(state, sessionID, cycleSource, undefined, defect.transition.step, startedAt)
           }),
         ),
       )
@@ -826,15 +868,62 @@ const layer = Layer.effect(
       // promotion). SessionStore.get reads fresh from the DB, so the gate is
       // sound with no cache staleness.
       if (session.pausedAt !== undefined) return
+      const automationRuntime = yield* goalAutomation.runtime(input.sessionID)
+      const auditRecovery =
+        automationRuntime?.phase === "audit_requested"
+          ? yield* goalAutomation.claimAuditRecovery(input.sessionID)
+          : undefined
       const initialLane = yield* SessionInput.nextPendingLane(db, input.sessionID)
       let claimedAutomatic =
-        !initialLane || initialLane.admissionClass === "automatic"
+        !auditRecovery && (!initialLane || initialLane.admissionClass === "automatic")
           ? yield* goalAutomation.claim(input.sessionID)
           : undefined
-      if (!input.force && !initialLane && !claimedAutomatic) return
+      if (!input.force && !initialLane && !claimedAutomatic && !auditRecovery) return
       const history = yield* makeRunnerHistoryProjection({ events, readDb, sessionID: input.sessionID })
       const state: RunState = { history, workerTurns: new Map(), recoveredInterruptedTools: false, baselineSeq: -1 }
       return yield* Effect.gen(function* () {
+        if (auditRecovery) {
+          // The worker cycle already settled before the interruption/restart.
+          // Re-audit that durable work; never rematerialize/re-execute its
+          // continuation merely because the auditor lease was lost.
+          const activeEntries = yield* state.history.entries(state.baselineSeq)
+          const workerTurn = yield* resolveWorkerTurn(state, input.sessionID, activeEntries)
+          if (!workerTurn) {
+            yield* goalAutomation.failAudit({
+              sessionID: input.sessionID,
+              error: "Goal audit recovery cannot resolve the completed worker cycle.",
+            })
+          } else {
+            const reservation = auditRecovery.reservation
+            const audit = yield* goalAuditor.evaluate({
+              sessionID: input.sessionID,
+              session,
+              latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
+              ...(reservation ? { reservationID: reservation.id } : {}),
+            })
+            const pendingUser =
+              (yield* SessionInput.pendingLanes(db, input.sessionID, [
+                { admissionClass: "user", delivery: "steer" },
+                { admissionClass: "user", delivery: "queue" },
+              ])).size > 0
+            yield* goalAutomation.afterTurn({
+              sessionID: input.sessionID,
+              origin: reservation ? "automatic" : "user",
+              ...(reservation ? { reservationID: reservation.id } : {}),
+              sourceMessageID: reservation?.sourceMessageID
+                ? SessionMessage.ID.make(reservation.sourceMessageID)
+                : workerTurn.message.id,
+              expectedLatestUserSeq:
+                reservation?.expectedLatestUserSeq ?? (yield* SessionInput.latestUserSeq(db, input.sessionID)),
+              ...(reservation && pendingUser ? { supersededByUser: true } : {}),
+              audit,
+              requireAuditCursor: audit.auditorSessionID !== undefined,
+            })
+            yield* reconcileGoalProjection(state, input.sessionID)
+            yield* telemetry.idle(input.sessionID)
+          }
+        }
+
         let nextLane = initialLane
         let forceAvailable = input.force
         while (true) {
@@ -892,7 +981,11 @@ const layer = Layer.effect(
                 Effect.catchDefect((defect) =>
                   defect instanceof SessionInput.AdmissionFenceConflict
                     ? goalAutomation
-                        .release({ sessionID: input.sessionID, reservationID: cycleAutomatic!.id })
+                        // The frozen User fence is terminal for this automatic
+                        // continuation. Releasing it would make claim() return
+                        // the same stale reservation on the next loop turn,
+                        // producing an unbounded admit/rollback retry loop.
+                        .cancel(input.sessionID, cycleAutomatic!.id)
                         .pipe(Effect.as({ state: "superseded" as const }))
                     : Effect.die(defect),
                 ),
@@ -942,6 +1035,12 @@ const layer = Layer.effect(
           let cycleTokens = 0
           let cycleSourceMessageID: SessionMessage.ID | undefined
           let spentProvider = false
+          // A cycle that yielded after already spending a provider step is not
+          // a completed cycle, and neither is one whose provider reported an
+          // error. Both are tracked explicitly so partially executed work can
+          // never be recorded as cycle completion for its exact input.
+          let cycleYielded = false
+          let cycleProviderFailed = false
           let needsContinuation = true
           let step = 1
           let promotion = cyclePromotion
@@ -953,8 +1052,12 @@ const layer = Layer.effect(
                   : Effect.void,
               ),
             )
-            if (result.state === "yielded") break
+            if (result.state === "yielded") {
+              cycleYielded = true
+              break
+            }
             spentProvider = true
+            if (!result.completedWithoutProviderError) cycleProviderFailed = true
             if (cycleSource === "user") cycleUserFence = yield* SessionInput.latestUserSeq(db, input.sessionID)
             cycleTokens += result.tokens
             cycleSourceMessageID = result.sourceMessageID
@@ -985,14 +1088,10 @@ const layer = Layer.effect(
           }
 
           const pendingUser =
-            (yield* SessionInput.hasPendingLane(db, input.sessionID, {
-              admissionClass: "user",
-              delivery: "steer",
-            })) ||
-            (yield* SessionInput.hasPendingLane(db, input.sessionID, {
-              admissionClass: "user",
-              delivery: "queue",
-            }))
+            (yield* SessionInput.pendingLanes(db, input.sessionID, [
+              { admissionClass: "user", delivery: "steer" },
+              { admissionClass: "user", delivery: "queue" },
+            ])).size > 0
 
           if (!spentProvider) {
             if (cycleAutomatic) {
@@ -1013,15 +1112,21 @@ const layer = Layer.effect(
             latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
             ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
           })
+          const pendingUserAfterAudit =
+            pendingUser ||
+            (yield* SessionInput.pendingLanes(db, input.sessionID, [
+              { admissionClass: "user", delivery: "steer" },
+              { admissionClass: "user", delivery: "queue" },
+            ])).size > 0
           const decision = yield* goalAutomation.afterTurn({
             sessionID: input.sessionID,
             origin: cycleSource,
             ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
             ...(cycleSourceMessageID ? { sourceMessageID: cycleSourceMessageID } : {}),
             expectedLatestUserSeq: cycleUserFence,
-            ...(cycleSource !== "user" && pendingUser ? { supersededByUser: true } : {}),
-            tokens: cycleTokens,
+            ...(cycleSource !== "user" && pendingUserAfterAudit ? { supersededByUser: true } : {}),
             audit,
+            requireAuditCursor: audit.auditorSessionID !== undefined,
           })
 
           // The auditor may have changed lifecycle status, blocker, criteria, or
@@ -1030,10 +1135,27 @@ const layer = Layer.effect(
           // waiting, this also guarantees the human turn is promoted after the
           // state it is responding to.
           yield* reconcileGoalProjection(state, input.sessionID)
+          // Exact cycle completion for the single input this cycle ran from.
+          // The marker lives on that SessionInput row alone, so a later peer
+          // turn or a new execution generation can never make it cover work
+          // that never completed. This is execution-ended truth, never a
+          // semantic Swarm settlement.
+          if (cycleSourceMessageID && !cycleYielded && !cycleProviderFailed) {
+            const completion = yield* SessionInput.complete(db, events, {
+              sessionID: input.sessionID,
+              id: cycleSourceMessageID,
+            })
+            if (completion.state !== "completed")
+              yield* Effect.logDebug("Session cycle completion was not recorded for its exact input", {
+                sessionID: input.sessionID,
+                messageID: cycleSourceMessageID,
+                state: completion.state,
+              })
+          }
           // This cycle is the semantic user-visible turn boundary. A single
-          // cycle may contain many provider steps/tool loops, but a queued or
-          // automatic input promoted by the next loop is a fresh turn and must
-          // receive a fresh `turnStartedAt` on its first provider begin.
+          // cycle may contain many provider steps/tool loops. Clear the settled
+          // clock here; the next accepted cycle establishes its fresh clock via
+          // startTurn() before provider dispatch (begin() remains a fallback).
           yield* telemetry.idle(input.sessionID)
           // `decision.reservation` is intentionally not claimed here. The next
           // loop iteration re-runs SessionInput priority first, so a user/host
@@ -1054,6 +1176,7 @@ const layer = Layer.effect(
         // Interrupts and defects can leave before the normal cycle boundary.
         // Always release the live turn latch so a later run cannot inherit an
         // old turn start timestamp.
+        Effect.ensuring(goalAutomation.requeueClaim(input.sessionID)),
         Effect.ensuring(telemetry.idle(input.sessionID)),
         Effect.ensuring(history.close),
       )

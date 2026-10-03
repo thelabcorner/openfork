@@ -67,18 +67,191 @@ export const WorkspacePolicy = Schema.Union([
 ]).annotate({ identifier: "Swarm.WorkspacePolicy" })
 export type WorkspacePolicy = typeof WorkspacePolicy.Type
 
+/**
+ * Closed vocabulary of provider/model runtime capabilities a managed member can
+ * require from its execution profile.
+ *
+ * This is a deliberately different axis from {@link MemberCapabilities} `tags`.
+ * Tags are semantic/routing labels a coordinator invents ("research", "audit",
+ * "preregistration"). Model requirements are provider/model facts the runtime
+ * resolves against the live catalog and can prove or disprove. The two used to
+ * share one unvalidated `requestedCapabilities: string[]`, which let a persisted
+ * Swarm request the tag "preregistration" and leave every worker permanently
+ * unbound with zero task runs. Making this a closed set makes that unrepresentable.
+ */
+export const ModelRequirement = Schema.Literals([
+  "toolcall",
+  "reasoning",
+  "attachment",
+  "temperature",
+  "input_text",
+  "input_audio",
+  "input_image",
+  "input_video",
+  "input_pdf",
+  "output_text",
+  "output_audio",
+  "output_image",
+  "output_video",
+  "output_pdf",
+]).annotate({ identifier: "Swarm.ModelRequirement" })
+export type ModelRequirement = typeof ModelRequirement.Type
+
 export interface MemberExecutionProfile extends Schema.Schema.Type<typeof MemberExecutionProfile> {}
 export const MemberExecutionProfile = Schema.Struct({
   agent: Agent.ID,
   model: Model.Ref,
   permissionBoundary: Permission.Boundary,
-  requestedCapabilities: optional(Schema.Array(Schema.String)),
+  /**
+   * Capabilities the resolved provider/model must actually publish. Every entry
+   * is checked before the first durable Swarm write and again before the managed
+   * member Session is materialized.
+   *
+   * Rows persisted before this rename carry the retired `requestedCapabilities`
+   * key. That key is a migration input only: it is absent from this contract and
+   * never re-encoded. Read it through {@link normalizeLegacyExecutionProfile},
+   * which recovers recognized runtime requirements and refuses to silently
+   * weaken an unrecognized one.
+   */
+  modelRequirements: optional(Schema.Array(ModelRequirement)),
 }).annotate({ identifier: "Swarm.MemberExecutionProfile" })
 
 export interface MemberCapabilities extends Schema.Schema.Type<typeof MemberCapabilities> {}
 export const MemberCapabilities = Schema.Struct({
+  /** Semantic/routing labels for this member. Never a provider/model requirement. */
   tags: Schema.Array(Schema.String),
+  /**
+   * Legacy stored capability values that were actually semantic routing tags.
+   * Reported for operator visibility only; never a reason to refuse a member.
+   */
+  legacyRoutingTags: optional(Schema.Array(Schema.String)),
+  /**
+   * Legacy stored capability values this runtime cannot map onto the closed
+   * {@link ModelRequirement} vocabulary and therefore cannot prove against the
+   * model catalog.
+   *
+   * A non-empty list is a fail-closed signal: the member's historical profile
+   * expressed a constraint nothing can verify, so it must not be materialized
+   * rather than silently run against a possibly-wrong model.
+   */
+  legacyUnprovenRequirements: optional(Schema.Array(Schema.String)),
 }).annotate({ identifier: "Swarm.MemberCapabilities" })
+
+/**
+ * Legacy `requestedCapabilities` spellings that were real provider/model runtime
+ * capabilities, mapped onto the closed {@link ModelRequirement} vocabulary.
+ *
+ * Keys are compared after trim + lowercase, matching the retired runtime
+ * matcher. Anything absent here is NOT silently discarded; see
+ * {@link normalizeLegacyExecutionProfile}.
+ */
+export const LEGACY_MODEL_REQUIREMENT_ALIASES: { readonly [legacy: string]: ModelRequirement } = {
+  tools: "toolcall",
+  toolcall: "toolcall",
+  reasoning: "reasoning",
+  attachment: "attachment",
+  temperature: "temperature",
+  text: "input_text",
+  "input:text": "input_text",
+  input_text: "input_text",
+  audio: "input_audio",
+  "input:audio": "input_audio",
+  input_audio: "input_audio",
+  image: "input_image",
+  "input:image": "input_image",
+  input_image: "input_image",
+  video: "input_video",
+  "input:video": "input_video",
+  input_video: "input_video",
+  pdf: "input_pdf",
+  "input:pdf": "input_pdf",
+  input_pdf: "input_pdf",
+  "output:text": "output_text",
+  output_text: "output_text",
+  "output:audio": "output_audio",
+  output_audio: "output_audio",
+  "output:image": "output_image",
+  output_image: "output_image",
+  "output:video": "output_video",
+  output_video: "output_video",
+  "output:pdf": "output_pdf",
+  output_pdf: "output_pdf",
+}
+
+/**
+ * Semantic routing tags observed in persisted `requestedCapabilities` columns.
+ *
+ * These were never provider/model requirements, so keeping them as requirements
+ * stranded their members forever. They are reported (see
+ * {@link normalizeLegacyExecutionProfile}) rather than migrated, because this
+ * schema cannot authoritatively rewrite the member's separate `tags` column.
+ */
+export const LEGACY_SEMANTIC_ROUTING_TAGS: readonly string[] = ["research", "preregistration", "audit", "adversarial"]
+
+export interface LegacyProfileNormalization {
+  readonly profile: MemberExecutionProfile
+  /** Legacy values recognized as semantic routing tags; reported, not migrated. */
+  readonly routingTags: readonly string[]
+  /** Legacy values that cannot be proven against the model catalog. */
+  readonly unproven: readonly string[]
+}
+
+/**
+ * Compatibility boundary for durable `desired_profile` JSON written before
+ * {@link ModelRequirement} existed.
+ *
+ * Raw hydration means historical rows still carry `requestedCapabilities`. The
+ * contract intentionally has no such key, so this function is the one place
+ * that converts stored state into the current contract:
+ *
+ * - recognized runtime aliases migrate to `modelRequirements`;
+ * - recognized semantic routing tags are reported, not silently reinterpreted;
+ * - anything else is reported as unproven, so the member fails closed instead
+ *   of running against a model that may not satisfy the original constraint.
+ *
+ * Pure: safe to call from a read projection.
+ */
+export function normalizeLegacyExecutionProfile(stored: unknown): LegacyProfileNormalization {
+  const raw = (stored && typeof stored === "object" ? stored : {}) as {
+    requestedCapabilities?: unknown
+    modelRequirements?: unknown
+  }
+  const legacy = Array.isArray(raw.requestedCapabilities) ? raw.requestedCapabilities : []
+  const current = Array.isArray(raw.modelRequirements) ? (raw.modelRequirements as ModelRequirement[]) : []
+
+  const migrated = new Set<ModelRequirement>(current)
+  const routingTags: string[] = []
+  const unproven: string[] = []
+  const semantic = new Set(LEGACY_SEMANTIC_ROUTING_TAGS)
+
+  for (const value of legacy) {
+    if (typeof value !== "string") {
+      unproven.push(`legacy capability entry is not a string: ${JSON.stringify(value)}`)
+      continue
+    }
+    const key = value.trim().toLowerCase()
+    const alias = LEGACY_MODEL_REQUIREMENT_ALIASES[key]
+    if (alias) {
+      migrated.add(alias)
+      continue
+    }
+    if (semantic.has(key)) {
+      routingTags.push(value.trim())
+      continue
+    }
+    unproven.push(`"${value}" is not a known model requirement and cannot be proven against the model catalog`)
+  }
+
+  const profile: Record<string, unknown> = { ...(stored as Record<string, unknown>) }
+  delete profile.requestedCapabilities
+  if (migrated.size > 0) profile.modelRequirements = [...migrated]
+  else delete profile.modelRequirements
+  return {
+    profile: profile as unknown as MemberExecutionProfile,
+    routingTags,
+    unproven,
+  }
+}
 
 /**
  * Deliberately small in the first milestone. New policy knobs may be added as
@@ -117,6 +290,11 @@ export const TaskRunStatus = Schema.Literals([
   "failed",
   "cancelled",
   "superseded",
+  // Execution reached a proven quiescent end but the worker never settled the
+  // task semantically. Truthfully distinct from completed (never claimed
+  // success) and from failed (never a semantic failure), and terminal so no
+  // later lifecycle path can mistake the run for live work.
+  "unsettled",
 ]).annotate({ identifier: "Swarm.TaskRunStatus" })
 export type TaskRunStatus = typeof TaskRunStatus.Type
 
@@ -269,6 +447,8 @@ export const TaskRun = Schema.Struct({
   status: TaskRunStatus,
   failureKind: optional(TaskFailureKind),
   failureDetail: optional(Schema.String),
+  /** Bounded result authored by the worker that successfully completed this run. */
+  resultSummary: optional(Schema.String),
   admittedAt: optional(DateTimeUtcFromMillis),
   startedAt: optional(DateTimeUtcFromMillis),
   endedAt: optional(DateTimeUtcFromMillis),
@@ -367,6 +547,102 @@ export const Summary = Schema.Struct({
   workingTaskCount: Schema.Int,
   pendingDeliveryCount: Schema.Int,
 }).annotate({ identifier: "Swarm.Summary" })
+
+/**
+ * Compact, bounded lifecycle observability for exactly one Swarm.
+ *
+ * Authoritative source: durable `swarm_*` rows only, grouped by the Swarm domain
+ * owner at read time. No field may be reconstructed from Session message
+ * history, part scans, rendered timeline rows, or a client-side recount, and no
+ * consumer may re-derive these numbers per rendered row.
+ *
+ * The counters deliberately keep three terminal run facts apart so operational
+ * observability cannot manufacture semantic truth:
+ *
+ * - `completed`/`failed` are explicit settlements the worker (or a reviewer)
+ *   actually declared;
+ * - `unsettled` is a proven quiescent execution end with **no** semantic
+ *   settlement — neither success nor failure;
+ * - `superseded` plus `unowned` are operational churn: authority loss, expiry,
+ *   preemption, or an assignment whose lease is gone.
+ */
+export interface Reliability extends Schema.Schema.Type<typeof Reliability> {}
+export const Reliability = Schema.Struct({
+  tasks: Schema.Struct({
+    total: Schema.Int,
+    pending: Schema.Int,
+    blocked: Schema.Int,
+    ready: Schema.Int,
+    working: Schema.Int,
+    reviewPending: Schema.Int,
+    changesRequested: Schema.Int,
+    completed: Schema.Int,
+    failed: Schema.Int,
+    cancelled: Schema.Int,
+  }).annotate({ identifier: "Swarm.ReliabilityTasks" }),
+  runs: Schema.Struct({
+    total: Schema.Int,
+    admitted: Schema.Int,
+    running: Schema.Int,
+    completed: Schema.Int,
+    failed: Schema.Int,
+    cancelled: Schema.Int,
+    unsettled: Schema.Int,
+    superseded: Schema.Int,
+    /** Failed runs whose durable `failure_kind` is `semantic` (task-true failure). */
+    semanticFailure: Schema.Int,
+    /** Failed runs whose durable `failure_kind` is anything operational. */
+    operationalFailure: Schema.Int,
+    /**
+     * Admitted/running runs with no owning lease. An owning lease is `active`
+     * **or** `human_hold`: a human-preempted lease still fences its run, so it
+     * must not be reported as lost authority. A non-zero value means execution
+     * authority was actually replaced while the run still looks live, which is
+     * the measurable pre-condition of an uncontrolled replay loop.
+     */
+    unowned: Schema.Int,
+  }).annotate({ identifier: "Swarm.ReliabilityRuns" }),
+  leases: Schema.Struct({
+    active: Schema.Int,
+    humanHold: Schema.Int,
+    retiring: Schema.Int,
+    /** Non-retiring leases whose deadline is already past at read time. */
+    expired: Schema.Int,
+  }).annotate({ identifier: "Swarm.ReliabilityLeases" }),
+  members: Schema.Struct({
+    total: Schema.Int,
+    managedWorker: Schema.Int,
+    boundManagedWorker: Schema.Int,
+    /**
+     * Managed workers holding a durable desired execution profile but no live
+     * Session binding. This proves an unbound roster intent, **not** that
+     * materialization failed: a worker that was simply never dispatched has the
+     * same shape. Materialization failure still requires a durable
+     * materialization-outcome field owned by the creation-preflight lane.
+     */
+    unboundConfiguredManagedWorker: Schema.Int,
+    held: Schema.Int,
+    stopped: Schema.Int,
+  }).annotate({ identifier: "Swarm.ReliabilityMembers" }),
+  collaboration: Schema.Struct({
+    messages: Schema.Int,
+    deliveries: Schema.Int,
+    pendingDeliveries: Schema.Int,
+    claimedDeliveries: Schema.Int,
+    admittedDeliveries: Schema.Int,
+    expiredDeliveries: Schema.Int,
+    failedDeliveries: Schema.Int,
+    /** Deliveries that needed at least one retry/defer cycle. */
+    retriedDeliveries: Schema.Int,
+    blackboardEntries: Schema.Int,
+    /** Successful Blackboard writes: initial create plus every CAS overwrite. */
+    blackboardWrites: Schema.Int,
+    /** Retained claim rows for this Swarm, including released and expired ones. */
+    totalClaimRows: Schema.Int,
+    deliverables: Schema.Int,
+    deliverablesAwaitingVerdict: Schema.Int,
+  }).annotate({ identifier: "Swarm.ReliabilityCollaboration" }),
+}).annotate({ identifier: "Swarm.Reliability" })
 
 export interface Detail extends Schema.Schema.Type<typeof Detail> {}
 export const Detail = Schema.Struct({

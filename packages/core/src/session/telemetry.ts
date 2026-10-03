@@ -20,6 +20,7 @@ export const Updated = TelemetrySchema.Updated
 const FLUSH_DELAY_MS = 75
 const IDLE_TTL_MS = 15 * 60_000
 const MAX_LIVE_STATES = 2048
+const monotonicNow = () => performance.now()
 
 type ContentKind = "text" | "reasoning"
 
@@ -67,11 +68,30 @@ type MutableInfo = {
 
 type LiveState = {
   info: MutableInfo
-  contentStarts: Map<string, { readonly kind: ContentKind; readonly at: number }>
+  contentStarts: Map<string, { readonly kind: ContentKind; readonly monotonicAt: number }>
   toolStarts: Map<string, number>
+  /** Process-local monotonic anchors for live elapsed-time projection. */
+  turnStartedMonotonic?: number
+  phaseStartedMonotonic?: number
   stepGeneratedMs: number
   stepToolMs: number
+  /** Provider events observed for the currently active physical attempt. Live-only. */
+  providerEvents: number
+  /** Linearization bit: newer transcript work claimed this still-unproven attempt. */
+  providerPreempted: boolean
 }
+
+export type ProviderAttempt = {
+  readonly assistantMessageID?: string
+  readonly requestSentAt: number
+  readonly observedEvents: number
+  readonly streamedAt?: number
+  readonly completedAt?: number
+}
+
+export type ProviderExecutionClaim =
+  | { readonly kind: "retry"; readonly assistantMessageID?: string }
+  | ({ readonly kind: "attempt" } & ProviderAttempt)
 
 export type BeginInput = {
   readonly sessionID: string
@@ -90,6 +110,8 @@ export type ObserveInput = {
   readonly sessionID: string
   readonly event: LLMEvent
   readonly at?: number
+  /** Deterministic test/adapter override; production defaults to performance.now(). */
+  readonly monotonicAt?: number
 }
 
 export type SettleInput = {
@@ -101,10 +123,20 @@ export type SettleInput = {
 }
 
 export interface Interface {
+  /**
+   * Start a fresh user-visible turn before provider dispatch. This is the
+   * semantic clock boundary; provider retries/tool loops call begin() without
+   * resetting it.
+   */
+  readonly startTurn: (sessionID: string, at?: number, monotonicAt?: number) => Effect.Effect<void>
   /** Begin one provider attempt. Never reads storage or location services. */
   readonly begin: (input: BeginInput) => Effect.Effect<void>
-  /** Observe one already-produced provider event; O(1), memory-only. */
-  readonly observe: (input: ObserveInput) => Effect.Effect<void>
+  /**
+   * Observe one provider event. Returns false when a zero-progress preemption
+   * claim already owns this attempt, in which case the caller must not perform
+   * event-specific side effects.
+   */
+  readonly observe: (input: ObserveInput) => Effect.Effect<boolean>
   /** Provider response body ended; local tools may still be settling. */
   readonly streamed: (sessionID: string, at?: number) => Effect.Effect<void>
   /** Persist one compact settled step; no token/delta writes reach SQLite. */
@@ -112,6 +144,28 @@ export interface Interface {
   readonly retry: (sessionID: string, at?: number) => Effect.Effect<void>
   readonly idle: (sessionID: string, at?: number) => Effect.Effect<void>
   readonly fail: (sessionID: string, at?: number) => Effect.Effect<void>
+  /**
+   * Snapshot the currently active physical provider attempt, if this process
+   * owns one. This is descriptive liveness state, not admission/preemption
+   * policy, and intentionally disappears when the process dies.
+   */
+  readonly providerAttempt: (sessionID: string) => Effect.Effect<ProviderAttempt | undefined>
+  /**
+   * Atomically claims zero-progress provider execution: either retry recovery
+   * before its next physical request, or a live physical attempt that has
+   * produced zero provider events. The optional assistant ID generation-fences
+   * the claim. This is liveness synchronization only; callers own policy.
+   */
+  readonly claimUnprovenProviderExecution: (
+    sessionID: string,
+    assistantMessageID?: string,
+  ) => Effect.Effect<ProviderExecutionClaim | undefined>
+  /**
+   * Snapshot the process-global live set without touching durable history or
+   * materializing a Location/Instance. This intentionally reports only
+   * non-idle in-memory telemetry states; durable rows are settled history.
+   */
+  readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
   /** Bootstrap-free batched read. Storage only; never creates a Location/Instance. */
   readonly snapshot: (sessionIDs: readonly string[]) => Effect.Effect<Record<string, Info>>
 }
@@ -191,9 +245,17 @@ function rowInfo(row: typeof SessionTelemetryTable.$inferSelect): Info {
   }
 }
 
-function cloneInfo(info: MutableInfo): Info {
+function cloneInfo(state: LiveState, sampledAt: number, sampledMonotonic: number): Info {
+  const info = state.info
   return {
     ...info,
+    sampledAt,
+    ...(info.turnStartedAt === undefined || state.turnStartedMonotonic === undefined
+      ? {}
+      : { turnElapsedMs: Math.max(0, sampledMonotonic - state.turnStartedMonotonic) }),
+    ...(info.phase === "idle" || info.phaseStartedAt === undefined || state.phaseStartedMonotonic === undefined
+      ? {}
+      : { phaseElapsedMs: Math.max(0, sampledMonotonic - state.phaseStartedMonotonic) }),
     model: info.model && { ...info.model },
     context: info.context && {
       model: { ...info.context.model },
@@ -249,9 +311,11 @@ const layer = Layer.effect(
       const ids = Array.from(dirty)
       dirty.clear()
       if (ids.length === 0) return
+      const sampledAt = Date.now()
+      const sampledMonotonic = monotonicNow()
       const items = ids.flatMap((id) => {
         const value = states.get(id)
-        return value ? [cloneInfo(value.info)] : []
+        return value ? [cloneInfo(value, sampledAt, sampledMonotonic)] : []
       })
       if (items.length === 0) return
       yield* events.publish(TelemetrySchema.Updated, { items }).pipe(Effect.ignore)
@@ -280,6 +344,8 @@ const layer = Layer.effect(
       toolStarts: new Map(),
       stepGeneratedMs: 0,
       stepToolMs: 0,
+      providerEvents: 0,
+      providerPreempted: false,
     })
 
     const stateFor = (value: string, at = Date.now()) => {
@@ -309,18 +375,23 @@ const layer = Layer.effect(
             toolStarts: new Map(),
             stepGeneratedMs: 0,
             stepToolMs: 0,
+            providerEvents: 0,
+            providerPreempted: false,
           }
         : fresh(id, at)
       states.set(id, state)
       return state
     })
 
-    const touch = (state: LiveState, at: number) => {
+    const touch = (state: LiveState, at: number, monotonicAt: number) => {
       const previous = state.info.phase
       state.info.updatedAt = at
       const next = derivePhase(state)
       state.info.phase = next
-      if (next !== previous) state.info.phaseStartedAt = at
+      if (next !== previous) {
+        state.info.phaseStartedAt = at
+        state.phaseStartedMonotonic = monotonicAt
+      }
       pruneStates(at)
       return mark(state.info.sessionID)
     }
@@ -331,52 +402,93 @@ const layer = Layer.effect(
       step.firstTokenAt = at
     }
 
-    const closeContent = (state: LiveState, key: string, at: number) => {
+    const closeContent = (state: LiveState, key: string, monotonicAt: number) => {
       const start = state.contentStarts.get(key)
       if (!start) return
       state.contentStarts.delete(key)
-      if (at > start.at) {
-        const elapsed = at - start.at
+      if (monotonicAt > start.monotonicAt) {
+        const elapsed = monotonicAt - start.monotonicAt
         state.stepGeneratedMs += elapsed
         state.info.generatedMs += elapsed
         if (state.info.step) state.info.step.generatedMs += elapsed
       }
     }
 
-    const closeTool = (state: LiveState, key: string, at: number) => {
+    const closeTool = (state: LiveState, key: string, monotonicAt: number) => {
       const start = state.toolStarts.get(key)
       if (start === undefined) return
       state.toolStarts.delete(key)
-      if (at > start) {
-        const elapsed = at - start
+      if (monotonicAt > start) {
+        const elapsed = monotonicAt - start
         state.stepToolMs += elapsed
         state.info.toolMs += elapsed
         if (state.info.step) state.info.step.toolMs += elapsed
       }
     }
 
-    const closeAllContent = (state: LiveState, at: number) => {
-      for (const key of Array.from(state.contentStarts.keys())) closeContent(state, key, at)
+    const closeAllContent = (state: LiveState, monotonicAt: number) => {
+      for (const key of Array.from(state.contentStarts.keys())) closeContent(state, key, monotonicAt)
     }
 
-    const closeAllTools = (state: LiveState, at: number) => {
-      for (const key of Array.from(state.toolStarts.keys())) closeTool(state, key, at)
+    const closeAllTools = (state: LiveState, monotonicAt: number) => {
+      for (const key of Array.from(state.toolStarts.keys())) closeTool(state, key, monotonicAt)
     }
 
-    const begin = Effect.fnUntraced(function* (input: BeginInput) {
-      const at = input.requestSentAt
-      const state = yield* loadState(input.sessionID, at)
+    const startTurn = Effect.fnUntraced(function* (
+      value: string,
+      timestamp = Date.now(),
+      monotonicAt = monotonicNow(),
+    ) {
+      const state = yield* loadState(value, timestamp)
+      // A semantic turn boundary may follow a completed provider/tool cycle
+      // without the Session itself becoming idle (queued input, Goal
+      // continuation). Reset only live attempt state; full-session counters and
+      // the latest settled context remain intact.
+      closeAllContent(state, monotonicAt)
+      closeAllTools(state, monotonicAt)
       state.contentStarts.clear()
       state.toolStarts.clear()
       state.stepGeneratedMs = 0
       state.stepToolMs = 0
+      state.providerEvents = 0
+      state.providerPreempted = false
+      state.info.turnStartedAt = timestamp
+      state.turnStartedMonotonic = monotonicAt
+      state.info.phase = "requesting"
+      state.info.phaseStartedAt = timestamp
+      state.phaseStartedMonotonic = monotonicAt
+      state.info.updatedAt = timestamp
+      state.info.step = undefined
+      pruneStates(timestamp)
+      yield* mark(state.info.sessionID)
+    })
+
+    const begin = Effect.fnUntraced(function* (input: BeginInput) {
+      const at = input.requestSentAt
+      const monotonicAt = monotonicNow()
+      const state = yield* loadState(input.sessionID, at)
+      state.contentStarts.clear()
+      state.toolStarts.clear()
+      const preservePreemption = state.info.phase === "retrying" && state.providerPreempted
+      state.stepGeneratedMs = 0
+      state.stepToolMs = 0
+      state.providerEvents = 0
+      state.providerPreempted = preservePreemption
       // `begin` is provider-step scoped and may run repeatedly inside one
-      // user-visible turn (tool loops, retries, continuations). The turn clock
-      // must therefore latch only once and survive subsequent step begins until
-      // the runner declares the whole session drain idle.
-      state.info.turnStartedAt ??= at
+      // user-visible turn (tool loops, retries, continuations). startTurn() owns
+      // semantic resets; begin() is only the compatibility fallback for callers
+      // that have not established the turn boundary explicitly.
+      if (state.info.turnStartedAt === undefined) {
+        state.info.turnStartedAt = at
+        state.turnStartedMonotonic = monotonicAt
+      } else {
+        // Defensive recovery for a state created before monotonic anchors were
+        // introduced; never replace an established turn anchor.
+        state.turnStartedMonotonic ??= monotonicAt
+      }
       state.info.phase = "requesting"
       state.info.phaseStartedAt = at
+      state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = at
       state.info.model = { ...input.model }
       state.info.step = {
@@ -393,67 +505,72 @@ const layer = Layer.effect(
 
     const observe = Effect.fnUntraced(function* (input: ObserveInput) {
       const at = input.at ?? Date.now()
+      const monotonicAt = input.monotonicAt ?? monotonicNow()
       const state = stateFor(input.sessionID, at)
       if (!state.info.step) {
         state.info.step = { visibleChars: 0, reasoningChars: 0, generatedMs: 0, toolMs: 0 }
       }
       const step = state.info.step
       const event = input.event
+      if (state.providerPreempted) return false
+      state.providerEvents++
       switch (event.type) {
         case "reasoning-start": {
           firstToken(state, at)
-          state.contentStarts.set(`reasoning:${event.id}`, { kind: "reasoning", at })
+          state.contentStarts.set(`reasoning:${event.id}`, { kind: "reasoning", monotonicAt })
           break
         }
         case "reasoning-delta": {
           firstToken(state, at)
           step.reasoningChars += event.text.length
           if (!state.contentStarts.has(`reasoning:${event.id}`))
-            state.contentStarts.set(`reasoning:${event.id}`, { kind: "reasoning", at })
+            state.contentStarts.set(`reasoning:${event.id}`, { kind: "reasoning", monotonicAt })
           break
         }
         case "reasoning-end":
-          closeContent(state, `reasoning:${event.id}`, at)
+          closeContent(state, `reasoning:${event.id}`, monotonicAt)
           break
         case "text-start": {
           firstToken(state, at)
-          state.contentStarts.set(`text:${event.id}`, { kind: "text", at })
+          state.contentStarts.set(`text:${event.id}`, { kind: "text", monotonicAt })
           break
         }
         case "text-delta": {
           firstToken(state, at)
           step.visibleChars += event.text.length
           if (!state.contentStarts.has(`text:${event.id}`))
-            state.contentStarts.set(`text:${event.id}`, { kind: "text", at })
+            state.contentStarts.set(`text:${event.id}`, { kind: "text", monotonicAt })
           break
         }
         case "text-end":
-          closeContent(state, `text:${event.id}`, at)
+          closeContent(state, `text:${event.id}`, monotonicAt)
           break
         case "tool-call":
-          if (!state.toolStarts.has(event.id)) state.toolStarts.set(event.id, at)
+          if (!state.toolStarts.has(event.id)) state.toolStarts.set(event.id, monotonicAt)
           break
         case "tool-result":
         case "tool-error":
-          closeTool(state, event.id, at)
+          closeTool(state, event.id, monotonicAt)
           break
       }
-      yield* touch(state, at)
+      yield* touch(state, at, monotonicAt)
+      return true
     })
 
     const streamed = Effect.fnUntraced(function* (value: string, timestamp = Date.now()) {
+      const monotonicAt = monotonicNow()
       const state = stateFor(value, timestamp)
-      closeAllContent(state, timestamp)
+      closeAllContent(state, monotonicAt)
       if (state.info.step) state.info.step.streamedAt ??= timestamp
-      yield* touch(state, timestamp)
+      yield* touch(state, timestamp, monotonicAt)
     })
 
     const settle = Effect.fnUntraced(function* (input: SettleInput) {
       const id = sessionID(input.sessionID)
+      const monotonicAt = monotonicNow()
       const state = stateFor(input.sessionID, input.completedAt)
-      const streamedAt = state.info.step?.streamedAt ?? input.completedAt
-      closeAllContent(state, streamedAt)
-      closeAllTools(state, input.completedAt)
+      closeAllContent(state, monotonicAt)
+      closeAllTools(state, monotonicAt)
       const model = state.info.model
       const step: MutableStep = state.info.step ?? {
         visibleChars: 0,
@@ -526,6 +643,7 @@ const layer = Layer.effect(
       state.info.toolMs = stored?.toolMs ?? state.info.toolMs
       state.info.phase = "requesting"
       state.info.phaseStartedAt = input.completedAt
+      state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = input.completedAt
       state.info.step = step
       if (model) state.info.context = { model: { ...model }, tokens: { ...input.tokens, cache: { ...input.tokens.cache } } }
@@ -533,22 +651,28 @@ const layer = Layer.effect(
     })
 
     const retry = Effect.fnUntraced(function* (value: string, timestamp = Date.now()) {
+      const monotonicAt = monotonicNow()
       const state = stateFor(value, timestamp)
-      closeAllContent(state, timestamp)
-      closeAllTools(state, timestamp)
+      closeAllContent(state, monotonicAt)
+      closeAllTools(state, monotonicAt)
       state.info.phase = "retrying"
       state.info.phaseStartedAt = timestamp
+      state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = timestamp
       yield* mark(state.info.sessionID)
     })
 
     const idle = Effect.fnUntraced(function* (value: string, timestamp = Date.now()) {
+      const monotonicAt = monotonicNow()
       const state = stateFor(value, timestamp)
-      closeAllContent(state, timestamp)
-      closeAllTools(state, timestamp)
+      closeAllContent(state, monotonicAt)
+      closeAllTools(state, monotonicAt)
       state.info.phase = "idle"
+      state.providerPreempted = false
       state.info.turnStartedAt = undefined
+      state.turnStartedMonotonic = undefined
       state.info.phaseStartedAt = timestamp
+      state.phaseStartedMonotonic = monotonicAt
       state.info.updatedAt = timestamp
       pruneStates(timestamp)
       yield* mark(state.info.sessionID)
@@ -556,6 +680,67 @@ const layer = Layer.effect(
 
     const fail = Effect.fnUntraced(function* (value: string, timestamp = Date.now()) {
       yield* idle(value, timestamp)
+    })
+
+    const providerAttempt = Effect.fnUntraced(function* (value: string) {
+      const state = states.get(sessionID(value))
+      const step = state?.info.step
+      if (!state || state.info.phase === "idle" || state.info.phase === "retrying" || step?.requestSentAt === undefined)
+        return undefined
+      return {
+        ...(step.assistantMessageID === undefined ? {} : { assistantMessageID: step.assistantMessageID }),
+        requestSentAt: step.requestSentAt,
+        observedEvents: state.providerEvents,
+        ...(step.streamedAt === undefined ? {} : { streamedAt: step.streamedAt }),
+        ...(step.completedAt === undefined ? {} : { completedAt: step.completedAt }),
+      } satisfies ProviderAttempt
+    })
+
+    const claimUnprovenProviderExecution = Effect.fnUntraced(function* (
+      value: string,
+      expectedAssistantMessageID?: string,
+    ) {
+      const state = states.get(sessionID(value))
+      const step = state?.info.step
+      if (
+        !state ||
+        state.info.phase === "idle" ||
+        state.providerPreempted ||
+        (expectedAssistantMessageID !== undefined && step?.assistantMessageID !== expectedAssistantMessageID)
+      )
+        return undefined
+
+      if (state.info.phase === "retrying") {
+        state.providerPreempted = true
+        return {
+          kind: "retry",
+          ...(step?.assistantMessageID === undefined ? {} : { assistantMessageID: step.assistantMessageID }),
+        } satisfies ProviderExecutionClaim
+      }
+
+      if (
+        step?.requestSentAt === undefined ||
+        state.providerEvents !== 0 ||
+        step.streamedAt !== undefined ||
+        step.completedAt !== undefined
+      )
+        return undefined
+
+      state.providerPreempted = true
+      return {
+        kind: "attempt",
+        ...(step.assistantMessageID === undefined ? {} : { assistantMessageID: step.assistantMessageID }),
+        requestSentAt: step.requestSentAt,
+        observedEvents: 0,
+      } satisfies ProviderExecutionClaim
+    })
+
+    const active = Effect.sync(() => {
+      const result = new Set<SessionSchema.ID>()
+      for (const [id, state] of states) {
+        if (state.info.phase !== "idle") result.add(id)
+      }
+      return result as ReadonlySet<SessionSchema.ID>
     })
 
     const snapshot = Effect.fn("SessionTelemetry.snapshot")(function* (values: readonly string[]) {
@@ -567,15 +752,34 @@ const layer = Layer.effect(
         .where(inArray(SessionTelemetryTable.session_id, ids))
         .all()
         .pipe(Effect.orDie)
-      const result: Record<string, Info> = Object.fromEntries(rows.map((row) => [row.session_id, rowInfo(row)]))
+      // Capture the projection sample after storage I/O so a slow cold read
+      // cannot make a reconnect snapshot under-report a quiet live interval.
+      const sampledAt = Date.now()
+      const sampledMonotonic = monotonicNow()
+      const result: Record<string, Info> = Object.fromEntries(
+        rows.map((row) => [row.session_id, { ...rowInfo(row), sampledAt }]),
+      )
       for (const id of ids) {
         const live = states.get(id)
-        if (live) result[id] = cloneInfo(live.info)
+        if (live) result[id] = cloneInfo(live, sampledAt, sampledMonotonic)
       }
       return result
     })
 
-    return Service.of({ begin, observe, streamed, settle, retry, idle, fail, snapshot })
+    return Service.of({
+      startTurn,
+      begin,
+      observe,
+      streamed,
+      settle,
+      retry,
+      idle,
+      fail,
+      providerAttempt,
+      claimUnprovenProviderExecution,
+      active,
+      snapshot,
+    })
   }),
 )
 

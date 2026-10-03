@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "7b48271a-a579-432f-91c7-3048ffe74163",
+  "id": "a137fe13-bed6-4e88-bbca-48916631811a",
   "prevIds": [
-    "1e91de53-b1f9-4724-a8fe-9ba10df22b2d"
+    "fb49601b-d4a4-4ada-9772-80ada35203a6"
   ],
   "ddl": [
     {
@@ -12,6 +12,38 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "directory_activity_lease",
+      "entityType": "tables"
+    },
+    {
+      "name": "directory_maintenance_guard",
+      "entityType": "tables"
+    },
+    {
+      "name": "managed_worktree_binding",
+      "entityType": "tables"
+    },
+    {
+      "name": "provider_account_route_health",
+      "entityType": "tables"
+    },
+    {
+      "name": "provider_public_route_health",
+      "entityType": "tables"
+    },
+    {
+      "name": "provider_route_account_stats",
+      "entityType": "tables"
+    },
+    {
+      "name": "provider_route_binding",
+      "entityType": "tables"
+    },
+    {
+      "name": "provider_route_policy_cursor",
       "entityType": "tables"
     },
     {
@@ -339,6 +371,10 @@
       "entityType": "tables"
     },
     {
+      "name": "usage_session",
+      "entityType": "tables"
+    },
+    {
       "name": "usage_yield_meta",
       "entityType": "tables"
     },
@@ -445,6 +481,766 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "lease_id",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_id",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquired_at",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "released_at",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "directory_activity_lease"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "guard_id",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_id",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquisition_id",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquired_at",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "released_at",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "binding_state",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "installation_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "repository_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "worktree_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "storage_volume_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workspace_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "branch_ref",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pin_ref",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "head",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "manager_revision",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "lifecycle_state",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "operation_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "create_operation_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "initialization_operation_id",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state_reason",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "evidence_json",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "activated_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reconciled_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "quarantined_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "retired_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "credential_revision",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_at",
+      "entityType": "columns",
+      "table": "provider_account_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "provider_public_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "provider_public_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "provider_public_route_health"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "provider_public_route_health"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_at",
+      "entityType": "columns",
+      "table": "provider_public_route_health"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "affinity_domain",
+      "entityType": "columns",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "assignment_count",
+      "entityType": "columns",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_assigned_at",
+      "entityType": "columns",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "affinity_domain",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "route_kind",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "credential_handle",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "mode",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pin",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "route_revision",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "assigned_at",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "assignment_epoch",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reason",
+      "entityType": "columns",
+      "table": "provider_route_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "affinity_domain",
+      "entityType": "columns",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "epoch",
+      "entityType": "columns",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_assigned_handle",
+      "entityType": "columns",
+      "table": "provider_route_policy_cursor"
     },
     {
       "type": "text",
@@ -1020,6 +1816,16 @@
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "credential"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
       "default": null,
       "generated": null,
       "name": "time_created",
@@ -1398,76 +2204,6 @@
     },
     {
       "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "started_at",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "0",
-      "generated": null,
-      "name": "consecutive_turns",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "0",
-      "generated": null,
-      "name": "no_progress_turns",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "0",
-      "generated": null,
-      "name": "auditor_blocked_streak",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "0",
-      "generated": null,
-      "name": "consumed_tokens",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "text",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "last_auditor_decision",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "text",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "last_auditor_rationale",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -1503,16 +2239,6 @@
       "default": null,
       "generated": null,
       "name": "runtime_error",
-      "entityType": "columns",
-      "table": "goal_automation"
-    },
-    {
-      "type": "integer",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
-      "name": "previous_revision",
       "entityType": "columns",
       "table": "goal_automation"
     },
@@ -2063,16 +2789,6 @@
       "default": "0",
       "generated": null,
       "name": "auditor_runs",
-      "entityType": "columns",
-      "table": "goal"
-    },
-    {
-      "type": "text",
-      "notNull": true,
-      "autoincrement": false,
-      "default": "'{}'",
-      "generated": null,
-      "name": "continuation_policy",
       "entityType": "columns",
       "table": "goal"
     },
@@ -3443,6 +4159,66 @@
       "default": null,
       "generated": null,
       "name": "safe_summary",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_request_chars",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_request_source",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_request_schema",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_result_chars",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_result_source",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_result_schema",
       "entityType": "columns",
       "table": "oxp_invocation"
     },
@@ -5478,6 +6254,16 @@
     },
     {
       "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_seq",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "integer",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -7397,6 +8183,16 @@
       "table": "swarm_task_run"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "result_summary",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
       "type": "integer",
       "notNull": false,
       "autoincrement": false,
@@ -7662,6 +8458,26 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "route_kind",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "account_id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "variant",
       "entityType": "columns",
       "table": "maintenance_usage"
@@ -7852,6 +8668,16 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "route_kind",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "account_id",
       "entityType": "columns",
       "table": "usage_record"
@@ -8002,6 +8828,86 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "title",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_name",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_created_at",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_updated_at",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_usage_at",
+      "entityType": "columns",
+      "table": "usage_session"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "id",
       "entityType": "columns",
       "table": "usage_yield_meta"
@@ -8110,6 +9016,51 @@
       "name": "fk_workspace_project_id_project_id_fk",
       "entityType": "fks",
       "table": "workspace"
+    },
+    {
+      "columns": [
+        "owner_id"
+      ],
+      "tableTo": "runtime_owner",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_directory_activity_lease_owner_id_runtime_owner_id_fk",
+      "entityType": "fks",
+      "table": "directory_activity_lease"
+    },
+    {
+      "columns": [
+        "owner_id"
+      ],
+      "tableTo": "runtime_owner",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_directory_maintenance_guard_owner_id_runtime_owner_id_fk",
+      "entityType": "fks",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_provider_route_binding_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "provider_route_binding"
     },
     {
       "columns": [
@@ -9253,6 +10204,58 @@
     },
     {
       "columns": [
+        "provider_id",
+        "account_id",
+        "model_id"
+      ],
+      "nameExplicit": false,
+      "name": "provider_account_route_health_pk",
+      "entityType": "pks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "columns": [
+        "provider_id",
+        "model_id"
+      ],
+      "nameExplicit": false,
+      "name": "provider_public_route_health_pk",
+      "entityType": "pks",
+      "table": "provider_public_route_health"
+    },
+    {
+      "columns": [
+        "provider_id",
+        "affinity_domain",
+        "account_id"
+      ],
+      "nameExplicit": false,
+      "name": "provider_route_account_stats_pk",
+      "entityType": "pks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "columns": [
+        "session_id",
+        "affinity_domain"
+      ],
+      "nameExplicit": false,
+      "name": "provider_route_binding_pk",
+      "entityType": "pks",
+      "table": "provider_route_binding"
+    },
+    {
+      "columns": [
+        "provider_id",
+        "affinity_domain"
+      ],
+      "nameExplicit": false,
+      "name": "provider_route_policy_cursor_pk",
+      "entityType": "pks",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "columns": [
         "target_kind",
         "target_key"
       ],
@@ -9457,6 +10460,33 @@
       "nameExplicit": false,
       "name": "data_migration_pk",
       "table": "data_migration",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "lease_id"
+      ],
+      "nameExplicit": false,
+      "name": "directory_activity_lease_pk",
+      "table": "directory_activity_lease",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "directory"
+      ],
+      "nameExplicit": false,
+      "name": "directory_maintenance_guard_pk",
+      "table": "directory_maintenance_guard",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "directory"
+      ],
+      "nameExplicit": false,
+      "name": "managed_worktree_binding_pk",
+      "table": "managed_worktree_binding",
       "entityType": "pks"
     },
     {
@@ -10019,6 +11049,15 @@
     },
     {
       "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "usage_session_pk",
+      "table": "usage_session",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -10034,6 +11073,254 @@
       "name": "usage_yield_stat_pk",
       "table": "usage_yield_stat",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "directory_activity_lease_directory_idx",
+      "entityType": "indexes",
+      "table": "directory_activity_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_id",
+          "isExpression": false
+        },
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "directory_activity_lease_owner_idx",
+      "entityType": "indexes",
+      "table": "directory_activity_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "guard_id",
+          "isExpression": false
+        },
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "directory_maintenance_guard_guard_idx",
+      "entityType": "indexes",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_id",
+          "isExpression": false
+        },
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "directory_maintenance_guard_owner_idx",
+      "entityType": "indexes",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "columns": [
+        {
+          "value": "acquisition_id",
+          "isExpression": false
+        },
+        {
+          "value": "state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "directory_maintenance_guard_acquisition_idx",
+      "entityType": "indexes",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "columns": [
+        {
+          "value": "binding_state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "managed_worktree_binding_state_idx",
+      "entityType": "indexes",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "installation_id",
+          "isExpression": false
+        },
+        {
+          "value": "repository_id",
+          "isExpression": false
+        },
+        {
+          "value": "worktree_id",
+          "isExpression": false
+        },
+        {
+          "value": "binding_state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "managed_worktree_binding_worktree_idx",
+      "entityType": "indexes",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "binding_state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "managed_worktree_binding_project_idx",
+      "entityType": "indexes",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "workspace_id",
+          "isExpression": false
+        },
+        {
+          "value": "binding_state",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "managed_worktree_binding_workspace_idx",
+      "entityType": "indexes",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "provider_account_route_health_expiry_idx",
+      "entityType": "indexes",
+      "table": "provider_account_route_health"
+    },
+    {
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "provider_public_route_health_expiry_idx",
+      "entityType": "indexes",
+      "table": "provider_public_route_health"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "route_kind",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "provider_route_binding_provider_kind_idx",
+      "entityType": "indexes",
+      "table": "provider_route_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "account_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "provider_route_binding_account_idx",
+      "entityType": "indexes",
+      "table": "provider_route_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "credential_handle",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "provider_route_binding_credential_idx",
+      "entityType": "indexes",
+      "table": "provider_route_binding"
     },
     {
       "columns": [
@@ -11764,6 +13051,50 @@
     {
       "columns": [
         {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_updated",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"session\".\"parent_id\" IS NULL AND \"session\".\"time_archived\" IS NULL",
+      "origin": "manual",
+      "name": "session_directory_root_updated_id_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_archived",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"session\".\"parent_id\" IS NULL AND \"session\".\"time_archived\" IS NOT NULL",
+      "origin": "manual",
+      "name": "session_directory_root_archived_id_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
           "value": "workspace_id",
           "isExpression": false
         }
@@ -12562,6 +13893,28 @@
     {
       "columns": [
         {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "account_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_completed",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "maintenance_usage_account_completed_idx",
+      "entityType": "indexes",
+      "table": "maintenance_usage"
+    },
+    {
+      "columns": [
+        {
           "value": "completed_at",
           "isExpression": false
         }
@@ -12664,6 +14017,24 @@
     {
       "columns": [
         {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "last_usage_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_session_project_last_usage_idx",
+      "entityType": "indexes",
+      "table": "usage_session"
+    },
+    {
+      "columns": [
+        {
           "value": "provider_id",
           "isExpression": false
         },
@@ -12718,6 +14089,252 @@
       "name": "push_subscription_endpoint_unique",
       "entityType": "uniques",
       "table": "push_subscription"
+    },
+    {
+      "value": "\"state\" in ('active', 'released', 'reconcile_required')",
+      "name": "directory_activity_lease_state_check",
+      "entityType": "checks",
+      "table": "directory_activity_lease"
+    },
+    {
+      "value": "(\"state\" = 'released' and \"released_at\" is not null) or (\"state\" <> 'released' and \"released_at\" is null)",
+      "name": "directory_activity_lease_release_check",
+      "entityType": "checks",
+      "table": "directory_activity_lease"
+    },
+    {
+      "value": "length(\"lease_id\") > 0 and length(\"kind\") > 0",
+      "name": "directory_activity_lease_identity_check",
+      "entityType": "checks",
+      "table": "directory_activity_lease"
+    },
+    {
+      "value": "\"state\" in ('active', 'released', 'reconcile_required')",
+      "name": "directory_maintenance_guard_state_check",
+      "entityType": "checks",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "value": "(\"state\" = 'released' and \"released_at\" is not null) or (\"state\" <> 'released' and \"released_at\" is null)",
+      "name": "directory_maintenance_guard_release_check",
+      "entityType": "checks",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "value": "length(\"acquisition_id\") > 0",
+      "name": "directory_maintenance_guard_acquisition_check",
+      "entityType": "checks",
+      "table": "directory_maintenance_guard"
+    },
+    {
+      "value": "\"binding_state\" in ('handoff_pending', 'active', 'reconcile_required', 'quarantined', 'retired')",
+      "name": "managed_worktree_binding_state_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "\"generation\" > 0",
+      "name": "managed_worktree_binding_generation_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "length(\"directory\") > 0 and length(\"installation_id\") > 0 and length(\"repository_id\") > 0 and length(\"worktree_id\") > 0 and length(\"storage_volume_id\") > 0 and length(\"project_id\") > 0 and length(\"branch_ref\") > 0",
+      "name": "managed_worktree_binding_identity_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "(\"pin_ref\" is null or length(\"pin_ref\") > 0) and (\"manager_revision\" is null or \"manager_revision\" > 0)",
+      "name": "managed_worktree_binding_observation_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "(\"binding_state\" <> 'active') or (\"head\" is not null and \"manager_revision\" is not null and \"lifecycle_state\" is not null and \"activated_at\" is not null)",
+      "name": "managed_worktree_binding_activation_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "(\"binding_state\" = 'retired' and \"retired_at\" is not null) or (\"binding_state\" <> 'retired' and \"retired_at\" is null)",
+      "name": "managed_worktree_binding_retirement_check",
+      "entityType": "checks",
+      "table": "managed_worktree_binding"
+    },
+    {
+      "value": "length(\"provider_id\") > 0",
+      "name": "provider_account_route_health_provider_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "length(\"account_id\") > 0",
+      "name": "provider_account_route_health_account_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "length(\"model_id\") > 0",
+      "name": "provider_account_route_health_model_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "\"state\" in ('auth-invalid', 'cooling-down', 'quota-exhausted')",
+      "name": "provider_account_route_health_state_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "\"observed_at\" >= 0 and \"observed_at\" <= 9007199254740991",
+      "name": "provider_account_route_health_observed_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "(\n        \"state\" = 'auth-invalid'\n        and \"credential_revision\" is not null\n        and \"credential_revision\" > 0\n        and \"credential_revision\" <= 9007199254740991\n        and \"expires_at\" is null\n      ) or (\n        \"state\" in ('cooling-down', 'quota-exhausted')\n        and \"credential_revision\" is null\n        and \"expires_at\" is not null\n        and \"expires_at\" > \"observed_at\"\n        and \"expires_at\" <= 9007199254740991\n      )",
+      "name": "provider_account_route_health_shape_check",
+      "entityType": "checks",
+      "table": "provider_account_route_health"
+    },
+    {
+      "value": "length(\"provider_id\") > 0",
+      "name": "provider_public_route_health_provider_check",
+      "entityType": "checks",
+      "table": "provider_public_route_health"
+    },
+    {
+      "value": "length(\"model_id\") > 0",
+      "name": "provider_public_route_health_model_check",
+      "entityType": "checks",
+      "table": "provider_public_route_health"
+    },
+    {
+      "value": "\"state\" in ('cooling-down', 'quota-exhausted')",
+      "name": "provider_public_route_health_state_check",
+      "entityType": "checks",
+      "table": "provider_public_route_health"
+    },
+    {
+      "value": "\"observed_at\" >= 0\n        and \"observed_at\" <= 9007199254740991\n        and \"expires_at\" > \"observed_at\"\n        and \"expires_at\" <= 9007199254740991",
+      "name": "provider_public_route_health_time_check",
+      "entityType": "checks",
+      "table": "provider_public_route_health"
+    },
+    {
+      "value": "length(\"provider_id\") > 0",
+      "name": "provider_route_account_stats_provider_id_check",
+      "entityType": "checks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "value": "length(\"affinity_domain\") > 0",
+      "name": "provider_route_account_stats_affinity_domain_check",
+      "entityType": "checks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "value": "length(\"account_id\") > 0",
+      "name": "provider_route_account_stats_account_id_check",
+      "entityType": "checks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "value": "\"assignment_count\" >= 0 and \"assignment_count\" <= 9007199254740991",
+      "name": "provider_route_account_stats_count_check",
+      "entityType": "checks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "value": "\"last_assigned_at\" is null or (\"last_assigned_at\" >= 0 and \"last_assigned_at\" <= 9007199254740991)",
+      "name": "provider_route_account_stats_last_assigned_at_check",
+      "entityType": "checks",
+      "table": "provider_route_account_stats"
+    },
+    {
+      "value": "length(\"affinity_domain\") > 0",
+      "name": "provider_route_binding_affinity_domain_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "length(\"provider_id\") > 0",
+      "name": "provider_route_binding_provider_id_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"route_kind\" in ('public', 'account')",
+      "name": "provider_route_binding_route_kind_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"mode\" is null or \"mode\" in ('concentrate', 'session-round-robin')",
+      "name": "provider_route_binding_mode_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"pin\" is null or \"pin\" in ('hard', 'soft')",
+      "name": "provider_route_binding_pin_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"reason\" in ('explicit', 'initial', 'failover', 'model-selection')",
+      "name": "provider_route_binding_reason_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"route_revision\" > 0",
+      "name": "provider_route_binding_revision_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"assignment_epoch\" > 0",
+      "name": "provider_route_binding_assignment_epoch_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "\"assigned_at\" >= 0",
+      "name": "provider_route_binding_assigned_at_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "(\n        \"route_kind\" = 'public'\n        and \"account_id\" is null\n        and \"credential_handle\" is null\n        and \"mode\" is null\n        and \"pin\" is null\n      ) or (\n        \"route_kind\" = 'account'\n        and \"account_id\" is not null\n        and length(\"account_id\") > 0\n        and \"credential_handle\" is not null\n        and length(\"credential_handle\") > 0\n      )",
+      "name": "provider_route_binding_identity_check",
+      "entityType": "checks",
+      "table": "provider_route_binding"
+    },
+    {
+      "value": "length(\"provider_id\") > 0",
+      "name": "provider_route_policy_cursor_provider_id_check",
+      "entityType": "checks",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "value": "length(\"affinity_domain\") > 0",
+      "name": "provider_route_policy_cursor_affinity_domain_check",
+      "entityType": "checks",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "value": "\"epoch\" >= 0 and \"epoch\" <= 9007199254740991",
+      "name": "provider_route_policy_cursor_epoch_check",
+      "entityType": "checks",
+      "table": "provider_route_policy_cursor"
+    },
+    {
+      "value": "\"last_assigned_handle\" is null or length(\"last_assigned_handle\") > 0",
+      "name": "provider_route_policy_cursor_last_handle_check",
+      "entityType": "checks",
+      "table": "provider_route_policy_cursor"
     },
     {
       "value": "length(\"operation\") BETWEEN 1 AND 128",

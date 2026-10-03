@@ -108,7 +108,7 @@ describe("SessionDelegationInspection", () => {
         malformedOrigin: false,
         execution: {
           generation: 0,
-          running: false,
+          owned: false,
         },
       })
 
@@ -134,7 +134,7 @@ describe("SessionDelegationInspection", () => {
         id: workerID,
         execution: {
           generation: acquired.token.generation,
-          running: true,
+          owned: true,
         },
       })
 
@@ -143,7 +143,7 @@ describe("SessionDelegationInspection", () => {
         id: workerID,
         execution: {
           generation: acquired.token.generation,
-          running: false,
+          owned: false,
         },
       })
     }),

@@ -1,12 +1,14 @@
 export * as SessionInspection from "./inspection"
 
 import { Context, Effect, Layer } from "effect"
-import { and, desc, eq, inArray, isNull, like, lt, or } from "drizzle-orm"
+import { and, desc, eq, inArray, isNull, like, lt, or, sql } from "drizzle-orm"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionTurnProvenance } from "../v1/session-turn-provenance"
 import { MessageTable, PartTable, SessionTable } from "./sql"
 import { SessionSchema } from "./schema"
+import { SessionSearch } from "./search"
+import { SessionRecall } from "./recall"
 
 const MAX_LIST = 100
 const MAX_MESSAGES = 100
@@ -80,6 +82,12 @@ export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<readonly SessionRow[]>
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionRow | undefined>
   readonly children: (parentID: SessionSchema.ID, limit?: number) => Effect.Effect<readonly SessionRow[]>
+  readonly search: (
+    input: SessionSearch.SearchInput,
+  ) => Effect.Effect<SessionSearch.SearchResult, SessionSearch.SearchError>
+  readonly recall: (
+    input: SessionRecall.RecallInput,
+  ) => Effect.Effect<SessionRecall.RecallResult, SessionSearch.SearchError>
   readonly messages: (input: {
     readonly sessionID: SessionSchema.ID
     readonly limit?: number
@@ -153,7 +161,15 @@ const layer = Layer.effect(
       const conditions = []
       if (input.search) conditions.push(like(SessionTable.title, `%${input.search}%`))
       if (input.parentID) conditions.push(eq(SessionTable.parent_id, input.parentID))
-      if (input.roots) conditions.push(isNull(SessionTable.parent_id))
+      if (input.roots) {
+        // Grouped OXP workers have no native parent Session. They are reached
+        // through their durable delegation SessionGroup; legacy/unlinked rows
+        // retain the old root-list fallback.
+        conditions.push(isNull(SessionTable.parent_id))
+        conditions.push(
+          sql`json_extract(${SessionTable.metadata}, '$.workerDelegation.producer') IS NOT 'oxp' OR ${SessionTable.group_id} IS NULL`,
+        )
+      }
       if (!input.includeArchived) conditions.push(isNull(SessionTable.time_archived))
       if (input.before) {
         conditions.push(
@@ -186,6 +202,9 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       return rows.map(project)
     })
+
+    const search: Interface["search"] = (input) => SessionSearch.search(readDb, input)
+    const recall: Interface["recall"] = (input) => SessionRecall.recall(readDb, input)
 
     const messages = Effect.fn("SessionInspection.messages")(function* (input: {
       readonly sessionID: SessionSchema.ID
@@ -279,6 +298,8 @@ const layer = Layer.effect(
       list,
       get,
       children,
+      search,
+      recall,
       messages,
     })
   }),

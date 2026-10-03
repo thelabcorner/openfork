@@ -1,95 +1,30 @@
-import { Duration, Effect, Schema, Semaphore, Stream } from "effect"
+import { Effect, Schema, Semaphore, Stream } from "effect"
 import type { Scope } from "effect"
-import type { IntegrationOAuthMethodRegistration } from "@opencode-ai/plugin/v2/effect/integration"
 import { define } from "@opencode-ai/plugin/v2/effect/plugin"
 import type { CredentialValue } from "@opencode-ai/sdk/v2/types"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient } from "effect/unstable/http"
 import { EventV2 } from "../../event"
-import { Credential } from "../../credential"
+import { FSUtil } from "../../fs-util"
 import { Integration } from "../../integration"
 import { ModelV2 } from "../../model"
 import { ProviderV2 } from "../../provider"
 import { ConfigProviderV1 } from "../../v1/config/provider"
 import { ConfigProviderOptionsV1 } from "../../v1/config/provider-options"
 import { ConfigV1 } from "../../v1/config/config"
+import { DEFAULT_SERVER, getProviderConfig } from "./opencode-console"
+import { integrationID, keyMethod, oauth } from "./opencode-auth"
+import { isHostedPublicModel, refreshHostedCatalog } from "./opencode-hosted"
 
-const defaultServer = "https://opencode.ai/console"
-const clientID = "opencode-cli"
-const methodID = Integration.MethodID.make("device")
-const RemoteResponse = Schema.Struct({ config: ConfigV1.Info })
-const Device = Schema.Struct({
-  device_code: Schema.String,
-  user_code: Schema.String,
-  verification_uri_complete: Schema.String,
-  expires_in: Schema.Number,
-  interval: Schema.Number,
-})
-const Token = Schema.Struct({
-  access_token: Schema.String,
-  refresh_token: Schema.String,
-  expires_in: Schema.Number,
-})
-const TokenPending = Schema.Struct({ error: Schema.String })
-const DeviceToken = Schema.Union([Token, TokenPending])
-const User = Schema.Struct({ id: Schema.String, email: Schema.String })
-const Org = Schema.Struct({ id: Schema.String, name: Schema.String })
-
-function oauth(http: HttpClient.HttpClient) {
-  return {
-    integrationID: Integration.ID.make("opencode"),
-    method: {
-      id: methodID,
-      type: "oauth",
-      label: "OpenCode Console account",
-    },
-    authorize: () =>
-      Effect.gen(function* () {
-        const device = yield* post(http, `${defaultServer}/auth/device/code`, { client_id: clientID }, Device)
-        const verification = yield* Effect.try({
-          try: () => {
-            const url = new URL(device.verification_uri_complete, `${defaultServer}/`)
-            if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("expected HTTP(S)")
-            return url
-          },
-          catch: (cause) =>
-            new Error(`Invalid device verification URL: ${cause instanceof Error ? cause.message : String(cause)}`),
-        })
-        return {
-          mode: "auto" as const,
-          url: verification.href,
-          instructions: `Enter code: ${device.user_code}`,
-          callback: poll(http, defaultServer, device.device_code, Duration.seconds(device.interval)),
-        }
-      }),
-    refresh: (credential) =>
-      Effect.gen(function* () {
-        const server = typeof credential.metadata?.server === "string" ? credential.metadata.server : defaultServer
-        const token = yield* post(
-          http,
-          `${server}/auth/device/token`,
-          { grant_type: "refresh_token", refresh_token: credential.refresh, client_id: clientID },
-          Token,
-        )
-        return {
-          ...credential,
-          access: token.access_token,
-          refresh: token.refresh_token,
-          expires: Date.now() + token.expires_in * 1000,
-        }
-      }),
-    label: (credential) => {
-      return typeof credential.metadata?.orgName === "string" ? credential.metadata.orgName : undefined
-    },
-  } satisfies IntegrationOAuthMethodRegistration
-}
-
-export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | Scope.Scope>({
+export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | FSUtil.Service | Scope.Scope>({
   id: "opencode",
   effect: Effect.fn(function* (ctx) {
     const events = yield* EventV2.Service
+    const fs = yield* FSUtil.Service
     const http = yield* HttpClient.HttpClient
     const loading = Semaphore.makeUnsafe(1)
     let connected = false
+    let catalogHasKey = false
+    let needsHostedWitness = true
     let providers: typeof ConfigV1.Info.Type.provider | undefined
 
     const load = Effect.fn("OpencodePlugin.load")(function* () {
@@ -105,6 +40,9 @@ export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | S
             ),
           )
         : undefined
+      if (!connection && !process.env.OPENCODE_API_KEY && !catalogHasKey) {
+        yield* refreshHostedCatalog(http, fs)
+      }
     })
 
     yield* ctx.integration.transform((draft) => {
@@ -112,7 +50,7 @@ export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | S
         integration.name = "OpenCode Console"
       })
       draft.method.update(oauth(http))
-      draft.method.update({ integrationID: "opencode", method: { type: "key", label: "API key (service account)" } })
+      draft.method.update({ integrationID, method: keyMethod })
     })
 
     connected = (yield* ctx.integration.connection.active("opencode")) !== undefined
@@ -173,13 +111,20 @@ export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | S
 
       const item = catalog.provider.get(ProviderV2.ID.opencode)
       if (!item) return
-      const hasKey = Boolean(process.env.OPENCODE_API_KEY || connected || item.provider.request.body.apiKey)
+      catalogHasKey = typeof item.provider.request.body.apiKey === "string"
+      const hasKey = Boolean(process.env.OPENCODE_API_KEY || connected || catalogHasKey)
+      needsHostedWitness = !hasKey
       catalog.provider.update(item.provider.id, (provider) => {
         if (!hasKey) provider.request.body.apiKey = "public"
       })
       if (hasKey) return
       for (const model of item.models.values()) {
-        if (!model.cost.some((cost) => cost.input > 0)) continue
+        if (
+          isTrustedPublicCost(model) &&
+          isHostedPublicModel({ id: model.id, apiID: model.api.id })
+        ) {
+          continue
+        }
         catalog.model.update(item.provider.id, model.id, (draft) => {
           draft.enabled = false
         })
@@ -193,35 +138,52 @@ export const OpencodePlugin = define<HttpClient.HttpClient | EventV2.Service | S
       Effect.forkScoped({ startImmediately: true }),
     )
     yield* refresh().pipe(Effect.forkScoped)
+    yield* Effect.gen(function* () {
+      while (true) {
+        yield* Effect.sleep("5 minutes")
+        if (!needsHostedWitness) continue
+        yield* refreshHostedCatalog(http, fs)
+        yield* ctx.catalog.reload()
+      }
+    }).pipe(Effect.forkScoped)
   }),
 })
 
 function fetchProviders(http: HttpClient.HttpClient, value: CredentialValue) {
   const metadata = value.metadata
-  const server = typeof metadata?.server === "string" ? metadata.server : defaultServer
+  const server = typeof metadata?.server === "string" ? metadata.server : DEFAULT_SERVER
   const orgID = typeof metadata?.orgID === "string" ? metadata.orgID : undefined
   const token = value.type === "oauth" ? value.access : value.key
-  return http
-    .execute(
-      HttpClientRequest.get(`${server}/api/config`).pipe(
-        HttpClientRequest.acceptJson,
-        HttpClientRequest.bearerToken(token),
-        HttpClientRequest.setHeaders(orgID ? { "x-org-id": orgID } : {}),
-      ),
-    )
-    .pipe(
-      Effect.flatMap((response) => {
-        if (response.status === 404) return Effect.succeed(undefined)
-        return HttpClientResponse.filterStatusOk(response).pipe(
-          Effect.flatMap(HttpClientResponse.schemaBodyJson(RemoteResponse)),
-          Effect.map((remote) => remote.config.provider),
-        )
-      }),
-    )
+  return getProviderConfig(http, server, token, orgID).pipe(
+    Effect.flatMap((config) =>
+      config === undefined
+        ? Effect.succeed(undefined)
+        : Schema.decodeUnknownEffect(ConfigV1.Info)(config).pipe(Effect.map((remote) => remote.provider)),
+    ),
+  )
 }
 
 function withoutCredentials(body: Readonly<Record<string, unknown>> | undefined) {
   return Object.fromEntries(Object.entries(body ?? {}).filter(([key]) => key !== "apiKey" && key !== "headers"))
+}
+
+/**
+ * Anonymous/public eligibility must be proven by explicit pricing metadata.
+ * Empty cost arrays are unknown, not free, and every published tier must have
+ * zero input/output/cache charges. This keeps the V2 runner aligned with the
+ * P0F public-lane safety contract instead of treating input-only-zero as free.
+ */
+export function isTrustedPublicCost(model: Pick<ModelV2.Info, "cost">) {
+  return (
+    model.cost.length > 0 &&
+    model.cost.every(
+      (entry) =>
+        entry.input === 0 &&
+        entry.output === 0 &&
+        entry.cache.read === 0 &&
+        entry.cache.write === 0,
+    )
+  )
 }
 
 function remoteCost(input: NonNullable<(typeof ConfigProviderV1.Model.Type)["cost"]>) {
@@ -243,78 +205,4 @@ function remoteCost(input: NonNullable<(typeof ConfigProviderV1.Model.Type)["cos
       },
     },
   ]
-}
-
-function poll(http: HttpClient.HttpClient, server: string, deviceCode: string, interval: Duration.Duration) {
-  const loop = (wait: Duration.Duration): Effect.Effect<Credential.OAuth, unknown> =>
-    Effect.gen(function* () {
-      yield* Effect.sleep(wait)
-      const result = yield* post(
-        http,
-        `${server}/auth/device/token`,
-        {
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          device_code: deviceCode,
-          client_id: clientID,
-        },
-        DeviceToken,
-        false,
-      )
-      if ("access_token" in result) return yield* credential(http, server, result)
-      if (result.error === "authorization_pending") return yield* loop(wait)
-      if (result.error === "slow_down") {
-        return yield* loop(Duration.sum(wait, Duration.seconds(5)))
-      }
-      return yield* Effect.fail(new Error(`Device authorization failed: ${result.error}`))
-    })
-  return loop(interval)
-}
-
-function credential(http: HttpClient.HttpClient, server: string, token: typeof Token.Type) {
-  return Effect.gen(function* () {
-    const [user, orgs] = yield* Effect.all(
-      [
-        get(http, `${server}/api/user`, token.access_token, User),
-        get(http, `${server}/api/orgs`, token.access_token, Schema.Array(Org)),
-      ],
-      { concurrency: 2 },
-    )
-    const org = orgs.toSorted((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))[0]
-    return Credential.OAuth.make({
-      type: "oauth" as const,
-      methodID,
-      access: token.access_token,
-      refresh: token.refresh_token,
-      expires: Date.now() + token.expires_in * 1000,
-      metadata: {
-        server,
-        accountID: user.id,
-        email: user.email,
-        orgID: org?.id,
-        orgName: org?.name,
-      },
-    })
-  })
-}
-
-function get<S extends Schema.Top>(http: HttpClient.HttpClient, url: string, token: string, schema: S) {
-  return HttpClient.filterStatusOk(http)
-    .execute(HttpClientRequest.get(url).pipe(HttpClientRequest.acceptJson, HttpClientRequest.bearerToken(token)))
-    .pipe(Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)))
-}
-
-function post<S extends Schema.Top>(
-  http: HttpClient.HttpClient,
-  url: string,
-  body: Record<string, string>,
-  schema: S,
-  statusOk = true,
-) {
-  return HttpClientRequest.post(url).pipe(
-    HttpClientRequest.acceptJson,
-    HttpClientRequest.schemaBodyJson(Schema.Record(Schema.String, Schema.String))(body),
-    Effect.flatMap((request) => http.execute(request)),
-    Effect.flatMap((response) => (statusOk ? HttpClientResponse.filterStatusOk(response) : Effect.succeed(response))),
-    Effect.flatMap(HttpClientResponse.schemaBodyJson(schema)),
-  )
 }

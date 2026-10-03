@@ -41,6 +41,7 @@ import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
 import { MessageDecodeError } from "@opencode-ai/core/session/error"
 import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
+import { MaintenanceUsageTable } from "@opencode-ai/core/usage/sql"
 import { resetToolChoiceCapabilityMemory } from "@opencode-ai/core/tool-choice-compatibility"
 import { SPECIAL_AGENT_TIME_WINDOW_MS } from "@opencode-ai/core/special-agent-completion"
 import { Cause, DateTime, Deferred, Effect, Fiber, Layer } from "effect"
@@ -135,7 +136,10 @@ const sessions = Layer.mock(SessionStore.Service, {
 })
 
 const models = SessionRunnerModel.layerWith(
-  () => Effect.die("unexpected session model resolution"),
+  (session) =>
+    session.model
+      ? Effect.succeed(model)
+      : Effect.die("unexpected session model resolution without a selected model"),
   () => Effect.succeed(model),
 )
 
@@ -1282,9 +1286,11 @@ describe("PromptRevisor", () => {
         variant: ModelV2.VariantID.make("high"),
       }
       let candidates: readonly ModelV2.Ref[] = []
+      let explicitCandidates: readonly ModelV2.Ref[] = []
       const runtime: PromptRevisor.Runtime = {
-        resolveModel: ({ candidates: next }) => {
+        resolveModel: ({ candidates: next, explicitCandidates: nextExplicit = [] }) => {
           candidates = next
+          explicitCandidates = nextExplicit
           return Effect.succeed({ ref: next[0]!, value: {} })
         },
         generate: () => Effect.succeed(revisionResponse("Final revised prompt")),
@@ -1299,6 +1305,7 @@ describe("PromptRevisor", () => {
       expect(result.type).toBe("revision")
       expect(candidates[0]).toEqual(dedicated)
       expect(candidates[1]).toEqual(composer)
+      expect(explicitCandidates).toEqual([dedicated])
       expect(String(candidates[1]?.variant)).toBe("high")
     }),
   )
@@ -1576,6 +1583,98 @@ describe("PromptRevisor", () => {
         error: { message: "Prompt Revisor provider turn failed" },
       })
       expect(assistants[0]?.type === "assistant" ? assistants[0].time.completed : undefined).toBeDefined()
+    }),
+  )
+
+  it.effect("settles Session-owned Prompt Revisor usage under the exact runtime-selected account route", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_route_settlement")
+      const stableAccountID = "account-revisor-stable"
+      sessionInfo = {
+        id: sessionID,
+        title: "Prompt route owner",
+        model: modelRef,
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      sessionMessages = []
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const projectID = ProjectV2.ID.make("prompt-revisor-route-settlement-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt route owner",
+          version: "test",
+          model: modelRef,
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      let resolvedSession: SessionSchema.Info | undefined
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates, session }) => {
+          resolvedSession = session
+          return Effect.succeed({
+            ref: ModelV2.Ref.make({
+              ...candidates[0]!,
+              accountID: stableAccountID,
+            }),
+            value: {},
+            route: { routeKind: "account", accountID: stableAccountID },
+          })
+        },
+        generate: (request) => {
+          const response = revisionResponse("Route-settled revision")
+          return Effect.gen(function* () {
+            if (request.publish) {
+              for (const event of response.events) yield* request.publish(event)
+            }
+            return response
+          })
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef, sessionID },
+        runtime,
+      )
+      expect(result).toMatchObject({ type: "revision", prompt: "Route-settled revision" })
+      expect(resolvedSession?.id).toBe(sessionID)
+
+      const usage = yield* readDb
+        .select()
+        .from(MaintenanceUsageTable)
+        .where(
+          and(
+            eq(MaintenanceUsageTable.session_id, sessionID),
+            eq(MaintenanceUsageTable.agent, "prompt_revisor"),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      expect(usage).toHaveLength(1)
+      expect(usage[0]).toMatchObject({
+        route_kind: "account",
+        account_id: stableAccountID,
+      })
     }),
   )
 

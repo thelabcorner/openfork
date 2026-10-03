@@ -101,7 +101,15 @@ export function mergeEventDeltas<T extends EventEnvelope>(previous: T, next: T):
   if (typeof previousFragment !== "string" || typeof nextFragment !== "string") return undefined
   if (previousFragment.length + nextFragment.length > MAX_DELTA_CHARS) return undefined
 
-  const data = { ...nextData, [descriptor.field]: previousFragment + nextFragment }
+  const offset = previousData.offset
+  const nextOffset = nextData.offset
+  if (offset !== undefined || nextOffset !== undefined) {
+    if (typeof offset !== "number" || typeof nextOffset !== "number" ||
+      !Number.isSafeInteger(offset) || offset < 0 || nextOffset !== offset + previousFragment.length) return undefined
+  }
+
+  const data = { ...nextData, [descriptor.field]: previousFragment + nextFragment,
+    ...(offset === undefined ? {} : { offset }) }
   if ("data" in next && next.data !== undefined) return { ...next, data } as T
   return { ...next, properties: data } as T
 }
@@ -125,12 +133,12 @@ export type EventAccumulator<T> = {
  * string plus one envelope clone are materialized exactly once at delivery.
  */
 export function createEventDeltaAccumulator<T extends EventEnvelope>(): EventAccumulator<T> {
-  type State = { readonly descriptor: DeltaDescriptor; readonly fragments: string[]; length: number }
+  type State = { readonly descriptor: DeltaDescriptor; readonly fragments: string[]; length: number; readonly offset?: number }
 
-  const replaceFragment = (event: T, descriptor: DeltaDescriptor, fragment: string): T => {
+  const replaceFragment = (event: T, descriptor: DeltaDescriptor, fragment: string, offset?: number): T => {
     const source = dataOf(event)
     if (!source) return event
-    const data = { ...source, [descriptor.field]: fragment }
+    const data = { ...source, [descriptor.field]: fragment, ...(offset === undefined ? {} : { offset }) }
     if ("data" in event && event.data !== undefined) return { ...event, data } as T
     return { ...event, properties: data } as T
   }
@@ -142,7 +150,9 @@ export function createEventDeltaAccumulator<T extends EventEnvelope>(): EventAcc
       if (!descriptor || !data) return undefined
       const fragment = data[descriptor.field]
       if (typeof fragment !== "string") return undefined
-      return { descriptor, fragments: [fragment], length: fragment.length } satisfies State
+      if (data.offset !== undefined && (typeof data.offset !== "number" || !Number.isSafeInteger(data.offset) || data.offset < 0)) return undefined
+      return { descriptor, fragments: [fragment], length: fragment.length,
+        ...(data.offset === undefined ? {} : { offset: data.offset as number }) } satisfies State
     },
     push(value, event) {
       const state = value as State
@@ -151,6 +161,9 @@ export function createEventDeltaAccumulator<T extends EventEnvelope>(): EventAcc
       const fragment = data?.[state.descriptor.field]
       if (typeof fragment !== "string") return false
       if (state.length + fragment.length > MAX_DELTA_CHARS) return false
+      if (state.offset !== undefined || data?.offset !== undefined) {
+        if (state.offset === undefined || data?.offset !== state.offset + state.length) return false
+      }
       state.fragments.push(fragment)
       state.length += fragment.length
       return true
@@ -160,7 +173,7 @@ export function createEventDeltaAccumulator<T extends EventEnvelope>(): EventAcc
       // A one-fragment entry was never coalesced; preserve object identity and
       // avoid an unnecessary envelope/data clone.
       if (state.fragments.length === 1) return event
-      return replaceFragment(event, state.descriptor, state.fragments.join(""))
+      return replaceFragment(event, state.descriptor, state.fragments.join(""), state.offset)
     },
   }
 }

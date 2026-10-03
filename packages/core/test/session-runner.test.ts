@@ -63,6 +63,8 @@ import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
+import { OpenCodeHostedUserAgent } from "@opencode-ai/core/installation/version"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { testEffect } from "./lib/effect"
 
 const requests: LLMRequest[] = []
@@ -70,6 +72,7 @@ const auditRequests: LLMRequest[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let auditResponses: LLMEvent[][] = []
+let auditStreams: Stream.Stream<LLMEvent, LLMError>[] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
@@ -87,6 +90,8 @@ const client = Layer.succeed(
     stream: ((request: LLMRequest) => {
       if (request.tools.some((tool) => tool.name === "audit_verdict")) {
         auditRequests.push(request)
+        const stream = auditStreams?.shift()
+        if (stream) return stream
         return Stream.fromIterable(auditResponses.shift() ?? [])
       }
       requests.push(request)
@@ -110,6 +115,7 @@ const client = Layer.succeed(
   }),
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
+const hostedModel = Model.make({ id: "space-bunny-free", provider: "opencode", route: OpenAIChat.route })
 const replacementModel = Model.make({ id: "replacement", provider: "fake", route: OpenAIChat.route })
 const cumulativeModel = Model.make({ id: "claude-opus-4-8", provider: "anthropic", route: AnthropicMessages.route })
 const cumulativeReplacementModel = Model.make({ id: "claude-opus-5", provider: "anthropic", route: AnthropicMessages.route })
@@ -344,6 +350,7 @@ const setup = Effect.gen(function* () {
   skillBaselines.clear()
   responses = undefined
   auditResponses = []
+  auditStreams = undefined
   auditRequests.length = 0
   streamFailure = undefined
   responseStream = undefined
@@ -586,7 +593,7 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
-  it.effect("runs multiple provider-backed autonomous Goal cycles until an explicit no-progress policy limit stops re-entry", () =>
+  it.effect("runs provider-backed autonomous Goal cycles until the auditor verifies completion", () =>
     Effect.gen(function* () {
       yield* setup
       const goals = yield* GoalV2.Service
@@ -597,10 +604,6 @@ describe("SessionRunnerLLM", () => {
           title: "Autonomous runner integration",
           objective: "Keep working without another user prompt",
           criteria: ["Complete the autonomous work"],
-          continuationPolicy: {
-            maxNoProgressTurns: 2,
-            maxConsecutiveTurns: 8,
-          },
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -639,15 +642,14 @@ describe("SessionRunnerLLM", () => {
           continuationPrompt: "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
         }),
         auditResponse("audit-goal-3", {
-          decision: "continue",
-          rationale: "The worker still has unfinished work, but no durable progress was recorded.",
-          progressMade: false,
+          decision: "complete",
+          rationale: "The autonomous work is independently verified complete.",
+          progressMade: true,
           criteria: active.criteria.map((criterion) => ({
             criterionID: criterion.id,
-            status: "pending",
-            evidence: "No new evidence proves the criterion yet.",
+            status: "passed",
+            evidence: "The completed worker cycles now satisfy the criterion.",
           })),
-          continuationPrompt: "Investigate why progress is not being recorded before attempting additional implementation.",
         }),
       ]
 
@@ -689,46 +691,119 @@ describe("SessionRunnerLLM", () => {
       }
 
       const stopped = yield* goals.get(created.goal.id).pipe(Effect.orDie)
-      expect(stopped.goal).toMatchObject({
-        status: "active",
-        blocker: undefined,
+      expect(stopped.goal).toMatchObject({ status: "completed", blocker: undefined })
+      const context = yield* session.context(sessionID)
+      const synthetic = context.filter((item) => item.type === "synthetic")
+      expect(
+        synthetic.some(
+          (item) =>
+            item.provenance?.source === "goal.spec" &&
+            item.text.includes('<goal_spec state="current"'),
+        ),
+      ).toBe(true)
+      expect(
+        synthetic.some(
+          (item) =>
+            item.provenance?.source === "goal.progress" &&
+            item.text.includes("<status>completed</status>"),
+        ),
+      ).toBe(true)
+      const continuations = synthetic.filter(
+        (item) => item.provenance?.source === "goal.continuation",
+      )
+      expect(continuations).toHaveLength(2)
+      expect(continuations[0]).toMatchObject({
+        provenance: { sourceMessageID: goalRoot.id },
       })
-      expect(yield* session.context(sessionID)).toMatchObject([
-        {
-          type: "synthetic",
-          text: expect.stringContaining('<goal_spec state="current"'),
-          provenance: { owner: "host", source: "goal.spec", ref: expect.any(String) },
-        },
-        {
-          type: "synthetic",
-          text: expect.stringContaining('<goal_progress state="current"'),
-          provenance: { owner: "host", source: "goal.progress", ref: expect.any(String) },
-        },
-        { type: "user", text: "Begin the Goal" },
-        { type: "assistant" },
-        {
-          type: "synthetic",
-          text: expect.stringContaining("Implement the first remaining autonomous Goal task, then verify the affected behavior."),
-          provenance: {
-            owner: "host",
-            source: "goal.continuation",
-            sourceMessageID: goalRoot.id,
-            ref: expect.any(String),
-          },
-        },
-        { type: "assistant" },
-        {
-          type: "synthetic",
-          text: expect.stringContaining("Finish the second remaining Goal task without repeating the previous cycle"),
-          provenance: {
-            owner: "host",
-            source: "goal.continuation",
-            sourceMessageID: goalRoot.id,
-            ref: expect.any(String),
-          },
-        },
-        { type: "assistant" },
-      ])
+      expect(continuations[0]?.text).toContain(
+        "Implement the first remaining autonomous Goal task, then verify the affected behavior.",
+      )
+      expect(continuations[1]?.text).toContain(
+        "Finish the second remaining Goal task without repeating the previous cycle",
+      )
+    }),
+  )
+
+  it.effect("re-audits a completed autonomous Goal cycle after auditor interruption without rerunning the worker", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const session = yield* SessionV2.Service
+      const created = yield* goals
+        .create({
+          projectID: Project.ID.global,
+          title: "Interrupted Goal auditor recovery",
+          objective: "Keep the exact autonomous continuation recoverable across runner interruption",
+          criteria: ["The claimed continuation is pending again after interruption"],
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Begin interruption recovery test" }),
+        resume: false,
+      })
+      requests.length = 0
+
+      const secondAuditStarted = yield* Deferred.make<void>()
+      responses = [
+        fragmentFixture("text", "goal-interrupt-user", ["Initial Goal work complete."]).completeEvents,
+        fragmentFixture("text", "goal-interrupt-auto", ["Autonomous follow-up complete."]).completeEvents,
+      ]
+      auditStreams = [
+        Stream.fromIterable(
+          auditResponse("audit-goal-interrupt-1", {
+            decision: "continue",
+            rationale: "One autonomous cycle remains.",
+            progressMade: true,
+            criteria: active.criteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending" as const,
+              evidence: "The autonomous recovery cycle still needs verification.",
+            })),
+            continuationPrompt: "Run the autonomous recovery cycle, then audit its result.",
+          }),
+        ),
+        Stream.fromEffect(Deferred.succeed(secondAuditStarted, undefined)).pipe(Stream.flatMap(() => Stream.never)),
+      ]
+
+      const runner = yield* SessionRunner.Service
+      const fiber = yield* runner.run({ sessionID, force: true }).pipe(Effect.forkChild)
+      yield* Deferred.await(secondAuditStarted)
+      expect(yield* automation.runtime(sessionID)).toMatchObject({ phase: "auditing" })
+
+      yield* Fiber.interrupt(fiber)
+
+      expect(requests).toHaveLength(2)
+      expect(auditRequests).toHaveLength(2)
+      expect(yield* automation.runtime(sessionID)).toMatchObject({ phase: "audit_requested" })
+      expect(yield* automation.pendingSessions()).not.toContain(sessionID)
+      expect(yield* automation.claim(sessionID)).toBeUndefined()
+
+      auditStreams = [
+        Stream.fromIterable(
+          auditResponse("audit-goal-interrupt-recovered", {
+            decision: "complete",
+            rationale: "The already-completed autonomous cycle satisfies the Goal after recovery.",
+            progressMade: true,
+            criteria: active.criteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "passed" as const,
+              evidence: "Recovery re-audited the completed worker cycle without executing it again.",
+            })),
+          }),
+        ),
+      ]
+      yield* runner.run({ sessionID, force: false })
+
+      expect(requests).toHaveLength(2)
+      expect(auditRequests).toHaveLength(3)
+      expect(yield* automation.runtime(sessionID)).toBeUndefined()
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("completed")
     }),
   )
 
@@ -744,7 +819,6 @@ describe("SessionRunnerLLM", () => {
           title: "User prompt reactivation",
           objective: "Resume blocked work when the user speaks again",
           criteria: ["Goal is active after admission"],
-          continuationPolicy: {},
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -828,7 +902,6 @@ describe("SessionRunnerLLM", () => {
           title: "Automatic pre-spend revalidation",
           objective: "Prove a newer User owns the provider boundary",
           criteria: ["Do not spend stale automatic work"],
-          continuationPolicy: { maxConsecutiveTurns: 8 },
         })
         .pipe(Effect.orDie)
       const active = yield* goals
@@ -3132,6 +3205,31 @@ describe("SessionRunnerLLM", () => {
       yield* Fiber.join(second)
       streamGate = undefined
       streamStarted = undefined
+    }),
+  )
+
+  it.effect("emits OpenCode hosted identity on the actual V2 provider request", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      currentModel = hostedModel
+      const admitted = yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Run Space Bunny through the V2 runner" }),
+        resume: false,
+      })
+
+      requests.length = 0
+      yield* drainSession(sessionID)
+
+      expect(requests).toHaveLength(1)
+      expect(requests[0]?.http?.headers).toEqual({
+        "x-opencode-project": Project.ID.global,
+        "x-opencode-session": sessionID,
+        "x-opencode-request": admitted.id,
+        "x-opencode-client": Flag.OPENCODE_CLIENT,
+        "User-Agent": OpenCodeHostedUserAgent(),
+      })
     }),
   )
 

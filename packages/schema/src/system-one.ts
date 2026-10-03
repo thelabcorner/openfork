@@ -4,6 +4,7 @@ import { Schema } from "effect"
 import { optional } from "./schema"
 import { Model } from "./model"
 import { Provider } from "./provider"
+import { ProviderRouteIntent } from "./model-select/provider-route-intent"
 
 /** Non-null TypeSafe content used by state and question instructions. */
 export const Content = Schema.Union([
@@ -56,6 +57,11 @@ export interface InferInput extends Schema.Schema.Type<typeof InferInput> {}
 export const InferInput = Schema.Struct({
   providerID: Provider.ID,
   modelID: Model.ID,
+  /**
+   * Reusable secret-free route preference. Legacy accountID remains accepted
+   * during migration and is normalized to an explicit hard account pin.
+   */
+  routeIntent: ProviderRouteIntent.Info.pipe(optional),
   accountID: Schema.String.pipe(optional),
   /**
    * Optional caller-owned routing/cache affinity key. This is not a persisted

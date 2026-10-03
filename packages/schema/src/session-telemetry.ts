@@ -58,10 +58,28 @@ export type Context = typeof Context.Type
 export const Info = Schema.Struct({
   sessionID: SessionID,
   phase: Phase,
-  /** Start of the current session drain / user-visible turn. Live-only. */
+  /**
+   * Start of the current user-visible semantic turn. Live-only. A new promoted
+   * or automatic turn resets this value even when the Session stays busy.
+   */
   turnStartedAt: Schema.optional(Schema.Finite),
   phaseStartedAt: Schema.optional(Schema.Finite),
   updatedAt: Schema.Finite,
+  /**
+   * Producer-monotonic elapsed time captured with this projection. These values
+   * are authoritative for live duration math and are immune to wall-clock/NTP
+   * adjustments. Epoch timestamps above remain useful for provenance and
+   * rolling-version fallback.
+   */
+  turnElapsedMs: Schema.optional(Schema.Finite),
+  phaseElapsedMs: Schema.optional(Schema.Finite),
+  /**
+   * Producer wall-clock sample captured when this projection payload is
+   * materialized. Consumers may compare it with producer timestamps such as
+   * turnStartedAt/phaseStartedAt, but must not subtract those timestamps from a
+   * client-local clock directly.
+   */
+  sampledAt: Schema.optional(Schema.Finite),
   model: Schema.optional(Model),
   /** Latest settled provider turn; remains stable while the next turn streams. */
   context: Schema.optional(Context),

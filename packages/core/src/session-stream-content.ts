@@ -46,6 +46,7 @@ const CONTENT_PREFIXES = [
 
 export const STREAM_INTEREST_SUBSCRIBER_HEADER = "x-opencode-stream-subscriber"
 export const STREAM_INTEREST_SESSIONS_HEADER = "x-opencode-stream-sessions"
+export const STREAM_INTEREST_GENERATION_HEADER = "x-opencode-stream-generation"
 export const STREAM_INTEREST_MAX_SESSIONS = 128
 export const STREAM_INTEREST_MAX_SUBSCRIBER_CHARS = 128
 export const STREAM_INTEREST_MAX_SESSION_CHARS = 256

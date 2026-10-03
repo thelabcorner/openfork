@@ -6,6 +6,7 @@ import { Context, Effect, Layer } from "effect"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
+import { UsageRevision } from "./revision"
 import { UsageRecordTable, UsageYieldMetaTable, UsageYieldStatTable } from "./sql"
 import {
   isUserFacingYieldObservation,
@@ -225,6 +226,11 @@ const layer = Layer.effect(
         .run()
         .pipe(Effect.orDie)
 
+      // A full rewrite replaces every materialized state, so in-process readers
+      // memoizing this projection must observe it even when no settlement was
+      // recorded. Observing through the caller's transaction keeps the advance
+      // tied to the commit that carries the new states.
+      UsageRevision.advance()
       return { sourceRows, states: states.size } satisfies RebuildResult
     })
 
@@ -261,6 +267,11 @@ const layer = Layer.effect(
       yield* db
         .transaction((inner) => observeIn(inner, input), { behavior: "immediate" })
         .pipe(Effect.orDie)
+      // A standalone observation commits the projection outside the settlement
+      // ledger, so it is the only writer of the change and must advance the
+      // watermark itself. The transactional path is owned by UsageRecord.record,
+      // which advances only when its ledger row was actually inserted.
+      UsageRevision.advance()
     })
 
     const get = Effect.fn("UsageYield.get")(function* (key: YieldStatisticalKey) {

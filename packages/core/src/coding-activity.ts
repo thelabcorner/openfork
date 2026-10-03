@@ -32,7 +32,19 @@ export interface Input {
   readonly language?: string
   readonly model?: Model
   readonly source: Source
+  /**
+   * Stable identity of the actor/origin named by the producer, when it has one.
+   * This is attribution metadata, not an idempotency token: the same principal
+   * may legitimately produce many observations with the same sourceRef.
+   */
   readonly sourceRef?: string
+  /**
+   * Optional producer-proven identity for exactly one logical observation.
+   * Consumers may use this to suppress a replay of that same observation. It
+   * must never be synthesized from an actor/principal identity merely because
+   * one is available; absence means "not safely replay-deduplicable".
+   */
+  readonly replayToken?: string
 }
 
 export interface Activity extends Input {
@@ -92,6 +104,7 @@ function sanitize(input: Input, entity: string, time: number): Activity {
     model: sanitizeModel(input.model),
     source: input.source,
     sourceRef: optionalString(input.sourceRef),
+    replayToken: optionalString(input.replayToken),
   }
 }
 

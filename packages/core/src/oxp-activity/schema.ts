@@ -23,6 +23,12 @@ export type Status = typeof Status.Type
 export const ContinuityMarker = OxpActivity.ContinuityMarker
 export type ContinuityMarker = typeof ContinuityMarker.Type
 
+export const ContextExactSource = OxpActivity.ContextExactSource
+export type ContextExactSource = typeof ContextExactSource.Type
+
+export const ContextSchema = OxpActivity.ContextSchema
+export type ContextSchema = typeof ContextSchema.Type
+
 export const LinkKind = OxpActivity.LinkKind
 export type LinkKind = typeof LinkKind.Type
 

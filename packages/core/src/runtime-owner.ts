@@ -91,16 +91,18 @@ export const make = Effect.fn("RuntimeOwner.make")(function* (options: MakeOptio
     heartbeat = yield* Effect.gen(function* () {
       for (;;) {
         yield* Effect.sleep(Duration.millis(heartbeatIntervalMs))
-        yield* beat()
+        yield* beat().pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.logError("RuntimeOwner heartbeat failed; retrying", {
+                  id,
+                  cause: Cause.pretty(cause),
+                }),
+          ),
+        )
       }
-    }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause)
-          ? Effect.void
-          : Effect.logError("RuntimeOwner heartbeat failed", { id, cause }),
-      ),
-      Effect.forkIn(scope),
-    )
+    }).pipe(Effect.forkIn(scope))
   })
 
   const retain = mutex.withPermit(

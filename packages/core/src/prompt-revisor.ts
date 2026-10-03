@@ -53,6 +53,8 @@ import {
   type TerminalFailure,
 } from "./special-agent-completion"
 import { type ToolChoiceCapabilityIdentity } from "./tool-choice-compatibility"
+import type { UsageRouteAttribution } from "./usage/route-attribution"
+import { providerRequestHeaders } from "./session/runner/provider-request-headers"
 import { DEFAULT_PROMPT, PROTOCOL_PROMPT } from "./prompt-revisor-prompt"
 
 export { DEFAULT_PROMPT, PROTOCOL_PROMPT } from "./prompt-revisor-prompt"
@@ -313,6 +315,8 @@ export type Result = RevisionResult | CancelledResult
 export interface ResolvedModel {
   readonly ref: ModelV2.Ref
   readonly value: unknown
+  /** Secret-free execution/settlement authority selected by the host runtime. */
+  readonly route?: UsageRouteAttribution.Committed
   /** Route-aware runtime identity for shared required→auto capability learning. */
   readonly capability?: ToolChoiceCapabilityIdentity
 }
@@ -341,6 +345,14 @@ export interface RuntimeGenerateInput {
 export interface Runtime {
   readonly resolveModel: (input: {
     readonly candidates: readonly ModelV2.Ref[]
+    /**
+     * Dedicated request/agent selections are true maintenance overrides.
+     * Composer/session fallbacks are not allowed to create a different
+     * provider-domain route merely because an earlier candidate was unavailable.
+     */
+    readonly explicitCandidates?: readonly ModelV2.Ref[]
+    /** Present only when revision belongs to a durable Session and may inherit its route. */
+    readonly session?: SessionSchema.Info
   }) => Effect.Effect<ResolvedModel, UnavailableError>
   readonly generate: (input: RuntimeGenerateInput) => Effect.Effect<LLMResponse, UnavailableError>
   /** Optional host-only entities not represented by core services (for example MCP resources). */
@@ -690,23 +702,82 @@ const layer = Layer.effect(
     })
 
     const defaultRuntime: Runtime = {
-      resolveModel: Effect.fn("PromptRevisor.defaultRuntime.resolveModel")(function* ({ candidates }) {
-        const resolvedModel = (ref: ModelV2.Ref, value: Model): ResolvedModel => ({
-          ref,
-          value,
-          capability: {
-            providerID: String(value.provider),
-            modelID: String(value.id),
-            apiURL: value.route.endpoint.baseURL,
-            routeID: value.route.id,
-            routeProtocol: String(value.route.protocol),
-          },
-        })
+      resolveModel: Effect.fn("PromptRevisor.defaultRuntime.resolveModel")(function* ({
+        candidates,
+        explicitCandidates = [],
+        session,
+      }) {
+        const candidateKey = (candidate: ModelV2.Ref) =>
+          `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
+        const explicit = new Set(explicitCandidates.map(candidateKey))
+        const sessionModelKey = session?.model ? candidateKey(session.model) : undefined
+        const resolvedModel = (
+          ref: ModelV2.Ref,
+          value: Model,
+          route?: SessionRunnerModel.ResolvedInfo["route"],
+        ): ResolvedModel => {
+          const usageRoute =
+            route?.routeKind === "account"
+              ? ({ routeKind: "account", accountID: route.accountID! } as const)
+              : route?.routeKind === "public"
+                ? ({ routeKind: "public" } as const)
+                : undefined
+          const selectedRef =
+            usageRoute?.routeKind === "account"
+              ? ModelV2.Ref.make({ ...ref, accountID: usageRoute.accountID })
+              : usageRoute?.routeKind === "public"
+                ? ModelV2.Ref.make({
+                    providerID: ref.providerID,
+                    id: ref.id,
+                    ...(ref.variant ? { variant: ref.variant } : {}),
+                  })
+                : ref
+          return {
+            ref: selectedRef,
+            value,
+            ...(usageRoute ? { route: usageRoute } : {}),
+            capability: {
+              providerID: String(value.provider),
+              modelID: String(value.id),
+              apiURL: value.route.endpoint.baseURL,
+              routeID: value.route.id,
+              routeProtocol: String(value.route.protocol),
+            },
+          }
+        }
         const seen = new Set<string>()
         for (const candidate of candidates) {
-          const key = `${candidate.providerID}/${candidate.id}/${candidate.accountID ?? ""}/${candidate.variant ?? ""}`
+          const key = candidateKey(candidate)
           if (seen.has(key)) continue
           seen.add(key)
+          if (session) {
+            const explicitOverride = explicit.has(key)
+            const inheritedProvider =
+              session.model === undefined || candidate.providerID === session.model.providerID
+            if (!explicitOverride && !inheritedProvider) continue
+
+            // Automatic composer fallbacks inherit the Session provider-domain
+            // route and must not hard-pin stale account metadata. The actual
+            // Session model and explicit overrides keep their account intent.
+            const routedCandidate =
+              !explicitOverride &&
+              session.model &&
+              candidate.providerID === session.model.providerID &&
+              key !== sessionModelKey
+                ? ModelV2.Ref.make({
+                    providerID: candidate.providerID,
+                    id: candidate.id,
+                    ...(candidate.variant ? { variant: candidate.variant } : {}),
+                  })
+                : candidate
+            const routed = yield* models
+              .resolveWithInfo({ ...session, model: routedCandidate })
+              .pipe(Effect.option)
+            if (routed._tag === "Some") {
+              return resolvedModel(candidate, routed.value.model, routed.value.route)
+            }
+            continue
+          }
           const resolved = yield* models.resolveRef(candidate).pipe(Effect.option)
           if (resolved._tag === "Some") return resolvedModel(candidate, resolved.value)
         }
@@ -740,8 +811,30 @@ const layer = Layer.effect(
           request.generation.maxTokens === undefined
             ? undefined
             : boundedMaxTokens(model, request.generation.maxTokens)
+        // Hosted request identity is request-shape parity, never entitlement,
+        // and it never selects or restamps a route: the route was already
+        // committed by resolveModel above. A durable Session supplies the
+        // project identity the shared helper requires; draft-mode revision owns
+        // no Session, so there is no truthful project identity to send and we
+        // omit hosted headers rather than fabricate one.
+        const owned = request.sessionID === undefined ? undefined : yield* sessions.get(request.sessionID)
         const base = LLM.request({
           model,
+          ...(owned?.projectID === undefined
+            ? {}
+            : {
+                http: {
+                  headers: providerRequestHeaders({
+                    providerID: model.provider,
+                    projectID: owned.projectID,
+                    sessionID: owned.id,
+                    // One physical provider request per generate() call, including
+                    // the reconnaissance and protocol-correction retries.
+                    requestID: crypto.randomUUID(),
+                    parentSessionID: owned.parentID,
+                  }),
+                },
+              }),
           system: request.system,
           messages: request.messages,
           tools: request.tools,
@@ -810,10 +903,17 @@ const layer = Layer.effect(
       const sessionContext =
         loadedContext && loadedContext._tag === "Some" ? assembleSessionContext(loadedContext.value) : ""
       const agent = yield* agents.get(AgentV2.ID.make("prompt-revisor"))
-      const candidates = [input.model, agent?.model, input.fallbackModel, session?.model].filter(
+      const explicitCandidates = [input.model, agent?.model].filter(
         (item): item is ModelV2.Ref => item !== undefined,
       )
-      const model = yield* runtime.resolveModel({ candidates })
+      const candidates = [...explicitCandidates, input.fallbackModel, session?.model].filter(
+        (item): item is ModelV2.Ref => item !== undefined,
+      )
+      const model = yield* runtime.resolveModel({
+        candidates,
+        explicitCandidates,
+        ...(session ? { session } : {}),
+      })
       const modelRef = model.ref
       // A revision attached to a real Session gets a durable transcript owned by
       // its semantic producer. Session ownership is independent from whether the
@@ -1000,6 +1100,7 @@ const layer = Layer.effect(
               agent: specialAgent,
               providerID: modelRef.providerID,
               modelID: modelRef.id,
+              ...(model.route ? { route: model.route } : {}),
               variant: modelRef.variant,
               sessionID: runtimeSessionID,
               costEstimated: reported === undefined,
@@ -1050,6 +1151,7 @@ const layer = Layer.effect(
             agent: specialAgent,
             providerID: modelRef.providerID,
             modelID: modelRef.id,
+            ...(model.route ? { route: model.route } : {}),
             variant: modelRef.variant,
             sessionID: runtimeSessionID,
             costEstimated: reported === undefined,

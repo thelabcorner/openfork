@@ -46,7 +46,7 @@ const seedLayer = () =>
       yield* db.run("PRAGMA journal_mode = WAL")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, readDb: db, filename: ":memory:" }
+      return { db, readDb: db, scanDb: () => Effect.succeed(db), filename: ":memory:" }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename: ":memory:", createTimePragmas: { page_size: 8192, auto_vacuum: 2 } })))
 

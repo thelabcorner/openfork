@@ -4,7 +4,8 @@ import { Swarm } from "@opencode-ai/schema/swarm"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { EventV2 } from "../event"
 import { SessionInputTable } from "../session/sql"
-import { isTaskTerminal, semanticRetryConsumesBudget } from "./state-machine"
+import { taskRunResultSummary } from "./bounds"
+import { canTransitionTask, isTaskTerminal, semanticRetryConsumesBudget } from "./state-machine"
 import {
   hydrateLease,
   hydrateTask,
@@ -107,7 +108,11 @@ export interface StartTaskRunInput {
 }
 
 export type TaskSettlement =
-  | { readonly type: "completed" }
+  | {
+      readonly type: "completed"
+      /** Worker-authored result; Core trims and byte-bounds it before persistence. */
+      readonly summary?: string
+    }
   | {
       readonly type: "failed"
       readonly failureKind: Swarm.TaskFailureKind
@@ -115,11 +120,70 @@ export type TaskSettlement =
     }
   | { readonly type: "cancelled"; readonly detail?: string }
   | { readonly type: "superseded"; readonly detail?: string }
+  /**
+   * Host-observed execution end without a semantic decision. The run becomes a
+   * truthful `unsettled` terminal fact and the task becomes `review_pending`,
+   * which is not dispatchable. Never inferred from model prose and never a
+   * success or a semantic failure, so it consumes no semantic retry budget.
+   */
+  | { readonly type: "unsettled"; readonly detail?: string }
+  /**
+   * A retiring run whose external effects were contained by an explicit
+   * acknowledgement. The mutation may or may not have happened, so the run ends
+   * as the same terminal `unsettled` unknown fact as an execution that ended
+   * without a decision, and the task becomes `review_pending`.
+   *
+   * This deliberately does NOT reuse `superseded`. `superseded` means "no
+   * external outcome to worry about" and therefore returns the task to `ready`,
+   * which would make a contained unknown-outcome mutation immediately
+   * dispatchable again and risk repeating it. `contained_unknown` keeps the task
+   * non-dispatchable so only a deliberate review decision can retry it, spends
+   * no semantic retry budget, and never claims the effect did not occur.
+   */
+  | { readonly type: "contained_unknown"; readonly detail?: string }
 
 export interface SettleTaskInput {
   readonly token: LeaseToken
   readonly runID?: Swarm.TaskRunID
   readonly settlement: TaskSettlement
+  readonly now?: number
+  /**
+   * Retirement's anti-replay capability.
+   *
+   * Settling `unsettled` on a `retiring` lease is normally refused: retirement
+   * owns closure of a retiring lease, and the execution-end closure service
+   * only ever selects `active` leases. Retirement itself is the one caller that
+   * may close a retiring lease as `unsettled`, and only when it holds proven
+   * execution-end truth for that run's exact SessionInput (the assignment's
+   * `completed_seq`), which turns a would-be `ready` redispatch into
+   * `review_pending`. Absent this assertion the previous
+   * `swarm.retirement_owns_closure` refusal stands unchanged.
+   */
+  readonly retirementOwnerUnsettled?: true
+}
+
+/**
+ * The only reviewer/coordinator decisions that may resolve an unsettled task.
+ *
+ * `request_changes` and `retry` stay separate on purpose: demanding changes and
+ * authorizing a fresh execution are different decisions, so neither can imply
+ * the other and already-produced work cannot be replayed by accident.
+ */
+export type TaskReviewDecision =
+  | { readonly type: "accept" }
+  | { readonly type: "request_changes"; readonly detail?: string }
+  | { readonly type: "retry"; readonly detail?: string }
+  | { readonly type: "fail"; readonly detail?: string }
+  | { readonly type: "cancel"; readonly detail?: string }
+
+export interface ReviewTaskInput {
+  readonly swarmID: Swarm.ID
+  readonly taskID: Swarm.TaskID
+  /** Host-resolvable roster identity; membership is re-proven inside the commit. */
+  readonly reviewerMemberID: Swarm.MemberID
+  /** Fences a reviewer acting twice on a task it already decided about. */
+  readonly expectedLeaseGeneration: number
+  readonly decision: TaskReviewDecision
   readonly now?: number
 }
 
@@ -242,6 +306,7 @@ export const commitTaskRunAdmission = Effect.fn("Swarm.commitTaskRunAdmission")(
     ...row,
     failure_kind: null,
     failure_detail: null,
+    result_summary: null,
     started_at: null,
     ended_at: null,
   })
@@ -982,10 +1047,38 @@ export function makeLeaseOperations(input: {
         code: "swarm.supersede_requires_retirement",
         reason: `Task ${request.token.taskID} must enter retiring before it can be superseded.`,
       })
+    if (
+      request.settlement.type === "unsettled" &&
+      leaseRow.state === "retiring" &&
+      request.retirementOwnerUnsettled !== true
+    )
+      return yield* new SwarmSchema.ConflictError({
+        code: "swarm.retirement_owns_closure",
+        reason: `Task ${request.token.taskID} is retiring; retirement must settle it as superseded before it can be closed as unsettled.`,
+      })
+    if (request.settlement.type === "contained_unknown" && leaseRow.state !== "retiring")
+      return yield* new SwarmSchema.ConflictError({
+        code: "swarm.containment_requires_retirement",
+        reason: `Task ${request.token.taskID} must enter retiring before contained effects can be acknowledged.`,
+      })
     if (request.settlement.type === "completed" || request.settlement.type === "failed")
       yield* requireRunnableBinding(readDb, request.token)
 
     const runRow = request.runID === undefined ? undefined : yield* requireTaskRunRow(readDb, request.runID)
+    if (request.settlement.type === "unsettled" || request.settlement.type === "contained_unknown") {
+      if (runRow === undefined)
+        return yield* new SwarmSchema.ValidationError({
+          reason: "An unsettled closure must name the exact task run whose execution ended.",
+        })
+      // `unsettled` asserts that execution demonstrably began. An `admitted`
+      // run never started, so ending without settlement is not a fact about it;
+      // operational supersession owns that case instead.
+      if (runRow.status !== "running")
+        return yield* new SwarmSchema.ConflictError({
+          code: "swarm.run_not_started",
+          reason: `Task run ${runRow.id} cannot be closed as unsettled from ${runRow.status}; unsettled means execution actually began.`,
+        })
+    }
     if (
       runRow &&
       (runRow.task_id !== request.token.taskID ||
@@ -1009,6 +1102,12 @@ export function makeLeaseOperations(input: {
 
     const now = request.now ?? Date.now()
     const nextGeneration = request.token.generation + 1
+    const resultSummary =
+      request.settlement.type === "completed" ? taskRunResultSummary(request.settlement.summary) : undefined
+    if (resultSummary !== undefined && runRow === undefined)
+      return yield* new SwarmSchema.ValidationError({
+        reason: "A successful task result summary requires the exact TaskRun that produced it.",
+      })
     const semanticFailure =
       request.settlement.type === "failed" && semanticRetryConsumesBudget(request.settlement.failureKind)
     const nextStatus: Swarm.TaskStatus =
@@ -1016,11 +1115,13 @@ export function makeLeaseOperations(input: {
         ? "completed"
         : request.settlement.type === "cancelled"
           ? "cancelled"
-          : request.settlement.type === "superseded"
-            ? "ready"
-            : semanticFailure
-              ? "failed"
-              : "ready"
+          : request.settlement.type === "unsettled" || request.settlement.type === "contained_unknown"
+            ? "review_pending"
+            : request.settlement.type === "superseded"
+              ? "ready"
+              : semanticFailure
+                ? "failed"
+                : "ready"
     const task = hydrateTask({
       ...taskRow,
       status: nextStatus,
@@ -1036,9 +1137,11 @@ export function makeLeaseOperations(input: {
         ? "completed"
         : request.settlement.type === "cancelled"
           ? "cancelled"
-          : request.settlement.type === "superseded"
-            ? "superseded"
-            : "failed"
+          : request.settlement.type === "unsettled" || request.settlement.type === "contained_unknown"
+            ? "unsettled"
+            : request.settlement.type === "superseded"
+              ? "superseded"
+              : "failed"
     const run =
       runRow === undefined
         ? undefined
@@ -1048,9 +1151,14 @@ export function makeLeaseOperations(input: {
             failure_kind:
               request.settlement.type === "failed" ? request.settlement.failureKind : runRow.failure_kind,
             failure_detail:
-              request.settlement.type === "failed" || request.settlement.type === "cancelled" || request.settlement.type === "superseded"
+              request.settlement.type === "failed" ||
+              request.settlement.type === "cancelled" ||
+              request.settlement.type === "superseded" ||
+              request.settlement.type === "unsettled" ||
+              request.settlement.type === "contained_unknown"
                 ? request.settlement.detail ?? null
                 : runRow.failure_detail,
+            result_summary: request.settlement.type === "completed" ? resultSummary ?? null : runRow.result_summary,
             ended_at: now,
           })
 
@@ -1081,6 +1189,24 @@ export function makeLeaseOperations(input: {
               reason: `Task ${request.token.taskID} left retiring before settlement.`,
             }),
           )
+        if (
+          request.settlement.type === "unsettled" &&
+          liveLease.state === "retiring" &&
+          request.retirementOwnerUnsettled !== true
+        )
+          return yield* commitFail(
+            new SwarmSchema.ConflictError({
+              code: "swarm.retirement_owns_closure",
+              reason: `Task ${request.token.taskID} began retiring before unsettled closure.`,
+            }),
+          )
+        if (request.settlement.type === "contained_unknown" && liveLease.state !== "retiring")
+          return yield* commitFail(
+            new SwarmSchema.ConflictError({
+              code: "swarm.containment_requires_retirement",
+              reason: `Task ${request.token.taskID} left retiring before contained effects were acknowledged.`,
+            }),
+          )
         if (request.settlement.type === "completed" || request.settlement.type === "failed")
           yield* requireRunnableBinding(db, request.token).pipe(Effect.catch((error) => commitFail(error)))
 
@@ -1094,15 +1220,20 @@ export function makeLeaseOperations(input: {
               failure_detail:
                 request.settlement.type === "failed" ||
                 request.settlement.type === "cancelled" ||
-                request.settlement.type === "superseded"
+                request.settlement.type === "superseded" ||
+                request.settlement.type === "unsettled" ||
+                request.settlement.type === "contained_unknown"
                   ? request.settlement.detail ?? null
                   : runRow.failure_detail,
+              result_summary: request.settlement.type === "completed" ? resultSummary ?? null : runRow.result_summary,
               ended_at: now,
             })
             .where(
               and(
                 eq(SwarmTaskRunTable.id, runRow.id),
-                inArray(SwarmTaskRunTable.status, ["admitted", "running"]),
+                request.settlement.type === "unsettled" || request.settlement.type === "contained_unknown"
+                  ? eq(SwarmTaskRunTable.status, "running")
+                  : inArray(SwarmTaskRunTable.status, ["admitted", "running"]),
                 eq(SwarmTaskRunTable.lease_generation, request.token.generation),
                 eq(SwarmTaskRunTable.binding_generation, request.token.bindingGeneration),
               ),
@@ -1202,6 +1333,154 @@ export function makeLeaseOperations(input: {
     return rows.map(hydrateLease)
   })
 
+  /**
+   * Resolve a task whose execution ended without a semantic decision.
+   *
+   * This is the review-loop exit, not a settlement: it never marks work
+   * successful because a model stayed silent, and it never mints lease
+   * authority. It deliberately requires NO live lease row, because
+   * `review_pending` already released execution ownership; requiring one would
+   * make the exit unreachable. What it does require is that no lease exists at
+   * all, so a reviewer can never decide a task that is executing or retiring.
+   */
+  const reviewTask = Effect.fn("Swarm.reviewTask")(function* (request: ReviewTaskInput) {
+    const taskRow = yield* requireTaskRow(readDb, request.swarmID, request.taskID)
+    if (taskRow.status !== "review_pending" && taskRow.status !== "changes_requested")
+      return yield* new SwarmSchema.InvalidTransitionError({
+        entity: "task",
+        id: request.taskID,
+        from: taskRow.status,
+        to: `review:${request.decision.type}`,
+      })
+    if (taskRow.lease_generation !== request.expectedLeaseGeneration)
+      return yield* new SwarmSchema.StaleFenceError({
+        fence: "task_lease",
+        id: request.taskID,
+        expectedGeneration: request.expectedLeaseGeneration,
+        actualGeneration: taskRow.lease_generation,
+      })
+    if (request.decision.type === "request_changes" && taskRow.status === "changes_requested")
+      return yield* new SwarmSchema.InvalidTransitionError({
+        entity: "task",
+        id: request.taskID,
+        from: taskRow.status,
+        to: "review:request_changes",
+      })
+
+    const nextStatus: Swarm.TaskStatus =
+      request.decision.type === "accept"
+        ? "completed"
+        : request.decision.type === "request_changes"
+          ? "changes_requested"
+          : request.decision.type === "retry"
+            ? "ready"
+            : request.decision.type === "fail"
+              ? "failed"
+              : "cancelled"
+    if (!canTransitionTask(taskRow.status, nextStatus))
+      return yield* new SwarmSchema.InvalidTransitionError({
+        entity: "task",
+        id: request.taskID,
+        from: taskRow.status,
+        to: nextStatus,
+      })
+
+    // A stopped member has no active review authority. Membership is re-proven
+    // under the writer reservation below, so this read is only the fast path.
+    const reviewer = yield* requireMemberRow(readDb, request.swarmID, request.reviewerMemberID)
+    if (reviewer.lifecycle !== "active")
+      return yield* new SwarmSchema.ConflictError({
+        code: "swarm.reviewer_inactive",
+        reason: `Member ${request.reviewerMemberID} is ${reviewer.lifecycle} and cannot resolve task ${request.taskID}.`,
+      })
+
+    const now = request.now ?? Date.now()
+    const task = hydrateTask({
+      ...taskRow,
+      status: nextStatus,
+      lease_generation: taskRow.lease_generation + 1,
+      ready_at: nextStatus === "ready" ? now : null,
+      time_updated: now,
+      time_completed: isTaskTerminal(nextStatus) ? now : null,
+    })
+
+    yield* publishWithCommit(events, Swarm.Event.TaskUpdated, { swarmID: request.swarmID, task }, () =>
+      Effect.gen(function* () {
+        const live = yield* db
+          .select({ id: SwarmTaskLeaseTable.task_id })
+          .from(SwarmTaskLeaseTable)
+          .where(eq(SwarmTaskLeaseTable.task_id, request.taskID))
+          .get()
+          .pipe(Effect.orDie)
+        if (live)
+          return yield* commitFail(
+            new SwarmSchema.ConflictError({
+              code: "swarm.task_under_authority",
+              reason: `Task ${request.taskID} holds live execution authority and cannot be reviewed.`,
+            }),
+          )
+
+        const member = yield* db
+          .select({ lifecycle: SwarmMemberTable.lifecycle })
+          .from(SwarmMemberTable)
+          .where(
+            and(
+              eq(SwarmMemberTable.id, request.reviewerMemberID),
+              eq(SwarmMemberTable.swarm_id, request.swarmID),
+            ),
+          )
+          .get()
+          .pipe(Effect.orDie)
+        if (!member)
+          return yield* commitFail(
+            new SwarmSchema.NotFoundError({ entity: "member", id: request.reviewerMemberID }),
+          )
+        if (member.lifecycle !== "active")
+          return yield* commitFail(
+            new SwarmSchema.ConflictError({
+              code: "swarm.reviewer_inactive",
+              reason: `Member ${request.reviewerMemberID} lost active review authority before commit.`,
+            }),
+          )
+
+        const updated = yield* db
+          .update(SwarmTaskTable)
+          .set({
+            status: task.status,
+            lease_generation: task.leaseGeneration,
+            ready_at: task.status === "ready" ? now : null,
+            time_updated: now,
+            time_completed: isTaskTerminal(task.status) ? now : null,
+          })
+          .where(
+            and(
+              eq(SwarmTaskTable.id, request.taskID),
+              eq(SwarmTaskTable.swarm_id, request.swarmID),
+              inArray(SwarmTaskTable.status, ["review_pending", "changes_requested"]),
+              eq(SwarmTaskTable.lease_generation, request.expectedLeaseGeneration),
+            ),
+          )
+          .returning({ id: SwarmTaskTable.id })
+          .get()
+          .pipe(Effect.orDie)
+        if (!updated)
+          return yield* commitFail(
+            new SwarmSchema.ConflictError({
+              code: "swarm.task_review_raced",
+              reason: `Task ${request.taskID} changed before the review decision committed.`,
+            }),
+          )
+        if (isTaskTerminal(task.status))
+          yield* promoteSatisfiedDependents(db, {
+            swarmID: request.swarmID,
+            prerequisiteTaskID: request.taskID,
+            now,
+          })
+      }),
+    )
+    return task
+  })
+
   const taskRunHistory = Effect.fn("Swarm.taskRunHistory")(function* (request: {
     readonly swarmID: Swarm.ID
     readonly taskID?: Swarm.TaskID
@@ -1249,6 +1528,7 @@ export function makeLeaseOperations(input: {
     recordTaskRun,
     startTaskRun,
     settleTask,
+    reviewTask,
     expiredLeases,
     taskRunHistory,
   }

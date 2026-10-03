@@ -1,5 +1,8 @@
 export * as SessionMetadataOwnership from "./metadata-ownership"
 
+import { Schema } from "effect"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
+
 /**
  * Root Session metadata is a V1 compatibility bag. Most keys are caller-owned,
  * but a small set encode producer-owned Session identity and must not be
@@ -22,6 +25,8 @@ export interface WorkerDelegationModel {
   readonly modelID: string
   readonly accountID?: string
   readonly variant?: string
+  /** Secret-free canonical routing intent; never a credential binding. */
+  readonly routeIntent?: ProviderRouteIntent.Info
 }
 
 export interface WorkerDelegationOrigin {
@@ -113,6 +118,74 @@ function stringField(value: Record<string, unknown>, key: string) {
   return typeof field === "string" && field.length > 0 ? field : undefined
 }
 
+function sameRouteIntent(left: ProviderRouteIntent.Info, right: ProviderRouteIntent.Info) {
+  return (
+    left.kind === right.kind &&
+    (left.kind !== "account" ||
+      (right.kind === "account" &&
+        left.accountID === right.accountID &&
+        (left.pin ?? "hard") === (right.pin ?? "hard")))
+  )
+}
+
+/**
+ * Canonicalize the protected delegated-worker model migration window.
+ *
+ * Legacy accountID is a hard account pin; missing route data is Auto. Explicit
+ * route intent is authoritative but may coexist with legacy accountID only when
+ * both name the exact same account. Account intent without the compatibility
+ * field is projected back into accountID so old Session/model surfaces retain
+ * the same stable account identity.
+ */
+export function normalizeWorkerDelegationModel(value: unknown): WorkerDelegationModel | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return
+  const model = value as Record<string, unknown>
+  const providerID = stringField(model, "providerID")
+  const modelID = stringField(model, "modelID")
+  if (!providerID || !modelID) return
+
+  let accountID = stringField(model, "accountID")
+  const variant = stringField(model, "variant")
+  const rawRouteIntent = model.routeIntent
+  let routeIntent: ProviderRouteIntent.Info
+
+  if (rawRouteIntent === undefined) {
+    routeIntent = accountID
+      ? { kind: "account", accountID, pin: "hard" }
+      : { kind: "auto" }
+  } else {
+    if (!Schema.is(ProviderRouteIntent.Info)(rawRouteIntent)) return
+    routeIntent = rawRouteIntent
+    if (accountID !== undefined) {
+      if (routeIntent.kind !== "account" || routeIntent.accountID !== accountID) return
+    } else if (routeIntent.kind === "account") {
+      accountID = routeIntent.accountID
+    }
+  }
+
+  return {
+    providerID,
+    modelID,
+    ...(accountID ? { accountID } : {}),
+    ...(variant ? { variant } : {}),
+    routeIntent,
+  }
+}
+
+export function sameWorkerDelegationModel(left: WorkerDelegationModel, right: WorkerDelegationModel) {
+  const canonicalLeft = normalizeWorkerDelegationModel(left)
+  const canonicalRight = normalizeWorkerDelegationModel(right)
+  if (!canonicalLeft || !canonicalRight) return false
+  return (
+    canonicalLeft.providerID === canonicalRight.providerID &&
+    canonicalLeft.modelID === canonicalRight.modelID &&
+    canonicalLeft.accountID === canonicalRight.accountID &&
+    (canonicalLeft.variant && canonicalLeft.variant !== "default" ? canonicalLeft.variant : undefined) ===
+      (canonicalRight.variant && canonicalRight.variant !== "default" ? canonicalRight.variant : undefined) &&
+    sameRouteIntent(canonicalLeft.routeIntent!, canonicalRight.routeIntent!)
+  )
+}
+
 /**
  * Parse the protected delegation policy without trusting arbitrary metadata.
  * Invalid legacy/corrupt envelopes remain producer-owned via
@@ -123,28 +196,21 @@ export function workerDelegation(value: Metadata | undefined): WorkerDelegationO
   const raw = value?.[Keys.workerDelegation]
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return
   const row = raw as Record<string, unknown>
-  const modelRaw = row.model
-  if (!modelRaw || typeof modelRaw !== "object" || Array.isArray(modelRaw)) return
-  const model = modelRaw as Record<string, unknown>
+  const model = normalizeWorkerDelegationModel(row.model)
+  if (!model) return
   const producer = stringField(row, "producer")
   const principalRef = stringField(row, "principalRef")
   const invocationRef = stringField(row, "invocationRef")
   const rootRef = stringField(row, "rootRef")
   const agent = stringField(row, "agent")
-  const providerID = stringField(model, "providerID")
-  const modelID = stringField(model, "modelID")
   if (
     !producer ||
     !principalRef ||
     !invocationRef ||
     !rootRef ||
     !agent ||
-    !providerID ||
-    !modelID ||
     typeof row.nestedDelegation !== "boolean"
   ) return
-  const accountID = stringField(model, "accountID")
-  const variant = stringField(model, "variant")
   const parentWorkerID = stringField(row, "parentWorkerID")
   return {
     producer,
@@ -152,12 +218,7 @@ export function workerDelegation(value: Metadata | undefined): WorkerDelegationO
     invocationRef,
     rootRef,
     agent,
-    model: {
-      providerID,
-      modelID,
-      ...(accountID ? { accountID } : {}),
-      ...(variant ? { variant } : {}),
-    },
+    model,
     nestedDelegation: row.nestedDelegation,
     ...(parentWorkerID ? { parentWorkerID } : {}),
   }
@@ -269,10 +330,11 @@ export function rebindDelegatedWorkerModel(
   model: WorkerDelegationModel,
 ): Record<string, unknown> | undefined {
   const origin = workerDelegation(value)
-  if (!origin) return
+  const canonical = normalizeWorkerDelegationModel(model)
+  if (!origin || !canonical) return
   return delegatedWorker({
     ...origin,
-    model,
+    model: canonical,
     metadata: value,
   })
 }

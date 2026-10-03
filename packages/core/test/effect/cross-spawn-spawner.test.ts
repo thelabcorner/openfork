@@ -3,7 +3,7 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
-import { Effect, Exit, Stream } from "effect"
+import { Effect, Exit, Fiber, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -341,6 +341,24 @@ describe("cross-spawn spawner", () => {
         expect(out).toBe("a b c")
       }),
     )
+
+    fx.effect(
+      "contains late EPIPE after an interrupted backpressured stdin write",
+      Effect.gen(function* () {
+        const handle = yield* js("setTimeout(() => {}, 10_000)", { stdin: "pipe" })
+        const payload = new Uint8Array(4 * 1024 * 1024)
+        const writer = yield* Stream.run(Stream.make(payload), handle.stdin).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+
+        yield* Effect.sleep("50 millis")
+        yield* Fiber.interrupt(writer)
+        yield* handle.kill({ forceKillAfter: "3 seconds" })
+        yield* Effect.sleep("50 millis")
+
+        expect(yield* handle.isRunning).toBe(false)
+      }),
+    )
   })
 
   describe("process control", () => {
@@ -432,6 +450,19 @@ describe("cross-spawn spawner", () => {
         yield* handle.exitCode
         const running = yield* handle.isRunning
         expect(running).toBe(false)
+      }),
+    )
+
+    fx.effect(
+      "makes kill idempotent after natural process exit",
+      Effect.gen(function* () {
+        const handle = yield* js('process.stdout.write("done")')
+        yield* handle.exitCode
+
+        yield* handle.kill()
+        yield* handle.kill({ forceKillAfter: "3 seconds" })
+
+        expect(yield* handle.isRunning).toBe(false)
       }),
     )
   })

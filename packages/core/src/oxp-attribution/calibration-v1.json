@@ -1,0 +1,1920 @@
+{
+  "version": 1,
+  "sourceArtifact": {
+    "version": 3,
+    "digest": "ee99b231a792b6ec41f578b4ef4e7e6508e7170a66e83e1d22372a04f1848db4"
+  },
+  "canonicalSchema": "oxp-primary-args-output-error/v1",
+  "calibratedAt": "2026-10-03T00:40:49.009Z",
+  "observations": 121632,
+  "corpus": {
+    "observations": 121632,
+    "activities": 184,
+    "tools": 14,
+    "toolStatusGroups": 76,
+    "minStartedAt": 1789884034998,
+    "maxStartedAt": 1790979647728,
+    "maxCompletedAt": 1790979648095
+  },
+  "rho": 0.9,
+  "gapThresholdMs": 2102.7989025051,
+  "units": {
+    "rawLength": "sqlite-text-unicode-codepoints",
+    "canonicalLength": "sqlite-text-unicode-codepoints",
+    "note": "Production scalar projection must preserve this unit or deliberately recalibrate."
+  },
+  "tokenizer": {
+    "encoding": "o200k_base",
+    "implementation": "js-tiktoken",
+    "implementationVersion": "1.0.21",
+    "calibratedAt": "2026-10-02",
+    "charUnit": "unicode-codepoints",
+    "modulus": 97,
+    "residues": [
+      0,
+      15,
+      31,
+      63,
+      79
+    ],
+    "sampledInvocations": 6174,
+    "sampledRawChars": 45874416,
+    "sampledCanonicalChars": 28594609,
+    "rawRequestCharsPerToken": 3.3400572128430284,
+    "rawResultCharsPerToken": 3.4213180475526763,
+    "canonicalRequestCharsPerToken": 3.325470347614613,
+    "canonicalResultCharsPerToken": 3.5742728255165748,
+    "rawCombinedCharsPerToken": 3.4157257323837333,
+    "rawCombinedStratumMin": 3.3437885711248336,
+    "rawCombinedStratumMax": 3.4590887172517917,
+    "canonicalCombinedCharsPerToken": 3.5461449113891903,
+    "canonicalCombinedStratumMin": 3.470586744575862,
+    "canonicalCombinedStratumMax": 3.580190930948733
+  },
+  "validation": {
+    "best": {
+      "toolPriorChars": 75000,
+      "statusPriorChars": 0,
+      "statusSpecialization": "tool",
+      "exposureAggregateBiasRMSE": 0.0056650002611659,
+      "exposureWAPE": 0.07226074948600858
+    },
+    "byTool": [
+      {
+        "tool": "process",
+        "observations": 26763,
+        "exposureAggregateBiasRMSE": 0.012804589235126538,
+        "exposureMaxAbsFoldBias": 0.018779889191766097,
+        "exposureWAPE": 0.14117817416995554,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "find",
+        "observations": 22425,
+        "exposureAggregateBiasRMSE": 0.028255480516096502,
+        "exposureMaxAbsFoldBias": 0.04936753524454285,
+        "exposureWAPE": 0.2004368317716574,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "read",
+        "observations": 21761,
+        "exposureAggregateBiasRMSE": 0.007491321313424111,
+        "exposureMaxAbsFoldBias": 0.009391008664477729,
+        "exposureWAPE": 0.03063066222228229,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "openfork_worker",
+        "observations": 14811,
+        "exposureAggregateBiasRMSE": 0.010397241663825316,
+        "exposureMaxAbsFoldBias": 0.02092889794058017,
+        "exposureWAPE": 0.031485755566230685,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "edit",
+        "observations": 8793,
+        "exposureAggregateBiasRMSE": 0.01158038930963688,
+        "exposureMaxAbsFoldBias": 0.020741213857810026,
+        "exposureWAPE": 0.06261557527745179,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "openfork_session",
+        "observations": 7516,
+        "exposureAggregateBiasRMSE": 0.0034645638465163374,
+        "exposureMaxAbsFoldBias": 0.0070422628389381625,
+        "exposureWAPE": 0.014562885109024721,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "capability",
+        "observations": 5553,
+        "exposureAggregateBiasRMSE": 0.10343957698317074,
+        "exposureMaxAbsFoldBias": 0.20253416532896085,
+        "exposureWAPE": 0.3527897101577877,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "git",
+        "observations": 3897,
+        "exposureAggregateBiasRMSE": 0.005289431616751251,
+        "exposureMaxAbsFoldBias": 0.009062317593220737,
+        "exposureWAPE": 0.022163888830359555,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "patch",
+        "observations": 3567,
+        "exposureAggregateBiasRMSE": 0.022713031902344815,
+        "exposureMaxAbsFoldBias": 0.032912219887552774,
+        "exposureWAPE": 0.09809433395686079,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "write",
+        "observations": 1929,
+        "exposureAggregateBiasRMSE": 0.005563961180014552,
+        "exposureMaxAbsFoldBias": 0.007126506788218245,
+        "exposureWAPE": 0.013401802822855807,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "openfork_request",
+        "observations": 1498,
+        "exposureAggregateBiasRMSE": 0.055575630281708636,
+        "exposureMaxAbsFoldBias": 0.07820184810605513,
+        "exposureWAPE": 0.11153035050932147,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "openfork_info",
+        "observations": 981,
+        "exposureAggregateBiasRMSE": 0.0070624402528539154,
+        "exposureMaxAbsFoldBias": 0.011648515816021998,
+        "exposureWAPE": 0.013079776579232476,
+        "foldsWithExposureEvidence": 5
+      },
+      {
+        "tool": "openai_files",
+        "observations": 11,
+        "exposureAggregateBiasRMSE": 0.8689671126527794,
+        "exposureMaxAbsFoldBias": 0.9938457867900001,
+        "exposureWAPE": 0.6429951261573663,
+        "foldsWithExposureEvidence": 3
+      }
+    ],
+    "temporal": {
+      "aggregate": {
+        "observations": 23308,
+        "uniqueRelativeError": -0.0008903230223339387,
+        "exposureRelativeError": 0.0018450238857157242,
+        "uniqueActual": 114795622,
+        "uniquePredicted": 114693416.81487025,
+        "exposureActual": 660295541.1791954,
+        "exposurePredicted": 661513802.2243026
+      },
+      "byTool": {
+        "process": {
+          "observations": 6538,
+          "exposureRelativeError": -0.023780325746730946
+        },
+        "find": {
+          "observations": 4586,
+          "exposureRelativeError": 0.03130341475735254
+        },
+        "read": {
+          "observations": 3937,
+          "exposureRelativeError": 0.01780486538100967
+        },
+        "openfork_worker": {
+          "observations": 2856,
+          "exposureRelativeError": -0.0007746358096610839
+        },
+        "git": {
+          "observations": 1495,
+          "exposureRelativeError": -0.004866262149230027
+        },
+        "openfork_session": {
+          "observations": 1429,
+          "exposureRelativeError": 0.0060886558239090505
+        },
+        "patch": {
+          "observations": 1160,
+          "exposureRelativeError": 0.016191854420523066
+        },
+        "openfork_request": {
+          "observations": 430,
+          "exposureRelativeError": -0.010314224040181785
+        },
+        "edit": {
+          "observations": 353,
+          "exposureRelativeError": 0.024883731432843836
+        },
+        "openfork_info": {
+          "observations": 303,
+          "exposureRelativeError": -0.0008327400374837923
+        },
+        "write": {
+          "observations": 137,
+          "exposureRelativeError": 0.01128662614674436
+        },
+        "capability": {
+          "observations": 76,
+          "exposureRelativeError": -0.2680943103147666
+        },
+        "openai_files": {
+          "observations": 8,
+          "exposureRelativeError": 0.7190596607424917
+        }
+      }
+    }
+  },
+  "donors": {
+    "version": 1,
+    "global": {
+      "reqArgsMean": 505.83190661478596,
+      "reqArgsCount": 119505,
+      "canonicalResultMean": 4403.040713749318,
+      "canonicalResultCount": 117184
+    },
+    "groups": {
+      "openfork_info\u0000success": {
+        "tool": "openfork_info",
+        "status": "success",
+        "reqArgsMean": 19.538622129436327,
+        "reqArgsCount": 958,
+        "canonicalResultMean": 2449.757828810021,
+        "canonicalResultCount": 958
+      },
+      "project\u0000success": {
+        "tool": "project",
+        "status": "success",
+        "reqArgsMean": 0,
+        "reqArgsCount": 0,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "capability\u0000success": {
+        "tool": "capability",
+        "status": "success",
+        "reqArgsMean": 206.6522309711286,
+        "reqArgsCount": 2286,
+        "canonicalResultMean": 5322.02668416448,
+        "canonicalResultCount": 2286
+      },
+      "find\u0000success": {
+        "tool": "find",
+        "status": "success",
+        "reqArgsMean": 137.43600349280757,
+        "reqArgsCount": 21759,
+        "canonicalResultMean": 1147.8677328921367,
+        "canonicalResultCount": 21759
+      },
+      "git\u0000interrupted": {
+        "tool": "git",
+        "status": "interrupted",
+        "reqArgsMean": 203.1529411764706,
+        "reqArgsCount": 170,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "read\u0000success": {
+        "tool": "read",
+        "status": "success",
+        "reqArgsMean": 219.17864496049796,
+        "reqArgsCount": 20885,
+        "canonicalResultMean": 9850.816710557816,
+        "canonicalResultCount": 20885
+      },
+      "process\u0000committed": {
+        "tool": "process",
+        "status": "committed",
+        "reqArgsMean": 447.398804955597,
+        "reqArgsCount": 18242,
+        "canonicalResultMean": 2922.459269816906,
+        "canonicalResultCount": 18242
+      },
+      "process\u0000success": {
+        "tool": "process",
+        "status": "success",
+        "reqArgsMean": 110.49726238944265,
+        "reqArgsCount": 7123,
+        "canonicalResultMean": 6554.163414291731,
+        "canonicalResultCount": 7123
+      },
+      "capability\u0000failed": {
+        "tool": "capability",
+        "status": "failed",
+        "reqArgsMean": 409.51020408163265,
+        "reqArgsCount": 98,
+        "canonicalResultMean": 158.5408163265306,
+        "canonicalResultCount": 98
+      },
+      "process\u0000failed": {
+        "tool": "process",
+        "status": "failed",
+        "reqArgsMean": 255.93418647166362,
+        "reqArgsCount": 547,
+        "canonicalResultMean": 203.87934186471662,
+        "canonicalResultCount": 547
+      },
+      "capability\u0000committed": {
+        "tool": "capability",
+        "status": "committed",
+        "reqArgsMean": 565.1164122137404,
+        "reqArgsCount": 3144,
+        "canonicalResultMean": 3297.476463104326,
+        "canonicalResultCount": 3144
+      },
+      "openai_files\u0000success": {
+        "tool": "openai_files",
+        "status": "success",
+        "reqArgsMean": 43.6,
+        "reqArgsCount": 5,
+        "canonicalResultMean": 36.2,
+        "canonicalResultCount": 5
+      },
+      "read\u0000failed": {
+        "tool": "read",
+        "status": "failed",
+        "reqArgsMean": 239.46386946386946,
+        "reqArgsCount": 429,
+        "canonicalResultMean": 83.44755244755245,
+        "canonicalResultCount": 429
+      },
+      "read\u0000denied": {
+        "tool": "read",
+        "status": "denied",
+        "reqArgsMean": 144.66666666666666,
+        "reqArgsCount": 3,
+        "canonicalResultMean": 77.66666666666667,
+        "canonicalResultCount": 3
+      },
+      "openfork_worker\u0000success": {
+        "tool": "openfork_worker",
+        "status": "success",
+        "reqArgsMean": 109.28751506163685,
+        "reqArgsCount": 10789,
+        "canonicalResultMean": 2872.178700528316,
+        "canonicalResultCount": 10789
+      },
+      "openfork_worker\u0000denied": {
+        "tool": "openfork_worker",
+        "status": "denied",
+        "reqArgsMean": 0,
+        "reqArgsCount": 0,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "openfork_session\u0000success": {
+        "tool": "openfork_session",
+        "status": "success",
+        "reqArgsMean": 113.89187289088864,
+        "reqArgsCount": 7112,
+        "canonicalResultMean": 11007.442210348707,
+        "canonicalResultCount": 7112
+      },
+      "openfork_session\u0000failed": {
+        "tool": "openfork_session",
+        "status": "failed",
+        "reqArgsMean": 598.1,
+        "reqArgsCount": 110,
+        "canonicalResultMean": 138.43636363636364,
+        "canonicalResultCount": 110
+      },
+      "patch\u0000committed": {
+        "tool": "patch",
+        "status": "committed",
+        "reqArgsMean": 3033.3185360894613,
+        "reqArgsCount": 2951,
+        "canonicalResultMean": 262.8075228736022,
+        "canonicalResultCount": 2951
+      },
+      "patch\u0000conflict": {
+        "tool": "patch",
+        "status": "conflict",
+        "reqArgsMean": 3837.86582278481,
+        "reqArgsCount": 395,
+        "canonicalResultMean": 900.3696202531646,
+        "canonicalResultCount": 395
+      },
+      "write\u0000committed": {
+        "tool": "write",
+        "status": "committed",
+        "reqArgsMean": 5241.72078265468,
+        "reqArgsCount": 1891,
+        "canonicalResultMean": 85.72554204124802,
+        "canonicalResultCount": 1891
+      },
+      "patch\u0000interrupted": {
+        "tool": "patch",
+        "status": "interrupted",
+        "reqArgsMean": 4921.021739130435,
+        "reqArgsCount": 138,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "git\u0000failed": {
+        "tool": "git",
+        "status": "failed",
+        "reqArgsMean": 170.50751879699249,
+        "reqArgsCount": 266,
+        "canonicalResultMean": 114.12781954887218,
+        "canonicalResultCount": 266
+      },
+      "openfork_worker\u0000failed": {
+        "tool": "openfork_worker",
+        "status": "failed",
+        "reqArgsMean": 1079.7130801687763,
+        "reqArgsCount": 237,
+        "canonicalResultMean": 114.51898734177215,
+        "canonicalResultCount": 237
+      },
+      "process\u0000interrupted": {
+        "tool": "process",
+        "status": "interrupted",
+        "reqArgsMean": 461.04477611940297,
+        "reqArgsCount": 737,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "find\u0000failed": {
+        "tool": "find",
+        "status": "failed",
+        "reqArgsMean": 134.25862068965517,
+        "reqArgsCount": 116,
+        "canonicalResultMean": 87.27586206896552,
+        "canonicalResultCount": 116
+      },
+      "edit\u0000committed": {
+        "tool": "edit",
+        "status": "committed",
+        "reqArgsMean": 1234.3378198132655,
+        "reqArgsCount": 8247,
+        "canonicalResultMean": 120.6268946283497,
+        "canonicalResultCount": 8247
+      },
+      "edit\u0000conflict": {
+        "tool": "edit",
+        "status": "conflict",
+        "reqArgsMean": 1760.0747422680413,
+        "reqArgsCount": 388,
+        "canonicalResultMean": 565.25,
+        "canonicalResultCount": 388
+      },
+      "patch\u0000failed": {
+        "tool": "patch",
+        "status": "failed",
+        "reqArgsMean": 3714.0576923076924,
+        "reqArgsCount": 52,
+        "canonicalResultMean": 310.0192307692308,
+        "canonicalResultCount": 52
+      },
+      "edit\u0000failed": {
+        "tool": "edit",
+        "status": "failed",
+        "reqArgsMean": 2172.979797979798,
+        "reqArgsCount": 99,
+        "canonicalResultMean": 235,
+        "canonicalResultCount": 99
+      },
+      "openfork_request\u0000success": {
+        "tool": "openfork_request",
+        "status": "success",
+        "reqArgsMean": 99.63576881134134,
+        "reqArgsCount": 917,
+        "canonicalResultMean": 182.40458015267177,
+        "canonicalResultCount": 917
+      },
+      "openfork_worker\u0000committed": {
+        "tool": "openfork_worker",
+        "status": "committed",
+        "reqArgsMean": 1241.7789588443718,
+        "reqArgsCount": 3669,
+        "canonicalResultMean": 191.9490324339057,
+        "canonicalResultCount": 3669
+      },
+      "edit\u0000success": {
+        "tool": "edit",
+        "status": "success",
+        "reqArgsMean": 342,
+        "reqArgsCount": 13,
+        "canonicalResultMean": 124,
+        "canonicalResultCount": 13
+      },
+      "capability\u0000interrupted": {
+        "tool": "capability",
+        "status": "interrupted",
+        "reqArgsMean": 494.1666666666667,
+        "reqArgsCount": 12,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "capability\u0000conflict": {
+        "tool": "capability",
+        "status": "conflict",
+        "reqArgsMean": 620.0769230769231,
+        "reqArgsCount": 13,
+        "canonicalResultMean": 830.8461538461538,
+        "canonicalResultCount": 13
+      },
+      "openfork_session\u0000committed": {
+        "tool": "openfork_session",
+        "status": "committed",
+        "reqArgsMean": 186.56914893617022,
+        "reqArgsCount": 188,
+        "canonicalResultMean": 597.1595744680851,
+        "canonicalResultCount": 188
+      },
+      "openfork_session\u0000conflict": {
+        "tool": "openfork_session",
+        "status": "conflict",
+        "reqArgsMean": 765.3939393939394,
+        "reqArgsCount": 33,
+        "canonicalResultMean": 322.06060606060606,
+        "canonicalResultCount": 33
+      },
+      "openfork_session\u0000interrupted": {
+        "tool": "openfork_session",
+        "status": "interrupted",
+        "reqArgsMean": 120.45161290322581,
+        "reqArgsCount": 62,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "write\u0000conflict": {
+        "tool": "write",
+        "status": "conflict",
+        "reqArgsMean": 14512.692307692309,
+        "reqArgsCount": 13,
+        "canonicalResultMean": 142.84615384615384,
+        "canonicalResultCount": 13
+      },
+      "write\u0000success": {
+        "tool": "write",
+        "status": "success",
+        "reqArgsMean": 1230.3333333333333,
+        "reqArgsCount": 3,
+        "canonicalResultMean": 106,
+        "canonicalResultCount": 3
+      },
+      "process\u0000denied": {
+        "tool": "process",
+        "status": "denied",
+        "reqArgsMean": 475,
+        "reqArgsCount": 1,
+        "canonicalResultMean": 68,
+        "canonicalResultCount": 1
+      },
+      "git\u0000success": {
+        "tool": "git",
+        "status": "success",
+        "reqArgsMean": 196.7164643635232,
+        "reqArgsCount": 3213,
+        "canonicalResultMean": 14390.838157485216,
+        "canonicalResultCount": 3213
+      },
+      "openfork_request\u0000failed": {
+        "tool": "openfork_request",
+        "status": "failed",
+        "reqArgsMean": 202.64743589743588,
+        "reqArgsCount": 156,
+        "canonicalResultMean": 89.69871794871794,
+        "canonicalResultCount": 156
+      },
+      "openfork_request\u0000denied": {
+        "tool": "openfork_request",
+        "status": "denied",
+        "reqArgsMean": 296.63157894736844,
+        "reqArgsCount": 19,
+        "canonicalResultMean": 128,
+        "canonicalResultCount": 19
+      },
+      "openfork_request\u0000committed": {
+        "tool": "openfork_request",
+        "status": "committed",
+        "reqArgsMean": 357.8056265984655,
+        "reqArgsCount": 391,
+        "canonicalResultMean": 118.95907928388746,
+        "canonicalResultCount": 391
+      },
+      "write\u0000failed": {
+        "tool": "write",
+        "status": "failed",
+        "reqArgsMean": 3656.3333333333335,
+        "reqArgsCount": 3,
+        "canonicalResultMean": 85,
+        "canonicalResultCount": 3
+      },
+      "git\u0000conflict": {
+        "tool": "git",
+        "status": "conflict",
+        "reqArgsMean": 155.09803921568627,
+        "reqArgsCount": 51,
+        "canonicalResultMean": 1039.3725490196077,
+        "canonicalResultCount": 51
+      },
+      "patch\u0000success": {
+        "tool": "patch",
+        "status": "success",
+        "reqArgsMean": 1903.84,
+        "reqArgsCount": 25,
+        "canonicalResultMean": 1160.96,
+        "canonicalResultCount": 25
+      },
+      "openfork_worker\u0000interrupted": {
+        "tool": "openfork_worker",
+        "status": "interrupted",
+        "reqArgsMean": 278.54545454545456,
+        "reqArgsCount": 99,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "find\u0000interrupted": {
+        "tool": "find",
+        "status": "interrupted",
+        "reqArgsMean": 142.84848484848484,
+        "reqArgsCount": 528,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "process\u0000cancelled_before_commit": {
+        "tool": "process",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 149.825,
+        "reqArgsCount": 80,
+        "canonicalResultMean": 67.2,
+        "canonicalResultCount": 80
+      },
+      "git\u0000committed": {
+        "tool": "git",
+        "status": "committed",
+        "reqArgsMean": 266.4947916666667,
+        "reqArgsCount": 192,
+        "canonicalResultMean": 4703.640625,
+        "canonicalResultCount": 192
+      },
+      "openai_files\u0000failed": {
+        "tool": "openai_files",
+        "status": "failed",
+        "reqArgsMean": 47,
+        "reqArgsCount": 1,
+        "canonicalResultMean": 78,
+        "canonicalResultCount": 1
+      },
+      "edit\u0000interrupted": {
+        "tool": "edit",
+        "status": "interrupted",
+        "reqArgsMean": 788.5434782608696,
+        "reqArgsCount": 46,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "read\u0000interrupted": {
+        "tool": "read",
+        "status": "interrupted",
+        "reqArgsMean": 243.68459657701712,
+        "reqArgsCount": 409,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "read\u0000conflict": {
+        "tool": "read",
+        "status": "conflict",
+        "reqArgsMean": 322.8181818181818,
+        "reqArgsCount": 11,
+        "canonicalResultMean": 349.54545454545456,
+        "canonicalResultCount": 11
+      },
+      "process\u0000conflict": {
+        "tool": "process",
+        "status": "conflict",
+        "reqArgsMean": 196.5,
+        "reqArgsCount": 4,
+        "canonicalResultMean": 78,
+        "canonicalResultCount": 4
+      },
+      "openfork_worker\u0000cancelled_before_commit": {
+        "tool": "openfork_worker",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 127.41666666666667,
+        "reqArgsCount": 12,
+        "canonicalResultMean": 69,
+        "canonicalResultCount": 12
+      },
+      "openfork_worker\u0000cancelled_after_commit": {
+        "tool": "openfork_worker",
+        "status": "cancelled_after_commit",
+        "reqArgsMean": 2960.5,
+        "reqArgsCount": 4,
+        "canonicalResultMean": 382.75,
+        "canonicalResultCount": 4
+      },
+      "read\u0000cancelled_before_commit": {
+        "tool": "read",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 240.3,
+        "reqArgsCount": 10,
+        "canonicalResultMean": 59.6,
+        "canonicalResultCount": 10
+      },
+      "openfork_session\u0000cancelled_after_commit": {
+        "tool": "openfork_session",
+        "status": "cancelled_after_commit",
+        "reqArgsMean": 2383.818181818182,
+        "reqArgsCount": 11,
+        "canonicalResultMean": 206,
+        "canonicalResultCount": 11
+      },
+      "git\u0000cancelled_before_commit": {
+        "tool": "git",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 128,
+        "reqArgsCount": 3,
+        "canonicalResultMean": 66,
+        "canonicalResultCount": 3
+      },
+      "openfork_info\u0000interrupted": {
+        "tool": "openfork_info",
+        "status": "interrupted",
+        "reqArgsMean": 19,
+        "reqArgsCount": 22,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "find\u0000running": {
+        "tool": "find",
+        "status": "running",
+        "reqArgsMean": 132,
+        "reqArgsCount": 22,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "git\u0000running": {
+        "tool": "git",
+        "status": "running",
+        "reqArgsMean": 104,
+        "reqArgsCount": 2,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "read\u0000running": {
+        "tool": "read",
+        "status": "running",
+        "reqArgsMean": 276,
+        "reqArgsCount": 14,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "process\u0000running": {
+        "tool": "process",
+        "status": "running",
+        "reqArgsMean": 528.2105263157895,
+        "reqArgsCount": 19,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "patch\u0000running": {
+        "tool": "patch",
+        "status": "running",
+        "reqArgsMean": 2963,
+        "reqArgsCount": 4,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "write\u0000interrupted": {
+        "tool": "write",
+        "status": "interrupted",
+        "reqArgsMean": 5936.9473684210525,
+        "reqArgsCount": 19,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "openfork_request\u0000interrupted": {
+        "tool": "openfork_request",
+        "status": "interrupted",
+        "reqArgsMean": 390.06666666666666,
+        "reqArgsCount": 15,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "patch\u0000cancelled_before_commit": {
+        "tool": "patch",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 1972,
+        "reqArgsCount": 2,
+        "canonicalResultMean": 56,
+        "canonicalResultCount": 2
+      },
+      "process\u0000cancelled_after_commit": {
+        "tool": "process",
+        "status": "cancelled_after_commit",
+        "reqArgsMean": 260.7,
+        "reqArgsCount": 10,
+        "canonicalResultMean": 160,
+        "canonicalResultCount": 10
+      },
+      "openai_files\u0000committed": {
+        "tool": "openai_files",
+        "status": "committed",
+        "reqArgsMean": 130.33333333333334,
+        "reqArgsCount": 3,
+        "canonicalResultMean": 100.33333333333333,
+        "canonicalResultCount": 3
+      },
+      "openai_files\u0000interrupted": {
+        "tool": "openai_files",
+        "status": "interrupted",
+        "reqArgsMean": 133,
+        "reqArgsCount": 2,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      },
+      "openfork_info\u0000cancelled_before_commit": {
+        "tool": "openfork_info",
+        "status": "cancelled_before_commit",
+        "reqArgsMean": 19,
+        "reqArgsCount": 1,
+        "canonicalResultMean": 62,
+        "canonicalResultCount": 1
+      },
+      "openfork_worker\u0000running": {
+        "tool": "openfork_worker",
+        "status": "running",
+        "reqArgsMean": 63,
+        "reqArgsCount": 1,
+        "canonicalResultMean": 0,
+        "canonicalResultCount": 0
+      }
+    }
+  },
+  "profile": {
+    "version": 1,
+    "settings": {
+      "toolPriorChars": 75000,
+      "statusPriorChars": 0,
+      "statusSpecialization": "tool"
+    },
+    "request": {
+      "global": {
+        "ratio": 0.9825185659933581,
+        "observedRawChars": 61524987,
+        "observations": 119505
+      },
+      "tools": {
+        "read": {
+          "ratio": 0.961043589514239,
+          "observedRawChars": 4986044,
+          "observations": 21761
+        },
+        "find": {
+          "ratio": 0.9395643553321932,
+          "observedRawChars": 3286197,
+          "observations": 22425
+        },
+        "edit": {
+          "ratio": 0.9928633139849781,
+          "observedRawChars": 11197474,
+          "observations": 8793
+        },
+        "write": {
+          "ratio": 0.9981907892839281,
+          "observedRawChars": 10245582,
+          "observations": 1929
+        },
+        "process": {
+          "ratio": 0.9752122291573015,
+          "observedRawChars": 9695064,
+          "observations": 26763
+        },
+        "git": {
+          "ratio": 0.9587333457143916,
+          "observedRawChars": 806683,
+          "observations": 3897
+        },
+        "patch": {
+          "ratio": 0.9970969515873884,
+          "observedRawChars": 11435007,
+          "observations": 3567
+        },
+        "openfork_worker": {
+          "ratio": 0.9784292190103957,
+          "observedRawChars": 6165391,
+          "observations": 14811
+        },
+        "openfork_info": {
+          "ratio": 0.9015370586644708,
+          "observedRawChars": 27984,
+          "observations": 981
+        },
+        "capability": {
+          "ratio": 0.9788784241254863,
+          "observedRawChars": 2353233,
+          "observations": 5553
+        },
+        "openfork_session": {
+          "ratio": 0.9380154850475136,
+          "observedRawChars": 1037457,
+          "observations": 7516
+        },
+        "openfork_request": {
+          "ratio": 0.959230790821281,
+          "observedRawChars": 287850,
+          "observations": 1498
+        },
+        "openai_files": {
+          "ratio": 0.9814510786427679,
+          "observedRawChars": 1021,
+          "observations": 11
+        }
+      },
+      "groups": {
+        "read\u0000success": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "success",
+          "observedRawChars": 4765511,
+          "observations": 20885
+        },
+        "find\u0000success": {
+          "ratio": 0.9395643553321932,
+          "tool": "find",
+          "status": "success",
+          "observedRawChars": 3186301,
+          "observations": 21759
+        },
+        "edit\u0000committed": {
+          "ratio": 0.9928633139849781,
+          "tool": "edit",
+          "status": "committed",
+          "observedRawChars": 10253807,
+          "observations": 8247
+        },
+        "edit\u0000conflict": {
+          "ratio": 0.9928633139849781,
+          "tool": "edit",
+          "status": "conflict",
+          "observedRawChars": 686401,
+          "observations": 388
+        },
+        "write\u0000committed": {
+          "ratio": 0.9981907892839281,
+          "tool": "write",
+          "status": "committed",
+          "observedRawChars": 9929113,
+          "observations": 1891
+        },
+        "process\u0000success": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "success",
+          "observedRawChars": 851179,
+          "observations": 7123
+        },
+        "process\u0000committed": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "committed",
+          "observedRawChars": 8325627,
+          "observations": 18242
+        },
+        "process\u0000failed": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "failed",
+          "observedRawChars": 144919,
+          "observations": 547
+        },
+        "git\u0000failed": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "failed",
+          "observedRawChars": 47749,
+          "observations": 266
+        },
+        "find\u0000failed": {
+          "ratio": 0.9395643553321932,
+          "tool": "find",
+          "status": "failed",
+          "observedRawChars": 16618,
+          "observations": 116
+        },
+        "read\u0000failed": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "failed",
+          "observedRawChars": 106591,
+          "observations": 429
+        },
+        "patch\u0000committed": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "committed",
+          "observedRawChars": 8977882,
+          "observations": 2951
+        },
+        "edit\u0000failed": {
+          "ratio": 0.9928633139849781,
+          "tool": "edit",
+          "status": "failed",
+          "observedRawChars": 216016,
+          "observations": 99
+        },
+        "patch\u0000conflict": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "conflict",
+          "observedRawChars": 1519512,
+          "observations": 395
+        },
+        "openfork_worker\u0000failed": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "failed",
+          "observedRawChars": 258025,
+          "observations": 237
+        },
+        "openfork_worker\u0000success": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "success",
+          "observedRawChars": 1276204,
+          "observations": 10789
+        },
+        "openfork_info\u0000success": {
+          "ratio": 0.9015370586644708,
+          "tool": "openfork_info",
+          "status": "success",
+          "observedRawChars": 27340,
+          "observations": 958
+        },
+        "capability\u0000success": {
+          "ratio": 0.9788784241254863,
+          "tool": "capability",
+          "status": "success",
+          "observedRawChars": 492981,
+          "observations": 2286
+        },
+        "openfork_session\u0000success": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "success",
+          "observedRawChars": 874007,
+          "observations": 7112
+        },
+        "capability\u0000committed": {
+          "ratio": 0.9788784241254863,
+          "tool": "capability",
+          "status": "committed",
+          "observedRawChars": 1805022,
+          "observations": 3144
+        },
+        "openfork_session\u0000failed": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "failed",
+          "observedRawChars": 66781,
+          "observations": 110
+        },
+        "capability\u0000failed": {
+          "ratio": 0.9788784241254863,
+          "tool": "capability",
+          "status": "failed",
+          "observedRawChars": 41014,
+          "observations": 98
+        },
+        "openfork_request\u0000success": {
+          "ratio": 0.959230790821281,
+          "tool": "openfork_request",
+          "status": "success",
+          "observedRawChars": 99619,
+          "observations": 917
+        },
+        "openai_files\u0000success": {
+          "ratio": 0.9814510786427679,
+          "tool": "openai_files",
+          "status": "success",
+          "observedRawChars": 263,
+          "observations": 5
+        },
+        "openfork_worker\u0000committed": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "committed",
+          "observedRawChars": 4589108,
+          "observations": 3669
+        },
+        "edit\u0000success": {
+          "ratio": 0.9928633139849781,
+          "tool": "edit",
+          "status": "success",
+          "observedRawChars": 4563,
+          "observations": 13
+        },
+        "capability\u0000interrupted": {
+          "ratio": 0.9788784241254863,
+          "tool": "capability",
+          "status": "interrupted",
+          "observedRawChars": 6038,
+          "observations": 12
+        },
+        "patch\u0000interrupted": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "interrupted",
+          "observedRawChars": 680343,
+          "observations": 138
+        },
+        "capability\u0000conflict": {
+          "ratio": 0.9788784241254863,
+          "tool": "capability",
+          "status": "conflict",
+          "observedRawChars": 8178,
+          "observations": 13
+        },
+        "openfork_session\u0000committed": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "committed",
+          "observedRawChars": 36767,
+          "observations": 188
+        },
+        "openfork_session\u0000conflict": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "conflict",
+          "observedRawChars": 25555,
+          "observations": 33
+        },
+        "openfork_session\u0000interrupted": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "interrupted",
+          "observedRawChars": 8026,
+          "observations": 62
+        },
+        "write\u0000conflict": {
+          "ratio": 0.9981907892839281,
+          "tool": "write",
+          "status": "conflict",
+          "observedRawChars": 188782,
+          "observations": 13
+        },
+        "read\u0000denied": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "denied",
+          "observedRawChars": 461,
+          "observations": 3
+        },
+        "process\u0000interrupted": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "interrupted",
+          "observedRawChars": 346423,
+          "observations": 737
+        },
+        "write\u0000success": {
+          "ratio": 0.9981907892839281,
+          "tool": "write",
+          "status": "success",
+          "observedRawChars": 3718,
+          "observations": 3
+        },
+        "process\u0000denied": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "denied",
+          "observedRawChars": 484,
+          "observations": 1
+        },
+        "patch\u0000failed": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "failed",
+          "observedRawChars": 193599,
+          "observations": 52
+        },
+        "git\u0000success": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "success",
+          "observedRawChars": 660967,
+          "observations": 3213
+        },
+        "openfork_request\u0000failed": {
+          "ratio": 0.959230790821281,
+          "tool": "openfork_request",
+          "status": "failed",
+          "observedRawChars": 33017,
+          "observations": 156
+        },
+        "openfork_request\u0000denied": {
+          "ratio": 0.959230790821281,
+          "tool": "openfork_request",
+          "status": "denied",
+          "observedRawChars": 5807,
+          "observations": 19
+        },
+        "openfork_request\u0000committed": {
+          "ratio": 0.959230790821281,
+          "tool": "openfork_request",
+          "status": "committed",
+          "observedRawChars": 143421,
+          "observations": 391
+        },
+        "write\u0000failed": {
+          "ratio": 0.9981907892839281,
+          "tool": "write",
+          "status": "failed",
+          "observedRawChars": 10996,
+          "observations": 3
+        },
+        "git\u0000conflict": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "conflict",
+          "observedRawChars": 8369,
+          "observations": 51
+        },
+        "patch\u0000success": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "success",
+          "observedRawChars": 47821,
+          "observations": 25
+        },
+        "openfork_worker\u0000interrupted": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "interrupted",
+          "observedRawChars": 28467,
+          "observations": 99
+        },
+        "find\u0000interrupted": {
+          "ratio": 0.9395643553321932,
+          "tool": "find",
+          "status": "interrupted",
+          "observedRawChars": 80176,
+          "observations": 528
+        },
+        "process\u0000cancelled_before_commit": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 12706,
+          "observations": 80
+        },
+        "git\u0000committed": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "committed",
+          "observedRawChars": 52895,
+          "observations": 192
+        },
+        "openai_files\u0000failed": {
+          "ratio": 0.9814510786427679,
+          "tool": "openai_files",
+          "status": "failed",
+          "observedRawChars": 56,
+          "observations": 1
+        },
+        "edit\u0000interrupted": {
+          "ratio": 0.9928633139849781,
+          "tool": "edit",
+          "status": "interrupted",
+          "observedRawChars": 36687,
+          "observations": 46
+        },
+        "read\u0000interrupted": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "interrupted",
+          "observedRawChars": 103348,
+          "observations": 409
+        },
+        "read\u0000conflict": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "conflict",
+          "observedRawChars": 3650,
+          "observations": 11
+        },
+        "git\u0000interrupted": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "interrupted",
+          "observedRawChars": 36066,
+          "observations": 170
+        },
+        "process\u0000conflict": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "conflict",
+          "observedRawChars": 822,
+          "observations": 4
+        },
+        "openfork_worker\u0000cancelled_before_commit": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 1637,
+          "observations": 12
+        },
+        "openfork_worker\u0000cancelled_after_commit": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 11878,
+          "observations": 4
+        },
+        "read\u0000cancelled_before_commit": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 2493,
+          "observations": 10
+        },
+        "openfork_session\u0000cancelled_after_commit": {
+          "ratio": 0.9380154850475136,
+          "tool": "openfork_session",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 26321,
+          "observations": 11
+        },
+        "git\u0000cancelled_before_commit": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 411,
+          "observations": 3
+        },
+        "openfork_info\u0000interrupted": {
+          "ratio": 0.9015370586644708,
+          "tool": "openfork_info",
+          "status": "interrupted",
+          "observedRawChars": 616,
+          "observations": 22
+        },
+        "find\u0000running": {
+          "ratio": 0.9395643553321932,
+          "tool": "find",
+          "status": "running",
+          "observedRawChars": 3102,
+          "observations": 22
+        },
+        "git\u0000running": {
+          "ratio": 0.9587333457143916,
+          "tool": "git",
+          "status": "running",
+          "observedRawChars": 226,
+          "observations": 2
+        },
+        "read\u0000running": {
+          "ratio": 0.961043589514239,
+          "tool": "read",
+          "status": "running",
+          "observedRawChars": 3990,
+          "observations": 14
+        },
+        "process\u0000running": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "running",
+          "observedRawChars": 10207,
+          "observations": 19
+        },
+        "patch\u0000running": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "running",
+          "observedRawChars": 11888,
+          "observations": 4
+        },
+        "write\u0000interrupted": {
+          "ratio": 0.9981907892839281,
+          "tool": "write",
+          "status": "interrupted",
+          "observedRawChars": 112973,
+          "observations": 19
+        },
+        "openfork_request\u0000interrupted": {
+          "ratio": 0.959230790821281,
+          "tool": "openfork_request",
+          "status": "interrupted",
+          "observedRawChars": 5986,
+          "observations": 15
+        },
+        "patch\u0000cancelled_before_commit": {
+          "ratio": 0.9970969515873884,
+          "tool": "patch",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 3962,
+          "observations": 2
+        },
+        "process\u0000cancelled_after_commit": {
+          "ratio": 0.9752122291573015,
+          "tool": "process",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 2697,
+          "observations": 10
+        },
+        "openai_files\u0000committed": {
+          "ratio": 0.9814510786427679,
+          "tool": "openai_files",
+          "status": "committed",
+          "observedRawChars": 418,
+          "observations": 3
+        },
+        "openai_files\u0000interrupted": {
+          "ratio": 0.9814510786427679,
+          "tool": "openai_files",
+          "status": "interrupted",
+          "observedRawChars": 284,
+          "observations": 2
+        },
+        "openfork_info\u0000cancelled_before_commit": {
+          "ratio": 0.9015370586644708,
+          "tool": "openfork_info",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 28,
+          "observations": 1
+        },
+        "openfork_worker\u0000running": {
+          "ratio": 0.9784292190103957,
+          "tool": "openfork_worker",
+          "status": "running",
+          "observedRawChars": 72,
+          "observations": 1
+        }
+      }
+    },
+    "result": {
+      "global": {
+        "ratio": 0.6045243396325489,
+        "observedRawChars": 853507277,
+        "observations": 117184
+      },
+      "tools": {
+        "read": {
+          "ratio": 0.9356826023408047,
+          "observedRawChars": 219892881,
+          "observations": 21338
+        },
+        "find": {
+          "ratio": 0.8052685080222772,
+          "observedRawChars": 31010181,
+          "observations": 21875
+        },
+        "edit": {
+          "ratio": 0.07182079024431337,
+          "observedRawChars": 17807612,
+          "observations": 8747
+        },
+        "write": {
+          "ratio": 0.018987694737195332,
+          "observedRawChars": 10978281,
+          "observations": 1910
+        },
+        "process": {
+          "ratio": 0.4185016661634786,
+          "observedRawChars": 239257441,
+          "observations": 26007
+        },
+        "git": {
+          "ratio": 0.9612108780547868,
+          "observedRawChars": 49102310,
+          "observations": 3725
+        },
+        "patch": {
+          "ratio": 0.09349235964617628,
+          "observedRawChars": 12993312,
+          "observations": 3425
+        },
+        "openfork_worker": {
+          "ratio": 0.4719016698317002,
+          "observedRawChars": 67242067,
+          "observations": 14711
+        },
+        "openfork_info": {
+          "ratio": 0.5212557374649475,
+          "observedRawChars": 4514435,
+          "observations": 959
+        },
+        "capability": {
+          "ratio": 0.6003045971975293,
+          "observedRawChars": 37581044,
+          "observations": 5541
+        },
+        "openfork_session": {
+          "ratio": 0.48263528696402563,
+          "observedRawChars": 162512897,
+          "observations": 7454
+        },
+        "openfork_request": {
+          "ratio": 0.40090488079086334,
+          "observedRawChars": 612301,
+          "observations": 1483
+        },
+        "openai_files": {
+          "ratio": 0.5921347542081038,
+          "observedRawChars": 2515,
+          "observations": 9
+        }
+      },
+      "groups": {
+        "read\u0000success": {
+          "ratio": 0.9356826023408047,
+          "tool": "read",
+          "status": "success",
+          "observedRawChars": 219847878,
+          "observations": 20885
+        },
+        "find\u0000success": {
+          "ratio": 0.8052685080222772,
+          "tool": "find",
+          "status": "success",
+          "observedRawChars": 30998897,
+          "observations": 21759
+        },
+        "edit\u0000committed": {
+          "ratio": 0.07182079024431337,
+          "tool": "edit",
+          "status": "committed",
+          "observedRawChars": 17554921,
+          "observations": 8247
+        },
+        "edit\u0000conflict": {
+          "ratio": 0.07182079024431337,
+          "tool": "edit",
+          "status": "conflict",
+          "observedRawChars": 223197,
+          "observations": 388
+        },
+        "write\u0000committed": {
+          "ratio": 0.018987694737195332,
+          "tool": "write",
+          "status": "committed",
+          "observedRawChars": 10974941,
+          "observations": 1891
+        },
+        "process\u0000success": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "success",
+          "observedRawChars": 107978803,
+          "observations": 7123
+        },
+        "process\u0000committed": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "committed",
+          "observedRawChars": 131153340,
+          "observations": 18242
+        },
+        "process\u0000failed": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "failed",
+          "observedRawChars": 116992,
+          "observations": 547
+        },
+        "git\u0000failed": {
+          "ratio": 0.9612108780547868,
+          "tool": "git",
+          "status": "failed",
+          "observedRawChars": 33018,
+          "observations": 266
+        },
+        "find\u0000failed": {
+          "ratio": 0.8052685080222772,
+          "tool": "find",
+          "status": "failed",
+          "observedRawChars": 11284,
+          "observations": 116
+        },
+        "read\u0000failed": {
+          "ratio": 0.9356826023408047,
+          "tool": "read",
+          "status": "failed",
+          "observedRawChars": 40089,
+          "observations": 429
+        },
+        "patch\u0000committed": {
+          "ratio": 0.09349235964617628,
+          "tool": "patch",
+          "status": "committed",
+          "observedRawChars": 12556388,
+          "observations": 2951
+        },
+        "edit\u0000failed": {
+          "ratio": 0.07182079024431337,
+          "tool": "edit",
+          "status": "failed",
+          "observedRawChars": 24255,
+          "observations": 99
+        },
+        "patch\u0000conflict": {
+          "ratio": 0.09349235964617628,
+          "tool": "patch",
+          "status": "conflict",
+          "observedRawChars": 359596,
+          "observations": 395
+        },
+        "openfork_worker\u0000failed": {
+          "ratio": 0.4719016698317002,
+          "tool": "openfork_worker",
+          "status": "failed",
+          "observedRawChars": 29511,
+          "observations": 237
+        },
+        "openfork_worker\u0000success": {
+          "ratio": 0.4719016698317002,
+          "tool": "openfork_worker",
+          "status": "success",
+          "observedRawChars": 65186593,
+          "observations": 10789
+        },
+        "openfork_info\u0000success": {
+          "ratio": 0.5212557374649475,
+          "tool": "openfork_info",
+          "status": "success",
+          "observedRawChars": 4514363,
+          "observations": 958
+        },
+        "capability\u0000success": {
+          "ratio": 0.6003045971975293,
+          "tool": "capability",
+          "status": "success",
+          "observedRawChars": 14932891,
+          "observations": 2286
+        },
+        "openfork_session\u0000success": {
+          "ratio": 0.48263528696402563,
+          "tool": "openfork_session",
+          "status": "success",
+          "observedRawChars": 162236764,
+          "observations": 7112
+        },
+        "capability\u0000committed": {
+          "ratio": 0.6003045971975293,
+          "tool": "capability",
+          "status": "committed",
+          "observedRawChars": 22620705,
+          "observations": 3144
+        },
+        "openfork_session\u0000failed": {
+          "ratio": 0.48263528696402563,
+          "tool": "openfork_session",
+          "status": "failed",
+          "observedRawChars": 16328,
+          "observations": 110
+        },
+        "capability\u0000failed": {
+          "ratio": 0.6003045971975293,
+          "tool": "capability",
+          "status": "failed",
+          "observedRawChars": 16517,
+          "observations": 98
+        },
+        "openfork_request\u0000success": {
+          "ratio": 0.40090488079086334,
+          "tool": "openfork_request",
+          "status": "success",
+          "observedRawChars": 447158,
+          "observations": 917
+        },
+        "openai_files\u0000success": {
+          "ratio": 0.5921347542081038,
+          "tool": "openai_files",
+          "status": "success",
+          "observedRawChars": 852,
+          "observations": 5
+        },
+        "openfork_worker\u0000committed": {
+          "ratio": 0.4719016698317002,
+          "tool": "openfork_worker",
+          "status": "committed",
+          "observedRawChars": 2023444,
+          "observations": 3669
+        },
+        "edit\u0000success": {
+          "ratio": 0.07182079024431337,
+          "tool": "edit",
+          "status": "success",
+          "observedRawChars": 5239,
+          "observations": 13
+        },
+        "capability\u0000conflict": {
+          "ratio": 0.6003045971975293,
+          "tool": "capability",
+          "status": "conflict",
+          "observedRawChars": 10931,
+          "observations": 13
+        },
+        "openfork_session\u0000committed": {
+          "ratio": 0.48263528696402563,
+          "tool": "openfork_session",
+          "status": "committed",
+          "observedRawChars": 246471,
+          "observations": 188
+        },
+        "openfork_session\u0000conflict": {
+          "ratio": 0.48263528696402563,
+          "tool": "openfork_session",
+          "status": "conflict",
+          "observedRawChars": 10958,
+          "observations": 33
+        },
+        "write\u0000conflict": {
+          "ratio": 0.018987694737195332,
+          "tool": "write",
+          "status": "conflict",
+          "observedRawChars": 1987,
+          "observations": 13
+        },
+        "read\u0000denied": {
+          "ratio": 0.9356826023408047,
+          "tool": "read",
+          "status": "denied",
+          "observedRawChars": 263,
+          "observations": 3
+        },
+        "write\u0000success": {
+          "ratio": 0.018987694737195332,
+          "tool": "write",
+          "status": "success",
+          "observedRawChars": 1068,
+          "observations": 3
+        },
+        "process\u0000denied": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "denied",
+          "observedRawChars": 78,
+          "observations": 1
+        },
+        "patch\u0000failed": {
+          "ratio": 0.09349235964617628,
+          "tool": "patch",
+          "status": "failed",
+          "observedRawChars": 16641,
+          "observations": 52
+        },
+        "git\u0000success": {
+          "ratio": 0.9612108780547868,
+          "tool": "git",
+          "status": "success",
+          "observedRawChars": 48048656,
+          "observations": 3213
+        },
+        "openfork_request\u0000failed": {
+          "ratio": 0.40090488079086334,
+          "tool": "openfork_request",
+          "status": "failed",
+          "observedRawChars": 15553,
+          "observations": 156
+        },
+        "openfork_request\u0000denied": {
+          "ratio": 0.40090488079086334,
+          "tool": "openfork_request",
+          "status": "denied",
+          "observedRawChars": 2622,
+          "observations": 19
+        },
+        "openfork_request\u0000committed": {
+          "ratio": 0.40090488079086334,
+          "tool": "openfork_request",
+          "status": "committed",
+          "observedRawChars": 146968,
+          "observations": 391
+        },
+        "write\u0000failed": {
+          "ratio": 0.018987694737195332,
+          "tool": "write",
+          "status": "failed",
+          "observedRawChars": 285,
+          "observations": 3
+        },
+        "git\u0000conflict": {
+          "ratio": 0.9612108780547868,
+          "tool": "git",
+          "status": "conflict",
+          "observedRawChars": 53518,
+          "observations": 51
+        },
+        "patch\u0000success": {
+          "ratio": 0.09349235964617628,
+          "tool": "patch",
+          "status": "success",
+          "observedRawChars": 60555,
+          "observations": 25
+        },
+        "process\u0000cancelled_before_commit": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 6176,
+          "observations": 80
+        },
+        "git\u0000committed": {
+          "ratio": 0.9612108780547868,
+          "tool": "git",
+          "status": "committed",
+          "observedRawChars": 966890,
+          "observations": 192
+        },
+        "openai_files\u0000failed": {
+          "ratio": 0.5921347542081038,
+          "tool": "openai_files",
+          "status": "failed",
+          "observedRawChars": 88,
+          "observations": 1
+        },
+        "read\u0000conflict": {
+          "ratio": 0.9356826023408047,
+          "tool": "read",
+          "status": "conflict",
+          "observedRawChars": 3955,
+          "observations": 11
+        },
+        "process\u0000conflict": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "conflict",
+          "observedRawChars": 352,
+          "observations": 4
+        },
+        "openfork_worker\u0000cancelled_before_commit": {
+          "ratio": 0.4719016698317002,
+          "tool": "openfork_worker",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 948,
+          "observations": 12
+        },
+        "openfork_worker\u0000cancelled_after_commit": {
+          "ratio": 0.4719016698317002,
+          "tool": "openfork_worker",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 1571,
+          "observations": 4
+        },
+        "read\u0000cancelled_before_commit": {
+          "ratio": 0.9356826023408047,
+          "tool": "read",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 696,
+          "observations": 10
+        },
+        "openfork_session\u0000cancelled_after_commit": {
+          "ratio": 0.48263528696402563,
+          "tool": "openfork_session",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 2376,
+          "observations": 11
+        },
+        "git\u0000cancelled_before_commit": {
+          "ratio": 0.9612108780547868,
+          "tool": "git",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 228,
+          "observations": 3
+        },
+        "patch\u0000cancelled_before_commit": {
+          "ratio": 0.09349235964617628,
+          "tool": "patch",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 132,
+          "observations": 2
+        },
+        "process\u0000cancelled_after_commit": {
+          "ratio": 0.4185016661634786,
+          "tool": "process",
+          "status": "cancelled_after_commit",
+          "observedRawChars": 1700,
+          "observations": 10
+        },
+        "openai_files\u0000committed": {
+          "ratio": 0.5921347542081038,
+          "tool": "openai_files",
+          "status": "committed",
+          "observedRawChars": 1575,
+          "observations": 3
+        },
+        "openfork_info\u0000cancelled_before_commit": {
+          "ratio": 0.5212557374649475,
+          "tool": "openfork_info",
+          "status": "cancelled_before_commit",
+          "observedRawChars": 72,
+          "observations": 1
+        }
+      }
+    }
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "digest": "9af4d64cfe67c0648ec736d4ad666c40ca2b5a63b15398ca6cc5b96e21d35b84"
+  }
+}

@@ -282,7 +282,7 @@ describe("SessionInput generalized lifecycle", () => {
     }),
   )
 
-  it.effect("projects a V1 semantic User onto the shared promoted frontier and revokes older Synthetic work", () =>
+  it.effect("projects a V1 semantic User onto the shared admission frontier, leaves it pending, and revokes older Synthetic work", () =>
     Effect.gen(function* () {
       yield* setup
       const { db } = yield* Database.Service
@@ -315,9 +315,10 @@ describe("SessionInput generalized lifecycle", () => {
       expect(frontier).toMatchObject({
         kind: "user",
         admissionClass: "user",
-        promotedSeq: frontier?.admittedSeq,
       })
+      expect(frontier?.promotedSeq).toBeUndefined()
       expect(yield* SessionInput.latestUserSeq(db, sessionID)).toBe(frontier?.admittedSeq)
+      expect(yield* SessionInput.latestPromotedUserSeq(db, sessionID)).toBeUndefined()
       expect(yield* SessionInput.findEntry(db, syntheticID)).toMatchObject({
         revokedSeq: frontier?.admittedSeq,
         revokedReason: "user_superseded",
@@ -368,6 +369,31 @@ describe("SessionInput generalized lifecycle", () => {
       expect(
         yield* eventCount(EventV2.versionedType(SessionEvent.SyntheticAdmitted.type, 1)),
       ).toBe(0)
+    }),
+  )
+
+  it.effect("keeps the promoted User frontier stable when a newer User is admitted after the provider-cycle cutoff", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const first = yield* user(SessionMessage.ID.make("msg_user_promoted_frontier_1"), "first")
+      const cutoff = yield* EventV2.latestSequence(db, sessionID)
+
+      const promoted = yield* SessionInput.promoteLane(
+        db,
+        events,
+        sessionID,
+        { admissionClass: "user", delivery: "queue" },
+        cutoff,
+      )
+      expect(promoted).toEqual({ selected: 1, promoted: 1, staleRevoked: 0 })
+      expect(yield* SessionInput.latestPromotedUserSeq(db, sessionID)).toBe(first.admittedSeq)
+
+      const second = yield* user(SessionMessage.ID.make("msg_user_promoted_frontier_2"), "newer pending user")
+      expect(second.admittedSeq).toBeGreaterThan(first.admittedSeq)
+      expect(yield* SessionInput.latestUserSeq(db, sessionID)).toBe(second.admittedSeq)
+      expect(yield* SessionInput.latestPromotedUserSeq(db, sessionID)).toBe(first.admittedSeq)
     }),
   )
 

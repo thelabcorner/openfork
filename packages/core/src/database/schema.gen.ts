@@ -24,6 +24,190 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`directory_activity_lease\` (
+          \`lease_id\` text PRIMARY KEY,
+          \`directory\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`owner_id\` text NOT NULL,
+          \`generation\` integer NOT NULL,
+          \`state\` text NOT NULL,
+          \`acquired_at\` integer NOT NULL,
+          \`released_at\` integer,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`fk_directory_activity_lease_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`owner_id\`) REFERENCES \`runtime_owner\`(\`id\`),
+          CONSTRAINT "directory_activity_lease_state_check" CHECK("state" in ('active', 'released', 'reconcile_required')),
+          CONSTRAINT "directory_activity_lease_release_check" CHECK(("state" = 'released' and "released_at" is not null) or ("state" <> 'released' and "released_at" is null)),
+          CONSTRAINT "directory_activity_lease_identity_check" CHECK(length("lease_id") > 0 and length("kind") > 0)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`directory_maintenance_guard\` (
+          \`directory\` text PRIMARY KEY,
+          \`guard_id\` text NOT NULL,
+          \`owner_id\` text NOT NULL,
+          \`acquisition_id\` text NOT NULL,
+          \`generation\` integer NOT NULL,
+          \`state\` text NOT NULL,
+          \`acquired_at\` integer NOT NULL,
+          \`released_at\` integer,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`fk_directory_maintenance_guard_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`owner_id\`) REFERENCES \`runtime_owner\`(\`id\`),
+          CONSTRAINT "directory_maintenance_guard_state_check" CHECK("state" in ('active', 'released', 'reconcile_required')),
+          CONSTRAINT "directory_maintenance_guard_release_check" CHECK(("state" = 'released' and "released_at" is not null) or ("state" <> 'released' and "released_at" is null)),
+          CONSTRAINT "directory_maintenance_guard_acquisition_check" CHECK(length("acquisition_id") > 0)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`managed_worktree_binding\` (
+          \`directory\` text PRIMARY KEY,
+          \`binding_state\` text NOT NULL,
+          \`generation\` integer NOT NULL,
+          \`installation_id\` text NOT NULL,
+          \`repository_id\` text NOT NULL,
+          \`worktree_id\` text NOT NULL,
+          \`storage_volume_id\` text NOT NULL,
+          \`project_id\` text NOT NULL,
+          \`workspace_id\` text,
+          \`branch_ref\` text NOT NULL,
+          \`pin_ref\` text,
+          \`head\` text,
+          \`manager_revision\` integer,
+          \`lifecycle_state\` text,
+          \`operation_id\` text,
+          \`create_operation_id\` text,
+          \`initialization_operation_id\` text,
+          \`state_reason\` text,
+          \`evidence_json\` text,
+          \`created_at\` integer NOT NULL,
+          \`activated_at\` integer,
+          \`reconciled_at\` integer,
+          \`quarantined_at\` integer,
+          \`retired_at\` integer,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT "managed_worktree_binding_state_check" CHECK("binding_state" in ('handoff_pending', 'active', 'reconcile_required', 'quarantined', 'retired')),
+          CONSTRAINT "managed_worktree_binding_generation_check" CHECK("generation" > 0),
+          CONSTRAINT "managed_worktree_binding_identity_check" CHECK(length("directory") > 0 and length("installation_id") > 0 and length("repository_id") > 0 and length("worktree_id") > 0 and length("storage_volume_id") > 0 and length("project_id") > 0 and length("branch_ref") > 0),
+          CONSTRAINT "managed_worktree_binding_observation_check" CHECK(("pin_ref" is null or length("pin_ref") > 0) and ("manager_revision" is null or "manager_revision" > 0)),
+          CONSTRAINT "managed_worktree_binding_activation_check" CHECK(("binding_state" <> 'active') or ("head" is not null and "manager_revision" is not null and "lifecycle_state" is not null and "activated_at" is not null)),
+          CONSTRAINT "managed_worktree_binding_retirement_check" CHECK(("binding_state" = 'retired' and "retired_at" is not null) or ("binding_state" <> 'retired' and "retired_at" is null))
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`provider_account_route_health\` (
+          \`provider_id\` text NOT NULL,
+          \`account_id\` text NOT NULL,
+          \`model_id\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`credential_revision\` integer,
+          \`expires_at\` integer,
+          \`observed_at\` integer NOT NULL,
+          CONSTRAINT \`provider_account_route_health_pk\` PRIMARY KEY(\`provider_id\`, \`account_id\`, \`model_id\`),
+          CONSTRAINT "provider_account_route_health_provider_check" CHECK(length("provider_id") > 0),
+          CONSTRAINT "provider_account_route_health_account_check" CHECK(length("account_id") > 0),
+          CONSTRAINT "provider_account_route_health_model_check" CHECK(length("model_id") > 0),
+          CONSTRAINT "provider_account_route_health_state_check" CHECK("state" in ('auth-invalid', 'cooling-down', 'quota-exhausted')),
+          CONSTRAINT "provider_account_route_health_observed_check" CHECK("observed_at" >= 0 and "observed_at" <= 9007199254740991),
+          CONSTRAINT "provider_account_route_health_shape_check" CHECK((
+                "state" = 'auth-invalid'
+                and "credential_revision" is not null
+                and "credential_revision" > 0
+                and "credential_revision" <= 9007199254740991
+                and "expires_at" is null
+              ) or (
+                "state" in ('cooling-down', 'quota-exhausted')
+                and "credential_revision" is null
+                and "expires_at" is not null
+                and "expires_at" > "observed_at"
+                and "expires_at" <= 9007199254740991
+              ))
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`provider_public_route_health\` (
+          \`provider_id\` text NOT NULL,
+          \`model_id\` text NOT NULL,
+          \`state\` text NOT NULL,
+          \`expires_at\` integer NOT NULL,
+          \`observed_at\` integer NOT NULL,
+          CONSTRAINT \`provider_public_route_health_pk\` PRIMARY KEY(\`provider_id\`, \`model_id\`),
+          CONSTRAINT "provider_public_route_health_provider_check" CHECK(length("provider_id") > 0),
+          CONSTRAINT "provider_public_route_health_model_check" CHECK(length("model_id") > 0),
+          CONSTRAINT "provider_public_route_health_state_check" CHECK("state" in ('cooling-down', 'quota-exhausted')),
+          CONSTRAINT "provider_public_route_health_time_check" CHECK("observed_at" >= 0
+                and "observed_at" <= 9007199254740991
+                and "expires_at" > "observed_at"
+                and "expires_at" <= 9007199254740991)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`provider_route_account_stats\` (
+          \`provider_id\` text NOT NULL,
+          \`affinity_domain\` text NOT NULL,
+          \`account_id\` text NOT NULL,
+          \`assignment_count\` integer DEFAULT 0 NOT NULL,
+          \`last_assigned_at\` integer,
+          CONSTRAINT \`provider_route_account_stats_pk\` PRIMARY KEY(\`provider_id\`, \`affinity_domain\`, \`account_id\`),
+          CONSTRAINT "provider_route_account_stats_provider_id_check" CHECK(length("provider_id") > 0),
+          CONSTRAINT "provider_route_account_stats_affinity_domain_check" CHECK(length("affinity_domain") > 0),
+          CONSTRAINT "provider_route_account_stats_account_id_check" CHECK(length("account_id") > 0),
+          CONSTRAINT "provider_route_account_stats_count_check" CHECK("assignment_count" >= 0 and "assignment_count" <= 9007199254740991),
+          CONSTRAINT "provider_route_account_stats_last_assigned_at_check" CHECK("last_assigned_at" is null or ("last_assigned_at" >= 0 and "last_assigned_at" <= 9007199254740991))
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`provider_route_binding\` (
+          \`session_id\` text NOT NULL,
+          \`affinity_domain\` text NOT NULL,
+          \`provider_id\` text NOT NULL,
+          \`route_kind\` text NOT NULL,
+          \`account_id\` text,
+          \`credential_handle\` text,
+          \`mode\` text,
+          \`pin\` text,
+          \`route_revision\` integer DEFAULT 1 NOT NULL,
+          \`assigned_at\` integer NOT NULL,
+          \`assignment_epoch\` integer NOT NULL,
+          \`reason\` text NOT NULL,
+          CONSTRAINT \`provider_route_binding_pk\` PRIMARY KEY(\`session_id\`, \`affinity_domain\`),
+          CONSTRAINT \`fk_provider_route_binding_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT "provider_route_binding_affinity_domain_check" CHECK(length("affinity_domain") > 0),
+          CONSTRAINT "provider_route_binding_provider_id_check" CHECK(length("provider_id") > 0),
+          CONSTRAINT "provider_route_binding_route_kind_check" CHECK("route_kind" in ('public', 'account')),
+          CONSTRAINT "provider_route_binding_mode_check" CHECK("mode" is null or "mode" in ('concentrate', 'session-round-robin')),
+          CONSTRAINT "provider_route_binding_pin_check" CHECK("pin" is null or "pin" in ('hard', 'soft')),
+          CONSTRAINT "provider_route_binding_reason_check" CHECK("reason" in ('explicit', 'initial', 'failover', 'model-selection')),
+          CONSTRAINT "provider_route_binding_revision_check" CHECK("route_revision" > 0),
+          CONSTRAINT "provider_route_binding_assignment_epoch_check" CHECK("assignment_epoch" > 0),
+          CONSTRAINT "provider_route_binding_assigned_at_check" CHECK("assigned_at" >= 0),
+          CONSTRAINT "provider_route_binding_identity_check" CHECK((
+                "route_kind" = 'public'
+                and "account_id" is null
+                and "credential_handle" is null
+                and "mode" is null
+                and "pin" is null
+              ) or (
+                "route_kind" = 'account'
+                and "account_id" is not null
+                and length("account_id") > 0
+                and "credential_handle" is not null
+                and length("credential_handle") > 0
+              ))
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`provider_route_policy_cursor\` (
+          \`provider_id\` text NOT NULL,
+          \`affinity_domain\` text NOT NULL,
+          \`epoch\` integer DEFAULT 0 NOT NULL,
+          \`last_assigned_handle\` text,
+          CONSTRAINT \`provider_route_policy_cursor_pk\` PRIMARY KEY(\`provider_id\`, \`affinity_domain\`),
+          CONSTRAINT "provider_route_policy_cursor_provider_id_check" CHECK(length("provider_id") > 0),
+          CONSTRAINT "provider_route_policy_cursor_affinity_domain_check" CHECK(length("affinity_domain") > 0),
+          CONSTRAINT "provider_route_policy_cursor_epoch_check" CHECK("epoch" >= 0 and "epoch" <= 9007199254740991),
+          CONSTRAINT "provider_route_policy_cursor_last_handle_check" CHECK("last_assigned_handle" is null or length("last_assigned_handle") > 0)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`revision_draft_claim\` (
           \`target_kind\` text NOT NULL,
           \`target_key\` text NOT NULL,
@@ -121,6 +305,7 @@ export default {
           \`connector_id\` text,
           \`method_id\` text,
           \`active\` integer,
+          \`revision\` integer DEFAULT 1 NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL
         );
@@ -198,18 +383,10 @@ export default {
         CREATE TABLE \`goal_automation\` (
           \`session_id\` text PRIMARY KEY,
           \`goal_id\` text NOT NULL,
-          \`started_at\` integer NOT NULL,
-          \`consecutive_turns\` integer DEFAULT 0 NOT NULL,
-          \`no_progress_turns\` integer DEFAULT 0 NOT NULL,
-          \`auditor_blocked_streak\` integer DEFAULT 0 NOT NULL,
-          \`consumed_tokens\` integer DEFAULT 0 NOT NULL,
-          \`last_auditor_decision\` text,
-          \`last_auditor_rationale\` text,
           \`audit_requested_at\` integer,
           \`auditing_at\` integer,
           \`auditor_session_id\` text,
           \`runtime_error\` text,
-          \`previous_revision\` integer,
           \`reservation_id\` text,
           \`reservation_owner\` text,
           \`reservation_created_at\` integer,
@@ -298,7 +475,6 @@ export default {
           \`status\` text DEFAULT 'draft' NOT NULL,
           \`revision\` integer DEFAULT 0 NOT NULL,
           \`auditor_runs\` integer DEFAULT 0 NOT NULL,
-          \`continuation_policy\` text DEFAULT '{}' NOT NULL,
           \`auditor_policy\` text DEFAULT '{}' NOT NULL,
           \`blocker\` text,
           \`time_created\` integer NOT NULL,
@@ -508,6 +684,12 @@ export default {
           \`mutation_attempted\` integer DEFAULT false NOT NULL,
           \`mutation_committed\` integer DEFAULT false NOT NULL,
           \`safe_summary\` text,
+          \`context_request_chars\` integer,
+          \`context_request_source\` text,
+          \`context_request_schema\` text,
+          \`context_result_chars\` integer,
+          \`context_result_source\` text,
+          \`context_result_schema\` text,
           \`time_started\` integer NOT NULL,
           \`time_completed\` integer,
           CONSTRAINT \`fk_oxp_invocation_activity_id_oxp_parent_activity_id_fk\` FOREIGN KEY (\`activity_id\`) REFERENCES \`oxp_parent_activity\`(\`id\`) ON DELETE CASCADE
@@ -827,6 +1009,7 @@ export default {
           \`promoted_seq\` integer,
           \`revoked_seq\` integer,
           \`revoked_reason\` text,
+          \`completed_seq\` integer,
           \`time_created\` integer NOT NULL,
           CONSTRAINT \`fk_session_input_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
@@ -1120,6 +1303,7 @@ export default {
           \`status\` text NOT NULL,
           \`failure_kind\` text,
           \`failure_detail\` text,
+          \`result_summary\` text,
           \`admitted_at\` integer,
           \`started_at\` integer,
           \`ended_at\` integer,
@@ -1157,6 +1341,8 @@ export default {
           \`agent\` text NOT NULL,
           \`provider_id\` text NOT NULL,
           \`model_id\` text NOT NULL,
+          \`route_kind\` text,
+          \`account_id\` text,
           \`variant\` text,
           \`session_id\` text,
           \`project_id\` text,
@@ -1180,6 +1366,7 @@ export default {
           \`provider_id\` text NOT NULL,
           \`model_id\` text NOT NULL,
           \`base_model_id\` text,
+          \`route_kind\` text,
           \`account_id\` text,
           \`variant\` text,
           \`agent\` text,
@@ -1195,6 +1382,18 @@ export default {
           \`cache_write_tokens\` integer DEFAULT 0 NOT NULL,
           \`output_tokens\` integer DEFAULT 0 NOT NULL,
           \`reasoning_tokens\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`usage_session\` (
+          \`session_id\` text PRIMARY KEY,
+          \`project_id\` text NOT NULL,
+          \`directory\` text NOT NULL,
+          \`title\` text NOT NULL,
+          \`project_name\` text,
+          \`session_created_at\` integer NOT NULL,
+          \`session_updated_at\` integer NOT NULL,
+          \`last_usage_at\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -1215,6 +1414,48 @@ export default {
           \`updated_at\` integer NOT NULL
         );
       `)
+      yield* tx.run(
+        `CREATE INDEX \`directory_activity_lease_directory_idx\` ON \`directory_activity_lease\` (\`directory\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`directory_activity_lease_owner_idx\` ON \`directory_activity_lease\` (\`owner_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`directory_maintenance_guard_guard_idx\` ON \`directory_maintenance_guard\` (\`guard_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`directory_maintenance_guard_owner_idx\` ON \`directory_maintenance_guard\` (\`owner_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`directory_maintenance_guard_acquisition_idx\` ON \`directory_maintenance_guard\` (\`acquisition_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`managed_worktree_binding_state_idx\` ON \`managed_worktree_binding\` (\`binding_state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`managed_worktree_binding_worktree_idx\` ON \`managed_worktree_binding\` (\`installation_id\`,\`repository_id\`,\`worktree_id\`,\`binding_state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`managed_worktree_binding_project_idx\` ON \`managed_worktree_binding\` (\`project_id\`,\`binding_state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`managed_worktree_binding_workspace_idx\` ON \`managed_worktree_binding\` (\`workspace_id\`,\`binding_state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`provider_account_route_health_expiry_idx\` ON \`provider_account_route_health\` (\`expires_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`provider_public_route_health_expiry_idx\` ON \`provider_public_route_health\` (\`expires_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`provider_route_binding_provider_kind_idx\` ON \`provider_route_binding\` (\`provider_id\`,\`route_kind\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`provider_route_binding_account_idx\` ON \`provider_route_binding\` (\`provider_id\`,\`account_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`provider_route_binding_credential_idx\` ON \`provider_route_binding\` (\`provider_id\`,\`credential_handle\`);`,
+      )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`revision_draft_target_idx\` ON \`revision_draft\` (\`target_kind\`,\`target_key\`);`,
       )
@@ -1418,6 +1659,12 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`session_directory_root_created_id_idx\` ON \`session\` (\`directory\`,\`time_created\`,\`id\`) WHERE ("session"."parent_id" is null);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`session_directory_root_updated_id_idx\` ON \`session\` (\`directory\`,\`time_updated\`,\`id\`) WHERE "session"."parent_id" IS NULL AND "session"."time_archived" IS NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_directory_root_archived_id_idx\` ON \`session\` (\`directory\`,\`time_archived\`,\`id\`) WHERE "session"."parent_id" IS NULL AND "session"."time_archived" IS NOT NULL;`,
+      )
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)
@@ -1517,6 +1764,9 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`maintenance_usage_agent_completed_idx\` ON \`maintenance_usage\` (\`agent\`,\`time_completed\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`maintenance_usage_account_completed_idx\` ON \`maintenance_usage\` (\`provider_id\`,\`account_id\`,\`time_completed\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`usage_record_completed_idx\` ON \`usage_record\` (\`completed_at\`);`)
       yield* tx.run(
         `CREATE INDEX \`usage_record_session_completed_idx\` ON \`usage_record\` (\`session_id\`,\`completed_at\`);`,
@@ -1529,6 +1779,9 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`usage_record_account_model_completed_idx\` ON \`usage_record\` (\`provider_id\`,\`base_model_id\`,\`account_id\`,\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_session_project_last_usage_idx\` ON \`usage_session\` (\`project_id\`,\`last_usage_at\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`usage_yield_stat_model_idx\` ON \`usage_yield_stat\` (\`provider_id\`,\`base_model_id\`);`,

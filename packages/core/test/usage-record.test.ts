@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
+import { eq, sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -7,7 +8,7 @@ import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { UsageYield } from "@opencode-ai/core/usage/yield"
 import { meanVector, momentsFor } from "@opencode-ai/core/usage/yield-statistics"
-import { UsageRecordTable } from "@opencode-ai/core/usage/sql"
+import { UsageRecordTable, UsageSessionTable } from "@opencode-ai/core/usage/sql"
 import { testEffect } from "./lib/effect"
 
 const layer = AppNodeBuilder.build(
@@ -25,6 +26,199 @@ const tokens = {
 }
 
 describe("UsageRecord identity materialization", () => {
+  it.live("snapshots Session attribution into an independent monotonic usage dimension", () =>
+    Effect.gen(function* () {
+      const usage = yield* UsageRecord.Service
+      const database = yield* Database.Service
+
+      yield* database.db.run(sql`
+        INSERT INTO project (id, worktree, name, sandboxes, time_created, time_updated)
+        VALUES ('usage-project', '/usage/project', 'Usage Project', '[]', 1, 1)
+      `)
+      yield* database.db.run(sql`
+        INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated)
+        VALUES ('ses_usage_dimension', 'usage-project', '/usage/project', 'usage-dimension', 'Newer title', '1', 10, 20)
+      `)
+
+      yield* usage.record({
+        messageID: "msg_usage_dimension_newer",
+        sessionID: "ses_usage_dimension",
+        providerID: "openai",
+        modelID: "gpt-5.6-sol",
+        completedAt: 500,
+        cost: 0,
+        tokens,
+      })
+
+      // A late settlement with an older completion timestamp must not roll the
+      // accounting watermark backward.
+      yield* usage.record({
+        messageID: "msg_usage_dimension_older",
+        sessionID: "ses_usage_dimension",
+        providerID: "openai",
+        modelID: "gpt-5.6-sol",
+        completedAt: 400,
+        cost: 0,
+        tokens,
+      })
+
+      // Live metadata is a separate dimension: renames after the last response
+      // must survive a later Session delete without changing the usage watermark.
+      yield* database.db.run(sql`
+        UPDATE session
+        SET title = 'Latest title', time_updated = 30
+        WHERE id = 'ses_usage_dimension'
+      `)
+
+      const dimension = yield* database.readDb
+        .select({
+          projectID: UsageSessionTable.project_id,
+          directory: UsageSessionTable.directory,
+          title: UsageSessionTable.title,
+          projectName: UsageSessionTable.project_name,
+          lastUsageAt: UsageSessionTable.last_usage_at,
+        })
+        .from(UsageSessionTable)
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(dimension).toEqual({
+        projectID: "usage-project",
+        directory: "/usage/project",
+        title: "Latest title",
+        projectName: "Usage Project",
+        lastUsageAt: 500,
+      })
+    }),
+  )
+
+  it.live("retains attribution when the first Usage settlement arrives after Session deletion", () =>
+    Effect.gen(function* () {
+      const usage = yield* UsageRecord.Service
+      const database = yield* Database.Service
+      const sessionID = SessionSchema.ID.make("ses_late_usage")
+
+      yield* database.db.run(sql`
+        INSERT INTO project (id, worktree, name, sandboxes, time_created, time_updated)
+        VALUES ('late-usage-project', '/usage/late', 'Late Usage Project', '[]', 1, 1)
+      `)
+      yield* database.db.run(sql`
+        INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated)
+        VALUES ('ses_late_usage', 'late-usage-project', '/usage/late', 'late-usage', 'Late Usage', '1', 100, 200)
+      `)
+
+      // A delete can win the race with the first scalar Usage settlement. Keep
+      // a tiny attribution tombstone at the storage boundary so that settlement
+      // remains project/title-addressable even after the live Session is gone.
+      yield* database.db.run(sql`DELETE FROM session WHERE id = 'ses_late_usage'`)
+
+      const tombstone = yield* database.readDb
+        .select({
+          projectID: UsageSessionTable.project_id,
+          directory: UsageSessionTable.directory,
+          title: UsageSessionTable.title,
+          projectName: UsageSessionTable.project_name,
+          lastUsageAt: UsageSessionTable.last_usage_at,
+        })
+        .from(UsageSessionTable)
+        .where(eq(UsageSessionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(tombstone).toEqual({
+        projectID: "late-usage-project",
+        directory: "/usage/late",
+        title: "Late Usage",
+        projectName: "Late Usage Project",
+        lastUsageAt: 0,
+      })
+
+      yield* usage.record({
+        messageID: "msg_late_usage",
+        sessionID,
+        providerID: "openai",
+        modelID: "gpt-5.6-sol",
+        completedAt: 600,
+        cost: 0,
+        tokens,
+      })
+
+      const settled = yield* database.readDb
+        .select({
+          projectID: UsageSessionTable.project_id,
+          directory: UsageSessionTable.directory,
+          title: UsageSessionTable.title,
+          projectName: UsageSessionTable.project_name,
+          lastUsageAt: UsageSessionTable.last_usage_at,
+        })
+        .from(UsageSessionTable)
+        .where(eq(UsageSessionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(settled).toEqual({
+        projectID: "late-usage-project",
+        directory: "/usage/late",
+        title: "Late Usage",
+        projectName: "Late Usage Project",
+        lastUsageAt: 600,
+      })
+    }),
+  )
+
+  it.live("preserves Usage attribution through project cascade deletion", () =>
+    Effect.gen(function* () {
+      const usage = yield* UsageRecord.Service
+      const database = yield* Database.Service
+      const sessionID = SessionSchema.ID.make("ses_project_cascade")
+
+      yield* database.db.run(sql`
+        INSERT INTO project (id, worktree, name, sandboxes, time_created, time_updated)
+        VALUES ('cascade-project', '/usage/cascade', 'Cascade Project', '[]', 1, 1)
+      `)
+      yield* database.db.run(sql`
+        INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated)
+        VALUES ('ses_project_cascade', 'cascade-project', '/usage/cascade', 'cascade', 'Cascade Session', '1', 100, 200)
+      `)
+      yield* usage.record({
+        messageID: "msg_project_cascade",
+        sessionID,
+        providerID: "openai",
+        modelID: "gpt-5.6-sol",
+        completedAt: 700,
+        cost: 0,
+        tokens,
+      })
+
+      yield* database.db.run(sql`DELETE FROM project WHERE id = 'cascade-project'`)
+
+      const liveSession = yield* database.readDb.get(sql`SELECT id FROM session WHERE id = 'ses_project_cascade'`)
+      const usageRow = yield* database.readDb.get(sql`SELECT message_id FROM usage_record WHERE message_id = 'msg_project_cascade'`)
+      const dimension = yield* database.readDb
+        .select({
+          projectID: UsageSessionTable.project_id,
+          directory: UsageSessionTable.directory,
+          title: UsageSessionTable.title,
+          projectName: UsageSessionTable.project_name,
+          lastUsageAt: UsageSessionTable.last_usage_at,
+        })
+        .from(UsageSessionTable)
+        .where(eq(UsageSessionTable.session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+
+      expect(liveSession).toBeUndefined()
+      expect(usageRow).toEqual({ message_id: "msg_project_cascade" })
+      expect(dimension).toEqual({
+        projectID: "cascade-project",
+        directory: "/usage/cascade",
+        title: "Cascade Session",
+        projectName: "Cascade Project",
+        lastUsageAt: 700,
+      })
+    }),
+  )
+
   it.live("persists raw, base-model, and suffix account identity", () =>
     Effect.gen(function* () {
       const usage = yield* UsageRecord.Service

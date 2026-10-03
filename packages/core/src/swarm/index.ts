@@ -24,19 +24,24 @@ import {
   requireMemberRow,
   requireSwarmRow,
   requireTaskRow,
+  validateSessionBindingScope,
   validateSessionScope,
 } from "./repository"
 import { commitFail, publishWithCommit } from "./transaction"
 import { makeLeaseOperations } from "./lease"
+import { makeHandoffOperations, type HandoffLimits, type SwarmHandoff } from "./handoff"
+import { makeObservabilityOperations } from "./observability"
 import { makeMessagingOperations } from "./messaging"
 import { makeSharedStateOperations } from "./shared-state"
 import { makeRuntimeOperations } from "./runtime"
+import { makeAggregateRecoveryOperations } from "./aggregate-recovery"
 export type {
   LeaseRuntimeTarget,
   SessionTaskAuthority,
   RetirementRequiredTarget,
   RetirementRun,
   RetirementTarget,
+  UnsettledTarget,
   NextRuntimeDeadlineInput,
   RuntimeDeadlineState,
 } from "./runtime"
@@ -58,9 +63,12 @@ export type {
   ClaimToken,
   AcquireClaimInput,
   RenewClaimInput,
+  ClaimConflictInput,
+  ClaimConflict,
   PublishDeliverableInput,
   VerdictDeliverableInput,
 } from "./shared-state"
+export { SwarmClaims } from "./claims"
 export type {
   LeaseToken,
   ClaimTaskInput,
@@ -72,6 +80,8 @@ export type {
   StartTaskRunInput,
   SettleTaskInput,
   TaskSettlement,
+  TaskReviewDecision,
+  ReviewTaskInput,
   RetirementReason,
 } from "./lease"
 import {
@@ -120,6 +130,12 @@ export interface CreateInput {
   readonly name: string
   readonly policy?: SwarmModel.Policy
   readonly now?: number
+}
+
+export interface PreflightMemberSessionInput {
+  readonly projectID: typeof ProjectTable.$inferSelect.id
+  readonly workspaceID?: typeof WorkspaceTable.$inferSelect.id
+  readonly sessionID: typeof SessionTable.$inferSelect.id
 }
 
 export interface UpdateInput {
@@ -229,18 +245,37 @@ export interface Interface
   extends ReturnType<typeof makeLeaseOperations>,
     ReturnType<typeof makeMessagingOperations>,
     ReturnType<typeof makeSharedStateOperations>,
-    ReturnType<typeof makeRuntimeOperations> {
+    ReturnType<typeof makeRuntimeOperations>,
+    ReturnType<typeof makeAggregateRecoveryOperations> {
   readonly create: (input: CreateInput) => Effect.Effect<SwarmModel.Info, SwarmSchema.Error>
   readonly info: (id: SwarmModel.ID) => Effect.Effect<SwarmModel.Info, SwarmSchema.Error>
   readonly get: (id: SwarmModel.ID) => Effect.Effect<SwarmModel.Detail, SwarmSchema.Error>
   readonly summary: (id: SwarmModel.ID) => Effect.Effect<SwarmModel.Summary, SwarmSchema.Error>
   /** Bootstrap-free bounded catalog projection. Aggregate counts are batched, never N+1. */
   readonly summaries: (input?: SummaryListInput) => Effect.Effect<ReadonlyArray<SwarmModel.Summary>>
+  /**
+   * Bootstrap-free compact lifecycle observability for one Swarm, aggregated
+   * from durable `swarm_*` rows at the owning boundary. Consumers must read it
+   * instead of recounting assignments, settlements, supersessions, peer
+   * delivery, or shared-state writes from history or rendered rows.
+   */
+  readonly reliability: (input: {
+    readonly swarmID: SwarmModel.ID
+    readonly now?: number
+  }) => Effect.Effect<SwarmModel.Reliability, SwarmSchema.Error>
   readonly list: (input?: {
     readonly projectID?: typeof ProjectTable.$inferSelect.id
     readonly status?: SwarmModel.Status
   }) => Effect.Effect<ReadonlyArray<SwarmModel.Info>>
   readonly update: (input: UpdateInput) => Effect.Effect<SwarmModel.Info, SwarmSchema.Error>
+  /**
+   * Read-only Core authority preflight for a prospective bound member Session.
+   * Commit paths still revalidate transactionally; this exists only to reject
+   * deterministic invalid coordinator bindings before Swarm.create writes.
+   */
+  readonly preflightMemberSession: (
+    input: PreflightMemberSessionInput,
+  ) => Effect.Effect<void, SwarmSchema.Error>
   readonly addMember: (input: AddMemberInput) => Effect.Effect<SwarmModel.Member, SwarmSchema.Error>
   readonly rebindMember: (input: RebindMemberInput) => Effect.Effect<SwarmModel.Member, SwarmSchema.Error>
   readonly setMemberLifecycle: (
@@ -281,6 +316,15 @@ export interface Interface
     swarmID: SwarmModel.ID,
   ) => Effect.Effect<ReadonlyArray<SwarmModel.TaskDependency>>
   /**
+   * Bootstrap-free bounded predecessor knowledge handoff for one task. Reads
+   * Swarm collaboration tables only; it never hydrates predecessor Session
+   * history, so its cost is independent of predecessor run history length.
+   */
+  readonly taskHandoff: (
+    taskID: SwarmModel.TaskID,
+    options?: { readonly swarmID?: SwarmModel.ID; readonly limits?: HandoffLimits },
+  ) => Effect.Effect<SwarmHandoff>
+  /**
    * Cheap reverse binding lookup for Session-control/navigation policy.
    * A Session may intentionally participate in more than one Swarm.
    */
@@ -303,6 +347,9 @@ const layer = Layer.effect(
     const messaging = makeMessagingOperations({ db, readDb, events })
     const sharedState = makeSharedStateOperations({ db, readDb, events })
     const runtime = makeRuntimeOperations({ readDb })
+    const handoff = makeHandoffOperations({ readDb })
+    const aggregateRecovery = makeAggregateRecoveryOperations({ readDb })
+    const observability = makeObservabilityOperations({ readDb })
 
     const create = Effect.fn("Swarm.create")(function* (input: CreateInput) {
       const directory = absoluteDirectory(input.directory)
@@ -642,6 +689,19 @@ const layer = Layer.effect(
         }),
       )
       return info
+    })
+
+    const preflightMemberSession = Effect.fn("Swarm.preflightMemberSession")(function* (
+      input: PreflightMemberSessionInput,
+    ) {
+      yield* validateSessionBindingScope(
+        readDb,
+        {
+          projectID: input.projectID,
+          ...(input.workspaceID === undefined ? {} : { workspaceID: input.workspaceID }),
+        },
+        input.sessionID,
+      )
     })
 
     const addMember = Effect.fn("Swarm.addMember")(function* (input: AddMemberInput) {
@@ -1603,6 +1663,7 @@ const layer = Layer.effect(
       summaries,
       list,
       update,
+      preflightMemberSession,
       addMember,
       rebindMember,
       setMemberLifecycle,
@@ -1615,12 +1676,15 @@ const layer = Layer.effect(
       setTaskDependencies,
       dependencies,
       dependenciesForSwarm,
+      taskHandoff: handoff.taskHandoff,
       membersForSession,
       navigation,
       ...lease,
       ...messaging,
       ...sharedState,
-      ...runtime,
+    ...runtime,
+    ...aggregateRecovery,
+    ...observability,
     })
   }),
 )

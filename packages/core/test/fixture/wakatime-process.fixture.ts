@@ -15,7 +15,7 @@
  */
 
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { CodingActivity } from "@opencode-ai/core/coding-activity"
@@ -24,19 +24,28 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import * as LayerNodePlatform from "@opencode-ai/core/effect/app-node-platform"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
-import { AppProcess } from "@opencode-ai/core/process"
+import { AppProcess, AppProcessError } from "@opencode-ai/core/process"
 import { WakaTime } from "@opencode-ai/core/wakatime"
 import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 
 export const RESULT_MARKER = "WAKATIME_FIXTURE_RESULT "
+const VALID_MANAGED_FIXTURE = Buffer.alloc(1_048_576, 0x41)
+
+// This fixture is documented as directly runnable, so it cannot rely on the
+// parent test's XDG_CACHE_HOME override. Redirect the managed CLI target before
+// any scenario can write a fake binary; otherwise the system-CLI precedence
+// case can overwrite the developer's real ~/.cache/openfork/bin/wakatime-cli.
+const fixtureCache = await mkdtemp(path.join(os.tmpdir(), "openfork-wakatime-fixture-cache-"))
+Global.Path.bin = path.join(fixtureCache, "bin")
+await mkdir(Global.Path.bin, { recursive: true })
 
 interface Invocation {
   readonly binary: string
   readonly args: readonly string[]
   readonly stdin?: string
-  /** When the CLI was actually reached, so debounce timing is observable. */
+  readonly cwd?: string
   readonly at: number
 }
 
@@ -48,6 +57,8 @@ let invocations: Invocation[] = []
  * and the queue has to stay usable while it does.
  */
 let spawnHold: Deferred.Deferred<void> | undefined
+let spawnExitCode = 0
+let spawnFailure: AppProcessError | undefined
 
 const processNode = makeGlobalNode({
   service: AppProcess.Service,
@@ -59,13 +70,15 @@ const processNode = makeGlobalNode({
           binary: command.command,
           args: command.args,
           ...(options?.stdin === undefined ? {} : { stdin: String(options.stdin) }),
+          ...(command.options.cwd === undefined ? {} : { cwd: String(command.options.cwd) }),
           at: Date.now(),
         })
         return Effect.gen(function* () {
           if (spawnHold) yield* Deferred.await(spawnHold)
+          if (spawnFailure) return yield* Effect.fail(spawnFailure)
           return {
             command: command.command,
-            exitCode: 0,
+            exitCode: spawnExitCode,
             stdout: Buffer.alloc(0),
             stderr: Buffer.alloc(0),
             stdoutTruncated: false,
@@ -471,11 +484,28 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           equal(invocations.length, 1, "one coalescing window must produce exactly one CLI invocation")
           const [invocation] = invocations
           equal(invocation!.binary, binary, "the resolved override binary must be invoked")
+          equal(argValue(invocation!.args, "--entity"), "/repo/a.ts", "the leading heartbeat must keep its entity")
+          equal(argValue(invocation!.args, "--entity-type"), "file", "WakaTime activity must use file entities")
+          equal(argValue(invocation!.args, "--category"), "ai coding", "WakaTime activity must use the AI coding category")
+          equal(argValue(invocation!.args, "--time"), "1700000000", "the leading heartbeat must use observation time")
+          assert(invocation!.args.includes("--write"), "a created/written leading entity must carry --write")
+          assert(invocation!.args.includes("--sync-ai-disabled"), "OpenFork must prevent CLI-side AI transcript double counting")
+          const plugin = argValue(invocation!.args, "--plugin")
+          assert(plugin?.startsWith("openfork/"), "the actual native heartbeat argv must identify OpenFork")
           assert(invocation!.args.includes("--extra-heartbeats"), "a batch must request extra heartbeats")
-          const extras = JSON.parse(invocation!.stdin!.trim()) as Array<{ entity: string; time: number }>
+          const extras = JSON.parse(invocation!.stdin!.trim()) as Array<{
+            entity: string
+            entity_type: string
+            category: string
+            time: number
+            is_write?: boolean
+          }>
           equal(extras.length, 1, "the batch must carry every non-leading heartbeat")
           equal(extras[0]!.entity, "/repo/b.ts", "the trailing heartbeat must keep its entity")
+          equal(extras[0]!.entity_type, "file", "extra heartbeats must preserve file entity semantics")
+          equal(extras[0]!.category, "ai coding", "extra heartbeats must preserve the AI coding category")
           equal(extras[0]!.time, 1_700_000_001, "millis must lower back to CLI seconds")
+          equal(extras[0]!.is_write, undefined, "a read-only trailing heartbeat must omit the write field")
           return { invocations: invocations.length }
         }),
       ),
@@ -602,6 +632,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           equal(invocations.length, 1, "both observations must coalesce into one spawn")
           const args = invocations[0]!.args
           equal(argValue(args, "--project-folder"), "/repo", "a proven project folder must be forwarded verbatim")
+          equal(invocations[0]!.cwd, "/repo", "a proven project folder must also own the CLI working directory")
           const extras = JSON.parse(invocations[0]!.stdin!.trim()) as Array<Record<string, unknown>>
           equal(extras[0]!.entity, "/repo/src/other.ts", "a trailing heartbeat must keep its entity")
           // An extra heartbeat must not be able to rename or re-route WakaTime's
@@ -618,6 +649,20 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           for (const leaked of ["ses_folder", "call_01", "sourceRef", "aiSession"]) {
             assert(!wire.includes(leaked), `internal metadata ${leaked} must never reach wakatime-cli`)
           }
+
+          invocations = []
+          yield* wakatime.record({ entity: "/unscoped/file.ts", time: 1_700_000_002_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 1, "an unscoped observation must still be deliverable")
+          assert(
+            !invocations[0]!.args.includes("--project-folder"),
+            "an unproven project folder must never be invented on the CLI argv",
+          )
+          equal(
+            invocations[0]!.cwd,
+            WakaTime.neutralCwd(),
+            "an unscoped observation must run from a neutral root instead of inheriting OpenFork's cwd",
+          )
           return { projectFolder: argValue(args, "--project-folder") }
         }),
       ),
@@ -639,7 +684,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             entity: "/repo/authoritative.ts",
             aiSession: "ses_replay",
             source: "session" as const,
-            sourceRef: "call_01",
+            replayToken: "call_01",
             kind: "write" as const,
             isWrite: true,
           }
@@ -648,31 +693,77 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           yield* wakatime.flush()
           equal(invocations.length, 1, "the first authoritative observation must be delivered")
 
-          // The same reference replayed in a LATER window, after the queue was
+          // The same token replayed in a LATER window, after the queue was
           // already emptied, is the same event and must be suppressed.
           yield* wakatime.record({ ...authoritative, time: 1_700_000_005_000 })
           yield* wakatime.flush()
           equal(invocations.length, 1, "a replay across debounce windows must be suppressed")
 
-          // A different reference in the same window is a different event.
-          yield* wakatime.record({ ...authoritative, sourceRef: "call_02", time: 1_700_000_006_000 })
+          // A different replay token in the same window is a different event.
+          yield* wakatime.record({ ...authoritative, replayToken: "call_02", time: 1_700_000_006_000 })
           yield* wakatime.flush()
-          equal(invocations.length, 2, "a distinct authoritative reference must not be suppressed")
+          equal(invocations.length, 2, "a distinct authoritative replay token must not be suppressed")
 
-          // Without an authoritative reference there is no proof of a replay,
+          // Without an authoritative replay token there is no proof of a replay,
           // so an honest repeat is always kept.
           const unproven = { entity: "/repo/unproven.ts", aiSession: "ses_replay", source: "session" as const }
           yield* wakatime.record({ ...unproven, time: 1_700_000_007_000 })
           yield* wakatime.flush()
           yield* wakatime.record({ ...unproven, time: 1_700_000_008_000 })
           yield* wakatime.flush()
-          equal(invocations.length, 4, "records without an authoritative reference must never be deduped")
+          equal(invocations.length, 4, "records without an authoritative replay token must never be deduped")
 
-          // Suppression is scoped per session, so the same reference observed by
+          // Suppression is scoped per session, so the same replay token observed by
           // another session is a different event.
           yield* wakatime.record({ ...authoritative, aiSession: "ses_other", time: 1_700_000_009_000 })
           yield* wakatime.flush()
-          equal(invocations.length, 5, "the same reference in another session must not be suppressed")
+          equal(invocations.length, 5, "the same replay token in another session must not be suppressed")
+          return { delivered: invocations.length }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * `sourceRef` is actor attribution, not idempotency. OFXP deliberately keeps
+   * one stable principal key across calls, so two real edits by that same peer
+   * to the same file must both survive unless a per-invocation replayToken says
+   * they are the same logical observation.
+   */
+  "principal-source-ref-not-replay-token": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          const principal = {
+            entity: "/repo/remote.ts",
+            source: "ofxp" as const,
+            sourceRef: "ofxp:peer:stable-principal",
+            kind: "write" as const,
+            isWrite: true,
+          }
+
+          yield* wakatime.record({ ...principal, aiLineChanges: 2, time: 1_700_000_000_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 1, "the peer's first real observation must be delivered")
+
+          yield* wakatime.record({ ...principal, aiLineChanges: 3, time: 1_700_000_001_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 2, "stable principal identity must not suppress a later real edit")
+          equal(
+            argValue(invocations[1]!.args, "--ai-line-changes"),
+            "3",
+            "the peer's later edit must retain its own line-change delta",
+          )
+
+          const replayable = { ...principal, replayToken: "invocation_exact", aiLineChanges: 4 }
+          yield* wakatime.record({ ...replayable, time: 1_700_000_002_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 3, "the first observation carrying a replay token must be delivered")
+          yield* wakatime.record({ ...replayable, time: 1_700_000_003_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 3, "the same per-invocation replay token must suppress a true replay")
           return { delivered: invocations.length }
         }),
       ),
@@ -785,6 +876,57 @@ const scenarios: Record<string, () => Promise<unknown>> = {
   },
 
   /**
+   * The official adapter persists the project heartbeat floor across process
+   * restarts. Core keeps the same external behavior with one bounded hashed
+   * state document: closing the last exporter lease and rebuilding it must not
+   * buy the project a fresh automatic 60-second budget.
+   */
+  "delivery-limiter-restart-state": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        optIn()
+
+        const firstScope = yield* Scope.make()
+        const first = yield* buildInto(firstScope)
+        yield* first.record({
+          entity: "/repo/first.ts",
+          projectFolder: "/repo/private-project",
+          time: 1_700_000_000_000,
+        })
+        assert(yield* waitForDelivery(8_000), "the first exporter must deliver the project's first window")
+        equal(invocations.length, 1, "the first exporter must produce exactly one CLI invocation")
+
+        const persisted = yield* Effect.promise(() => Bun.file(WakaTime.deliveryStateFile()).text())
+        assert(!persisted.includes("/repo/private-project"), "persisted limiter state must never expose the raw project path")
+        assert(
+          persisted.includes(WakaTime.deliveryWindowKey("/repo/private-project")),
+          "persisted limiter state must contain the project's stable fingerprint",
+        )
+
+        yield* Scope.close(firstScope, Exit.void)
+
+        const secondScope = yield* Scope.make()
+        const second = yield* buildInto(secondScope)
+        yield* second.record({
+          entity: "/repo/second.ts",
+          projectFolder: "/repo/private-project",
+          time: 1_700_000_001_000,
+        })
+        yield* Effect.sleep(3_000)
+        equal(invocations.length, 1, "a rebuilt exporter must honor the persisted project delivery window")
+
+        yield* second.flush()
+        equal(invocations.length, 2, "forced flush must recover the restart-held observation")
+        equal(argValue(invocations[1]!.args, "--entity"), "/repo/second.ts", "restart-held work must not be dropped")
+
+        yield* Scope.close(secondScope, Exit.void)
+        return { invocations: invocations.length }
+      }),
+    )
+  },
+
+  /**
    * Managed-CLI freshness never turns a status read or an operator override
    * into a download, an install, or a network call. Only delivery that actually
    * needs a managed binary may check, and never more than once per 4h.
@@ -822,6 +964,131 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           assert(!alpha.stdin!.includes("/beta"), "a beta heartbeat must never ride in the alpha payload")
           assert(beta.stdin === undefined, "a single-heartbeat project must not open an extras pipe")
           return { spawns: invocations.length }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * One WakaTime CLI invocation owns one plugin/User-Agent for its primary and
+   * every stdin extra heartbeat. Native OpenFork, OXP, and OFXP activity in the
+   * same project must therefore remain three attribution groups even when two
+   * observations touch the exact same file and would otherwise coalesce.
+   */
+  "source-attribution-batch": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          yield* wakatime.record([
+            { entity: "/repo/shared.ts", projectFolder: "/repo", source: "session", time: 1_700_000_000_000 },
+            // `core` is the same bounded OpenFork attribution as `session`, so it
+            // must coalesce rather than manufacture a fourth source bucket.
+            { entity: "/repo/shared.ts", projectFolder: "/repo", source: "core", time: 1_700_000_000_500 },
+            { entity: "/repo/shared.ts", projectFolder: "/repo", source: "oxp", time: 1_700_000_001_000 },
+            { entity: "/repo/oxp-extra.ts", projectFolder: "/repo", source: "oxp", time: 1_700_000_002_000 },
+            {
+              entity: "/repo/shared.ts",
+              projectFolder: "/repo",
+              source: "ofxp",
+              sourceRef: "secret-principal-ref-must-never-reach-wakatime",
+              time: 1_700_000_003_000,
+            },
+          ])
+          yield* wakatime.flush()
+
+          equal(invocations.length, 3, "one project must still spawn once per attribution bucket")
+          const nativePlugin = WakaTime.pluginIdentifier()
+          const oxpPlugin = WakaTime.pluginIdentifier("openfork-oxp")
+          const ofxpPlugin = WakaTime.pluginIdentifier("openfork-ofxp")
+          const native = invocations.find((entry) => argValue(entry.args, "--plugin") === nativePlugin)
+          const oxp = invocations.find((entry) => argValue(entry.args, "--plugin") === oxpPlugin)
+          const ofxp = invocations.find((entry) => argValue(entry.args, "--plugin") === ofxpPlugin)
+          assert(native !== undefined, "native OpenFork work must have its own WakaTime attribution")
+          assert(oxp !== undefined, "OXP work must have its own WakaTime attribution")
+          assert(ofxp !== undefined, "OFXP work must have its own WakaTime attribution")
+
+          equal(argValue(native.args, "--entity"), "/repo/shared.ts", "native attribution must retain its observation")
+          equal(argValue(oxp.args, "--entity"), "/repo/shared.ts", "OXP attribution must retain the same-file observation")
+          equal(argValue(ofxp.args, "--entity"), "/repo/shared.ts", "OFXP attribution must retain the same-file observation")
+          const oxpExtras = JSON.parse(oxp.stdin!.trim()) as Array<{
+            entity: string
+            entity_type: string
+            category: string
+            time: number
+          }>
+          equal(
+            oxpExtras,
+            [{ entity: "/repo/oxp-extra.ts", entity_type: "file", category: "ai coding", time: 1_700_000_002 }],
+            "OXP extras must batch only with OXP and keep the same wire semantics",
+          )
+          assert(native.stdin === undefined, "native activity must not absorb OXP/OFXP extras")
+          assert(ofxp.stdin === undefined, "OFXP activity must not absorb OXP/native extras")
+          assert(
+            !invocations.some(
+              (entry) =>
+                entry.args.some((value) => value.includes("secret-principal-ref-must-never-reach-wakatime")) ||
+                entry.stdin?.includes("secret-principal-ref-must-never-reach-wakatime"),
+            ),
+            "raw producer references must never leak into WakaTime attribution or payloads",
+          )
+          return { spawns: invocations.length, plugins: invocations.map((entry) => argValue(entry.args, "--plugin")) }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * Attribution changes delivery grouping, never the project's ordinary rate
+   * budget. A normal debounce may emit several source groups for one project,
+   * but all of them open one shared 60-second project window.
+   */
+  "source-attribution-limiter": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+
+          yield* wakatime.record([
+            { entity: "/repo/native.ts", projectFolder: "/repo", source: "session", time: 1_700_000_000_000 },
+            { entity: "/repo/oxp.ts", projectFolder: "/repo", source: "oxp", time: 1_700_000_001_000 },
+          ])
+          assert(yield* waitFor(() => invocations.length === 2, 8_000), "the first project window must deliver both attribution groups")
+
+          const firstPlugins = new Set(invocations.map((entry) => argValue(entry.args, "--plugin")))
+          assert(firstPlugins.has(WakaTime.pluginIdentifier()), "the first window must include native OpenFork attribution")
+          assert(
+            firstPlugins.has(WakaTime.pluginIdentifier("openfork-oxp")),
+            "the first window must include OXP attribution",
+          )
+
+          // A new attribution bucket does not get a fresh rate budget. Native,
+          // OXP, and OFXP work are all held by the same project's open window.
+          yield* wakatime.record([
+            { entity: "/repo/native-2.ts", projectFolder: "/repo", source: "session", time: 1_700_000_002_000 },
+            { entity: "/repo/oxp-2.ts", projectFolder: "/repo", source: "oxp", time: 1_700_000_003_000 },
+            { entity: "/repo/ofxp.ts", projectFolder: "/repo", source: "ofxp", time: 1_700_000_004_000 },
+          ])
+          yield* Effect.sleep(3_000)
+          equal(invocations.length, 2, "source attribution must not create independent project delivery windows")
+
+          // Held means delayed, never dropped. A deliberate forced flush emits
+          // all three attribution buckets that remained queued.
+          yield* wakatime.flush()
+          equal(invocations.length, 5, "forced flush must recover all held attribution groups")
+          const recovered = [...new Set(invocations.slice(2).map((entry) => argValue(entry.args, "--plugin")))].sort()
+          equal(
+            recovered,
+            [
+              WakaTime.pluginIdentifier(),
+              WakaTime.pluginIdentifier("openfork-oxp"),
+              WakaTime.pluginIdentifier("openfork-ofxp"),
+            ].sort(),
+            "held work must retain all three attribution identities",
+          )
+          return { initialSpawns: 2, totalSpawns: invocations.length }
         }),
       ),
     )
@@ -999,6 +1266,37 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           "failed CLI preparation must not persist the opt-in",
         )
         assert(!(yield* wakatime.status()).enabled, "failed preparation must leave the exporter disabled")
+        const spent = JSON.parse(yield* readText(home.state)) as { checkedAt?: number }
+        assert(
+          typeof spent.checkedAt === "number" && spent.checkedAt > 0,
+          "a failed managed install must consume and persist the ordinary background backoff window",
+        )
+
+        // Temporarily opt in through the higher-precedence env toggle and drive
+        // the ordinary delivery path. The failed install above already consumed
+        // the four-hour window, so background resolution must honor it and make
+        // no second HTTP attempt.
+        process.env.OPENFORK_WAKATIME = "1"
+        const unavailableActivity = {
+          entity: "/repo/background-backoff.ts",
+          projectFolder: "/repo",
+          source: "session" as const,
+          replayToken: "call_unavailable_cli",
+          kind: "read" as const,
+        }
+        yield* wakatime.record({ ...unavailableActivity, time: 1_700_000_000_000 })
+        yield* wakatime.flush()
+        equal(versionFetches, 1, "background delivery must honor the failed-install freshness backoff")
+        equal(archiveFetches, 1, "background delivery must not redownload inside the freshness backoff")
+        equal(invocations, [], "a batch with no usable CLI must not be treated as a CLI attempt")
+        const deliveryState = Bun.file(WakaTime.deliveryStateFile())
+        if (yield* Effect.promise(() => deliveryState.exists())) {
+          assert(
+            !(yield* Effect.promise(() => deliveryState.text())).includes(WakaTime.deliveryWindowKey("/repo")),
+            "an unresolved CLI must not spend the project's delivery window",
+          )
+        }
+        delete process.env.OPENFORK_WAKATIME
 
         const archive = storedZip(home.asset.binary, new TextEncoder().encode(RELEASE_BYTES))
         servedArchiveChecksum = `${createHash("sha256").update(archive).digest("hex")}  ${home.asset.archive}\n`
@@ -1019,9 +1317,157 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           "the opt-in may be persisted only after CLI preparation succeeds",
         )
 
+        // The failed delivery released its replay token. Replaying the exact
+        // observation after preparation must reach the newly installed CLI.
+        yield* wakatime.record({ ...unavailableActivity, time: 1_700_000_001_000 })
+        yield* wakatime.flush()
+        equal(invocations.length, 1, "the previously unattempted observation must become replayable after preparation")
+        equal(invocations[0]!.binary, home.binary, "the recovered observation must use the prepared managed CLI")
+
         yield* Scope.close(scope, Exit.void)
         return { versionFetches, archiveFetches, source: enabled.source }
       }).pipe(Effect.provide(TestClock.layer())),
+    )
+  },
+
+  "env-disable-skips-cli-prepare": async () => {
+    await emptyWakaTimeHome()
+    const home = await managedHome()
+    if (!home) return { skipped: true }
+    process.env.OPENFORK_WAKATIME = "0"
+    process.env.WAKATIME_API_KEY = "key"
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        const wakatime = yield* buildInto(scope, managedBuild)
+        const status = yield* wakatime.setEnabled(true)
+
+        equal(status.enabled, false, "the explicit env disable must remain authoritative")
+        equal(status.configured, true, "the credential can remain configured while export is disabled")
+        equal(versionFetches, 0, "env-disabled enablement must not fetch managed release metadata")
+        equal(archiveFetches, 0, "env-disabled enablement must not download a managed archive")
+        equal(
+          yield* Effect.promise(() => Bun.file(home.binary).exists()),
+          false,
+          "env-disabled enablement must not install a managed CLI",
+        )
+        equal(
+          yield* Effect.promise(() => Bun.file(home.state).exists()),
+          false,
+          "env-disabled enablement must not create managed CLI freshness state",
+        )
+        equal(
+          yield* Effect.promise(() => Bun.file(WakaTime.settingsFile()).exists()),
+          false,
+          "a forced-off Enable request must not create a latent future opt-in",
+        )
+
+        yield* Scope.close(scope, Exit.void)
+        return { enabled: status.enabled, versionFetches, archiveFetches }
+      }),
+    )
+  },
+
+  "enable-reuses-override-cli": async () => {
+    await emptyWakaTimeHome()
+    const binary = await cliFixture()
+    optInPersisted()
+    versionFetches = 0
+    archiveFetches = 0
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        const wakatime = yield* buildInto(scope, managedBuild)
+        const enabled = yield* wakatime.setEnabled(true)
+
+        equal(enabled.source, "override", "explicit enable must reuse an existing operator override")
+        equal(enabled.cli, binary, "explicit enable must return the reused override path")
+        equal(versionFetches, 0, "reusing an override must not fetch managed release metadata")
+        equal(archiveFetches, 0, "reusing an override must not download a managed archive")
+        equal(
+          JSON.parse(yield* Effect.promise(() => Bun.file(WakaTime.settingsFile()).text())),
+          { enabled: true },
+          "reusing an override must still persist the opt-in",
+        )
+
+        yield* Scope.close(scope, Exit.void)
+        return { source: enabled.source, versionFetches, archiveFetches }
+      }),
+    )
+  },
+
+  "enable-reuses-system-cli": async () => {
+    await emptyWakaTimeHome()
+    delete process.env.OPENFORK_WAKATIME_CLI
+    const dir = await mkdtemp(path.join(os.tmpdir(), "openfork-wakatime-system-"))
+    const binary = path.join(dir, process.platform === "win32" ? "wakatime-cli.exe" : "wakatime-cli")
+    await writeFile(binary, "system-wakatime-cli")
+    const managed = path.join(Global.Path.bin, process.platform === "win32" ? "wakatime-cli.exe" : "wakatime-cli")
+    await mkdir(path.dirname(managed), { recursive: true })
+    await writeFile(managed, "existing-managed-wakatime-cli")
+    process.env.PATH = dir
+    optInPersisted()
+    versionFetches = 0
+    archiveFetches = 0
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        const wakatime = yield* buildInto(scope, managedBuild)
+        const enabled = yield* wakatime.setEnabled(true)
+
+        equal(enabled.source, "system", "explicit enable must reuse an existing system WakaTime CLI")
+        equal(enabled.cli, binary, "explicit enable must return the reused system CLI path")
+        equal(versionFetches, 0, "reusing a system CLI must not fetch managed release metadata")
+        equal(archiveFetches, 0, "reusing a system CLI must not download a managed archive")
+        equal(yield* readText(managed), "existing-managed-wakatime-cli", "a real system CLI must outrank managed")
+        equal(
+          JSON.parse(yield* Effect.promise(() => Bun.file(WakaTime.settingsFile()).text())),
+          { enabled: true },
+          "reusing a system CLI must still persist the opt-in",
+        )
+
+        yield* Scope.close(scope, Exit.void)
+        return { source: enabled.source, versionFetches, archiveFetches }
+      }),
+    )
+  },
+
+  "enable-reuses-managed-cli": async () => {
+    await emptyWakaTimeHome()
+    const home = await managedHome()
+    if (!home) return { skipped: true }
+    await mkdir(path.dirname(home.binary), { recursive: true })
+    await writeFile(home.binary, VALID_MANAGED_FIXTURE)
+    optInPersisted()
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        const scope = yield* Scope.make()
+        const wakatime = yield* buildInto(scope, managedBuild)
+        const enabled = yield* wakatime.setEnabled(true)
+
+        equal(enabled.source, "managed", "explicit enable must reuse an already-installed managed CLI")
+        equal(enabled.cli, home.binary, "explicit enable must return the existing managed CLI path")
+        equal(versionFetches, 0, "reusing a managed CLI must not perform a freshness lookup")
+        equal(archiveFetches, 0, "reusing a managed CLI must not download a replacement")
+        equal(
+          (yield* Effect.promise(() => readFile(home.binary))).byteLength,
+          VALID_MANAGED_FIXTURE.byteLength,
+          "explicit enable must not replace an already-usable managed CLI",
+        )
+        equal(
+          yield* Effect.promise(() => Bun.file(home.state).exists()),
+          false,
+          "reusing a managed CLI must not consume a freshness window",
+        )
+        equal(
+          JSON.parse(yield* Effect.promise(() => Bun.file(WakaTime.settingsFile()).text())),
+          { enabled: true },
+          "reusing a managed CLI must still persist the opt-in",
+        )
+
+        yield* Scope.close(scope, Exit.void)
+        return { source: enabled.source, versionFetches, archiveFetches }
+      }),
     )
   },
 
@@ -1213,6 +1659,57 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           assert(
             invocations[2]!.at - requestedAt < 1_000,
             "a stale urgency marker must not suppress the new request's re-arm",
+          )
+          return { rounds: 2 }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * `flushSession` drains the same session named by an urgency marker, so it
+   * must consume that marker just like a full flush. Otherwise the next request
+   * for the session is mistaken for a duplicate and waits behind the ordinary
+   * debounce/project limiter.
+   */
+  "flush-session-clears-urgency-marker": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          yield* wakatime.record({ entity: "/repo/warm.ts", projectFolder: "/repo", time: 1_700_000_000_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 1, "the warming delivery must open the project window")
+
+          yield* wakatime.record({
+            entity: "/repo/first.ts",
+            projectFolder: "/repo",
+            aiSession: "ses_session_flush",
+            time: 1_700_000_001_000,
+          })
+          yield* wakatime.requestFlushSession("ses_session_flush")
+          // Race the armed scheduler deliberately: the explicit completion path
+          // drains this session before the urgency marker can be consumed there.
+          yield* wakatime.flushSession("ses_session_flush")
+          equal(invocations.length, 2, "flushSession must deliver the first round exactly once")
+
+          yield* wakatime.record({
+            entity: "/repo/second.ts",
+            projectFolder: "/repo",
+            aiSession: "ses_session_flush",
+            time: 1_700_000_002_000,
+          })
+          const requestedAt = Date.now()
+          yield* wakatime.requestFlushSession("ses_session_flush")
+          assert(
+            yield* waitFor(() => invocations.length > 2, 5_000),
+            "a request after flushSession must install a fresh urgency marker",
+          )
+          equal(argValue(invocations[2]!.args, "--entity"), "/repo/second.ts", "the second round must be delivered")
+          assert(
+            invocations[2]!.at - requestedAt < 1_000,
+            "a stale marker must not force the second request through the normal debounce",
           )
           return { rounds: 2 }
         }),
@@ -1513,6 +2010,245 @@ const scenarios: Record<string, () => Promise<unknown>> = {
   },
 
   /**
+   * Automatic delivery owns at most one project per scheduler turn. This is a
+   * runtime proof rather than a source-shape check: while project A's spawn is
+   * held open, project B must still be sitting in the live queue. An explicit
+   * flush therefore takes B and blocks on the delivery permit. Without the
+   * fairness slice, B would already have been detached into A's scheduler batch
+   * and the flush would return immediately with nothing to do.
+   */
+  "automatic-project-fairness": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          const gate = yield* Deferred.make<void>()
+          spawnHold = gate
+          try {
+            yield* wakatime.record([
+              { entity: "/alpha/a.ts", projectFolder: "/alpha", time: 1_700_000_000_000 },
+              { entity: "/beta/b.ts", projectFolder: "/beta", time: 1_700_000_001_000 },
+            ])
+
+            assert(
+              yield* waitFor(() => invocations.length === 1, 8_000),
+              "the first automatic project must reach the fake CLI",
+            )
+            equal(
+              argValue(invocations[0]!.args, "--project-folder"),
+              "/alpha",
+              "insertion order makes alpha the first automatic project",
+            )
+
+            const forced = yield* wakatime.flush().pipe(Effect.forkChild)
+            const pendingFlush = yield* Fiber.join(forced).pipe(Effect.timeoutOption("250 millis"))
+            equal(
+              pendingFlush._tag,
+              "None",
+              "flush must still be waiting because beta remained queued and is blocked on the delivery permit",
+            )
+            equal(invocations.length, 1, "beta must not have spawned concurrently with alpha")
+
+            yield* Deferred.succeed(gate, undefined)
+            yield* Fiber.join(forced)
+            equal(invocations.length, 2, "the forced settlement must deliver beta after alpha releases the permit")
+            equal(
+              argValue(invocations[1]!.args, "--project-folder"),
+              "/beta",
+              "the second project must remain intact across the automatic-yield boundary",
+            )
+            return { spawns: invocations.length }
+          } finally {
+            spawnHold = undefined
+          }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * A detached batch owns a replay snapshot, not the live pending-key slot. New
+   * work for the exact same activity key may therefore enqueue while the older
+   * CLI attempt is blocked, and the old batch must never retire the new entry's
+   * replay ownership when it settles.
+   */
+  "same-key-reenqueue-inflight": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          const gate = yield* Deferred.make<void>()
+          spawnHold = gate
+          try {
+            const base = {
+              entity: "/repo/same.ts",
+              projectFolder: "/repo",
+              source: "session" as const,
+              kind: "write" as const,
+              isWrite: true,
+            }
+            yield* wakatime.record({ ...base, replayToken: "old-call", aiLineChanges: 1, time: 1_700_000_000_000 })
+            const first = yield* wakatime.flush().pipe(Effect.forkChild)
+            assert(yield* waitFor(() => invocations.length === 1, 5_000), "the first same-key observation must reach the CLI")
+
+            yield* wakatime.record({ ...base, replayToken: "new-call", aiLineChanges: 2, time: 1_700_000_001_000 })
+            const second = yield* wakatime.flush().pipe(Effect.forkChild)
+            const blocked = yield* Fiber.join(second).pipe(Effect.timeoutOption("250 millis"))
+            equal(blocked._tag, "None", "the second same-key batch must wait behind the first delivery permit")
+            equal(invocations.length, 1, "same-key re-enqueue must never create a concurrent CLI process")
+
+            yield* Deferred.succeed(gate, undefined)
+            yield* Fiber.join(first)
+            yield* Fiber.join(second)
+            equal(invocations.length, 2, "both distinct same-key observations must survive detached delivery")
+            equal(argValue(invocations[1]!.args, "--ai-line-changes"), "2", "the new same-key observation must retain its own delta")
+
+            // The second observation really was attempted, so replaying the same
+            // producer token stays suppressed after both detached batches settle.
+            yield* wakatime.record({ ...base, replayToken: "new-call", aiLineChanges: 2, time: 1_700_000_002_000 })
+            yield* wakatime.flush()
+            equal(invocations.length, 2, "the delivered new-call token must remain replay-suppressed")
+            return { delivered: invocations.length }
+          } finally {
+            spawnHold = undefined
+          }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * A flush can be cancelled while waiting behind another delivery. Its queue
+   * entries have already been detached, so the outer delivery finalizer must
+   * release their replay tokens even though the permit body never started.
+   */
+  "permit-wait-interruption-releases-replay": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+          const gate = yield* Deferred.make<void>()
+          spawnHold = gate
+          try {
+            yield* wakatime.record({ entity: "/repo/blocker.ts", projectFolder: "/repo/a", time: 1_700_000_000_000 })
+            const blocker = yield* wakatime.flush().pipe(Effect.forkChild)
+            assert(yield* waitFor(() => invocations.length === 1, 5_000), "the blocking delivery must acquire the permit")
+
+            const replayable = {
+              entity: "/repo/interrupted.ts",
+              projectFolder: "/repo/b",
+              source: "session" as const,
+              replayToken: "interrupted-call",
+              kind: "read" as const,
+            }
+            yield* wakatime.record({ ...replayable, time: 1_700_000_001_000 })
+            const timed = yield* wakatime.flush().pipe(Effect.timeoutOption("250 millis"))
+            equal(timed._tag, "None", "the second flush must be interrupted while waiting for the permit")
+            equal(invocations.length, 1, "an interrupted permit wait must not spawn")
+
+            yield* Deferred.succeed(gate, undefined)
+            yield* Fiber.join(blocker)
+
+            // The timed-out flush never attempted the CLI, so its replay token
+            // must have been released by deliver's outer finalizer.
+            yield* wakatime.record({ ...replayable, time: 1_700_000_002_000 })
+            yield* wakatime.flush()
+            equal(invocations.length, 2, "the interrupted observation must be replayable and recoverable")
+            equal(argValue(invocations[1]!.args, "--entity"), "/repo/interrupted.ts", "the recovered observation must be the interrupted one")
+            return { delivered: invocations.length }
+          } finally {
+            spawnHold = undefined
+          }
+        }),
+      ),
+    )
+  },
+
+  /**
+   * Once Core crosses the CLI-attempt boundary, both a non-zero CLI exit and a
+   * process-spawn failure consume/persist the project's delivery window and keep
+   * the observation's replay token suppressed. They differ from a prerequisite
+   * failure, which is covered by `unauthenticated-no-delivery` and is explicitly
+   * not an attempt.
+   */
+  "cli-attempt-failure-semantics": async () => {
+    await cliFixture()
+    return Effect.runPromise(
+      withService((wakatime) =>
+        Effect.gen(function* () {
+          optIn()
+
+          const nonzero = {
+            entity: "/repo/nonzero.ts",
+            projectFolder: "/repo/nonzero",
+            source: "session" as const,
+            replayToken: "nonzero-call",
+            kind: "write" as const,
+          }
+          spawnExitCode = 9
+          yield* wakatime.record({ ...nonzero, time: 1_700_000_000_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 1, "a non-zero CLI result must still be one real attempt")
+          let state = yield* Effect.promise(() => Bun.file(WakaTime.deliveryStateFile()).text())
+          assert(
+            state.includes(WakaTime.deliveryWindowKey("/repo/nonzero")),
+            "a non-zero attempt must persist its project delivery window",
+          )
+
+          spawnExitCode = 0
+          yield* wakatime.record({ ...nonzero, time: 1_700_000_001_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 1, "replaying a non-zero attempted observation must remain suppressed")
+
+          yield* wakatime.record({
+            ...nonzero,
+            entity: "/repo/nonzero-new.ts",
+            replayToken: "nonzero-new-call",
+            time: 1_700_000_002_000,
+          })
+          yield* Effect.sleep(3_000)
+          equal(invocations.length, 1, "a non-zero attempt must spend the ordinary project rate window")
+          yield* wakatime.flush()
+          equal(invocations.length, 2, "forced settlement must recover new work held behind that spent window")
+
+          const spawnFailed = {
+            entity: "/repo/spawn-fail.ts",
+            projectFolder: "/repo/spawn-fail",
+            source: "session" as const,
+            replayToken: "spawn-fail-call",
+            kind: "read" as const,
+          }
+          spawnFailure = new AppProcessError({ command: "wakatime-cli", cause: new Error("fixture spawn failure") })
+          yield* wakatime.record({ ...spawnFailed, time: 1_700_000_003_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 3, "a process spawn failure must still cross the real-attempt boundary exactly once")
+          state = yield* Effect.promise(() => Bun.file(WakaTime.deliveryStateFile()).text())
+          assert(
+            state.includes(WakaTime.deliveryWindowKey("/repo/spawn-fail")),
+            "a spawn failure must persist its project delivery window",
+          )
+
+          spawnFailure = undefined
+          yield* wakatime.record({ ...spawnFailed, time: 1_700_000_004_000 })
+          yield* wakatime.flush()
+          equal(invocations.length, 3, "replaying a spawn-failed attempted observation must remain suppressed")
+          return { attempts: invocations.length }
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              spawnExitCode = 0
+              spawnFailure = undefined
+            }),
+          ),
+        ),
+      ),
+    )
+  },
+
+  /**
    * Bounded background state. The delivery-window map is keyed by project
    * directory, so a process that visits many checkouts must not accumulate one
    * entry per project. The proof is behavioural: an evicted project is
@@ -1578,7 +2314,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             yield* wakatime.record({
               entity: `/repo/f${index}.ts`,
               source: "session",
-              sourceRef: `call_${index}`,
+              replayToken: `call_${index}`,
               kind: "read",
               time: 1_700_000_000_000 + index,
             })
@@ -1592,7 +2328,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           yield* wakatime.record({
             entity: "/repo/f0.ts",
             source: "session",
-            sourceRef: "call_0",
+            replayToken: "call_0",
             kind: "read",
             time: 1_700_000_100_000,
           })
@@ -1605,7 +2341,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           yield* wakatime.record({
             entity: "/repo/f7.ts",
             source: "session",
-            sourceRef: "call_7",
+            replayToken: "call_7",
             kind: "read",
             time: 1_700_000_200_000,
           })
@@ -1637,15 +2373,15 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             source: "session" as const,
             kind: "read" as const,
           }
-          yield* wakatime.record({ ...first, sourceRef: "call_a", time: 1_700_000_000_000 })
-          yield* wakatime.record({ ...first, sourceRef: "call_b", time: 1_700_000_001_000 })
+          yield* wakatime.record({ ...first, replayToken: "call_a", time: 1_700_000_000_000 })
+          yield* wakatime.record({ ...first, replayToken: "call_b", time: 1_700_000_001_000 })
 
           // Then enough distinct entities to push that entry out under queue pressure.
           for (let index = 0; index < WakaTime.MAX_PENDING; index++) {
             yield* wakatime.record({
               entity: `/repo/x${index}.ts`,
               source: "session",
-              sourceRef: `x_${index}`,
+              replayToken: `x_${index}`,
               kind: "read",
               time: 1_700_000_002_000 + index,
             })
@@ -1655,13 +2391,13 @@ const scenarios: Record<string, () => Promise<unknown>> = {
 
           // Both coalesced references were never delivered, so both recover.
           invocations = []
-          yield* wakatime.record({ ...first, sourceRef: "call_a", time: 1_700_000_100_000 })
+          yield* wakatime.record({ ...first, replayToken: "call_a", time: 1_700_000_100_000 })
           yield* wakatime.flush()
           equal(invocations.length, 1, "the older coalesced call must be recoverable")
           equal(argValue(invocations[0]!.args, "--entity"), "/repo/first.ts", "the recovered call must be delivered")
 
           invocations = []
-          yield* wakatime.record({ ...first, sourceRef: "call_b", time: 1_700_000_101_000 })
+          yield* wakatime.record({ ...first, replayToken: "call_b", time: 1_700_000_101_000 })
           yield* wakatime.flush()
           equal(invocations.length, 1, "the newer coalesced call must be recoverable too")
 
@@ -1670,7 +2406,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
           yield* wakatime.record({
             entity: "/repo/x7.ts",
             source: "session",
-            sourceRef: "x_7",
+            replayToken: "x_7",
             kind: "read",
             time: 1_700_000_200_000,
           })
@@ -1679,7 +2415,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
 
           // A delivered coalesced entry keeps suppressing BOTH of its references.
           invocations = []
-          yield* wakatime.record({ ...first, sourceRef: "call_a", time: 1_700_000_300_000 })
+          yield* wakatime.record({ ...first, replayToken: "call_a", time: 1_700_000_300_000 })
           yield* wakatime.flush()
           equal(invocations, [], "a delivered coalesced entry must keep suppressing its references")
           return { coalesced: ["call_a", "call_b"] }
@@ -1885,9 +2621,38 @@ const scenarios: Record<string, () => Promise<unknown>> = {
       withService((wakatime) =>
         Effect.gen(function* () {
           process.env.OPENFORK_WAKATIME = "1"
-          yield* wakatime.record({ entity: "/repo/a.ts" })
+          const activity = {
+            entity: "/repo/a.ts",
+            projectFolder: "/repo",
+            source: "session" as const,
+            replayToken: "call_unconfigured",
+            kind: "read" as const,
+          }
+          yield* wakatime.record(activity)
           yield* wakatime.flush()
           equal(invocations, [], "opted in but unauthenticated must not deliver")
+
+          const stateFile = Bun.file(WakaTime.deliveryStateFile())
+          if (yield* Effect.promise(() => stateFile.exists())) {
+            const persisted = yield* Effect.promise(() => stateFile.text())
+            assert(
+              !persisted.includes(WakaTime.deliveryWindowKey("/repo")),
+              "a batch that never reached the CLI must not spend the project's delivery window",
+            )
+          }
+
+          // The dropped attempt must release its replay token as well. Once the
+          // credential appears, replaying the exact same logical observation is
+          // accepted and the ordinary debounce can deliver it immediately — no
+          // stale 60-second limiter window from the unauthenticated flush.
+          process.env.WAKATIME_API_KEY = "key"
+          yield* wakatime.record({ ...activity, time: 1_700_000_001_000 })
+          assert(
+            yield* waitForDelivery(8_000),
+            "the same observation must become deliverable as soon as credentials appear",
+          )
+          equal(invocations.length, 1, "the authenticated retry must deliver exactly once")
+          equal(argValue(invocations[0]!.args, "--entity"), "/repo/a.ts", "the retried observation must be delivered")
         }),
       ),
     )
@@ -2002,7 +2767,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             entity: "/repo/q.ts",
             projectFolder: "/repo",
             source: "session",
-            sourceRef: "call_1",
+            replayToken: "call_1",
             kind: "read",
             time: 1_700_000_000_000,
           })
@@ -2017,7 +2782,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             entity: "/repo/dropped.ts",
             projectFolder: "/repo",
             source: "session",
-            sourceRef: "call_drop",
+            replayToken: "call_drop",
             kind: "read",
             time: 1_700_000_001_000,
           })
@@ -2054,7 +2819,7 @@ const scenarios: Record<string, () => Promise<unknown>> = {
             entity: "/repo/dropped.ts",
             projectFolder: "/replay",
             source: "session",
-            sourceRef: "call_drop",
+            replayToken: "call_drop",
             kind: "read",
             time: 1_700_000_300_000,
           })
@@ -2283,8 +3048,10 @@ if (!scenario) {
 try {
   const result = await scenario()
   process.stdout.write(`${RESULT_MARKER}${JSON.stringify(result ?? null)}\n`)
+  await rm(fixtureCache, { recursive: true, force: true })
   process.exit(0)
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`)
+  await rm(fixtureCache, { recursive: true, force: true }).catch(() => undefined)
   process.exit(1)
 }

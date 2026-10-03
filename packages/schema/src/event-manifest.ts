@@ -68,6 +68,7 @@ const featureDefinitions = Event.inventory(
 export const ServerDefinitions = Event.inventory(
   ...foundationDefinitions,
   ...featureDefinitions,
+  ...ServerEvent.Definitions,
   ...SessionTodo.Event.Definitions,
   ...SessionGroup.Event.Definitions,
 )

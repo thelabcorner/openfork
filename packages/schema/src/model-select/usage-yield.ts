@@ -30,8 +30,13 @@ import { freeTierOf, hasPublishedPricing, isUnlimitedModel } from "./badges"
 export type Workload = {
   freshInputTokens: number
   cachedReadTokens: number
+  /**
+   * Optional because the standardized Go corpus does not publish cache-write
+   * tokens. Generalized personal workloads do, and must pay for them.
+   */
+  cacheWriteTokens?: number
   outputTokens: number
-  /** fresh + cached — the input context size that drives threshold tiers */
+  /** fresh + cached + cache-write — the prompt size that drives threshold tiers */
   contextTokens: number
 }
 
@@ -134,10 +139,144 @@ function hashCorpus(corpus: Workload[]): string {
 //  Pricing regimes (§8-9, §26)
 // ---------------------------------------------------------------------------
 
-export type ModelCost = {
+export type ModelCostRates = {
   input: number
   output: number
   cache: { read: number; write: number }
+}
+
+export type ModelCost = ModelCostRates & {
+  /** Native model-catalog context tiers. A tier activates strictly when the
+   * request context exceeds its threshold, matching server Capacity. */
+  tiers?: Array<ModelCostRates & { tier: { type: "context"; size: number } }>
+  /** Legacy/current catalog fallback row for contexts above 200k. */
+  experimentalOver200K?: ModelCostRates
+}
+
+// ---------------------------------------------------------------------------
+//  Native context pricing — the one tier-selection rule (§8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Native model-catalog context pricing rows, resolved away from any workload.
+ *
+ * This is deliberately a separate shape from `ModelCost`: `priceWorkload`
+ * compiles a `ModelCost` snapshot into one of these, and server Capacity
+ * compiles a models.dev catalog row into one of these. Both then select the
+ * active row through the same `selectNativePrices` call, so "which rate applies
+ * to this context" can never have two answers in one codebase.
+ */
+export type NativePricing = {
+  readonly base: ModelCostRates
+  readonly tiers: Array<{ thresholdTokens: number; prices: ModelCostRates }>
+  readonly over200K?: ModelCostRates
+}
+
+/** Context above which the legacy `context_over_200k` fallback row applies. */
+export const NATIVE_OVER_200K = 200_000
+
+/**
+ * Select the active native pricing row for a context size.
+ *
+ * The rule, exactly once:
+ *
+ * - among rows whose threshold this context strictly EXCEEDS, the LARGEST
+ *   threshold wins, so publication order is irrelevant;
+ * - a duplicate threshold keeps the first published row, which is what the
+ *   historical stable descending sort produced;
+ * - `over200K` only applies when no threshold was activated AND the context is
+ *   above 200k, so a real published tier always beats the legacy fallback row.
+ *
+ * Allocation-free by construction — it borrows the winning row and returns a
+ * small literal. Callers pricing one settled request at a time depend on that.
+ */
+export function selectNativePrices(pricing: NativePricing, contextTokens: number) {
+  let prices =
+    contextTokens > NATIVE_OVER_200K && pricing.over200K ? pricing.over200K : pricing.base
+  let thresholdTokens = Number.NEGATIVE_INFINITY
+  for (const tier of pricing.tiers) {
+    if (contextTokens <= tier.thresholdTokens) continue
+    if (tier.thresholdTokens <= thresholdTokens) continue
+    thresholdTokens = tier.thresholdTokens
+    prices = tier.prices
+  }
+  return { prices, thresholdTokens }
+}
+
+/**
+ * The models.dev catalog `Cost` row, structurally typed.
+ *
+ * Declared here rather than imported from Core so this module stays
+ * browser-safe and free of a package dependency; the field names are the
+ * catalog's own and are asserted by the parity test. Every member is readonly
+ * because the real row is a Schema-decoded frozen record, so an adapter that
+ * required mutable arrays would only compile against a hand-built literal.
+ */
+export type CatalogCostRates = {
+  readonly input: number
+  readonly output: number
+  readonly cache_read?: number
+  readonly cache_write?: number
+}
+
+export type CatalogCost = CatalogCostRates & {
+  readonly tiers?: ReadonlyArray<
+    CatalogCostRates & {
+      readonly tier: { readonly type: "context"; readonly size: number }
+    }
+  >
+  readonly context_over_200k?: CatalogCostRates
+}
+
+/**
+ * Convert one catalog row to pricing rates for server Capacity.
+ *
+ * A cache dimension the catalog row omits becomes $0, which is the historical
+ * server Capacity contract: the models.dev feed publishes `cache_read`/
+ * `cache_write` on every metered row, so an absent dimension is a non-metered
+ * dimension, not a stale snapshot.
+ *
+ * This deliberately does NOT share `tokenCost`'s conservative fallback (a
+ * missing cache rate prices at the fresh-input rate) because that one guards a
+ * browser-facing stale-snapshot path where overstating savings would mislead a
+ * ranking. The two fallbacks protect different consumers and are asserted
+ * separately rather than merged.
+ */
+export function catalogRates(cost: CatalogCostRates): ModelCostRates {
+  return {
+    input: cost.input,
+    output: cost.output,
+    cache: { read: cost.cache_read ?? 0, write: cost.cache_write ?? 0 },
+  }
+}
+
+/** Compile a models.dev catalog cost row into `NativePricing`. */
+export function nativePricingFromCatalogCost(cost: CatalogCost): NativePricing {
+  const tiers = (cost.tiers ?? []).flatMap((row) =>
+    row.tier.type === "context" && Number.isFinite(row.tier.size) && row.tier.size >= 0
+      ? [{ thresholdTokens: row.tier.size, prices: catalogRates(row) }]
+      : [],
+  )
+  return {
+    base: catalogRates(cost),
+    tiers,
+    ...(cost.context_over_200k ? { over200K: catalogRates(cost.context_over_200k) } : {}),
+  }
+}
+
+/** Compile a `ModelCost` snapshot into `NativePricing`. */
+export function nativePricingFromModelCost(cost: ModelCost): NativePricing {
+  const tiers = (cost.tiers ?? [])
+    .filter((row) => row.tier.type === "context" && Number.isFinite(row.tier.size) && row.tier.size >= 0)
+    .map((row) => ({
+      thresholdTokens: row.tier.size,
+      prices: { input: row.input, output: row.output, cache: { read: row.cache.read, write: row.cache.write } },
+    }))
+  return {
+    base: { input: cost.input, output: cost.output, cache: { read: cost.cache.read, write: cost.cache.write } },
+    tiers,
+    ...(cost.experimentalOver200K ? { over200K: cost.experimentalOver200K } : {}),
+  }
 }
 
 export type PricingRegime =
@@ -146,6 +285,12 @@ export type PricingRegime =
   // threshold uses that row's prices. Order matters only for the integer
   // boundary — we treat "≤ X" as inclusive.
   | { kind: "context-threshold"; thresholdTokens: number; operator: "<=" | ">"; prices: ModelCost }
+  | {
+      kind: "native-context"
+      base: ModelCostRates
+      tiers: Array<{ thresholdTokens: number; prices: ModelCostRates }>
+      over200K?: ModelCostRates
+    }
   // Time regime (§9): only DeepSeek today. Peak/off-peak use the weekly
   // schedule fraction; expected cost is the time-weighted blend.
   | { kind: "time"; label: "peak" | "off-peak"; fraction: number; prices: ModelCost }
@@ -193,6 +338,10 @@ export function compilePricingRegimes(
       ]
     }
   }
+  const native = nativePricingFromModelCost(baseCost)
+  if (native.tiers.length > 0 || native.over200K) {
+    return [{ kind: "native-context", ...native }]
+  }
   if (thresholdPricing && thresholdPricing.length === 2) {
     // Ensure deterministic order: the ≤ row first (cheaper tier usually).
     const sorted = [...thresholdPricing].sort((a, b) => a.thresholdTokens - b.thresholdTokens)
@@ -228,25 +377,7 @@ export function priceWorkload(
   worst: number | undefined
   regimeLabel: string | undefined
 } {
-  // Apply cache hit rate if available: re-split the prompt's total context
-  // `T = I+K` as `K' = T*h`, `I' = T*(1-h)`. This keeps total context constant
-  // while letting a provider's actual cache efficiency (personal or openrouter
-  // telemetry) directly affect cost: higher h → more tokens at cheap `P_K`.
-  const effectiveWorkload = (() => {
-    if (hitRate === undefined || hitRate === null || !Number.isFinite(hitRate)) return workload
-    let h = hitRate > 1 ? hitRate / 100 : hitRate
-    h = Math.max(0, Math.min(1, h))
-    const totalPrompt = workload.freshInputTokens + workload.cachedReadTokens
-    if (totalPrompt <= 0) return workload
-    const effectiveCached = Math.round(totalPrompt * h)
-    const effectiveFresh = totalPrompt - effectiveCached
-    return {
-      freshInputTokens: effectiveFresh,
-      cachedReadTokens: effectiveCached,
-      outputTokens: workload.outputTokens,
-      contextTokens: totalPrompt,
-    }
-  })()
+  const effectiveWorkload = applyHitRate(workload, hitRate)
 
   const timeRegimes = regimes.filter((r): r is Extract<PricingRegime, { kind: "time" }> => r.kind === "time")
   if (timeRegimes.length === 2) {
@@ -265,6 +396,24 @@ export function priceWorkload(
     }
   }
 
+  const native = regimes.find(
+    (r): r is Extract<PricingRegime, { kind: "native-context" }> => r.kind === "native-context",
+  )
+  if (native) {
+    const selected = selectNativePrices(native, effectiveWorkload.contextTokens)
+    return {
+      expected: tokenCost(effectiveWorkload, selected.prices),
+      best: undefined,
+      worst: undefined,
+      regimeLabel:
+        selected.thresholdTokens !== Number.NEGATIVE_INFINITY
+          ? `> ${selected.thresholdTokens.toLocaleString()}`
+          : selected.prices === native.over200K
+            ? "> 200,000"
+            : undefined,
+    }
+  }
+
   const thresholdRegimes = regimes.filter(
     (r): r is Extract<PricingRegime, { kind: "context-threshold" }> => r.kind === "context-threshold",
   )
@@ -278,20 +427,83 @@ export function priceWorkload(
     return { expected: tokenCost(effectiveWorkload, match.prices), best: undefined, worst: undefined, regimeLabel: `${match.operator} ${match.thresholdTokens.toLocaleString()}` }
   }
 
-  const flat = regimes.find((r) => r.kind === "flat") ?? regimes[0]!
+  const flat = regimes.find(
+    (r): r is Extract<PricingRegime, { kind: "flat" }> => r.kind === "flat",
+  )
+  // compilePricingRegimes always returns a non-empty, recognized regime set.
+  // If a future caller constructs an invalid set manually, fail closed instead
+  // of accidentally treating missing pricing as free.
+  if (!flat) {
+    return { expected: Number.POSITIVE_INFINITY, best: undefined, worst: undefined, regimeLabel: undefined }
+  }
   return { expected: tokenCost(effectiveWorkload, flat.prices), best: undefined, worst: undefined, regimeLabel: undefined }
 }
 
-function tokenCost(workload: Workload, prices: ModelCost): number {
+/**
+ * Apply a cache hit rate to a workload by re-splitting its prompt total
+ * `T = I+K` as `K' = T*h`, `I' = T*(1-h)`.
+ *
+ * Total context stays constant while a provider's actual cache efficiency
+ * (personal or openrouter telemetry) moves tokens onto the cheap `P_K` rate.
+ * Shared by `priceWorkload` and the per-regime diagnostic pricer so both apply
+ * exactly the same re-split.
+ */
+function applyHitRate(workload: Workload, hitRate: number | undefined | null): Workload {
+  if (hitRate === undefined || hitRate === null || !Number.isFinite(hitRate)) return workload
+  let h = hitRate > 1 ? hitRate / 100 : hitRate
+  h = Math.max(0, Math.min(1, h))
+  const totalPrompt = workload.freshInputTokens + workload.cachedReadTokens
+  if (totalPrompt <= 0) return workload
+  const effectiveCached = Math.round(totalPrompt * h)
+  const effectiveFresh = totalPrompt - effectiveCached
+  return {
+    freshInputTokens: effectiveFresh,
+    cachedReadTokens: effectiveCached,
+    ...(workload.cacheWriteTokens !== undefined ? { cacheWriteTokens: workload.cacheWriteTokens } : {}),
+    outputTokens: workload.outputTokens,
+    contextTokens: totalPrompt + (workload.cacheWriteTokens ?? 0),
+  }
+}
+
+/**
+ * Price one workload under exactly ONE regime, using that regime's own price
+ * row.
+ *
+ * `priceWorkload` prices a whole regime SET: time regimes need both periods to
+ * blend and threshold regimes need both rows to select a tier. Handing it a
+ * one-element array therefore matched no branch and fell through to the
+ * fail-closed `Infinity`, which turned every per-regime diagnostic into
+ * `1/Infinity = 0` requests per dollar. Diagnostics name one regime, so they
+ * price exactly that regime through this.
+ */
+export function priceWorkloadUnderRegime(workload: Workload, regime: PricingRegime, hitRate?: number): number {
+  const effective = applyHitRate(workload, hitRate)
+  if (regime.kind === "native-context")
+    return tokenCost(effective, selectNativePrices(regime, effective.contextTokens).prices)
+  // `flat`, `context-threshold`, and `time` each carry one complete price row.
+  // A threshold/time row is used as published because the caller has already
+  // chosen the regime being reported.
+  return tokenCost(effective, regime.prices)
+}
+
+function tokenCost(workload: Workload, prices: ModelCostRates): number {
   // §5.2: C_{m,j} = (I_j P_I + K_j P_K + O_j P_O) / 1_000_000
-  // §26.2: cached-write is NOT in the primary score — it models reuse, not creation.
+  // The standardized corpus has no cache-write dimension, so its historical
+  // primary score is unchanged. Generalized personal workloads can opt into
+  // the dimension and pay the target model's current cache-write rate.
   // `Model.Cost` requires cache pricing in current schema versions, but stale
   // provider snapshots / older servers can legitimately reach the renderer as
   // `{ input, output }`. Treat missing cache-read pricing as uncached-input
   // pricing rather than crashing the selector. This is conservative: a missing
   // discount must never make a model look artificially cheaper.
   const cacheRead = prices.cache?.read ?? prices.input
-  return (workload.freshInputTokens * prices.input + workload.cachedReadTokens * cacheRead + workload.outputTokens * prices.output) / 1_000_000
+  const cacheWrite = prices.cache?.write ?? prices.input
+  return (
+    workload.freshInputTokens * prices.input +
+    workload.cachedReadTokens * cacheRead +
+    (workload.cacheWriteTokens ?? 0) * cacheWrite +
+    workload.outputTokens * prices.output
+  ) / 1_000_000
 }
 
 // ---------------------------------------------------------------------------
@@ -457,14 +669,17 @@ export function evaluateModelUsageYield(
   const timeRegimes = regimes.filter((r): r is Extract<PricingRegime, { kind: "time" }> => r.kind === "time")
   if (timeRegimes.length === 2) {
     for (const r of timeRegimes) {
-      const c = median(corpusBands.corpus.map((w) => priceWorkload(w, [r], opts?.hitRate).expected))
+      // Price the regime itself, not a one-element "set" (see
+      // priceWorkloadUnderRegime): peak/off-peak are the diagnostic rows the
+      // tooltip compares against the blend.
+      const c = median(corpusBands.corpus.map((w) => priceWorkloadUnderRegime(w, r, opts?.hitRate)))
       diagnostics.push({ kind: "time", label: r.label, cost: c, requestsPerDollar: c > 0 ? 1 / c : null })
     }
     // Expected already in primary; also push it as a synthetic entry for completeness
     diagnostics.push({ kind: "time", label: "expected", cost: typicalCost, requestsPerDollar: typicalYield })
   } else if (regimes.some((r) => r.kind === "context-threshold")) {
     for (const r of regimes as Extract<PricingRegime, { kind: "context-threshold" }>[]) {
-      const c = median(corpusBands.corpus.map((w) => priceWorkload(w, [r], opts?.hitRate).expected))
+      const c = median(corpusBands.corpus.map((w) => priceWorkloadUnderRegime(w, r, opts?.hitRate)))
       diagnostics.push({ kind: "context", label: `${r.operator} ${r.thresholdTokens.toLocaleString()}`, cost: c, requestsPerDollar: c > 0 ? 1 / c : null })
     }
   } else {

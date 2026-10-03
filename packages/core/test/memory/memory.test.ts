@@ -32,7 +32,7 @@ const testLayer = (filename: string) =>
       yield* db.run("PRAGMA journal_mode = WAL")
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
-      return { db, readDb: db, filename }
+      return { db, readDb: db, scanDb: () => Effect.succeed(db), filename }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename })))
 
@@ -58,7 +58,7 @@ function withDb<A, E>(body: Effect.Effect<A, E, Memory.Service>) {
             yield* db.run("PRAGMA journal_mode = WAL")
             yield* db.run("PRAGMA foreign_keys = ON")
             yield* DatabaseMigration.apply(db)
-            return { db, readDb: db, filename }
+            return { db, readDb: db, scanDb: () => Effect.succeed(db), filename }
           }).pipe(Effect.orDie),
         )
         .pipe(Layer.provide(sqliteLayer({ filename }))),

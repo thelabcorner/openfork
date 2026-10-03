@@ -149,7 +149,6 @@ const layer = Layer.effect(
           constraints: input.constraints,
           criteria,
           steps: input.steps,
-          continuationPolicy: {},
           sourceMessageID: authorizingTurn.userMessageID,
           actor: "agent",
         })

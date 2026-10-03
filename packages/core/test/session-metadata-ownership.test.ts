@@ -178,7 +178,17 @@ describe("Session metadata ownership", () => {
       ...origin,
       metadata: { ordinary: true, workerDelegation: { producer: "spoof" } },
     })
-    expect(SessionMetadataOwnership.workerDelegation(metadata)).toEqual(origin)
+    expect(SessionMetadataOwnership.workerDelegation(metadata)).toEqual({
+      ...origin,
+      model: {
+        ...origin.model,
+        routeIntent: {
+          kind: "account",
+          accountID: "wb-account",
+          pin: "hard",
+        },
+      },
+    })
     expect(SessionMetadataOwnership.isProducerOwned(metadata)).toBe(true)
     expect(
       SessionMetadataOwnership.replaceCallerOwned(metadata, {
@@ -204,8 +214,123 @@ describe("Session metadata ownership", () => {
         modelID: "deepseek-r2",
         accountID: "go-account",
         variant: "high",
+        routeIntent: {
+          kind: "account",
+          accountID: "go-account",
+          pin: "hard",
+        },
       },
     })
+  })
+
+  test("worker delegation route intent canonicalizes legacy, Public, and explicit account selections", () => {
+    expect(
+      SessionMetadataOwnership.normalizeWorkerDelegationModel({
+        providerID: "opencode",
+        modelID: "model-a",
+      }),
+    ).toEqual({
+      providerID: "opencode",
+      modelID: "model-a",
+      routeIntent: { kind: "auto" },
+    })
+
+    expect(
+      SessionMetadataOwnership.normalizeWorkerDelegationModel({
+        providerID: "opencode-go",
+        modelID: "model-a",
+        accountID: "acct-a",
+      }),
+    ).toEqual({
+      providerID: "opencode-go",
+      modelID: "model-a",
+      accountID: "acct-a",
+      routeIntent: { kind: "account", accountID: "acct-a", pin: "hard" },
+    })
+
+    expect(
+      SessionMetadataOwnership.normalizeWorkerDelegationModel({
+        providerID: "opencode",
+        modelID: "model-a",
+        routeIntent: { kind: "public" },
+      }),
+    ).toEqual({
+      providerID: "opencode",
+      modelID: "model-a",
+      routeIntent: { kind: "public" },
+    })
+
+    expect(
+      SessionMetadataOwnership.normalizeWorkerDelegationModel({
+        providerID: "opencode-go",
+        modelID: "model-a",
+        routeIntent: { kind: "account", accountID: "acct-a" },
+      }),
+    ).toEqual({
+      providerID: "opencode-go",
+      modelID: "model-a",
+      accountID: "acct-a",
+      routeIntent: { kind: "account", accountID: "acct-a" },
+    })
+  })
+
+  test("worker delegation route/account conflicts stay producer-owned but fail closed", () => {
+    for (const routeIntent of [
+      { kind: "public" } as const,
+      { kind: "auto" } as const,
+      { kind: "account", accountID: "acct-b", pin: "hard" } as const,
+    ]) {
+      const metadata = {
+        workerDelegation: {
+          producer: "oxp",
+          principalRef: "principal",
+          invocationRef: "invocation",
+          rootRef: "root",
+          agent: "build",
+          model: {
+            providerID: "opencode-go",
+            modelID: "model-a",
+            accountID: "acct-a",
+            routeIntent,
+          },
+          nestedDelegation: false,
+        },
+      }
+      expect(SessionMetadataOwnership.hasWorkerDelegationOrigin(metadata)).toBe(true)
+      expect(SessionMetadataOwnership.workerDelegation(metadata)).toBeUndefined()
+    }
+  })
+
+  test("worker delegation model equality is route-aware and treats omitted explicit account pin as hard", () => {
+    expect(
+      SessionMetadataOwnership.sameWorkerDelegationModel(
+        {
+          providerID: "opencode-go",
+          modelID: "model-a",
+          accountID: "acct-a",
+        },
+        {
+          providerID: "opencode-go",
+          modelID: "model-a",
+          routeIntent: { kind: "account", accountID: "acct-a" },
+        },
+      ),
+    ).toBe(true)
+
+    expect(
+      SessionMetadataOwnership.sameWorkerDelegationModel(
+        {
+          providerID: "opencode",
+          modelID: "model-a",
+          routeIntent: { kind: "public" },
+        },
+        {
+          providerID: "opencode",
+          modelID: "model-a",
+          routeIntent: { kind: "auto" },
+        },
+      ),
+    ).toBe(false)
   })
 
   test("malformed worker delegation metadata remains producer-owned but yields no executable policy", () => {

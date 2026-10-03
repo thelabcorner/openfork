@@ -6,7 +6,10 @@ import { OxpActivity as OxpActivityContract } from "@opencode-ai/schema/oxp-acti
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventV2 } from "../event"
+import { OxpAttributionRevision } from "../oxp-attribution/revision"
+import { runHistoricalContextBackfillLoop } from "../oxp-attribution/backfill"
 import { OxpActivitySchema } from "./schema"
+import { runInvocationDetailRetentionLoop } from "./retention"
 import {
   OxpCorrelationRefTable,
   OxpInvocationDetailTable,
@@ -16,7 +19,7 @@ import {
 } from "./sql"
 
 const MAX_SAFE_SUMMARY_BYTES = 8 * 1024
-const MAX_INVOCATION_DETAIL_BYTES = 512 * 1024
+const MAX_INVOCATION_DETAIL_BYTES = 4 * 1024
 const MAX_TOOL_BYTES = 256
 const MAX_ACTION_BYTES = 256
 const MAX_ROOT_ALIAS_BYTES = 64
@@ -27,14 +30,11 @@ const MAX_KNOWN_EPOCH_SEGMENTS = 4096
 
 function bounded(value: string | undefined, max: number, label: string) {
   if (value === undefined) return
-  if (!value || Buffer.byteLength(value, "utf8") > max)
-    throw new Error(`Invalid OXP activity ${label}`)
+  if (!value || Buffer.byteLength(value, "utf8") > max) throw new Error(`Invalid OXP activity ${label}`)
   return value
 }
 
-function safeSummary(
-  value: OxpActivitySchema.SafeSummary | undefined,
-): OxpActivitySchema.SafeSummary | undefined {
+function safeSummary(value: OxpActivitySchema.SafeSummary | undefined): OxpActivitySchema.SafeSummary | undefined {
   if (value === undefined) return
   const encoded = JSON.stringify(value)
   if (Buffer.byteLength(encoded, "utf8") > MAX_SAFE_SUMMARY_BYTES)
@@ -49,12 +49,25 @@ function invocationDetail(
   if (value === undefined) return
   const encoded = JSON.stringify(value)
   if (Buffer.byteLength(encoded, "utf8") > MAX_INVOCATION_DETAIL_BYTES)
-    throw new Error(`OXP activity ${label} exceeds 512 KiB`)
+    throw new Error(`OXP activity ${label} exceeds 4 KiB`)
   return value
 }
 
 function failed(status: OxpActivitySchema.Status) {
   return status !== "success" && status !== "committed"
+}
+
+export interface ContextMeasurement {
+  readonly chars: number
+  readonly source: OxpActivitySchema.ContextExactSource
+  readonly schema: OxpActivitySchema.ContextSchema
+}
+
+function contextMeasurement(value: ContextMeasurement | undefined, label: string) {
+  if (value === undefined) return
+  if (!Number.isSafeInteger(value.chars) || value.chars < 0)
+    throw new Error(`Invalid OXP activity ${label} character count`)
+  return value
 }
 
 export interface BeginInput {
@@ -72,6 +85,7 @@ export interface BeginInput {
   readonly rootAlias?: string
   readonly summary?: OxpActivitySchema.SafeSummary
   readonly detail?: OxpActivitySchema.InvocationDetail
+  readonly contextRequest?: ContextMeasurement
   readonly startedAt?: number
 }
 
@@ -89,6 +103,7 @@ export interface SettleInput {
   readonly mutationCommitted?: boolean
   readonly summary?: OxpActivitySchema.SafeSummary
   readonly detail?: OxpActivitySchema.InvocationDetail
+  readonly contextResult?: ContextMeasurement
   readonly completedAt?: number
 }
 
@@ -107,43 +122,29 @@ export interface Interface {
   /** Distinct host generations that still own running historical spans. */
   readonly runningHostRuns: () => Effect.Effect<readonly string[]>
   /** Settle only still-running spans owned by one proven-dead/gracefully-stopping host generation. */
-  readonly interruptHostRun: (
-    hostRunID: string,
-    completedAt?: number,
-  ) => Effect.Effect<number>
-  readonly rename: (
-    id: OxpActivitySchema.ActivityID,
-    title: string | undefined,
-  ) => Effect.Effect<boolean>
-  readonly archive: (
-    id: OxpActivitySchema.ActivityID,
-    archived: boolean,
-  ) => Effect.Effect<boolean>
-  readonly deleteHistory: (
-    id: OxpActivitySchema.ActivityID,
-  ) => Effect.Effect<boolean>
+  readonly interruptHostRun: (hostRunID: string, completedAt?: number) => Effect.Effect<number>
+  readonly rename: (id: OxpActivitySchema.ActivityID, title: string | undefined) => Effect.Effect<boolean>
+  readonly archive: (id: OxpActivitySchema.ActivityID, archived: boolean) => Effect.Effect<boolean>
+  readonly deleteHistory: (id: OxpActivitySchema.ActivityID) => Effect.Effect<boolean>
 }
 
-export class Service extends Context.Service<Service, Interface>()(
-  "@opencode/core/OxpActivity",
-) {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/core/OxpActivity") {}
 
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, filename } = yield* Database.Service
     const events = yield* EventV2.Service
+    yield* Effect.forkScoped(runHistoricalContextBackfillLoop(filename))
+    yield* Effect.forkScoped(runInvocationDetailRetentionLoop(filename))
     // Positive-only, bounded acceleration for the common case where many calls
     // land in the same observed parent-tool segment. A cache miss still proves
     // existence against SQLite, so eviction/restart/multi-process execution can
     // only add a read — never change durable counting semantics.
     const knownEpochSegments = new Set<string>()
 
-    const epochSegmentKey = (
-      activityID: OxpActivitySchema.ActivityID,
-      hostRunID: string,
-      observedEpoch: number,
-    ) => activityID + "\\0" + hostRunID + "\\0" + observedEpoch
+    const epochSegmentKey = (activityID: OxpActivitySchema.ActivityID, hostRunID: string, observedEpoch: number) =>
+      activityID + "\\0" + hostRunID + "\\0" + observedEpoch
 
     const rememberEpochSegment = (key: string) => {
       if (knownEpochSegments.delete(key)) {
@@ -172,181 +173,166 @@ const layer = Layer.effect(
       const now = input.startedAt ?? Date.now()
       const tool = bounded(input.tool, MAX_TOOL_BYTES, "tool")!
       const action = bounded(input.action, MAX_ACTION_BYTES, "action")
-      const rootAlias = bounded(
-        input.rootAlias,
-        MAX_ROOT_ALIAS_BYTES,
-        "root alias",
-      )
+      const rootAlias = bounded(input.rootAlias, MAX_ROOT_ALIAS_BYTES, "root alias")
       const summary = safeSummary(input.summary)
       const detail = invocationDetail(input.detail, "request detail")
+      const contextRequest = contextMeasurement(input.contextRequest, "request context")
       bounded(input.correlation.scheme, 128, "correlation scheme")
       bounded(input.correlation.digest, 256, "correlation digest")
       bounded(input.hostRunID, 128, "host run ID")
 
-      const result = yield* db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            // Existing-parent hot path: resolve the durable activity ID while
-            // refreshing correlation observation metadata in one indexed write.
-            // This replaces the previous SELECT + UPDATE pair without caching
-            // authority in memory; a row deleted by another process simply
-            // falls through to ordinary first-observation creation.
-            const existing = yield* tx
-              .update(OxpCorrelationRefTable)
-              .set({
-                last_seen_at: now,
-                scope: input.correlation.scope,
-              })
-              .where(
-                and(
-                  eq(
-                    OxpCorrelationRefTable.scheme,
-                    input.correlation.scheme,
+      const result = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              // Existing-parent hot path: correlation identity is immutable after
+              // first observation, while user-visible recency/counters live on the
+              // parent aggregate below. Resolve the durable activity ID with an
+              // indexed read instead of dirtying a write-only correlation metadata
+              // row on every tool call. We intentionally do not cache activityID:
+              // cross-process deletion must still fall through to fresh creation.
+              const existing = yield* tx
+                .select({ activityID: OxpCorrelationRefTable.activity_id })
+                .from(OxpCorrelationRefTable)
+                .where(
+                  and(
+                    eq(OxpCorrelationRefTable.scheme, input.correlation.scheme),
+                    eq(OxpCorrelationRefTable.digest, input.correlation.digest),
                   ),
-                  eq(
-                    OxpCorrelationRefTable.digest,
-                    input.correlation.digest,
-                  ),
-                ),
-              )
-              .returning({ activityID: OxpCorrelationRefTable.activity_id })
-              .get()
-              .pipe(Effect.orDie)
-
-            const activityID =
-              existing?.activityID ?? OxpActivitySchema.nextActivityID()
-            const activityCreated = existing === undefined
-
-            if (!existing) {
-              yield* tx
-                .insert(OxpParentActivityTable)
-                .values({
-                  id: activityID,
-                  first_seen_at: now,
-                  last_seen_at: now,
-                })
-                .run()
+                )
+                .get()
                 .pipe(Effect.orDie)
-              yield* tx
-                .insert(OxpCorrelationRefTable)
-                .values({
-                  scheme: input.correlation.scheme,
-                  digest: input.correlation.digest,
-                  activity_id: activityID,
-                  scope: input.correlation.scope,
-                  first_seen_at: now,
-                  last_seen_at: now,
-                })
-                .run()
-                .pipe(Effect.orDie)
-            }
 
-            const segmentKey =
-              input.observedEpoch === undefined
-                ? undefined
-                : epochSegmentKey(
-                    activityID,
-                    input.hostRunID,
-                    input.observedEpoch,
-                  )
-            const observedEpochIsNew =
-              segmentKey === undefined
-                ? false
-                : activityCreated
-                  ? true
-                  : knownEpochSegments.has(segmentKey)
-                    ? false
-                    : (yield* tx
-                        .select({ id: OxpInvocationTable.id })
-                        .from(OxpInvocationTable)
-                        .where(
-                          and(
-                            eq(OxpInvocationTable.activity_id, activityID),
-                            eq(OxpInvocationTable.host_run_id, input.hostRunID),
-                            eq(
-                              OxpInvocationTable.observed_epoch,
-                              input.observedEpoch!,
+              const activityID = existing?.activityID ?? OxpActivitySchema.nextActivityID()
+              const activityCreated = existing === undefined
+
+              if (!existing) {
+                yield* tx
+                  .insert(OxpParentActivityTable)
+                  .values({
+                    id: activityID,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                  })
+                  .run()
+                  .pipe(Effect.orDie)
+                yield* tx
+                  .insert(OxpCorrelationRefTable)
+                  .values({
+                    scheme: input.correlation.scheme,
+                    digest: input.correlation.digest,
+                    activity_id: activityID,
+                    scope: input.correlation.scope,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                  })
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+
+              const segmentKey =
+                input.observedEpoch === undefined
+                  ? undefined
+                  : epochSegmentKey(activityID, input.hostRunID, input.observedEpoch)
+              const observedEpochIsNew =
+                segmentKey === undefined
+                  ? false
+                  : activityCreated
+                    ? true
+                    : knownEpochSegments.has(segmentKey)
+                      ? false
+                      : (yield* tx
+                          .select({ id: OxpInvocationTable.id })
+                          .from(OxpInvocationTable)
+                          .where(
+                            and(
+                              eq(OxpInvocationTable.activity_id, activityID),
+                              eq(OxpInvocationTable.host_run_id, input.hostRunID),
+                              eq(OxpInvocationTable.observed_epoch, input.observedEpoch!),
                             ),
-                          ),
-                        )
-                        .limit(1)
-                        .get()
-                        .pipe(Effect.orDie)) === undefined
+                          )
+                          .limit(1)
+                          .get()
+                          .pipe(Effect.orDie)) === undefined
 
-            const invocationID = OxpActivitySchema.nextInvocationID()
-            yield* tx
-              .insert(OxpInvocationTable)
-              .values({
-                id: invocationID,
-                activity_id: activityID,
-                host_run_id: input.hostRunID,
-                observed_epoch: input.observedEpoch,
-                plane: input.plane,
-                tool,
-                action,
-                root_id: input.rootID,
-                root_alias: rootAlias,
-                safe_summary: summary,
-                time_started: now,
-              })
-              .run()
-              .pipe(Effect.orDie)
-
-            if (detail !== undefined) {
+              const invocationID = OxpActivitySchema.nextInvocationID()
               yield* tx
-                .insert(OxpInvocationDetailTable)
+                .insert(OxpInvocationTable)
                 .values({
-                  invocation_id: invocationID,
-                  request: detail,
+                  id: invocationID,
+                  activity_id: activityID,
+                  host_run_id: input.hostRunID,
+                  observed_epoch: input.observedEpoch,
+                  plane: input.plane,
+                  tool,
+                  action,
+                  root_id: input.rootID,
+                  root_alias: rootAlias,
+                  safe_summary: summary,
+                  ...(contextRequest === undefined
+                    ? {}
+                    : {
+                        context_request_chars: contextRequest.chars,
+                        context_request_source: contextRequest.source,
+                        context_request_schema: contextRequest.schema,
+                      }),
+                  time_started: now,
                 })
                 .run()
                 .pipe(Effect.orDie)
-            }
 
-            yield* tx
-              .update(OxpParentActivityTable)
-              .set({
-                last_seen_at: now,
-                last_tool: tool,
-                last_root_alias: rootAlias,
-                call_count: sql`${OxpParentActivityTable.call_count} + 1`,
-                augmentation_calls:
-                  input.plane === "augmentation"
-                    ? sql`${OxpParentActivityTable.augmentation_calls} + 1`
-                    : OxpParentActivityTable.augmentation_calls,
-                supervision_calls:
-                  input.plane === "supervision"
-                    ? sql`${OxpParentActivityTable.supervision_calls} + 1`
-                    : OxpParentActivityTable.supervision_calls,
-                delegation_calls:
-                  input.plane === "delegation"
-                    ? sql`${OxpParentActivityTable.delegation_calls} + 1`
-                    : OxpParentActivityTable.delegation_calls,
-                observed_epoch_count:
-                  observedEpochIsNew
+              if (detail !== undefined) {
+                yield* tx
+                  .insert(OxpInvocationDetailTable)
+                  .values({
+                    invocation_id: invocationID,
+                    request: detail,
+                  })
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+
+              yield* tx
+                .update(OxpParentActivityTable)
+                .set({
+                  last_seen_at: now,
+                  last_tool: tool,
+                  last_root_alias: rootAlias,
+                  call_count: sql`${OxpParentActivityTable.call_count} + 1`,
+                  augmentation_calls:
+                    input.plane === "augmentation"
+                      ? sql`${OxpParentActivityTable.augmentation_calls} + 1`
+                      : OxpParentActivityTable.augmentation_calls,
+                  supervision_calls:
+                    input.plane === "supervision"
+                      ? sql`${OxpParentActivityTable.supervision_calls} + 1`
+                      : OxpParentActivityTable.supervision_calls,
+                  delegation_calls:
+                    input.plane === "delegation"
+                      ? sql`${OxpParentActivityTable.delegation_calls} + 1`
+                      : OxpParentActivityTable.delegation_calls,
+                  observed_epoch_count: observedEpochIsNew
                     ? sql`${OxpParentActivityTable.observed_epoch_count} + 1`
                     : OxpParentActivityTable.observed_epoch_count,
-              })
-              .where(eq(OxpParentActivityTable.id, activityID))
-              .run()
-              .pipe(Effect.orDie)
+                })
+                .where(eq(OxpParentActivityTable.id, activityID))
+                .run()
+                .pipe(Effect.orDie)
 
-            return {
-              activityID,
-              invocationID,
-              activityCreated,
-            } satisfies BeginResult
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
-      if (input.observedEpoch !== undefined) {
-        rememberEpochSegment(
-          epochSegmentKey(
-            result.activityID,
-            input.hostRunID,
-            input.observedEpoch,
-          ),
+              return {
+                activityID,
+                invocationID,
+                activityCreated,
+              } satisfies BeginResult
+            }),
+          { behavior: "immediate" },
         )
+        .pipe(Effect.orDie)
+      // Every inserted invocation changes attribution call counts/clustering,
+      // even when the boundary measurement is unavailable.
+      OxpAttributionRevision.advance()
+      if (input.observedEpoch !== undefined) {
+        rememberEpochSegment(epochSegmentKey(result.activityID, input.hostRunID, input.observedEpoch))
       }
       if (result.activityCreated) {
         yield* emit(
@@ -373,78 +359,81 @@ const layer = Layer.effect(
       return result
     })
 
-    const settle = Effect.fn("OxpActivity.settle")(function* (
-      input: SettleInput,
-    ) {
+    const settle = Effect.fn("OxpActivity.settle")(function* (input: SettleInput) {
       const completedAt = input.completedAt ?? Date.now()
       const summary = safeSummary(input.summary)
       const detail = invocationDetail(input.detail, "outcome detail")
+      const contextResult = contextMeasurement(input.contextResult, "result context")
       bounded(input.errorCode, 128, "error code")
-      const settled = yield* db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            const row = yield* tx
-              .select()
-              .from(OxpInvocationTable)
-              .where(eq(OxpInvocationTable.id, input.invocationID))
-              .get()
-              .pipe(Effect.orDie)
-            if (!row || row.status !== "running") return undefined
-
-            yield* tx
-              .update(OxpInvocationTable)
-              .set({
-                status: input.status,
-                error_code: input.errorCode,
-                mutation_attempted: input.mutationAttempted ?? false,
-                mutation_committed: input.mutationCommitted ?? false,
-                ...(summary === undefined ? {} : { safe_summary: summary }),
-                time_completed: completedAt,
-              })
-              .where(eq(OxpInvocationTable.id, input.invocationID))
-              .run()
-              .pipe(Effect.orDie)
-
-            if (detail !== undefined) {
-              yield* tx
-                .insert(OxpInvocationDetailTable)
-                .values({
-                  invocation_id: input.invocationID,
-                  outcome: detail,
-                })
-                .onConflictDoUpdate({
-                  target: OxpInvocationDetailTable.invocation_id,
-                  set: { outcome: detail },
-                })
-                .run()
-                .pipe(Effect.orDie)
-            }
-
-            if (failed(input.status)) {
-              yield* tx
-                .update(OxpParentActivityTable)
+      const settled = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              // Exactly-once settlement is one conditional indexed write. The
+              // previous SELECT + UPDATE pair paid an extra SQLite statement and
+              // widened the race window between observing "running" and settling.
+              const row = yield* tx
+                .update(OxpInvocationTable)
                 .set({
-                  failure_count: sql`${OxpParentActivityTable.failure_count} + 1`,
-                  last_seen_at: sql`MAX(${OxpParentActivityTable.last_seen_at}, ${completedAt})`,
+                  status: input.status,
+                  error_code: input.errorCode,
+                  mutation_attempted: input.mutationAttempted ?? false,
+                  mutation_committed: input.mutationCommitted ?? false,
+                  ...(summary === undefined ? {} : { safe_summary: summary }),
+                  ...(contextResult === undefined
+                    ? {}
+                    : {
+                        context_result_chars: contextResult.chars,
+                        context_result_source: contextResult.source,
+                        context_result_schema: contextResult.schema,
+                      }),
+                  time_completed: completedAt,
                 })
-                .where(eq(OxpParentActivityTable.id, row.activity_id))
-                .run()
+                .where(and(eq(OxpInvocationTable.id, input.invocationID), eq(OxpInvocationTable.status, "running")))
+                .returning({ activityID: OxpInvocationTable.activity_id })
+                .get()
                 .pipe(Effect.orDie)
-            } else {
-              yield* tx
-                .update(OxpParentActivityTable)
-                .set({
-                  last_seen_at: sql`MAX(${OxpParentActivityTable.last_seen_at}, ${completedAt})`,
-                })
-                .where(eq(OxpParentActivityTable.id, row.activity_id))
-                .run()
-                .pipe(Effect.orDie)
-            }
-            return row.activity_id
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
+              if (!row) return undefined
+
+              if (detail !== undefined) {
+                yield* tx
+                  .insert(OxpInvocationDetailTable)
+                  .values({
+                    invocation_id: input.invocationID,
+                    outcome: detail,
+                  })
+                  .onConflictDoUpdate({
+                    target: OxpInvocationDetailTable.invocation_id,
+                    set: { outcome: detail },
+                  })
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+
+              if (failed(input.status)) {
+                yield* tx
+                  .update(OxpParentActivityTable)
+                  .set({
+                    failure_count: sql`${OxpParentActivityTable.failure_count} + 1`,
+                    last_seen_at: sql`MAX(${OxpParentActivityTable.last_seen_at}, ${completedAt})`,
+                  })
+                  .where(eq(OxpParentActivityTable.id, row.activityID))
+                  .run()
+                  .pipe(Effect.orDie)
+              }
+              // Successful invocation recency was already durably observed by
+              // begin(). Avoid a second parent-row write on the success hot path;
+              // terminal truth remains on the invocation row and failures still
+              // advance both failure_count and parent recency.
+              return row.activityID
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
       if (!settled) return false
+      // Settlement always changes status/completion geometry read by the
+      // attribution projection, regardless of whether result text was measured.
+      OxpAttributionRevision.advance()
       yield* emit(
         "updated",
         events.publish(OxpActivityContract.Event.Updated, {
@@ -468,11 +457,7 @@ const layer = Layer.effect(
           invocation_id: input.invocationID,
           kind: input.kind,
           ref: bounded(input.ref, MAX_LINK_REF_BYTES, "link ref")!,
-          relation: bounded(
-            input.relation,
-            MAX_RELATION_BYTES,
-            "link relation",
-          )!,
+          relation: bounded(input.relation, MAX_RELATION_BYTES, "link relation")!,
           label: bounded(input.label, MAX_LINK_LABEL_BYTES, "link label"),
         })
         .onConflictDoNothing()
@@ -497,22 +482,23 @@ const layer = Layer.effect(
       }
     })
 
-    const runningHostRuns = Effect.fn("OxpActivity.runningHostRuns")(
-      function* () {
-        const rows = yield* db
-          .selectDistinct({ hostRunID: OxpInvocationTable.host_run_id })
-          .from(OxpInvocationTable)
-          .where(eq(OxpInvocationTable.status, "running"))
-          .all()
-          .pipe(Effect.orDie)
-        return rows.map((row) => row.hostRunID)
-      },
-    )
+    const runningHostRuns = Effect.fn("OxpActivity.runningHostRuns")(function* () {
+      const rows = yield* db
+        .selectDistinct({ hostRunID: OxpInvocationTable.host_run_id })
+        .from(OxpInvocationTable)
+        .where(eq(OxpInvocationTable.status, "running"))
+        .all()
+        .pipe(Effect.orDie)
+      return rows.map((row) => row.hostRunID)
+    })
 
-    const interruptHostRun = Effect.fn("OxpActivity.interruptHostRun")(
-      function* (hostRunID: string, completedAt = Date.now()) {
-        bounded(hostRunID, 128, "host run ID")
-        const interrupted = yield* db.transaction(
+    const interruptHostRun = Effect.fn("OxpActivity.interruptHostRun")(function* (
+      hostRunID: string,
+      completedAt = Date.now(),
+    ) {
+      bounded(hostRunID, 128, "host run ID")
+      const interrupted = yield* db
+        .transaction(
           (tx) =>
             Effect.gen(function* () {
               const rows = yield* tx
@@ -521,12 +507,7 @@ const layer = Layer.effect(
                   activityID: OxpInvocationTable.activity_id,
                 })
                 .from(OxpInvocationTable)
-                .where(
-                  and(
-                    eq(OxpInvocationTable.host_run_id, hostRunID),
-                    eq(OxpInvocationTable.status, "running"),
-                  ),
-                )
+                .where(and(eq(OxpInvocationTable.host_run_id, hostRunID), eq(OxpInvocationTable.status, "running")))
                 .all()
                 .pipe(Effect.orDie)
               if (rows.length === 0) return rows
@@ -538,18 +519,12 @@ const layer = Layer.effect(
                   error_code: "OXP_HOST_INTERRUPTED",
                   time_completed: completedAt,
                 })
-                .where(
-                  and(
-                    eq(OxpInvocationTable.host_run_id, hostRunID),
-                    eq(OxpInvocationTable.status, "running"),
-                  ),
-                )
+                .where(and(eq(OxpInvocationTable.host_run_id, hostRunID), eq(OxpInvocationTable.status, "running")))
                 .run()
                 .pipe(Effect.orDie)
 
               const counts = new Map<OxpActivitySchema.ActivityID, number>()
-              for (const row of rows)
-                counts.set(row.activityID, (counts.get(row.activityID) ?? 0) + 1)
+              for (const row of rows) counts.set(row.activityID, (counts.get(row.activityID) ?? 0) + 1)
               for (const [activityID, count] of counts) {
                 yield* tx
                   .update(OxpParentActivityTable)
@@ -564,126 +539,110 @@ const layer = Layer.effect(
               return rows
             }),
           { behavior: "immediate" },
-        ).pipe(Effect.orDie)
+        )
+        .pipe(Effect.orDie)
+      if (interrupted.length > 0) OxpAttributionRevision.advance()
 
-        const activities = new Set<OxpActivitySchema.ActivityID>()
-        for (const row of interrupted) {
-          activities.add(row.activityID)
-          yield* emit(
-            "invocation.interrupted",
-            events.publish(OxpActivityContract.Event.InvocationSettled, {
-              activityID: row.activityID,
-              invocationID: row.id,
-            }),
-          )
-        }
-        for (const activityID of activities) {
-          yield* emit(
-            "updated",
-            events.publish(OxpActivityContract.Event.Updated, { activityID }),
-          )
-        }
-        return interrupted.length
-      },
-    )
+      const activities = new Set<OxpActivitySchema.ActivityID>()
+      for (const row of interrupted) {
+        activities.add(row.activityID)
+        yield* emit(
+          "invocation.interrupted",
+          events.publish(OxpActivityContract.Event.InvocationSettled, {
+            activityID: row.activityID,
+            invocationID: row.id,
+          }),
+        )
+      }
+      for (const activityID of activities) {
+        yield* emit("updated", events.publish(OxpActivityContract.Event.Updated, { activityID }))
+      }
+      return interrupted.length
+    })
 
     const rename = Effect.fn("OxpActivity.rename")(function* (
       id: OxpActivitySchema.ActivityID,
       title: string | undefined,
     ) {
-      const next =
-        title === undefined
-          ? null
-          : bounded(title.trim(), 256, "title") ?? null
-      const changed = yield* db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            const row = yield* tx
-              .select({ id: OxpParentActivityTable.id })
-              .from(OxpParentActivityTable)
-              .where(eq(OxpParentActivityTable.id, id))
-              .get()
-              .pipe(Effect.orDie)
-            if (!row) return false
-            yield* tx
-              .update(OxpParentActivityTable)
-              .set({ title: next })
-              .where(eq(OxpParentActivityTable.id, id))
-              .run()
-              .pipe(Effect.orDie)
-            return true
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
-      if (changed) {
-        yield* emit(
-          "renamed",
-          events.publish(OxpActivityContract.Event.Updated, { activityID: id }),
+      const next = title === undefined ? null : (bounded(title.trim(), 256, "title") ?? null)
+      const changed = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const row = yield* tx
+                .select({ id: OxpParentActivityTable.id })
+                .from(OxpParentActivityTable)
+                .where(eq(OxpParentActivityTable.id, id))
+                .get()
+                .pipe(Effect.orDie)
+              if (!row) return false
+              yield* tx
+                .update(OxpParentActivityTable)
+                .set({ title: next })
+                .where(eq(OxpParentActivityTable.id, id))
+                .run()
+                .pipe(Effect.orDie)
+              return true
+            }),
+          { behavior: "immediate" },
         )
+        .pipe(Effect.orDie)
+      if (changed) {
+        yield* emit("renamed", events.publish(OxpActivityContract.Event.Updated, { activityID: id }))
       }
       return changed
     })
 
-    const archive = Effect.fn("OxpActivity.archive")(function* (
-      id: OxpActivitySchema.ActivityID,
-      archived: boolean,
-    ) {
-      const changed = yield* db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            const row = yield* tx
-              .select({ id: OxpParentActivityTable.id })
-              .from(OxpParentActivityTable)
-              .where(eq(OxpParentActivityTable.id, id))
-              .get()
-              .pipe(Effect.orDie)
-            if (!row) return false
-            yield* tx
-              .update(OxpParentActivityTable)
-              .set({ time_archived: archived ? Date.now() : null })
-              .where(eq(OxpParentActivityTable.id, id))
-              .run()
-              .pipe(Effect.orDie)
-            return true
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
-      if (changed) {
-        yield* emit(
-          "archived",
-          events.publish(OxpActivityContract.Event.Updated, { activityID: id }),
+    const archive = Effect.fn("OxpActivity.archive")(function* (id: OxpActivitySchema.ActivityID, archived: boolean) {
+      const changed = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const row = yield* tx
+                .select({ id: OxpParentActivityTable.id })
+                .from(OxpParentActivityTable)
+                .where(eq(OxpParentActivityTable.id, id))
+                .get()
+                .pipe(Effect.orDie)
+              if (!row) return false
+              yield* tx
+                .update(OxpParentActivityTable)
+                .set({ time_archived: archived ? Date.now() : null })
+                .where(eq(OxpParentActivityTable.id, id))
+                .run()
+                .pipe(Effect.orDie)
+              return true
+            }),
+          { behavior: "immediate" },
         )
+        .pipe(Effect.orDie)
+      if (changed) {
+        yield* emit("archived", events.publish(OxpActivityContract.Event.Updated, { activityID: id }))
       }
       return changed
     })
 
-    const deleteHistory = Effect.fn("OxpActivity.deleteHistory")(function* (
-      id: OxpActivitySchema.ActivityID,
-    ) {
-      const deleted = yield* db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            const row = yield* tx
-              .select({ id: OxpParentActivityTable.id })
-              .from(OxpParentActivityTable)
-              .where(eq(OxpParentActivityTable.id, id))
-              .get()
-              .pipe(Effect.orDie)
-            if (!row) return false
-            yield* tx
-              .delete(OxpParentActivityTable)
-              .where(eq(OxpParentActivityTable.id, id))
-              .run()
-              .pipe(Effect.orDie)
-            return true
-          }),
-        { behavior: "immediate" },
-      ).pipe(Effect.orDie)
+    const deleteHistory = Effect.fn("OxpActivity.deleteHistory")(function* (id: OxpActivitySchema.ActivityID) {
+      const deleted = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const row = yield* tx
+                .select({ id: OxpParentActivityTable.id })
+                .from(OxpParentActivityTable)
+                .where(eq(OxpParentActivityTable.id, id))
+                .get()
+                .pipe(Effect.orDie)
+              if (!row) return false
+              yield* tx.delete(OxpParentActivityTable).where(eq(OxpParentActivityTable.id, id)).run().pipe(Effect.orDie)
+              return true
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
       if (deleted) {
-        yield* emit(
-          "removed",
-          events.publish(OxpActivityContract.Event.Removed, { activityID: id }),
-        )
+        OxpAttributionRevision.advance()
+        yield* emit("removed", events.publish(OxpActivityContract.Event.Removed, { activityID: id }))
       }
       return deleted
     })
@@ -706,4 +665,3 @@ export const node = makeGlobalNode({
   layer,
   deps: [Database.node, EventV2.node],
 })
-

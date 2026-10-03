@@ -766,6 +766,9 @@ describe("SessionSearch V1 part search", () => {
       expect(match.sessionTitle).toBe("V1 session title")
       expect(match.type).toBe("user")
       expect(match.snippet).toContain("conversations")
+      expect(result.partMatches).toMatchObject([
+        { partID: "prt_v1_text", partType: "text", role: "user", sessionID: created.id },
+      ])
     }),
   )
 

@@ -128,6 +128,8 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       "session.next.moved": () => Effect.void,
       // Execution policy is Session state, not conversational history.
       "session.next.execution-boundary.updated": () => Effect.void,
+      // Exact-input completion is projected by SessionInput, not into history.
+      "session.next.input.completed": () => Effect.void,
       "session.next.prompted": (event) => {
         return adapter.appendMessage(
           SessionMessage.User.make({

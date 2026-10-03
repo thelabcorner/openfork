@@ -234,6 +234,13 @@ export const make = Effect.gen(function* () {
     Effect.suspend(() => {
       let sink: Sink.Sink<void, unknown, never, PlatformError.PlatformError> = Sink.drain
       if (Predicate.isNotNull(proc.stdin)) {
+        // Node treats an emitted "error" with no listener as an uncaught
+        // exception. NodeSink owns a listener only while a concrete sink run is
+        // alive; callers may interrupt a backpressured write while this process
+        // handle remains owned. Keep one process-lifetime observer installed so
+        // a later EPIPE during retirement cannot escape the process abstraction.
+        // Active NodeSink runs still receive the error through their own listener.
+        proc.stdin.on("error", () => {})
         sink = NodeSink.fromWritable({
           evaluate: () => proc.stdin!,
           onError: (err) => toPlatformError("fromWritable(stdin)", toError(err), command),
@@ -432,8 +439,23 @@ export const make = Effect.gen(function* () {
             }),
             kill: (opts?: ChildProcess.KillOptions) => {
               const sig = opts?.killSignal ?? "SIGTERM"
-              const send = (s: NodeJS.Signals) =>
+              const deliver = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+              const send = (s: NodeJS.Signals) =>
+                Deferred.isDone(signal).pipe(
+                  Effect.flatMap((done) => {
+                    if (done) return Effect.void
+                    return deliver(s).pipe(
+                      Effect.catch((error) =>
+                        Deferred.isDone(signal).pipe(
+                          Effect.flatMap((doneAfterDelivery) =>
+                            doneAfterDelivery ? Effect.void : Effect.fail(error),
+                          ),
+                        ),
+                      ),
+                    )
+                  }),
+                )
               const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               if (!opts?.forceKillAfter) return attempt
               return Effect.timeoutOrElse(attempt, {

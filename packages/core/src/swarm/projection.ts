@@ -35,6 +35,21 @@ export function hydrateInfo(row: typeof SwarmTable.$inferSelect): Swarm.Info {
 }
 
 export function hydrateMember(row: typeof SwarmMemberTable.$inferSelect): Swarm.Member {
+  // `desired_profile` is raw JSON written before Swarm.ModelRequirement was a
+  // closed vocabulary, so historical rows still carry the retired
+  // `requestedCapabilities` key. This is the single durable->contract boundary
+  // that converts it: recognized runtime aliases migrate, recognized routing tags
+  // are reported, and anything unrecognized is surfaced as a fail-closed signal
+  // instead of being silently dropped (which would weaken a real old
+  // constraint) or honored as a requirement (which would strand the member).
+  const normalized = Swarm.normalizeLegacyExecutionProfile(row.desired_profile)
+  const legacy =
+    normalized.routingTags.length === 0 && normalized.unproven.length === 0
+      ? {}
+      : {
+          ...(normalized.routingTags.length === 0 ? {} : { legacyRoutingTags: normalized.routingTags }),
+          ...(normalized.unproven.length === 0 ? {} : { legacyUnprovenRequirements: normalized.unproven }),
+        }
   return {
     id: row.id,
     swarmID: row.swarm_id,
@@ -44,9 +59,11 @@ export function hydrateMember(row: typeof SwarmMemberTable.$inferSelect): Swarm.
     lifecycle: row.lifecycle,
     sessionID: row.session_id ?? undefined,
     bindingGeneration: row.binding_generation,
-    desiredProfile: row.desired_profile ?? undefined,
+    desiredProfile: row.desired_profile === null ? undefined : normalized.profile,
     workspacePolicy: row.workspace_policy,
-    capabilities: row.capabilities ?? undefined,
+    capabilities: row.capabilities || Object.keys(legacy).length > 0
+      ? ({ ...(row.capabilities ?? { tags: [] }), ...legacy } as Swarm.MemberCapabilities)
+      : undefined,
     time: {
       created: DateTime.makeUnsafe(row.time_created),
       updated: DateTime.makeUnsafe(row.time_updated),
@@ -121,6 +138,7 @@ export function hydrateTaskRun(row: typeof SwarmTaskRunTable.$inferSelect): Swar
     status: row.status,
     failureKind: row.failure_kind ?? undefined,
     failureDetail: row.failure_detail ?? undefined,
+    resultSummary: row.result_summary ?? undefined,
     admittedAt: row.admitted_at == null ? undefined : DateTime.makeUnsafe(row.admitted_at),
     startedAt: row.started_at == null ? undefined : DateTime.makeUnsafe(row.started_at),
     endedAt: row.ended_at == null ? undefined : DateTime.makeUnsafe(row.ended_at),

@@ -147,6 +147,8 @@ export type SemanticPruneOutcome = {
   readonly hasMore: boolean
   readonly indexBackfilled: number
   readonly indexComplete: boolean
+  readonly indexCursor?: number
+  readonly indexUpper?: number
   readonly canonicalValuesDeleted: number
   readonly canonicalBytesReclaimed: number
   readonly dependencyBackfilled: number
@@ -900,7 +902,9 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
       compatibilityRejected: 0,
       hasMore: true,
       indexBackfilled: backfill.indexed,
-      indexComplete: false,
+      indexComplete: backfill.complete,
+      indexCursor: backfill.cursor,
+      indexUpper: backfill.upper,
       canonicalValuesDeleted: 0,
       canonicalBytesReclaimed: 0,
       dependencyBackfilled: dependency.indexed,

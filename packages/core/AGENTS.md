@@ -15,6 +15,16 @@ location-scoped runtime services. UI demand may reveal that Core needs a new
 projection, but UI code must not define the computation by reconstructing Core
 state from rendered artifacts.
 
+## Goal Mode
+
+`../../docs/architecture/goal-mode.md` is the canonical Goal execution
+contract. Goal Mode is intrinsically autonomous and has no continuation-policy
+dimension. A runnable Goal keeps cycling worker → auditor → worker until
+independently complete or genuinely blocked. Do not reintroduce per-Goal
+manual/auto/unattended modes, turn/no-progress/token ceilings, blocked streaks,
+or an auditor terminal-fail verdict. `goal_automation` stores recovery/
+reservation state only.
+
 ## Bottom-up ownership
 
 - Start from the domain producer or durable table, then expose the smallest

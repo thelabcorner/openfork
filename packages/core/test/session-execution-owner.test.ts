@@ -161,6 +161,24 @@ const setupRecovery = (
   })
 
 describe("SessionExecutionOwner", () => {
+  it.effect("lists globally working sessions from durable ownership without location services", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const owner = yield* SessionExecutionOwner.Service
+
+      let working = yield* owner.listWorking()
+      expect([...working]).toEqual([])
+      const acquired = yield* owner.tryAcquire(sessionID)
+      if (acquired.state !== "acquired") return yield* Effect.die("expected acquisition")
+      working = yield* owner.listWorking()
+      expect([...working]).toEqual([[sessionID, { type: "busy" }]])
+
+      expect(yield* owner.release(acquired.token)).toBe("released")
+      working = yield* owner.listWorking()
+      expect([...working]).toEqual([])
+    }),
+  )
+
   it.effect("uses one process incarnation across multiple strong retains", () =>
     Effect.gen(function* () {
       const runtime = yield* RuntimeOwner.Service
@@ -331,6 +349,12 @@ describe("SessionExecutionOwner", () => {
       if (acquired.state !== "acquired") return yield* Effect.die("expected acquisition")
       const before = yield* runtime.snapshot(runtime.id)
 
+      expect(yield* owner.requestInterrupt(sessionID, "operator", acquired.token.generation - 1)).toMatchObject({
+        state: "stale",
+        snapshot: { generation: acquired.token.generation, ownerID: acquired.token.ownerID },
+      })
+      expect((yield* runtime.snapshot(runtime.id))?.controlEpoch).toBe(before?.controlEpoch)
+
       expect(yield* owner.requestInterrupt(sessionID, "handoff")).toMatchObject({
         state: "requested",
         token: acquired.token,
@@ -363,6 +387,36 @@ describe("SessionExecutionOwner", () => {
         "not-local-or-unknown",
       )
       yield* retention.release
+    }),
+  )
+
+  it.effect("shares one process-local activation and heals only an unregistered same-runtime owner", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const owner = yield* SessionExecutionOwner.Service
+
+      const first = yield* owner.tryAcquireLocal(sessionID)
+      expect(first.state).toBe("acquired")
+      if (first.state !== "acquired") return
+      expect(yield* owner.localActivation(sessionID)).toEqual(first.token)
+
+      const joined = yield* owner.tryAcquireLocal(sessionID)
+      expect(joined).toMatchObject({
+        state: "busy",
+        snapshot: { generation: first.token.generation, ownerID: first.token.ownerID },
+      })
+
+      expect(yield* owner.release(first.token)).toBe("released")
+      expect(yield* owner.localActivation(sessionID)).toBeUndefined()
+
+      const raw = yield* owner.tryAcquire(sessionID)
+      if (raw.state !== "acquired") return yield* Effect.die("expected raw orphan acquisition")
+      const healed = yield* owner.tryAcquireLocal(sessionID)
+      expect(healed.state).toBe("acquired")
+      if (healed.state === "acquired") {
+        expect(healed.token.generation).toBe(raw.token.generation + 1)
+        expect(yield* owner.release(healed.token)).toBe("released")
+      }
     }),
   )
 })
@@ -440,6 +494,30 @@ describe("SessionExecutionOwner recovery fencing", () => {
       expect(yield* owner.snapshot(sessionID)).toMatchObject({
         recoveryOwnerID: liveRecoveryOwnerID,
       })
+    }),
+  )
+
+  recoveryIt.effect("ordinary release cannot erase an active recovery claim", () =>
+    Effect.gen(function* () {
+      yield* setupRecovery(deadExecutionOwnerID)
+      const owner = yield* SessionExecutionOwner.Service
+
+      const claimed = yield* owner.tryClaimRecovery(sessionID)
+      if (claimed.state !== "claimed") return yield* Effect.die("expected recovery claim")
+      const executionToken: SessionExecutionOwner.Token = {
+        sessionID,
+        ownerID: deadExecutionOwnerID,
+        generation: 7,
+      }
+
+      expect(yield* owner.releaseIfDrained(executionToken)).toBe("stale")
+      expect(yield* owner.release(executionToken)).toBe("stale")
+      expect(yield* owner.snapshot(sessionID)).toMatchObject({
+        ownerID: deadExecutionOwnerID,
+        generation: 7,
+        recoveryOwnerID: claimed.token.recoveryOwnerID,
+      })
+      expect(yield* owner.abandonRecovery(claimed.token)).toBe("released")
     }),
   )
 

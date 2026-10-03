@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { mkdtemp } from "node:fs/promises"
+import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { deflateRawSync } from "node:zlib"
-import { WakaTime } from "@opencode-ai/core/wakatime"
+import { resolveWakaTimeHome, WakaTime } from "@opencode-ai/core/wakatime"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect } from "effect"
 
@@ -49,9 +49,11 @@ const scenarios = [
   "signed-deltas",
   "project-folder",
   "replay-dedupe",
+  "principal-source-ref-not-replay-token",
   "replay-evicted-recovers",
   "replay-coalesced-recovers",
   "flush-session",
+  "flush-session-clears-urgency-marker",
   "request-flush-session",
   "request-flush-unrelated-session",
   "flush-clears-urgency-markers",
@@ -59,15 +61,26 @@ const scenarios = [
   "pending-session-index-accounting",
   "request-many-sessions-one-scheduler",
   "queue-not-held-during-delivery",
+  "automatic-project-fairness",
+  "same-key-reenqueue-inflight",
+  "permit-wait-interruption-releases-replay",
+  "cli-attempt-failure-semantics",
   "single-scheduler-burst",
   "delivery-limiter",
+  "delivery-limiter-restart-state",
   "project-window-bound",
   "cross-project-batch",
+  "source-attribution-batch",
+  "source-attribution-limiter",
   "managed-http-byte-bounds",
   "managed-cli-stays-offline",
   "managed-cli-freshness",
   "managed-cli-update-failure",
   "enable-prepares-managed-cli",
+  "env-disable-skips-cli-prepare",
+  "enable-reuses-override-cli",
+  "enable-reuses-system-cli",
+  "enable-reuses-managed-cli",
   "unauthenticated-no-delivery",
   "coding-activity-single-consumer",
   "set-enabled",
@@ -90,16 +103,33 @@ async function runScenario(name: (typeof scenarios)[number]) {
     stderr: "pipe",
     env: { ...process.env, XDG_STATE_HOME: state, XDG_CACHE_HOME: cache },
   })
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ])
-  if (exitCode !== 0) throw new Error(`scenario ${name} failed (exit ${exitCode})\n${stdout}\n${stderr}`)
-  return stdout
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    if (exitCode !== 0) throw new Error(`scenario ${name} failed (exit ${exitCode})\n${stdout}\n${stderr}`)
+    return stdout
+  } finally {
+    await Promise.all([
+      rm(state, { recursive: true, force: true }),
+      rm(cache, { recursive: true, force: true }),
+    ])
+  }
 }
 
 describe("WakaTime process-global exporter", () => {
+  test("resolves WAKATIME_HOME with official tilde semantics", () => {
+    const home = path.join("root", "operator")
+    expect(resolveWakaTimeHome(undefined, home)).toBe(home)
+    expect(resolveWakaTimeHome("", home)).toBe(home)
+    expect(resolveWakaTimeHome("~", home)).toBe(home)
+    expect(resolveWakaTimeHome("~/wakatime", home)).toBe(path.join(home, "wakatime"))
+    expect(resolveWakaTimeHome("~\\wakatime", home)).toBe(path.join(home, "wakatime"))
+    expect(resolveWakaTimeHome("  /explicit/wakatime  ", home)).toBe("/explicit/wakatime")
+  })
+
   for (const name of scenarios) {
     // A scenario drives real coalescing windows and, for the managed-CLI cases,
     // real persistence and atomic replacement, so the default 5s cap is too
@@ -218,6 +248,7 @@ describe("WakaTime activity projection", () => {
       aiSession: "ses_alpha",
       source: "session",
       sourceRef: "call_01",
+      replayToken: "event_01",
     })
 
     expect(projected).toEqual({
@@ -231,6 +262,7 @@ describe("WakaTime activity projection", () => {
       aiSession: "ses_alpha",
       source: "session",
       sourceRef: "call_01",
+      replayToken: "event_01",
       kind: "write",
       // The observation's own moment, not the projection time.
       time: 1_700_000_000_000,
@@ -249,6 +281,9 @@ describe("WakaTime activity projection", () => {
     // entirely rather than derived from the display name or a working directory.
     expect(projected).not.toHaveProperty("projectFolder")
     expect(projected.projectFolder).toBeUndefined()
+    expect(WakaTime.neutralCwd(path.join(path.parse(process.cwd()).root, "users", "operator"))).toBe(
+      path.parse(process.cwd()).root,
+    )
   })
 
   test("coalescing keeps write state sticky and merges signed deltas arithmetically", () => {
@@ -296,32 +331,52 @@ describe("WakaTime activity projection", () => {
 })
 
 describe("WakaTime plugin identity", () => {
-  test("names the canonical client and the installation version", () => {
-    expect(WakaTime.pluginIdentifier("desktop")).toBe(`openfork-desktop/${InstallationVersion}`)
-    expect(WakaTime.pluginIdentifier("cli")).toBe(`openfork-cli/${InstallationVersion}`)
+  test("separates OpenFork, OXP, and OFXP behind one stable integration token", () => {
+    expect(WakaTime.pluginIdentifier()).toBe(
+      `openfork/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+    )
+    expect(WakaTime.pluginIdentifier("openfork-oxp")).toBe(
+      `openfork-oxp/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+    )
+    expect(WakaTime.pluginIdentifier("openfork-ofxp")).toBe(
+      `openfork-ofxp/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+    )
+    expect(WakaTime.attribution({ source: "oxp" })).toBe("openfork-oxp")
+    expect(WakaTime.attribution({ source: "ofxp" })).toBe("openfork-ofxp")
+    expect(WakaTime.attribution({ source: "session" })).toBe("openfork")
+    expect(WakaTime.attribution({ source: "special-agent" })).toBe("openfork")
+    expect(WakaTime.attribution({})).toBe("openfork")
   })
 
-  test("sanitizes the client into a stable identity token", () => {
-    // WakaTime parses this as `name/version`, so a separator or whitespace in the
-    // client would corrupt that grammar and split the identity.
-    expect(WakaTime.pluginIdentifier("my client/v2")).toBe(`openfork-my-client-v2/${InstallationVersion}`)
-    expect(WakaTime.pluginIdentifier("  spaced  ")).toBe(`openfork-spaced/${InstallationVersion}`)
-    // Never an empty segment, even for a wholly unusable value.
-    expect(WakaTime.pluginIdentifier("   ")).toBe(`openfork-cli/${InstallationVersion}`)
-    expect(WakaTime.pluginIdentifier("///")).toBe(`openfork-cli/${InstallationVersion}`)
-  })
-
-  test("reads the canonical process client and never a per-session one", () => {
+  test("carrier client changes cannot fragment source attribution", () => {
     const previous = process.env.OPENCODE_CLIENT
     try {
       process.env.OPENCODE_CLIENT = "acp"
-      expect(WakaTime.pluginIdentifier()).toBe(`openfork-acp/${InstallationVersion}`)
+      expect(WakaTime.pluginIdentifier()).toBe(
+        `openfork/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+      )
+      expect(WakaTime.pluginIdentifier("openfork-oxp")).toBe(
+        `openfork-oxp/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+      )
       delete process.env.OPENCODE_CLIENT
-      expect(WakaTime.pluginIdentifier()).toBe(`openfork-cli/${InstallationVersion}`)
+      expect(WakaTime.pluginIdentifier()).toBe(
+        `openfork/${InstallationVersion} openfork-wakatime/${InstallationVersion}`,
+      )
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_CLIENT
       else process.env.OPENCODE_CLIENT = previous
     }
+  })
+
+  test("delivery grouping separates attribution without splitting the project limiter", () => {
+    const base: WakaTime.Activity = { entity: "/repo/a.ts", projectFolder: "/repo" }
+    const native = { ...base, source: "session" as const }
+    const oxp = { ...base, source: "oxp" as const }
+    const ofxp = { ...base, source: "ofxp" as const }
+    expect(WakaTime.projectKey(native)).toBe(WakaTime.projectKey(oxp))
+    expect(WakaTime.projectKey(oxp)).toBe(WakaTime.projectKey(ofxp))
+    expect(WakaTime.deliveryGroupKey(native)).not.toBe(WakaTime.deliveryGroupKey(oxp))
+    expect(WakaTime.deliveryGroupKey(oxp)).not.toBe(WakaTime.deliveryGroupKey(ofxp))
   })
 })
 
@@ -330,17 +385,23 @@ describe("WakaTime replay and project identity", () => {
     entity: "/repo/a.ts",
     source: "session",
     aiSession: "ses_a",
-    sourceRef: "call_01",
+    sourceRef: "actor_alpha",
+    replayToken: "call_01",
     kind: "write",
   }
 
-  test("only an authoritative reference makes a record eligible for replay suppression", () => {
+  test("only a producer-proven replay token makes a record eligible for replay suppression", () => {
     expect(WakaTime.replayKey(base)).toBeTruthy()
-    // Without a reference there is no proof two records are the same event, and
+    // Actor identity is deliberately insufficient: one principal can perform
+    // many legitimate observations on the same file.
+    expect(WakaTime.replayKey({ ...base, replayToken: undefined })).toBeUndefined()
+    expect(WakaTime.replayKey({ ...base, replayToken: "   " })).toBeUndefined()
+    expect(
+      WakaTime.replayKey({ entity: "/repo/a.ts", source: "ofxp", sourceRef: "ofxp:peer:principal", kind: "write" }),
+    ).toBeUndefined()
+    // Without a token there is no proof two records are the same event, and
     // dropping a legitimate repeat would lose real coding time.
     expect(WakaTime.replayKey({ entity: "/repo/a.ts", source: "session", kind: "write" })).toBeUndefined()
-    expect(WakaTime.replayKey({ ...base, sourceRef: undefined })).toBeUndefined()
-    expect(WakaTime.replayKey({ ...base, sourceRef: "   " })).toBeUndefined()
   })
 
   test("the replay identity separates producer, session, entity, and kind", () => {
@@ -350,15 +411,16 @@ describe("WakaTime replay and project identity", () => {
     expect(WakaTime.replayKey({ ...base, aiSession: "ses_b" })).not.toBe(key)
     expect(WakaTime.replayKey({ ...base, entity: "/repo/b.ts" })).not.toBe(key)
     expect(WakaTime.replayKey({ ...base, kind: "read" })).not.toBe(key)
-    expect(WakaTime.replayKey({ ...base, sourceRef: "call_02" })).not.toBe(key)
+    expect(WakaTime.replayKey({ ...base, sourceRef: "actor_beta" })).toBe(key)
+    expect(WakaTime.replayKey({ ...base, replayToken: "call_02" })).not.toBe(key)
   })
 
   test("falls back to the write flag when no kind was recorded", () => {
-    expect(WakaTime.replayKey({ entity: "/repo/a.ts", sourceRef: "call_01", isWrite: true })).toBe(
-      WakaTime.replayKey({ entity: "/repo/a.ts", sourceRef: "call_01", kind: "write" }),
+    expect(WakaTime.replayKey({ entity: "/repo/a.ts", replayToken: "call_01", isWrite: true })).toBe(
+      WakaTime.replayKey({ entity: "/repo/a.ts", replayToken: "call_01", kind: "write" }),
     )
-    expect(WakaTime.replayKey({ entity: "/repo/a.ts", sourceRef: "call_01" })).toBe(
-      WakaTime.replayKey({ entity: "/repo/a.ts", sourceRef: "call_01", kind: "read" }),
+    expect(WakaTime.replayKey({ entity: "/repo/a.ts", replayToken: "call_01" })).toBe(
+      WakaTime.replayKey({ entity: "/repo/a.ts", replayToken: "call_01", kind: "read" }),
     )
   })
 
@@ -373,6 +435,38 @@ describe("WakaTime replay and project identity", () => {
       WakaTime.projectKey({ entity: "/other/b.ts", projectFolder: "/other" }),
     )
   })
+
+  test("persists only bounded hashed project delivery windows", () => {
+    const now = 1_000_000
+    const alpha = WakaTime.deliveryWindowKey("/alpha/private/project")
+    const beta = WakaTime.deliveryWindowKey("/beta/private/project")
+    expect(alpha).toMatch(/^[0-9a-f]{64}$/)
+    expect(beta).toMatch(/^[0-9a-f]{64}$/)
+    expect(alpha).not.toBe(beta)
+    expect(alpha).not.toContain("alpha")
+
+    const parsed = WakaTime.parseDeliveryState(
+      {
+        version: 1,
+        windows: [
+          { key: alpha, at: now - 1_000 },
+          { key: alpha, at: now - 500 },
+          { key: beta, at: now + 50_000 },
+          { key: WakaTime.deliveryWindowKey("/stale"), at: now - WakaTime.MIN_DELIVERY_INTERVAL_MS },
+          { key: "/raw/project/path", at: now - 100 },
+          { key: "not-a-hash", at: now - 100 },
+          { key: WakaTime.deliveryWindowKey("/invalid-time"), at: Number.NaN },
+        ],
+      },
+      now,
+    )
+    expect(parsed).toEqual([
+      { key: alpha, at: now - 500 },
+      { key: beta, at: now },
+    ])
+    expect(JSON.stringify(parsed)).not.toContain("/alpha/private/project")
+    expect(WakaTime.normalizeDeliveryWindows([{ key: alpha, at: now }], now, 60_000, 0)).toEqual([])
+  })
 })
 
 describe("WakaTime delivery limiting and session-selective flush", () => {
@@ -381,9 +475,25 @@ describe("WakaTime delivery limiting and session-selective flush", () => {
     // The hold branch must be evaluated before anything is taken, otherwise a
     // throttled project would be dropped instead of delayed.
     expect(body).toContain("if (remaining > 0)")
-    expect(body).toContain("heldUntil = Math.max(heldUntil, remaining)")
-    expect(body.indexOf("heldUntil = Math.max")).toBeLessThan(body.indexOf("ready.push(activity)"))
-    expect(body).toContain("dropPending(key, true)")
+    expect(body).toContain("heldUntil = heldUntil === 0 ? remaining : Math.min(heldUntil, remaining)")
+    expect(body.indexOf("Math.min(heldUntil, remaining)")).toBeLessThan(body.indexOf("takePending(key)"))
+    expect(body).toContain("ready.push(taken)")
+    expect(body).not.toContain("dropPending(key, true)")
+  })
+
+  test("automatic delivery yields after one project while keeping its attribution siblings together", async () => {
+    expect(WakaTime.MAX_AUTOMATIC_PROJECTS_PER_RUN).toBe(1)
+    const text = await source()
+    const take = section(text, "const takeEligible = Effect.sync(() => {", "const takeForSession")
+    expect(take).toContain("const selectedProjects = new Set<string>()")
+    expect(take).toContain("selectedProjects.size >= MAX_AUTOMATIC_PROJECTS_PER_RUN")
+    expect(take).toContain("moreReady = true")
+    // A project already selected remains eligible after the cap is reached, so
+    // OpenFork/OXP/OFXP groups for that project stay in the same delivery turn.
+    expect(take.indexOf("!selectedProjects.has(project)")).toBeLessThan(take.indexOf("selectedProjects.add(project)"))
+
+    const scheduler = section(text, "armLocked = Effect.fnUntraced", "const arm = (delayMs = DEBOUNCE_MS)")
+    expect(scheduler).toContain("const requestedWake = taken.moreReady ? 0 : wake")
   })
 
   test("a held window is rescheduled instead of retried or discarded", async () => {
@@ -398,7 +508,8 @@ describe("WakaTime delivery limiting and session-selective flush", () => {
     const flush = section(text, 'const flush: Interface["flush"]', 'const flushSession: Interface["flushSession"]')
     const session = section(text, 'const flushSession: Interface["flushSession"]', 'const clearTransientState')
     // Neither forced path consults the delivery window: the caller asked, so the
-    // request is honoured. Both still stamp it, because both spawn the CLI.
+    // request is honoured. Once prerequisites admit a real CLI attempt, both
+    // still stamp it through the common delivery path.
     expect(flush).not.toContain("lastDelivery")
     expect(session).not.toContain("lastDelivery")
     expect(session).toContain("takeForSession(sessionID)")
@@ -423,17 +534,19 @@ describe("WakaTime delivery limiting and session-selective flush", () => {
     expect(body).toContain("if (accepted > 0) yield* arm()")
   })
 
-  test("a delivery batch is partitioned per project before spawning", async () => {
+  test("a delivery batch is partitioned by project and attribution without splitting the limiter", async () => {
     const body = section(await source(), "const deliver = Effect.fnUntraced", "const cancelTimer")
-    expect(body).toContain("const groups = new Map<string, Activity[]>()")
-    expect(body).toContain("projectKey(activity)")
-    // One spawn per group, and the window is stamped per group so one project's
-    // delivery cannot consume another's budget.
-    expect(body).toContain("for (const [scope, group] of groups)")
-    expect(body).toContain("send(group)")
-    expect(body).toContain("openWindow(scope)")
-    // A single spawn for a mixed batch would file one project's time under
-    // another project's root.
+    expect(body).toContain("deliveryGroupKey(activity)")
+    expect(body).toContain("project: projectKey(activity)")
+    expect(body).toContain("const openedProjects = new Set<string>()")
+    expect(body).toContain("if (!openedProjects.has(group.project))")
+    expect(body).toContain("openWindow(group.project)")
+    expect(body).toContain("send(binary, group.items.map((item) => item.activity))")
+    // Replay state becomes durable only once prerequisites admit a real attempt.
+    expect(body.indexOf("prepareDelivery()")).toBeLessThan(body.indexOf("settle(group.items, true)"))
+    expect(body.indexOf("settle(group.items, true)")).toBeLessThan(body.indexOf("openWindow(group.project)"))
+    // A single spawn for a mixed batch would either file one project's time
+    // under another root or apply one attribution identity to another source.
     expect(body).not.toMatch(/send\(batch\)/)
     // Strictly sequential: no unbounded fan-out of concurrent CLI processes.
     expect(body).not.toContain("Effect.forEach")
@@ -515,7 +628,8 @@ describe("WakaTime bounded background state", () => {
     // The cap is enforced AFTER insertion, so the bound is a true hard cap and
     // the map never transiently exceeds it.
     const open = section(await source(), "const openWindow = (scope: string) => {", "const deliver")
-    expect(open.indexOf("lastDelivery.set(scope, at)")).toBeLessThan(open.indexOf("pruneWindows(at)"))
+    expect(open).toContain("lastDelivery.set(key, at)")
+    expect(open.indexOf("lastDelivery.set(key, at)")).toBeLessThan(open.indexOf("pruneWindows(at)"))
   })
 
   test("admission is pure process memory and delivery caches the config probe", async () => {
@@ -532,6 +646,11 @@ describe("WakaTime bounded background state", () => {
       "probeBinary",
       "fetch",
       "app.run",
+      "realPath",
+      "realpath",
+      "FSUtil",
+      "path.resolve",
+      "path.normalize",
     ]) {
       expect(record).not.toContain(forbidden)
     }
@@ -540,7 +659,8 @@ describe("WakaTime bounded background state", () => {
     // so a burst of coalescing windows costs no filesystem work.
     expect(text).toContain("const configuredCached = () => {")
     expect(text).toContain("CONFIG_PROBE_TTL_MS")
-    expect(section(text, "const send = Effect.fn", "const pruneWindows")).toContain("deliverableCached()")
+    expect(section(text, "const prepareDelivery = Effect.fn", "const send = Effect.fn")).toContain("deliverableCached()")
+    expect(section(text, "const send = Effect.fn", "const pruneWindows")).not.toContain("deliverableCached()")
     // A user-invoked status deliberately bypasses the cache.
     const status = section(text, 'const status: Interface["status"]', "const service: Interface")
     expect(status).toContain("configured()")
@@ -718,17 +838,22 @@ describe("WakaTime nonblocking session flush lifecycle", () => {
 
   test("every exit from the queue retires the session it owned exactly once", async () => {
     const text = await source()
-    // One removal path: unlinking an entry settles both of its consequences, so
-    // no exit can forget the session, the replay fingerprints, or either order.
-    const drop = section(text, "const dropPending = (key: string, delivered: boolean) => {", "const takeAll")
-    expect(drop).toContain("pending.delete(key)")
-    expect(drop).toContain("releasePendingReplay(key, delivered)")
-    expect(drop).toContain("releasePendingSession(activity)")
+    // One extraction path unlinks an entry, detaches replay ownership, and
+    // retires its session exactly once. Delivery outcome is settled separately
+    // only after that detached snapshot leaves the queue.
+    const take = section(text, "const takePending = (key: string): TakenActivity | undefined => {", "const dropPending")
+    expect(take).toContain("pending.delete(key)")
+    expect(take).toContain("detachPendingReplay(key)")
+    expect(take).toContain("releasePendingSession(activity)")
+    expect(take).toContain("return { activity, replayFingerprints }")
+    const drop = section(text, "const dropPending = (key: string, attempted: boolean) => {", "const takeAll")
+    expect(drop).toContain("const taken = takePending(key)")
+    expect(drop).toContain("settleTakenReplay(taken, attempted)")
     for (const [start, end] of [
       ["const takeEligible = Effect.sync(() => {", "const takeForSession"],
       ["const takeForSession = (sessionID: string) =>", "const deliver"],
     ] as const) {
-      expect(section(text, start, end)).toContain("dropPending(key, true)")
+      expect(section(text, start, end)).toContain("takePending(key)")
     }
     expect(
       section(text, 'const record: Interface["record"]', 'const flush: Interface["flush"]'),
@@ -782,11 +907,17 @@ describe("WakaTime nonblocking session flush lifecycle", () => {
     // The slot is released only after delivery, and the re-arm decision is made
     // exactly once, from the held deadline plus any deferred request.
     expect(arm.indexOf("timer !== undefined) timer = undefined")).toBeGreaterThan(arm.indexOf("deliver(taken.ready)"))
-    expect(arm).toContain("const requestedWake = wake")
+    expect(arm).toContain("const requestedWake = taken.moreReady ? 0 : wake")
     expect(arm).toContain("wake = undefined")
     expect(arm).toContain("decideNextDelay(requestedWake, taken.heldUntil)")
     // A cancelled scheduler cannot resurrect itself: ownership is proven by epoch.
     expect(arm).toContain("if (epoch !== ownedEpoch) {")
+    // Ownership must be checked BEFORE clearing the shared timer slot. A newer
+    // scheduler may have been installed after this fiber's epoch was invalidated;
+    // a stale fiber must return without erasing that replacement.
+    expect(arm.indexOf("if (epoch !== ownedEpoch) {")).toBeLessThan(
+      arm.indexOf("if (timer !== undefined) timer = undefined"),
+    )
     // The earlier of a held deadline and a deferred request wins, so a held
     // deadline is never pushed later by an arriving record.
     const decide = section(text, "const decideNextDelay = (requested", "let armLocked!")
@@ -822,7 +953,8 @@ describe("WakaTime nonblocking session flush lifecycle", () => {
     // A held record is still branched away from and left queued, so accelerating
     // one session never costs another.
     expect(take).toContain("heldUntil = Math.max(heldUntil, remaining)")
-    expect(take.indexOf("if (remaining > 0)")).toBeLessThan(take.indexOf("ready.push(activity)"))
+    expect(take.indexOf("if (remaining > 0)")).toBeLessThan(take.indexOf("takePending(key)"))
+    expect(take).toContain("ready.push(taken)")
   })
 
   test("a blank selector is a no-op on both session entry points", async () => {
@@ -1074,7 +1206,8 @@ describe("WakaTime managed CLI freshness", () => {
     // and stop telemetry, so the request is bounded in time around body
     // consumption too.
     expect(fetch).toContain("Effect.timeout(MANAGED_HTTP_TIMEOUT)")
-    expect(fetch.indexOf("response.arrayBuffer")).toBeLessThan(fetch.indexOf("Effect.timeout("))
+    expect(fetch).toContain("collectBoundedResponseBody(")
+    expect(fetch.indexOf("collectBoundedResponseBody(")).toBeLessThan(fetch.indexOf("Effect.timeout("))
     // Exactly two asset requests, issued together.
     const candidate = section(text, "const fetchVerifiedCandidate = Effect.fn", "const commitCandidate")
     expect(candidate).toContain("{ concurrency: 2 }")
@@ -1104,14 +1237,25 @@ describe("WakaTime managed CLI freshness", () => {
 
   test("queued replay ownership is bounded and released on both exits", async () => {
     const text = await source()
-    const release = section(text, "const releasePendingReplay = (key: string, delivered: boolean) => {", "const takeAll")
+    const detach = section(
+      text,
+      "const detachPendingReplay = (key: string) => {",
+      "const settleTakenReplay = (taken: TakenActivity, attempted: boolean) => {",
+    )
     // One entry may own several fingerprints, because several distinct
     // authoritative calls can coalesce onto it before delivery.
-    expect(release).toContain("for (const fingerprint of owned) {")
-    // Taken means delivered: the fingerprints stay in `seen` so later replays
-    // remain suppressed. Evicted means never delivered: all of them are freed.
-    expect(release).toContain("if (!delivered) seen.delete(fingerprint)")
-    expect(release).toContain("replayOwner.delete(fingerprint)")
+    expect(detach).toContain("const fingerprints = [...owned]")
+    expect(detach).toContain("replayOwner.delete(fingerprint)")
+    // Detachment alone never decides delivery outcome; that decision is delayed
+    // until the batch knows whether a real CLI attempt happened.
+    expect(detach).not.toContain("seen.delete(fingerprint)")
+    const settle = section(
+      text,
+      "const settleTakenReplay = (taken: TakenActivity, attempted: boolean) => {",
+      "const pendingSessionOf",
+    )
+    expect(settle).toContain("if (attempted) return")
+    expect(settle).toContain("seen.delete(fingerprint)")
 
     const record = section(text, 'const record: Interface["record"]', 'const flush: Interface["flush"]')
     // Ownership is recorded on accept, and a fingerprint evicted from the global
@@ -1126,17 +1270,25 @@ describe("WakaTime managed CLI freshness", () => {
     expect(record.indexOf("owned.add(fingerprint)")).toBeLessThan(record.indexOf("pending.set(key,"))
     expect(record).not.toMatch(/for \(const .* of owned\)/)
 
-    // Every exit from the queue detaches ownership. Delivery keeps the
-    // fingerprints; only eviction frees them.
-    expect(section(text, "const takeAll = Effect.sync(() => {", "const takeEligible")).toContain(
-      "releasePendingReplay(key, true)",
-    )
+    // Every exit from the queue moves ownership into a TakenActivity snapshot;
+    // no extraction path is allowed to pre-commit the entry as delivered.
+    expect(section(text, "const takeAll = Effect.sync(() => {", "const takeEligible")).toContain("takePending(key)")
     for (const [start, end] of [
       ["const takeEligible = Effect.sync(() => {", "const takeForSession"],
       ["const takeForSession = (sessionID: string) =>", "const deliver"],
     ] as const) {
-      expect(section(text, start, end)).toContain("dropPending(key, true)")
+      expect(section(text, start, end)).toContain("takePending(key)")
     }
+
+    const deliver = section(text, "const deliver = Effect.fnUntraced", "const cancelTimer")
+    // Missing prerequisites free every detached replay token and open no attempt
+    // semantics. Real groups are committed only at the delivery boundary, and
+    // interruption frees every group that never reached it.
+    expect(deliver).toContain("if (binary === undefined) {")
+    expect(deliver).toContain("settle(batch, false)")
+    expect(deliver).toContain("settle(group.items, true)")
+    expect(deliver).toContain("settle([...unsettled], false)")
+    expect(deliver.indexOf("prepareDelivery()")).toBeLessThan(deliver.indexOf("openWindow(group.project)"))
 
     // Total association membership cannot exceed the global replay bound,
     // because an owned fingerprint is always also present in `seen`.

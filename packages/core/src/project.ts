@@ -122,15 +122,21 @@ const layer = Layer.effect(
           vcs: undefined,
         }
       }
-      const repo = yield* git.repo.discover(input)
-      if (!repo) return { id: ID.global, directory: AbsolutePath.make(path.parse(input).root), vcs: undefined }
+      // Git discovery starts from the already-realpathed opening directory, not
+      // the caller's alias spelling. Canonicalize the discovered worktree once
+      // more at this project boundary because git's --show-toplevel output is
+      // lexical and can preserve a junction/symlink spelling on some platforms.
+      // Downstream consumers can then trust `Resolved.directory` without doing
+      // filesystem I/O on their own hot paths.
+      const repo = yield* git.repo.discover(AbsolutePath.make(opened))
+      if (!repo) return { id: ID.global, directory: AbsolutePath.make(path.parse(opened).root), vcs: undefined }
 
       const previous = yield* cached(repo.commonDirectory)
       const id = (yield* remote(repo)) ?? previous ?? (yield* root(repo))
       return {
         previous,
         id: id ?? ID.global,
-        directory: repo.worktree,
+        directory: AbsolutePath.make(FSUtil.resolve(repo.worktree)),
         vcs: { type: "git" as const, store: repo.commonDirectory },
       }
     })

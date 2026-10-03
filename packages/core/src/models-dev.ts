@@ -1,5 +1,5 @@
 import path from "path"
-import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Option, Schedule, Schema, Semaphore } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { ModelsDev } from "@opencode-ai/schema/models-dev"
 import { Model as ModelContract } from "@opencode-ai/schema/model"
@@ -155,6 +155,14 @@ export const Event = ModelsDev.Event
 declare const OPENCODE_MODELS_DEV: Record<string, Provider> | undefined
 
 export interface Interface {
+  /** Read only the local bundled/cache snapshot; never fetch the catalog. */
+  readonly getCached: () => Effect.Effect<Record<string, Provider>>
+  /**
+   * Resolve models.dev metadata for an explicitly selected provider. A cold
+   * empty catalog may populate once; a nonempty catalog miss is returned as-is
+   * so a typo or configured/custom provider never triggers an unrelated fetch.
+   */
+  readonly getForSelectedProvider: (providerID: string) => Effect.Effect<Record<string, Provider>>
   readonly get: () => Effect.Effect<Record<string, Provider>>
   readonly getDecisionModels: () => Effect.Effect<Record<string, Model>>
   readonly refresh: (force?: boolean) => Effect.Effect<void>
@@ -234,6 +242,15 @@ const layer = Layer.effect(
       typeof OPENCODE_MODELS_DEV === "undefined" ? undefined : OPENCODE_MODELS_DEV,
     )
 
+    const [cachedSnapshot, invalidateSnapshot] = yield* Effect.cachedInvalidateWithTTL(
+      Effect.gen(function* () {
+        const fromDisk = yield* loadFromDisk
+        if (fromDisk) return fromDisk
+        return (yield* loadSnapshot) ?? {}
+      }),
+      Duration.infinity,
+    )
+
     const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {
       const catalog = yield* fetchCatalog()
       const text = JSON.stringify(catalog)
@@ -260,13 +277,35 @@ const layer = Layer.effect(
       const catalog = yield* Effect.scoped(
         Effect.gen(function* () {
           yield* Flock.effect(lockKey)
+          // A concurrent explicit get or periodic refresh may have populated
+          // the file while this caller waited for the cross-process lock.
+          const disk = yield* loadFromDisk
+          if (disk) return disk
+          const snapshot = yield* loadSnapshot
+          if (snapshot) return snapshot
           return yield* fetchAndWrite()
         }),
       )
+      yield* invalidateSnapshot
       return catalog
     }).pipe(Effect.withSpan("ModelsDev.populate"), Effect.orDie)
 
-    const [cachedGet, invalidate] = yield* Effect.cachedInvalidateWithTTL(populate, Duration.infinity)
+    // Successful metadata is shared. A canceled/failed cold fetch must not
+    // cache its Exit forever and poison every later selected-provider demand.
+    const populationAdmission = yield* Semaphore.make(1)
+    let populated: Record<string, Provider> | undefined
+    let populationRevision = 0
+    const cachedGet = populationAdmission.withPermits(1)(Effect.gen(function* () {
+      if (populated) return populated
+      const revision = populationRevision
+      const value = yield* populate
+      if (revision === populationRevision) populated = value
+      return value
+    }))
+    const invalidate = Effect.sync(() => {
+      populationRevision++
+      populated = undefined
+    })
     const [cachedDecisionModels, invalidateDecisionModels] = yield* Effect.cachedInvalidateWithTTL(
       Flag.OPENCODE_DISABLE_MODELS_FETCH
         ? Effect.succeed({} as Record<string, Model>)
@@ -276,7 +315,19 @@ const layer = Layer.effect(
           ),
       Duration.infinity,
     )
+    const getCached = (): Effect.Effect<Record<string, Provider>> => cachedSnapshot
     const get = (): Effect.Effect<Record<string, Provider>> => cachedGet
+    const getForSelectedProvider = Effect.fn("ModelsDev.getForSelectedProvider")(function* (providerID: string) {
+      const cached = yield* getCached()
+      if (
+        Object.hasOwn(cached, providerID) ||
+        Object.keys(cached).length > 0 ||
+        Flag.OPENCODE_DISABLE_MODELS_FETCH
+      ) {
+        return cached
+      }
+      return yield* get()
+    })
     const getDecisionModels = (): Effect.Effect<Record<string, Model>> => cachedDecisionModels
 
     const refresh = Effect.fn("ModelsDev.refresh")(function* (force = false) {
@@ -289,6 +340,7 @@ const layer = Layer.effect(
           if (!force && (yield* fresh())) return
           yield* fetchAndWrite()
           yield* invalidate
+          yield* invalidateSnapshot
           yield* invalidateDecisionModels
           yield* events.publish(Event.Refreshed, {})
         }),
@@ -299,11 +351,16 @@ const layer = Layer.effect(
     })
 
     if (!Flag.OPENCODE_DISABLE_MODELS_FETCH && !process.argv.includes("--get-yargs-completions")) {
-      // Schedule.spaced runs the effect once, then waits between completions.
-      yield* Effect.forkScoped(refresh().pipe(Effect.repeat(Schedule.spaced("60 minutes")), Effect.ignore))
+      // Do not turn service construction into an implicit models.dev request.
+      // The first refresh is an explicit selected-provider demand or the TTL
+      // check after five minutes; subsequent maintenance remains hourly.
+      yield* Effect.sleep(ttl).pipe(
+        Effect.andThen(refresh().pipe(Effect.repeat(Schedule.spaced("60 minutes")), Effect.ignore)),
+        Effect.forkScoped,
+      )
     }
 
-    return Service.of({ get, getDecisionModels, refresh })
+    return Service.of({ getCached, getForSelectedProvider, get, getDecisionModels, refresh })
   }),
 )
 

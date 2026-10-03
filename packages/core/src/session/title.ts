@@ -12,7 +12,6 @@ import { EventV2 } from "../event"
 import { makeLocationNode } from "../effect/app-node"
 import { KeyedMutex } from "../effect/keyed-mutex"
 import { llmClient } from "../effect/app-node-platform"
-import { Integration } from "../integration"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
 import { SpecialAgentSession } from "../special-agent-session"
@@ -31,6 +30,8 @@ import { SessionMessage } from "./message"
 import { SessionTurnProvenance } from "./turn-provenance"
 import { SpecialAgentSessionContext } from "../special-agent-session-context"
 import { SessionRunnerModel } from "./runner/model"
+import { providerRequestHeaders } from "./runner/provider-request-headers"
+import type { UsageRouteAttribution } from "../usage/route-attribution"
 import { SessionSchema } from "./schema"
 import { SessionTable } from "./sql"
 import { SessionStore } from "./store"
@@ -154,7 +155,6 @@ const layer = Layer.effect(
     const store = yield* SessionStore.Service
     const config = yield* Config.Service
     const catalog = yield* Catalog.Service
-    const integrations = yield* Integration.Service
     const models = yield* SessionRunnerModel.Service
     const events = yield* EventV2.Service
     const specialAgents = yield* SpecialAgentSession.Service
@@ -188,44 +188,73 @@ const layer = Layer.effect(
         }),
       )
 
-    const resolveFromCatalog = Effect.fn("SessionTitle.resolveFromCatalog")(function* (ref: {
-      readonly providerID: ProviderV2.ID
-      readonly id: ModelV2.ID
-    }) {
+    const usageRoute = (
+      route: SessionRunnerModel.ResolvedInfo["route"],
+    ): UsageRouteAttribution.Committed | undefined =>
+      route?.routeKind === "account"
+        ? { routeKind: "account", accountID: route.accountID! }
+        : route?.routeKind === "public"
+          ? { routeKind: "public" }
+          : undefined
+
+    /**
+     * Resolve one candidate through the single route authority.
+     *
+     * The catalog lookup below is a pure capability gate, never a credential
+     * decision. Provider auth, Public eligibility, route health, and the
+     * committed route all come from `SessionRunnerModel.resolveWithInfo`, so a
+     * title generation can no longer pick a different account or provider than
+     * the one the Session already committed. The caller's ref is passed through
+     * whole, so an explicit `accountID` hard pin survives reconstruction instead
+     * of degrading into Auto selection.
+     */
+    const resolveCandidate = Effect.fn("SessionTitle.resolveCandidate")(function* (
+      session: SessionSchema.Info,
+      ref: Pick<ModelV2.Ref, "providerID" | "id" | "accountID" | "variant">,
+    ) {
       const model = yield* catalog.model.get(ref.providerID, ref.id)
       // Structured title completion is a hard transport requirement now. A
       // prose-only model can never satisfy generated_title, so do not select it
       // and then fail the request with a misleading 503. Let the cascade move
       // on to the next usable model instead.
       if (model === undefined || !model.capabilities.tools || !SessionRunnerModel.supported(model)) return undefined
-      const provider = yield* catalog.provider.get(ref.providerID)
-      const connection = yield* integrations.connection.active(
-        provider?.integrationID ?? Integration.ID.make(ref.providerID),
-      )
-      return yield* SessionRunnerModel.fromCatalogModel(
-        model,
-        connection ? yield* integrations.connection.resolve(connection) : undefined,
-      ).pipe(Effect.catchTag("SessionRunnerModel.UnsupportedApiError", () => Effect.succeed(undefined)))
+      const routed = yield* models
+        .resolveWithInfo({
+          ...session,
+          model: ModelV2.Ref.make({
+            providerID: ref.providerID,
+            id: ref.id,
+            ...(ref.accountID ? { accountID: ref.accountID } : {}),
+            ...(ref.variant ? { variant: ref.variant } : {}),
+          }),
+        })
+        .pipe(Effect.option)
+      return routed._tag === "Some" ? routed.value : undefined
     })
 
     const resolveModel = Effect.fn("SessionTitle.resolveModel")(function* (
       session: SessionSchema.Info,
       requestModel: ModelV2.Ref | undefined,
     ) {
+      // An explicitly requested model, the title agent's configured model, and
+      // the configured small_model are caller/config authority: they may own a
+      // separate provider-domain route. The automatic same-provider candidates
+      // and the final fallback inherit the Session's existing binding, so a
+      // title never silently re-selects provider auth.
       if (requestModel) {
-        const resolved = yield* resolveFromCatalog({ providerID: requestModel.providerID, id: requestModel.id })
+        const resolved = yield* resolveCandidate(session, requestModel)
         if (resolved) return resolved
       }
       const titleAgent = yield* agents.get(AgentV2.ID.make("title"))
       if (titleAgent?.model) {
-        const resolved = yield* resolveFromCatalog({ providerID: titleAgent.model.providerID, id: titleAgent.model.id })
+        const resolved = yield* resolveCandidate(session, titleAgent.model)
         if (resolved) return resolved
       }
       const smallModel = Config.latest(yield* config.entries(), "small_model")
       if (smallModel) {
         const [providerID, ...rest] = smallModel.split("/")
         if (providerID !== undefined && rest.length > 0) {
-          const resolved = yield* resolveFromCatalog({
+          const resolved = yield* resolveCandidate(session, {
             providerID: ProviderV2.ID.make(providerID),
             id: ModelV2.ID.make(rest.join("/")),
           })
@@ -235,11 +264,11 @@ const layer = Layer.effect(
       if (session.model) {
         const small = yield* catalog.model.small(session.model.providerID)
         if (small) {
-          const resolved = yield* resolveFromCatalog({ providerID: small.providerID, id: small.id })
+          const resolved = yield* resolveCandidate(session, { providerID: small.providerID, id: small.id })
           if (resolved) return resolved
         }
       }
-      return yield* models.resolve(session)
+      return yield* models.resolveWithInfo(session)
     })
 
     const applyTitle = Effect.fn("SessionTitle.applyTitle")(function* (input: {
@@ -308,7 +337,10 @@ const layer = Layer.effect(
       const context = assembleContext(messages)
       const entries = yield* config.entries()
       const configured = Config.latest(entries, "title_prompt")
-      const model = yield* resolveModel(session, input.model).pipe(
+      // One route decision. The same resolved route drives the physical request
+      // and the maintenance settlement below; nothing downstream may reselect
+      // a credential, an account, or a default.
+      const resolved = yield* resolveModel(session, input.model).pipe(
         Effect.catch(
           (error) =>
             new UnavailableError({
@@ -317,6 +349,8 @@ const layer = Layer.effect(
             }),
         ),
       )
+      const model = resolved.model
+      const usage = usageRoute(resolved.route)
       const titleAgent = yield* agents.get(AgentV2.ID.make("title"))
       const policySource =
         input.prompt?.trim() || configured?.trim() || titleAgent?.system?.trim() || DEFAULT_TITLE_PROMPT
@@ -361,6 +395,15 @@ const layer = Layer.effect(
       })
       const request = LLM.request({
         model,
+        http: {
+          headers: providerRequestHeaders({
+            providerID: model.provider,
+            projectID: session.projectID,
+            sessionID: session.id,
+            requestID: input.requestID,
+            parentSessionID: session.parentID,
+          }),
+        },
         system: [SystemPart.make(system)],
         messages: [Message.user(requestText)],
         tools: toDefinitions({ [GENERATED_TITLE_TOOL]: generatedTitleTool }),
@@ -486,7 +529,9 @@ const layer = Layer.effect(
             agent: "session_title",
             providerID: modelRef.providerID,
             modelID: modelRef.id,
+            ...(usage ? { route: usage } : {}),
             sessionID: session.id,
+            projectID: session.projectID,
             costEstimated: reported === undefined,
             tokens: {
               input: turn.tokens.input,
@@ -644,7 +689,6 @@ export const node = makeLocationNode({
     SessionStore.node,
     Config.node,
     Catalog.node,
-    Integration.node,
     SessionRunnerModel.node,
     Database.node,
     EventV2.node,

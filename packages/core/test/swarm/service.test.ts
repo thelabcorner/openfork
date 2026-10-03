@@ -206,6 +206,11 @@ describe("Swarm Core service", () => {
         ["child", sessionChild],
         ["producer", sessionProducer],
       ] as const) {
+        const preflightError = yield* service
+          .preflightMemberSession({ projectID, workspaceID, sessionID })
+          .pipe(Effect.flip)
+        expect(preflightError._tag).toBe("Swarm.ValidationError")
+
         const error = yield* service
           .addMember({
             swarmID: swarm.id,

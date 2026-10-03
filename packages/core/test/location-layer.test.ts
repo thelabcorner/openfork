@@ -17,6 +17,15 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
+import { ProviderPublicRouteHealthTable } from "@opencode-ai/core/provider-route-health.sql"
+import { ProviderRouteBindingTable } from "@opencode-ai/core/provider-route.sql"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  resetHostedCatalogForTest,
+  setHostedCatalogForTest,
+} from "@opencode-ai/core/plugin/provider/opencode-hosted"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 import { toolDefinitions } from "./lib/tool"
@@ -209,6 +218,161 @@ describe("LocationServiceMap", () => {
             providerID: "unavailable",
             modelID: "chat",
           })
+        }),
+      ),
+    ),
+  )
+
+  it.live("Core/current Public routing consumes durable route health before bind and recovers when health clears", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const { db, readDb } = yield* Database.Service
+          const directory = AbsolutePath.make(dir.path)
+          const location = Location.Ref.make({ directory })
+          const providerID = ProviderV2.ID.opencode
+          const modelID = ModelV2.ID.make("public-health-test")
+          const sessionID = SessionV2.ID.make("ses_core_public_health")
+          const now = Date.now()
+
+          yield* db
+            .insert(ProjectTable)
+            .values({
+              id: ProjectV2.ID.global,
+              worktree: directory,
+              sandboxes: [],
+            })
+            .onConflictDoNothing()
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(SessionTable)
+            .values({
+              id: sessionID,
+              project_id: ProjectV2.ID.global,
+              slug: sessionID,
+              directory,
+              title: "Core Public health test",
+              version: "test",
+              model: { id: modelID, providerID },
+            })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(ProviderPublicRouteHealthTable)
+            .values({
+              provider_id: providerID,
+              model_id: modelID,
+              state: "quota-exhausted",
+              expires_at: now + 60_000,
+              observed_at: now,
+            })
+            .run()
+            .pipe(Effect.orDie)
+
+          setHostedCatalogForTest([modelID], now)
+          yield* Effect.addFinalizer(() => Effect.sync(resetHostedCatalogForTest))
+
+          const session = SessionV2.Info.make({
+            id: sessionID,
+            projectID: ProjectV2.ID.global,
+            title: "Core Public health test",
+            model: { id: modelID, providerID },
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            time: { created: DateTime.makeUnsafe(now), updated: DateTime.makeUnsafe(now) },
+            location,
+          })
+
+          yield* Effect.gen(function* () {
+            const catalog = yield* Catalog.Service
+            yield* catalog.transform((editor) => {
+              editor.provider.update(providerID, (provider) => {
+                provider.name = "OpenCode Public Health"
+                provider.api = {
+                  type: "aisdk",
+                  package: "@ai-sdk/openai-compatible",
+                  url: "https://opencode.test/v1",
+                  settings: {},
+                }
+                provider.request = {
+                  headers: {},
+                  body: { apiKey: "catalog-only-availability-sentinel" },
+                }
+                provider.integrationID = undefined
+                provider.disabled = false
+              })
+              editor.model.update(providerID, modelID, (model) => {
+                model.name = "Public health test"
+                model.api = {
+                  id: modelID,
+                  type: "aisdk",
+                  package: "@ai-sdk/openai-compatible",
+                  url: "https://opencode.test/v1",
+                  settings: {},
+                }
+                model.capabilities = { tools: true, input: ["text"], output: ["text"] }
+                model.request = { headers: {}, body: {} }
+                model.variants = []
+                model.time = { released: 0 }
+                model.cost = [
+                  {
+                    input: 0,
+                    output: 0,
+                    cache: { read: 0, write: 0 },
+                    tier: undefined,
+                  },
+                ]
+                model.status = "active"
+                model.enabled = true
+                model.limit = { context: 100, output: 20 }
+              })
+            })
+
+            const models = yield* SessionRunnerModel.Service
+            const blocked = yield* models
+              .resolveWithInfo(session, ProviderRouteIntent.Info.make({ kind: "public" }))
+              .pipe(Effect.flip)
+            expect(blocked).toMatchObject({
+              _tag: "SessionRunnerModel.RouteUnavailableError",
+              providerID,
+              modelID,
+            })
+            expect(yield* readDb.select().from(ProviderRouteBindingTable).all()).toEqual([])
+
+            yield* db.delete(ProviderPublicRouteHealthTable).run().pipe(Effect.orDie)
+
+            const resolved = yield* models.resolveWithInfo(
+              session,
+              ProviderRouteIntent.Info.make({ kind: "public" }),
+            )
+            expect(resolved.route).toMatchObject({
+              providerID,
+              routeKind: "public",
+              routeRevision: 1,
+            })
+            expect(
+              (yield* readDb.select().from(ProviderRouteBindingTable).all()).map((row) => ({
+                providerID: row.provider_id,
+                routeKind: row.route_kind,
+                accountID: row.account_id,
+                credentialHandle: row.credential_handle,
+              })),
+            ).toEqual([
+              {
+                providerID,
+                routeKind: "public",
+                accountID: null,
+                credentialHandle: null,
+              },
+            ])
+          }).pipe(
+            Effect.scoped,
+            Effect.provide(LocationServiceMap.Service.get(location)),
+          )
         }),
       ),
     ),

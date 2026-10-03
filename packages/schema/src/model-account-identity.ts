@@ -18,15 +18,13 @@ export type AccountModelParts = {
 
 export const ACCOUNT_MODEL_PROVIDERS: readonly AccountModelProvider[] = [
   { id: "workbuddy", accountPrefix: "wb-", aliasMarkers: ["#ctx-"] },
-  { id: "verdent", accountPrefix: "vd-", aliasMarkers: [] },
   { id: "opencode", accountPrefix: "zen-", aliasMarkers: [] },
   { id: "opencode-go", accountPrefix: "zen-", aliasMarkers: [] },
 ]
 
 /**
- * Split only a known account suffix. Model ids are allowed to contain `@` for
- * unrelated purposes (for example Verdent context aliases), so an arbitrary
- * last-at-sign is not an account boundary.
+ * Split only a known account suffix. Model ids may contain `@` for unrelated
+ * purposes, so an arbitrary last-at-sign is not an account boundary.
  */
 export function splitAccountModelID(
   modelID: string,

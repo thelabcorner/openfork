@@ -70,7 +70,6 @@ const createFocused = Effect.gen(function* () {
     constraints: ["Do not scan transcript history"],
     criteria: ["Projection is durable"],
     steps: [{ title: "Implement", description: "Publish semantic snapshots" }],
-    continuationPolicy: { maxConsecutiveTurns: 4, maxNoProgressTurns: 2 },
   })
   yield* goals.focus({ goalID: detail.goal.id, sessionID })
   return detail
@@ -117,6 +116,7 @@ describe("GoalProjection", () => {
       expect(spec.text).toContain("Do not scan transcript history")
       expect(spec.text).toContain("Projection is durable")
       expect(spec.text).toContain("Publish semantic snapshots")
+      expect(spec.text).not.toContain("continuation_policy")
       expect(spec.text).not.toContain("status=\"draft\"")
       expect(progress.text).toContain("<status>draft</status>")
       expect(progress.text).not.toContain("Keep mutable Goal state out of privileged System context")
@@ -134,7 +134,7 @@ describe("GoalProjection", () => {
       const policyOnly = yield* goals.update({
         id: detail.goal.id,
         expectedRevision: updated.goal.revision,
-        auditorPolicy: { blockedThreshold: 2, maxAttempts: 2 },
+        auditorPolicy: { maxAttempts: 2 },
       })
       const afterUnrelatedRevision = GoalProjection.sections(policyOnly)
       expect(afterUnrelatedRevision.map((item) => item.digest)).toEqual(afterSpec.map((item) => item.digest))
@@ -175,7 +175,7 @@ describe("GoalProjection", () => {
       const unrelated = yield* goals.update({
         id: detail.goal.id,
         expectedRevision: specUpdate.goal.revision,
-        auditorPolicy: { blockedThreshold: 3 },
+        auditorPolicy: { maxAttempts: 3 },
       })
       expect((yield* reconcile()).published).toBe(0)
 

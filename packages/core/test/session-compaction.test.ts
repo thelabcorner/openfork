@@ -2,6 +2,8 @@ import { expect, test } from "bun:test"
 import { LLM, LLMEvent, Message, Model, type LLMRequest } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { SessionCompaction } from "@opencode-ai/core/session/compaction"
+import { Config } from "@opencode-ai/core/config"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTurnProvenance } from "@opencode-ai/core/session/turn-provenance"
@@ -136,7 +138,19 @@ test("compaction excludes mutable Goal state snapshots while retaining historica
         ])
       },
     },
-    config: [],
+    // Deliberately smaller than the continuation itself. The active Goal
+    // handoff must remain verbatim in the retained tail regardless of this
+    // user-tunable compaction budget.
+    config: [
+      new Config.Document({
+        type: "document",
+        info: new Config.Info({
+          compaction: new ConfigCompaction.Info({
+            keep: new ConfigCompaction.Keep({ tokens: 1 }),
+          }),
+        }),
+      }),
+    ],
   })
   const request = LLM.request({ model, system: [], messages: [Message.user("provider request")], tools: [] })
 
