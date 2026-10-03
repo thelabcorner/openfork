@@ -3,7 +3,7 @@
 import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
-import { chmod, readdir, rm, writeFile } from "node:fs/promises"
+import { chmod, rm, writeFile } from "node:fs/promises"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { validateChunkDbCapability } from "./chunkdb-capability"
 
@@ -23,6 +23,7 @@ import {
   PRODUCT_SLUG,
 } from "@opencode-ai/core/brand"
 import pkg from "../package.json"
+import manifest from "../../../keep-manifest.json"
 import { T3_CODE_COMPAT_EXECUTABLE, T3_CODE_COMPAT_PROFILE } from "../src/compat/t3code"
 
 const singleFlag = process.argv.includes("--single")
@@ -32,10 +33,10 @@ const sourcemapsFlag = process.argv.includes("--sourcemaps")
 const plugin = createSolidTransformPlugin()
 const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
 
-// Client identity headers present the released version line. Preview builds
-// stamp a synthetic `0.0.0-*` build version; identity must stay on the release
-// version the build is based on or the Console free-tier gate rejects it.
+// OpenFork product/build identity and upstream-hosted compatibility are separate.
+// The latter advances only when a verified upstream tag sync updates the manifest.
 const releaseVersion = Script.preview ? pkg.version : Script.version
+const upstreamCompatVersion = manifest.openCodeHostedCompatibility.version
 
 const createEmbeddedWebUIBundle = async () => {
   console.log(`Building Web UI to embed in the binary`)
@@ -148,16 +149,7 @@ const targets = singleFlag
     })
   : allTargets
 
-// `dist/node` is the live Electron sidecar build in local development. The
-// running process lazily opens sibling WASM assets (tree-sitter, photon, ...),
-// so deleting the whole dist directory while Desktop is open turns otherwise
-// unrelated shell/tool calls into ENOENT failures. Clean CLI build artifacts
-// without invalidating the sidecar that may currently be executing from here.
 const distDir = path.join(dir, "dist")
-for (const entry of await readdir(distDir, { withFileTypes: true }).catch(() => [])) {
-  if (entry.name === "node") continue
-  await rm(path.join(distDir, entry.name), { recursive: true, force: true })
-}
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
@@ -177,6 +169,11 @@ for (const item of targets) {
   const name = [PRODUCT_SLUG, ...targetParts].join("-")
   const bunTarget = ["bun", ...targetParts].join("-")
   console.log(`building ${name}`)
+  // Clean only the target we are about to replace. `dist/node` may be serving a
+  // live Electron sidecar, and unrelated historical/cross-platform output may
+  // legitimately be locked by another process. A single-target build must not
+  // fail because some other dist subtree cannot be removed.
+  await rm(path.join(distDir, name), { recursive: true, force: true })
   await $`mkdir -p dist/${name}/bin`
 
   const workerPath = "./src/cli/tui/worker.ts"
@@ -216,6 +213,7 @@ for (const item of targets) {
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_RELEASE_VERSION: JSON.stringify(releaseVersion),
+      OPENCODE_UPSTREAM_COMPAT_VERSION: JSON.stringify(upstreamCompatVersion),
       OPENCODE_MODELS_DEV: generated.modelsData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
@@ -240,6 +238,19 @@ for (const item of targets) {
       : `#!/bin/sh\nexec "$(dirname "$0")/${PRODUCT_EXECUTABLE}" "$@"\n`
   await writeFile(compatibilityPath, compatibilityLauncher)
   if (item.os !== "win32") await chmod(compatibilityPath, 0o755)
+
+  const devLauncherPath = path.join(
+    "dist",
+    name,
+    "bin",
+    item.os === "win32" ? "opencode-dev.cmd" : "opencode-dev",
+  )
+  const devLauncher =
+    item.os === "win32"
+      ? `@echo off\r\nif not defined OPENCODE_DB set "OPENCODE_DB=%USERPROFILE%\\.local\\share\\openfork\\openfork-dev.db"\r\n"%~dp0${PRODUCT_EXECUTABLE}.exe" %*\r\nexit /b %ERRORLEVEL%\r\n`
+      : `#!/bin/sh\nif [ -z "\${OPENCODE_DB:-}" ]; then export OPENCODE_DB="$HOME/.local/share/openfork/openfork-dev.db"; fi\nexec "$(dirname "$0")/${PRODUCT_EXECUTABLE}" "$@"\n`
+  await writeFile(devLauncherPath, devLauncher)
+  if (item.os !== "win32") await chmod(devLauncherPath, 0o755)
 
   // Ship an explicitly named OpenFork-owned T3 launcher. T3 already exposes a
   // configurable OpenCode binaryPath, so this consumer-specific compatibility

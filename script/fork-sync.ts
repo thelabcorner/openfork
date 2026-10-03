@@ -23,6 +23,7 @@
  */
 import { readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
+import { OPEN_CODE_HOSTED_COMPATIBILITY_FALLBACK } from "../packages/core/src/installation/upstream-compat"
 
 type PkgJson = Record<string, any>
 
@@ -115,6 +116,29 @@ function showFile(rev: string, path: string): string | undefined {
 
 interface KeepManifest {
   pruneFromMain: string[]
+  openCodeHostedCompatibility?: {
+    tag?: unknown
+    version?: unknown
+  }
+}
+
+export function validateOpenCodeHostedCompatibility(
+  value: KeepManifest["openCodeHostedCompatibility"],
+  verifyTag?: string,
+): string | undefined {
+  if (!value || typeof value.tag !== "string" || typeof value.version !== "string") {
+    return "keep-manifest.json openCodeHostedCompatibility.tag/version missing"
+  }
+  if (!/^v\d+\.\d+\.\d+$/.test(value.tag)) {
+    return `invalid OpenCode hosted compatibility tag: ${JSON.stringify(value.tag)}`
+  }
+  const expectedVersion = value.tag.slice(1)
+  if (value.version !== expectedVersion) {
+    return `OpenCode hosted compatibility version ${JSON.stringify(value.version)} does not match tag ${value.tag}`
+  }
+  if (verifyTag && value.tag !== verifyTag) {
+    return `OpenCode hosted compatibility is ${value.tag}, but fork-sync verify targets ${verifyTag}`
+  }
 }
 
 function loadManifest(): KeepManifest {
@@ -660,6 +684,23 @@ function workspaceDirExists(entry: string): boolean {
 function cmdVerify(tag?: string): number {
   const manifest = loadManifest()
   const failures: string[] = []
+
+  const compatibilityFailure = validateOpenCodeHostedCompatibility(manifest.openCodeHostedCompatibility, tag)
+  if (compatibilityFailure) {
+    failures.push(compatibilityFailure)
+  } else {
+    const compat = manifest.openCodeHostedCompatibility!
+    const compatTag = compat.tag as string
+    const compatVersion = compat.version as string
+    if (compatVersion !== OPEN_CODE_HOSTED_COMPATIBILITY_FALLBACK) {
+      failures.push(
+        `OpenCode hosted compatibility fallback ${OPEN_CODE_HOSTED_COMPATIBILITY_FALLBACK} does not match manifest ${compatVersion}`,
+      )
+    }
+    if (!git("merge-base", "--is-ancestor", compatTag, "HEAD").ok) {
+      failures.push(`OpenCode hosted compatibility tag ${compatTag} is not merged into HEAD`)
+    }
+  }
 
   const unmerged = unmergedFiles()
   if (unmerged.length > 0) failures.push(`unmerged paths remain: ${unmerged.join(", ")}`)

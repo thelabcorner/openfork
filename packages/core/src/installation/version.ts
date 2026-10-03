@@ -1,3 +1,5 @@
+import { OPEN_CODE_HOSTED_COMPATIBILITY_FALLBACK } from "./upstream-compat"
+
 declare global {
   const OPENCODE_VERSION: string
   const OPENCODE_CHANNEL: string
@@ -8,6 +10,8 @@ declare global {
    * on. Release builds omit this define and fall back to the build version.
    */
   const OPENCODE_RELEASE_VERSION: string
+  /** Upstream OpenCode release whose hosted-service wire contract this build implements. */
+  const OPENCODE_UPSTREAM_COMPAT_VERSION: string
 }
 
 export const InstallationVersion = typeof OPENCODE_VERSION === "string" ? OPENCODE_VERSION : "local"
@@ -17,15 +21,27 @@ export const InstallationLocal = InstallationChannel === "local"
 export const InstallationReleaseVersion =
   typeof OPENCODE_RELEASE_VERSION === "string" ? OPENCODE_RELEASE_VERSION : InstallationVersion
 
-/**
- * Canonical OpenCode client identity for outbound HTTP requests. The OpenCode
- * Console free-tier gate rejects requests whose User-Agent is not the canonical
- * `opencode/<channel>/<version>/<client>` shape or whose version predates the
- * minimum supported release, so every consumer that identifies the client to a
- * provider must use this formatter instead of composing the string locally.
- */
+export const InstallationOpenCodeCompatibilityVersion =
+  typeof OPENCODE_UPSTREAM_COMPAT_VERSION === "string"
+    ? OPENCODE_UPSTREAM_COMPAT_VERSION
+    : InstallationReleaseVersion !== "local"
+      ? InstallationReleaseVersion
+      : OPEN_CODE_HOSTED_COMPATIBILITY_FALLBACK
+
+/** OpenFork-owned/general client identity. Do not use this for upstream Zen admission. */
 export function InstallationUserAgent(client = "cli") {
   return `opencode/${InstallationChannel}/${InstallationReleaseVersion}/${client}`
+}
+
+/**
+ * Exact first-party wire identity emitted by upstream OpenCode.
+ *
+ * Upstream OpenCode currently sends `User-Agent: opencode/<InstallationVersion>`.
+ * Keep this for hosted-service wire and observability parity. Anonymous Zen
+ * eligibility is controlled separately by public credential and model metadata.
+ */
+export function OpenCodeHostedUserAgent() {
+  return `opencode/${InstallationOpenCodeCompatibilityVersion}`
 }
 
 // Version pin for `npm install @opencode-ai/plugin`. Dev builds stamp a

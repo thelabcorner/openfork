@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "typecheck": "tsgo --noEmit",
-    "test": "bun test --timeout 30000 --only-failures",
+    "test": "OPENCODE_EFFECT_TEST_TIMEOUT_MS=30000 bun test --timeout 30000 --only-failures",
     "test:httpapi": "bun run script/httpapi-exercise.ts --mode coverage --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode auth --fail-on-missing --fail-on-skip && bun run script/httpapi-exercise.ts --mode effect --fail-on-missing --fail-on-skip",
     "bench:test": "bun run script/bench-test-suite.ts",
     "profile:test": "bun run script/profile-test-files.ts",
@@ -17,6 +17,7 @@
   },
   "bin": {
     "openfork": "./bin/openfork",
+    "opencode-dev": "./bin/opencode-dev",
     "openfork-t3code": "./bin/openfork-t3code",
     "opencode": "./bin/opencode"
   },

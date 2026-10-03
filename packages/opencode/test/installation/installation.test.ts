@@ -126,6 +126,8 @@ describe("installation", () => {
 
   describe("direct installation ownership", () => {
     test("recognizes the canonical OpenFork direct path and its legacy migration source", () => {
+      expect(isDirectInstallPath("/home/me/.openfork/bin/openfork", "linux")).toBe(true)
+      expect(isDirectInstallPath("/Users/me/.openfork/bin/openfork", "darwin")).toBe(true)
       expect(isDirectInstallPath("/home/me/.openfork/bin/opencode", "linux")).toBe(true)
       expect(isDirectInstallPath("/Users/me/.openfork/bin/opencode", "darwin")).toBe(true)
       expect(isDirectInstallPath("/home/me/.opencode/bin/opencode", "linux")).toBe(true)
@@ -138,17 +140,17 @@ describe("installation", () => {
     test("builds a self-contained OpenFork release installer without upstream distribution channels", () => {
       const script = openForkDirectUpgradeScript({
         version: "v1.18.30",
-        target: "/home/me/.openfork/bin/opencode",
+        target: "/home/me/.openfork/bin/openfork",
       })
 
       expect(script).toContain("https://github.com/thelabcorner/openfork")
-      expect(script).toContain('asset="opencode-linux-x64${baseline}${libc}.tar.gz"')
-      expect(script).toContain('asset="opencode-linux-arm64${libc}.tar.gz"')
-      expect(script).toContain('asset="opencode-darwin-x64${baseline}.zip"')
-      expect(script).toContain('opencode-darwin-arm64.zip')
+      expect(script).toContain('asset="openfork-linux-x64${baseline}${libc}.tar.gz"')
+      expect(script).toContain('asset="openfork-linux-arm64${libc}.tar.gz"')
+      expect(script).toContain('asset="openfork-darwin-x64${baseline}.zip"')
+      expect(script).toContain('openfork-darwin-arm64.zip')
       expect(script).toContain('baseline="-baseline"')
       expect(script).toContain('libc="-musl"')
-      expect(script).toContain('install -m 0755 "$tmp/opencode" "$staged"')
+      expect(script).toContain('install -m 0755 "$tmp/openfork" "$staged"')
       expect(script).toContain('test "$staged_version" = "$version"')
       expect(script).toContain('mv -f "$staged" "$target"')
       expect(script).toContain('test "$actual" = "$version"')

@@ -11,17 +11,24 @@ This folder contains adapters behind that service boundary:
 ## Outbound request identity
 
 Provider requests identify the client through headers owned by
-`LLMRequestPrep.prepare`: the canonical `User-Agent`
-(`opencode/<channel>/<version>/<client>` from `InstallationUserAgent`),
-`x-opencode-session`, `x-opencode-request`, `x-opencode-client`, and
-`x-opencode-project`.
+`LLMRequestPrep.prepare`: `User-Agent`, `x-opencode-session`,
+`x-opencode-request`, `x-opencode-client`, and `x-opencode-project`.
 
-- Never compose the User-Agent locally in this folder or any other provider
-  request path. The OpenCode Console free-tier gate rejects the legacy
-  `opencode/<version>` identity and non-`ses_` session ids, so the canonical
-  formatter in `@opencode-ai/core/installation/version` is the only owner.
-- Special agents (Prompt Revisor, title generation, auditors) cross this same
-  seam; they do not get their own identity or headers.
+- Upstream-operated OpenCode services are a strict compatibility boundary.
+  Current upstream OpenCode sends `User-Agent: opencode/<InstallationVersion>`;
+  OpenFork uses `OpenCodeHostedUserAgent()` for `opencode*` providers to preserve
+  exact hosted wire/observability identity. Zen anonymous eligibility is a separate
+  contract controlled by the `public` credential sentinel and hosted model metadata.
+- General/third-party requests keep the fork-owned `InstallationUserAgent(client)`
+  identity. Do not leak the hosted compatibility identity to unrelated providers.
+- Never compose either User-Agent locally; the canonical formatters live in
+  `@opencode-ai/core/installation/version`.
+- The remaining hosted headers must preserve ordinary OpenCode semantics and
+  session/request identifier shapes. Special agents crossing this V1 seam do
+  not invent a separate identity.
+- V2/Core HTTP prompt execution does not cross `LLMRequestPrep`; its runner must
+  consume the same hosted identity helper independently rather than assuming
+  this V1 adapter covers server/API-originated inference.
 
 ## File Structure
 

@@ -4,6 +4,7 @@ import { Script } from "@opencode-ai/script"
 import { existsSync, promises as fs, readdirSync, statSync } from "node:fs"
 import path from "path"
 import { fileURLToPath } from "url"
+import manifest from "../../../keep-manifest.json"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -23,10 +24,11 @@ const buildLockOwner = `build:${process.pid}`
 // below already decide when a preview artifact must be rebuilt. Explicit/release
 // versions remain part of the freshness contract because they are stable inputs.
 const stampVersion = process.env.OPENCODE_VERSION ?? (Script.preview ? `preview:${Script.channel}` : Script.version)
-const stamp = `${stampVersion}\0${Script.channel}`
+const upstreamCompatVersion = manifest.openCodeHostedCompatibility.version
+const stamp = `${stampVersion}\0${Script.channel}\0${upstreamCompatVersion}`
 
-// Identity headers present the released version line, not the synthetic preview
-// build stamp, so dev sidecars still satisfy the Console free-tier version gate.
+// Product release identity stays independent from the upstream OpenCode hosted
+// compatibility baseline stamped above.
 const releaseVersion = Script.preview
   ? ((await Bun.file(path.join(dir, "package.json")).json()) as { version: string }).version
   : Script.version
@@ -60,6 +62,7 @@ try {
         OPENCODE_MODELS_DEV: generated.modelsData,
         OPENCODE_VERSION: `'${Script.version}'`,
         OPENCODE_RELEASE_VERSION: JSON.stringify(releaseVersion),
+        OPENCODE_UPSTREAM_COMPAT_VERSION: JSON.stringify(upstreamCompatVersion),
         OPENCODE_CHANNEL: `'${Script.channel}'`,
         OPENCODE_CHUNKDB_COMPRESS_WORKER_PATH: JSON.stringify("./compress-worker.js"),
         OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH: JSON.stringify("./decompress-worker.js"),

@@ -23,20 +23,24 @@ if (!skipBuild) {
 }
 
 const pkg = JSON.parse(await fs.readFile(path.join(root, "package.json"), "utf8")) as { version: string }
-const source = path.join(root, "dist", "opencode-windows-x64", "bin", "opencode.exe")
+const source = path.join(root, "dist", "openfork-windows-x64", "bin", "openfork.exe")
 await fs.access(source).catch(() => {
   throw new Error(`Built OpenFork executable not found at ${source}. Run without --skip-build first.`)
 })
 
 const localAppData = process.env.LOCALAPPDATA
 if (!localAppData) throw new Error("LOCALAPPDATA is not set")
+const configuredInstallRoot = process.env.OPENFORK_ACP_INSTALL_ROOT?.trim()
+const installRoot = configuredInstallRoot
+  ? path.resolve(configuredInstallRoot)
+  : path.join(localAppData, "JetBrains", "acp-agents", "openfork")
 
 const shaResult = Bun.spawnSync(["git", "rev-parse", "--short=10", "HEAD"], { cwd: root, stdout: "pipe" })
 const sha = shaResult.exitCode === 0 ? shaResult.stdout.toString().trim() : "unknown"
 const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)
 const buildID = `${pkg.version}-openfork-${sha}-${stamp}`
-const installDir = path.join(localAppData, "JetBrains", "acp-agents", "openfork", buildID)
-const installed = path.join(installDir, "opencode.exe")
+const installDir = path.join(installRoot, buildID)
+const installed = path.join(installDir, "openfork.exe")
 await fs.mkdir(installDir, { recursive: true })
 await fs.copyFile(source, installed)
 
@@ -189,7 +193,12 @@ const configPath = path.join(configDir, "acp.json")
 await fs.mkdir(configDir, { recursive: true })
 let config: Record<string, unknown> = {}
 try {
-  config = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>
+  // Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes a UTF-8 BOM.
+  // JetBrains accepts that file, but JavaScript's JSON.parse does not accept the
+  // leading U+FEFF character. Tolerate it on read, then our normal write path
+  // emits clean UTF-8 without a BOM.
+  const raw = await fs.readFile(configPath, "utf8")
+  config = JSON.parse(raw.replace(/^\uFEFF/, "")) as Record<string, unknown>
 } catch (error) {
   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
 }
@@ -205,9 +214,10 @@ servers[AGENT_NAME] = {
 }
 config.agent_servers = servers
 
-// Keep a last-known-good backup, then replace the config. Never rewrite the
-// JetBrains registry-managed OpenCode cache: those versions remain stock and
-// can update independently of this custom entry.
+// Keep a last-known-good backup, then replace the config. The OpenFork custom
+// entry always points at the canonical openfork.exe; stock OpenCode entries are
+// retired separately by machine cutover rather than being treated as runtime
+// dependencies.
 try {
   await fs.copyFile(configPath, `${configPath}.openfork-backup`)
 } catch (error) {
@@ -222,39 +232,36 @@ try {
   await fs.rm(temp, { force: true })
 }
 
-// Heal stale OpenFork builds that cannot read the current durable ChunkDB epoch.
-// JetBrains can keep an older custom ACP command cached in memory even after
-// acp.json changes. Deleting that old versioned path merely changes the failure
-// from a schema mismatch to ENOENT; replacing its executable with this newly
-// validated build makes cached commands safe immediately. Only our versioned
-// OpenFork install root is examined here. Stock JetBrains-managed OpenCode
-// binaries are never touched, and already-compatible OpenFork builds remain
-// unchanged as rollback candidates.
+// JetBrains can cache an older custom ACP absolute command in memory even after
+// acp.json changes. Keep those OpenFork-owned paths valid, but make every one of
+// them execute the same freshly validated build. Rollback belongs to the
+// canonical W:\Apps\OpenFork\builds store, not to stale ACP copies. Stock
+// JetBrains-managed OpenCode binaries are never touched here.
 const openforkRoot = path.dirname(installDir)
 const healedBuilds: string[] = []
 for (const entry of await fs.readdir(openforkRoot, { withFileTypes: true })) {
   if (!entry.isDirectory() || entry.name === path.basename(installDir)) continue
   const candidateDir = path.join(openforkRoot, entry.name)
-  const candidate = path.join(candidateDir, "opencode.exe")
+  const canonicalCandidate = path.join(candidateDir, "openfork.exe")
+  const legacyCandidate = path.join(candidateDir, "opencode.exe")
+  let candidate = canonicalCandidate
   try {
-    await fs.access(candidate)
+    await fs.access(canonicalCandidate)
   } catch {
-    continue
+    try {
+      await fs.access(legacyCandidate)
+      candidate = legacyCandidate
+    } catch {
+      continue
+    }
   }
 
   try {
+    await fs.copyFile(installed, candidate)
     await validateChunkDbCapability(candidate)
-  } catch {
-    // Versioned directories are installer-owned and resolved under the explicit
-    // OpenFork root above. Preserve the path JetBrains may have cached, but make
-    // that path execute the same validated binary as the current config target.
-    try {
-      await fs.copyFile(installed, candidate)
-      await validateChunkDbCapability(candidate)
-      healedBuilds.push(entry.name)
-    } catch (error) {
-      console.warn(`Could not heal stale OpenFork ACP path ${candidate}: ${String(error)}`)
-    }
+    healedBuilds.push(entry.name)
+  } catch (error) {
+    console.warn(`Could not refresh cached OpenFork ACP path ${candidate}: ${String(error)}`)
   }
 }
 

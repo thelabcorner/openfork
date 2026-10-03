@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { checkSnapshot, classifyConflict, mergePackageJson, mergeWorkspacePackages, snapshotPackageJson } from "./fork-sync"
+import { checkSnapshot, classifyConflict, mergePackageJson, mergeWorkspacePackages, snapshotPackageJson, validateOpenCodeHostedCompatibility } from "./fork-sync"
 
 const PRUNE = ["packages/console", "packages/web", "infra", "nix", "sdks", "packages/cli"]
 
@@ -115,5 +115,23 @@ describe("snapshot round-trip", () => {
     const snap = snapshotPackageJson("packages/core/package.json", ours, theirs)
     expect(checkSnapshot(snap, ours)).toEqual([])
     expect(checkSnapshot(snap, theirs)).toContain("exports../memory")
+  })
+})
+
+describe("OpenCode hosted compatibility metadata", () => {
+  test("accepts an exact verified release tag/version pair", () => {
+    expect(validateOpenCodeHostedCompatibility({ tag: "v1.18.30", version: "1.18.30" }, "v1.18.30")).toBeUndefined()
+  })
+
+  test("rejects version/tag drift", () => {
+    expect(validateOpenCodeHostedCompatibility({ tag: "v1.18.30", version: "1.18.31" })).toContain("does not match")
+    expect(validateOpenCodeHostedCompatibility({ tag: "v1.18.30", version: "1.18.30" }, "v1.18.31")).toContain(
+      "verify targets",
+    )
+  })
+
+  test("rejects malformed or missing metadata", () => {
+    expect(validateOpenCodeHostedCompatibility(undefined)).toContain("missing")
+    expect(validateOpenCodeHostedCompatibility({ tag: "github-v1.2.25", version: "1.2.25" })).toContain("invalid")
   })
 })

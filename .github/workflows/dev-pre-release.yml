@@ -17,7 +17,8 @@ run-name: "dev pre-release ${{ github.run_number }}"
 #                   cross-compiles EVERY Bun target (linux glibc+musl x64/arm64
 #                   and baseline, darwin x64/arm64, windows x64/arm64/baseline)
 #                   on one ubuntu-latest runner, then archives and uploads each
-#                   (`opencode-windows-x64.zip` contains `opencode.exe`, etc.).
+#                   (`openfork-windows-x64.zip` contains `openfork.exe` plus an
+#                   `opencode` compatibility launcher, etc.).
 #                   This is the same packaging block `script/publish.ts` uses.
 #   build-desktop - GitHub-hosted matrix (macOS Intel + Apple Silicon, Windows,
 #                   Linux) that builds the unsigned Electron installers
@@ -180,7 +181,7 @@ jobs:
       - name: Upload CLI archives as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: opencode-cli-all-targets
+          name: openfork-cli-all-targets
           path: |
             packages/opencode/dist/*.zip
             packages/opencode/dist/*.tar.gz

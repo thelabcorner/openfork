@@ -90,19 +90,20 @@ ARCH=$(uname -m)
 [ "$PLATFORM" = "darwin" ] && true
 [ "$PLATFORM" = "linux" ] && true
 
-BUILT_BINARY="$OPENCODE_SRC/packages/opencode/dist/opencode-${PLATFORM}-${ARCH}/bin/opencode"
+BUILT_BINARY="$OPENCODE_SRC/packages/opencode/dist/openfork-${PLATFORM}-${ARCH}/bin/openfork"
 
 if [ ! -f "$BUILT_BINARY" ]; then
-  BUILT_BINARY=$(find "$OPENCODE_SRC/packages/opencode/dist" -name "opencode" -type f -executable 2>/dev/null | head -1)
+  BUILT_BINARY=$(find "$OPENCODE_SRC/packages/opencode/dist" -name "openfork" -type f -executable 2>/dev/null | head -1)
 fi
 
 if [ -f "$BUILT_BINARY" ]; then
-  if [ -f "$OPENCODE_DIR/bin/opencode" ]; then
-    cp "$OPENCODE_DIR/bin/opencode" "$OPENCODE_DIR/bin/opencode.bak.$(date +%Y%m%d%H%M%S)"
+  if [ -f "$OPENCODE_DIR/bin/openfork" ]; then
+    cp "$OPENCODE_DIR/bin/openfork" "$OPENCODE_DIR/bin/openfork.bak.$(date +%Y%m%d%H%M%S)"
   fi
-  cp "$BUILT_BINARY" "$OPENCODE_DIR/bin/opencode"
-  chmod +x "$OPENCODE_DIR/bin/opencode"
-  ok "Installed to $OPENCODE_DIR/bin/opencode"
+  cp "$BUILT_BINARY" "$OPENCODE_DIR/bin/openfork"
+  chmod +x "$OPENCODE_DIR/bin/openfork"
+  ln -sfn openfork "$OPENCODE_DIR/bin/opencode"
+  ok "Installed to $OPENCODE_DIR/bin/openfork (opencode compatibility link updated)"
 else
   err "Build failed - binary not found in dist/"
   info "Try running manually:"

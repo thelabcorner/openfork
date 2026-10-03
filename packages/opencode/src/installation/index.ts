@@ -1,7 +1,14 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { PRODUCT_RELEASES_URL, PRODUCT_REPOSITORY_API_URL, PRODUCT_REPOSITORY_URL } from "@opencode-ai/core/brand"
+import {
+  LEGACY_PRODUCT_EXECUTABLE,
+  PRODUCT_EXECUTABLE,
+  PRODUCT_RELEASES_URL,
+  PRODUCT_REPOSITORY_API_URL,
+  PRODUCT_REPOSITORY_URL,
+  PRODUCT_SLUG,
+} from "@opencode-ai/core/brand"
 import { Effect, Layer, Schema, Context, Stream } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -102,8 +109,10 @@ export function releaseVersionForChannel(releases: readonly GitHubReleaseInfo[],
 export function isDirectInstallPath(execPath: string, platform: NodeJS.Platform = process.platform) {
   if (platform === "win32") return false
   const normalized = execPath.replaceAll("\\", "/")
-  return [DIRECT_INSTALL_DIRNAME, LEGACY_DIRECT_INSTALL_DIRNAME].some((dir) =>
-    normalized.endsWith(`/${dir}/bin/opencode`),
+  if (normalized.endsWith(`/${DIRECT_INSTALL_DIRNAME}/bin/${PRODUCT_EXECUTABLE}`)) return true
+  return (
+    normalized.endsWith(`/${DIRECT_INSTALL_DIRNAME}/bin/${LEGACY_PRODUCT_EXECUTABLE}`) ||
+    normalized.endsWith(`/${LEGACY_DIRECT_INSTALL_DIRNAME}/bin/${LEGACY_PRODUCT_EXECUTABLE}`)
   )
 }
 
@@ -125,13 +134,13 @@ export function openForkDirectUpgradeScript(input: { version: string; target: st
     '  Linux:x86_64|Linux:amd64)',
     '    baseline=""',
     '    grep -qw avx2 /proc/cpuinfo 2>/dev/null || baseline="-baseline"',
-    '    asset="opencode-linux-x64${baseline}${libc}.tar.gz"; archive="tar" ;;',
-    '  Linux:aarch64|Linux:arm64) asset="opencode-linux-arm64${libc}.tar.gz"; archive="tar" ;;',
+    `    asset="${PRODUCT_SLUG}-linux-x64\${baseline}\${libc}.tar.gz"; archive="tar" ;;`,
+    `  Linux:aarch64|Linux:arm64) asset="${PRODUCT_SLUG}-linux-arm64\${libc}.tar.gz"; archive="tar" ;;`,
     '  Darwin:x86_64|Darwin:amd64)',
     '    baseline=""',
     '    sysctl -n machdep.cpu.leaf7_features 2>/dev/null | grep -qw AVX2 || baseline="-baseline"',
-    '    asset="opencode-darwin-x64${baseline}.zip"; archive="zip" ;;',
-    '  Darwin:arm64|Darwin:aarch64) asset="opencode-darwin-arm64.zip"; archive="zip" ;;',
+    `    asset="${PRODUCT_SLUG}-darwin-x64\${baseline}.zip"; archive="zip" ;;`,
+    `  Darwin:arm64|Darwin:aarch64) asset="${PRODUCT_SLUG}-darwin-arm64.zip"; archive="zip" ;;`,
     '  *) echo "OpenFork does not publish a CLI binary for $platform" >&2; exit 2 ;;',
     "esac",
     'tmp="$(mktemp -d)"',
@@ -145,8 +154,8 @@ export function openForkDirectUpgradeScript(input: { version: string; target: st
     "else",
     '  unzip -q "$tmp/archive" -d "$tmp"',
     "fi",
-    'test -f "$tmp/opencode" || { echo "OpenFork release archive is missing the opencode compatibility executable" >&2; exit 3; }',
-    'install -m 0755 "$tmp/opencode" "$staged"',
+    `test -f "$tmp/${PRODUCT_EXECUTABLE}" || { echo "OpenFork release archive is missing the canonical ${PRODUCT_EXECUTABLE} executable" >&2; exit 3; }`,
+    `install -m 0755 "$tmp/${PRODUCT_EXECUTABLE}" "$staged"`,
     'staged_version="$("$staged" --version)"',
     'test "$staged_version" = "$version" || { echo "Downloaded OpenFork binary reported $staged_version; expected $version" >&2; exit 4; }',
     'mv -f "$staged" "$target"',

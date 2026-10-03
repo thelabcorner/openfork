@@ -24,9 +24,9 @@ const archMap = {
 
 const platform = platformMap[os.platform()] ?? os.platform()
 const arch = archMap[os.arch()] ?? os.arch()
-const base = `opencode-${platform}-${arch}`
-const sourceBinary = platform === "windows" ? "opencode.exe" : "opencode"
-const targetBinary = path.join(__dirname, "bin", "opencode.exe")
+const base = `openfork-${platform}-${arch}`
+const sourceBinary = platform === "windows" ? "openfork.exe" : "openfork"
+const targetBinary = path.join(__dirname, "bin", platform === "windows" ? ".openfork.exe" : ".openfork")
 
 function supportsAvx2() {
   if (arch !== "x64") return false
@@ -123,26 +123,6 @@ function resolveBinary(name) {
   return binaryPath
 }
 
-function installPackage(name) {
-  const version = packageJson.optionalDependencies?.[name]
-  if (!version) return
-
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-install-"))
-  try {
-    const result = childProcess.spawnSync(
-      "npm",
-      ["install", "--ignore-scripts", "--no-save", "--loglevel=error", "--prefix", temp, `${name}@${version}`],
-      { stdio: "inherit", windowsHide: true },
-    )
-    if (result.status !== 0) return
-    const packageDir = path.join(temp, "node_modules", name)
-    copyBinary(path.join(packageDir, "bin", sourceBinary), targetBinary)
-    return true
-  } finally {
-    fs.rmSync(temp, { recursive: true, force: true })
-  }
-}
-
 function copyBinary(source, target) {
   if (!fs.existsSync(source)) throw new Error(`Binary not found at ${source}`)
   fs.mkdirSync(path.dirname(target), { recursive: true })
@@ -169,15 +149,13 @@ function main() {
     try {
       copyBinary(resolveBinary(name), targetBinary)
       if (verifyBinary()) return
-    } catch {
-      if (installPackage(name) && verifyBinary()) return
-    }
+    } catch {}
   }
 
   throw new Error(
-    `It seems your package manager failed to install the right opencode CLI package. Try manually installing ${packageNames()
-      .map((name) => JSON.stringify(name))
-      .join(" or ")}.`,
+    "OpenFork could not stage a fork-owned native executable from the installed optional dependencies. " +
+      "This installer will not fetch an upstream OpenCode runtime. Install a verified OpenFork release from " +
+      "https://github.com/thelabcorner/openfork/releases.",
   )
 }
 

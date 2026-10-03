@@ -1,5 +1,11 @@
 import path from "path"
 import { fileURLToPath } from "url"
+import {
+  formatFreeModelCoverageIssues,
+  loadFreeModelCoverageFixture,
+  strictFreeModelCoverageBuild,
+  validateFreeModelCoverage,
+} from "./opencode-free-model-coverage"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -11,7 +17,20 @@ const cachePath = path.join(dir, ".cache", "models.dev.json")
 const ttlMs = 6 * 60 * 60 * 1000
 
 export const modelsData = await loadModelsData()
+await validateCoverage(modelsData)
 console.log("Loaded models.dev snapshot")
+
+async function validateCoverage(payload: string) {
+  const fixture = await loadFreeModelCoverageFixture()
+  const issues = validateFreeModelCoverage(payload, fixture)
+  if (issues.length === 0) return
+  const message = formatFreeModelCoverageIssues(fixture, issues)
+  if (strictFreeModelCoverageBuild()) throw new Error(message)
+  console.warn(message)
+  console.warn(
+    "Continuing because this is not a strict CI/release coverage build. Refresh the Models.dev snapshot before release qualification.",
+  )
+}
 
 async function loadModelsData() {
   if (process.env.MODELS_DEV_API_JSON) return await Bun.file(process.env.MODELS_DEV_API_JSON).text()

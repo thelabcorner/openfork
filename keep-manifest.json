@@ -4,6 +4,10 @@
   "origin": "https://github.com/thelabcorner/openfork.git",
   "defaultBranch": "main",
   "sync": "tags",
+  "openCodeHostedCompatibility": {
+    "tag": "v1.18.30",
+    "version": "1.18.30"
+  },
   "stage": "prune-main",
   "workspace": [
     "packages/app",
