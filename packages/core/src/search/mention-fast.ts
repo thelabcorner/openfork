@@ -14,6 +14,107 @@ import type { Matcher } from "./matcher"
 const NEG = -1_000_000_000
 const MAX_QUERY_CHARS = 64
 
+export type CandidateCoverage =
+  | "path-substring+basename-boundary"
+  | "path-substring+basename-subsequence"
+
+/**
+ * True when the scorer basename of `path` contains `query` as an in-order,
+ * possibly non-contiguous, ASCII-folded subsequence.
+ *
+ * This is the exact PRECONDITION that exhaustive basename-subsequence coverage
+ * guarantees: a native row whose basename contains the token as a subsequence
+ * is enumerated by the basename-subsequence candidate source, so it can never be
+ * an omitted row. Rows that do not contain it may still be omitted, and that is
+ * precisely the population {@link omittedSingleTokenScoreUpperBound} bounds.
+ *
+ * Callers MUST treat a false result as "not enumerated by the certifying
+ * source", never as "does not match the query". A row can match the scorer
+ * through its directory portion while its basename lacks the subsequence.
+ *
+ * The token is derived exactly as {@link searchFileMentionsFast} derives it
+ * (trim, clamp, lowercase) because that scorer lowercases before scanning.
+ * Comparing a raw mixed-case query against a lowercased path would wrongly
+ * report a high-scoring basename-prefix row as uncovered. Multi-token and
+ * directory-mode queries are not modelled by the single-token bound and
+ * therefore report false here.
+ */
+export function basenameContainsQuerySubsequence(query: string, path: string): boolean {
+  const token = query.trim().slice(0, MAX_QUERY_CHARS).toLowerCase()
+  if (!token || /\s/.test(token) || /[\\/]$/.test(token)) return false
+  const base = basenameStart(path)
+  const end = basenameEnd(path)
+  let qi = 0
+  for (let i = base; i < end && qi < token.length; i++) {
+    if (foldAscii(path.charCodeAt(i)) === token.charCodeAt(qi)) qi++
+  }
+  return qi === token.length
+}
+
+/**
+ * Conservative upper bound for any single-token OpenFork match omitted by a
+ * candidate compiler with the stated coverage.
+ *
+ * The fast scorer contributes at most 18 points per consecutive character,
+ * 16 per boundary hit, and 12 per basename hit. If path-substring candidates
+ * are exhaustive, an omitted ordinary subsequence cannot be fully consecutive.
+ *
+ * For basename-boundary coverage, the worst omitted case may still live fully
+ * in the basename, so it can retain first-at-basename and basename-only bonuses.
+ * For exhaustive basename-subsequence coverage, an omitted match must involve
+ * a directory segment, which removes those bonuses and at least one basename
+ * hit. These bounds intentionally remain conservative rather than trying to
+ * predict candidate ordering.
+ *
+ * Soundness argument for `path-substring+basename-subsequence`, for a row R
+ * whose basename lacks the token as a subsequence (see
+ * {@link basenameContainsQuerySubsequence}):
+ *   - `first < base`, so R forfeits the first-at-basename +120 and exact-start
+ *     +90 bonuses.
+ *   - `asciiEquals(path, base, token)` cannot hold, because that places the
+ *     whole token inside the basename; so R forfeits prefix +520 and the stem
+ *     bonus, and also `basenameHits === length` so it forfeits +180.
+ *   - Case A (the match crosses into the basename): the separator at `base-1`
+ *     lies strictly between `first` and `last`, so R pays at least one gap
+ *     (-1). R also cannot hold `length` consecutive characters, because a
+ *     length-long run starting below `base` would contain '/', which a
+ *     `[a-z0-9]` token cannot match; so `bestConsecutive <= length - 1`.
+ *     Bound: 18(L-1) + 16L + 12(L-1) - 1 = 46L - 31.
+ *   - Case B (the match lives entirely before the basename): `basenameHits = 0`
+ *     and no start bonuses, but every character may sit at a boundary.
+ *     Bound: 18L + 16L = 34L.
+ * Both cases also subtract `min(gaps, 80)` and `min(base >> 2, 30)`, which are
+ * non-negative, so dropping them keeps the result an upper bound.
+ *
+ * Consumers must compare STRICTLY (`floor > bound`). Equality is reachable in
+ * practice - query `ab` against path `aB/x.ts` scores exactly 68 == 34 * 2 - and
+ * an equal-scoring omitted row can still win the scorer's tie-break, so
+ * equality is UNPROVEN, never a pass.
+ */
+export function omittedSingleTokenScoreUpperBound(
+  query: string,
+  coverage: CandidateCoverage,
+): number | undefined {
+  const token = query.trim()
+  if (!/^[a-z0-9]{2,8}$/i.test(token)) return
+  const length = token.length
+  if (coverage === "path-substring+basename-subsequence") {
+    // Omitted matches split into two cases:
+    //
+    // 1. The match crosses into basename. It loses at least one basename hit
+    //    (-12), cannot keep all L characters consecutive across the separator
+    //    (-18), and pays at least one gap (-1): 46L - 31.
+    // 2. The match lives entirely before basename. It gets no basename/start
+    //    bonuses, but can still be fully consecutive with every character at a
+    //    boundary in the conservative bound: 18L + 16L = 34L.
+    //
+    // Case (2) matters for two-character camel-boundary paths such as
+    // `aB/x.ts`: query `ab` scores 68, above 46*2-31 = 61.
+    return Math.max(46 * length - 31, 34 * length)
+  }
+  return 46 * length + 371
+}
+
 type Ranked = {
   id: number
   score: number

@@ -17,9 +17,12 @@ import { Watcher } from "./watcher"
 import { Matcher } from "../search/matcher"
 import { rankFileMentionResults } from "../search/mention-ranking"
 import { searchFileMentionsFast } from "../search/mention-fast"
+import { compareShadow as compareEverythingShadow } from "../search/everything"
 import { SearchIndex } from "../search/index-service"
 import { ChunkStore } from "../search/chunk-store"
 import { Global } from "../global"
+import { Config } from "../config"
+import { searchBackend, useSearchIndex, watcherIgnoredPath, workspaceIgnoreGlobs } from "./search-policy"
 
 // Mention-search session cache shared by backends that can enumerate paths.
 // Its owner supplies a structural revision so watcher deltas rebuild the
@@ -73,6 +76,12 @@ export const ripgrepLayer = Layer.effect(
     const ripgrep = yield* Ripgrep.Service
     const events = yield* EventV2.Service
     const scope = yield* Scope.Scope
+    const config = yield* Config.Service
+    const watcherIgnore = (yield* config.entries())
+      .filter((entry): entry is Config.Document => entry.type === "document")
+      .flatMap((entry) => entry.info.watcher?.ignore ?? [])
+    const ignoreGlobs = workspaceIgnoreGlobs(watcherIgnore, location.directory)
+    const isConfiguredIgnored = (relative: string) => watcherIgnoredPath(relative, ignoreGlobs)
     const known = new Set<string>()
     const directories = new Set<string>()
     const dirCounts = new Map<string, number>()
@@ -81,11 +90,25 @@ export const ripgrepLayer = Layer.effect(
       directories: [] as string[],
       mentionRevision: 0,
     }
+    let mentionPathsRevision = -1
+    let mentionPathsCache: Matcher.PathEntry[] = []
+    const mentionPaths = () => {
+      if (mentionPathsRevision === state.mentionRevision) return mentionPathsCache
+      const paths: Matcher.PathEntry[] = state.files.map((p) => ({ path: p, isDir: false }))
+      for (const d of state.directories) {
+        const trimmed = d.endsWith(path.sep) ? d.slice(0, -path.sep.length) : d
+        paths.push({ path: trimmed, isDir: true })
+      }
+      mentionPathsCache = paths
+      mentionPathsRevision = state.mentionRevision
+      return paths
+    }
 
     // Register a relative path (seed or watcher event) with its ancestor dirs, so
     // directories stay mentionable. Same dir derivation as the original seed walk:
     // path prefixes joined with "/", displayed with a trailing path.sep.
     const registerFile = (rel: string) => {
+      if (isConfiguredIgnored(rel)) return
       if (known.has(rel)) return
       known.add(rel)
       state.files.push(rel)
@@ -123,6 +146,7 @@ export const ripgrepLayer = Layer.effect(
       const rel = path.relative(location.directory, file).replaceAll("\\", "/")
       if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false
       if (rel.split("/").some((segment) => segment === "" || segment.startsWith("."))) return false
+      if (isConfiguredIgnored(rel)) return event === "unlink" ? unregisterFile(rel) : false
       if (event === "unlink") return unregisterFile(rel)
       registerFile(rel)
       return false
@@ -132,6 +156,7 @@ export const ripgrepLayer = Layer.effect(
       .find({
         cwd: location.directory,
         pattern: "*",
+        ignore: ignoreGlobs,
         limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
         onEntry: (entry) =>
           Effect.sync(() => {
@@ -140,7 +165,14 @@ export const ripgrepLayer = Layer.effect(
       })
       .pipe(
         Effect.orDie,
-        Effect.tap(() => Effect.sync(() => (state.directories = Array.from(directories)))),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            state.directories = Array.from(directories)
+            // Directory visibility becomes queryable only after the seed walk
+            // publishes this array; invalidate any snapshot built mid-seed.
+            state.mentionRevision++
+          }),
+        ),
         Effect.asVoid,
         Effect.forkIn(scope),
       )
@@ -249,13 +281,59 @@ export const ripgrepLayer = Layer.effect(
           })
         }),
       searchMentions: (input) =>
-        Effect.sync(() => {
-          const paths: Matcher.PathEntry[] = state.files.map((p) => ({ path: p, isDir: false }))
-          for (const d of state.directories) {
-            const trimmed = d.endsWith(path.sep) ? d.slice(0, -path.sep.length) : d
-            paths.push({ path: trimmed, isDir: true })
+        Effect.gen(function* () {
+          const paths = mentionPaths()
+          if (!input.symbols) {
+            const page = searchFileMentionsFast(paths, input)
+            if (paths.length >= 100_000) {
+              yield* compareEverythingShadow({
+                root: location.directory,
+                query: input.query,
+                count: Math.min(10_000, Math.max(512, input.limit + input.offset, (input.limit + input.offset) * 8)),
+                native: page.results,
+                corpus: paths,
+                limit: input.limit,
+                offset: input.offset,
+                // Everything is discovery only. Intersect candidates with the
+                // exact native snapshot so .gitignore/hidden/configured-ignore
+                // semantics remain owned by the existing ripgrep backend.
+                ignore: (relative) =>
+                  isConfiguredIgnored(relative) ||
+                  (!known.has(relative) && !directories.has(relative + path.sep)),
+              }).pipe(
+                Effect.flatMap((shadow) =>
+                  shadow.measured
+                    ? Effect.logDebug("everything mention shadow", {
+                        corpus: paths.length,
+                        queryLength: input.query.length,
+                        limit: input.limit,
+                        offset: input.offset,
+                        candidateCount: shadow.candidateCount,
+                        complete: shadow.complete,
+                        requiredCount: shadow.requiredCount,
+                        exhaustible: shadow.exhaustible,
+                        providerMs: shadow.providerMs,
+                        recall: shadow.recall,
+                        orderedExact: shadow.orderedExact,
+                        proofFloor: shadow.proofFloor,
+                        omittedScoreUpperBound: shadow.omittedScoreUpperBound,
+                        provenTopK: shadow.provenTopK,
+                        missing: shadow.missing.slice(0, 8),
+                      })
+                    : Effect.logDebug("everything mention shadow skipped", {
+                        corpus: paths.length,
+                        queryLength: input.query.length,
+                        reason: shadow.skippedReason,
+                        unavailableReason: shadow.unavailableReason,
+                        detail: shadow.detail,
+                      }),
+                ),
+                Effect.ignore,
+                Effect.forkDetach,
+              )
+            }
+            return page
           }
-          if (!input.symbols) return searchFileMentionsFast(paths, input)
           return mentionsFromEntries(state, state.mentionRevision, paths, [], input)
         }),
     })
@@ -434,6 +512,7 @@ const indexLayer = Layer.effect(
     const location = yield* Location.Service
     const fs = yield* FSUtil.Service
     const ripgrep = yield* Ripgrep.Service
+    const config = yield* Config.Service
     return Service.of({
       glob: (input) =>
         Effect.gen(function* () {
@@ -478,6 +557,60 @@ const indexLayer = Layer.effect(
           const page = input.symbols
             ? mentionsFromEntries(index, snapshot.paths, snapshot.paths, snapshot.symbols, input)
             : searchFileMentionsFast(snapshot.paths, input)
+          if (!input.symbols && snapshot.paths.length >= 100_000) {
+            const watcherIgnore = (yield* config.entries())
+              .filter((entry): entry is Config.Document => entry.type === "document")
+              .flatMap((entry) => entry.info.watcher?.ignore ?? [])
+            if (watcherIgnore.length === 0) {
+              let visiblePaths: Set<string> | undefined
+              yield* compareEverythingShadow({
+                root: location.directory,
+                query: input.query,
+                count: Math.min(10_000, Math.max(512, input.limit + input.offset, (input.limit + input.offset) * 8)),
+                native: page.results,
+                corpus: snapshot.paths,
+                limit: input.limit,
+                offset: input.offset,
+                // Build this lazily inside detached shadow work. SearchIndex is
+                // still the semantic owner; Everything may only propose rows
+                // already present in the query-time authoritative snapshot.
+                ignore: (relative) => {
+                  visiblePaths ??= new Set(snapshot.paths.map((entry) => entry.path))
+                  return !visiblePaths.has(relative)
+                },
+              }).pipe(
+                Effect.flatMap((shadow) =>
+                  shadow.measured
+                    ? Effect.logDebug("everything mention shadow", {
+                        corpus: snapshot.paths.length,
+                        queryLength: input.query.length,
+                        limit: input.limit,
+                        offset: input.offset,
+                        candidateCount: shadow.candidateCount,
+                        complete: shadow.complete,
+                        requiredCount: shadow.requiredCount,
+                        exhaustible: shadow.exhaustible,
+                        providerMs: shadow.providerMs,
+                        recall: shadow.recall,
+                        orderedExact: shadow.orderedExact,
+                        proofFloor: shadow.proofFloor,
+                        omittedScoreUpperBound: shadow.omittedScoreUpperBound,
+                        provenTopK: shadow.provenTopK,
+                        missing: shadow.missing.slice(0, 8),
+                      })
+                    : Effect.logDebug("everything mention shadow skipped", {
+                        corpus: snapshot.paths.length,
+                        queryLength: input.query.length,
+                        reason: shadow.skippedReason,
+                        unavailableReason: shadow.unavailableReason,
+                        detail: shadow.detail,
+                      }),
+                ),
+                Effect.ignore,
+                Effect.forkDetach,
+              )
+            }
+          }
           // Prompt Input V2 requests file-only results. Blend a bounded, live
           // mtime prior into those rows after lexical matching so ordinary saves
           // never force an expensive Matcher.prepare rebuild. This is O(K log K)
@@ -501,9 +634,35 @@ const indexComposite = Layer.unwrap(
     return indexLayer.pipe(Layer.provideMerge(SearchIndex.layerWith(ChunkStore.dbPathFor(root, global.data))))
   }),
 )
-const baseLayer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_DISABLE_FFF || !Fff.available() ? ripgrepLayer : fffLayer)))
-const layer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_SEARCH_INDEX ? indexComposite : baseLayer)))
+const baseLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const config = yield* Config.Service
+    const watcherIgnore = (yield* config.entries())
+      .filter((entry): entry is Config.Document => entry.type === "document")
+      .flatMap((entry) => entry.info.watcher?.ignore ?? [])
+    return searchBackend({
+      disableFff: Flag.OPENCODE_DISABLE_FFF,
+      available: Fff.available(),
+      watcherIgnore,
+    }) === "ripgrep"
+      ? ripgrepLayer
+      : fffLayer
+  }),
+)
+const layer = Layer.unwrap(
+  Effect.gen(function* () {
+    if (!Flag.OPENCODE_SEARCH_INDEX) return baseLayer
+    const config = yield* Config.Service
+    const watcherIgnore = (yield* config.entries())
+      .filter((entry): entry is Config.Document => entry.type === "document")
+      .flatMap((entry) => entry.info.watcher?.ignore ?? [])
+    // SearchIndex's materialized candidate set has its own ownership and does
+    // not consume location watcher exclusions. Keep configured-ignore
+    // workspaces on the ignore-aware per-location backend.
+    return useSearchIndex({ enabled: true, watcherIgnore }) ? (indexComposite as unknown as typeof baseLayer) : baseLayer
+  }),
+)
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node, EventV2.node, Global.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node, EventV2.node, Global.node, Config.node] })
