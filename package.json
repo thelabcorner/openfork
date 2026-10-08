@@ -11,6 +11,8 @@
     "dev:web": "bun --cwd packages/app dev",
     "lint": "oxlint",
     "typecheck": "bun turbo typecheck",
+    "typecheck:frontier": "node script/typecheck-frontier.mjs",
+    "typecheck:frontier:test": "node --test script/typecheck-frontier.test.mjs",
     "upgrade-opentui": "bun run script/upgrade-opentui.ts",
     "postinstall": "bun run --cwd packages/core fix-node-pty",
     "prepare": "husky",
