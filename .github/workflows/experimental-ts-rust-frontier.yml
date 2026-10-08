@@ -1,0 +1,71 @@
+name: Experimental Rust typecheck frontier
+
+# Manual only. This is NOT a required build/release check or a replacement for tsgo.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-typecheck-frontier-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: github.actor == github.repository_owner
+    runs-on: [self-hosted, homelab]
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      HUSKY: "0"
+    steps:
+      - name: Require Linux x64
+        shell: bash
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install locked OpenFork dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install isolated Rust compiler 0.1.0
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/openfork-tsc-rs"
+          npm install --prefix "$RUNNER_TEMP/openfork-tsc-rs" --no-save --ignore-scripts tsc-rs@0.1.0
+          "$RUNNER_TEMP/openfork-tsc-rs/node_modules/.bin/tsc-rs" --version
+
+      - name: Parser/policy regression suite
+        run: node --test script/typecheck-frontier.test.mjs
+
+      - name: Ordinary TypeScript parity and Effect diagnostic inventory
+        shell: bash
+        run: |
+          node script/typecheck-frontier.mjs \
+            --rust-bin "$RUNNER_TEMP/openfork-tsc-rs/node_modules/.bin/tsc-rs" \
+            --rust-types llm=bun \
+            --rust-types effect-drizzle-sqlite=bun \
+            --rust-types effect-sqlite-node=node \
+            --rust-types http-recorder=node \
+            --gate parity --warmup 1 --repeats 3 \
+            --output "$RUNNER_TEMP/openfork-frontier-report.json"
+
+      - name: Upload inspectable diagnostic report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openfork-rust-typecheck-frontier
+          path: ${{ runner.temp }}/openfork-frontier-report.json
+          if-no-files-found: ignore
+          retention-days: 7
