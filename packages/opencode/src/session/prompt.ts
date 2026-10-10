@@ -712,6 +712,7 @@ const layer = Layer.effect(
           ? yield* resolve(
               ag.model.providerID,
               ag.model.modelID,
+              ag.model.accountID,
               ag.model.accountID !== undefined,
               true,
             )
