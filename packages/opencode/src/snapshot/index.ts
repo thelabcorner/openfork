@@ -822,13 +822,22 @@ const layer: Layer.Layer<
               const ops: { hash: string; file: string; rel: string }[] = []
               const seen = new Set<string>()
               for (const item of patches) {
+                // Reject invalid source trees *before* touching any worktree file.
+                // A failed lookup must never be interpreted as an absent file.
+                if (item.files.length && !TREE_OID.test(item.hash)) {
+                  return yield* Effect.die(new Error(`invalid snapshot revert tree: ${item.hash}`))
+                }
                 for (const file of item.files) {
                   if (seen.has(file)) continue
+                  const relative = path.relative(state.worktree, file)
+                  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+                    return yield* Effect.die(new Error(`snapshot revert path escapes worktree: ${file}`))
+                  }
                   seen.add(file)
                   ops.push({
                     hash: item.hash,
                     file,
-                    rel: path.relative(state.worktree, file).replaceAll("\\", "/"),
+                    rel: relative.replaceAll("\\", "/"),
                   })
                 }
               }
