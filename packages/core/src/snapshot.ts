@@ -13,7 +13,7 @@ import { Location } from "./location"
 import { AppProcess } from "./process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { Hash } from "./util/hash"
-import { Flock } from "./util/flock"
+import { SnapshotIndexLock } from "./snapshot-index-lock"
 import { GitRuntime } from "./git-runtime"
 
 export const ID = Schema.String.pipe(Schema.brand("Snapshot.ID"))
@@ -159,18 +159,7 @@ const layer = Layer.effect(
     // independent OpenFork server processes. Reuse the exact V1 filesystem
     // lease key and hold it across initialization, refresh and write-tree.
     const withShadowIndex = <A, E, R>(body: Effect.Effect<A, E, R>) =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          yield* Flock.effect(`snapshot-index:${gitDirectory}`, {
-            dir: path.join(global.data, "snapshot-locks"),
-            staleMs: 180_000,
-            timeoutMs: 45_000,
-            baseDelayMs: 60,
-            maxDelayMs: 750,
-          })
-          return yield* body
-        }),
-      )
+      SnapshotIndexLock.withLock(gitDirectory, global.data, body)
 
     const scope = Effect.fnUntraced(function* () {
       const relative = path.relative(worktree, location.directory)
