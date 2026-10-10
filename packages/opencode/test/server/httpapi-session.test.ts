@@ -52,7 +52,7 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer, reply } from "../lib/llm-server"
+import { TestLLMServer, reply, httpError } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
 import { pollWithTimeout, awaitWithTimeout, testEffect } from "../lib/effect"
 
@@ -2471,6 +2471,73 @@ describe("session HttpApi", () => {
       expect(
         byID.parts.some((part) => part.type === "tool" && part.tool === SessionTitle.GENERATED_TITLE_TOOL),
       ).toBe(true)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    20_000,
+  )
+
+  it.live("regenerateTitle recovers on a second model after a provider HTTP 400", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.push(
+        httpError(400, { error: { type: "invalid_request_error", message: "Bad Request" } }),
+        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Fallback Title" }).item(),
+      )
+
+      const base = testProviderConfig(llm.url)
+      const config = {
+        ...base,
+        provider: {
+          test: {
+            ...base.provider.test,
+            models: {
+              ...base.provider.test.models,
+              "recovery-model": {
+                ...base.provider.test.models["test-model"],
+                id: "recovery-model",
+                name: "Recovery Model",
+              },
+            },
+          },
+        },
+      }
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "Original Title" }).pipe(provideInstanceEffect(directory))
+      const svc = yield* Session.Service
+      const message = yield* svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* svc.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: message.id,
+        type: "text",
+        text: "Recover the title without changing provider",
+      })
+
+      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(response.status).toBe(204)
+
+      const title = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+          return current.title === "Original Title" ? undefined : current.title
+        }),
+        "title recovery failed after provider 400",
+        "10 seconds",
+      )
+      expect(title).toBe("Fallback Title")
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(inputs.map((body) => body.model)).toEqual(["test-model", "recovery-model"])
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     20_000,
   )
