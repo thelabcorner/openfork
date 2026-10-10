@@ -9,6 +9,7 @@ import fs from "fs/promises"
 import path from "path"
 import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { Flock } from "@opencode-ai/core/util/flock"
+import { SnapshotIndexLock } from "@opencode-ai/core/snapshot-index-lock"
 import { Snapshot } from "../../src/snapshot"
 import { InstanceState } from "@/effect/instance-state"
 import {
@@ -974,12 +975,12 @@ it.instance(
     const ctx = yield* InstanceState.context
     const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
     const options = {
-      dir: path.join(Global.Path.data, "snapshot-locks"),
+      dir: SnapshotIndexLock.root(Global.Path.data),
       timeoutMs: 1_000,
     }
     yield* write(path.join(tmp.path, "new.txt"), "new snapshot content")
     const fiber = yield* Effect.acquireUseRelease(
-      Effect.promise(() => Flock.acquire(`snapshot-index:${gitdir}`, options)),
+      Effect.promise(() => Flock.acquire(SnapshotIndexLock.key(gitdir), options)),
       () =>
         Effect.gen(function* () {
           const pending = yield* snapshot.track().pipe(Effect.forkScoped)
