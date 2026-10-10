@@ -7,7 +7,7 @@ import { Global } from "@opencode-ai/core/global"
 import { Hash } from "@opencode-ai/core/util/hash"
 import fs from "fs/promises"
 import path from "path"
-import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Flock } from "@opencode-ai/core/util/flock"
 import { SnapshotIndexLock } from "@opencode-ai/core/snapshot-index-lock"
 import { Snapshot } from "../../src/snapshot"
@@ -987,7 +987,7 @@ it.instance(
           yield* Effect.sleep("200 millis")
           // The competing capture cannot advance until the external owner
           // releases its lease, even though the Git index is not itself locked.
-          expect(Option.isNone(yield* Fiber.poll(pending))).toBe(true)
+          expect(pending.pollUnsafe()).toBeUndefined()
           return pending
         }),
       (lease) => Effect.promise(() => lease.release()),
