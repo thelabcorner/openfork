@@ -998,6 +998,24 @@ it.instance(
 )
 
 it.instance(
+  "revert rejects paths outside the captured worktree",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const tree = yield* snapshot.track()
+    expect(tree).toBeTruthy()
+    const outside = path.join(path.dirname(tmp.path), `${path.basename(tmp.path)}-outside.txt`)
+    yield* Effect.addFinalizer(() => rm(outside))
+    yield* write(outside, "preserve outside file")
+    const result = yield* Effect.exit(snapshot.revert([{ hash: tree!, files: [outside] }]))
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(yield* readText(outside)).toBe("preserve outside file")
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
+
+it.instance(
   "invalid revert refs never cause worktree files to be deleted",
   Effect.gen(function* () {
     const tmp = yield* bootstrap()
