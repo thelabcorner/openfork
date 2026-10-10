@@ -19,7 +19,7 @@ import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Hash } from "@opencode-ai/core/util/hash"
-import { Flock } from "@opencode-ai/core/util/flock"
+import { SnapshotIndexLock } from "@opencode-ai/core/snapshot-index-lock"
 import { Config } from "@/config/config"
 import { Global } from "@opencode-ai/core/global"
 import { Info } from "@opencode-ai/schema/file-diff"
@@ -364,21 +364,8 @@ const layer: Layer.Layer<
         const remove = (file: string) => fs.remove(file).pipe(Effect.catch(() => Effect.void))
         const locked = <A, E, R>(fx: Effect.Effect<A, E, R>) =>
           shadowLock(state.gitdir).withPermits(1)(
-            Effect.scoped(
-              Effect.gen(function* () {
-                // Index writes must be atomic across *processes*, not merely
-                // Snapshot layer instances. Hold the lease across sync, stage,
-                // write-tree, repair, checkout and GC; release on interruption.
-                yield* Flock.effect(`snapshot-index:${state.gitdir}`, {
-                  dir: path.join(Global.Path.data, "snapshot-locks"),
-                  staleMs: 180_000,
-                  timeoutMs: 45_000,
-                  baseDelayMs: 60,
-                  maxDelayMs: 750,
-                })
-                return yield* fx
-              }),
-            ),
+            // Exclusive across V1, core/V2 and any number of server processes.
+            SnapshotIndexLock.withLock(state.gitdir, Global.Path.data, fx),
           )
 
         const enabled = Effect.fnUntraced(function* () {
