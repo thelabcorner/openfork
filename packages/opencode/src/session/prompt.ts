@@ -721,47 +721,65 @@ const layer = Layer.effect(
         yield* resolve(input.providerID, input.modelID),
       ].filter((item): item is MaintenanceModelResolution => item !== undefined)
 
-      // Configured candidates can collapse to a single model. Keep recovery
-      // within the original provider: never silently cross account/provider
-      // boundaries, and never bypass the authoritative route resolver.
-      const excluded = new Set(
-        configuredCandidates
-          .filter((candidate) => candidate.model.providerID === input.providerID)
-          .map((candidate) => String(candidate.model.id)),
-      )
-      const recoveryModels = yield* provider.getProvider(input.providerID).pipe(
-        Effect.map((info) =>
-          rankTitleRecoveryModels(Object.values(info.models).filter(Provider.isLanguageModel), excluded, 8),
-        ),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("title recovery catalog unavailable", {
-            sessionID: input.sessionID,
-            providerID: input.providerID,
-            error: String(Cause.squash(cause)),
-          }).pipe(Effect.as([] as Provider.Model[])),
-        ),
-      )
-      const recoveryCandidates: MaintenanceModelResolution[] = []
-      for (const model of recoveryModels) {
-        const resolved = yield* resolve(input.providerID, model.id)
-        if (!resolved) continue
-        recoveryCandidates.push(resolved)
-        if (recoveryCandidates.length === 2) break
-      }
-      const candidates = [...configuredCandidates, ...recoveryCandidates]
       const seen = new Set<string>()
-      const uniqueCandidates = candidates.filter((item) => {
-        const key = [
+      const candidateKey = (item: MaintenanceModelResolution) =>
+        [
           item.model.providerID,
           item.model.id,
           item.route?.routeKind ?? "legacy",
           item.route?.accountID ?? "",
         ].join("/")
+      const uniqueCandidates = configuredCandidates.filter((item) => {
+        const key = candidateKey(item)
         if (seen.has(key)) return false
         seen.add(key)
         return true
       })
       const toolCandidates = uniqueCandidates.filter((item) => item.model.capabilities.toolcall)
+
+      // Normal title generation must not perform extra catalog reads or route
+      // resolution. Only an exhausted candidate queue activates recovery.
+      // Stay within the original provider, inheriting the committed route when
+      // one exists; never silently choose an unrelated provider/account.
+      let recoveryLoaded = false
+      const loadRecovery = Effect.fn("SessionPrompt.loadTitleRecovery")(function* () {
+        if (recoveryLoaded) return
+        recoveryLoaded = true
+        const excluded = new Set(
+          configuredCandidates
+            .filter((candidate) => candidate.model.providerID === input.providerID)
+            .map((candidate) => String(candidate.model.id)),
+        )
+        const recoveryModels = yield* provider.getProvider(input.providerID).pipe(
+          Effect.map((info) =>
+            rankTitleRecoveryModels(Object.values(info.models).filter(Provider.isLanguageModel), excluded, 8),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("title recovery catalog unavailable", {
+              sessionID: input.sessionID,
+              providerID: input.providerID,
+              error: String(Cause.squash(cause)),
+            }).pipe(Effect.as([] as Provider.Model[])),
+          ),
+        )
+        const added: string[] = []
+        for (const model of recoveryModels) {
+          const candidate = yield* resolve(input.providerID, model.id)
+          if (!candidate || !candidate.model.capabilities.toolcall) continue
+          const key = candidateKey(candidate)
+          if (seen.has(key)) continue
+          seen.add(key)
+          toolCandidates.push(candidate)
+          added.push(String(candidate.model.id))
+          if (added.length === 2) break
+        }
+        yield* Effect.logInfo("title recovery candidates", {
+          sessionID: input.sessionID,
+          providerID: input.providerID,
+          models: added,
+        })
+      })
+      if (toolCandidates.length === 0) yield* loadRecovery()
       yield* Effect.logInfo("title generation candidates", {
         sessionID: input.sessionID,
         candidates: toolCandidates.map((item) => `${item.model.providerID}/${item.model.id}`),
@@ -803,7 +821,8 @@ const layer = Layer.effect(
           text: titleRequestText,
         })
       }
-      for (const candidate of toolCandidates) {
+      for (let index = 0; index < toolCandidates.length; index++) {
+        const candidate = toolCandidates[index]!
         const mdl = candidate.model
         const candidateRoute = candidate.route
         const candidateUsageRoute = usageRoute(candidateRoute)
@@ -1080,6 +1099,7 @@ const layer = Layer.effect(
           ),
         )
         if (title) return title
+        if (index === toolCandidates.length - 1) yield* loadRecovery()
       }
       yield* Effect.logWarning("all title model candidates failed", {
         sessionID: input.sessionID,
