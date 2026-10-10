@@ -7,7 +7,8 @@ import { Global } from "@opencode-ai/core/global"
 import { Hash } from "@opencode-ai/core/util/hash"
 import fs from "fs/promises"
 import path from "path"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Flock } from "@opencode-ai/core/util/flock"
 import { Snapshot } from "../../src/snapshot"
 import { InstanceState } from "@/effect/instance-state"
 import {
@@ -933,6 +934,84 @@ it.instance(
   { git: true },
 )
 
+
+it.instance(
+  "does not publish an old tree or an empty hash when git add encounters index.lock",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    const before = yield* snapshot.track()
+    expect(before).toMatch(/^[a-f0-9]{40,64}$/)
+
+    const ctx = yield* InstanceState.context
+    const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+    const lock = path.join(gitdir, "index.lock")
+    yield* write(path.join(tmp.path, "new.txt"), "new snapshot content")
+    yield* write(lock, "simulated legacy git index writer")
+
+    // Staging is required here, so an existing Git lock must make the whole
+    // capture fail closed. The invalid capture must not poison single-flight.
+    const failed = yield* snapshot.track()
+    expect(failed).toBeUndefined()
+    expect(yield* exists(lock)).toBe(true)
+    yield* rm(lock)
+
+    const after = yield* snapshot.track()
+    expect(after).toMatch(/^[a-f0-9]{40,64}$/)
+    expect(after).not.toBe(before)
+    expect((yield* snapshot.patch(before!, after!)).files).toContain(fwd(tmp.path, "new.txt"))
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "holds the filesystem lease across a complete snapshot capture",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    expect(yield* snapshot.track()).toBeTruthy()
+    const ctx = yield* InstanceState.context
+    const gitdir = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree))
+    const options = {
+      dir: path.join(Global.Path.data, "snapshot-locks"),
+      timeoutMs: 1_000,
+    }
+    yield* write(path.join(tmp.path, "new.txt"), "new snapshot content")
+    const fiber = yield* Effect.acquireUseRelease(
+      Effect.promise(() => Flock.acquire(`snapshot-index:${gitdir}`, options)),
+      () =>
+        Effect.gen(function* () {
+          const pending = yield* snapshot.track().pipe(Effect.forkScoped)
+          yield* Effect.sleep("200 millis")
+          // The competing capture cannot advance until the external owner
+          // releases its lease, even though the Git index is not itself locked.
+          expect(Option.isNone(yield* Fiber.poll(pending))).toBe(true)
+          return pending
+        }),
+      (lease) => Effect.promise(() => lease.release()),
+    )
+    expect(yield* Fiber.join(fiber)).toMatch(/^[a-f0-9]{40,64}$/)
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "invalid revert refs never cause worktree files to be deleted",
+  Effect.gen(function* () {
+    const tmp = yield* bootstrap()
+    const snapshot = yield* Snapshot.Service
+    expect(yield* snapshot.track()).toBeTruthy()
+    const target = path.join(tmp.path, "precious.txt")
+    yield* write(target, "retain me")
+    const result = yield* Effect.exit(snapshot.revert([{ hash: "invalid-tree", files: [target] }]))
+    expect(Exit.isFailure(result)).toBe(true)
+    expect(yield* readText(target)).toBe("retain me")
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
 
 it.instance(
   "reconstructs a corrupt shadow index instead of failing every capture",
