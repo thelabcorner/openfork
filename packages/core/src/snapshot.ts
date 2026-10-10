@@ -13,6 +13,7 @@ import { Location } from "./location"
 import { AppProcess } from "./process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { Hash } from "./util/hash"
+import { Flock } from "./util/flock"
 import { GitRuntime } from "./git-runtime"
 
 export const ID = Schema.String.pipe(Schema.brand("Snapshot.ID"))
@@ -153,6 +154,24 @@ const layer = Layer.effect(
       : location.project.directory
     const gitDirectory = AbsolutePath.make(path.join(global.data, "snapshot", location.project.id, Hash.fast(worktree)))
 
+    // V1 Snapshot and this V2/core service use the *same* shadow gitdir.
+    // Git.tree has an in-process lock, but that cannot coordinate V1 or
+    // independent OpenFork server processes. Reuse the exact V1 filesystem
+    // lease key and hold it across initialization, refresh and write-tree.
+    const withShadowIndex = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Flock.effect(`snapshot-index:${gitDirectory}`, {
+            dir: path.join(global.data, "snapshot-locks"),
+            staleMs: 180_000,
+            timeoutMs: 45_000,
+            baseDelayMs: 60,
+            maxDelayMs: 750,
+          })
+          return yield* body
+        }),
+      )
+
     const scope = Effect.fnUntraced(function* () {
       const relative = path.relative(worktree, location.directory)
       if (relative.startsWith("..") || path.isAbsolute(relative))
@@ -218,19 +237,23 @@ const layer = Layer.effect(
 
     const capture = Effect.fn("Snapshot.capture")(function* () {
       if (!(yield* enabled())) return undefined
-      return yield* Effect.gen(function* () {
-        const repo = yield* repository()
-        yield* healIndex(repo)
-        return ID.make(
-          yield* git.tree.capture({
-            repository: repo,
-            scopes: [yield* scope()],
-            ignores: source,
-            maximumUntrackedFileBytes: 2 * 1024 * 1024,
-          }),
-        )
-      }).pipe(
-        Effect.catch((cause) => Effect.logWarning("failed to capture snapshot", { cause }).pipe(Effect.as(undefined))),
+      return yield* withShadowIndex(
+        Effect.gen(function* () {
+          const repo = yield* repository()
+          yield* healIndex(repo)
+          return ID.make(
+            yield* git.tree.capture({
+              repository: repo,
+              scopes: [yield* scope()],
+              ignores: source,
+              maximumUntrackedFileBytes: 2 * 1024 * 1024,
+            }),
+          )
+        }),
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to capture snapshot; no tree published", { cause }).pipe(Effect.as(undefined)),
+        ),
       )
     })
 
@@ -279,40 +302,52 @@ const layer = Layer.effect(
 
     const preview = Effect.fn("Snapshot.preview")(function* (input: PreviewInput) {
       if (!(yield* enabled())) return yield* new Error({ operation: "preview", message: "Snapshots are disabled" })
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("preview", cause)))
-      yield* healIndex(repo).pipe(Effect.catch(() => Effect.void))
-      const files = yield* plan("preview", input)
-      const current = yield* git.tree
-        .capture({
-          repository: repo,
-          scopes: Array.from(files.keys()),
-          ignores: source,
-          maximumUntrackedFileBytes: 2 * 1024 * 1024,
-        })
-        .pipe(Effect.mapError((cause) => failure("preview", cause)))
-      return yield* git.tree
-        .preview({
-          repository: repo,
-          current,
-          files,
-          context: input.context,
-        })
-        .pipe(Effect.mapError((cause) => failure("preview", cause)))
+      return yield* withShadowIndex(
+        Effect.gen(function* () {
+          const repo = yield* repository().pipe(Effect.mapError((cause) => failure("preview", cause)))
+          yield* healIndex(repo)
+          const files = yield* plan("preview", input)
+          const current = yield* git.tree
+            .capture({
+              repository: repo,
+              scopes: Array.from(files.keys()),
+              ignores: source,
+              maximumUntrackedFileBytes: 2 * 1024 * 1024,
+            })
+            .pipe(Effect.mapError((cause) => failure("preview", cause)))
+          return yield* git.tree
+            .preview({
+              repository: repo,
+              current,
+              files,
+              context: input.context,
+            })
+            .pipe(Effect.mapError((cause) => failure("preview", cause)))
+        }),
+      )
     })
 
     const restore = Effect.fn("Snapshot.restore")(function* (input: RestoreInput) {
       if (!(yield* enabled())) return yield* new Error({ operation: "restore", message: "Snapshots are disabled" })
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
-      yield* git.tree
-        .restore({ repository: repo, files: yield* plan("restore", input) })
-        .pipe(Effect.mapError((cause) => failure("restore", cause)))
+      return yield* withShadowIndex(
+        Effect.gen(function* () {
+          const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
+          yield* git.tree
+            .restore({ repository: repo, files: yield* plan("restore", input) })
+            .pipe(Effect.mapError((cause) => failure("restore", cause)))
+        }),
+      )
     })
 
     const checkout = Effect.fn("Snapshot.checkout")(function* (snapshot: ID) {
-      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
-      yield* git.tree
-        .checkout({ repository: repo, tree: Git.TreeID.make(snapshot) })
-        .pipe(Effect.mapError((cause) => failure("restore", cause)))
+      return yield* withShadowIndex(
+        Effect.gen(function* () {
+          const repo = yield* repository().pipe(Effect.mapError((cause) => failure("restore", cause)))
+          yield* git.tree
+            .checkout({ repository: repo, tree: Git.TreeID.make(snapshot) })
+            .pipe(Effect.mapError((cause) => failure("restore", cause)))
+        }),
+      )
     })
 
     const epoch = Effect.fnUntraced(function* () {
