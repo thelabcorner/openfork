@@ -573,7 +573,16 @@ const layer = Layer.effect(
     })
 
     const writeTree = Effect.fn("Git.tree.write")(function* (repository: Repository) {
-      return TreeID.make((yield* repositoryOperation("write_tree", repository, ["write-tree"])).text.trim())
+      const result = yield* repositoryOperation("write_tree", repository, ["write-tree"])
+      const oid = result.text.trim()
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(oid)) {
+        return yield* new OperationError({
+          operation: "write_tree",
+          directory: repository.worktree,
+          message: "Git write-tree did not return a valid tree object ID",
+        })
+      }
+      return TreeID.make(oid)
     })
 
     type CaptureInput = {
