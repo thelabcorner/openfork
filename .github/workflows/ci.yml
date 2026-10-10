@@ -52,6 +52,13 @@ jobs:
       # Fail-closed channel behavior and the staged-layout/runtime-discovery
       # contract for the managed worktree-store sidecar. Focused on purpose: the
       # full desktop suite needs packaged native resources this job does not build.
+      # Exercise the actual HTTP-400 -> second-model retitle path in addition
+      # to the cheaper pure candidate-ranking cases.
+      - name: Title recovery regressions
+        run: |
+          bun test ./packages/opencode/test/session/title-recovery-models.test.ts
+          bun test ./packages/opencode/test/server/httpapi-session.test.ts --test-name-pattern "regenerateTitle recovers on a second model"
+
       - name: Desktop worktree-store packaging tests
         working-directory: packages/desktop
         run: bun run test:worktree-store
