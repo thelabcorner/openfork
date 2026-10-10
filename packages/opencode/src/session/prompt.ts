@@ -27,6 +27,7 @@ import { TurnCheckpoint } from "./checkpoint"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { rankTitleRecoveryModels } from "./title-recovery-models"
 
 import { type ModelMessage, type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -697,7 +698,7 @@ const layer = Layer.effect(
           ...(input.route ? { route: input.route } : {}),
         })
       const small = yield* provider.getSmallModel(input.providerID)
-      const candidates = [
+      const configuredCandidates = [
         input.model
           ? yield* resolve(
               input.model.providerID,
@@ -711,7 +712,6 @@ const layer = Layer.effect(
           ? yield* resolve(
               ag.model.providerID,
               ag.model.modelID,
-              ag.model.accountID,
               ag.model.accountID !== undefined,
               true,
             )
@@ -719,6 +719,35 @@ const layer = Layer.effect(
         small ? yield* resolve(small.providerID, small.id) : undefined,
         yield* resolve(input.providerID, input.modelID),
       ].filter((item): item is MaintenanceModelResolution => item !== undefined)
+
+      // Configured candidates can collapse to a single model. Keep recovery
+      // within the original provider: never silently cross account/provider
+      // boundaries, and never bypass the authoritative route resolver.
+      const excluded = new Set(
+        configuredCandidates
+          .filter((candidate) => candidate.model.providerID === input.providerID)
+          .map((candidate) => String(candidate.model.id)),
+      )
+      const recoveryModels = yield* provider.getProvider(input.providerID).pipe(
+        Effect.map((info) =>
+          rankTitleRecoveryModels(Object.values(info.models).filter(Provider.isLanguageModel), excluded, 8),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("title recovery catalog unavailable", {
+            sessionID: input.sessionID,
+            providerID: input.providerID,
+            error: String(Cause.squash(cause)),
+          }).pipe(Effect.as([] as Provider.Model[])),
+        ),
+      )
+      const recoveryCandidates: MaintenanceModelResolution[] = []
+      for (const model of recoveryModels) {
+        const resolved = yield* resolve(input.providerID, model.id)
+        if (!resolved) continue
+        recoveryCandidates.push(resolved)
+        if (recoveryCandidates.length === 2) break
+      }
+      const candidates = [...configuredCandidates, ...recoveryCandidates]
       const seen = new Set<string>()
       const uniqueCandidates = candidates.filter((item) => {
         const key = [
