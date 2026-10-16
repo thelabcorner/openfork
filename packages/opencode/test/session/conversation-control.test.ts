@@ -120,7 +120,7 @@ describe("conversation control", () => {
       const canonical = ContextInspection.ledger(created.id, yield* ContextInspection.read(created.id))
       expect(page.mode).toBe("chronological")
       expect(page.entries).toHaveLength(10)
-      expect(page.authoritativeTotals).toBeUndefined()
+      expect("authoritativeTotals" in page).toBe(false)
       const authoritative = yield* readContextLedgerTotals(created.id)
       expect(authoritative.revision).toBe(page.revision)
       expect(authoritative.totals).toEqual(canonical.totals)
@@ -129,7 +129,7 @@ describe("conversation control", () => {
       expect(canonical.totals.pinnedCount).toBe(1)
       expect(canonical.totals.editedCount).toBe(1)
       const next = yield* readContextLedgerPage({ sessionID: created.id, limit: 10, cursor: page.nextCursor })
-      expect(next.authoritativeTotals).toBeUndefined()
+      expect("authoritativeTotals" in next).toBe(false)
 
       // Historical v0 part scalars are never trusted as zero-valued facts.
       yield* db.run(sql`UPDATE part SET context_projection_version = 0 WHERE id = ${"prt_context_totals_0"}`)

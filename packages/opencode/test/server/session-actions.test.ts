@@ -296,7 +296,7 @@ describe("session action routes", () => {
     () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
-        const ruleset = [{ permission: "codesearch", pattern: "*", action: "ask" }]
+        const ruleset = [{ permission: "codesearch", pattern: "*", action: "ask" as const }]
 
         const created = yield* requestInDirectory("/session", test.directory, {
           method: "POST",
