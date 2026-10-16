@@ -5,6 +5,7 @@ import {
   type SessionMessageInfo,
 } from "./session-message-info"
 import { UserTurnSource } from "@opencode-ai/schema/session-v1"
+import type { Message, Part } from "@opencode-ai/sdk/v2"
 import {
   isSemanticUserMessage,
   isStateProjectionMessage,
@@ -12,10 +13,86 @@ import {
   isConversationParentMessage,
   latestRestorableUserMessage,
   normalizeSessionMessages,
+  createSessionMessageNormalizer,
   userTurnPresentation,
 } from "./session-message"
 
 describe("normalizeSessionMessages", () => {
+  test("stateful append projection matches a full rebuild across carried agent, model, parent, shell, and compaction state", () => {
+    const source = [
+      { id: "msg_agent", type: "agent-switched", agent: "build", time: { created: 1 } },
+      {
+        id: "msg_model",
+        type: "model-switched",
+        model: { id: "model-a", providerID: "provider-a", variant: "high" },
+        time: { created: 2 },
+      },
+      { id: "msg_user", type: "user", text: "prompt", time: { created: 3 } },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "review",
+        model: { id: "model-b", providerID: "provider-b" },
+        content: [{ type: "text", text: "reply" }],
+        cost: 0,
+        tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 4 },
+      },
+      {
+        id: "msg_compaction",
+        type: "compaction",
+        status: "completed",
+        reason: "auto",
+        summary: "summary",
+        recent: "recent",
+        time: { created: 5 },
+      },
+      {
+        id: "msg_shell",
+        type: "shell",
+        shellID: "shell_1",
+        command: "echo hi",
+        status: "exited",
+        exit: 0,
+        time: { created: 6, completed: 7 },
+      },
+      { id: "msg_user_after_shell", type: "user", text: "next", time: { created: 8 } },
+      {
+        id: "msg_host",
+        type: "synthetic",
+        text: "host continuation",
+        provenance: { owner: "host", source: UserTurnSource.GoalContinuation },
+        time: { created: 9 },
+      },
+      {
+        id: "msg_host_assistant",
+        type: "assistant",
+        agent: "goal-worker",
+        model: { id: "model-c", providerID: "provider-c" },
+        content: [{ type: "reasoning", text: "thinking" }],
+        cost: 0,
+        tokens: { input: 2, output: 0, reasoning: 1, cache: { read: 0, write: 0 } },
+        time: { created: 10 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const sessionID = "ses_incremental_normalizer"
+    const projectedMessages = new Map<string, Message>()
+    const projectedParts = new Map<string, Part[]>()
+    const state = createSessionMessageNormalizer(sessionID, [], (id) => projectedMessages.get(id))
+    const prefix: SessionMessageInfo[] = []
+    for (const item of source) {
+      const projected = state.append(item, (id) => projectedParts.get(id) ?? [])
+      expect(projected).toBeDefined()
+      projected?.messages.forEach((message) => projectedMessages.set(message.id, message))
+      projected?.parts.forEach((parts, id) => projectedParts.set(id, parts))
+      prefix.push(item)
+      const expected = normalizeSessionMessages(sessionID, prefix)
+      expect([...projectedMessages.values()]).toEqual(expected.messages)
+      expect([...projectedParts]).toEqual([...expected.parts])
+    }
+  })
+
   test("projects current turns into stable legacy rendering records", () => {
     const source = [
       { id: "msg_1", type: "agent-switched", agent: "build", time: { created: 1 } },

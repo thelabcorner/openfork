@@ -216,6 +216,149 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
   return { messages, parts }
 }
 
+/**
+ * Stateful append projection for a session whose structural source is known to
+ * be a strict tail append. Hydration, prepend, reorder, replacement, and gap
+ * repair must rebuild with `normalizeSessionMessages`; this helper deliberately
+ * has no API for applying those operations. It carries the same agent/model and
+ * conversation-parent state as the full normalizer so one new source record can
+ * be projected without replaying all prior history.
+ */
+export function createSessionMessageNormalizer(
+  sessionID: string,
+  source: readonly SessionMessageInfo[],
+  getMessage: (id: string) => Message | undefined = () => undefined,
+) {
+  let agent = ""
+  let model = emptyModel
+  let parentID: string | undefined
+
+  // Reconstruct the small amount of cross-record state once at snapshot time.
+  // Keep this law in sync with normalizeSessionMessages; append-only callers
+  // then pay constant work per new source record.
+  for (const message of source) {
+    if (message.type === "agent-switched") {
+      agent = message.agent
+      continue
+    }
+    if (message.type === "model-switched") {
+      model = message.model
+      continue
+    }
+    if (message.type === "user") {
+      parentID = message.id
+      continue
+    }
+    if (message.type === "synthetic" && message.text.trim()) {
+      const provenance = message.provenance ?? { owner: "host" as const, source: legacyCurrentSyntheticSource }
+      if (!(provenance.owner === "host" && SessionTurnProvenance.isStateKind(provenance.source))) {
+        parentID = message.id
+      }
+      continue
+    }
+    if (message.type === "shell") {
+      parentID = undefined
+      continue
+    }
+    if (message.type === "assistant") {
+      agent = message.agent
+      model = message.model
+    }
+  }
+  let parentMessage = parentID ? getMessage(parentID) : undefined
+
+  const append = (
+    message: SessionMessageInfo,
+    getParts: (id: string) => Part[],
+  ) => {
+    const changedMessages: Message[] = []
+    const changedParts = new Map<string, Part[]>()
+    const rememberParts = (id: string, value: Part[]) => changedParts.set(id, value)
+
+    if (message.type === "agent-switched") {
+      agent = message.agent
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "model-switched") {
+      model = message.model
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "user") {
+      parentID = message.id
+      parentMessage = userMessage(sessionID, message, agent, model)
+      changedMessages.push(parentMessage)
+      rememberParts(message.id, userParts(sessionID, message))
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "synthetic") {
+      if (!message.text.trim()) return { messages: changedMessages, parts: changedParts }
+      const provenance = message.provenance ?? { owner: "host" as const, source: legacyCurrentSyntheticSource }
+      if (!(provenance.owner === "host" && SessionTurnProvenance.isStateKind(provenance.source))) {
+        parentID = message.id
+      }
+      const normalized = {
+        id: message.id,
+        sessionID,
+        role: "user",
+        time: message.time,
+        agent,
+        model: { providerID: model.providerID, modelID: model.id, variant: model.variant },
+        provenance,
+      } satisfies UserMessage
+      changedMessages.push(normalized)
+      if (parentID === message.id) parentMessage = normalized
+      rememberParts(message.id, [textPart(sessionID, message.id, 0, message.text, true)])
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "shell") {
+      const shell = shellMessages(sessionID, message, agent, model)
+      changedMessages.push(...shell)
+      parentMessage = undefined
+      rememberParts(message.id, [textPart(sessionID, message.id, 0, message.command)])
+      rememberParts(`${message.id}:assistant`, [shellPart(sessionID, message)])
+      parentID = undefined
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "assistant") {
+      agent = message.agent
+      model = message.model
+      if (!parentID) return { messages: changedMessages, parts: changedParts }
+      const parent = parentMessage
+      if (parent?.role === "user") {
+        parentMessage = {
+          ...parent,
+          agent: message.agent,
+          model: {
+            providerID: message.model.providerID,
+            modelID: message.model.id,
+            variant: message.model.variant,
+          },
+        }
+        changedMessages.push(parentMessage)
+      }
+      changedMessages.push(assistantMessage(sessionID, parentID, message))
+      rememberParts(message.id, assistantParts(sessionID, message))
+      return { messages: changedMessages, parts: changedParts }
+    }
+    if (message.type === "compaction" && parentID) {
+      const next = [
+        ...getParts(parentID),
+        {
+          id: `${message.id}:compaction`,
+          sessionID,
+          messageID: parentID,
+          type: "compaction" as const,
+          auto: message.reason === "auto",
+        },
+      ]
+      rememberParts(parentID, next)
+    }
+    return { messages: changedMessages, parts: changedParts }
+  }
+
+  return { append }
+}
+
 function shellMessages(
   sessionID: string,
   message: SessionMessageShell,

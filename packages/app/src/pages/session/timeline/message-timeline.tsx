@@ -8,6 +8,7 @@ import {
   onCleanup,
   onMount,
   Show,
+  Suspense,
   type Accessor,
   type JSX,
 } from "solid-js"
@@ -15,7 +16,8 @@ import { createStore, produce } from "solid-js/store"
 import { Dynamic } from "solid-js/web"
 import { useNavigate } from "@solidjs/router"
 import { useMutation } from "@tanstack/solid-query"
-import { createVirtualizer, defaultRangeExtractor, elementScroll, type VirtualItem } from "@tanstack/solid-virtual"
+import { defaultRangeExtractor, elementScroll, type VirtualItem } from "@tanstack/solid-virtual"
+import { createSafeVirtualizer } from "@/components/safe-solid-virtualizer"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { Button } from "@opencode-ai/ui/button"
 import { Card } from "@opencode-ai/ui/card"
@@ -78,15 +80,18 @@ import { useSync } from "@/context/sync"
 import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { sessionTitle } from "@/utils/session-title"
 import { isSemanticUserMessage, userTurnPresentation } from "@/utils/session-message"
+import { measureRowElement } from "@/components/virtual-scroll-element"
 import { scheduleConnectedMeasure } from "./measure"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
 import { systemInjectionPreview, systemInjectionSegments } from "./system-injection"
-import { collectVirtualItems, filterVirtualIndexes } from "./virtual-items"
+import { collectVirtualItems, coversVirtualViewport, mergeVirtualIndexes, recoverVirtualWindow, shouldCompensateReadingResize } from "./virtual-items"
+import { createVirtualTimelineItemKey } from "./virtual-item-key"
 import { textLayoutMode } from "@/lib/text-layout"
 import { TIMELINE_FALLBACK_SIZE, TimelineRowEstimator, type RowEstimateInput } from "./estimation"
 import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -99,9 +104,18 @@ type TimelineRowByTag<T extends TimelineRow.TimelineRow["_tag"]> = Extract<Timel
 
 const timelineFallbackItemSize = TIMELINE_FALLBACK_SIZE
 type TimelineOpenState = Record<string, boolean | undefined>
+type TimelineViewportSnapshot = {
+  scrollTop: number
+  anchor?: { key: string; delta: number }
+}
 const timelineCache = new Map<
   string,
-  { measurements: VirtualItem[]; toolOpen: TimelineOpenState; injectionOpen: TimelineOpenState }
+  {
+    measurements: VirtualItem[]
+    toolOpen: TimelineOpenState
+    injectionOpen: TimelineOpenState
+    viewport?: TimelineViewportSnapshot
+  }
 >()
 
 // Process-global estimator: priors/history learning persists across sessions;
@@ -248,7 +262,12 @@ function TimelineDiffView(props: { diff: SummaryDiff }) {
 
   return (
     <div data-slot="session-turn-diff-view" data-scrollable>
-      <Dynamic component={fileComponent} mode="diff" virtualize={false} fileDiff={view.fileDiff} />
+      {/* A historical diff can be the first consumer of the route-lazy File
+          viewer. Scope that suspension here, or opening one history entry
+          replaces the *whole timeline* with the parent route fallback. */}
+      <Suspense fallback={null}>
+        <Dynamic component={fileComponent} mode="diff" virtualize fileDiff={view.fileDiff} />
+      </Suspense>
     </div>
   )
 }
@@ -266,6 +285,7 @@ export function MessageTimeline(props: {
   onUserScroll: () => void
   onHistoryScroll: () => void
   onAutoScrollInteraction: (event: MouseEvent) => void
+  onPauseScrollFollow: () => void
   shouldAnchorBottom: () => boolean
   centered: boolean
   setContentRef: (el: HTMLDivElement) => void
@@ -315,6 +335,11 @@ export function MessageTimeline(props: {
     return sync().data.session_status[id] ?? idle
   })
   const sessionMessages = createMemo(() => (sessionID() ? (sync().data.message[sessionID()!] ?? []) : []))
+  const timelineContentStatus = createMemo(() => {
+    const id = sessionID()
+    if (!id) return { pendingCount: 0, error: undefined as string | undefined }
+    return sync().session.timelineContentStatus(id)
+  })
   const projectedMessages = createMemo(() => {
     const id = sessionID()
     if (!id) return []
@@ -324,6 +349,11 @@ export function MessageTimeline(props: {
     if (!boundary) return messages
     const index = messages.findIndex((message) => message.id === boundary)
     return index < 0 ? messages : messages.slice(0, index)
+  })
+  const structureChange = createMemo(() => {
+    const id = sessionID()
+    if (!id) return { revision: 0, operation: { kind: "reset" as const } }
+    return sync().session.structureChange(id)()
   })
   const info = createMemo(() => {
     const id = sessionID()
@@ -368,6 +398,7 @@ export function MessageTimeline(props: {
     messages: sessionMessages,
     userMessages: () => props.userMessages,
     sessionMessages: projectedMessages,
+    structureChange,
     parts: getMsgParts,
     status: sessionStatus,
     showReasoningSummaries: settings.general.showReasoningSummaries,
@@ -384,7 +415,10 @@ export function MessageTimeline(props: {
   const timelineRowByKey = projection.rowByKey
   const timelineRowIndexByKey = projection.rowIndexByKey
   const timelineRows = projection.rows
-  const safeTimelineRows = createMemo(() => timelineRows() ?? [])
+  // Projection rows mutate only in the append fast path. Force notification
+  // when the stable array identity is retained so the virtualizer refreshes
+  // its count and visible row lookup without copying the full history.
+  const safeTimelineRows = createMemo(() => timelineRows() ?? [], [], { equals: false })
   let estimateInputCache = new WeakMap<
     TimelineRow.TimelineRow,
     { key: string; text?: string; heightHint?: number }
@@ -533,6 +567,22 @@ export function MessageTimeline(props: {
   const [renderOverscan, setRenderOverscan] = createSignal(initialMeasurements?.length || coldBottomMount ? 6 : 20)
   let resizePinnedIndexes: number[] = []
   let resizePinFrame: number | undefined
+  // An explicitly opening diff may become taller than the viewport before
+  // the inner code viewer has measured. Retain only its row and its immediate
+  // successor during that short transition; unlike tail pinning this is
+  // initiated by the user and is released whether it succeeds or fails.
+  const [interactionPins, setInteractionPins] = createSignal<number[]>([])
+  let interactionPinTimer: ReturnType<typeof setTimeout> | undefined
+  const pinInteraction = (index: number) => {
+    const count = safeTimelineRows().length
+    if (index < 0 || index >= count) return
+    setInteractionPins(index + 1 < count ? [index, index + 1] : [index])
+    if (interactionPinTimer !== undefined) clearTimeout(interactionPinTimer)
+    interactionPinTimer = setTimeout(() => {
+      interactionPinTimer = undefined
+      setInteractionPins([])
+    }, 1500)
+  }
   let virtualContent: HTMLDivElement | undefined
   // Cached from the width/height ResizeObserver below instead of read live in
   // resizeItem. resizeItem runs once per row on every measurement and the
@@ -542,13 +592,20 @@ export function MessageTimeline(props: {
   // the more rows/messages a session has. The container's own height only
   // changes when it's actually resized, which the observer already tracks.
   let containerHeight = 0
-  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+  // TanStack includes getItemKey's *function identity* in its measurement
+  // memo dependencies. A new closure on every adapter options read needlessly
+  // rebuilds O(total rows) coordinates, even if nothing structural changed.
+  // Cache it by the reactive projection revision: content-only renders and
+  // scroll notifications keep the same function; any row reconciliation
+  // correctly invalidates it, including equal-count reorders.
+  const virtualItemKey = createVirtualTimelineItemKey(safeTimelineRows)
+  const virtualizer = createSafeVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
       return safeTimelineRows().length
     },
     getScrollElement: () => listRoot() ?? null,
     observeElementOffset: observeElementOffsetReconnectAware,
-    initialOffset: () => (props.shouldAnchorBottom() ? Number.MAX_SAFE_INTEGER : 0),
+    initialOffset: () => (props.shouldAnchorBottom() ? Number.MAX_SAFE_INTEGER : (cached?.viewport?.scrollTop ?? 0)),
     initialMeasurementsCache: initialMeasurements,
     estimateSize: (index) => {
       const row = safeTimelineRows()[index]
@@ -562,15 +619,14 @@ export function MessageTimeline(props: {
       elementScroll(offset, options, instance)
     },
     get getItemKey() {
-      const rows = safeTimelineRows()
-      return (index: number) => {
-        const row = rows[index]
-        // ResizeObserver can report a removed element after its row has left the projection.
-        if (!row) return `removed:${index}`
-        return TimelineRow.key(row)
-      }
+      return virtualItemKey()
     },
-    anchorTo: "end",
+    // The physical end is authoritative only while actively following it.
+    // An unconditional end anchor can undo an explicit tool-collapse gesture
+    // even after auto-follow has been paused, producing the classic rebound.
+    get anchorTo() {
+      return props.shouldAnchorBottom() ? "end" : "start"
+    },
     get scrollEndThreshold() {
       // While following, only the stick band counts as "at end". The old 80px
       // window re-anchored the first inertial ticks of a fast upward fling.
@@ -585,34 +641,26 @@ export function MessageTimeline(props: {
     overscan: 50,
     paddingEnd: 64,
     rangeExtractor: (range) => {
-      const id = activeMessageID()
+      // Pin the live tail only while actually following it. A historical
+      // expanded tool (idle) or an active tool the reader intentionally left
+      // behind should not run its expensive renderers and observers offscreen.
+      // The authoritative tool output is in the store and expansion state is
+      // keyed above this virtual row, so returning to it is safe.
+      const id = props.shouldAnchorBottom() && sessionStatusIsWorking(sessionStatus().type)
+        ? activeMessageID()
+        : undefined
       const active = id ? (messageLastRowIndex().get(id) ?? -1) : -1
       const indexes = defaultRangeExtractor({ ...range, overscan: renderOverscan() })
-      const extras =
-        active < 0 || active >= (resizePinnedIndexes.at(-1) ?? -1)
-          ? active < 0
-            ? resizePinnedIndexes
-            : [...resizePinnedIndexes, active]
-          : [...resizePinnedIndexes, active].sort((left, right) => left - right)
-      const merged: number[] = []
-      let extraIndex = 0
-      let index = 0
-      while (extraIndex < extras.length || index < indexes.length) {
-        const extra = extras[extraIndex]
-        const current = indexes[index]
-        if (current === undefined || (extra !== undefined && extra < current)) {
-          if (extra !== merged[merged.length - 1]) merged.push(extra)
-          extraIndex += 1
-          continue
-        }
-        if (current !== merged[merged.length - 1]) merged.push(current)
-        index += 1
-      }
-      return filterVirtualIndexes(merged, range.count)
+      const base = mergeVirtualIndexes(indexes, resizePinnedIndexes, active, range.count)
+      const pins = interactionPins()
+      return pins.length ? mergeVirtualIndexes(base, pins, -1, range.count) : base
     },
   })
   const resizeItem = virtualizer.resizeItem
+  type ResizeKey = (typeof virtualizer.measurementsCache)[number]["key"]
   let resizeAnchorScheduled = false
+  let resizeMeasureFrame: number | undefined
+  const pendingResizeByKey = new Map<ResizeKey, { index: number; size: number }>()
   const anchorResizedBottom = () => {
     if (resizeAnchorScheduled || props.hasScrollGesture()) return
     resizeAnchorScheduled = true
@@ -622,10 +670,26 @@ export function MessageTimeline(props: {
       virtualizer.scrollToEnd()
     })
   }
-  virtualizer.resizeItem = (index, size) => {
+  const applyResize = (index: number, size: number, expectedKey?: ResizeKey) => {
     const item = virtualizer.measurementsCache[index]
+    if (expectedKey !== undefined && item?.key !== expectedKey) return
     const previous = item ? (virtualizer.itemSizeCache.get(item.key) ?? item.size) : undefined
     const root = listRoot()
+    const traceSizeWrite = (window as any).__fullAppGateTraceTimelineSizeWrite
+    if (typeof traceSizeWrite === "function") {
+      traceSizeWrite({
+        at: performance.now(),
+        scenario: (window as any).__fullAppGateScenario ?? "startup",
+        index,
+        key: item?.key,
+        previous,
+        size,
+        stage: "applied",
+        scrollTop: root?.scrollTop,
+        clientHeight: root?.clientHeight,
+        resizeObserverDepth: (window as any).__fullAppGateResizeObserverDepth ?? 0,
+      })
+    }
     if (root && previous !== undefined && Math.abs(size - previous) > containerHeight) {
       const range = virtualizer.range
       resizePinnedIndexes = range
@@ -642,10 +706,51 @@ export function MessageTimeline(props: {
     resizeItem(index, size)
     if (root && props.shouldAnchorBottom()) anchorResizedBottom()
   }
+  virtualizer.resizeItem = (index, size) => {
+    const item = virtualizer.measurementsCache[index]
+    if (!item) return
+    const traceSizeWrite = (window as any).__fullAppGateTraceTimelineSizeWrite
+    if (typeof traceSizeWrite === "function") {
+      traceSizeWrite({
+        at: performance.now(),
+        scenario: (window as any).__fullAppGateScenario ?? "startup",
+        index,
+        key: item.key,
+        size,
+        stage: "queued",
+        scrollTop: listRoot()?.scrollTop,
+        clientHeight: listRoot()?.clientHeight,
+        resizeObserverDepth: (window as any).__fullAppGateResizeObserverDepth ?? 0,
+      })
+    }
+    pendingResizeByKey.set(item.key, { index, size })
+    if (resizeMeasureFrame !== undefined) return
+    resizeMeasureFrame = requestAnimationFrame(() => {
+      resizeMeasureFrame = undefined
+      const pending = [...pendingResizeByKey]
+      pendingResizeByKey.clear()
+      for (const [key, value] of pending) applyResize(value.index, value.size, key)
+    })
+  }
+  onCleanup(() => {
+    if (resizeMeasureFrame !== undefined) cancelAnimationFrame(resizeMeasureFrame)
+    resizeMeasureFrame = undefined
+    pendingResizeByKey.clear()
+    if (interactionPinTimer !== undefined) clearTimeout(interactionPinTimer)
+  })
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item) => {
-    if (props.shouldAnchorBottom()) return false
-    const first = virtualizer.range?.startIndex
-    return first !== undefined && item.index < first
+    const scrollTop = listRoot()?.scrollTop ?? virtualizer.scrollOffset ?? 0
+    const margin = showHeader() ? 64 : 0
+    const height = containerHeight || virtualizer.scrollRect?.height || 440
+    // A logical follow flag can lag a wheel/drag gesture. Ignore it if the
+    // physical viewport has already left the bottom stick band.
+    if (props.shouldAnchorBottom() && virtualizer.getTotalSize() - scrollTop - height <= 10) return false
+    return shouldCompensateReadingResize(
+      item,
+      virtualizer.measurementsCache[item.index + 1],
+      scrollTop + margin,
+      scrollTop + height,
+    )
   }
   // One pass over the virtual items for both lookups: the map (per row key)
   // and the key list for <For> (per virtualizer update, i.e. per scroll frame).
@@ -654,11 +759,128 @@ export function MessageTimeline(props: {
   // collectVirtualItems. Reading timelineRowByKey() adds no steady-state
   // recompute: scroll-only updates keep its Map identity, and row-list
   // updates invalidate this memo anyway.
-  const virtualItemsMemo = createMemo(() =>
-    collectVirtualItems(virtualizer.getVirtualItems(), (key) => timelineRowByKey().has(key)),
-  )
+  let lastVisibleWindow: { session: string; items: VirtualItem[] } | undefined
+  const virtualItemsMemo = createMemo(() => {
+    const rows = safeTimelineRows()
+    const items = virtualizer.getVirtualItems()
+    const root = listRoot()
+    const session = sessionKey()
+    const byKey = timelineRowByKey()
+    // Resolve row ownership by the current index, not the virtualizer's cached
+    // key from an earlier count/session. Filtering cached keys alone can drop
+    // the entire window during topology reconciliation.
+    const keyAt = (index: number) => {
+      const row = rows[index]
+      return row ? TimelineRow.key(row) : undefined
+    }
+    const collect = (source: readonly (VirtualItem | undefined)[]) =>
+      collectVirtualItems(source, (key) => byKey.has(key), keyAt)
+    let current = collect(items)
+    const measurements = virtualizer.measurementsCache
+    const scrollTop = root?.scrollTop ?? virtualizer.scrollOffset ?? 0
+    const viewportHeight = root?.clientHeight || containerHeight || 440
+    const top = scrollTop + (showHeader() ? 64 : 0)
+    // The last row ends before paddingEnd; trailing empty space is deliberate.
+    const contentEnd = measurements[rows.length - 1]?.end
+    const bottom = Math.max(top + 1, Math.min(scrollTop + viewportHeight, contentEnd ?? Infinity))
+    if (current.keys.length && coversVirtualViewport(current.byKey.values(), top, bottom)) {
+      lastVisibleWindow = { session, items: [...current.byKey.values()] }
+      return current
+    }
+    if (!rows.length) {
+      if (lastVisibleWindow?.session === session) lastVisibleWindow = undefined
+      return current
+    }
+    // A pinned active row can leave the viewport empty while the adapter range
+    // remains nonempty. Recover both empty and incompletely covered windows.
+    // Normal steady-state scrolling never enters this O(log n + visible) path.
+    current = collect(recoverVirtualWindow(
+      measurements,
+      scrollTop,
+      viewportHeight,
+    ))
+    if (current.keys.length) {
+      // Retain the offscreen streaming row to avoid throwing away its DOM
+      // state during a temporary window repair.
+      const combined = [...current.byKey.values()]
+      for (const item of items) {
+        if (!item || !Number.isSafeInteger(item.index)) continue
+        const key = keyAt(item.index)
+        if (!key || current.byKey.has(key) || !byKey.has(key)) continue
+        combined.push(String(item.key) === key ? item : { ...item, key })
+      }
+      combined.sort((a, b) => a.index - b.index)
+      return collect(combined)
+    }
+    // Even measurementsCache can briefly be empty during a virtualizer reset.
+    // Reuse the prior viewport only if the SAME session still owns at least one
+    // of its stable row keys. This bridges a transient empty range without
+    // ever rendering a row from a different tab/session.
+    const previous = lastVisibleWindow
+    if (!previous || previous.session !== session) return current
+    const retained = previous.items.filter((item) =>
+      String(item.key) === keyAt(item.index) && byKey.has(String(item.key)),
+    )
+    return retained.length ? collect(retained) : current
+  })
   const virtualItemByKey = () => virtualItemsMemo().byKey
   const virtualRowKeys = () => virtualItemsMemo().keys
+
+  // Preserve the first visible row, not merely the raw scrollTop. A structural
+  // reconcile can change estimates above the viewport; restoring the same
+  // pixel offset can then jump to an unrelated tool group.
+  let viewportAnchor: { session: string; key: string; delta: number } | undefined =
+    cached?.viewport?.anchor ? { session: ownerSessionKey, ...cached.viewport.anchor } : undefined
+  let viewportAnchorFrame: number | undefined
+  const captureViewportAnchor = () => {
+    if (props.shouldAnchorBottom()) return
+    const root = listRoot()
+    const index = virtualizer.range?.startIndex
+    if (!root || index === undefined) return
+    const measurement = virtualizer.measurementsCache[index]
+    const row = safeTimelineRows()[index]
+    if (!measurement || !row || String(measurement.key) !== TimelineRow.key(row)) return
+    viewportAnchor = {
+      session: sessionKey(),
+      key: TimelineRow.key(row),
+      delta: measurement.start - (showHeader() ? 64 : 0) - root.scrollTop,
+    }
+  }
+  const restoreViewportAnchor = () => {
+    if (!viewportAnchor || viewportAnchor.session !== sessionKey()) return
+    if (props.shouldAnchorBottom() || props.hasScrollGesture()) return
+    const root = listRoot()
+    const index = timelineRowIndexByKey().get(viewportAnchor.key)
+    const measurement = index === undefined ? undefined : virtualizer.measurementsCache[index]
+    if (!root || !measurement || String(measurement.key) !== viewportAnchor.key) return
+    const target = measurement.start - (showHeader() ? 64 : 0) - viewportAnchor.delta
+    if (Number.isFinite(target) && Math.abs(root.scrollTop - target) > 1)
+      root.scrollTop = Math.max(0, target)
+  }
+  createEffect(
+    on(
+      () => [sessionKey(), safeTimelineRows(), timelineRowIndexByKey()] as const,
+      ([key]) => {
+        if (viewportAnchor && viewportAnchor.session !== key) viewportAnchor = undefined
+        if (viewportAnchorFrame !== undefined) cancelAnimationFrame(viewportAnchorFrame)
+        restoreViewportAnchor()
+        // ResizeObserver can commit newly measured heights one frame after
+        // reconciliation. Recheck a bounded number of frames without polling.
+        let checks = 0
+        const check = () => {
+          viewportAnchorFrame = undefined
+          restoreViewportAnchor()
+          if (++checks >= 3) return
+          viewportAnchorFrame = requestAnimationFrame(check)
+        }
+        if (viewportAnchor) viewportAnchorFrame = requestAnimationFrame(check)
+      },
+      { defer: true },
+    ),
+  )
+  onCleanup(() => {
+    if (viewportAnchorFrame !== undefined) cancelAnimationFrame(viewportAnchorFrame)
+  })
   createEffect(() => {
     props.setRevealMessage?.((id, rowIndex) => {
       // If a specific row index is provided, scroll to that exact row
@@ -679,8 +901,17 @@ export function MessageTimeline(props: {
   })
 
   let overscanFrame: number | undefined
+  let viewportMountFrame: number | undefined
   let maybeAnchorFrame: number | undefined
   onMount(() => {
+    if (cached?.viewport && !props.shouldAnchorBottom()) {
+      // Restored measurement heights can settle after the scroll element
+      // reconnects. Row-key anchoring repairs that initial pixel offset.
+      viewportMountFrame = requestAnimationFrame(() => {
+        viewportMountFrame = undefined
+        restoreViewportAnchor()
+      })
+    }
     overscanFrame = requestAnimationFrame(() => {
       if (props.shouldAnchorBottom()) virtualizer.scrollToEnd()
       overscanFrame = requestAnimationFrame(() => {
@@ -701,7 +932,15 @@ export function MessageTimeline(props: {
     maybeAnchorFrame = requestAnimationFrame(() => {
       maybeAnchorFrame = undefined
       if (!props.shouldAnchorBottom() || props.hasScrollGesture()) return
-      virtualizer.scrollToEnd()
+      // A structural append first updates the virtualizer's row range, then
+      // mounts/measures the new tail row. Anchor once more on the following
+      // frame so a row appended just after a Prompted user bubble cannot leave
+      // its assistant Markdown below the scroll viewport until a tab switch.
+      maybeAnchorFrame = requestAnimationFrame(() => {
+        maybeAnchorFrame = undefined
+        if (!props.shouldAnchorBottom() || props.hasScrollGesture()) return
+        virtualizer.scrollToEnd()
+      })
     })
   }
 
@@ -730,10 +969,17 @@ export function MessageTimeline(props: {
       measurements: virtualizer.takeSnapshot(),
       toolOpen: { ...toolOpen },
       injectionOpen: { ...injectionOpen },
+      viewport: props.shouldAnchorBottom() ? undefined : {
+        scrollTop: listRoot()?.scrollTop ?? 0,
+        anchor: viewportAnchor?.session === activeSessionKey
+          ? { key: viewportAnchor.key, delta: viewportAnchor.delta }
+          : undefined,
+      },
     })
     while (timelineCache.size > 16) timelineCache.delete(timelineCache.keys().next().value!)
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
+    if (viewportMountFrame !== undefined) cancelAnimationFrame(viewportMountFrame)
     if (maybeAnchorFrame !== undefined) cancelAnimationFrame(maybeAnchorFrame)
     props.setRevealMessage?.(() => {})
     props.setRevealRow?.(() => {})
@@ -758,6 +1004,9 @@ export function MessageTimeline(props: {
 
   const bindListRoot = (root: HTMLDivElement) => {
     if (root === listRoot()) return
+    // Browser-native scroll anchoring must not race TanStack's compensation.
+    // Restrict this to the virtual timeline, not generic ScrollView instances.
+    root.style.setProperty("overflow-anchor", "none")
     setListRoot(root)
     props.setScrollRef(root)
   }
@@ -845,6 +1094,10 @@ export function MessageTimeline(props: {
 
   const handleListPointerDown = (event: PointerEvent & { currentTarget: HTMLDivElement }) => {
     if (!prependLoading) clearPrependAnchor()
+    // Clicking an accordion/menu can resize the transcript; it is not a
+    // scroll gesture. Middle-click autoscroll still owns the pointer press.
+    if (event.button !== 1 && event.target instanceof Element &&
+      event.target.closest('button, a[href], input, textarea, select, [role="button"], [contenteditable="true"]')) return
     props.onMarkScrollGesture(event.target)
   }
 
@@ -865,16 +1118,23 @@ export function MessageTimeline(props: {
   }
 
   const handleListScroll = (event: Event & { currentTarget: HTMLDivElement }) => {
+    const userIntent = props.hasScrollGesture()
     if (prependLoading) updatePrependAnchor()
+    // Capture only real navigation, not a virtualizer/browser correction.
+    // Otherwise the correction would overwrite the pre-correction anchor and
+    // make the subsequent restoration follow the incorrect scroll window.
+    else if (userIntent || !viewportAnchor) captureViewportAnchor()
     props.onScheduleScrollState(event.currentTarget)
     props.onHistoryScroll()
-    props.onAutoScrollHandleScroll()
-    const el = event.currentTarget
-    const viewport = containerHeight || el.clientHeight
-    const away = virtualizer.getTotalSize() - viewport - el.scrollTop > 2
-    // Keep the gesture window alive for inertial / middle-click autoscroll,
-    // which produce scroll events without pointer buttons after mouseup.
-    if (!props.hasScrollGesture() && !away) return
+    // Programmatic virtualizer corrections and browser anchoring can move the
+    // viewport away from the tail too. Only interpret the resulting scroll
+    // delta as a user escape when an input gesture owns it; otherwise one
+    // layout correction can permanently disable follow for the active turn.
+    if (userIntent) props.onAutoScrollHandleScroll()
+    // Keep a real gesture window alive for inertial / middle-click autoscroll,
+    // which produce scroll events without pointer buttons after mouseup. Being
+    // away from the tail alone is not evidence of user intent.
+    if (!userIntent) return
     props.onUserScroll()
     props.onMarkScrollGesture(event.currentTarget)
   }
@@ -1182,7 +1442,7 @@ export function MessageTimeline(props: {
     )
   }
 
-  const workingTurn = (userMessageID: string) => sessionStatus().type !== "idle" && activeMessageID() === userMessageID
+  const workingTurn = (userMessageID: string) => sessionStatusIsWorking(sessionStatus().type) && activeMessageID() === userMessageID
 
   const turnDurationByMessage = createMemo(() => {
     const result = new Map<string, number>()
@@ -1212,7 +1472,7 @@ export function MessageTimeline(props: {
   })
   const turnThroughputRate = (userMessageID: string) => turnThroughputByMessage().get(userMessageID)
 
-  const renderAssistantPartGroup = (row: Accessor<TimelineRowMap["AssistantPart"]>, onSizeChange?: () => void) => {
+  const renderAssistantPartGroup = (row: Accessor<TimelineRowMap["AssistantPart"]>, onSizeChange?: (immediate?: boolean) => void) => {
     // Keep copy-button discovery turn-local. The old global memo read parts for
     // EVERY historical assistant, so one live text delta invalidated a scan of
     // the entire conversation. Only mounted/virtualized rows need this value,
@@ -1244,7 +1504,13 @@ export function MessageTimeline(props: {
         <ContextToolGroup
           parts={parts()}
           open={open()}
-          onOpenChange={(value) => setToolOpen(contextOpenKey(), value)}
+          onOpenChange={(value) => {
+            // Expanding a tool is an explicit reading interaction. Preserve
+            // its on-screen heading instead of snapping the transcript to the
+            // newest message whenever nested content changes its height.
+            props.onPauseScrollFollow()
+            setToolOpen(contextOpenKey(), value)
+          }}
           busy={
             workingTurn(row().userMessageID) && lastAssistantGroupKey().get(row().userMessageID) === row().group.key
           }
@@ -1283,9 +1549,21 @@ export function MessageTimeline(props: {
                 useV2Actions={settings.general.newLayoutDesigns()}
                 defaultOpen={defaultOpen()}
                 toolOpen={toolOpen[part().id] ?? defaultOpen()}
-                onToolOpenChange={(open) => setToolOpen(part().id, open)}
+                onToolOpenChange={(open) => {
+                  // Inspection is a reading gesture, not a request to follow
+                  // the live tail. With a local Suspense boundary around the
+                  // lazy diff renderer it is now safe to pause end-follow for
+                  // edit/write/patch as well as ordinary tools.
+                  props.onPauseScrollFollow()
+                  const current = part()
+                  if (current?.type === "tool" && ["edit", "write", "apply_patch"].includes(current.tool)) {
+                    const index = timelineRowIndexByKey().get(`assistant-part:${row().userMessageID}:${row().group.key}`)
+                    if (index !== undefined) pinInteraction(index)
+                  }
+                  setToolOpen(part().id, open)
+                }}
                 deferToolContent
-                virtualizeDiff={false}
+                virtualizeDiff
                 onContentRendered={onSizeChange}
                 resolveVisualArtifact={resolveVisualArtifact}
               />
@@ -1335,7 +1613,7 @@ export function MessageTimeline(props: {
     )
   }
 
-  const renderTimelineRow = (row: Accessor<TimelineRow.TimelineRow>, onSizeChange?: () => void) => {
+  const renderTimelineRow = (row: Accessor<TimelineRow.TimelineRow>, onSizeChange?: (immediate?: boolean) => void) => {
     switch (row()._tag) {
       case "TurnGap":
         return <div data-timeline-row="TurnGap" aria-hidden="true" class="h-6" />
@@ -1570,7 +1848,7 @@ export function MessageTimeline(props: {
     }
   }
 
-  function TimelineRowView(props: { row: TimelineRow.TimelineRow; onSizeChange?: () => void }) {
+  function TimelineRowView(props: { row: TimelineRow.TimelineRow; onSizeChange?: (immediate?: boolean) => void }) {
     return renderTimelineRow(() => props.row, props.onSizeChange)
   }
 
@@ -1594,12 +1872,43 @@ export function MessageTimeline(props: {
     const asyncFile = () => ["edit", "write", "apply_patch"].includes(tool()?.tool ?? "")
     const [ready, setReady] = createSignal(initialItem.size <= timelineFallbackItemSize || !asyncFile())
     let contentMeasureFrame: number | undefined
+    let rowEstimatorFrame: number | undefined
+    let urgentMeasurePending = false
+
+    const measureUrgently = () => {
+      // Expansion is user-driven, unlike high-frequency streamed output.
+      // Commit its height correction in a microtask, after Solid updates the
+      // accordion but BEFORE paint. The normal rAF + ResizeObserver path
+      // otherwise paints a clipped/reflowed frame before finally compensating
+      // its scroll offset, producing the visible reverse jump on collapse.
+      if (urgentMeasurePending) return
+      urgentMeasurePending = true
+      queueMicrotask(() => {
+        urgentMeasurePending = false
+        if (!element?.isConnected) return
+        const current = item()
+        if (String(current.key) !== props.rowKey) return
+        const size = element.getBoundingClientRect().height
+        if (!Number.isFinite(size) || size <= 0) return
+        if (contentMeasureFrame !== undefined) cancelAnimationFrame(contentMeasureFrame)
+        contentMeasureFrame = undefined
+        pendingResizeByKey.delete(current.key)
+        applyResize(current.index, size, current.key)
+        rowEstimator.observe({ ...estimateInput(row()), height: size })
+      })
+    }
 
     const measureElementAndObserve = (element: HTMLDivElement) => {
-      virtualizer.measureElement(element)
-      const current = row()
-      const height = virtualizer.itemSizeCache.get(TimelineRow.key(current))
-      if (height !== undefined) rowEstimator.observe({ ...estimateInput(current), height })
+      measureRowElement(virtualizer, element, item().index)
+      // resizeItem commits the measurement in a shared frame batch. Read the
+      // cache after that batch so the estimator sees the same measured height.
+      if (rowEstimatorFrame !== undefined) cancelAnimationFrame(rowEstimatorFrame)
+      rowEstimatorFrame = requestAnimationFrame(() => {
+        rowEstimatorFrame = undefined
+        const current = row()
+        const height = virtualizer.itemSizeCache.get(TimelineRow.key(current))
+        if (height !== undefined) rowEstimator.observe({ ...estimateInput(current), height })
+      })
     }
 
     const measureOrDefer = () => {
@@ -1647,6 +1956,7 @@ export function MessageTimeline(props: {
 
     onCleanup(() => {
       if (contentMeasureFrame !== undefined) cancelAnimationFrame(contentMeasureFrame)
+      if (rowEstimatorFrame !== undefined) cancelAnimationFrame(rowEstimatorFrame)
     })
 
     return (
@@ -1672,8 +1982,12 @@ export function MessageTimeline(props: {
         >
           <TimelineRowView
             row={row()}
-            onSizeChange={() => {
+            onSizeChange={(immediate) => {
               setReady(true)
+              if (immediate) {
+                measureUrgently()
+                return
+              }
               if (contentMeasureFrame !== undefined) cancelAnimationFrame(contentMeasureFrame)
               contentMeasureFrame = scheduleConnectedMeasure(element, measureElementAndObserve)
             }}
@@ -1739,6 +2053,7 @@ export function MessageTimeline(props: {
       </div>
       <SessionTextSurface containerRef={listRoot}>
         <ScrollView
+          onThumbScrollIntent={() => props.onMarkScrollGesture(listRoot())}
           viewportRef={bindListRoot}
           onWheel={handleListWheel}
           onTouchStart={handleListTouchStart}
@@ -1755,6 +2070,31 @@ export function MessageTimeline(props: {
             "--sticky-accordion-top": showHeader() ? "48px" : "0px",
           }}
         >
+        {/* Background content repair is invisible during normal reading.
+            Only a genuine recovery failure warrants a visible status + retry. */}
+        <Show when={timelineContentStatus().error}>
+          <div
+            data-slot="session-timeline-content-status"
+            role="alert"
+            aria-live="polite"
+            class="mx-auto flex w-full max-w-4xl items-center justify-between gap-3 px-4 py-2 text-sm text-text-weak md:px-5"
+          >
+            <span>
+              {language.t("session.messages.recovery.error", { error: timelineContentStatus().error ?? "" })}
+            </span>
+            <Show when={timelineContentStatus().error && sessionID()}>
+              {(id) => (
+                <ButtonV2
+                  size="small"
+                  variant="ghost"
+                  onClick={() => void sync().session.retryTimelineContent(id())}
+                >
+                  {language.t("session.messages.recovery.retry")}
+                </ButtonV2>
+              )}
+            </Show>
+          </div>
+        </Show>
         <Show when={showHeader()}>
           <div
             data-session-title

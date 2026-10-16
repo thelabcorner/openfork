@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 import {
+  boundedMessagePreview,
   boundedPartsText,
   newestRawMessages,
   RAW_MESSAGE_PAGE_SIZE,
@@ -8,6 +9,24 @@ import {
 } from "./session-context-raw"
 
 describe("context raw-history bounds", () => {
+  test("preview exactly matches trim-and-slice, including empty, Unicode whitespace, and long text", () => {
+    for (const text of [
+      "",
+      "   ",
+      "  hi ",
+      "\u00a0\u2003hello world\n\t",
+      "a".repeat(24),
+      "a".repeat(25),
+      "    a".repeat(200),
+      "x".repeat(8 * 1024 * 1024),
+      "a".repeat(25) + " ".repeat(1024),
+    ]) {
+      const trimmed = text.trim()
+      const expected = !trimmed ? undefined : trimmed.length > 24 ? `${trimmed.slice(0, 24)}…` : trimmed
+      expect(boundedMessagePreview(text)).toBe(expected)
+    }
+  })
+
   test("5k-message histories mount only the newest 200 rows by default", () => {
     const messages = Array.from({ length: 5_000 }, (_, index) => ({
       id: `m-${index}`,

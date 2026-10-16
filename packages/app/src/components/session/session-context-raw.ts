@@ -3,6 +3,21 @@ import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 export const RAW_MESSAGE_PAGE_SIZE = 200
 export const RAW_MESSAGE_SUMMARY_CHARS = 24 * 1024
 
+/**
+ * Match trim()+slice() without allocating a potentially multi-megabyte
+ * trimmed copy for each mounted message header.
+ */
+export function boundedMessagePreview(text: string, limit = 24): string | undefined {
+  let start = 0
+  while (start < text.length && /\s/.test(text[start]!)) start++
+  if (start === text.length) return undefined
+  let end = text.length
+  while (end > start && /\s/.test(text[end - 1]!)) end--
+  const length = Math.max(0, limit)
+  const preview = text.slice(start, Math.min(end, start + length))
+  return end - start > length ? `${preview}…` : preview
+}
+
 export function newestRawMessages(messages: readonly Message[], requested = RAW_MESSAGE_PAGE_SIZE) {
   const limit = Math.max(RAW_MESSAGE_PAGE_SIZE, requested)
   return messages.length <= limit ? messages : messages.slice(messages.length - limit)

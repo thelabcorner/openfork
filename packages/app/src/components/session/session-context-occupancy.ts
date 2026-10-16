@@ -1,21 +1,14 @@
 import type { UsageSessionContextResponse } from "@opencode-ai/sdk/v2/client"
 import type { Info as SessionTelemetryInfo } from "@opencode-ai/schema/session-telemetry"
+import { ContextOccupancy } from "@opencode-ai/core/session/context-occupancy"
 
-export type SessionContextOccupancy = {
-  providerLabel: string
-  modelLabel: string
-  limit: number | undefined
-  total: number
-  usage: number | null
-  updatedAt: number
-}
+export type SessionContextOccupancy = ContextOccupancy.Footprint
 
 // The generated V2 client can lag the shared schema during a rolling source
 // update. SessionTelemetry.Info is the authoritative producer contract; retain
 // the generated route shape while admitting fields already present on the
 // server/schema surface.
-export type SessionContextTelemetry =
-  NonNullable<UsageSessionContextResponse["telemetry"]> &
+export type SessionContextTelemetry = NonNullable<UsageSessionContextResponse["telemetry"]> &
   Pick<SessionTelemetryInfo, "sampledAt">
 type SessionContextHistory = UsageSessionContextResponse["history"]
 
@@ -76,9 +69,6 @@ export function newestSessionContextTelemetry(
   return streamed.sampledAt > snapshot.sampledAt ? streamed : snapshot
 }
 
-const percent = (total: number, limit: number | undefined) =>
-  limit && limit > 0 ? Math.round((total / limit) * 100) : null
-
 /**
  * Project the latest provider-reported context footprint.
  *
@@ -89,37 +79,5 @@ const percent = (total: number, limit: number | undefined) =>
 export function projectSessionContextOccupancy(
   snapshot: UsageSessionContextResponse | undefined,
 ): SessionContextOccupancy | undefined {
-  if (!snapshot) return undefined
-
-  const current = snapshot.telemetry?.context
-  if (current) {
-    const tokens = current.tokens
-    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
-    const limit = current.model.contextLimit
-    return {
-      providerLabel: current.model.providerID,
-      modelLabel: current.model.name ?? current.model.modelID,
-      limit,
-      total,
-      usage: percent(total, limit),
-      updatedAt: snapshot.telemetry.updatedAt,
-    }
-  }
-
-  const latest = snapshot.history.latest
-  if (!latest) return undefined
-  const total =
-    latest.tokens.input +
-    latest.tokens.output +
-    latest.tokens.reasoning +
-    latest.tokens.cacheRead +
-    latest.tokens.cacheWrite
-  return {
-    providerLabel: latest.providerName || latest.providerID,
-    modelLabel: latest.modelName || latest.modelID,
-    limit: latest.contextLimit,
-    total,
-    usage: percent(total, latest.contextLimit),
-    updatedAt: latest.completedAt,
-  }
+  return ContextOccupancy.project(snapshot)
 }

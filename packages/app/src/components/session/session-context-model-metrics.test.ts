@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test"
+import { createMemo, createRoot, createSignal } from "solid-js"
 import type { AssistantMessage, Message, Part, UsageSessionContextResponse } from "@opencode-ai/sdk/v2/client"
-import { aggregateSessionContextByModel, liveGenerationProgress, projectSessionContextSnapshot } from "./session-context-model-metrics"
+import {
+  aggregateSessionContextByModel,
+  applySessionContextTelemetry,
+  liveGenerationProgress,
+  projectSessionContextHistory,
+  projectSessionContextSnapshot,
+} from "./session-context-model-metrics"
 
 const assistant = (
   id: string,
@@ -1255,5 +1262,48 @@ describe("projectSessionContextSnapshot", () => {
     expect(result.session.generatedSeconds).toBe(9)
     expect(result.session.toolSeconds).toBe(4)
     expect(result.models[0].generatedSeconds).toBe(5)
+  })
+
+  test("telemetry updates preserve model identity, complete history totals, and legacy projection semantics", () => {
+    const settled = snapshot(9000)
+    const historical = projectSessionContextHistory(settled.history)
+    const overlaid = applySessionContextTelemetry(historical, settled.telemetry)
+    const expected = projectSessionContextSnapshot(settled)
+
+    expect(overlaid).toEqual(expected)
+    expect(overlaid.models).toBe(historical.models)
+    expect(overlaid.models[0]).toBe(historical.models[0])
+    expect(overlaid.session.generatedSeconds).toBe(9)
+    expect(overlaid.session.tokensPerSecond).toBe(55.6)
+    expect(overlaid.session.total).toBe(historical.session.total)
+    expect(overlaid.session.costBreakdown).toBe(historical.session.costBreakdown)
+
+    const updated = applySessionContextTelemetry(historical, { ...settled.telemetry!, generatedMs: 12000 })
+    expect(updated.models).toBe(historical.models)
+    expect(updated.session.generatedSeconds).toBe(12)
+    expect(updated.session.toolSeconds).toBe(4)
+    expect(updated.session.tokensPerSecond).toBe(41.7)
+    expect(applySessionContextTelemetry(historical, null)).toBe(historical)
+    expect(applySessionContextTelemetry(historical, snapshot().telemetry)).toBe(historical)
+  })
+
+  test("1000 telemetry ticks never rerun history projection or replace model rows", () => {
+    createRoot((dispose) => {
+      const source = snapshot()
+      const [telemetry, setTelemetry] = createSignal(source.telemetry)
+      let projections = 0
+      const history = createMemo(() => {
+        projections++
+        return projectSessionContextHistory(source.history)
+      })
+      const current = createMemo(() => applySessionContextTelemetry(history(), telemetry()))
+      const originalModels = current().models
+      for (let tick = 1; tick <= 1000; tick++) {
+        setTelemetry({ ...source.telemetry!, generatedMs: 5000 + tick * 1000 })
+        expect(current().models).toBe(originalModels)
+      }
+      expect(projections).toBe(1)
+      dispose()
+    })
   })
 })

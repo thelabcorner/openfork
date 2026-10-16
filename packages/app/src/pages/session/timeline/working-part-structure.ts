@@ -1,4 +1,5 @@
 import type { Part } from "@opencode-ai/sdk/v2"
+import { isPendingUnavailableReasoningPrefix, isUnavailableReasoningSentinel } from "@opencode-ai/core/reasoning-sentinel"
 
 /**
  * Project a live assistant part into only the fields that can change timeline
@@ -14,10 +15,14 @@ import type { Part } from "@opencode-ai/sdk/v2"
 export function projectWorkingAssistantParts(parts: readonly Part[]): Part[] {
   return parts.map((part) => {
     if (part.type === "text" || part.type === "reasoning") {
+      const hiddenReasoning =
+        part.type === "reasoning" &&
+        (isUnavailableReasoningSentinel(part.text) ||
+          (part.time?.end === undefined && isPendingUnavailableReasoningPrefix(part.text)))
       return {
         id: part.id,
         type: part.type,
-        text: part.text.trim() ? "x" : "",
+        text: hiddenReasoning ? "" : part.text.trim() ? "x" : "",
       } as Part
     }
     if (part.type === "tool") {
