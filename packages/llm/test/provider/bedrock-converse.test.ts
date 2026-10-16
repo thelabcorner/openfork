@@ -242,6 +242,60 @@ describe("Bedrock Converse route", () => {
     }),
   )
 
+  it.effect("hoists tool-result images beside the result for non-Claude/Nova models", () =>
+    Effect.gen(function* () {
+      const mistral = AmazonBedrock.configure({
+        baseURL: "https://bedrock-runtime.test",
+        apiKey: "test-bearer",
+      }).model("mistral.mistral-large-2402-v1:0")
+      const prepared = yield* LLMClient.prepare(
+        LLM.request({
+          id: "req_tool_image_hoist",
+          model: mistral,
+          messages: [
+            Message.user("Capture the screen."),
+            Message.assistant([ToolCallPart.make({ id: "tool_1", name: "screenshot", input: {} })]),
+            Message.tool({
+              id: "tool_1",
+              name: "screenshot",
+              result: {
+                type: "content",
+                value: [
+                  { type: "text", text: "Screenshot captured." },
+                  { type: "file", uri: "data:image/png;base64,AAAA", mime: "image/png" },
+                ],
+              },
+            }),
+          ],
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body).toMatchObject({
+        messages: [
+          { role: "user", content: [{ text: "Capture the screen." }] },
+          {
+            role: "assistant",
+            content: [{ toolUse: { toolUseId: "tool_1", name: "screenshot", input: {} } }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                toolResult: {
+                  toolUseId: "tool_1",
+                  content: [{ text: "Screenshot captured." }],
+                  status: "success",
+                },
+              },
+              { image: { format: "png", source: { bytes: "AAAA" } } },
+            ],
+          },
+        ],
+      })
+    }),
+  )
+
   it.effect("decodes text-delta + messageStop + metadata usage from binary event stream", () =>
     Effect.gen(function* () {
       const body = eventStreamBody(

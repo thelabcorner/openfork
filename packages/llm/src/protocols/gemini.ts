@@ -26,6 +26,22 @@ const ADAPTER = "gemini"
 const MEDIA_MIMES = new Set<string>(ProviderShared.MEDIA_MIMES)
 export const DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+// Google documents this sentinel for replaying Gemini 3 function calls after
+// their original signature was lost (ported from upstream `ai`).
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR = "skip_thought_signature_validator"
+
+// Gemini 3 rejects replayed function calls without a thought signature.
+// Google's SDKs avoid that in normal chats by retaining complete model
+// responses, but OpenFork reconstructs durable history and may encounter an
+// unsigned call from an older or external session. Model IDs are open-ended,
+// so unknown Gemini aliases inherit current behavior.
+const requiresThoughtSignatureFallback = (modelID: string) => {
+  if (!/(^|\/)gemini-/i.test(modelID)) return false
+  if (/(^|\/)gemini-(?:1|2)(?:[.-]|$)/i.test(modelID)) return false
+  if (/(^|\/)gemini-pro(?:-vision)?$/i.test(modelID)) return false
+  return !/(^|\/)gemini-robotics-er-1\.5(?:[.-]|$)/i.test(modelID)
+}
+
 // =============================================================================
 // Request Body Schema
 // =============================================================================
@@ -197,9 +213,9 @@ const thoughtSignature = (providerMetadata: ProviderMetadata | undefined) => {
     : undefined
 }
 
-const lowerToolCall = (part: ToolCallPart) => ({
+const lowerToolCall = (part: ToolCallPart, fallbackSignature: string | undefined) => ({
   functionCall: { name: part.name, args: part.input },
-  thoughtSignature: thoughtSignature(part.providerMetadata),
+  thoughtSignature: thoughtSignature(part.providerMetadata) ?? fallbackSignature,
 })
 
 const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMRequest) {
@@ -228,6 +244,15 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
 
     if (message.role === "assistant") {
       const parts: Array<Schema.Schema.Type<typeof GeminiContentPart>> = []
+      // Parallel Gemini 3 calls may carry one signature on the first call;
+      // unsigned sibling calls are valid once any signature is present.
+      let hasSignedToolCall = message.content.some(
+        (part) => part.type === "tool-call" && thoughtSignature(part.providerMetadata) !== undefined,
+      )
+      const fallbackSignature =
+        requiresThoughtSignatureFallback(request.model.id) && !hasSignedToolCall
+          ? SKIP_THOUGHT_SIGNATURE_VALIDATOR
+          : undefined
       for (const part of message.content) {
         if (!ProviderShared.supportsContent(part, ["text", "reasoning", "tool-call"]))
           return yield* ProviderShared.unsupportedContent("Gemini", "assistant", ["text", "reasoning", "tool-call"])
@@ -240,7 +265,8 @@ const lowerMessages = Effect.fn("Gemini.lowerMessages")(function* (request: LLMR
           continue
         }
         if (part.type === "tool-call") {
-          parts.push(lowerToolCall(part))
+          parts.push(lowerToolCall(part, fallbackSignature))
+          if (thoughtSignature(part.providerMetadata) !== undefined) hasSignedToolCall = true
           continue
         }
       }
@@ -361,6 +387,7 @@ const mapUsage = (usage: GeminiUsage | undefined) => {
 }
 
 const mapFinishReason = (finishReason: string | undefined, hasToolCalls: boolean): FinishReason => {
+  if (finishReason === undefined) return hasToolCalls ? "tool-calls" : "unknown"
   if (finishReason === "STOP") return hasToolCalls ? "tool-calls" : "stop"
   if (finishReason === "MAX_TOKENS") return "length"
   if (
@@ -372,7 +399,15 @@ const mapFinishReason = (finishReason: string | undefined, hasToolCalls: boolean
     finishReason === "SPII"
   )
     return "content-filter"
-  if (finishReason === "MALFORMED_FUNCTION_CALL") return "error"
+  if (
+    finishReason === "MALFORMED_FUNCTION_CALL" ||
+    finishReason === "UNEXPECTED_TOOL_CALL" ||
+    finishReason === "NO_IMAGE" ||
+    finishReason === "TOO_MANY_TOOL_CALLS" ||
+    finishReason === "MISSING_THOUGHT_SIGNATURE" ||
+    finishReason === "MALFORMED_RESPONSE"
+  )
+    return "error"
   return "unknown"
 }
 

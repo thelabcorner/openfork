@@ -30,6 +30,24 @@ const ADAPTER = "anthropic-messages"
 export const DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
 export const PATH = "/messages"
 
+// Anthropic beta headers required for thinking-capable routes. The API
+// ignores unknown betas per model, while manual-thinking models need the
+// interleaved-thinking beta for thinking between tool calls. Fork body schema
+// has no context_management/output_config/block_binding fields, so only the
+// unconditional beta applies here; the V1 AI-SDK path
+// (packages/opencode/src/provider/provider.ts) carries the same beta plus
+// fine-grained-tool-streaming statically.
+const ANTHROPIC_REQUIRED_BETAS = ["interleaved-thinking-2025-05-14"] as const
+
+const anthropicBetaHeaders = (existing: Record<string, string>): Record<string, string> => {
+  const current = (existing["anthropic-beta"] ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+  const merged = new Set([...current, ...ANTHROPIC_REQUIRED_BETAS])
+  return { ...existing, "anthropic-beta": [...merged].join(",") }
+}
+
 // =============================================================================
 // Request Body Schema
 // =============================================================================
@@ -855,10 +873,12 @@ export const route = Route.make({
   id: ADAPTER,
   provider: "anthropic",
   protocol,
-  endpoint: Endpoint.path(PATH, { baseURL: DEFAULT_BASE_URL }),
+  endpoint: Endpoint.path((input) => (input.request.model.provider === "anthropic" ? `${PATH}?beta=true` : PATH), {
+    baseURL: DEFAULT_BASE_URL,
+  }),
   auth: Auth.none,
   framing: Framing.sse,
-  headers: () => ({ "anthropic-version": "2023-06-01" }),
+  headers: () => anthropicBetaHeaders({ "anthropic-version": "2023-06-01" }),
 })
 
 export * as AnthropicMessages from "./anthropic-messages"

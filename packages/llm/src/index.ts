@@ -2,7 +2,7 @@ export { LLMClient } from "./route/client"
 export { Auth } from "./route/auth"
 export { Provider } from "./provider"
 export { SystemOneClient } from "./system-one"
-export { isContextOverflow, isContextOverflowFailure } from "./provider-error"
+export { isContextOverflow, isContextOverflowFailure, isStaleReasoning, isStaleReasoningFailure } from "./provider-error"
 export type {
   RouteModelInput,
   RouteRoutedModelInput,

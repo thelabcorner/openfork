@@ -66,6 +66,31 @@ export const store = (request: LLMRequest): boolean | undefined => {
   return typeof value === "boolean" ? value : undefined
 }
 
+/**
+ * Whether a deployment accepts the OpenAI Chat `store` field. Moonshot,
+ * Together, ZAI, DeepSeek, Cerebras and Nvidia variants reject it; everything
+ * else is assumed to accept it. Ported from upstream `ai` detectSupportsStore.
+ */
+export const detectSupportsStore = (provider: string, baseURL: string | undefined): boolean => {
+  const p = provider.toLowerCase()
+  const url = (baseURL ?? "").toLowerCase()
+  if (p === "nvidia" || url.includes("integrate.api.nvidia.com")) return false
+  if (p === "moonshotai" || p === "moonshotai-cn" || url.includes("api.moonshot.")) return false
+  if (p === "togetherai" || p === "together" || url.includes("api.together.")) return false
+  if (
+    p === "zai" ||
+    p === "zai-coding-plan" ||
+    p === "zhipuai" ||
+    p === "zhipuai-coding-plan" ||
+    url.includes("api.z.ai") ||
+    url.includes("open.bigmodel.cn")
+  )
+    return false
+  if (p === "deepseek" || url.includes("deepseek.com")) return false
+  if (p === "cerebras" || url.includes("cerebras.ai")) return false
+  return true
+}
+
 export const reasoningEffort = (request: LLMRequest): ReasoningEffort | undefined => {
   const value = options(request)?.reasoningEffort
   return isAnyReasoningEffort(value) ? value : undefined
@@ -88,7 +113,15 @@ export const include = (request: LLMRequest): ReadonlyArray<OpenAIResponseInclud
 
 export const promptCacheKey = (request: LLMRequest) => {
   const value = options(request)?.promptCacheKey
-  return typeof value === "string" ? value : undefined
+  if (typeof value !== "string" || value.length === 0) return undefined
+  // OpenAI caps prompt_cache_key at 64 chars (DeepSeek/Zai inherit it via
+  // OpenAI-compatible APIs); clamp with unicode-aware slicing. Note: unlike
+  // upstream, we do NOT suppress the key when cache is "none" — fork
+  // semantics keep cache-domain/isolation identity separate from the cache
+  // mechanism (see cache-shape-lab isolation tests).
+  const chars = Array.from(value)
+  if (chars.length <= 64) return value
+  return chars.slice(0, 64).join("")
 }
 
 /**

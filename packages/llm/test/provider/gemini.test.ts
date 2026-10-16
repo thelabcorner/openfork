@@ -36,6 +36,51 @@ describe("Gemini route", () => {
     }),
   )
 
+  it.effect("adds thought-signature fallback for unsigned Gemini 3 tool calls", () =>
+    Effect.gen(function* () {
+      const gemini3 = Gemini.route
+        .with({
+          endpoint: { baseURL: "https://generativelanguage.test/v1beta/" },
+          auth: Auth.header("x-goog-api-key", "test"),
+        })
+        .model({ id: "gemini-3-pro-preview" })
+      const prepared = yield* LLMClient.prepare<Gemini.GeminiBody>(
+        LLM.request({
+          model: gemini3,
+          messages: [
+            Message.assistant([ToolCallPart.make({ id: "tool_0", name: "lookup", input: { query: "weather" } })]),
+          ],
+        }),
+      )
+
+      expect(prepared.body.contents).toEqual([
+        {
+          role: "model",
+          parts: [
+            {
+              functionCall: { name: "lookup", args: { query: "weather" } },
+              thoughtSignature: "skip_thought_signature_validator",
+            },
+          ],
+        },
+      ])
+    }),
+  )
+
+  it.effect("maps new Gemini error finish reasons to error", () =>
+    Effect.gen(function* () {
+      for (const finishReason of ["UNEXPECTED_TOOL_CALL", "NO_IMAGE", "MISSING_THOUGHT_SIGNATURE"]) {
+        const body = sseEvents({
+          candidates: [{ finishReason, content: { role: "model", parts: [{ text: "stopped" }] } }],
+        })
+        const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(body)))
+
+        expect(response.finishReason).toBe("error")
+        expect(response.events).toContainEqual({ type: "finish", reason: "error", usage: undefined })
+      }
+    }),
+  )
+
   it.effect("lowers chronological system updates to wrapped user text in order", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<Gemini.GeminiBody>(

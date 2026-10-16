@@ -32,9 +32,25 @@ const appendChunk = (state: FrameBufferState, chunk: Uint8Array): FrameBufferSta
   return { buffer: next, offset: 0 }
 }
 
-const consumeFrames = (route: string) => (state: FrameBufferState, chunk: Uint8Array) =>
+type FrameInput = { readonly _tag: "Chunk"; readonly bytes: Uint8Array } | { readonly _tag: "End" }
+
+const endOfStream: FrameInput = { _tag: "End" }
+
+const consumeFrames = (route: string) => (state: FrameBufferState, input: FrameInput) =>
   Effect.gen(function* () {
-    let cursor = appendChunk(state, chunk)
+    if (input._tag === "End") {
+      const remaining = state.buffer.subarray(state.offset)
+      // A truncated final frame means the provider stream died mid-frame;
+      // surface it as a typed decode failure instead of silently dropping
+      // bytes (ported from upstream `ai` consumeFrames).
+      if (remaining.length > 0)
+        return yield* ProviderShared.eventError(
+          route,
+          `Incomplete Bedrock Converse event-stream frame: ${remaining.length} buffered bytes remain at end of stream`,
+        )
+      return [state, []] as const
+    }
+    let cursor = appendChunk(state, input.bytes)
     const out: object[] = []
     while (cursor.buffer.length - cursor.offset >= 4) {
       const view = cursor.buffer.subarray(cursor.offset)
@@ -81,7 +97,12 @@ const consumeFrames = (route: string) => (state: FrameBufferState, chunk: Uint8A
  */
 export const framing = (route: string): Framing<object> => ({
   id: "aws-event-stream",
-  frame: (bytes) => bytes.pipe(Stream.mapAccumEffect(() => initialFrameBuffer, consumeFrames(route))),
+  frame: (bytes) =>
+    bytes.pipe(
+      Stream.map((chunk): FrameInput => ({ _tag: "Chunk", bytes: chunk })),
+      Stream.concat(Stream.succeed(endOfStream)),
+      Stream.mapAccumEffect(() => initialFrameBuffer, consumeFrames(route)),
+    ),
 })
 
 export * as BedrockEventStream from "./bedrock-event-stream"
