@@ -1266,7 +1266,8 @@ describe("session HttpApi", () => {
         expect((yield* owner.snapshot(session.id)).ownerID).toBeUndefined()
         expect((yield* sessions.get(session.id)).pausedAt).toBeDefined()
         const repaired = yield* db.select().from(PartTable).where(eq(PartTable.id, part.id)).get().pipe(Effect.orDie)
-        expect(repaired?.data.state).toMatchObject({ status: "error", metadata: { interrupted: true } })
+        if (!repaired || !("state" in repaired.data)) throw new Error("interrupted tool state was not persisted")
+        expect(repaired.data.state).toMatchObject({ status: "error", metadata: { interrupted: true } })
       }),
     { git: true, config: { formatter: false, lsp: false } },
     15_000,
@@ -1591,6 +1592,7 @@ describe("session HttpApi", () => {
         expect(current.ownerID).toBe(acquired.token.ownerID)
         expect(current.generation).toBe(acquired.token.generation)
         expect(cancelAutomation).not.toHaveBeenCalled()
+        if (!newerRecovery) throw new Error("expected a persisted newer recovery generation")
         expect((yield* Recovery.get(db, session.id))?.generation).toBe(newerRecovery.generation)
         cancelAutomation.mockRestore()
 
@@ -2173,7 +2175,7 @@ describe("session HttpApi", () => {
           pageSizes.push(page.data.length)
           for (const entry of page.data) {
             expect(entry.part.messageID).toBe(entry.messageID)
-            expect([first.info.id, second.info.id]).toContain(entry.messageID)
+            expect(new Set<string>([first.info.id, second.info.id]).has(entry.messageID)).toBe(true)
             expect(recovered.has(entry.part.id)).toBe(false)
             recovered.set(entry.part.id, entry.messageID)
           }
