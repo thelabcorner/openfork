@@ -104,7 +104,7 @@ try {
   if (!denied.isError) throw new Error("Revoked OXP grant unexpectedly allowed a read")
   const after = await OxpHost.getState()
   if (after.enabled) throw new Error("Host did not persist disabled state")
-  console.log("OXP_REVOKED", JSON.stringify({ rejected: denied.isError, code: denied.structuredContent?.error }))
+  console.log("OXP_REVOKED", JSON.stringify({ rejected: denied.isError, code: (denied.structuredContent as { error?: unknown } | undefined)?.error }))
   verified = true
   }
 } finally {

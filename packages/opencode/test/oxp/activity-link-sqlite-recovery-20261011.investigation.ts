@@ -86,7 +86,7 @@ test("probe: recorder link failures under real file-backed WAL contention", asyn
             }, 1200)
             const busyStart = Date.now()
             const busyAt = performance.now()
-            yield* recorder.success(busyHandle, busyInput, { structured: { workerID: "wrk_busy" } })
+            yield* recorder.success(busyHandle, busyInput, { output: "", structured: { workerID: "wrk_busy" } })
             const busyElapsed = performance.now() - busyAt
             clearTimeout(busyTimer)
             if (!busyReleased.done) busyPeer.exec("COMMIT")
@@ -103,6 +103,7 @@ test("probe: recorder link failures under real file-backed WAL contention", asyn
               args: { action: "status", workerID: "wrk_recover" },
             } as const
             const recoverHandle = yield* recorder.begin(recoverInput)
+            if (!recoverHandle) throw new Error("recovery probe did not create an activity handle")
             const recoverPeer = new Native(filename)
             recoverPeer.exec("BEGIN IMMEDIATE")
             const recoverReleased = { done: false }
@@ -112,7 +113,7 @@ test("probe: recorder link failures under real file-backed WAL contention", asyn
             }, 280)
             const recoverStart = Date.now()
             const recoverAt = performance.now()
-            yield* recorder.success(recoverHandle, recoverInput, { structured: { workerID: "wrk_recover" } })
+            yield* recorder.success(recoverHandle, recoverInput, { output: "", structured: { workerID: "wrk_recover" } })
             const recoverElapsed = performance.now() - recoverAt
             clearTimeout(recoverTimer)
             if (!recoverReleased.done) recoverPeer.exec("COMMIT")
@@ -134,10 +135,11 @@ test("probe: recorder link failures under real file-backed WAL contention", asyn
               args: { action: "status", workerID: "wrk_stale" },
             } as const
             const staleHandle = yield* recorder.begin(staleInput)
+            if (!staleHandle) throw new Error("stale-FK probe did not create an activity handle")
             yield* activity.deleteHistory(staleHandle.activityID)
             const staleStart = Date.now()
             const staleAt = performance.now()
-            yield* recorder.success(staleHandle, staleInput, { structured: { workerID: "wrk_stale" } })
+            yield* recorder.success(staleHandle, staleInput, { output: "", structured: { workerID: "wrk_stale" } })
             const staleElapsed = performance.now() - staleAt
             console.log(
               "STAGE_STALE",
