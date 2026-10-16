@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { chatSidebarWorkingIndicatorAnimated, uniqueSidebarSessions } from "./chat-sidebar-pane-state"
+import {
+  CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX,
+  chatSidebarWorkingIndicatorAnimated,
+  createChatSidebarIndicatorBudget,
+  uniqueSidebarSessions,
+} from "./chat-sidebar-pane-state"
 
 describe("dense sidebar working indicator fanout", () => {
   test("limits animation to one Recent slot per logical session", () => {
@@ -34,5 +39,34 @@ describe("dense sidebar working indicator fanout", () => {
     expect(animatedRoots).toBe(30)
     expect(animatedRoots).toBeLessThanOrEqual(representations.filter((row) => row.visible && row.group === "recent").length)
     expect(animatedRoots).toBeLessThan(12 * representations.length)
+  })
+})
+
+describe("animated indicator budget", () => {
+  test("never grants more than the cap, however many rows ask", () => {
+    const budget = createChatSidebarIndicatorBudget()
+    const state = Array.from({ length: 30 }, () => false)
+    state.forEach((_, i) => budget.acquire((g) => (state[i] = g)))
+    expect(state.filter(Boolean)).toHaveLength(CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX)
+    expect(budget.granted()).toBe(CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX)
+    expect(budget.waiting()).toBe(30 - CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX)
+  })
+  test("a released slot goes to the next waiter in FIFO order", () => {
+    const budget = createChatSidebarIndicatorBudget(1)
+    const log: string[] = []
+    const releaseA = budget.acquire((g) => log.push(`a:${g}`))
+    budget.acquire((g) => log.push(`b:${g}`))
+    expect(log).toEqual(["a:true"])
+    releaseA()
+    expect(log).toEqual(["a:true", "b:true"])
+  })
+  test("releasing a waiter that never won does not free a slot; release is idempotent", () => {
+    const budget = createChatSidebarIndicatorBudget(1)
+    budget.acquire(() => {})
+    const releaseB = budget.acquire(() => {})
+    releaseB()
+    releaseB()
+    expect(budget.granted()).toBe(1)
+    expect(budget.waiting()).toBe(0)
   })
 })

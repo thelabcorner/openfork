@@ -67,6 +67,68 @@ describe("sessionPreviewTree", () => {
     const cycle = sessionPreviewTree([row("x", "y"), row("y", "x")])
     expect(cycle.map((r) => r.row.id).sort()).toEqual(["x", "y"])
   })
+  test("deep delegated-worker nesting cannot overflow the JS call stack", () => {
+    const rows = Array.from({ length: 16_384 }, (_, i): SessionPreviewRow => ({
+      id: `ses_${i}`,
+      title: `worker_${i}`,
+      ...(i ? { parentID: `ses_${i - 1}` } : {}),
+      locked: false,
+      origin: "user",
+    }))
+    const tree = sessionPreviewTree(rows, 3)
+    expect(tree).toHaveLength(rows.length)
+    expect(tree[0]?.depth).toBe(0)
+    expect(tree[1]?.depth).toBe(1)
+    expect(tree.at(-1)?.depth).toBe(3)
+    expect(tree.at(-1)?.row.id).toBe("ses_16383")
+  })
+  test("iterative preorder exactly matches the former recursive traversal for cycles and duplicate IDs", () => {
+    const legacy = (rows: SessionPreviewRow[], maxDepth: number) => {
+      const ids = new Set(rows.map((item) => item.id))
+      const children = new Map<string | undefined, SessionPreviewRow[]>()
+      for (const item of rows) {
+        const parent = item.parentID && item.parentID !== item.id && ids.has(item.parentID) ? item.parentID : undefined
+        const list = children.get(parent)
+        if (list) list.push(item)
+        else children.set(parent, [item])
+      }
+      const output: ReturnType<typeof sessionPreviewTree> = []
+      const visited = new Set<string>()
+      const walk = (parent: string | undefined, depth: number) => {
+        const list = children.get(parent) ?? []
+        list.forEach((item, index) => {
+          if (visited.has(item.id)) return
+          visited.add(item.id)
+          output.push({ row: item, depth: Math.min(depth, maxDepth), last: index === list.length - 1 })
+          walk(item.id, depth + 1)
+        })
+      }
+      walk(undefined, 0)
+      for (const item of rows) {
+        if (visited.has(item.id)) continue
+        visited.add(item.id)
+        output.push({ row: item, depth: 0, last: true })
+      }
+      return output
+    }
+    let seed = 0x291e9321
+    const random = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+      return seed
+    }
+    for (let trial = 0; trial < 500; trial++) {
+      const count = 1 + random() % 80
+      const rows = Array.from({ length: count }, (_, i): SessionPreviewRow => ({
+        id: `id-${random() % 24}`,
+        title: `label-${i}`,
+        ...(random() % 4 ? { parentID: `id-${random() % 24}` } : {}),
+        locked: false,
+        origin: "user",
+      }))
+      const depth = random() % 8
+      expect(sessionPreviewTree(rows, depth)).toEqual(legacy(rows, depth))
+    }
+  })
 })
 
 describe("sessionPreviewRow", () => {

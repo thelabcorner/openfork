@@ -12,7 +12,10 @@ import { sessionTitle } from "@/utils/session-title"
 import { getRelativeTime } from "@/utils/time"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
-import { createMemo, For, Show, type Accessor } from "solid-js"
+import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Accessor } from "solid-js"
+import { measureVirtualRow } from "@/components/virtual-scroll-element"
+import { indexChatSidebarSearchHits } from "./chat-sidebar-search-index"
 
 type Language = ReturnType<typeof useLanguage>
 
@@ -22,6 +25,86 @@ export function ChatSidebarSearchResults(props: {
   server: Accessor<ServerConnection.Key>
   isOpenTab: (record: HomeSessionRecord) => boolean
 }) {
+  const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
+  const hitPositions = createMemo(() => indexChatSidebarSearchHits(props.search.result.list()))
+  const activeIndex = createMemo(() => {
+    const key = props.search.result.active()
+    if (!key) return -1
+    return hitPositions().get(key) ?? -1
+  })
+  const searchItemKey = (index: number) => props.search.result.list()[index]?.key ?? index
+  const searchRangeExtractor = (range: Parameters<typeof defaultRangeExtractor>[0]) => {
+    const indexes = defaultRangeExtractor(range)
+    const active = activeIndex()
+    if (active >= 0 && active < range.count && !indexes.includes(active)) indexes.push(active)
+    return indexes.sort((a, b) => a - b)
+  }
+  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return props.search.result.list().length
+    },
+    getScrollElement: () => scrollRoot() ?? null,
+    initialRect: { width: 320, height: 420 },
+    get estimateSize() {
+      const rows = props.search.result.list()
+      return (index: number) => {
+        const hit = rows[index]
+        const previous = index > 0 ? rows[index - 1] : undefined
+        const startsGroup = !!hit && (!previous || previous.kind !== hit.kind)
+        return 36 + (startsGroup ? 32 : 0)
+      }
+    },
+    overscan: 6,
+    getItemKey: searchItemKey,
+    rangeExtractor: searchRangeExtractor,
+  })
+  const virtualRows = createMemo<
+    Array<{
+      virtualRow: ReturnType<typeof virtualizer.getVirtualItems>[number]
+      hit: HomeSearchHit | undefined
+      key: string | number
+    }>
+  >((previous = []) => {
+    const prior = new Map(previous.map((entry) => [entry.key, entry] as const))
+    const rows = props.search.result.list()
+    return virtualizer.getVirtualItems().map((virtualRow) => {
+      const hit = rows[virtualRow.index]
+      const key = hit?.key ?? virtualRow.index
+      const existing = prior.get(key)
+      if (
+        existing &&
+        existing.hit === hit &&
+        existing.virtualRow.index === virtualRow.index &&
+        existing.virtualRow.start === virtualRow.start &&
+        existing.virtualRow.size === virtualRow.size
+      ) {
+        return existing
+      }
+      return { virtualRow, hit, key }
+    })
+  })
+  // Rapid selection changes (keyboard repeat, filter replacement) should
+  // scroll once per microtask, to the LATEST active hit. Otherwise every
+  // intermediate selection triggers a virtualizer measurement/scroll pass.
+  let scrollQueued = false
+  let pendingScrollIndex = -1
+  let disposed = false
+  onCleanup(() => {
+    disposed = true
+    pendingScrollIndex = -1
+  })
+  createEffect(() => {
+    const index = activeIndex()
+    pendingScrollIndex = index >= 0 && scrollRoot() ? index : -1
+    if (pendingScrollIndex < 0 || scrollQueued) return
+    scrollQueued = true
+    queueMicrotask(() => {
+      scrollQueued = false
+      if (disposed || pendingScrollIndex < 0) return
+      virtualizer.scrollToIndex(pendingScrollIndex, { align: "auto" })
+    })
+  })
+
   return (
     <div id="chats-session-search-results" role="listbox" class="flex flex-col pt-1">
       <Show when={!props.search.result.loading()} fallback={<ChatsSearchLoading language={props.language} />}>
@@ -37,13 +120,27 @@ export function ChatSidebarSearchResults(props: {
               </p>
             }
           >
-            <ScrollView class="max-h-[min(420px,50vh)]" viewportRef={props.search.element.setList}>
-              <div class="flex flex-col pb-1">
-                <For each={props.search.result.list()}>
-                  {(hit, index) => {
-                    const previous = index() > 0 ? props.search.result.list()[index() - 1] : undefined
+            <ScrollView
+              class="max-h-[min(420px,50vh)]"
+              viewportRef={(element) => {
+                setScrollRoot(element)
+                props.search.element.setList(element)
+              }}
+            >
+              <div class="relative pb-1" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+                <For each={virtualRows()}>
+                  {(entry) => {
+                    const hit = entry.hit
+                    if (!hit) return null
+                    const index = entry.virtualRow.index
+                    const previous = index > 0 ? props.search.result.list()[index - 1] : undefined
                     return (
-                      <>
+                      <div
+                        ref={measureVirtualRow(virtualizer, index)}
+                        data-index={index}
+                        class="absolute inset-x-0 top-0"
+                        style={{ transform: `translateY(${entry.virtualRow.start}px)` }}
+                      >
                         <Show when={hit.kind === "session" && (!previous || previous.kind !== "session")}>
                           <ChatsSearchGroupHeader
                             label={props.language.t("home.sessions.search.sessions")}
@@ -89,7 +186,7 @@ export function ChatSidebarSearchResults(props: {
                             onSelect={props.search.result.select}
                           />
                         </Show>
-                      </>
+                      </div>
                     )
                   }}
                 </For>

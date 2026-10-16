@@ -4,7 +4,6 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
-import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { A } from "@solidjs/router"
 import { createSignal, For, Show, type JSX } from "solid-js"
 import { CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN } from "./chat-sidebar-pane-state"
@@ -170,19 +169,21 @@ function ArchivedRow(props: {
             <span class="text-[10px] leading-none tabular-nums text-v2-text-text-muted group-hover/session:hidden group-focus-within/session:hidden">
               {relativeStamp(props.session.time?.archived, props.minuteNow())}
             </span>
-            <TooltipV2 value={language.t("chats.archived.unarchive")} placement="top">
-              <button
-                type="button"
-                aria-label={language.t("chats.archived.unarchive")}
-                disabled={busy()}
-                class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex group-focus-within/session:flex"
-                onClick={unarchive}
-              >
-                <Show when={!busy()} fallback={<LoaderV2 class="size-3" aria-hidden="true" />}>
-                  <IconV2 name="archive" size="small" class="size-3 rotate-180" />
-                </Show>
-              </button>
-            </TooltipV2>
+            {/* The parent pane's delegated tooltip owns this intent; do not
+                create a separate TooltipV2 listener/portal for every row. */}
+            <button
+              type="button"
+              aria-label={language.t("chats.archived.unarchive")}
+              data-chat-tooltip-text={language.t("chats.archived.unarchive")}
+              data-chat-tooltip-placement="top"
+              disabled={busy()}
+              class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex group-focus-within/session:flex"
+              onClick={unarchive}
+            >
+              <Show when={!busy()} fallback={<LoaderV2 class="size-3" aria-hidden="true" />}>
+                <IconV2 name="archive" size="small" class="size-3 rotate-180" />
+              </Show>
+            </button>
           </div>
         </div>
         <div class="flex min-h-[10px] min-w-0 items-center gap-1.5 ps-[18px]">

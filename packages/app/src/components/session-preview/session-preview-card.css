@@ -349,11 +349,29 @@
     max-height: min(360px, 54vh);
   }
 
-  [data-slot="members"] {
+  [data-slot="members-shell"] {
     display: flex;
+    min-height: 0;
     flex-direction: column;
-    gap: 1px;
-    padding: 0 4px 4px;
+    padding-bottom: 4px;
+  }
+
+  [data-slot="members"] {
+    position: relative;
+    min-width: 0;
+  }
+
+  [data-slot="virtual-member"] {
+    position: absolute;
+    inset-inline: 4px;
+    top: 0;
+    min-width: 0;
+    padding-bottom: 1px;
+  }
+
+  [data-slot="members-shell"] > [data-slot="more"] {
+    margin-inline: 4px;
+    width: calc(100% - 8px);
   }
 
   /* Sub-group divider: separates subagents / delegations / plugin groups /

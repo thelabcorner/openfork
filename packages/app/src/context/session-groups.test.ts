@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { eventInvalidatesSessionGroupNavigation } from "./session-groups"
+import { eventInvalidatesSessionGroupNavigation } from "./session-group-event-filter"
 
 describe("SessionGroup virtual Swarm invalidation", () => {
   test("refreshes navigation only for Swarm events that can change virtual group identity or membership", () => {

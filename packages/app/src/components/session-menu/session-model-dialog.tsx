@@ -27,7 +27,12 @@ import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 
 const favoritesRailKey = "favorites"
 
-export function DialogSessionModelPicker(props: { session: Session; server?: ServerConnection.Key }) {
+export function DialogSessionModelPicker(props: {
+  session: Session
+  server?: ServerConnection.Key
+  /** Explicit model choice for a one-shot action, not a session preference change. */
+  onSelectModel?: (model: { providerID: string; id: string }) => void
+}) {
   // Wrap inner content with a directory-scoped ModelsProvider so that
   // useModels().list() returns models for *this* session's directory,
   // not the current global directory (which is empty at the titlebar).
@@ -36,12 +41,16 @@ export function DialogSessionModelPicker(props: { session: Session; server?: Ser
   // state seen in image-1.png.
   return (
     <ModelsProvider directory={() => props.session.directory}>
-      <DialogSessionModelPickerInner session={props.session} server={props.server} />
+      <DialogSessionModelPickerInner session={props.session} server={props.server} onSelectModel={props.onSelectModel} />
     </ModelsProvider>
   )
 }
 
-function DialogSessionModelPickerInner(props: { session: Session; server?: ServerConnection.Key }) {
+function DialogSessionModelPickerInner(props: {
+  session: Session
+  server?: ServerConnection.Key
+  onSelectModel?: (model: { providerID: string; id: string }) => void
+}) {
   const language = useLanguage()
   const models = useModels()
   const global = useGlobal()
@@ -95,6 +104,11 @@ function DialogSessionModelPickerInner(props: { session: Session; server?: Serve
   })
 
   const select = (item: ReturnType<typeof models.list>[number]) => {
+    if (props.onSelectModel) {
+      dialog.close()
+      props.onSelectModel({ providerID: item.provider.id, id: item.id })
+      return
+    }
     const conn = props.server ? global.servers.list().find((c) => ServerConnection.key(c) === props.server) : undefined
     const scope = conn ? global.ensureServerCtx(conn).sdk.scope : undefined
     if (!scope) {

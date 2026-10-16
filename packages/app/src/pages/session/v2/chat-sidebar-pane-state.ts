@@ -3,13 +3,22 @@ import type { Session } from "@opencode-ai/sdk/v2/client"
 import { Persist, persisted } from "@/utils/persist"
 import { clampSize } from "@/utils/resizable-size"
 import { pathKey } from "@/utils/path-key"
+import {
+  CHAT_SIDEBAR_SORT_MODES,
+  CHAT_SIDEBAR_VIEW_MODES,
+  type ChatSidebarDensity,
+  type ChatSidebarSortMode,
+  type ChatSidebarViewMode,
+} from "./chat-sidebar-tree"
 
 export const CHAT_SIDEBAR_PANE_WIDTH_DEFAULT = 280
 export const CHAT_SIDEBAR_PANE_WIDTH_MIN = 200
 export const CHAT_SIDEBAR_PANE_WIDTH_MAX = 420
 
-export const CHAT_SIDEBAR_RECENT_LIMIT_MIN = 5
-const CHAT_SIDEBAR_RECENT_LIMIT_STEP = 5
+// Recent is a whole view now (not a 5-row teaser above duplicated project
+// groups), and a folded SessionGroup counts as one item, so page in larger steps.
+export const CHAT_SIDEBAR_RECENT_LIMIT_MIN = 15
+const CHAT_SIDEBAR_RECENT_LIMIT_STEP = 15
 
 export const CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN = 5
 const CHAT_SIDEBAR_ARCHIVED_LIMIT_STEP = 5
@@ -45,6 +54,50 @@ export const shouldAutoHydrateChatSidebarMetrics = (input: { selected?: boolean;
 export const chatSidebarWorkingIndicatorAnimated = (recent: boolean, primary: boolean, visible: boolean) =>
   recent && primary && visible
 
+/**
+ * Hard ceiling on concurrently animated working indicators in one pane. Every
+ * animated dot is its own compositor layer (opacity animation), and Layerize
+ * cost scales with the layer count, not with how cheap each animation is. A
+ * static accent dot already conveys "working"; the pulse is garnish, so it is
+ * rationed. Grants are FIFO and handed to the next waiter on release.
+ */
+export const CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX = 6
+
+export function createChatSidebarIndicatorBudget(max: number = CHAT_SIDEBAR_ANIMATED_INDICATOR_MAX) {
+  type Waiter = { notify: (granted: boolean) => void; granted: boolean }
+  const queue: Waiter[] = []
+  let granted = 0
+  const pump = () => {
+    for (const waiter of queue) {
+      if (granted >= max) return
+      if (waiter.granted) continue
+      waiter.granted = true
+      granted += 1
+      waiter.notify(true)
+    }
+  }
+  return {
+    /** Request an animation slot. `notify` reports grant/revocation; call the result to give it back. */
+    acquire(notify: (granted: boolean) => void) {
+      const waiter: Waiter = { notify, granted: false }
+      queue.push(waiter)
+      pump()
+      return () => {
+        const index = queue.indexOf(waiter)
+        if (index < 0) return
+        queue.splice(index, 1)
+        if (waiter.granted) {
+          waiter.granted = false
+          granted -= 1
+        }
+        pump()
+      }
+    },
+    granted: () => granted,
+    waiting: () => queue.length - granted,
+  }
+}
+
 export function uniqueSidebarSessions<T extends { id: string }>(sessions: T[]): T[] {
   return [...new Map(sessions.map((session) => [session.id, session])).values()]
 }
@@ -69,11 +122,26 @@ export function createChatSidebarPaneState() {
       recentLimit: CHAT_SIDEBAR_RECENT_LIMIT_MIN,
       archivedLimit: CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN,
       collapsedGroups: {} as Record<string, boolean>,
+      view: "recent" as ChatSidebarViewMode,
+      sort: "updated" as ChatSidebarSortMode,
+      density: "detailed" as ChatSidebarDensity,
+      // Folded SessionGroups default to collapsed; true = expanded. Keyed by
+      // group id so a group keeps its state across views.
+      expandedClusters: {} as Record<string, boolean>,
     }),
   )
 
   return {
     ready,
+    view: (): ChatSidebarViewMode => (CHAT_SIDEBAR_VIEW_MODES.includes(store.view) ? store.view : "recent"),
+    setView: (view: ChatSidebarViewMode) => setStore("view", view),
+    sort: (): ChatSidebarSortMode => (CHAT_SIDEBAR_SORT_MODES.includes(store.sort) ? store.sort : "updated"),
+    setSort: (sort: ChatSidebarSortMode) => setStore("sort", sort),
+    density: (): ChatSidebarDensity => (store.density === "compact" ? "compact" : "detailed"),
+    setDensity: (density: ChatSidebarDensity) => setStore("density", density),
+    isClusterExpanded: (groupID: string) => store.expandedClusters?.[groupID] === true,
+    toggleCluster: (groupID: string) => setStore("expandedClusters", groupID, (prev) => !prev),
+    revealCluster: (groupID: string) => setStore("expandedClusters", groupID, true),
     sidebarWidth: () => store.sidebarWidth,
     resizeSidebar: (width: number) =>
       setStore("sidebarWidth", clampSize(width, CHAT_SIDEBAR_PANE_WIDTH_MIN, CHAT_SIDEBAR_PANE_WIDTH_MAX)),

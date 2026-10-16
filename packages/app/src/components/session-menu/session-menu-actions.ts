@@ -1,9 +1,10 @@
-import { useLanguage } from "@/context/language"
 import { useGlobal, type ServerCtx } from "@/context/global"
 import { useTabs, tabKey } from "@/context/tabs"
 import { ServerConnection } from "@/context/server"
 import { tabSessionState } from "../titlebar-tab-state"
-import { beginTitleRegeneration, endTitleRegeneration, isTitleRegenerationPending, sessionApiOf } from "../titlebar-tab-actions"
+import { isTitleRegenerationPending, sessionApiOf } from "../titlebar-tab-actions"
+import { createSessionTitleRegeneration } from "../session-title-regeneration"
+import { stopSession } from "@/utils/session-stop"
 import { showToast } from "@/utils/toast"
 
 /**
@@ -15,7 +16,6 @@ export function createSessionControlActions(input: {
   sessionID?: string
   server?: ServerConnection.Key
 }) {
-  const language = useLanguage()
   const global = useGlobal()
 
   const serverCtx = () => {
@@ -34,7 +34,11 @@ export function createSessionControlActions(input: {
     const id = input.sessionID
     const a = api()
     if (!id || !a) return
-    void (a as unknown as { interrupt: (p: { sessionID: string }) => Promise<unknown> }).interrupt({ sessionID: id })
+    void stopSession(a, id).catch((error) => showToast({
+      variant: "error",
+      title: "Unable to stop session",
+      description: error instanceof Error ? error.message : String(error),
+    }))
   }
 
   const pause = () => {
@@ -51,23 +55,13 @@ export function createSessionControlActions(input: {
     void a.resume({ sessionID: id })
   }
 
-  const regenerateTitle = () => {
-    const id = input.sessionID
-    const a = api()
-    if (!id || !a || pendingRegenerate()) return
-    beginTitleRegeneration(id)
-    void a
-      .regenerateTitle({ sessionID: id })
-      .then(() => showToast({ title: language.t("toast.title.regenerated"), variant: "success" }))
-      .catch((err) =>
-        showToast({
-          title: language.t("toast.title.failed"),
-          description: err instanceof Error ? err.message : undefined,
-          variant: "error",
-        }),
-      )
-      .finally(() => endTitleRegeneration(id))
-  }
+  const titleRegeneration = createSessionTitleRegeneration({
+    sessionID: () => input.sessionID,
+    session: () => (input.sessionID ? serverCtx()?.sync.session.peek(input.sessionID) : undefined),
+    api,
+    server: () => input.server,
+  })
+  const regenerateTitle = () => titleRegeneration.run()
 
   return { serverCtx, state, pendingRegenerate, stop, pause, resume, regenerateTitle }
 }

@@ -11,6 +11,13 @@ export type SessionMenuActions = {
   pause?: () => void
   resume?: () => void
   regenerateTitle?: () => void
+  stopAll?: () => void
+  pauseAll?: () => void
+  resumeAll?: () => void
+  regenerateGroupTitle?: () => void
+  changeModelAll?: () => void
+  toggleAutoAcceptAll?: () => void
+  pokeAll?: () => void
   renameGroup?: () => void
   addSessions?: () => void
   addToGroup?: (groupId: string) => void
@@ -69,6 +76,17 @@ export type SessionMenuModelInput = {
   // Session-specific quick-action state
   isAutoAccepting?: boolean
   isPinned?: boolean
+  groupState?: {
+    members: number
+    permissionMembers: number
+    permissionReady: boolean
+    working: number
+    stopEligible?: number
+    paused: number
+    pokeable: number
+    allAutoAccepting: boolean
+    titlePending: boolean
+  }
   currentVariant?: string | undefined
   currentModelLabel?: string | undefined
   availableVariants?: string[]
@@ -82,6 +100,7 @@ export type SessionMenuModelInput = {
 export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectionDef[] {
   const t = input.language.t.bind(input.language)
   const working = input.state === "working"
+  const stopEligible = working || input.state === "interrupted"
   const paused = input.state === "paused"
   const hasSession = !!input.sessionID
   const tabIndex = input.tabIndex
@@ -90,7 +109,7 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   const sections: MenuSectionDef[] = []
 
   // ── Section 1: session execution state (stop/pause/resume) — only when session exists
-  if (hasSession && (input.where === "tab" || input.where === "home" || input.where === "chats")) {
+  if (hasSession && !input.isGroup && (input.where === "tab" || input.where === "home" || input.where === "chats")) {
     sections.push({
       id: "state",
       items: [
@@ -98,7 +117,7 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
           kind: "item",
           id: "stop",
           label: t("command.session.stop"),
-          disabled: !working || !input.actions.stop,
+          disabled: !stopEligible || !input.actions.stop,
           icon: "stop",
           onSelect: () => input.actions.stop?.(),
         },
@@ -123,7 +142,7 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   }
 
   // ── Section 2: retitle — only when session exists
-  if (hasSession) {
+  if (hasSession && !input.isGroup) {
     sections.push({
       id: "retitle",
       items: [
@@ -285,7 +304,7 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
 
   // ── Section 7: navigation (Open / Open in background) — home/chats only
   if (input.where === "home" || input.where === "chats") {
-    if (hasSession && (input.actions.open || input.actions.openInBackground)) {
+    if (hasSession && !input.isGroup && (input.actions.open || input.actions.openInBackground)) {
       sections.push({
         id: "navigation",
         items: [
@@ -314,9 +333,90 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   // For group tabs: Rename group / Add sessions
   // For session rows (home/chats): Add to group submenu + Remove from group
   if (input.isGroup) {
-    sections.push({
-      id: "group-tab",
-      items: [
+    const groupState = input.groupState
+    const executionItems: MenuSectionDef["items"] = []
+    if (input.actions.stopAll) {
+      executionItems.push({
+        kind: "item",
+        id: "stopAll",
+        label: input.language.plural("sessionGroup.stopAll", groupState?.stopEligible ?? groupState?.working ?? 0),
+        disabled: (groupState?.stopEligible ?? groupState?.working ?? 0) === 0,
+        icon: "stop",
+        onSelect: () => input.actions.stopAll?.(),
+      })
+    }
+    if (input.actions.pauseAll) {
+      executionItems.push({
+        kind: "item",
+        id: "pauseAll",
+        label: input.language.plural("sessionGroup.pauseAll", groupState?.working ?? 0),
+        disabled: (groupState?.working ?? 0) === 0,
+        icon: "pause",
+        onSelect: () => input.actions.pauseAll?.(),
+      })
+    }
+    if (input.actions.resumeAll) {
+      executionItems.push({
+        kind: "item",
+        id: "resumeAll",
+        label: input.language.plural("sessionGroup.resumeAll", groupState?.paused ?? 0),
+        disabled: (groupState?.paused ?? 0) === 0,
+        icon: "play",
+        onSelect: () => input.actions.resumeAll?.(),
+      })
+    }
+    if (executionItems.length > 0) sections.push({ id: "groupExecution", items: executionItems })
+
+    const coordinationItems: MenuSectionDef["items"] = []
+    if (input.actions.regenerateGroupTitle) {
+      coordinationItems.push({
+        kind: "item",
+        id: "regenerateGroupTitle",
+        label: groupState?.titlePending
+          ? t("sessionGroup.regenerateGroupTitle.pending")
+          : t("sessionGroup.regenerateGroupTitle"),
+        disabled: (groupState?.members ?? 0) === 0 || !!groupState?.titlePending,
+        icon: "outline-reset",
+        onSelect: () => input.actions.regenerateGroupTitle?.(),
+      })
+    }
+    if (input.actions.pokeAll) {
+      coordinationItems.push({
+        kind: "item",
+        id: "pokeAll",
+        label: input.language.plural("sessionGroup.pokeAll", groupState?.pokeable ?? 0),
+        disabled: (groupState?.pokeable ?? 0) === 0,
+        icon: "play",
+        onSelect: () => input.actions.pokeAll?.(),
+      })
+    }
+    if (coordinationItems.length > 0) sections.push({ id: "groupCoordination", items: coordinationItems })
+
+    const modelItems: MenuSectionDef["items"] = []
+    if (input.actions.changeModelAll) {
+      modelItems.push({
+        kind: "item",
+        id: "changeModelAll",
+        label: t("sessionGroup.changeModelAll"),
+        disabled: (groupState?.members ?? 0) === 0,
+        icon: "outline-sliders",
+        onSelect: () => input.actions.changeModelAll?.(),
+      })
+    }
+    if (input.actions.toggleAutoAcceptAll) {
+      modelItems.push({
+        kind: "checkbox",
+        id: "autoAcceptAll",
+        label: t("sessionGroup.autoAcceptAll"),
+        checked: !!groupState?.allAutoAccepting,
+        disabled: (groupState?.permissionMembers ?? 0) === 0 || !groupState?.permissionReady,
+        icon: "shield-check",
+        onSelect: () => input.actions.toggleAutoAcceptAll?.(),
+      })
+    }
+    if (modelItems.length > 0) sections.push({ id: "groupModelPermissions", items: modelItems })
+
+    const groupItems: MenuSectionDef["items"] = [
         {
           kind: "item",
           id: "renameGroup",
@@ -325,16 +425,20 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
           icon: "edit",
           onSelect: () => input.actions.renameGroup?.(),
         },
-        {
-          kind: "item",
-          id: "addSessions",
-          label: t("sessionGroup.addSessions"),
-          disabled: !input.actions.addSessions,
-          icon: "outline-dots",
-          onSelect: () => input.actions.addSessions?.(),
-        },
-      ],
-    })
+    ]
+    if (input.where === "group-tab") {
+      groupItems.push({
+        kind: "item",
+        id: "addSessions",
+        label: t("sessionGroup.addSessions"),
+        disabled: !input.actions.addSessions,
+        icon: "outline-dots",
+        onSelect: () => input.actions.addSessions?.(),
+      })
+    }
+    if (groupItems.length > 0) {
+      sections.push({ id: "group-tab", items: groupItems })
+    }
   } else if (input.where === "home" || input.where === "chats") {
     // Session row group section — submenu + remove
     const submenuItems: MenuSectionDef["items"] = [

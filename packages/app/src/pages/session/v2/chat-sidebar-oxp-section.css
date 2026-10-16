@@ -1,0 +1,198 @@
+/*
+ * ChatGPT / OXP section of the chat sidebar. The shared pane vocabulary
+ * (section, section-head, section-chevron, section-label, section-count,
+ * section-body, more) is styled by the pane itself; this file owns only the
+ * OXP-specific pieces: the 24h exposure strip, plane-mix bars and activity
+ * rows. Color is reserved for state (live, failed, plane identity).
+ */
+
+[data-component="chats-oxp-section"] {
+  --oxp-plane-augmentation: color-mix(in srgb, var(--v2-text-text-accent) 70%, transparent);
+  --oxp-plane-supervision: color-mix(in srgb, var(--v2-state-fg-info) 70%, transparent);
+  --oxp-plane-delegation: color-mix(in srgb, var(--v2-state-fg-warning) 70%, transparent);
+}
+
+/* ---- 24h exposure strip ------------------------------------------------ */
+
+[data-component="chats-oxp-section"] [data-slot="oxp-stats"] {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 3px 8px 0;
+  font-family: var(--v2-font-family-sans);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-stat"] {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-stat-label"] {
+  overflow: hidden;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 11px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--v2-text-text-faint);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-stat-value"] {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-base);
+}
+
+/* Loading / failed: faint placeholder dash, same box so nothing shifts. */
+[data-component="chats-oxp-section"] [data-slot="oxp-stats"]:is([data-state="idle"], [data-state="loading"], [data-state="error"]) [data-slot="oxp-stat-value"] {
+  color: var(--v2-text-text-faint);
+}
+
+/* ---- Plane mix bars ----------------------------------------------------- */
+
+[data-component="chats-oxp-section"] :is([data-slot="plane-mix"], [data-slot="row-mix"]) {
+  display: flex;
+  overflow: hidden;
+  flex: none;
+  background: color-mix(in srgb, var(--v2-text-text-faint) 22%, transparent);
+}
+
+[data-component="chats-oxp-section"] :is([data-slot="plane-mix"], [data-slot="row-mix"]) > [data-plane] {
+  flex-basis: 0;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+[data-component="chats-oxp-section"] [data-slot="plane-mix"] {
+  height: 3px;
+  margin: 5px 8px 4px;
+  border-radius: 2px;
+}
+
+[data-component="chats-oxp-section"] [data-slot="row-mix"] {
+  width: 18px;
+  height: 3px;
+  border-radius: 1.5px;
+}
+
+[data-component="chats-oxp-section"] [data-plane="augmentation"] {
+  background: var(--oxp-plane-augmentation);
+}
+
+[data-component="chats-oxp-section"] [data-plane="supervision"] {
+  background: var(--oxp-plane-supervision);
+}
+
+[data-component="chats-oxp-section"] [data-plane="delegation"] {
+  background: var(--oxp-plane-delegation);
+}
+
+/* ---- Activity rows ------------------------------------------------------ */
+
+[data-component="chats-oxp-section"] [data-component="chats-oxp-activity-row"] {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  text-align: start;
+  font-family: var(--v2-font-family-sans);
+  cursor: default;
+  transition: background-color 120ms ease;
+}
+
+[data-component="chats-oxp-section"] [data-component="chats-oxp-activity-row"]:hover,
+[data-component="chats-oxp-section"] [data-component="chats-oxp-activity-row"]:focus-visible {
+  background: var(--v2-background-bg-layer-01);
+  outline: none;
+}
+
+[data-component="chats-oxp-section"] [data-component="chats-oxp-activity-row"][data-selected="true"] {
+  background: var(--v2-background-bg-layer-02);
+}
+
+[data-component="chats-oxp-section"] [data-component="chats-oxp-activity-row"][data-selected="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 4px auto 4px 0;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--v2-background-bg-accent);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-dot"] {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--v2-text-text-faint);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-dot"][data-state="live"] {
+  background: var(--v2-text-text-accent);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-dot"][data-state="failed"] {
+  background: var(--v2-state-fg-danger);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-title"] {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--v2-text-text-base);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-calls"],
+[data-component="chats-oxp-section"] [data-slot="oxp-time"] {
+  flex: none;
+  font-size: 10px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-time"] {
+  min-width: 22px;
+  text-align: end;
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-failures"] {
+  display: none;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-state-fg-danger);
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-failures"][data-active="true"] {
+  display: inline-flex;
+}
+
+[data-component="chats-oxp-section"] [data-slot="oxp-failures"] svg {
+  width: 10px;
+  height: 10px;
+}
