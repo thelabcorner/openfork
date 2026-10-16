@@ -9,6 +9,22 @@ export const settingsGeneralDict = {
   "settings.general.section.display": "Display",
   "settings.general.section.titleGeneration": "Title generation",
   "settings.general.section.promptRevision": "Prompt revision",
+  "settings.general.row.promptAutocorrectionCustom.title": "Personal spelling corrections",
+  "settings.general.row.promptAutocorrectionCustom.description": "Exact spelling pairs (gaol=goal). Code and action-critical words are protected; invalid pairs are ignored.",
+  "settings.general.row.promptAutocorrectionCustom.placeholder": "gaol=goal, fuction=function",
+  "settings.general.row.promptAutocorrectionIgnore.title": "Never autocorrect these words",
+  "settings.general.row.promptAutocorrectionIgnore.description": "Optional comma-separated terms; only affects known spelling rules, not native device autocorrect.",
+  "settings.general.row.promptAutocorrectionIgnore.placeholder": "e.g. teh, reasearch",
+  "settings.general.row.promptGrammarIgnoredWords.title": "Personal writing dictionary",
+  "settings.general.row.promptGrammarIgnoredWords.description": "Words never underlined as spelling errors, including technical names. Stored locally in your settings.",
+  "settings.general.row.promptGrammarIgnoredWords.placeholder": "OpenFork, Nacre, Silica",
+  "settings.general.row.promptGrammarAutoApply.title": "Auto-apply safe spelling and articles",
+  "settings.general.row.promptGrammarAutoApply.description": "Correct vetted spelling mistakes and simple a/an grammar automatically. Click a dotted word or Review to restore individual changes; ambiguous grammar, code, and identifiers stay untouched.",
+  "settings.general.row.promptGrammarHarper.title": "Inline spelling and grammar (Harper)",
+  "settings.general.row.promptGrammarHarper.description": "Opt-in offline English grammar assistance with colored squiggles and click-to-apply suggestions. Runs in a local WASM worker; never sends the prompt to Harper servers.",
+  "settings.general.row.promptAutocorrection.title": "Safe prompt autocorrection",
+  "settings.general.row.promptAutocorrection.description":
+    "Fix vetted English spelling mistakes locally before sending normal prompts. Preserves code, commands, and references. No model requests; off by default.",
   "settings.general.section.goalAuditor": "Goal auditor",
   "settings.general.section.spadAuditor": "SPAD auditor",
   "settings.general.section.compaction": "Compaction",
@@ -69,6 +85,13 @@ export const settingsGeneralDict = {
   "settings.general.row.autoAcceptPermissionsDefault.title": "Auto-accept permissions for new sessions",
   "settings.general.row.autoAcceptPermissionsDefault.description":
     "Automatically approves permission requests. Use only with trusted projects—actions may run without asking you first.",
+  "settings.general.row.usageLimitRecovery.autoResume.title": "Resume at usage reset",
+  "settings.general.row.usageLimitRecovery.autoResume.description":
+    "Automatically continue stopped sessions when the provider gives OpenFork a trusted reset deadline.",
+  "settings.general.row.usageLimitRecovery.snooze.title": "Snooze until usage reset",
+  "settings.general.row.usageLimitRecovery.snooze.description":
+    "Hide usage-limit attention until the trusted reset deadline while keeping execution policy separate.",
+  "settings.general.row.usageLimitRecovery.error": "Couldn't update usage-limit recovery",
   "settings.general.row.shellToolPartsExpanded.title": "Expand shell tool parts",
   "settings.general.row.shellToolPartsExpanded.description":
     "Show shell tool parts expanded by default in the timeline",
@@ -116,6 +139,12 @@ export const settingsGeneralDict = {
   "settings.general.row.promptRevisionAutoSendAfterRevision.title": "Auto-send after revising",
   "settings.general.row.promptRevisionAutoSendAfterRevision.description":
     "Immediately send the revised prompt after Prompt Revisor finishes. Requires Auto-revise before sending.",
+  "settings.general.row.autoInterruptOnModelSelectorChange.title": "Resume task with selected model",
+  "settings.general.row.autoInterruptOnModelSelectorChange.description":
+    "When you explicitly choose a different model while a task is running, stop and resume that task with your choice.",
+  "settings.general.row.autoUpdateModelSelectorOnGeneratingMismatch.title": "Follow the model in use",
+  "settings.general.row.autoUpdateModelSelectorOnGeneratingMismatch.description":
+    "When a live generation independently starts with a different model, update the selector to match it.",
   "settings.general.row.auditorPrompt.title": "Auditor prompt",
   "settings.general.row.auditorPrompt.description":
     "Instructions used by the independent read-only auditor after autonomous Goal turns",

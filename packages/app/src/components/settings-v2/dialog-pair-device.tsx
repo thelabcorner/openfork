@@ -82,9 +82,11 @@ export const DialogPairDevice: Component = () => {
         >
           {(session) => (
             <>
-              <div class="settings-v2-pair-qr">
-                <QrCode value={session().url} label={language.t("settings.pair.qr.alt")} />
-              </div>
+              <Show when={session().url}>
+                <div class="settings-v2-pair-qr">
+                  <QrCode value={session().url} label={language.t("settings.pair.qr.alt")} />
+                </div>
+              </Show>
               <div class="settings-v2-pair-code-block">
                 <span class="settings-v2-pair-code-label">{language.t("settings.pair.code.label")}</span>
                 {/* OTP is a Latin code token — keep LTR in RTL locales. */}
@@ -92,6 +94,9 @@ export const DialogPairDevice: Component = () => {
                   {formatPairingCode(session().code)}
                 </bdi>
               </div>
+              <Show when={!session().url}>
+                <p class="settings-v2-pair-qr-hint">{language.t("settings.pair.qr.unavailable")}</p>
+              </Show>
               <div class="settings-v2-pair-countdown" classList={{ "settings-v2-pair-countdown--expired": expired() }}>
                 <Show when={!expired()} fallback={<span>{language.t("settings.pair.expired")}</span>}>
                   {language.t("settings.pair.expires", { seconds: remaining() })}

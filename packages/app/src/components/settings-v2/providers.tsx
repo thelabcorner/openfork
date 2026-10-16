@@ -123,7 +123,7 @@ export const SettingsProvidersV2: Component<{
   const accounts = (providerID: string) => credentialAccounts(connections(providerID))
   const activeAccount = (providerID: string) => activeCredentialAccount(connections(providerID))
   const canAddAccount = (providerID: string) => {
-    if (!props.directory()) return protocol() === "v2"
+    if (!props.directory()) return protocol() === "v2" && providerSettings.auth.methods(providerID).length > 0
     return integration(providerID)?.methods.some((method) => method.type !== "env") ?? false
   }
   const refreshAccounts = async () => {
@@ -349,7 +349,7 @@ export const SettingsProvidersV2: Component<{
                           <Show
                             when={canAddAccount(item.id)}
                             fallback={
-                              <Show when={accountReady() && providerAccounts().length === 0}>
+                              <Show when={accountReady() && providerAccounts().length === 0 && item.source === "env"}>
                                 <span class="settings-v2-provider-env-hint">
                                   {language.t("settings.providers.connected.environmentDescription")}
                                 </span>
