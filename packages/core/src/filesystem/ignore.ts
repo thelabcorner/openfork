@@ -48,6 +48,7 @@ const FILES = [
 ]
 
 export const PATTERNS = [...FILES, ...FOLDERS]
+export const MAX_GIT_IGNORED_PATHS = 512
 
 const normalize = (file: string) => file.replaceAll("\\", "/")
 
@@ -138,6 +139,25 @@ export function nativeIgnored(filepath: string, native: readonly string[] = PATT
     if (parts[0] === pattern) return true
   }
   return false
+}
+
+/** Git's `ls-files --ignored --directory` projection. Git already applies
+ * precedence, negation, and tracked-file semantics; treat projected entries as
+ * exact roots and hide only their descendants. */
+export function projectedIgnored(filepath: string, projected: readonly string[]): boolean {
+  const normalized = normalize(filepath).replace(/^\.\//, "").replace(/\/$/, "")
+  if (projected.includes("**") && normalized) return true
+  return projected.some((root) => {
+    const entry = normalize(root).replace(/^\.\//, "").replace(/\/$/, "")
+    return normalized === entry || normalized.startsWith(`${entry}/`)
+  })
+}
+
+export function boundedProjection(paths: readonly string[]): readonly string[] {
+  return [...new Set(paths.map((item) => normalize(item).replace(/^\.\//, "").replace(/\/$/, "")))].slice(
+    0,
+    MAX_GIT_IGNORED_PATHS,
+  )
 }
 
 export function match(filepath: string, opts?: { extra?: string[]; whitelist?: readonly string[] }) {

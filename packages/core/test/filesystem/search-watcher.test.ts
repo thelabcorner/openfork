@@ -5,6 +5,7 @@ import { ConfigProvider, Effect, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Config } from "@opencode-ai/core/config"
+import { ConfigWatcher } from "@opencode-ai/core/config/watcher"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { FileSystemSearch } from "@opencode-ai/core/filesystem/search"
@@ -16,22 +17,26 @@ import { tmpdir } from "../fixture/tmpdir"
 
 const describeWatcher = Watcher.hasNativeBinding() && !process.env.CI ? describe : describe.skip
 
-const configLayer = Layer.succeed(
-  Config.Service,
-  Config.Service.of({
-    entries: () => Effect.succeed([]),
-  }),
-)
-
-const flagsLayer = ConfigProvider.layer(
-  ConfigProvider.fromUnknown({
-    OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
-    OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "false",
-    OPENCODE_DISABLE_FFF: "true",
-  }),
-)
-
-function provide(directory: string) {
+function provide(
+  directory: string,
+  options: { watcherIgnore?: string[]; disableFff?: boolean; disableWatcher?: boolean } = {},
+) {
+  const configEntries = options.watcherIgnore?.length
+    ? [new Config.Document({ type: "document", info: new Config.Info({ watcher: new ConfigWatcher.Info({ ignore: options.watcherIgnore }) }) })]
+    : []
+  const configLayer = Layer.succeed(
+    Config.Service,
+    Config.Service.of({
+      entries: () => Effect.succeed(configEntries),
+    }),
+  )
+  const flagsLayer = ConfigProvider.layer(
+    ConfigProvider.fromUnknown({
+      OPENCODE_EXPERIMENTAL_FILEWATCHER: options.disableWatcher ? "false" : "true",
+      OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: options.disableWatcher ? "true" : "false",
+      OPENCODE_DISABLE_FFF: options.disableFff === false ? "false" : "true",
+    }),
+  )
   const locationLayer = Layer.succeed(
     Location.Service,
     Location.Service.of(location({ directory: AbsolutePath.make(directory) })),
@@ -44,13 +49,20 @@ function provide(directory: string) {
   )
 }
 
-async function run<R, T>(program: (directory: string) => Effect.Effect<T, never, R>) {
+async function run<R, T>(
+  program: (directory: string) => Effect.Effect<T, never, R>,
+  options: { watcherIgnore?: string[]; disableFff?: boolean; disableWatcher?: boolean } = {},
+) {
   const tmp = await tmpdir()
+  const searchIndex = process.env.OPENCODE_SEARCH_INDEX
+  process.env.OPENCODE_SEARCH_INDEX = "false"
   try {
     return await Effect.runPromise(
-      program(tmp.path).pipe(provide(tmp.path)) as unknown as Effect.Effect<T>,
+      program(tmp.path).pipe(provide(tmp.path, options)) as unknown as Effect.Effect<T>,
     )
   } finally {
+    if (searchIndex === undefined) delete process.env.OPENCODE_SEARCH_INDEX
+    else process.env.OPENCODE_SEARCH_INDEX = searchIndex
     await fs.rm(tmp.path, { recursive: true, force: true })
   }
 }
@@ -140,5 +152,28 @@ describeWatcher("FileSystemSearch (ripgrepLayer) watcher feed", () => {
       }),
     )
     expect(result.some((entry) => entry.path === RelativePath.make(".env"))).toBe(false)
+  })
+})
+
+describeWatcher("FileSystemSearch configured watcher ignores", () => {
+  test("uses the ignore-aware backend and excludes configured paths from the initial scan", async () => {
+    const result = await run(
+      (directory) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => fs.mkdir(path.join(directory, "ignored"), { recursive: true }))
+          yield* Effect.promise(() => fs.mkdir(path.join(directory, "src"), { recursive: true }))
+          yield* Effect.promise(() => fs.writeFile(path.join(directory, "ignored", "private-note.ts"), "secret"))
+          yield* Effect.promise(() => fs.writeFile(path.join(directory, "src", "visible-note.ts"), "visible"))
+          const search = yield* FileSystemSearch.Service
+          yield* Effect.sleep("500 millis")
+          const visible = yield* search.find({ query: "visible" })
+          const ignored = yield* search.find({ query: "private-note" })
+          return { visible, ignored }
+        }),
+      { watcherIgnore: ["ignored/**"], disableFff: false },
+    )
+
+    expect(result.visible.some((entry) => entry.path === RelativePath.make("src/visible-note.ts"))).toBe(true)
+    expect(result.ignored.some((entry) => entry.path === RelativePath.make("ignored/private-note.ts"))).toBe(false)
   })
 })

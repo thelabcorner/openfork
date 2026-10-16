@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { searchFileMentionsFast } from "../src/search/mention-fast"
+import { omittedSingleTokenScoreUpperBound, searchFileMentionsFast } from "../src/search/mention-fast"
 import type { Matcher } from "../src/search/matcher"
 
 const PATHS: Matcher.PathEntry[] = [
@@ -78,5 +78,39 @@ describe("fast file mention search", () => {
         if (i > 0) expect(positions[i]!).toBeGreaterThan(positions[i - 1]!)
       }
     }
+  })
+
+  test("candidate omission bounds stay conservative and query-shape limited", () => {
+    expect(omittedSingleTokenScoreUpperBound("sis", "path-substring+basename-boundary")).toBe(509)
+    expect(omittedSingleTokenScoreUpperBound("vlccsc", "path-substring+basename-subsequence")).toBe(245)
+    expect(omittedSingleTokenScoreUpperBound("a", "path-substring+basename-boundary")).toBeUndefined()
+    expect(omittedSingleTokenScoreUpperBound("server session", "path-substring+basename-boundary")).toBeUndefined()
+    expect(omittedSingleTokenScoreUpperBound("src/foo", "path-substring+basename-boundary")).toBeUndefined()
+  })
+
+  test("basename-subsequence omission bound dominates adversarial directory matches", () => {
+    const alphabet = "abcdefgh"
+    for (let length = 2; length <= 8; length++) {
+      const token = alphabet.slice(0, length)
+      const last = token.at(-1)!
+      const omitted: Matcher.PathEntry[] = [
+        { path: `${token}/x.ts`, isDir: false },
+        { path: `${token.slice(0, -1)}/${last}.ts`, isDir: false },
+        { path: `${token.split("").join("/")}/x.ts`, isDir: false },
+        { path: `${token.slice(0, -1).split("").join("/")}/${last}.ts`, isDir: false },
+      ]
+      const bound = omittedSingleTokenScoreUpperBound(token, "path-substring+basename-subsequence")!
+      for (const candidate of omitted) {
+        const score = searchFileMentionsFast([candidate], { query: token, limit: 1, offset: 0 }).results[0]?.score
+        expect(score).toBeLessThanOrEqual(bound)
+      }
+    }
+
+    const camelDirectory: Matcher.PathEntry = { path: "aB/x.ts", isDir: false }
+    const camelScore = searchFileMentionsFast([camelDirectory], { query: "ab", limit: 1, offset: 0 }).results[0]?.score
+    expect(camelScore).toBe(68)
+    expect(camelScore).toBeLessThanOrEqual(
+      omittedSingleTokenScoreUpperBound("ab", "path-substring+basename-subsequence")!,
+    )
   })
 })

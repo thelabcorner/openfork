@@ -384,6 +384,8 @@ describe("coverage precondition mirrors the scorer", () => {
     // keeps it UNPROVEN.
     expect(basenameContainsQuerySubsequence("ab", "aB/x.ts")).toBe(false)
     const score = searchFileMentionsFast([{ path: "aB/x.ts", isDir: false }], { query: "ab", limit: 1, offset: 0 }).results[0]!.score
-    expect(score).toBe(omittedSingleTokenScoreUpperBound("ab", "path-substring+basename-subsequence"))
+    const bound = omittedSingleTokenScoreUpperBound("ab", "path-substring+basename-subsequence")
+    expect(bound).toBeDefined()
+    expect(score).toBe(bound!)
   })
 })

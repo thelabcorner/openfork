@@ -110,6 +110,10 @@ const serviceLayer = Layer.effect(
     const listeners = new Set<(updates: readonly PathEntry[]) => void>()
     let snapshotCache: PathEntry[] | undefined
     let snapshotLookup: Map<string, number> | undefined
+    // File removals can make one or more indexed ancestor directories disappear
+    // from the candidate set. Defer checking those prefixes until the next
+    // snapshot/seal, where the live path projection is already being materialized.
+    const directoriesToPrune = new Set<string>()
     const metadataPending = new Map<string, { entry: PathEntry; countLines: boolean }>()
     const metadataWake = yield* Queue.dropping<void>(1)
 
@@ -157,18 +161,24 @@ const serviceLayer = Layer.effect(
       pending.set(entry.path, entry)
       if (!entry.isDir) {
         for (const ancestor of ancestors(entry.path)) {
-          if (!sealed.has(ancestor) && !pending.has(ancestor)) pending.set(ancestor, { path: ancestor, isDir: true })
+          directoriesToPrune.delete(ancestor)
+          const wasDeleted = tombstones.delete(ancestor)
+          if (wasDeleted || (!sealed.has(ancestor) && !pending.has(ancestor)))
+            pending.set(ancestor, { path: ancestor, isDir: true })
         }
       }
     }
     const deleteEntry = (entryPath: string) => {
       invalidateSnapshot()
-      pending.delete(entryPath)
+      // Keep a pending tombstone so a delete-only watcher batch still reaches
+      // seal() and is persisted even when there are no additions to append.
+      pending.set(entryPath, undefined)
       sealed.delete(entryPath)
       tombstones.add(entryPath)
       symbols.delete(entryPath)
       fileMeta.delete(entryPath)
       metadataPending.delete(entryPath)
+      for (const ancestor of ancestors(entryPath)) directoriesToPrune.add(ancestor)
     }
 
     const loadRaw = Effect.gen(function* () {
@@ -213,6 +223,26 @@ const serviceLayer = Layer.effect(
           if (!pending.has(entryPath)) push({ path: entryPath, isDir: true })
       for (const entry of sealed.values()) push(entry)
       for (const entry of pending.values()) if (entry !== undefined) push(entry)
+      if (directoriesToPrune.size > 0) {
+        const candidates = directoriesToPrune
+        const live = new Set<string>()
+        for (const entry of out) {
+          if (entry.isDir) continue
+          for (const ancestor of ancestors(entry.path)) if (candidates.has(ancestor)) live.add(ancestor)
+        }
+        for (const directory of candidates) {
+          if (live.has(directory)) continue
+          tombstones.add(directory)
+          sealed.delete(directory)
+          pending.set(directory, undefined)
+          fileMeta.delete(directory)
+        }
+        directoriesToPrune.clear()
+        for (let index = out.length - 1; index >= 0; index--) {
+          const entry = out[index]
+          if (entry?.isDir && tombstones.has(entry.path)) out.splice(index, 1)
+        }
+      }
       snapshotCache = out
       snapshotLookup = new Map(out.map((entry, index) => [entry.path, index]))
       return out
@@ -232,6 +262,9 @@ const serviceLayer = Layer.effect(
       })
 
     const seal = Effect.gen(function* () {
+      // Resolve empty ancestors in the same coalesced batch as file removals.
+      // This is deferred so a burst of unlinks performs one projection pass.
+      if (directoriesToPrune.size > 0) snapshot()
       if (pending.size === 0) return
       const adds: PathEntry[] = []
       for (const entry of pending.values()) if (entry !== undefined) adds.push(entry)
@@ -316,6 +349,7 @@ const serviceLayer = Layer.effect(
       dirs.sort(compareBytes)
       yield* store.clear()
       tombstones.clear()
+      pending.clear()
       yield* store.putMeta("tombstones", "[]").pipe(Effect.ignore)
       // fileMeta entries survive compaction (paths unchanged); re-persist as-is.
       yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
@@ -363,6 +397,8 @@ const serviceLayer = Layer.effect(
         Flock.effect(`search-index-cold-seed:${dbPath}`, {
           dir: lockDir,
           staleMs: COLD_SEED_LOCK_STALE_MS,
+          // Filesystem reconciliation may outlive a heartbeat under load.
+          protectLiveProcess: true,
           timeoutMs: COLD_SEED_LOCK_TIMEOUT_MS,
           baseDelayMs: 100,
           maxDelayMs: 2_000,

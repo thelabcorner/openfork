@@ -142,6 +142,62 @@ describe("SearchIndex", () => {
     }
   }, 20_000)
 
+  test("unlink prunes empty indexed ancestors and later files recreate them", async () => {
+    const tmp = await tmpdir()
+    const dataDir = path.join(tmp.path, "data")
+    try {
+      const files = ["src/only.ts", "src/other.ts", "src/nested/leaf.ts"]
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const seeded = yield* Effect.promise(() => pollUntil(async () => (await load(index)).paths.length >= 5))
+          expect(seeded).toBe(true)
+
+          // Deleting one branch prunes only that branch; the shared ancestor
+          // remains while other indexed files still exist below it.
+          yield* index.remove("src/nested/leaf.ts")
+          yield* index.seal()
+          let paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          expect(paths.has("src/nested/leaf.ts")).toBe(false)
+          expect(paths.has("src/nested")).toBe(false)
+          expect(paths.has("src")).toBe(true)
+
+          // Once the final descendants are gone, the ancestor row is removed.
+          yield* index.remove("src/only.ts")
+          yield* index.remove("src/other.ts")
+          yield* index.seal()
+          paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          expect(paths.has("src")).toBe(false)
+
+          // The candidate directory is restored by a later file event.
+          yield* index.upsert({ path: "src/reborn.ts", isDir: false })
+          yield* index.seal()
+          paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          expect(paths.has("src/reborn.ts")).toBe(true)
+          expect(paths.has("src")).toBe(true)
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, files)), Effect.scoped),
+      )
+
+      let walks = 0
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          expect(paths).toEqual(new Set(["src/reborn.ts", "src"]))
+        }).pipe(
+          Effect.provide(makeLayer(tmp.path, dataDir, [], { onSeed: () => walks++ })),
+          Effect.scoped,
+        ),
+      )
+      // The delete-only watcher seals must persist file and directory
+      // tombstones; a fresh index should trust the recent snapshot without a
+      // full tree walk and must not resurrect the old empty ancestors.
+      expect(walks).toBe(0)
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 20_000)
+
   test("persists across reopen from the same project db", async () => {
     const tmp = await tmpdir()
     try {
