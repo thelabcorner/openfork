@@ -2935,7 +2935,7 @@ goalIt.instance(
       console.error("[GOAL_HISTORY_DIAG] interrupted tool state", JSON.stringify({
         matching: Boolean(interruptedTool),
         tools: parentMessages.flatMap((message) => message.parts).filter((p) => p.type === "tool")
-          .map((p) => ({status: p.state.status, metadata: p.state.metadata, error: p.state.error, tool: p.tool})),
+          .map((p) => ({status: p.state.status, metadata: "metadata" in p.state ? p.state.metadata : undefined, error: "error" in p.state ? p.state.error : undefined, tool: p.tool})),
       }))
       expect(interruptedTool?.type).toBe("tool")
       console.error("[GOAL_HISTORY_DIAG] tool settled")
@@ -3229,7 +3229,8 @@ it.instance(
       expect(continuation?.info.role).toBe("user")
       if (!continuation || continuation.info.role !== "user") throw new Error("missing timeout continuation")
       expect(continuation.info.provenance?.owner).toBe("host")
-      expect(continuation.info.provenance?.ref).toContain("1:msg_")
+        if (continuation.info.provenance?.owner !== "host") throw new Error("timeout continuation must be host-owned")
+        expect(continuation.info.provenance.ref).toContain("1:msg_")
       const entry = yield* SessionInput.findEntry(db, SessionMessage.ID.make(continuation.info.id))
       expect(entry).toMatchObject({ admissionClass: "automatic", userPreemptible: true, delivery: "queue" })
       expect((yield* llm.hits).length).toBe(2)
@@ -3268,7 +3269,7 @@ it.instance(
         row.info.role === "user" &&
         row.info.provenance?.source === SessionTurnProvenance.Source.ProviderTimeoutContinuation)
       expect(continuations).toHaveLength(2)
-      expect(continuations.map((row) => row.info.role === "user" && row.info.provenance?.ref?.slice(0, 2)))
+      expect(continuations.map((row) => row.info.role === "user" && row.info.provenance?.owner === "host" && row.info.provenance.ref?.slice(0, 2)))
         .toEqual(["1:", "2:"])
       expect((yield* llm.hits).length).toBe(3)
       const last = rows.findLast((row) => row.info.role === "assistant")

@@ -985,6 +985,7 @@ describe("session.llm.stream", () => {
         }).pipe(Effect.flip)
         yield* Effect.promise(() => request)
         expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+        if (!(error instanceof ProviderError.ResponseStreamError)) throw new Error("expected a stream error")
         expect(error.message).toBe("OpenAI-compatible stream ended without a recognized finish_reason")
       }),
     {
