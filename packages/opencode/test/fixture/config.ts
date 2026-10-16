@@ -5,6 +5,7 @@ import { Effect, Layer } from "effect"
 export function make(overrides: Partial<Config.Interface> = {}) {
   return Config.Service.of({
     get: () => Effect.succeed({}),
+    getForLocation: () => Effect.succeed({}),
     getGlobal: () => Effect.succeed({}),
     sharePolicyForLocation: () => Effect.succeed(undefined),
     getConsoleState: () => Effect.succeed(emptyConsoleState),

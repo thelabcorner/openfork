@@ -63,6 +63,7 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
     enabled: bool("OPENCODE_ENABLE_SEARXNG"),
     legacy: bool("OPENCODE_EXPERIMENTAL_SEARXNG"),
   }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableOllamaSearch: bool("OPENCODE_ENABLE_OLLAMA_SEARCH"),
   enableExperimentalModels: bool("OPENCODE_ENABLE_EXPERIMENTAL_MODELS"),
   enableQuestionTool: bool("OPENCODE_ENABLE_QUESTION_TOOL"),
   experimentalReferences: enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES"),
@@ -71,9 +72,9 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   experimentalLspTool: enabledByExperimental("OPENCODE_EXPERIMENTAL_LSP_TOOL"),
   experimentalOxfmt: enabledByExperimental("OPENCODE_EXPERIMENTAL_OXFMT"),
   experimentalPlanMode: enabledByExperimental("OPENCODE_EXPERIMENTAL_PLAN_MODE"),
-  // OpenFork ships upstream Code Mode as the default MCP orchestration path.
-  // Keep the upstream compatibility flag as an explicit opt-out: setting
-  // OPENCODE_EXPERIMENTAL_CODE_MODE=false restores direct MCP tool exposure.
+  // Deprecated compatibility parse only. The provider-visible orchestration
+  // surface is always the static OpenFork `code` tool; this legacy flag no
+  // longer selects a tool or re-exposes direct MCP tools.
   experimentalCodeMode: Config.boolean("OPENCODE_EXPERIMENTAL_CODE_MODE").pipe(Config.withDefault(true)),
   experimentalEventSystem: enabledByExperimental("OPENCODE_EXPERIMENTAL_EVENT_SYSTEM"),
   experimentalWorkspaces: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),

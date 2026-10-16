@@ -163,6 +163,52 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     expect(stable).toHaveLength(2)
   })
 
+  test("large partial reasoning blocks deduplicate against final blocks without rebuilding each prefix", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
+    const pending = events(ClaudeRuntimeAdapter.stream(baseInput({ runtime, tools: {} })))
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-partial-reasoning" })
+    script.push({
+      type: "stream_event",
+      session_id: "ext-partial-reasoning",
+      event: { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+    })
+    for (let index = 0; index < 10_000; index++) {
+      script.push({
+        type: "stream_event",
+        session_id: "ext-partial-reasoning",
+        event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "x" } },
+      })
+    }
+    script.push({
+      type: "stream_event",
+      session_id: "ext-partial-reasoning",
+      event: { type: "content_block_stop", index: 0 },
+    })
+    script.push({
+      type: "assistant",
+      session_id: "ext-partial-reasoning",
+      message: { content: [{ type: "thinking", thinking: "x".repeat(10_000) }] },
+    })
+    script.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "finished",
+      session_id: "ext-partial-reasoning",
+    })
+    script.end()
+
+    const list = await pending
+    const reasoning = list.filter((event) => event.type === "reasoning-delta")
+    expect(reasoning.map((event) => event.text).join("")).toBe("x".repeat(10_000))
+    expect(reasoning).toHaveLength(10_000)
+    expect(list.filter((event) => event.type === "reasoning-start")).toHaveLength(1)
+    expect(list.filter((event) => event.type === "reasoning-end")).toHaveLength(1)
+  })
+
   test("tool_use executes through BridgeStore + Permission and the turn continues to completion", async () => {
     resetSharedState()
     const script = new SdkScript()
@@ -430,7 +476,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     expect(list.at(-1)?.type).toBe("finish")
   })
 
-  test("Code Mode catalog stays ToolRegistry-owned and reaches Claude through the execute tool description", async () => {
+  test("static Code tool reaches Claude without dynamic catalog prose", async () => {
     resetSharedState()
     const script = new SdkScript()
     let mcpOptions: any
@@ -447,25 +493,22 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
           },
         }) as never,
     })
-    const execute = {
-      description: [
-        "Run a confined orchestration script with access to connected MCP tools.",
-        "# Code Mode",
-        "## Available tools (COMPLETE list)",
-        "tools.github.list_issues(input: {}): Promise<unknown>",
-      ].join("\n"),
+    const code = {
+      description:
+        "Programmable OpenFork orchestration. code.search finds refs; code.describe inspects one exact ref; code.run executes confined JavaScript/TypeScript.",
       execute: async () => "ok",
     } as unknown as Tool
-    const pending = events(ClaudeRuntimeAdapter.stream(baseInput({ runtime, tools: { execute } })))
+    const pending = events(ClaudeRuntimeAdapter.stream(baseInput({ runtime, tools: { code } })))
 
     script.push({ type: "system", subtype: "init", session_id: "ext-code-mode-1" })
     await script.waitForRequest(1)
     expect(mcpOptions.tools).toHaveLength(1)
-    expect(mcpOptions.tools[0].name).toBe("execute")
-    expect(mcpOptions.tools[0].description).toContain("# Code Mode")
-    expect(mcpOptions.tools[0].description).toContain("tools.github.list_issues")
+    expect(mcpOptions.tools[0].name).toBe("code")
+    expect(mcpOptions.tools[0].description).toContain("code.search finds refs")
+    expect(mcpOptions.tools[0].description).not.toContain("Available tools")
+    expect(mcpOptions.tools[0].description).not.toContain("github.list_issues")
     expect(String((script.requests[0].options.systemPrompt as { append?: string }).append ?? "")).not.toContain(
-      "# Code Mode",
+      "Available tools",
     )
 
     script.push({ type: "result", subtype: "success", is_error: false, result: "ok", session_id: "ext-code-mode-1" })

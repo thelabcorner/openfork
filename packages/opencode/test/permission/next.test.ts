@@ -13,6 +13,7 @@ import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "../../src/session/schema"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import * as AutoAcceptPolicy from "../../src/permission/auto-accept-policy"
 
 const noopBootstrap = Layer.succeed(
   InstanceBootstrap.Service,
@@ -77,6 +78,43 @@ const list = () =>
     const permission = yield* Permission.Service
     return yield* permission.list()
   })
+
+it.instance("sidecar auto-accept resolves asks without renderer event delivery and honors child policy revocation", () =>
+  Effect.gen(function* () {
+    const instance = yield* TestInstance
+    const events = yield* EventV2Bridge.Service
+    const sessionID = SessionID.make("ses_hidden_renderer_auto_accept")
+    let askedEvents = 0
+    const unsubscribe = yield* events.listen((event) => {
+      if (event.type === Permission.Event.Asked.type) askedEvents++
+      return Effect.void
+    })
+    yield* Effect.addFinalizer(() => unsubscribe)
+    yield* Effect.promise(() => AutoAcceptPolicy.update(instance.directory, { [sessionID]: true }, "patch"))
+    try {
+      const cachedPolicy = yield* Effect.promise(() => AutoAcceptPolicy.get(instance.directory))
+      const policyReads = AutoAcceptPolicy.readCount(instance.directory)
+      const ioBeforeAsks = AutoAcceptPolicy.ioCount()
+      yield* ask({ sessionID, permission: "bash", patterns: ["echo hello"], always: [], metadata: {}, ruleset: [] })
+      expect(yield* list()).toHaveLength(0)
+      yield* ask({ sessionID, permission: "bash", patterns: ["echo twice"], always: [], metadata: {}, ruleset: [] })
+      expect(yield* Effect.promise(() => AutoAcceptPolicy.get(instance.directory))).toBe(cachedPolicy)
+      expect(AutoAcceptPolicy.readCount(instance.directory)).toBe(policyReads)
+      expect(AutoAcceptPolicy.ioCount()).toEqual(ioBeforeAsks)
+      expect(askedEvents).toBe(0)
+
+      yield* Effect.promise(() => AutoAcceptPolicy.update(instance.directory, { "*": true, [sessionID]: false }, "patch"))
+      const live = yield* Effect.promise(() => AutoAcceptPolicy.get(instance.directory))
+      yield* Effect.promise(() => AutoAcceptPolicy.update(instance.directory, {
+        [sessionID]: true,
+      }, "hydrate"))
+      expect(live.current.autoAccept[sessionID]).toBe(false)
+      expect(AutoAcceptPolicy.acceptsLineage(live, [sessionID], "*")).toBe(false)
+    } finally {
+      yield* Effect.promise(() => AutoAcceptPolicy.update(instance.directory, { [sessionID]: false, "*": false }, "patch"))
+    }
+  }), { git: true }, 15_000,
+)
 
 // `permission.ask` plugin hook tests: a mock Plugin.Service that observes the
 // trigger and can override the ask decision (the hook's output contract).
@@ -878,6 +916,121 @@ it.instance(
         ruleset: [],
       })
       expect(result).toBeUndefined()
+    }),
+  { git: true },
+)
+
+it.instance(
+  "configured deny outranks stale standing approval and a later configured allow can re-authorize",
+  () =>
+    Effect.gen(function* () {
+      const initial = yield* ask({
+        id: PermissionV1.ID.make("per_precedence_seed"),
+        sessionID: SessionID.make("session_precedence_seed"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: ["ls"],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_precedence_seed"), reply: "always" })
+      yield* Fiber.join(initial)
+
+      const denied = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_precedence_deny"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "deny" }],
+        }),
+      )
+      expect(denied).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+
+      const allowed = yield* ask({
+        sessionID: SessionID.make("session_precedence_allow"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [
+          { permission: "bash", pattern: "*", action: "deny" },
+          { permission: "bash", pattern: "ls", action: "allow" },
+        ],
+      })
+      expect(allowed).toBeUndefined()
+    }),
+  { git: true },
+)
+
+it.instance(
+  "run approval is scoped to one execution and release drops it",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("session_run_scope")
+      const permission = yield* Permission.Service
+
+      const initial = yield* ask({
+        id: PermissionV1.ID.make("per_run_scope_seed"),
+        sessionID,
+        executionID: "run-A",
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_run_scope_seed"), reply: "run" })
+      yield* Fiber.join(initial)
+
+      expect(
+        yield* ask({
+          sessionID,
+          executionID: "run-A",
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      ).toBeUndefined()
+
+      const sibling = yield* ask({
+        id: PermissionV1.ID.make("per_run_scope_sibling"),
+        sessionID,
+        executionID: "run-B",
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      expect((yield* list()).map((item) => item.id)).toEqual([PermissionV1.ID.make("per_run_scope_sibling")])
+      yield* reply({ requestID: PermissionV1.ID.make("per_run_scope_sibling"), reply: "once" })
+      yield* Fiber.join(sibling)
+
+      yield* permission.releaseExecution({ sessionID, executionID: "run-A" })
+
+      const afterRelease = yield* ask({
+        id: PermissionV1.ID.make("per_run_scope_released"),
+        sessionID,
+        executionID: "run-A",
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_run_scope_released"), reply: "once" })
+      yield* Fiber.join(afterRelease)
     }),
   { git: true },
 )

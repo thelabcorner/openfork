@@ -99,10 +99,10 @@ describe("lsp.spawn", () => {
       Effect.gen(function* () {
         const dir = (yield* TestInstance).directory
         const lsp = yield* LSP.Service
-        const updated = yield* Deferred.make<void>()
+        const updated = yield* Deferred.make<unknown>()
         const events = yield* EventV2Bridge.Service
         const unsubscribe = yield* events.listen((event) => {
-          if (event.type === LSP.Event.Updated.type) Deferred.doneUnsafe(updated, Effect.void)
+          if (event.type === LSP.Event.Updated.type) Deferred.doneUnsafe(updated, Effect.succeed(event.data))
           return Effect.void
         })
         yield* Effect.addFinalizer(() => unsubscribe)
@@ -110,7 +110,13 @@ describe("lsp.spawn", () => {
         const file = path.join(dir, "sample.repro")
         yield* Effect.promise(() => Bun.write(file, "sample\n"))
         yield* lsp.touchFile(file)
-        yield* awaitWithTimeout(Deferred.await(updated), "lsp.updated event was not published")
+        const payload = (yield* awaitWithTimeout(
+          Deferred.await(updated),
+          "lsp.updated event was not published",
+        )) as { servers: LSP.Status[] }
+        expect(payload.servers).toEqual([
+          { id: "fake", name: "fake", root: "", status: "connected" },
+        ])
       }),
     {
       config: {

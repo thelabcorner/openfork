@@ -25,11 +25,11 @@ export interface Interface extends EventV2.Interface {
   readonly replayEpoch: string
   readonly sequenceOf: (event: EventV2.Payload) => number | undefined
   /**
-   * Open one compatibility `/event` replay range. The first subscriber after an
-   * idle period starts a fresh epoch and returns the exact sequence boundary at
-   * connect time. Fresh subscribers replay only events published after `after`,
-   * which closes the capture-before-live-listener setup race without sending
-   * unrelated pre-connect history.
+   * Open one compatibility `/event` replay range. A reconnect during the
+   * bounded post-disconnect grace reuses its epoch and retained cursor window;
+   * after expiry, the next subscriber starts a fresh epoch. Fresh subscribers
+   * replay only events published after `after`, which closes the
+   * capture-before-live-listener setup race without sending unrelated history.
    */
   readonly replayConnect: () => { readonly epoch: string; readonly after: number; readonly release: () => void }
 }
@@ -41,6 +41,10 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Ev
 // 4 MiB replay guard silently reject half of an 8 MiB retained window.
 export const REPLAY_CAPACITY = 4096
 export const REPLAY_MAX_BYTES = 8 * 1024 * 1024
+// Match the pinned T3 SDK's default first SSE retry delay (3s) with ample
+// headroom for backoff and local scheduling. The existing count/byte bounds
+// remain authoritative while a disconnected client may retry.
+export const LEGACY_REPLAY_GRACE_MS = 30_000
 
 /**
  * Liveness probes for transports that can observe a legacy `GlobalBus`
@@ -151,9 +155,34 @@ const layer = Layer.effect(
     })
     let replayGeneration = makeReplayGeneration()
     let replaySubscribers = 0
+    let replayRetentionUntil = 0
+    let replayRetentionTimer: ReturnType<typeof setTimeout> | undefined
+
+    const clearReplayRetentionTimer = () => {
+      if (replayRetentionTimer !== undefined) clearTimeout(replayRetentionTimer)
+      replayRetentionTimer = undefined
+    }
+
+    const expireReplayRetention = () => {
+      replayRetentionTimer = undefined
+      if (replaySubscribers > 0 || replayRetentionUntil === 0) return
+      const remaining = replayRetentionUntil - Date.now()
+      if (remaining > 0) {
+        replayRetentionTimer = setTimeout(expireReplayRetention, remaining)
+        return
+      }
+      replayRetentionUntil = 0
+      replayGeneration = makeReplayGeneration()
+    }
+
+    yield* Effect.addFinalizer(() => Effect.sync(clearReplayRetentionTimer))
 
     const replayConnect = () => {
-      if (replaySubscribers === 0) replayGeneration = makeReplayGeneration()
+      if (replaySubscribers === 0) {
+        if (Date.now() >= replayRetentionUntil) replayGeneration = makeReplayGeneration()
+        clearReplayRetentionTimer()
+        replayRetentionUntil = 0
+      }
       replaySubscribers += 1
       const generation = replayGeneration
       const after = generation.replay.latest()
@@ -165,6 +194,11 @@ const layer = Layer.effect(
           if (released) return
           released = true
           replaySubscribers = Math.max(0, replaySubscribers - 1)
+          if (replaySubscribers === 0) {
+            replayRetentionUntil = Date.now() + LEGACY_REPLAY_GRACE_MS
+            clearReplayRetentionTimer()
+            replayRetentionTimer = setTimeout(expireReplayRetention, LEGACY_REPLAY_GRACE_MS)
+          }
         },
       }
     }
@@ -188,12 +222,22 @@ const layer = Layer.effect(
     const unsubscribe = yield* events.listen((event) =>
       Effect.gen(function* () {
         // `/api/event` owns its own replay ring in packages/server. This bridge
-        // ring exists only for the compatibility `/event` transport, so do not
-        // duplicate byte estimation + retention for every token while no such
-        // subscriber exists. A replay lease is opened before that transport's
-        // live listener/replay handoff, preserving its reconnect window exactly.
-        if (replaySubscribers > 0) {
+        // ring exists only for the compatibility `/event` transport. Keep its
+        // bounded history while connected and for a short retry grace after the
+        // final subscriber disconnects, so SDK Last-Event-ID retries can replay
+        // events across a transient transport failure. Outside that window the
+        // capture remains idle; a later connection starts a new epoch and gets
+        // an explicit gap instead of a false promise of replay completeness.
+        const now = Date.now()
+        if (replaySubscribers > 0 || now < replayRetentionUntil) {
           replayGeneration.sequences.set(event, replayGeneration.replay.append(event))
+        } else if (replayRetentionUntil !== 0) {
+          // The expiry timer is a resource bound, not a correctness boundary:
+          // if the event loop delayed it, release stale payloads before the
+          // first post-grace publish and rotate the cursor epoch immediately.
+          clearReplayRetentionTimer()
+          replayRetentionUntil = 0
+          replayGeneration = makeReplayGeneration()
         }
         EventTrace.count("bridge.published")
         EventTrace.histogram("bridge.type", event.type)

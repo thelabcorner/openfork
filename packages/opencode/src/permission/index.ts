@@ -11,6 +11,9 @@ import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import type { ExternalActor } from "@/session/external-actor"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { PendingResponseRegistry } from "@/server/pending-response-registry"
+import type { SessionID } from "@/session/schema"
+import * as AutoAcceptPolicy from "./auto-accept-policy"
+import { Session } from "@/session/session"
 
 export const Event = PermissionV1.Event
 
@@ -20,10 +23,12 @@ export interface Interface {
     input: PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref },
   ) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  readonly releaseExecution: (input: { sessionID: SessionID; executionID: string }) => Effect.Effect<void>
 }
 
 interface PendingEntry {
   info: PermissionV1.Request
+  ruleset: PermissionV1.Ruleset
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
   settling?: boolean
 }
@@ -31,6 +36,9 @@ interface PendingEntry {
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
   approved: PermissionV1.Rule[]
+  executionApprovals: Map<string, PermissionV1.Rule[]>
+  autoAcceptPolicy: AutoAcceptPolicy.PolicyRef
+  lineage: Map<SessionID, SessionID[]>
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -45,6 +53,22 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Permi
   )
 }
 
+function executionKey(sessionID: SessionID, executionID: string) {
+  return `${sessionID}\u0000${executionID}`
+}
+
+function resolve(
+  permission: string,
+  pattern: string,
+  ruleset: PermissionV1.Ruleset,
+  approved: PermissionV1.Ruleset,
+  executionApproved: PermissionV1.Ruleset = [],
+): PermissionV1.Rule {
+  const configured = evaluate(permission, pattern, ruleset)
+  if (configured.action !== "ask") return configured
+  return evaluate(permission, pattern, approved, executionApproved)
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
 const layer = Layer.effect(
@@ -52,12 +76,16 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const responses = yield* PendingResponseRegistry.Service
+    const sessions = yield* Session.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
-        void ctx
+        const autoAcceptPolicy = yield* Effect.promise(() => AutoAcceptPolicy.get(ctx.directory))
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
+          executionApprovals: new Map<string, PermissionV1.Rule[]>(),
+          autoAcceptPolicy,
+          lineage: new Map(),
         }
 
         yield* Effect.addFinalizer(() =>
@@ -74,12 +102,16 @@ const layer = Layer.effect(
     )
 
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, pending, executionApprovals, autoAcceptPolicy } = yield* InstanceState.get(state)
+      const context = yield* InstanceState.context
       const { ruleset, ...request } = input
       let needsAsk = false
+      const executionApproved = request.executionID
+        ? (executionApprovals.get(executionKey(request.sessionID, request.executionID)) ?? [])
+        : []
 
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule = resolve(request.permission, pattern, ruleset, approved, executionApproved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
           return yield* new PermissionV1.DeniedError({
@@ -96,6 +128,7 @@ const layer = Layer.effect(
       const info: PermissionV1.Request = {
         id,
         sessionID: request.sessionID,
+        executionID: request.executionID,
         permission: request.permission,
         patterns: request.patterns,
         metadata: request.metadata,
@@ -107,12 +140,43 @@ const layer = Layer.effect(
       if (status === "deny") return yield* new PermissionV1.RejectedError()
       if (status === "allow") return
 
+      // Auto-accept is execution policy, so evaluate it in the sidecar before
+      // publishing an interactive request. This remains live when Electron's
+      // renderer is hidden or throttled.
+      const direct = autoAcceptPolicy.current.autoAccept[request.sessionID]
+      if (direct === true) return
+      if (direct === false) {
+        // An explicit session OFF overrides a directory-wide ON.
+      } else if (!Object.keys(autoAcceptPolicy.current.autoAccept).some((key) => key !== "*")) {
+        if (autoAcceptPolicy.current.autoAccept["*"] === true) return
+      } else {
+        const currentState = yield* InstanceState.get(state)
+        let lineage = currentState.lineage.get(request.sessionID)
+        if (!lineage) {
+          lineage = []
+          const seen = new Set<SessionID>()
+          let current: SessionID | undefined = request.sessionID
+        while (current && !seen.has(current)) {
+            seen.add(current)
+            const info: Option.Option<Session.Info> = yield* sessions.get(current).pipe(Effect.option)
+            if (Option.isNone(info)) break
+            lineage.push(current)
+          current = info.value.parentID
+        }
+        if (currentState.lineage.size >= 4096) {
+          const oldest = currentState.lineage.keys().next().value
+          if (oldest) currentState.lineage.delete(oldest)
+        }
+        currentState.lineage.set(request.sessionID, lineage)
+        }
+        if (AutoAcceptPolicy.acceptsLineage(autoAcceptPolicy, lineage, "*")) return
+      }
+
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      const entry = { info, deferred }
+      const entry = { info, ruleset, deferred }
       pending.set(id, entry)
-      const context = yield* InstanceState.context
       const unregister = yield* responses.register({
         kind: "permission",
         requestID: id,
@@ -138,7 +202,7 @@ const layer = Layer.effect(
     const reply = Effect.fn("Permission.reply")(function* (
       input: PermissionV1.ReplyInput & { readonly actor?: ExternalActor.Ref },
     ) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, pending, executionApprovals, autoAcceptPolicy } = yield* InstanceState.get(state)
       const context = yield* InstanceState.context
       const workspaceID = yield* WorkspaceRef
       const notify = (effect: Effect.Effect<void, unknown>) =>
@@ -182,7 +246,7 @@ const layer = Layer.effect(
         return
       }
 
-      if (input.reply !== "once") {
+      if (input.reply === "always") {
         for (const pattern of existing.info.always) {
           approved.push({
             permission: existing.info.permission,
@@ -191,15 +255,31 @@ const layer = Layer.effect(
           })
         }
       }
+
+      if (input.reply === "run" && existing.info.executionID) {
+        const key = executionKey(existing.info.sessionID, existing.info.executionID)
+        const rules = executionApprovals.get(key) ?? []
+        const patterns = existing.info.always.length > 0 ? existing.info.always : existing.info.patterns
+        for (const pattern of patterns) {
+          rules.push({ permission: existing.info.permission, pattern, action: "allow" })
+        }
+        executionApprovals.set(key, rules)
+      }
+
       pending.delete(input.requestID)
       yield* Deferred.succeed(existing.deferred, undefined)
       yield* notify(event())
       if (input.reply === "once") return
+      if (input.reply === "run" && !existing.info.executionID) return
 
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
+        if (input.reply === "run" && item.info.executionID !== existing.info.executionID) continue
+        const executionApproved = item.info.executionID
+          ? (executionApprovals.get(executionKey(item.info.sessionID, item.info.executionID)) ?? [])
+          : []
         const ok = item.info.patterns.every(
-          (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
+          (pattern) => resolve(item.info.permission, pattern, item.ruleset, approved, executionApproved).action === "allow",
         )
         if (!ok) continue
         if (item.settling) continue
@@ -208,7 +288,7 @@ const layer = Layer.effect(
         yield* Deferred.succeed(item.deferred, undefined)
         yield* notify(events.publish(
           Event.Replied,
-          { sessionID: item.info.sessionID, requestID: item.info.id, reply: "always" },
+          { sessionID: item.info.sessionID, requestID: item.info.id, reply: input.reply },
           input.actor ? { metadata: { actor: input.actor } } : undefined,
         ))
       }
@@ -219,7 +299,15 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.info)
     })
 
-    return Service.of({ ask, reply, list })
+    const releaseExecution = Effect.fn("Permission.releaseExecution")(function* (input: {
+      sessionID: SessionID
+      executionID: string
+    }) {
+      const { executionApprovals } = yield* InstanceState.get(state)
+      executionApprovals.delete(executionKey(input.sessionID, input.executionID))
+    })
+
+    return Service.of({ ask, reply, list, releaseExecution })
   }),
 )
 
@@ -285,7 +373,7 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, PendingResponseRegistry.node],
+  deps: [EventV2Bridge.node, PendingResponseRegistry.node, Session.node],
 })
 
 export * as Permission from "."

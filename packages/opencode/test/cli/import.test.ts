@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test"
 import {
+  importPartProjection,
   formatImportFileError,
   parseShareUrl,
   sanitizeImportedMessage,
@@ -9,8 +10,59 @@ import {
   type ShareData,
 } from "../../src/cli/cmd/import"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { PlatformError } from "effect"
+import { Effect, PlatformError } from "effect"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Database } from "@opencode-ai/core/database/database"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { MessageTable, PartTable, SessionTable, SessionToolRecallTable } from "@opencode-ai/core/session/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { eq } from "drizzle-orm"
+import { testEffect } from "../lib/effect"
+
+const it = testEffect(AppNodeBuilder.build(
+  LayerNode.group([Database.node]),
+  [[Database.node, Database.layerFromPath(":memory:")]],
+))
+
+it.effect("import projects exact tool identity and certified facts atomically without trusting source session ownership", () =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const sessionID = SessionSchema.ID.make("ses_import_part_target")
+    const messageID = SessionV1.MessageID.make("msg_import_part")
+    yield* db.insert(ProjectTable).values({
+      id: Project.ID.global, worktree: AbsolutePath.make("/import"), sandboxes: [],
+    }).onConflictDoNothing().run()
+    yield* db.insert(SessionTable).values({
+      id: sessionID, project_id: Project.ID.global,
+      slug: "import", directory: "/import", title: "import", version: "test",
+    }).run()
+    yield* db.insert(MessageTable).values({
+      id: messageID, session_id: sessionID, data: { role: "assistant" } as never,
+    }).run()
+    const part = SessionV1.ToolPart.make({
+      id: SessionV1.PartID.make("prt_import_tool_identity"),
+      sessionID: SessionSchema.ID.make("ses_untrusted_export"),
+      messageID, type: "tool", callID: "call_import_real", tool: "bash",
+      state: { status: "running", input: { command: "pwd" }, metadata: {}, time: { start: 1 } },
+    }) as unknown as SessionV1.Part
+    expect(yield* importPartProjection(db, part, sessionID, 123)).toBe(true)
+    expect(yield* importPartProjection(db, part, sessionID, 123)).toBe(false)
+    expect(yield* db.select().from(PartTable).where(eq(PartTable.id, part.id)).get()).toMatchObject({
+      session_id: sessionID, context_projection_version: 1,
+      context_kind: "tool", context_status: "running",
+    })
+    expect(yield* db.select().from(SessionToolRecallTable)
+      .where(eq(SessionToolRecallTable.part_id, part.id)).all()).toMatchObject([{
+      source: "v1_part", session_id: sessionID, message_id: messageID,
+      part_id: part.id, tool: "bash", time_created: 123,
+    }])
+  }),
+)
 
 test("imported Sessions cannot mint producer-owned aggregate identity", () => {
   const info = sanitizeImportedSessionInfo({

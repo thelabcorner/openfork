@@ -15,7 +15,7 @@ import { ShareNext } from "@/share/share-next"
 import { Provider } from "@/provider/provider"
 import { ProviderTest } from "../fake/provider"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
-import { SessionShareTable } from "@opencode-ai/core/share/sql"
+import { SessionShareTable, ShareCleanupTable } from "@opencode-ai/core/share/sql"
 import { Database } from "@opencode-ai/core/database/database"
 import { eq } from "drizzle-orm"
 import { provideTmpdirInstance } from "../fixture/fixture"
@@ -489,5 +489,85 @@ describe("ShareNext", () => {
       },
       { config: { enterprise: { url: "https://legacy-share.example.com" } } },
     ),
+  )
+
+  it.live("session deletion persists share cleanup, returns while remote DELETE is held, and retries to convergence", () =>
+    provideTmpdirInstance(() => {
+      let started!: Deferred.Deferred<void>
+      let release!: Deferred.Deferred<void>
+      let deleteCalls = 0
+      let deleteURL: string | undefined
+      let deleteBody: { secret: string } | undefined
+      const client = HttpClient.make((req) => {
+        if (req.method === "DELETE") {
+          deleteCalls++
+          deleteURL = req.url
+          if (req.body._tag === "Uint8Array") {
+            deleteBody = JSON.parse(new TextDecoder().decode(req.body.body)) as { secret: string }
+          }
+          if (deleteCalls === 1) {
+            return Effect.gen(function* () {
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(release)
+              return json(req, { error: "temporary" }, 503)
+            })
+          }
+          if (deleteCalls <= 3) return Effect.succeed(json(req, { error: "temporary" }, 503))
+        }
+        return Effect.succeed(json(req, { ok: true }))
+      })
+
+      return Effect.gen(function* () {
+        started = yield* Deferred.make<void>()
+        release = yield* Deferred.make<void>()
+        const sharing = yield* ShareNext.Service
+        const sessions = yield* Session.Service
+        const info = yield* sessions.create({ title: "delete shared session" })
+        yield* sharing.init()
+        const { db } = yield* Database.Service
+        yield* db.insert(SessionShareTable).values({
+          session_id: info.id,
+          id: "shr_delete_outbox",
+          secret: "sec_delete_outbox",
+          url: "https://legacy-share.example.com/share/delete",
+        }).run().pipe(Effect.orDie)
+        yield* sessions.remove(info.id)
+        // The local projection is already gone while the first remote request
+        // is still blocked. The independent row survived the FK cascade.
+        expect(Exit.isFailure(yield* Effect.exit(sessions.get(info.id)))).toBe(true)
+        const pending = yield* db.select().from(ShareCleanupTable).where(eq(ShareCleanupTable.share_id, "shr_delete_outbox")).get().pipe(Effect.orDie)
+        expect(pending?.secret).toBe("sec_delete_outbox")
+        yield* Deferred.await(started)
+        expect(deleteCalls).toBe(1)
+        expect(deleteURL).toBe("https://legacy-share.example.com/api/share/shr_delete_outbox")
+        expect(deleteBody).toEqual({ secret: "sec_delete_outbox" })
+
+        yield* Deferred.succeed(release, undefined)
+        yield* pollWithTimeout(
+          db.select().from(ShareCleanupTable).where(eq(ShareCleanupTable.share_id, "shr_delete_outbox")).get().pipe(
+            Effect.map((row) => row?.attempts === 3 ? true : undefined),
+            Effect.orDie,
+          ),
+          "bounded share cleanup retries did not leave a durable pending row",
+          "5 seconds",
+        )
+        expect(deleteCalls).toBe(3)
+        yield* Effect.sleep(25)
+        // Initialization is the restart recovery boundary: it scans durable
+        // rows left behind after the previous bounded retry run.
+        yield* sharing.init()
+        yield* pollWithTimeout(
+          db.select().from(ShareCleanupTable).where(eq(ShareCleanupTable.share_id, "shr_delete_outbox")).get().pipe(
+            Effect.map((row) => row ? undefined : true),
+            Effect.orDie,
+          ),
+          "share cleanup outbox did not converge after retry",
+          "5 seconds",
+        )
+        expect(deleteCalls).toBe(4)
+        expect(yield* share(info.id)).toBeUndefined()
+      }).pipe(Effect.provide(integrationLayer(client)))
+    }, { config: { enterprise: { url: "https://changed-enterprise.example.com" } } }),
+    { timeout: 10000 },
   )
 })

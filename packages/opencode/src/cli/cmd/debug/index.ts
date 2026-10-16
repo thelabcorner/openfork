@@ -14,6 +14,7 @@ import { SkillCommand } from "./skill"
 import { SnapshotCommand } from "./snapshot"
 import { AgentCommand } from "./agent"
 import { StartupCommand } from "./startup"
+import { SupportBundleCommand } from "./support-bundle"
 import { V2Command } from "./v2"
 
 export const DebugCommand = cmd({
@@ -29,6 +30,7 @@ export const DebugCommand = cmd({
       .command(SkillCommand)
       .command(SnapshotCommand)
       .command(StartupCommand)
+      .command(SupportBundleCommand)
       .command(AgentCommand)
       .command(V2Command)
       .command(InfoCommand)

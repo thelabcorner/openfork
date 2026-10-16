@@ -42,6 +42,7 @@ type RouteInput = {
   modelID: ModelV2.ID
   accountID?: string
   routeIntent?: ProviderRouteIntent.Info
+  executionPurpose?: Provider.RoutedExecutionPurpose
 }
 
 type RoutePlan = (input: RouteInput) => Effect.Effect<Provider.TransientRoutedModel | undefined, Provider.RouteResolutionError>
@@ -191,6 +192,7 @@ describe("System One routed transient authority", () => {
         providerID: hostedModel.providerID,
         modelID: hostedModel.id,
         routeIntent: { kind: "public" },
+        executionPurpose: "system-one",
       })
       expect(captured).toHaveLength(1)
       const request = captured[0]!
@@ -220,6 +222,7 @@ describe("System One routed transient authority", () => {
         providerID: hostedModel.providerID,
         modelID: hostedModel.id,
         routeIntent: { kind: "account", accountID: "account-b", pin: "hard" },
+        executionPurpose: "system-one",
       })
       expect(captured[0]?.authorization).toBe(`Bearer ${SELECTED_ACCOUNT_SECRET}`)
       expect(captured[0]?.authorization).not.toContain(POOL_DEFAULT)
@@ -241,6 +244,7 @@ describe("System One routed transient authority", () => {
         providerID: hostedModel.providerID,
         modelID: hostedModel.id,
         accountID: "account-a",
+        executionPurpose: "system-one",
       })
       expect(captured[0]?.authorization).toBe(`Bearer ${SELECTED_ACCOUNT_SECRET}`)
       expect(directLookups).toEqual([])

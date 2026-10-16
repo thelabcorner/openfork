@@ -25,6 +25,8 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { isAmbiguousTsPath, resolveAttachmentMime } from "@/util/media"
+import { remuxMpegTransportStream } from "@/exchange/media-preview"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -396,17 +398,38 @@ export const RunCommand = effectCmd({
           })()
           const detected = FSUtil.mimeType(resolvedPath)
           const text = content?.toString("utf8")
+          const actual = args.attach && content
+            ? resolveAttachmentMime(content.subarray(0, 4096), resolvedPath, detected)
+            : detected
+          if (args.attach && isAmbiguousTsPath(resolvedPath) && actual === "application/octet-stream") {
+            UI.error(`Ambiguous .ts/.mts file: not verified UTF-8 source or MPEG-TS packets: ${filePath}`)
+            process.exit(1)
+          }
+          const converted = args.attach && content && actual === "video/mp2t"
+            ? await remuxMpegTransportStream(content)
+            : undefined
+          if (args.attach && actual === "video/mp2t" && !converted) {
+            UI.error(`Detected MPEG transport-stream video, not TypeScript: ${filePath}. FFmpeg lossless MP4 remux failed; convert it to MP4 before attaching.`)
+            process.exit(1)
+          }
+          const wireContent = converted ?? content
           const mime = !args.attach
             ? isDirectory
               ? "application/x-directory"
               : "text/plain"
-            : content && text !== undefined && Buffer.from(text, "utf8").equals(content)
+            : converted
+              ? "video/mp4"
+              : isAmbiguousTsPath(resolvedPath) && actual === "text/plain"
+                ? "text/plain"
+                : isAmbiguousTsPath(resolvedPath) && actual === "application/xml"
+                  ? "application/xml"
+                : content && text !== undefined && Buffer.from(text, "utf8").equals(content)
               ? "text/plain"
-              : detected
+              : actual
 
           files.push({
             type: "file",
-            url: content ? `data:${mime};base64,${content.toString("base64")}` : pathToFileURL(resolvedPath).href,
+            url: wireContent ? `data:${mime};base64,${Buffer.from(wireContent).toString("base64")}` : pathToFileURL(resolvedPath).href,
             filename: path.basename(resolvedPath),
             mime,
           })

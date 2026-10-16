@@ -1,8 +1,10 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { and, eq, sql } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
+import { retrySqliteBusyCause } from "@opencode-ai/core/database/sqlite-busy"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
+import { migrateProject as migrateMemoryProject } from "@opencode-ai/core/memory/migrate-project"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -91,6 +93,8 @@ export interface Interface {
    */
   readonly init: () => Effect.Effect<void>
   readonly fromDirectory: (directory: string) => Effect.Effect<{ project: Info; sandbox: string }>
+  /** Resolve the current project projection for an explicit directory without persisting project/runtime state. */
+  readonly currentForDirectory: (directory: string) => Effect.Effect<Info>
   readonly discover: (input: Info) => Effect.Effect<void>
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: ProjectV2.ID) => Effect.Effect<Info | undefined>
@@ -154,8 +158,11 @@ const layer = Layer.effect(
       if (oldID === ProjectV2.ID.global) return
       if (oldID === newID) return
 
-      yield* db
-        .transaction(
+      // Native BEGIN IMMEDIATE admission already retries safely. An outer
+      // transaction retry could replay memory migrations / project-id moves
+      // after an ambiguous COMMIT. On post-BEGIN failure, preserve the
+      // uncertain outcome rather than running the migration twice.
+      yield* db.transaction(
           (d) =>
             Effect.gen(function* () {
               const oldProject = yield* d.select().from(ProjectTable).where(eq(ProjectTable.id, oldID)).get()
@@ -188,11 +195,15 @@ const layer = Layer.effect(
                 .where(eq(WorkspaceTable.project_id, oldID))
                 .run()
 
+              // Memory is scoped independently from Session/Workspace. Do not
+              // strand topics, facts, and suppression tombstones under oldID
+              // after canonical repo identity changes.
+              yield* migrateMemoryProject(d, oldID, newID)
+
               if (oldProject) yield* d.delete(ProjectTable).where(eq(ProjectTable.id, oldID)).run()
             }),
           { behavior: "immediate" },
-        )
-        .pipe(Effect.orDie)
+        ).pipe(Effect.orDie)
     })
 
     const saveProjectDirectory = Effect.fn("Project.saveProjectDirectory")(function* (input: {
@@ -201,16 +212,23 @@ const layer = Layer.effect(
     }) {
       if (input.projectID === ProjectV2.ID.global) return
       const opened = AbsolutePath.make(FSUtil.resolve(input.directory))
-      yield* projectDirectories
-        .create({
-          directory: opened,
-          projectID: input.projectID,
-        })
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("project directory persistence failed", { projectID: input.projectID, cause }),
-          ),
-        )
+      // On a warm ACP/desktop open this link already exists. INSERT OR IGNORE
+      // still enters SQLite's writer lane, even when it changes zero rows.
+      // Keep ON CONFLICT in create() for correctness if a peer wins the race.
+      const known = yield* projectDirectories.contains({ directory: opened, projectID: input.projectID })
+      if (known) return
+      yield* retrySqliteBusyCause(
+        () => projectDirectories
+          .create({
+            directory: opened,
+            projectID: input.projectID,
+          }),
+        { maxElapsedMs: 15_000, delayMs: 50, maxDelayMs: 500 },
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("project directory persistence failed", { projectID: input.projectID, cause }),
+        ),
+      )
     })
 
     const fromDirectory = Effect.fn("Project.fromDirectory")(function* (directory: string) {
@@ -222,9 +240,11 @@ const layer = Layer.effect(
       const resolvedWorktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
       const worktree = isChat ? AbsolutePath.make(FSUtil.resolve(resolvedWorktree)) : resolvedWorktree
 
-      // Phase 2: upsert
+      // Phase 2: register only changed metadata. Workspace/session admission is
+      // a frequent read-like operation; an unconditional UPSERT takes SQLite's
+      // single WAL writer slot even when the project is already registered.
       yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
-      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+      const row = yield* readDb.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
         ? fromRow(row)
         : {
@@ -244,12 +264,10 @@ const layer = Layer.effect(
         // root once when the project loads; linked worktrees remain distinct
         // physical roots and are still tracked in `sandboxes` below.
         worktree:
-          projectID === ProjectV2.ID.global || isChat
-            ? worktree
-            : AbsolutePath.make(FSUtil.resolve(existing.worktree)),
+          projectID === ProjectV2.ID.global || isChat ? worktree : AbsolutePath.make(FSUtil.resolve(existing.worktree)),
         name: isChat ? CHAT_PROJECT_NAME : existing.name,
         vcs: data.vcs?.type ?? fakeVcs,
-        time: { ...existing.time, updated: Date.now() },
+        time: { ...existing.time },
       }
       if (
         projectID !== ProjectV2.ID.global &&
@@ -267,47 +285,83 @@ const layer = Layer.effect(
         { concurrency: 8 },
       ).pipe(Effect.map((arr) => arr.filter((x): x is string => x !== undefined)))
 
-      yield* db
-        .insert(ProjectTable)
-        .values({
-          id: result.id,
-          worktree: AbsolutePath.make(result.worktree),
-          vcs: result.vcs ?? null,
-          name: result.name,
-          icon_url: result.icon?.url,
-          icon_url_override: result.icon?.override,
-          icon_color: result.icon?.color,
-          time_created: result.time.created,
-          time_updated: result.time.updated,
-          time_initialized: result.time.initialized,
-          sandboxes: result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
-          commands: result.commands,
-        })
-        .onConflictDoUpdate({
-          target: ProjectTable.id,
-          set: {
-            worktree: AbsolutePath.make(result.worktree),
-            vcs: result.vcs ?? null,
-            name: result.name,
-            icon_url: result.icon?.url,
-            icon_url_override: result.icon?.override,
-            icon_color: result.icon?.color,
-            time_updated: result.time.updated,
-            time_initialized: result.time.initialized,
-            sandboxes: result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
-            commands: result.commands,
-          },
-        })
-        .run()
-        .pipe(Effect.orDie)
+      const persist =
+        !row ||
+        row.worktree !== result.worktree ||
+        row.vcs !== (result.vcs ?? null) ||
+        (isChat && row.name !== result.name) ||
+        JSON.stringify(row.sandboxes) !== JSON.stringify(result.sandboxes)
+      if (persist) {
+        const updatedAt = Date.now()
+        // Conflict updates touch only discovery-owned fields. A stale workspace
+        // opener must never replace another process's newer icon, commands, or
+        // initialized timestamp. setWhere additionally makes a racing identical
+        // registration a database-level no-op.
+        const stored = yield* retrySqliteBusyCause(
+          () =>
+            db
+              .insert(ProjectTable)
+              .values({
+                id: result.id,
+                worktree: AbsolutePath.make(result.worktree),
+                vcs: result.vcs ?? null,
+                name: result.name,
+                icon_url: result.icon?.url,
+                icon_url_override: result.icon?.override,
+                icon_color: result.icon?.color,
+                time_created: result.time.created,
+                time_updated: updatedAt,
+                time_initialized: result.time.initialized,
+                sandboxes: result.sandboxes.map((sandbox) => AbsolutePath.make(sandbox)),
+                commands: result.commands,
+              })
+              .onConflictDoUpdate({
+                target: ProjectTable.id,
+                set: {
+                  worktree: sql`excluded.worktree`,
+                  vcs: sql`excluded.vcs`,
+                  ...(isChat ? { name: sql`excluded.name` } : {}),
+                  sandboxes: sql`excluded.sandboxes`,
+                  time_updated: updatedAt,
+                },
+                setWhere: sql`${ProjectTable.worktree} IS NOT excluded.worktree
+                  OR ${ProjectTable.vcs} IS NOT excluded.vcs
+                  OR ${ProjectTable.sandboxes} IS NOT excluded.sandboxes
+                  ${isChat ? sql`OR ${ProjectTable.name} IS NOT excluded.name` : sql``}`,
+              })
+              .returning({ updatedAt: ProjectTable.time_updated })
+              .get(),
+          { maxElapsedMs: 30_000, delayMs: 50, maxDelayMs: 500 },
+        ).pipe(Effect.orDie)
+        if (stored) {
+          result.time.updated = stored.updatedAt
+          yield* emitUpdated(result)
+        }
+      }
 
       if (projectID !== ProjectV2.ID.global) {
-        yield* db
-          .update(SessionTable)
-          .set({ project_id: projectID })
+        // Legacy global sessions can arrive *after* registration (e.g. git init
+        // while an old session is active), so the check must remain repeatable.
+        // Probe on the read lane first: ordinary session/new must not acquire
+        // SQLite's writer reservation for an UPDATE that matches no rows.
+        const legacy = yield* readDb
+          .select({ id: SessionTable.id })
+          .from(SessionTable)
           .where(and(eq(SessionTable.project_id, ProjectV2.ID.global), eq(SessionTable.directory, data.directory)))
-          .run()
+          .limit(1)
+          .get()
           .pipe(Effect.orDie)
+        if (legacy) {
+          yield* retrySqliteBusyCause(
+            () =>
+              db
+                .update(SessionTable)
+                .set({ project_id: projectID })
+                .where(and(eq(SessionTable.project_id, ProjectV2.ID.global), eq(SessionTable.directory, data.directory)))
+                .run(),
+            { maxElapsedMs: 30_000, delayMs: 50, maxDelayMs: 500 },
+          ).pipe(Effect.orDie)
+        }
       }
 
       yield* saveProjectDirectory({
@@ -315,11 +369,62 @@ const layer = Layer.effect(
         directory: data.directory,
       })
 
-      yield* emitUpdated(result)
       if (projectID !== ProjectV2.ID.global && data.vcs?.type === "git") {
         yield* projectV2.commit({ store: data.vcs.store, id: data.id })
       }
       return { project: result, sandbox: data.vcs ? data.directory : worktree }
+    })
+
+    // `/project/current` is a Tier-1 identity read used before session execution
+    // (including the cold draft route). Keep it on the same authoritative
+    // ProjectV2 resolver and durable Project row, but do not run the
+    // `fromDirectory` bootstrap path: that path migrates IDs, writes project and
+    // directory rows, updates sessions, emits events, and may discover icons.
+    const currentForDirectory = Effect.fn("Project.currentForDirectory")(function* (directory: string) {
+      const data = yield* projectV2.resolve(AbsolutePath.make(directory))
+      const projectID = ProjectV2.ID.make(data.id)
+      const isChat = projectID === ProjectV2.ID.make(CHAT_PROJECT_ID)
+      const resolvedWorktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
+      const worktree = isChat ? AbsolutePath.make(FSUtil.resolve(resolvedWorktree)) : resolvedWorktree
+      const row =
+        (yield* readDb.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)) ??
+        (data.previous && data.previous !== projectID
+          ? yield* readDb.select().from(ProjectTable).where(eq(ProjectTable.id, data.previous)).get().pipe(Effect.orDie)
+          : undefined)
+      const existing = row
+        ? fromRow(row)
+        : {
+            id: projectID,
+            worktree,
+            vcs: data.vcs?.type ?? fakeVcs,
+            sandboxes: [] as string[],
+            time: { created: Date.now(), updated: Date.now() },
+          }
+      const result: Info = {
+        ...existing,
+        id: projectID,
+        worktree:
+          projectID === ProjectV2.ID.global || isChat ? worktree : AbsolutePath.make(FSUtil.resolve(existing.worktree)),
+        name: isChat ? CHAT_PROJECT_NAME : existing.name,
+        vcs: data.vcs?.type ?? fakeVcs,
+        sandboxes: [...existing.sandboxes],
+      }
+      if (
+        projectID !== ProjectV2.ID.global &&
+        data.directory !== result.worktree &&
+        !result.sandboxes.includes(data.directory)
+      )
+        result.sandboxes.push(data.directory)
+      result.sandboxes = yield* Effect.forEach(
+        result.sandboxes,
+        (sandbox) =>
+          fs.exists(sandbox).pipe(
+            Effect.orDie,
+            Effect.map((exists) => (exists ? sandbox : undefined)),
+          ),
+        { concurrency: 8 },
+      ).pipe(Effect.map((sandboxes) => sandboxes.filter((sandbox): sandbox is string => sandbox !== undefined)))
+      return result
     })
 
     const discover = Effect.fn("Project.discover")(function* (input: Info) {
@@ -359,9 +464,7 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       const now = Date.now()
       const changed = !existing || existing.worktree !== root || existing.name !== CHAT_PROJECT_NAME
-      const directoryRecorded = changed
-        ? false
-        : yield* projectDirectories.contains({ projectID, directory: root })
+      const directoryRecorded = changed ? false : yield* projectDirectories.contains({ projectID, directory: root })
 
       const row = changed
         ? yield* db
@@ -520,6 +623,7 @@ const layer = Layer.effect(
     return Service.of({
       init,
       fromDirectory,
+      currentForDirectory,
       discover,
       list,
       get,

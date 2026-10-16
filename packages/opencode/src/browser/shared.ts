@@ -1,6 +1,6 @@
 export * as BrowserShared from "./shared"
 
-import { BrowserError, type BrowserErrorClass } from "@opencode-ai/core/browser/host-broker"
+import { BrowserError, type BrowserErrorCertainty, type BrowserErrorClass } from "@opencode-ai/core/browser/host-broker"
 import { Schema } from "effect"
 import {
   A11yNode,
@@ -383,7 +383,7 @@ export const ERROR_MESSAGE: Record<Schema.Schema.Type<typeof BrowserErrorTag>, s
     "This session has no browser tab. Call browser_open to create a tab for this session.",
   BrowserGuestCrashed: "The browser guest crashed. Call browser_open to recreate it.",
   BrowserControlInterrupted:
-    "Browser control was interrupted (the user took over, a newer host connection superseded this one, or the operation was aborted). Re-snapshot and retry.",
+    "Browser control was interrupted (the user took over, a newer host connection superseded this one, or the operation was aborted). A mutating operation may already have executed: inspect browser state (snapshot/status) before replaying it.",
   BrowserInvalidSelector:
     "The locator could not be parsed. Rewrite the selector (valid CSS, XPath, or a supported locator type).",
   BrowserTargetNotFound:
@@ -408,8 +408,26 @@ export const ERROR_MESSAGE: Record<Schema.Schema.Type<typeof BrowserErrorTag>, s
  * Map a decoded `BrokerResponse` error arm (or a broker-detected failure) onto
  * a typed `BrowserErrorClass` with model-facing prose.
  */
-export function toBrowserError(error: { tag: Schema.Schema.Type<typeof BrowserErrorTag>; message: string; retryable: boolean; details?: unknown }): BrowserErrorClass {
+export function toBrowserError(error: {
+  tag: Schema.Schema.Type<typeof BrowserErrorTag>
+  message: string
+  retryable: boolean
+  details?: unknown
+  certainty?: BrowserErrorCertainty
+}): BrowserErrorClass {
   return BrowserError.make(error.tag, error)
+}
+
+/**
+ * Did the broker lose the outcome of an envelope it had already handed to the
+ * host (transport loss/timeout, supersession, or mid-flight abort)?
+ *
+ * Certainty is a verified property of where the failure happened, so it is read
+ * from the payload field — never inferred from message text. Mutating callers
+ * must not treat such a failure as safely repeatable; read-only callers may.
+ */
+export function isDispatchedUnconfirmed(error: BrowserErrorClass): boolean {
+  return error.certainty === "dispatched_unconfirmed"
 }
 
 /**

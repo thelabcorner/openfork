@@ -5,9 +5,13 @@ import { Session } from "@/session/session"
 import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
+import type { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
 import { partSearchText } from "@opencode-ai/core/session/search-text"
+import { contextPartFacts } from "@opencode-ai/core/session/context-part-facts"
+import { SessionToolRecall } from "@opencode-ai/core/session/tool-recall"
+import { SessionLegacyToolIndex } from "@opencode-ai/core/session/legacy-tool-index"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ShareNext } from "@/share/share-next"
 import { EOL } from "os"
@@ -18,6 +22,44 @@ import type { InstanceContext } from "@/project/instance-context"
 
 const decodeMessageInfo = Schema.decodeUnknownSync(SessionV1.Info)
 const decodePart = Schema.decodeUnknownSync(SessionV1.Part)
+
+/**
+ * One imported V1 Part plus its search/tool projections commit together.
+ * The caller supplies the destination session: an untrusted exported
+ * sessionID never becomes the new durable owner by accident.
+ */
+export function importPartProjection(
+  db: Database.Interface["db"],
+  partInfo: SessionV1.Part,
+  sessionID: SessionSchema.ID,
+  timeCreated: number,
+) {
+  const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
+  return db.transaction((tx) => Effect.gen(function* () {
+    const inserted = yield* tx.insert(PartTable).values({
+      id: partId,
+      message_id: messageID,
+      session_id: sessionID,
+      time_created: timeCreated,
+      data: partData,
+      context_compaction: partInfo.type === "compaction",
+      context_opaque: false,
+      ...contextPartFacts(partInfo),
+      tool_identity_version: SessionLegacyToolIndex.VERSION,
+      search_text: partSearchText(partInfo),
+    }).onConflictDoNothing().returning({ id: PartTable.id }).get().pipe(Effect.orDie)
+    if (!inserted) return false
+    if (partInfo.type === "tool") {
+      yield* SessionLegacyToolIndex.project(
+        tx, { ...partInfo, sessionID },
+      ).pipe(Effect.orDie)
+      yield* SessionToolRecall.projectV1Part(
+        tx, { ...partInfo, sessionID }, timeCreated,
+      ).pipe(Effect.orDie)
+    }
+    return true
+  }))
+}
 
 /** Discriminated union returned by the ShareNext API (GET /api/shares/:id/data) */
 export type ShareData =
@@ -245,26 +287,19 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
         id,
         session_id: row.id,
         time_created: msgInfo.time?.created ?? Date.now(),
-        data: msgData as never,
+          data: msgData as never,
+          // Imported messages are already decoded V1 records. Write the same
+          // compatibility fact as the live projector instead of forcing every
+          // imported transcript through the historical JSON fallback.
+          context_summary: msgInfo.role === "assistant" && msgInfo.summary === true,
+          context_opaque: false,
       })
       .onConflictDoNothing()
       .run()
       .pipe(Effect.orDie)
 
     for (const partInfo of decoded.parts) {
-      const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
-      yield* db
-        .insert(PartTable)
-        .values({
-          id: partId,
-          message_id: messageID,
-          session_id: row.id,
-          data: partData,
-          search_text: partSearchText(partInfo),
-        })
-        .onConflictDoNothing()
-        .run()
-        .pipe(Effect.orDie)
+      yield* importPartProjection(db, partInfo, row.id, msgInfo.time?.created ?? Date.now()).pipe(Effect.orDie)
     }
   }
 

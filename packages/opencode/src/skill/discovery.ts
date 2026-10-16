@@ -1,12 +1,13 @@
+import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { httpClient, path } from "@opencode-ai/core/effect/app-node-platform"
-import { NodePath } from "@effect/platform-node"
-import { Effect, Layer, Path, Schema, Context } from "effect"
-import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
+import { Effect, Layer, Schema, Context } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { LEGACY_SKILL_VERSION_FILENAME, SKILL_VERSION_FILENAME } from "@opencode-ai/core/storage-identity"
+import { SkillPathSafety } from "@opencode-ai/core/skill/path-safety"
 
 const skillConcurrency = 4
 const fileConcurrency = 8
@@ -27,11 +28,10 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SkillDiscovery") {}
 
-const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient.HttpClient> = Layer.effect(
+const layer: Layer.Layer<Service, never, FSUtil.Service | HttpClient.HttpClient> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
-    const path = yield* Path.Path
     const http = HttpClient.filterStatusOk(withTransientReadRetry(yield* HttpClient.HttpClient))
     const cache = path.join(Global.Path.cache, "skills")
 
@@ -48,9 +48,16 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
     })
 
     const pull = Effect.fn("Discovery.pull")(function* (url: string) {
-      const base = url.endsWith("/") ? url : `${url}/`
-      const index = new URL("index.json", base).href
-      const host = base.slice(0, -1)
+      // A configured source URL is untrusted input too. Canonicalize it before
+      // it is used to build a cache namespace or an index request, and reject
+      // a non-http(s) or unparseable value instead of letting `new URL` throw.
+      const base = SkillPathSafety.canonicalSourceUrl(url)
+      if (!base) {
+        yield* Effect.logWarning("invalid skill source url", { url })
+        return []
+      }
+      const source = new URL(base)
+      const index = new URL("index.json", source).href
 
       yield* Effect.logInfo("fetching index", { url: index })
 
@@ -65,6 +72,11 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
 
       if (!data) return []
 
+      // Namespace the cache per source so two catalogs can never share a
+      // directory, overwrite each other's staged swaps, or address each other's
+      // cached skills by name.
+      const sourceRoot = path.resolve(cache, SkillPathSafety.sourceNamespace(base))
+
       const missing = data.skills.filter((skill) => !skill.files.includes("SKILL.md"))
       yield* Effect.forEach(
         missing,
@@ -77,7 +89,38 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
         list,
         (skill) =>
           Effect.gen(function* () {
-            const root = path.join(cache, skill.name)
+            // Remote-controlled skill name -> filesystem directory. Validated
+            // and containment-proved before it can become a write target, so a
+            // traversing or absolute name can never escape the cache namespace.
+            const root = SkillPathSafety.resolveSkillRoot(sourceRoot, skill.name)
+            if (!root) {
+              yield* Effect.logWarning("rejected unsafe skill name", { url: index, skill: skill.name })
+              return null
+            }
+
+            const skillBase = new URL(`${encodeURIComponent(skill.name)}/`, source).href
+            const token = crypto.randomUUID()
+            const staging = `${root}.tmp-${token}`
+            const backup = `${root}.old-${token}`
+
+            // Every remote-controlled file entry must resolve to BOTH a
+            // same-origin URL and a contained destination under the live root
+            // and the staging root. One unsafe entry rejects the whole skill
+            // instead of writing the safe entries and quietly dropping the
+            // unsafe one.
+            const files = skill.files.map((file) => {
+              const resource = SkillPathSafety.resolveResourceUrl(source, skillBase, file)
+              const destination = SkillPathSafety.resolveSkillFile(root, file)
+              const staged = SkillPathSafety.resolveContained(staging, file)
+              if (!resource || !destination || !staged) return undefined
+              return { url: resource.href, destination, staged }
+            })
+            if (files.some((file) => file === undefined)) {
+              yield* Effect.logWarning("rejected unsafe skill files", { url: index, skill: skill.name })
+              return null
+            }
+            const planned = files as { url: string; destination: string; staged: string }[]
+
             const versionFile = path.join(root, SKILL_VERSION_FILENAME)
             const legacyVersionFile = path.join(root, LEGACY_SKILL_VERSION_FILENAME)
             const version = skill.version
@@ -100,21 +143,15 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                   })
 
             if (version === undefined || current === version) {
-              yield* Effect.forEach(
-                skill.files,
-                (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(root, file)),
-                { concurrency: fileConcurrency, discard: true },
-              )
+              yield* Effect.forEach(planned, (file) => download(file.url, file.destination), {
+                concurrency: fileConcurrency,
+                discard: true,
+              })
             } else {
-              const token = crypto.randomUUID()
-              const staging = `${root}.tmp-${token}`
-              const backup = `${root}.old-${token}`
               yield* Effect.gen(function* () {
-                const downloaded = yield* Effect.forEach(
-                  skill.files,
-                  (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(staging, file)),
-                  { concurrency: fileConcurrency },
-                )
+                const downloaded = yield* Effect.forEach(planned, (file) => download(file.url, file.staged), {
+                  concurrency: fileConcurrency,
+                })
                 if (!downloaded.every(Boolean)) return
                 if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) return
                 yield* fs.writeFileString(path.join(staging, SKILL_VERSION_FILENAME), version)
@@ -150,6 +187,6 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node, path, httpClient] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node, httpClient] })
 
 export * as Discovery from "./discovery"
