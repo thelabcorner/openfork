@@ -15,6 +15,11 @@ import { OxpSchema } from "./schema"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
 const NonEmptyText = Schema.String.check(Schema.isMinLength(1))
+const ExactSelection = Schema.Union([
+  Schema.Struct({ mode: Schema.Literal("one"), atLine: PositiveInt }),
+  Schema.Struct({ mode: Schema.Literal("selected"), atLines: Schema.Array(PositiveInt).check(Schema.isMinLength(1), Schema.isMaxLength(128)) }),
+  Schema.Struct({ mode: Schema.Literal("all"), expectedMatches: Schema.optionalKey(PositiveInt) }),
+])
 
 const BatchOp = Schema.Union([
   Schema.Struct({
@@ -49,7 +54,7 @@ const Target = Schema.Struct({
 })
 
 function recoverableMissingContent(input: RuntimeInput) {
-  if ("oldString" in input && input.oldString === "") {
+  if ("oldString" in input && input.oldString === "" && input.selection === undefined) {
     return { content: input.newString, reason: "empty oldString creation intent" }
   }
   if ("appendFile" in input && input.appendFile === true) {
@@ -66,6 +71,7 @@ const ExactEdit = Schema.Struct({
   oldString: Schema.String,
   newString: Schema.String,
   replaceAll: Schema.optionalKey(Schema.Boolean),
+  selection: Schema.optionalKey(ExactSelection),
 })
 
 const FullContent = Schema.Struct({
@@ -172,6 +178,7 @@ export const Parameters = Schema.Struct({
   oldString: Schema.optionalKey(Schema.String),
   newString: Schema.optionalKey(Schema.String),
   replaceAll: Schema.optionalKey(Schema.Boolean),
+  selection: Schema.optionalKey(ExactSelection),
   edits: Schema.optionalKey(Schema.Array(BatchOp).check(Schema.isMinLength(1), Schema.isMaxLength(128))),
   line: Schema.optionalKey(PositiveInt),
   startLine: Schema.optionalKey(PositiveInt),
@@ -209,7 +216,7 @@ const transportStrategy = (
 export const TransportStrategyConstraints = Object.freeze({
   oneOf: Object.freeze([
     transportStrategy(["path", "rootID", "content"], ["path", "content"]),
-    transportStrategy(["path", "rootID", "oldString", "newString", "replaceAll"], ["path", "oldString", "newString"]),
+    transportStrategy(["path", "rootID", "oldString", "newString", "replaceAll", "selection"], ["path", "oldString", "newString"]),
     transportStrategy(["path", "rootID", "edits"], ["path", "edits"]),
     transportStrategy(["path", "rootID", "line", "oldText", "newText"], ["path", "line", "oldText", "newText"]),
     transportStrategy(["path", "rootID", "startLine", "endLine", "oldText", "newText"], ["path", "startLine", "endLine", "oldText", "newText"]),

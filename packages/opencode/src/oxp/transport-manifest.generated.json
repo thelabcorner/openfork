@@ -1,0 +1,4380 @@
+{
+  "generator": "oxp-transport-manifest-v1",
+  "majorVersion": 0,
+  "fingerprint": "b9fefeb3b8223adb4902adf831071f4a6d839e3d1a419cfef66c7326fb68956d",
+  "instructions": "OXP serves the current ChatGPT/OpenAI agent; no backing OpenFork Session; no implicit ChatGPT workspace. Roots bound authority.\nFirst call openfork_info(action=status, sessionTitle=this conversation's title). Prefer direct tools for work; for brokered tools use capability.list to discover, capability.describe to obtain the exact schema/contract, then capability.call with that contract. Discovery never grants authority. Never blindly retry a write with an unknown commit outcome.\nDelegation uses explicit valid caller selections, otherwise user-configured OXP defaults; missing required defaults fail closed. Defaults are preferences, not allowlists.\nDefault model/agent changes require explicit user request; never change them autonomously.\nFile mutations: write creates/replaces whole files; edit handles surgical changes; compatible create/missing-file shapes self-heal through atomic write semantics; patch handles verified multi-file changes. process remains general-purpose.\nUse openfork_worker model_catalog for provider/model/variant discovery and agent_catalog for agents. If the direct worker schema is stale, capability describe/call the live contract.\nOn the first openfork_info action=status, pass sessionTitle set to this conversation's own title (not the repo or root). Status re-checks it on later calls; a different value updates the session title.\nDelegated worker wait/result may return blocked with native request IDs. Resolve each blocker via openfork_request using blockedBy[].sessionID, then wait again. externalDirectory=true is reject-only. Without request supervision, preserve/report the block; never auto-answer or restart it.\nDo not infer worker staleness from quiet messages, unchanged updatedAt, or elapsed time; native permission/question Deferreds can pause workers. Use wait/result before replacing or cancelling.\nUpstream may reject model-authored authentication before OXP receives it. For OpenAI Files call openai_files directly; OXP owns the OpenAI connection. Never read secrets or build auth in process.\nCode Mode is brokered: capability describe code, then capability call code with action search/describe/run. Every generated leaf retains its own authority.\nParent 25m; delegate. capability.list lazy; openfork_info capabilities complete. OXP_INTERNAL errors include incident IDs; query openfork_diagnostics by incidentID if openfork_info fails.",
+  "tools": [
+    {
+      "name": "read",
+      "title": "Read workspace files",
+      "description": "Read files and text windows in approved roots. Single media reads return image/audio or sampled video; batch media returns handles. No implicit edit grounding.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offset": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "read",
+                  "tail",
+                  "grep",
+                  "outline",
+                  "around"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pattern": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "symbol": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reads": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "rootID": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                          "maxLength": 36
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "offset": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 10000000
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "limit": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 10000
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "path"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1,
+                "maxItems": 8
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "offset": {},
+              "limit": {},
+              "action": {
+                "enum": [
+                  "read",
+                  "tail",
+                  "grep",
+                  "outline",
+                  "around"
+                ]
+              },
+              "pattern": {},
+              "symbol": {}
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "action": {
+                "const": "read"
+              },
+              "reads": {}
+            },
+            "required": [
+              "reads"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Reading workspace…",
+        "openai/toolInvocation/invoked": "Workspace read"
+      }
+    },
+    {
+      "name": "edit",
+      "title": "Edit workspace text",
+      "description": "Surgically edit text. For create/full-replace, pass content here or prefer write; missing-file empty-oldString, prepend, and append shapes self-heal through atomic write.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "content": {
+            "type": "string"
+          },
+          "oldString": {
+            "type": "string"
+          },
+          "newString": {
+            "type": "string"
+          },
+          "replaceAll": {
+            "type": "boolean"
+          },
+          "selection": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "one"
+                    ]
+                  },
+                  "atLine": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "mode",
+                  "atLine"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "selected"
+                    ]
+                  },
+                  "atLines": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "minItems": 1,
+                    "maxItems": 128
+                  }
+                },
+                "required": [
+                  "mode",
+                  "atLines"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "all"
+                    ]
+                  },
+                  "expectedMatches": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "mode"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "edits": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "line": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "newText": {
+                      "type": "string"
+                    },
+                    "oldText": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "line",
+                    "newText",
+                    "oldText"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "startLine": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "endLine": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "newText": {
+                      "type": "string"
+                    },
+                    "oldText": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "startLine",
+                    "endLine",
+                    "newText",
+                    "oldText"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "startLine": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "endLine": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "oldText": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "delete": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    }
+                  },
+                  "required": [
+                    "startLine",
+                    "endLine",
+                    "oldText",
+                    "delete"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "oldString": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "newString": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "oldString",
+                    "newString"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 128
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "startLine": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "endLine": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "oldText": {
+            "type": "string",
+            "minLength": 1
+          },
+          "newText": {
+            "type": "string"
+          },
+          "delete": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "insertAt": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "insertAfter": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "appendFile": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "nearText": {
+            "type": "string",
+            "minLength": 1
+          },
+          "occurrence": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "content": {}
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "oldString": {},
+              "newString": {},
+              "replaceAll": {},
+              "selection": {}
+            },
+            "required": [
+              "path",
+              "oldString",
+              "newString"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "edits": {}
+            },
+            "required": [
+              "path",
+              "edits"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "line": {},
+              "oldText": {},
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "line",
+              "oldText",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "startLine": {},
+              "endLine": {},
+              "oldText": {},
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "startLine",
+              "endLine",
+              "oldText",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "startLine": {},
+              "endLine": {},
+              "oldText": {},
+              "delete": {}
+            },
+            "required": [
+              "path",
+              "startLine",
+              "endLine",
+              "oldText",
+              "delete"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "insertAt": {
+                "const": 0
+              },
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "insertAt",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "insertAt": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "oldText": {},
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "insertAt",
+              "oldText",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "insertAfter": {},
+              "oldText": {},
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "insertAfter",
+              "oldText",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "appendFile": {
+                "const": true
+              },
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "appendFile",
+              "newText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "path": {},
+              "rootID": {},
+              "nearText": {},
+              "occurrence": {},
+              "oldText": {},
+              "newText": {}
+            },
+            "required": [
+              "path",
+              "nearText",
+              "oldText",
+              "newText"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Editing file…",
+        "openai/toolInvocation/invoked": "File edited"
+      }
+    },
+    {
+      "name": "write",
+      "title": "Create or replace workspace file",
+      "description": "Create or fully replace text files atomically. Prefer for exact Markdown/code/config content; edit.content is a compatible self-healing route.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "path": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "runTypecheck": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rootID",
+          "path",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Writing file…",
+        "openai/toolInvocation/invoked": "File written"
+      }
+    },
+    {
+      "name": "git",
+      "title": "Use Git",
+      "description": "Typed Git inspection plus guarded stage/restore/commit. For a parent approved root, pass workdir to select the nested repository. Prefer over raw shell Git.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "workdir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "help",
+                  "status",
+                  "summary",
+                  "diff",
+                  "log",
+                  "show",
+                  "stage",
+                  "unstage",
+                  "restore",
+                  "commit",
+                  "shell"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "paths": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 500
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "staged": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 2000,
+                "maximum": 500000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxCount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contextLines": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 200
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dryRun": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirm": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "STAGE_ALL",
+                  "UNSTAGE_ALL",
+                  "RESTORE_WORKTREE",
+                  "RESTORE_BOTH",
+                  "RESTORE_ALL",
+                  "COMMIT"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "allowEmpty": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sign": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "restoreTarget": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "worktree",
+                  "staged",
+                  "both"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "argv": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 80
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rootID"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "help"
+              }
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "status"
+              },
+              "paths": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "summary"
+              },
+              "paths": {},
+              "maxBytes": {},
+              "maxCount": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "diff"
+              },
+              "paths": {},
+              "ref": {},
+              "staged": {},
+              "maxBytes": {},
+              "contextLines": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "log"
+              },
+              "ref": {},
+              "maxBytes": {},
+              "maxCount": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "show"
+              },
+              "paths": {},
+              "ref": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode",
+              "ref"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "stage"
+              },
+              "paths": {},
+              "confirm": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "unstage"
+              },
+              "paths": {},
+              "confirm": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "restore"
+              },
+              "paths": {},
+              "confirm": {},
+              "restoreTarget": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "commit"
+              },
+              "message": {},
+              "dryRun": {},
+              "confirm": {},
+              "allowEmpty": {},
+              "sign": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode",
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "workdir": {},
+              "mode": {
+                "const": "shell"
+              },
+              "argv": {},
+              "maxBytes": {}
+            },
+            "required": [
+              "rootID",
+              "mode",
+              "argv"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Running Git…",
+        "openai/toolInvocation/invoked": "Git complete"
+      }
+    },
+    {
+      "name": "patch",
+      "title": "Patch workspace files",
+      "description": "Plan/apply verified multi-file patches. Default if-clean preserves safe/already-satisfied files and reports conflicts for targeted retry; apply:true stays atomic.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "patchText": {
+            "type": "string"
+          },
+          "format": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "opencode",
+                  "git"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "apply": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "string",
+                    "enum": [
+                      "if-clean"
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "showDiff": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rootID",
+          "patchText"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Applying patch…",
+        "openai/toolInvocation/invoked": "Patch complete"
+      }
+    },
+    {
+      "name": "find",
+      "title": "Find workspace content",
+      "description": "Find files by glob or bounded text search inside approved roots. Literal by default; use offset/limit metadata for resumable pages or opt into regex.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "glob": {
+            "type": "string",
+            "minLength": 1
+          },
+          "grep": {
+            "type": "string",
+            "minLength": 1
+          },
+          "include": {
+            "type": "string"
+          },
+          "syntax": {
+            "type": "string",
+            "enum": [
+              "literal",
+              "regex"
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "path": {},
+              "glob": {},
+              "offset": {},
+              "limit": {}
+            },
+            "required": [
+              "glob"
+            ],
+            "anyOf": [
+              {
+                "required": [
+                  "rootID"
+                ]
+              },
+              {
+                "required": [
+                  "path"
+                ]
+              }
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rootID": {},
+              "path": {},
+              "grep": {},
+              "glob": {},
+              "include": {},
+              "syntax": {},
+              "offset": {},
+              "limit": {}
+            },
+            "required": [
+              "grep"
+            ],
+            "anyOf": [
+              {
+                "required": [
+                  "rootID"
+                ]
+              },
+              {
+                "required": [
+                  "path"
+                ]
+              }
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Searching workspace…",
+        "openai/toolInvocation/invoked": "Search complete"
+      }
+    },
+    {
+      "name": "process",
+      "title": "Run workspace process",
+      "description": "Run commands; process remains unrestricted. Start via argv/command; use opaque handle (never PID) for lifecycle. Upstream may reject model-authored authentication before OXP.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "start",
+              "list",
+              "status",
+              "poll",
+              "write",
+              "wait",
+              "kill",
+              "remove"
+            ]
+          },
+          "rootID": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "maxLength": 36
+          },
+          "workdir": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 262144
+          },
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 262144
+            },
+            "minItems": 1,
+            "maxItems": 128
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "foreground",
+              "background"
+            ]
+          },
+          "shell": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "yieldMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 30000
+          },
+          "handle": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^proc_[A-Za-z0-9_-]+$"
+          },
+          "chars": {
+            "type": "string",
+            "maxLength": 262144
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 3600000
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 262144
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Running process…",
+        "openai/toolInvocation/invoked": "Process complete"
+      }
+    },
+    {
+      "name": "openai_files",
+      "title": "Use OpenAI Files",
+      "description": "List/get/upload/download OpenAI Files through OXP's trusted OpenAI connection and approved-root paths.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "get",
+              "upload",
+              "download"
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fileID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "assistants",
+                  "batch",
+                  "fine-tune",
+                  "vision",
+                  "user_data",
+                  "evals"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "list"
+              },
+              "purpose": {},
+              "limit": {},
+              "after": {}
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "get"
+              },
+              "fileID": {}
+            },
+            "required": [
+              "action",
+              "fileID"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "upload"
+              },
+              "rootID": {},
+              "path": {},
+              "purpose": {}
+            },
+            "required": [
+              "action",
+              "rootID",
+              "path"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "download"
+              },
+              "rootID": {},
+              "path": {},
+              "fileID": {}
+            },
+            "required": [
+              "action",
+              "rootID",
+              "path",
+              "fileID"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Using OpenAI Files…",
+        "openai/toolInvocation/invoked": "Files operation complete"
+      }
+    },
+    {
+      "name": "capability",
+      "title": "Use OpenFork capability",
+      "description": "Discover/call OpenFork/MCP tools. On describe, focusAction selects one operation; guidanceMode=full restores all parameter help. Code Mode: describe code, then call code. Use direct tools for authenticated work.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "describe",
+              "call"
+            ]
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "openfork",
+                  "mcp"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "capability": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "focusAction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guidanceMode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "compact",
+                  "balanced",
+                  "full"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "query": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "load": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "lazy",
+                  "all"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contract": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "args": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_file": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "download_url": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16384
+                  },
+                  "file_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "mime_type": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 1024
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "file_name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 1024
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "download_url",
+                  "file_id"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Using capability…",
+        "openai/toolInvocation/invoked": "Capability complete",
+        "openai/fileParams": [
+          "source_file"
+        ]
+      }
+    },
+    {
+      "name": "openfork_info",
+      "title": "Inspect OpenFork OXP",
+      "description": "Call status first with sessionTitle (this conversation's own title); it identifies the logical session. Status: roots, grants, schema fingerprint, recent incidents. Read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "status",
+              "capabilities",
+              "diagnostics"
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "incidentID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|[fF]{8}-[fF]{4}-[fF]{4}-[fF]{4}-[fF]{12})$",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sessionTitle": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Inspecting OpenFork…",
+        "openai/toolInvocation/invoked": "OpenFork status ready"
+      }
+    },
+    {
+      "name": "openfork_diagnostics",
+      "title": "Inspect OXP internal errors",
+      "description": "Read recent sanitized OXP internal-error incidents by incident ID. Uses only in-memory diagnostics and the authenticated OXP connection; it does not load workspace state or OXP configuration.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "incidentID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|[fF]{8}-[fF]{4}-[fF]{4}-[fF]{4}-[fF]{12})$",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Reading OXP diagnostics…",
+        "openai/toolInvocation/invoked": "OXP diagnostics ready"
+      }
+    },
+    {
+      "name": "openfork_session",
+      "title": "Supervise OpenFork session",
+      "description": "Session recall/control. search defaults to newest matching evidence and returns explicit event/record/retrieval-time provenance; Session updatedAt is record mutation, not guaranteed conversation activity or liveness. Newer recalled evidence normally supersedes older mutable-state claims, but live code/runtime is authoritative. Use relevance ranking for intentional historical/corroborative recall. turn waits exact turn; send queues; steer safe-boundary. send/steer admit, not execute.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "search",
+              "get",
+              "messages",
+              "children",
+              "selection",
+              "set_selection",
+              "steer",
+              "send",
+              "turn",
+              "background_subagents",
+              "todo_get",
+              "todo_set",
+              "goal",
+              "pause",
+              "resume",
+              "abort",
+              "archive",
+              "unarchive",
+              "delete"
+            ]
+          },
+          "sessionID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parentID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "search": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "roots": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "includeArchived": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ranking": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "recent",
+                  "relevance"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "beforeMessageID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Oxp.ModelSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "todos": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Todo"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "status",
+                      "progress",
+                      "add_evidence",
+                      "block",
+                      "request_verification",
+                      "claim_step",
+                      "release_step",
+                      "verify",
+                      "update",
+                      "create"
+                    ]
+                  },
+                  "expectedRevision": {
+                    "type": "number"
+                  },
+                  "criterionID": {
+                    "type": "string",
+                    "pattern": "^gcr_"
+                  },
+                  "criterionStatus": {
+                    "$ref": "#/$defs/Goal.CriterionStatus"
+                  },
+                  "stepID": {
+                    "type": "string",
+                    "pattern": "^gst_"
+                  },
+                  "stepStatus": {
+                    "$ref": "#/$defs/Goal.StepStatus"
+                  },
+                  "evidence": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "summary": {
+                        "type": "string"
+                      },
+                      "verdict": {
+                        "type": "string"
+                      },
+                      "checkpointID": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "commitSHA": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "summary"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "blocker": {
+                    "type": "string"
+                  },
+                  "verdict": {
+                    "type": "string",
+                    "enum": [
+                      "pass",
+                      "fail"
+                    ]
+                  },
+                  "title": {
+                    "type": "string"
+                  },
+                  "objective": {
+                    "type": "string"
+                  },
+                  "constraints": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "criteria": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "steps": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "title": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "title"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "start": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "action"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "$defs": {
+          "Oxp.ModelSelection": {
+            "type": "object",
+            "properties": {
+              "providerID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+              },
+              "modelID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+              },
+              "accountID": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "variant": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "routeIntent": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderRouteIntent"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "providerID",
+              "modelID"
+            ],
+            "additionalProperties": false
+          },
+          "Todo": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "content",
+              "status",
+              "priority"
+            ],
+            "additionalProperties": false
+          },
+          "Goal.CriterionStatus": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "passed",
+              "failed"
+            ]
+          },
+          "Goal.StepStatus": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "active",
+              "blocked",
+              "completed",
+              "cancelled"
+            ]
+          },
+          "ProviderRouteIntent": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  "strategy": {
+                    "$ref": "#/$defs/ProviderRouteIntent.Strategy"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "public"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "account"
+                    ]
+                  },
+                  "accountID": {
+                    "$ref": "#/$defs/ProviderRouteIntent.AccountID"
+                  },
+                  "pin": {
+                    "$ref": "#/$defs/ProviderRouteIntent.Pin"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "accountID"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ProviderRouteIntent.Strategy": {
+            "type": "string",
+            "enum": [
+              "adaptive",
+              "round-robin"
+            ]
+          },
+          "ProviderRouteIntent.AccountID": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "ProviderRouteIntent.Pin": {
+            "type": "string",
+            "enum": [
+              "hard",
+              "soft"
+            ]
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Supervising session…",
+        "openai/toolInvocation/invoked": "Session operation complete"
+      }
+    },
+    {
+      "name": "openfork_request",
+      "title": "Answer OpenFork request",
+      "description": "List/reply supervised Session permissions and questions. Resolve each blocked worker by sessionID, then wait again. External paths are reject-only; approved roots bound authority.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "reply_permission",
+              "answer_question",
+              "reject_question"
+            ]
+          },
+          "sessionID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requestID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reply": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "once",
+                  "always",
+                  "reject"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "answers": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 2048
+                  },
+                  "maxItems": 32
+                },
+                "maxItems": 32
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "details": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "maxItems": 32
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "list"
+              },
+              "sessionID": {},
+              "rootID": {}
+            },
+            "required": [
+              "action",
+              "sessionID"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "reply_permission"
+              },
+              "sessionID": {},
+              "rootID": {},
+              "requestID": {},
+              "reply": {},
+              "message": {}
+            },
+            "required": [
+              "action",
+              "sessionID",
+              "requestID",
+              "reply"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "answer_question"
+              },
+              "sessionID": {},
+              "rootID": {},
+              "requestID": {},
+              "answers": {},
+              "details": {}
+            },
+            "required": [
+              "action",
+              "sessionID",
+              "requestID",
+              "answers"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "action": {
+                "const": "reject_question"
+              },
+              "sessionID": {},
+              "rootID": {},
+              "requestID": {}
+            },
+            "required": [
+              "action",
+              "sessionID",
+              "requestID"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Handling request…",
+        "openai/toolInvocation/invoked": "Request handled"
+      }
+    },
+    {
+      "name": "openfork_worker",
+      "title": "Manage OpenFork worker",
+      "description": "Manage durable workers. list/get show ownership, not liveness; use result/wait for live state and blockers via openfork_request. Use model_catalog/agent_catalog for choices.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "model_policy",
+              "model_catalog",
+              "agent_catalog",
+              "set_default_model",
+              "clear_default_model",
+              "set_default_agent",
+              "clear_default_agent",
+              "start",
+              "list",
+              "get",
+              "wait",
+              "result",
+              "continue",
+              "set_selection",
+              "cancel",
+              "batch_start",
+              "batch_list",
+              "batch_get",
+              "batch_wait",
+              "batch_cancel",
+              "batch_continue"
+            ]
+          },
+          "rootID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "maxLength": 36
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workdir": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "providerID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "modelID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workerID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "batchID": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Oxp.ModelSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expectedModel": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Oxp.ModelSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "nestedDelegation": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timeoutMs": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 30000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "includeArchived": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workers": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Oxp.WorkerStart"
+                },
+                "maxItems": 16
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "continuations": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Oxp.WorkerContinue"
+                },
+                "maxItems": 16
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false,
+        "$defs": {
+          "Oxp.ModelSelection": {
+            "type": "object",
+            "properties": {
+              "providerID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+              },
+              "modelID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+              },
+              "accountID": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "variant": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "routeIntent": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderRouteIntent"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "providerID",
+              "modelID"
+            ],
+            "additionalProperties": false
+          },
+          "Oxp.WorkerStart": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "agent": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "model": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Oxp.ModelSelection"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "nestedDelegation": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "prompt"
+            ],
+            "additionalProperties": false
+          },
+          "Oxp.WorkerContinue": {
+            "type": "object",
+            "properties": {
+              "workerID": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536
+              },
+              "agent": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "model": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Oxp.ModelSelection"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "workerID",
+              "prompt"
+            ],
+            "additionalProperties": false
+          },
+          "ProviderRouteIntent": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "auto"
+                    ]
+                  },
+                  "strategy": {
+                    "$ref": "#/$defs/ProviderRouteIntent.Strategy"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "public"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "account"
+                    ]
+                  },
+                  "accountID": {
+                    "$ref": "#/$defs/ProviderRouteIntent.AccountID"
+                  },
+                  "pin": {
+                    "$ref": "#/$defs/ProviderRouteIntent.Pin"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "accountID"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "ProviderRouteIntent.Strategy": {
+            "type": "string",
+            "enum": [
+              "adaptive",
+              "round-robin"
+            ]
+          },
+          "ProviderRouteIntent.AccountID": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "ProviderRouteIntent.Pin": {
+            "type": "string",
+            "enum": [
+              "hard",
+              "soft"
+            ]
+          }
+        }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string"
+          },
+          "data": {},
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "mutation": {
+            "type": "object",
+            "properties": {
+              "attempted": {
+                "type": "boolean"
+              },
+              "committed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "attempted",
+              "committed"
+            ],
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": false
+          },
+          "oxp": {
+            "type": "object",
+            "properties": {
+              "continuity": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "continuity"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "output"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "securitySchemes": [
+        {
+          "type": "noauth"
+        }
+      ],
+      "_meta": {
+        "securitySchemes": [
+          {
+            "type": "noauth"
+          }
+        ],
+        "openai/toolInvocation/invoking": "Managing worker…",
+        "openai/toolInvocation/invoked": "Worker operation complete"
+      }
+    }
+  ],
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "output": {
+        "type": "string"
+      },
+      "data": {},
+      "attachments": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "metadata": {
+        "type": "object"
+      },
+      "mutation": {
+        "type": "object",
+        "properties": {
+          "attempted": {
+            "type": "boolean"
+          },
+          "committed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "attempted",
+          "committed"
+        ],
+        "additionalProperties": false
+      },
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "oxp": {
+        "type": "object",
+        "properties": {
+          "continuity": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "continuity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "output"
+    ],
+    "additionalProperties": false
+  },
+  "legacyOutputSchema": {
+    "type": "object",
+    "properties": {
+      "output": {
+        "type": "string"
+      },
+      "data": {},
+      "attachments": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "metadata": {
+        "type": "object"
+      },
+      "mutation": {
+        "type": "object",
+        "properties": {
+          "attempted": {
+            "type": "boolean"
+          },
+          "committed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "attempted",
+          "committed"
+        ],
+        "additionalProperties": false
+      },
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "oxp": {
+        "type": "object",
+        "properties": {
+          "continuity": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "continuity"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "additionalProperties": false
+  }
+}

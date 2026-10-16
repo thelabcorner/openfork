@@ -1,26 +1,17 @@
-import { Effect, Layer, ManagedRuntime } from "effect"
+import { Effect, ManagedRuntime } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { OxpConfig } from "./config"
-import { OxpAgentCatalog } from "./agent-catalog"
-import { OxpAgentCatalogV1 } from "./agent-catalog-v1"
-import { OxpModelCatalog } from "./model-catalog"
-import { OxpModelCatalogV1 } from "./model-catalog-v1"
+import type { OxpAgentCatalog } from "./agent-catalog"
 import { OxpError } from "./error"
 import { OxpRoot } from "./root"
 import { OxpSchema } from "./schema"
-import { OxpServer } from "./server"
-import { OxpRequestControl } from "./request-control"
-import { OxpRequestControlV1 } from "./request-control-v1"
-import { OxpSessionControl } from "./session-control"
-import { OxpSessionControlV1 } from "./session-control-v1"
-import { OxpWorkerControl } from "./worker-control"
-import { OxpWorkerControlV1 } from "./worker-control-v1"
-import { OxpMcpControl } from "./mcp-control"
-import { OxpMcpControlV1 } from "./mcp-control-v1"
-import { OxpSystemOneControl } from "./system-one-control"
-import { OxpSystemOneControlV1 } from "./system-one-control-v1"
+import { createHostOperationQueue } from "./host-operation-queue"
+import { startLeanOxpListener, type LeanEndpoint } from "./transport-listener"
+import { OxpResult } from "./result"
+import { OxpDiagnostics } from "./diagnostics"
+import { OXP_STATIC_TRANSPORT } from "./transport-manifest"
+import type { ExecutedCall } from "./transport-protocol"
 
 export interface EndpointDescriptor {
   readonly generation: number
@@ -79,42 +70,23 @@ export interface LegacyImportPlan {
 // Settings or restoring a disabled connector cannot hydrate Ripgrep/process
 // services or the capability execution graph.
 //
-// LayerNode dependencies provision a node's implementation but are not exported
-// from the compiled runtime. Host control/state paths consume Config/Root
-// directly, and the active worker-agent path also consumes AgentCatalog, so each
-// service used directly by this module must be an explicit group output.
 const idleLayer = AppNodeBuilder.build(LayerNode.group([OxpConfig.node, OxpRoot.node]))
-const activeLayer = AppNodeBuilder.build(
-  LayerNode.group([
-    CrossSpawnSpawner.node,
-    OxpConfig.node,
-    OxpRoot.node,
-    OxpAgentCatalog.node,
-    OxpModelCatalog.node,
-    OxpServer.node,
-  ]),
-  [
-    [OxpSessionControl.node, OxpSessionControlV1.layer],
-    [OxpRequestControl.node, OxpRequestControlV1.layer],
-    [OxpWorkerControl.node, OxpWorkerControlV1.layer],
-    [OxpMcpControl.node, OxpMcpControlV1.layer],
-    [OxpSystemOneControl.node, OxpSystemOneControlV1.layer],
-    [OxpAgentCatalog.node, OxpAgentCatalogV1.layer],
-    [OxpModelCatalog.node, OxpModelCatalogV1.layer],
-  ],
-)
 
 const makeIdleRuntime = () => ManagedRuntime.make(idleLayer)
-const makeActiveRuntime = () => ManagedRuntime.make(activeLayer)
 type IdleRuntime = ReturnType<typeof makeIdleRuntime>
-type ActiveRuntime = ReturnType<typeof makeActiveRuntime>
+type ActiveModule = typeof import("./active-runtime")
+type ActiveRuntime = ReturnType<ActiveModule["makeActiveRuntime"]>
 
 let idleRuntime: IdleRuntime | undefined
 let activeRuntime: ActiveRuntime | undefined
+let activeModule: ActiveModule | undefined
+let activeLoad: Promise<ActiveModule> | undefined
+let executionService: import("./server").OxpServer.Interface | undefined
+let leanEndpoint: LeanEndpoint | undefined
 let generation = 0
 let endpoint: EndpointDescriptor | undefined
 let endpointError: string | undefined
-let operation: Promise<void> = Promise.resolve()
+const hostOperations = createHostOperationQueue<TrustedState>()
 
 const EMPTY_METRICS: import("./server").OxpServer.Metrics = Object.freeze({
   calls: 0,
@@ -133,16 +105,27 @@ function getIdleRuntime(): IdleRuntime {
   return (idleRuntime ??= makeIdleRuntime())
 }
 
-function getActiveRuntime(): ActiveRuntime {
-  return (activeRuntime ??= makeActiveRuntime())
+async function getActiveRuntime(): Promise<ActiveRuntime> {
+  if (activeRuntime) return activeRuntime
+  // Only one caller initializes the active module/graph. All public host
+  // transitions run through enqueue(); this also coalesces accidental parallel
+  // internal consumers without constructing a duplicate runtime/Config cache.
+  const module = await (activeLoad ??= import("./active-runtime").catch((error) => {
+    // A failed first import must not permanently pin the host to a rejected
+    // promise. A later explicitly admitted activation may retry normally.
+    activeLoad = undefined
+    throw error
+  }))
+  activeModule = module
+  return (activeRuntime ??= module.makeActiveRuntime())
 }
 
 function runIdle<A>(effect: Effect.Effect<A, any, any>): Promise<A> {
   return getIdleRuntime().runPromise(effect as never) as Promise<A>
 }
 
-function runActive<A>(effect: Effect.Effect<A, any, any>): Promise<A> {
-  return getActiveRuntime().runPromise(effect as never) as Promise<A>
+async function runActive<A>(effect: Effect.Effect<A, any, any>): Promise<A> {
+  return (await getActiveRuntime()).runPromise(effect as never) as Promise<A>
 }
 
 function runControl<A>(effect: Effect.Effect<A, any, any>): Promise<A> {
@@ -150,32 +133,32 @@ function runControl<A>(effect: Effect.Effect<A, any, any>): Promise<A> {
 }
 
 function enqueue<A>(fn: () => Promise<A>): Promise<A> {
-  const next = operation.then(fn, fn)
-  operation = next.then(
-    () => undefined,
-    () => undefined,
-  )
-  return next
+  return hostOperations.enqueue(fn)
 }
 
 const baseStateEffect = Effect.gen(function* () {
   const config = yield* OxpConfig.Service
   const roots = yield* OxpRoot.Service
   const current = yield* config.get()
-  const projected = yield* Effect.forEach(current.roots, (root) =>
-    roots.verify(root).pipe(
-      Effect.as({ id: root.id, alias: root.alias, path: root.path, available: true, managedByProject: OxpRoot.isProjectManaged(root) } as const),
-      Effect.catch(() =>
-        Effect.succeed({ id: root.id, alias: root.alias, path: root.path, available: false, managedByProject: OxpRoot.isProjectManaged(root) } as const),
+  const projected = yield* Effect.forEach(
+    current.roots,
+    (root) =>
+      roots.verify(root).pipe(
+        Effect.as({ id: root.id, alias: root.alias, path: root.path, available: true, managedByProject: OxpRoot.isProjectManaged(root) } as const),
+        Effect.catch(() =>
+          Effect.succeed({ id: root.id, alias: root.alias, path: root.path, available: false, managedByProject: OxpRoot.isProjectManaged(root) } as const),
+        ),
       ),
-    ),
+    // Independent read-only realpath/stat checks; concurrency is bounded to
+    // avoid sequential slow-volume startup without filesystem I/O fan-out.
+    { concurrency: 4 },
   )
   return { current, projected }
 })
 
 const activeStateEffect = Effect.gen(function* () {
   const base = yield* baseStateEffect
-  const server = yield* OxpServer.Service
+  const server = yield* activeModule!.OxpServer.Service
   return { ...base, metrics: server.metrics() }
 })
 
@@ -220,7 +203,7 @@ async function stateNow(): Promise<TrustedState> {
 }
 
 export function getState(): Promise<TrustedState> {
-  return enqueue(stateNow)
+  return hostOperations.read(stateNow)
 }
 
 async function retireIdleRuntime() {
@@ -233,8 +216,81 @@ async function retireIdleRuntime() {
 async function retireActiveRuntime() {
   const active = activeRuntime
   if (!active) return
+  executionService = undefined
   activeRuntime = undefined
   await active.dispose()
+}
+
+async function ensureActiveForWorkerCatalog() {
+  const config = await runControl(OxpConfig.Service.use((service) => service.get()))
+  if (!config.enabled) {
+    throw new OxpError.AuthDenied({ detail: "Enable OXP before loading delegated-worker agents" })
+  }
+  if (activeRuntime) return
+  // Workspace agent settings are Tier-2 requests even without an MCP call.
+  // Reuse the same privileged runtime, never a separately initialized catalog.
+  await retireIdleRuntime()
+  await getActiveRuntime()
+}
+
+function admissionError(cause: unknown): ExecutedCall {
+  if (!OxpError.isError(cause)) throw cause
+  const error = OxpResult.projectError(cause)
+  const output = `${error.code}: ${error.message}`
+  return {
+    result: {
+      isError: true,
+      content: [{ type: "text", text: output }],
+      structuredContent: { output, error },
+    },
+  }
+}
+
+async function lazyExecute(
+  epoch: number,
+  name: string,
+  args: unknown,
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  signal: AbortSignal,
+): Promise<ExecutedCall> {
+  try {
+    if (signal.aborted) throw new OxpError.Cancelled({ detail: "OXP request cancelled before admission" })
+    // Cold activation is an OXP host mutation. Coalesce the first 100
+    // concurrent calls with configuration updates and stop operations so a
+    // retired listener cannot resurrect the privileged Effect owner.
+    const service = executionService ?? await enqueue(async () => {
+      if (signal.aborted) throw new OxpError.Cancelled({ detail: "OXP request cancelled during admission" })
+      if (!endpoint || endpoint.generation !== epoch) {
+        throw new OxpError.AuthRevoked({ detail: "OXP endpoint changed during execution admission" })
+      }
+      const state = await runControl(OxpConfig.Service.use((config) => config.get()))
+      if (!state.enabled) throw new OxpError.AuthRevoked({ detail: "OXP was disabled before execution admission" })
+      if (executionService) return executionService
+      // Retire the idle Config/Root cache before creating active equivalents:
+      // never let a cheap and privileged service graph claim independent
+      // authority over the same config revision.
+      await retireIdleRuntime()
+      // Service tags belong to the dynamically imported graph. Resolve it
+      // before evaluating any tag, not as an argument to runActive().
+      await getActiveRuntime()
+      const ready = await runActive(activeModule!.OxpServer.Service.use((server) => Effect.succeed(server)))
+      if (!ready.validateManifest()) {
+        throw new OxpError.DependencyUnavailable({
+          detail: "OXP static transport manifest no longer matches the executable schema; refresh the host before retrying",
+        })
+      }
+      executionService = ready
+      return ready
+    })
+    if (!endpoint || endpoint.generation !== epoch || signal.aborted) {
+      throw new OxpError.AuthRevoked({ detail: "OXP endpoint retired before execution dispatch" })
+    }
+    // Every leaf still runs its own authority and egress revalidation. This
+    // reference caches service identity, NEVER permission or root decisions.
+    return await service.execute(name, args, metadata, signal)
+  } catch (cause) {
+    return admissionError(cause)
+  }
 }
 
 async function startNow(): Promise<TrustedState> {
@@ -243,20 +299,20 @@ async function startNow(): Promise<TrustedState> {
     const current = await runControl(OxpConfig.Service.use((config) => config.get()))
     if (!current.enabled) throw new OxpError.AuthDenied({ detail: "Enable OXP before starting its endpoint" })
 
-    // There must never be two live OxpConfig caches. Commit/control work while
-    // idle uses the small runtime; activation disposes it before constructing
-    // the server runtime, whose Config instance reloads the committed disk truth.
-    if (!activeRuntime) await retireIdleRuntime()
-    const result = await runActive(
-      Effect.gen(function* () {
-        const config = yield* OxpConfig.Service
-        const server = yield* OxpServer.Service
-        const refreshed = yield* config.get()
-        if (!refreshed.enabled) return yield* new OxpError.AuthDenied({ detail: "Enable OXP before starting its endpoint" })
-        return yield* server.start()
-      }),
-    )
-    generation += 1
+    // Bind the real secret loopback MCP endpoint with only static protocol and
+    // idle Config/Root authority. The heavyweight execution runtime is loaded
+    // at the first actual tools/call, not on Connect/initialize/tools/list.
+    const nextGeneration = generation + 1
+    const result = await startLeanOxpListener({
+      execute: (name, args, meta, signal) => lazyExecute(nextGeneration, name, args, meta, signal),
+      onTransportError: (cause, phase) => OxpDiagnostics.record({
+        cause,
+        phase,
+        surfaceFingerprint: OXP_STATIC_TRANSPORT.fingerprint,
+      }).id,
+    })
+    leanEndpoint = result
+    generation = nextGeneration
     endpoint = Object.freeze({
       generation,
       url: result.url,
@@ -272,10 +328,14 @@ async function startNow(): Promise<TrustedState> {
 }
 
 async function stopNow(): Promise<TrustedState> {
-  if (activeRuntime) {
-    await runActive(OxpServer.Service.use((server) => server.stop()))
-  }
+  const listener = leanEndpoint
+  leanEndpoint = undefined
+  // Disallow new execution admissions before waiting on HTTP drain.
   endpoint = undefined
+  if (listener) await listener.stop({ forceAfterMs: 1_000 })
+  if (activeRuntime) {
+    await runActive(activeModule!.OxpServer.Service.use((server) => server.stop()))
+  }
   endpointError = undefined
   if (activeRuntime) {
     const current = await runActive(OxpConfig.Service.use((config) => config.get()))
@@ -324,16 +384,11 @@ export function setWorkerDefaultModel(
 
 export function listWorkerAgents(id: string): Promise<WorkerAgentCatalog> {
   return enqueue(async () => {
-    if (!activeRuntime) {
-      throw new OxpError.AuthDenied({
-        detail:
-          "Enable OXP before loading the workspace delegated-worker agent catalog",
-      })
-    }
+    await ensureActiveForWorkerCatalog()
     return runActive(
       Effect.gen(function* () {
         const roots = yield* OxpRoot.Service
-        const catalog = yield* OxpAgentCatalog.Service
+        const catalog = yield* activeModule!.OxpAgentCatalog.Service
         const resolved = yield* roots.resolveRoot(OxpSchema.RootID.make(id))
         const snapshot = yield* catalog.list({
           directory: resolved.canonicalPath,
@@ -356,16 +411,11 @@ export function setWorkerDefaultAgent(
   return enqueue(async () => {
     const rootID = OxpSchema.RootID.make(id)
     if (agent) {
-      if (!activeRuntime) {
-        throw new OxpError.AuthDenied({
-          detail:
-            "Enable OXP before selecting a workspace delegated-worker agent",
-        })
-      }
+      await ensureActiveForWorkerCatalog()
       await runActive(
         Effect.gen(function* () {
           const roots = yield* OxpRoot.Service
-          const catalog = yield* OxpAgentCatalog.Service
+          const catalog = yield* activeModule!.OxpAgentCatalog.Service
           const config = yield* OxpConfig.Service
           const resolved = yield* roots.resolveRoot(rootID)
           const snapshot = yield* catalog.list({
@@ -483,12 +533,16 @@ export function dispose() {
   return enqueue(async () => {
     const active = activeRuntime
     const idle = idleRuntime
-    if (!active && !idle) return
+    const listener = leanEndpoint
+    leanEndpoint = undefined
+    endpoint = undefined
+    if (!active && !idle && !listener) return
     try {
-      if (active) await active.runPromise(OxpServer.Service.use((server) => server.stop()) as never)
+      if (listener) await listener.stop({ forceAfterMs: 1_000 })
+      if (active) await active.runPromise(activeModule!.OxpServer.Service.use((server) => server.stop()) as never)
     } finally {
-      endpoint = undefined
       endpointError = undefined
+      executionService = undefined
       activeRuntime = undefined
       idleRuntime = undefined
       await Promise.all([active?.dispose(), idle?.dispose()])

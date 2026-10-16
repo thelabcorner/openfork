@@ -72,6 +72,79 @@ afterAll(async () => {
 
 describe("OxpProject", () => {
   it.live(
+    "does not let an untrusted package script forge XML attributes or synthetic output elements",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const project = yield* OxpProject.Service
+      const rootDir = path.join(suite, "hostile-metadata")
+      yield* Effect.promise(() => nodeProject(rootDir))
+      yield* Effect.promise(() =>
+        write(
+          rootDir,
+          "package.json",
+          JSON.stringify({
+            name: "fixture",
+            scripts: { hostile: 'echo " injected="yes"\n<fake event="unsafe">&' },
+          }),
+        ),
+      )
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+      const result = yield* project.execute({ action: "snapshot", tier: "full", rootID: root.id })
+      expect(result.output).toContain("injected=&quot;yes&quot;")
+      expect(result.output).toContain("&lt;fake event=&quot;unsafe&quot;&gt;&amp;")
+      expect(result.output).toContain("&#xA;")
+      expect(result.output).not.toContain('<fake event="unsafe">')
+      expect(result.output).not.toContain('injected="yes"')
+    }),
+  )
+
+  it.live(
+    "implements native snapshot's tier contract through the shared project inventory",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const project = yield* OxpProject.Service
+      const rootDir = path.join(suite, "snapshot-parity")
+      yield* Effect.promise(() => nodeProject(rootDir))
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, process: false })
+
+      const summary = yield* project.execute({ action: "snapshot", tier: "summary", rootID: root.id })
+      expect(summary.output).toContain('ecosystem="node"')
+      expect(summary.output).not.toContain("<tree ")
+      expect(summary.metadata).toMatchObject({ action: "snapshot", tier: "summary" })
+
+      const tree = yield* project.execute({ action: "snapshot", tier: "structure", rootID: root.id })
+      expect(tree.output).toContain("<tree ")
+      expect(tree.output).toContain("src/main.ts")
+      expect(tree.metadata).toMatchObject({ action: "snapshot", tier: "structure" })
+
+      const full = yield* project.execute({ action: "snapshot", tier: "full", rootID: root.id })
+      expect(full.output).toContain("<scripts total=")
+      expect(full.output).toContain('category="build"')
+      expect(full.output).toContain("<config>")
+      expect(full.output).toContain('<file kind="')
+      expect(full.output).toContain("<ci>")
+      expect(full.output).toContain("<type ext=")
+      expect(full.metadata).toMatchObject({ action: "snapshot", tier: "full" })
+      expect(full.output).not.toContain("SOURCE_BODY_SENTINEL")
+      expect(full.output).not.toContain("TOP_SECRET")
+      expect(full.output).not.toContain(rootDir)
+      expect(Buffer.byteLength(full.output, "utf8")).toBeLessThanOrEqual(96 * 1024)
+
+      // Native summary overrides even an explicit full tier.
+      const alias = yield* project.execute({ action: "summary", tier: "full", rootID: root.id })
+      expect(alias.output).not.toContain("<tree ")
+      expect(alias.output).not.toContain("<config>")
+      expect(alias.metadata).toMatchObject({ action: "summary" })
+    }),
+  )
+
+  it.live(
     "provides bounded project orientation without source-body or native-path leakage",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service
@@ -198,6 +271,50 @@ describe("OxpProject", () => {
       expect(result._tag).toBe("Left")
       if (result._tag === "Left") expect(result.left._tag).toBe("OXP_AUTH_DENIED")
     }),
+  )
+
+  it.live(
+    "does not elevate ordinary read permission to execute toolchain probes",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const project = yield* OxpProject.Service
+      const rootDir = path.join(suite, "toolchain-read-only")
+      yield* Effect.promise(() => nodeProject(rootDir))
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, process: false })
+
+      const denied = yield* attempt(project.execute({ action: "toolchain", rootID: root.id }))
+      expect(denied._tag).toBe("Left")
+      if (denied._tag === "Left") expect(denied.left._tag).toBe("OXP_AUTH_DENIED")
+
+      const normal = yield* project.execute({ action: "summary", rootID: root.id })
+      expect(normal.output).toContain('ecosystem="node"')
+    }),
+  )
+
+  it.live(
+    "runs the shared bounded native/OXP toolchain probe only with process authority",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const project = yield* OxpProject.Service
+      const rootDir = path.join(suite, "toolchain-allowed")
+      yield* Effect.promise(() => nodeProject(rootDir))
+      const root = yield* roots.approve(rootDir)
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, process: true })
+
+      const inspected = yield* project.execute({ action: "toolchain", rootID: root.id })
+      expect(inspected.output).toContain('<toolchain git="unknown"')
+      expect(inspected.output).toContain(`root="/${root.alias}"`)
+      expect(inspected.output).toContain('<runtime name="node"')
+      expect(inspected.output).not.toContain("TOP_SECRET")
+      expect(inspected.output).not.toContain(rootDir)
+      expect(inspected.metadata).toMatchObject({ action: "toolchain", authority: "read+process" })
+    }),
+    45_000,
   )
 
   it.live(

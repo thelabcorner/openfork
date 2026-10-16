@@ -4,9 +4,12 @@ import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { SessionV2 } from "@opencode-ai/core/session"
 import type { SwarmV2 } from "@opencode-ai/core/swarm"
+import { SwarmSchema } from "@opencode-ai/core/swarm/schema"
 import { Swarm as SwarmModel } from "@opencode-ai/schema/swarm"
 import { InstanceState } from "@/effect/instance-state"
 import { SwarmCommand } from "@/swarm/command"
+import { SwarmTaskBatch } from "@/swarm/task-batch"
+import { SwarmCreationKey } from "@/swarm/creation-key"
 import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { Parameters as NativeParameters } from "@/tool/swarm"
 import { OxpAuthority } from "./authority"
@@ -37,6 +40,7 @@ export const use = serviceUse(Service)
 
 const READ_ACTIONS = new Set<Input["action"]>([
   "list",
+  "creation.lookup",
   "get",
   "summary",
   "task.runs",
@@ -44,6 +48,7 @@ const READ_ACTIONS = new Set<Input["action"]>([
   "blackboard.get",
   "claim.list",
   "deliverable.list",
+  "recover.effects",
 ])
 
 function required(value: string | undefined, name: string) {
@@ -62,8 +67,20 @@ function executionError(error: unknown, rootPath: string, virtualRoot: string, s
   if (OxpError.isError(error)) return error
   const raw = error instanceof Error ? error.message : "OpenFork Swarm operation failed"
   const detail = raw.split(rootPath).join(virtualRoot)
-  if (/not found|does not exist/i.test(detail)) return new OxpError.NotFound({ detail })
-  if (/conflict|stale|already exists/i.test(detail)) return new OxpError.Conflict({ detail })
+  const tag =
+    error && typeof error === "object" && "_tag" in error && typeof (error as { _tag?: unknown })._tag === "string"
+      ? (error as { _tag: string })._tag
+      : undefined
+  if (tag === "Swarm.NotFoundError" || /not found|does not exist/i.test(detail))
+    return new OxpError.NotFound({ detail })
+  if (
+    tag === "Swarm.ConflictError" ||
+    tag === "Swarm.StaleRevisionError" ||
+    tag === "Swarm.StaleFenceError" ||
+    tag === "Swarm.InvalidTransitionError" ||
+    /conflict|stale|already exists/i.test(detail)
+  )
+    return new OxpError.Conflict({ detail })
   return new OxpError.InvalidArgument({ detail })
 }
 
@@ -76,6 +93,22 @@ const layer = Layer.effect(
 
     const executeRaw = Effect.fn("OxpSwarm.execute")(function* (input: Input, signal?: AbortSignal) {
       if (signal?.aborted) return yield* new OxpError.Cancelled({ detail: "OXP Swarm operation was cancelled" })
+      // Native force is a separately approved Session permission. An external
+      // connector neither owns that Session principal nor inherits its grants.
+      // Reject the parameters explicitly rather than silently ignoring them.
+      if (input.force !== undefined || input.sourceSwarmId !== undefined)
+        return yield* new OxpError.InvalidArgument({
+          detail: "force/sourceSwarmId are native Session-only privileges; OXP Swarm uses connector-owned coordinator authority.",
+        })
+      // admin.* recovery exists for the local operator when no coordinator
+      // Session can act. An OXP connector-owned coordinator already holds the
+      // stronger coordinator authority, so it uses recover.* and never needs
+      // (or gets) the operator-permission shortcut.
+      if (input.action.startsWith("admin."))
+        return yield* new OxpError.InvalidArgument({
+          detail:
+            "admin.* recovery actions are local-operator surfaces. An OXP connector-owned coordinator uses recover.effects, recover.contain, recover.session, and task.review instead.",
+        })
       const readOnly = READ_ACTIONS.has(input.action)
       const admission = yield* authority.authorize({
         plane: "delegation",
@@ -114,11 +147,17 @@ const layer = Layer.effect(
             { SwarmV2: RuntimeSwarm },
             { SwarmMemberSessionWake: RuntimeMemberWake },
             { SwarmProfilePreflight: RuntimeProfilePreflight },
+            { SwarmContainment: RuntimeContainment },
+            { SwarmTaskRetirement: RuntimeTaskRetirement },
+            { SwarmDispatcher: RuntimeDispatcher },
             { Project: RuntimeProject },
           ] = await Promise.all([
             import("@opencode-ai/core/swarm"),
             import("@/swarm/member-session-wake"),
             import("@/swarm/profile-preflight"),
+            import("@/swarm/containment"),
+            import("@/swarm/task-retirement"),
+            import("@/swarm/dispatcher"),
             import("@/project/project"),
           ])
           return Effect.gen(function* () {
@@ -165,11 +204,28 @@ const layer = Layer.effect(
               })).filter((row) => contained(root.canonicalPath, row.directory))
               return { title: "OpenFork Swarms", value: rows, metadata: { count: rows.length }, mutating: false }
             }
+            if (params.action === "creation.lookup") {
+              const workspaceID = yield* InstanceState.workspaceID
+              const found = yield* SwarmCreationKey.lookup(swarms, {
+                requestKey: params.requestKey,
+                projectID,
+                ...(workspaceID === undefined ? {} : { workspaceID }),
+                directory: root.canonicalPath,
+                coordinatorCapabilities: { tags: [ownerTag] },
+              })
+              return {
+                title: found.found ? "Creation found (" + found.status + ")" : "No creation under this key",
+                value: found,
+                metadata: { swarmId: found.swarmId, status: found.found ? found.status : "not_found" },
+                mutating: false,
+              }
+            }
 
             if (params.action === "delegate") {
               yield* commit()
               const workspaceID = yield* InstanceState.workspaceID
-              const created = yield* SwarmCommand.delegate(swarms, profilePreflight, {
+               const created = yield* SwarmCommand.delegatePartial(swarms, profilePreflight, {
+                ...(params.requestKey === undefined ? {} : { requestKey: params.requestKey }),
                 projectID,
                 ...(workspaceID === undefined ? {} : { workspaceID }),
                 directory: root.canonicalPath,
@@ -177,13 +233,18 @@ const layer = Layer.effect(
                 coordinatorName: params.coordinatorName?.trim() || "oxp-coordinator",
                 coordinatorRole: params.coordinatorRole?.trim() || "external coordinator",
                 coordinatorCapabilities: { tags: [ownerTag] },
+                beforeWrite: () => commit().pipe(Effect.mapError(() =>
+                  new SwarmSchema.ConflictError({
+                    code: "swarm.delegate_authority_changed",
+                    reason: "The connector's grant changed during Swarm creation. Earlier writes may exist; use creation.lookup to reconcile.",
+                  }))),
                 members: params.members ?? [],
                 tasks: params.tasks ?? [],
               })
               return {
                 title: "Created Swarm " + created.swarm.name,
                 value: created,
-                metadata: { swarmId: created.swarm.id, memberId: created.coordinator.id, count: created.members.length, status: created.swarm.status },
+                 metadata: { swarmId: created.swarm.id, memberId: created.coordinator.id, count: created.members.length, failedCount: created.admission.failures.length, status: created.admission.complete ? created.swarm.status : "partial" },
                 mutating: true,
               }
             }
@@ -230,6 +291,24 @@ const layer = Layer.effect(
               })
               return { title: "Added Swarm member " + value.name, value, metadata: { swarmId: swarmID, memberId: value.id, status: value.lifecycle }, mutating: true }
             }
+            if (params.action === "member.batch") {
+              yield* coordinator(swarmID)
+              if (!params.members?.length)
+                return yield* Effect.fail(new Error("member.batch requires at least one worker"))
+              if (params.members.length > 8)
+                return yield* Effect.fail(new Error("member.batch accepts up to 8 workers; split larger requests into verifiable stages"))
+              const receipt = yield* SwarmCommand.addMembersPartial(swarms, profilePreflight, {
+                swarmID,
+                members: params.members,
+                beforeWrite: commit,
+              })
+              return {
+                title: `Swarm members: ${receipt.created} created, ${receipt.satisfied} satisfied, ${receipt.failed} failed`,
+                value: receipt,
+                metadata: { swarmId: swarmID, count: receipt.created, failedCount: receipt.failed, status: receipt.failed ? "partial" : "complete" },
+                mutating: receipt.created > 0,
+              }
+            }
             if (params.action === "member.stop" || params.action === "member.resume") {
               const { detail } = yield* coordinator(swarmID)
               const memberID = SwarmModel.MemberID.make(required(params.memberId, "memberId"))
@@ -247,6 +326,20 @@ const layer = Layer.effect(
                 expectedLifecycle: current.lifecycle,
                 lifecycle,
               })
+              // OXP enters the native runtime lazily. Materialize and wake the
+              // durable owner explicitly so a lifecycle mutation cannot depend
+              // on an already-instantiated in-memory EventV2 subscriber.
+              //
+              // The wakes carry no authority: retirement/dispatch re-read
+              // durable Swarm state and enforce the ordinary generation/binding
+              // fences before doing any work.
+              if (lifecycle === "stopped") {
+                const retirement = yield* RuntimeTaskRetirement.Service
+                yield* retirement.poke()
+              } else {
+                const dispatcher = yield* RuntimeDispatcher.Service
+                yield* dispatcher.poke()
+              }
               return { title: "Swarm member " + lifecycle, value, metadata: { swarmId: swarmID, memberId: value.id, status: value.lifecycle }, mutating: true }
             }
             if (params.action === "task.create") {
@@ -266,6 +359,7 @@ const layer = Layer.effect(
               yield* commit()
               const value = yield* swarms.createTask({
                 swarmID,
+                allowedStatuses: ["active", "paused"],
                 title: required(params.title, "title"),
                 ...(params.description === undefined ? {} : { description: params.description }),
                 ...(params.priority === undefined ? {} : { priority: params.priority }),
@@ -276,6 +370,24 @@ const layer = Layer.effect(
                 dependencies,
               })
               return { title: "Created Swarm task " + value.title, value, metadata: { swarmId: swarmID, taskId: value.id, status: value.status }, mutating: true }
+            }
+            if (params.action === "task.batch") {
+              const { member } = yield* coordinator(swarmID)
+              if (!params.tasks?.length || params.tasks.length > 8)
+                return yield* Effect.fail(new Error("task.batch requires 1-8 tasks; split larger requests into dependency-safe stages"))
+              const receipt = yield* SwarmTaskBatch.add(swarms, {
+                swarmID, createdByMemberID: member.id, tasks: params.tasks,
+                beforeWrite: () => coordinator(swarmID).pipe(Effect.flatMap(() => commit())),
+              })
+              return {
+                title: `Swarm tasks: ${receipt.created} created, ${receipt.satisfied} satisfied, ${receipt.failed} failed`,
+                value: receipt,
+                metadata: {
+                  swarmId: swarmID, count: receipt.created, failedCount: receipt.failed,
+                  status: receipt.failed ? "partial" : "complete",
+                },
+                mutating: receipt.created > 0,
+              }
             }
             if (params.action === "task.dependencies") {
               yield* coordinator(swarmID)
@@ -342,6 +454,33 @@ const layer = Layer.effect(
                   : { type: "failed", failureKind: params.failureKind!, ...(params.detail === undefined ? {} : { detail: params.detail }) },
               })
               return { title: "Settled Swarm task", value, metadata: { swarmId: swarmID, memberId: owned.member.id, taskId: value.task.id, status: value.task.status }, mutating: true }
+            }
+            if (params.action === "task.review") {
+              const { member } = yield* coordinator(swarmID)
+              const type = required(params.decision, "decision") as
+                | "accept"
+                | "request_changes"
+                | "retry"
+                | "fail"
+                | "cancel"
+              const decision =
+                type === "accept"
+                  ? ({ type } as const)
+                  : ({ type, ...(params.detail === undefined ? {} : { detail: params.detail }) } as const)
+              yield* commit()
+              const value = yield* swarms.reviewTask({
+                swarmID,
+                taskID: SwarmModel.TaskID.make(required(params.taskId, "taskId")),
+                reviewerMemberID: member.id,
+                expectedLeaseGeneration: params.expectedLeaseGeneration!,
+                decision,
+              })
+              return {
+                title: "Reviewed Swarm task",
+                value,
+                metadata: { swarmId: swarmID, taskId: value.id, memberId: member.id, status: value.status },
+                mutating: true,
+              }
             }
             if (params.action === "message.list") {
               yield* scopedDetail(swarmID)
@@ -472,6 +611,75 @@ const layer = Layer.effect(
                 },
                 metadata: { swarmId: swarmID, count: unresolved.length, status: requested ? "requested" : "runtime_unavailable" },
                 mutating: requested,
+              }
+            }
+            if (params.action === "recover.effects") {
+              yield* coordinator(swarmID)
+              const containment = yield* RuntimeContainment.Service
+              const pending = yield* containment.unresolved({ limit: params.limit ?? 32, swarmID })
+              const value = pending.map((entry) => ({
+                taskId: entry.taskID,
+                leaseGeneration: entry.leaseGeneration,
+                sessionId: entry.sessionID,
+                sessionGeneration: entry.sessionGeneration,
+                retireReason: entry.retireReason,
+                hazards: entry.hazards,
+                hasRecoveringOwner: true,
+              }))
+              return {
+                title: value.length === 0 ? "No unresolved external effects" : `Unresolved external effects (${value.length})`,
+                value,
+                metadata: {
+                  swarmId: swarmID,
+                  count: value.length,
+                  status: value.length === 0 ? "clear" : "blocked",
+                },
+                mutating: false,
+              }
+            }
+            if (params.action === "recover.session") {
+              yield* coordinator(swarmID)
+              const containment = yield* RuntimeContainment.Service
+              yield* commit()
+              const value = yield* containment.acknowledgeSession({ swarmID, memberID: SwarmModel.MemberID.make(required(params.memberId, "memberId")) })
+              return { title: "Session recovery " + value.state, value, metadata: { swarmId: swarmID, status: value.state }, mutating: value.state === "contained" || value.state === "task-owned" }
+            }
+            if (params.action === "recover.contain") {
+              yield* coordinator(swarmID)
+              const containment = yield* RuntimeContainment.Service
+              const taskID = SwarmModel.TaskID.make(required(params.taskId, "taskId"))
+              const leaseGeneration = params.leaseGeneration!
+              const pending = (yield* containment.unresolved({ limit: 1, swarmID, taskID })).find(
+                (entry) => entry.leaseGeneration === leaseGeneration,
+              )
+              if (!pending)
+                return yield* Effect.fail(
+                  new Error(
+                    `No unresolved external effect for task ${taskID} at lease generation ${leaseGeneration} in Swarm ${swarmID}. Run recover.effects first.`,
+                  ),
+                )
+              yield* commit()
+              const acknowledged = yield* containment.acknowledge({ taskID, generation: leaseGeneration })
+              if (acknowledged.state !== "contained")
+                return yield* Effect.fail(
+                  new Error(
+                    `Containment was not acknowledged for task ${taskID} (${acknowledged.state}). The execution fence is unchanged and the task stays fenced.`,
+                  ),
+                )
+              const parked = (yield* swarms.get(swarmID)).tasks.find((task) => task.id === taskID)
+              const value = {
+                taskId: taskID,
+                leaseGeneration,
+                sealed: acknowledged.sealed,
+                outcome: "unknown" as const,
+                taskStatus: parked?.status,
+                nextAction: "task.review" as const,
+              }
+              return {
+                title: `Task ${taskID} contained; awaiting review`,
+                value,
+                metadata: { swarmId: swarmID, taskId: taskID, status: parked?.status },
+                mutating: true,
               }
             }
             return yield* Effect.fail(new Error("Unhandled Swarm action: " + params.action))

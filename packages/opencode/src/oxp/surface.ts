@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto"
+import { canonicalTransportJson } from "./transport-canonical"
 import { Schema } from "effect"
 import type { Tool } from "@modelcontextprotocol/server"
 import { OxpCapability } from "./capability"
+
 import { OxpEdit } from "./edit"
 import { OxpFind } from "./find"
 import { OxpFileExchange } from "./file-exchange"
@@ -20,27 +22,39 @@ export const MAJOR_VERSION = 0
 
 export const SERVER_INSTRUCTIONS = [
   "OXP serves the current ChatGPT/OpenAI agent; no backing OpenFork Session; no implicit ChatGPT workspace. Roots bound authority.",
-  "Delegation uses explicit valid caller selections when supplied; otherwise it uses the user-configured OXP delegation defaults and fails closed if required defaults are absent. These defaults are preferences, not allowlists.",
+  "First call openfork_info(action=status, sessionTitle=this conversation's title). Prefer direct tools for work; for brokered tools use capability.list to discover, capability.describe to obtain the exact schema/contract, then capability.call with that contract. Discovery never grants authority. Never blindly retry a write with an unknown commit outcome.",
+  "Delegation uses explicit valid caller selections, otherwise user-configured OXP defaults; missing required defaults fail closed. Defaults are preferences, not allowlists.",
   "Default model/agent changes require explicit user request; never change them autonomously.",
-  "Workspace file mutation routing: prefer write for create/full replace, edit for surgical changes, and patch for structured/multi-file changes. edit.content and unambiguous missing-file edit shapes self-heal through atomic write semantics. process remains general-purpose; use mutation tools for direct file content when they express the intent more safely.",
-  "Use openfork_worker model_catalog for authoritative provider/model/variant discovery and agent_catalog for agents; never invent a separate catalog bridge. If the direct worker schema is stale, capability describe/call the exact live contract.",
-  "Delegated worker wait/result can return state=blocked with native request IDs. Resolve each blocker through openfork_request using blockedBy[].sessionID (direct blockers equal workerID), then wait again. externalDirectory=true is reject-only over OXP. If request supervision is not granted, preserve/report the blocked worker; never auto-answer or cancel/restart it merely to make progress.",
-  "Never infer that a delegated worker is stale, exhausted, or 'no longer advancing' from quiet messages, unchanged updatedAt, or elapsed wall time alone. A worker may be paused inside a native permission/question Deferred. Use wait/result to classify live state before replacing or cancelling it.",
-  "File mutations are self-healing: write creates/replaces whole files; edit handles surgical changes and can route explicit content or unambiguous missing-file creation shapes through write semantics; patch handles verified multi-file changes. Prefer these surfaces for direct content to avoid unnecessary shell quoting.",
+  "File mutations: write creates/replaces whole files; edit handles surgical changes; compatible create/missing-file shapes self-heal through atomic write semantics; patch handles verified multi-file changes. process remains general-purpose.",
+  "Use openfork_worker model_catalog for provider/model/variant discovery and agent_catalog for agents. If the direct worker schema is stale, capability describe/call the live contract.",
+  "On the first openfork_info action=status, pass sessionTitle set to this conversation's own title (not the repo or root). Status re-checks it on later calls; a different value updates the session title.",
+  "Delegated worker wait/result may return blocked with native request IDs. Resolve each blocker via openfork_request using blockedBy[].sessionID, then wait again. externalDirectory=true is reject-only. Without request supervision, preserve/report the block; never auto-answer or restart it.",
+  "Do not infer worker staleness from quiet messages, unchanged updatedAt, or elapsed time; native permission/question Deferreds can pause workers. Use wait/result before replacing or cancelling.",
   "Upstream may reject model-authored authentication before OXP receives it. For OpenAI Files call openai_files directly; OXP owns the OpenAI connection. Never read secrets or build auth in process.",
-  "Parent 25m; delegate. capability.list lazy; openfork_info capabilities complete.",
+  "Code Mode is brokered: capability describe code, then capability call code with action search/describe/run. Every generated leaf retains its own authority.",
+  "Parent 25m; delegate. capability.list lazy; openfork_info capabilities complete. OXP_INTERNAL errors include incident IDs; query openfork_diagnostics by incidentID if openfork_info fails.",
 ].join("\n")
 
 export const CapabilityParameters = OxpCapability.Parameters
 export type CapabilityInput = Schema.Schema.Type<typeof CapabilityParameters>
 
 export const InfoParameters = Schema.Struct({
-  // Advertise only executable behavior. Future catalog/status actions may be
-  // added by a versioned surface change, but must not appear in tools/list
-  // before their runtime owner exists.
-  action: Schema.Literals(["status", "capabilities"]),
+  // Keep this list aligned with the read-authorized dispatcher branches.
+  action: Schema.Literals(["status", "capabilities", "diagnostics"]),
+  limit: Schema.optional(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(20))),
+  incidentID: Schema.optional(Schema.String.check(Schema.isUUID())),
+  // Conventional handshake metadata. A bounded string at the schema layer;
+  // normalization and the blank/length policy live in the status handler so
+  // the error messages stay compact and actionable.
+  sessionTitle: Schema.optional(Schema.String.check(Schema.isMaxLength(2048))),
 })
 export type InfoInput = Schema.Schema.Type<typeof InfoParameters>
+
+export const DiagnosticsParameters = Schema.Struct({
+  limit: Schema.optional(Schema.Number.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(20))),
+  incidentID: Schema.optional(Schema.String.check(Schema.isUUID())),
+})
+export type DiagnosticsInput = Schema.Schema.Type<typeof DiagnosticsParameters>
 
 interface Definition {
   readonly name: string
@@ -191,6 +205,18 @@ export const DEFINITIONS: readonly Definition[] = Object.freeze([
     invoked: "OpenFork status ready",
   },
   {
+    name: "openfork_diagnostics",
+    title: "Inspect OXP internal errors",
+    description: OxpProse.directToolDescription("openfork_diagnostics"),
+    schema: DiagnosticsParameters,
+    readOnly: true,
+    destructive: false,
+    idempotent: true,
+    openWorld: false,
+    invoking: "Reading OXP diagnostics…",
+    invoked: "OXP diagnostics ready",
+  },
+  {
     name: "openfork_session",
     title: "Supervise OpenFork session",
     description: OxpProse.directToolDescription("openfork_session"),
@@ -292,7 +318,9 @@ export const TOOLS: readonly ChatGptTool[] = Object.freeze(
       name: definition.name,
       title: definition.title,
       description: definition.description,
-      inputSchema: OxpSchemaProjection.definitionInputSchema(definition),
+      // Always keep the *permanently advertised* direct MCP tools lean. Rich
+      // descriptions belong to on-demand capability.describe, not every turn.
+      inputSchema: OxpSchemaProjection.definitionInputSchema(definition, "compact"),
       outputSchema: OUTPUT_SCHEMA,
       annotations: {
         readOnlyHint: definition.readOnly,
@@ -314,22 +342,13 @@ export const TOOLS: readonly ChatGptTool[] = Object.freeze(
   ),
 )
 
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, item]) => item !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b))
-  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`
-}
-
 export function toolProjectionFingerprint(tools: readonly Tool[]) {
-  return createHash("sha256").update(canonical([...tools].sort((a, b) => a.name.localeCompare(b.name)))).digest("hex")
+  return createHash("sha256").update(canonicalTransportJson([...tools].sort((a, b) => a.name.localeCompare(b.name)))).digest("hex")
 }
 
 export const FINGERPRINT = createHash("sha256")
   .update(
-    canonical({
+    canonicalTransportJson({
       major: MAJOR_VERSION,
       instructions: SERVER_INSTRUCTIONS,
       tools: [...TOOLS].sort((a, b) => a.name.localeCompare(b.name)),

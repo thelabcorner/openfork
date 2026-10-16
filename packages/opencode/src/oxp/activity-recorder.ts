@@ -1,9 +1,12 @@
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivitySchema } from "@opencode-ai/core/oxp-activity/schema"
 import { RuntimeOwner } from "@opencode-ai/core/runtime-owner"
+import { retrySqliteBusyCause } from "@opencode-ai/core/database/sqlite-busy"
 import { OxpActivityIdentity } from "./activity-identity"
+import { OxpDiagnostics } from "./diagnostics"
+import { OxpSurface } from "./surface"
 import { OxpConfig } from "./config"
 import { OxpError } from "./error"
 import type { OxpResult } from "./result"
@@ -37,9 +40,45 @@ export interface Interface {
     error: OxpError.Error,
     resultContextChars?: number,
   ) => Effect.Effect<void>
+  /**
+   * Register the logical session behind one conversation: resolves the
+   * pseudonymized correlation, ensures the parent activity row exists, and
+   * stamps the human-readable title. Always total — persistence failures
+   * degrade to a diagnostic and a `persisted: false` result so the status
+   * handshake never fails because attribution failed.
+   */
+  readonly registerSession: (input: RegisterSessionInput) => Effect.Effect<RegisterSessionOutcome>
+}
+
+export interface RegisterSessionInput {
+  readonly parentCorrelation?: ParentCorrelation
+  readonly title?: string
+}
+
+export interface RegisterSessionOutcome {
+  readonly persisted: boolean
+  readonly activityID?: OxpActivitySchema.ActivityID
+  readonly created?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/OxpActivityRecorder") {}
+
+function reportFailure(cause: Cause.Cause<unknown>, input: BeginInput, activityOperation: "begin" | "settle") {
+  try {
+    const tool = OxpSurface.TOOLS.some((definition) => definition.name === input.tool) ? input.tool : undefined
+    const action = record(input.args)?.action
+    OxpDiagnostics.record({
+      cause: Cause.squash(cause),
+      phase: "activity_recording",
+      activityOperation,
+      tool,
+      action: typeof action === "string" ? action : undefined,
+      surfaceFingerprint: OxpSurface.FINGERPRINT,
+    })
+  } catch {
+    // Activity diagnostics are deliberately unable to replace tool execution.
+  }
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
@@ -99,6 +138,11 @@ const DETAIL_MAX_STRING_BYTES = 2 * 1024
 const DETAIL_MAX_DEPTH = 6
 const DETAIL_MAX_ARRAY_ITEMS = 32
 const DETAIL_MAX_OBJECT_KEYS = 64
+// Activity is optional observability, not user-visible tool execution.
+// Retry only SQLITE_BUSY/SNAPSHOT, and only the complete atomic DB operation.
+// The native busy_timeout stays short to avoid blocking Bun's event loop.
+const recordWrite = <A, E, R>(attempt: () => Effect.Effect<A, E, R>) =>
+  retrySqliteBusyCause(attempt, { maxElapsedMs: 450, delayMs: 20, maxDelayMs: 75 })
 const SECRET_KEY =
   /(?:pass(?:word)?|secret|token|api[_-]?key|authorization|cookie|credential|private[_-]?key|access[_-]?key|refresh[_-]?token)/i
 
@@ -276,6 +320,17 @@ function requestDetail(input: BeginInput): OxpActivitySchema.InvocationDetail | 
   for (const key of keys) {
     const value = args[key]
     if (value !== undefined) projected[key] = value
+  }
+  // Batch worker names are useful for an explicit activity-title refresh, but
+  // worker prompts are private conversation content and never enter this
+  // detail projection.
+  if (input.tool === "openfork_worker" && Array.isArray(args.workers)) {
+    const titles = args.workers.slice(0, 16).flatMap((entry) => {
+      const title = text(record(entry), "title", 256)
+      if (!title || /^oxp delegated worker$/i.test(title)) return []
+      return [redactInlineSecrets(title)]
+    })
+    if (titles.length > 0) projected.workerTitles = titles
   }
   if (Object.keys(projected).length === 0) return
   return invocationDetail({ args: projected })
@@ -712,12 +767,27 @@ const layer = Layer.effect(
     // Legacy/random host ids and remote/unknown owners remain running rather than
     // being rewritten from insufficient evidence.
     yield* Effect.gen(function* () {
-      for (const candidate of yield* activity.runningHostRuns()) {
-        if (candidate === hostRunID) continue
-        const ownerID = recoverableHostRun(candidate)
-        if (!ownerID) continue
-        if ((yield* runtime.proveLocalDeath(ownerID)) !== "dead") continue
-        yield* activity.interruptHostRun(candidate)
+      const candidates = yield* activity.runningHostRuns()
+      const proven = yield* Effect.forEach(
+        candidates,
+        (candidate) =>
+          Effect.gen(function* () {
+            if (candidate === hostRunID) return undefined
+            const ownerID = recoverableHostRun(candidate)
+            if (!ownerID) return undefined
+            return (yield* runtime.proveLocalDeath(ownerID)) === "dead" ? candidate : undefined
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("OXP activity host death proof failed", { cause }).pipe(Effect.as(undefined)),
+            ),
+          ),
+        // RuntimeOwner proofs are read-only and independent. Keep database
+        // interruption writes serialized so historical recovery does not create
+        // its own SQLite writer contention during OXP activation.
+        { concurrency: 4 },
+      )
+      for (const candidate of proven) {
+        if (candidate !== undefined) yield* activity.interruptHostRun(candidate)
       }
     }).pipe(Effect.catchCause((cause) => Effect.logWarning("OXP activity dead-host recovery failed", { cause })))
 
@@ -740,10 +810,53 @@ const layer = Layer.effect(
 
     const linkAll = (invocationID: OxpActivitySchema.InvocationID, links: readonly Link[]) => {
       if (links.length === 0) return Effect.void
+      // Production Core inserts an invocation's links in one atomic statement.
+      // Retain the legacy per-link fallback for partial mocked Core services in
+      // integration tests and transitional runtimes.
+      if (typeof activity.linkMany === "function") {
+        // The Core statement is capped at 64 rows to bound SQL parameters and
+        // writer hold time. Large worker batches must not silently lose all
+        // lineage because the recorder forwarded >64 links in one call.
+        // Isolate each atomic page: one busy page cannot suppress later pages.
+        return Effect.gen(function* () {
+          for (let offset = 0; offset < links.length; offset += 64) {
+            const page = links.slice(offset, offset + 64).map((link) => ({ invocationID, ...link }))
+            yield* recordWrite(() => activity.linkMany(page)).pipe(
+              Effect.catchCause((cause) => Effect.sync(() => {
+                try {
+                  OxpDiagnostics.record({
+                    cause: Cause.squash(cause),
+                    phase: "activity_recording",
+                    activityOperation: "link",
+                    surfaceFingerprint: OxpSurface.FINGERPRINT,
+                  })
+                } catch {
+                  // Optional diagnostics never replace execution or settlement.
+                }
+              })),
+            )
+          }
+        })
+      }
       return Effect.forEach(
         links,
-        (link) => activity.link({ invocationID, ...link }).pipe(Effect.catchCause(() => Effect.void)),
-        { discard: true, concurrency: "unbounded" },
+        (link) => recordWrite(() => activity.link({ invocationID, ...link })).pipe(
+          Effect.catchCause((cause) => Effect.sync(() => {
+            // Optional attribution failures never replace a tool outcome.
+            // Record only the fixed operation enum, never link refs or SQL.
+            OxpDiagnostics.record({
+              cause: Cause.squash(cause),
+              phase: "activity_recording",
+              activityOperation: "link",
+              surfaceFingerprint: OxpSurface.FINGERPRINT,
+            })
+          })),
+        ),
+        // SQLite has one writer. A single invocation's unbounded concurrent
+        // activity links only compete for that lock; ordered writes also make
+        // partial link admission predictable and avoid internal busy storms.
+        // Link failures remain optional attribution, never a tool failure.
+        { discard: true, concurrency: 1 },
       )
     }
 
@@ -757,7 +870,13 @@ const layer = Layer.effect(
       const summary = safeSummary(input)
       const detail = requestDetail(input)
       const requestChars = requestContextChars(input.args)
-      const started = yield* activity.begin({
+      const initialLinks = inputLinks(input.tool, input.args, rootAlias)
+      // The production Core owner can insert initial lineage in the same
+      // transaction as the invocation. Older/mocked services retain the
+      // per-link compatibility path rather than silently losing links.
+      const inlineLinks =
+        initialLinks.length <= 64 && activity.atomicInitialLinks === true && typeof activity.beginWithLinks === "function"
+      const beginInput = {
         correlation,
         hostRunID,
         observedEpoch: input.observedEpoch,
@@ -777,8 +896,13 @@ const layer = Layer.effect(
                 schema: BOUNDARY_CONTEXT_SCHEMA,
               },
             }),
-      })
-      yield* linkAll(started.invocationID, inputLinks(input.tool, input.args, rootAlias))
+      }
+      const started = yield* recordWrite(() =>
+        inlineLinks
+          ? activity.beginWithLinks({ ...beginInput, initialLinks })
+          : activity.begin(beginInput),
+      )
+      if (!inlineLinks) yield* linkAll(started.invocationID, initialLinks)
       return {
         activityID: started.activityID,
         invocationID: started.invocationID,
@@ -786,7 +910,14 @@ const layer = Layer.effect(
     })
 
     const begin: Interface["begin"] = (input) =>
-      beginRaw(input).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      beginRaw(input).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            reportFailure(cause, input, "begin")
+            return undefined
+          }),
+        ),
+      )
 
     const success: Interface["success"] = (handle, input, result, resultContextChars) => {
       if (!handle) return Effect.void
@@ -794,7 +925,7 @@ const layer = Layer.effect(
       const action = text(args, "action", 256)
       return Effect.gen(function* () {
         yield* linkAll(handle.invocationID, resultLinks(input.tool, action, input.args, result))
-        yield* activity.settle({
+        yield* recordWrite(() => activity.settle({
           invocationID: handle.invocationID,
           status: result.mutation?.committed ? "committed" : "success",
           mutationAttempted: result.mutation?.attempted ?? false,
@@ -809,8 +940,12 @@ const layer = Layer.effect(
                   schema: BOUNDARY_CONTEXT_SCHEMA,
                 },
               }),
-        })
-      }).pipe(Effect.catchCause(() => Effect.void))
+        }))
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => reportFailure(cause, input, "settle")),
+        ),
+      )
     }
 
     const failure: Interface["failure"] = (handle, input, error, resultContextChars) => {
@@ -818,7 +953,7 @@ const layer = Layer.effect(
       return Effect.gen(function* () {
         yield* linkAll(handle.invocationID, errorLinks(input.tool, error))
         const committed = error.metadata?.committed === true
-        yield* activity.settle({
+        yield* recordWrite(() => activity.settle({
           invocationID: handle.invocationID,
           status: status(error),
           errorCode: error._tag,
@@ -835,11 +970,42 @@ const layer = Layer.effect(
                   schema: BOUNDARY_CONTEXT_SCHEMA,
                 },
               }),
-        })
-      }).pipe(Effect.catchCause(() => Effect.void))
+        }))
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => reportFailure(cause, input, "settle")),
+        ),
+      )
     }
 
-    return Service.of({ begin, success, failure })
+    const registerSession: Interface["registerSession"] = (input) => {
+      if (!input.parentCorrelation) return Effect.succeed({ persisted: false })
+      return identity.pseudonymize(input.parentCorrelation).pipe(
+        Effect.flatMap((correlation) =>
+          recordWrite(() => activity.registerSession({ correlation, ...(input.title !== undefined ? { title: input.title } : {}) })),
+        ),
+        Effect.map((result) => ({ persisted: true, activityID: result.activityID, created: result.created })),
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            try {
+              OxpDiagnostics.record({
+                cause: Cause.squash(cause),
+                phase: "activity_recording",
+                activityOperation: "registerSession",
+                tool: "openfork_info",
+                action: "status",
+                surfaceFingerprint: OxpSurface.FINGERPRINT,
+              })
+            } catch {
+              // Attribution persistence is observability; never fail the call.
+            }
+            return { persisted: false }
+          }),
+        ),
+      )
+    }
+
+    return Service.of({ begin, success, failure, registerSession })
   }),
 )
 

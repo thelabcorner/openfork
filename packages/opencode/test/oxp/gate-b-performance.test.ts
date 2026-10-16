@@ -46,6 +46,7 @@ const noSessionControl = Layer.succeed(
     unarchive: () => Effect.die("Gate B perf must not enter Session runtime control"),
     delete: () => Effect.die("Gate B perf must not enter Session runtime control"),
     setSelection: () => Effect.die("Gate B perf must not enter Session runtime control"),
+    steer: () => Effect.die("Gate B perf must not enter Session runtime control"),
     send: () => Effect.die("Gate B perf must not enter Session runtime control"),
     turn: () => Effect.die("Gate B perf must not enter Session runtime control"),
     backgroundSubagents: () => Effect.die("Gate B perf must not enter Session runtime control"),

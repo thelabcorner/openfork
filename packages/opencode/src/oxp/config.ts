@@ -44,6 +44,7 @@ function freezeConfig(config: OxpSchema.Config): OxpSchema.Config {
     grant: {
       ...config.grant,
       automation: config.grant.automation ?? false,
+      code: config.grant.code ?? false,
     },
     // models/agents are retained only for on-disk compatibility with the old
     // selection-authorization design. Defaults remain active preferences.

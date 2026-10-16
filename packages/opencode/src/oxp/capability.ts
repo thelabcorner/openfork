@@ -23,6 +23,8 @@ import { OxpSkill } from "./skill"
 import { OxpSymbols } from "./symbols"
 import { OxpTest } from "./test"
 import { OxpTypecheck } from "./typecheck"
+import { OxpUsage } from "./usage"
+import { OxpModels } from "./models"
 import { OxpWrite } from "./write"
 import { OxpMcp } from "./mcp"
 import { OxpFileExchange } from "./file-exchange"
@@ -35,9 +37,13 @@ import { OxpSympy } from "./sympy"
 import { OxpOfxp } from "./ofxp"
 import { OxpSystemOne } from "./system-one"
 import { OxpSwarm } from "./swarm"
+import { SWARM_FOCUSED_ACTIONS, swarmArgumentDiagnostic } from "./swarm-focus"
+import { OxpCapabilitySearch } from "./capability-search"
 import { OxpSession } from "./session"
 import { OxpWorker } from "./worker"
 import { OxpProse } from "./prose"
+import { OxpCode } from "./code"
+import { ExternalCode } from "@/exchange/code"
 import { BrokerContract } from "@/tool/broker-contract"
 import { ToolExposure } from "@/tool/exposure"
 
@@ -78,6 +84,7 @@ interface Definition extends Omit<CatalogRow, "load"> {
   readonly nativeToolID?: string
   readonly schema: Schema.Top
   readonly schemaConstraints?: Readonly<Record<string, unknown>>
+  readonly focusActions?: OxpSchemaProjection.Definition["focusActions"]
   readonly execute: (
     input: unknown,
     signal?: AbortSignal,
@@ -87,13 +94,22 @@ interface Definition extends Omit<CatalogRow, "load"> {
 
 export interface Interface {
   readonly list: (query?: string, load?: ListLoad) => Effect.Effect<readonly CatalogRow[], OxpError.Error>
-  readonly describe: (id: string) => Effect.Effect<Descriptor, OxpError.Error>
+  readonly describe: (id: string, focusAction?: string, guidanceMode?: OxpSchemaProjection.GuidanceMode) => Effect.Effect<Descriptor, OxpError.Error>
   readonly call: (id: string, input: unknown, signal?: AbortSignal, context?: CallContext) => Effect.Effect<OxpResult.CapabilityResult, OxpError.Error>
   readonly execute: (input: Input, signal?: AbortSignal, context?: CallContext) => Effect.Effect<OxpResult.CapabilityResult, OxpError.Error>
 }
 
 export type Descriptor = ReturnType<typeof BrokerContract.describe> & {
   readonly capability: CatalogRow
+  readonly guidance: {
+    readonly mode: OxpSchemaProjection.GuidanceMode
+    readonly authoredDescriptions: number
+    readonly returnedDescriptions: number
+    readonly omittedDescriptions: number
+    readonly complete: boolean
+    readonly expansion?: "Describe this capability again with guidanceMode=full for all authored field descriptions."
+    readonly authoringHint?: "The selected schema has no authored field descriptions. Use the capability overview and domain documentation; requesting full does not invent missing guidance."
+  }
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/OxpCapability") {}
@@ -109,6 +125,12 @@ export const Parameters = Schema.Struct({
       "Approved root. For OpenFork calls it may be promoted into args when the described capability accepts rootID; for MCP it scopes the server.",
   }),
   capability: Schema.optional(Schema.String),
+  focusAction: Schema.optional(Schema.String).annotate({
+    description: "describe only: narrow a discriminated action/operation union to one executable branch and return its matching contract.",
+  }),
+  guidanceMode: Schema.optional(Schema.Literals(["compact", "balanced", "full"])).annotate({
+    description: "How much parameter guidance to return: balanced (default), compact (minimal), full (all authored prose). Repeat on call when not using balanced.",
+  }),
   query: Schema.optional(Schema.String),
   load: Schema.optional(Schema.Literals(["default", "lazy", "all"])).annotate({
     description: "List filter; defaults to lazy without a query and all when a query is supplied.",
@@ -127,16 +149,67 @@ function catalogRow(item: Definition): CatalogRow {
   const {
     schema: _schema,
     schemaConstraints: _schemaConstraints,
+    focusActions: _focusActions,
     execute: _execute,
     nativeToolID,
     ...row
   } = item
-  return Object.freeze({ ...row, load: ToolExposure.loadPolicy(nativeToolID ?? item.id) })
+  // list() now reuses these rows for the lifetime of one authorized runtime.
+  // Own and freeze the only nested mutable catalog field as well, so no
+  // in-process consumer can poison later discovery results or definitions.
+  return Object.freeze({
+    ...row,
+    ...(row.authorities ? { authorities: Object.freeze([...row.authorities]) } : {}),
+    load: ToolExposure.loadPolicy(nativeToolID ?? item.id),
+  })
 }
 
-function descriptorOf(item: Definition): Descriptor {
-  const inputSchema = OxpSchemaProjection.definitionInputSchema(item)
-  return {
+// Store immutable JSON snapshots, not object references: consumers/tests can
+// decorate their schema projections after describe. Such mutations must never
+// poison the trusted descriptor/contract used for subsequent calls.
+// New module/layer definitions get fresh snapshots after a runtime refresh.
+type TrustedDescriptorSnapshot = {
+  readonly json: string
+  readonly contract: string
+  readonly acceptsRootID: boolean
+}
+const descriptorCache = new WeakMap<Definition, Map<string, TrustedDescriptorSnapshot>>()
+const focusedSchemaCache = new WeakMap<Definition, Map<string, string | null>>()
+
+function focusedSchemaOf(item: Definition, action: string, mode: OxpSchemaProjection.GuidanceMode) {
+  // Focus selectors are operation names, not prompts. Bound rejected-key
+  // caching so arbitrary discovery probes cannot accumulate unbounded memory.
+  if (!/^[A-Za-z0-9_.-]{1,96}$/.test(action)) return undefined
+  const key = mode + "\u0000" + action
+  const existing = focusedSchemaCache.get(item)
+  if (existing?.has(key)) {
+    const serialized = existing.get(key)
+    return serialized ? JSON.parse(serialized) as ReturnType<typeof OxpSchemaProjection.focusedInputSchema> : undefined
+  }
+  const result = OxpSchemaProjection.focusedInputSchema(item, action, mode)
+  const entries = existing ?? new Map<string, string | null>()
+  if (entries.size >= 96) {
+    const oldest = entries.keys().next().value
+    if (oldest !== undefined) entries.delete(oldest)
+  }
+  entries.set(key, result ? JSON.stringify(result) : null)
+  if (!existing) focusedSchemaCache.set(item, entries)
+  return result
+}
+
+function descriptorOf(item: Definition, focusAction?: string, guidanceMode: OxpSchemaProjection.GuidanceMode = "balanced"): Descriptor {
+  const key = guidanceMode + "\u0000" + (focusAction ?? "")
+  const entries = descriptorCache.get(item)
+  const cached = entries?.get(key)
+  if (cached) return JSON.parse(cached.json) as Descriptor
+  const inputSchema = (focusAction ? focusedSchemaOf(item, focusAction, guidanceMode) : undefined)
+    ?? OxpSchemaProjection.definitionInputSchema(item, guidanceMode)
+  const authoredSchema = guidanceMode === "full" ? inputSchema
+    : (focusAction ? focusedSchemaOf(item, focusAction, "full") : undefined)
+      ?? OxpSchemaProjection.definitionInputSchema(item, "full")
+  const authored = OxpSchemaProjection.annotationCoverage(authoredSchema)
+  const returned = OxpSchemaProjection.annotationCoverage(inputSchema)
+  const descriptor: Descriptor = {
     ...BrokerContract.describe({
       broker: "capability",
       target: item.id,
@@ -145,7 +218,38 @@ function descriptorOf(item: Definition): Descriptor {
       schema: inputSchema,
     }),
     capability: catalogRow(item),
+    guidance: {
+      mode: guidanceMode,
+      authoredDescriptions: authored.count,
+      returnedDescriptions: returned.count,
+      omittedDescriptions: Math.max(0, authored.count - returned.count),
+      complete: authored.count === returned.count,
+      ...(authored.count > returned.count
+        ? { expansion: "Describe this capability again with guidanceMode=full for all authored field descriptions." as const }
+        : {}),
+      ...(authored.count === 0
+        ? { authoringHint: "The selected schema has no authored field descriptions. Use the capability overview and domain documentation; requesting full does not invent missing guidance." as const }
+        : {}),
+    },
   }
+  const cache = entries ?? new Map<string, TrustedDescriptorSnapshot>()
+  cache.set(key, {
+    json: JSON.stringify(descriptor),
+    contract: descriptor.contract,
+    acceptsRootID: schemaAcceptsRootID(descriptor.inputSchema),
+  })
+  if (!entries) descriptorCache.set(item, cache)
+  return descriptor
+}
+
+function descriptorProof(item: Definition, focusAction?: string, mode: OxpSchemaProjection.GuidanceMode = "balanced") {
+  const key = mode + "\u0000" + (focusAction ?? "")
+  const cached = descriptorCache.get(item)?.get(key)
+  if (cached) return cached
+  // First call still mints the exact full-schema contract. Later calls verify
+  // a primitive owner-held value, without cloning or re-hashing the schema.
+  descriptorOf(item, focusAction, mode)
+  return descriptorCache.get(item)!.get(key)!
 }
 
 function schemaAcceptsRootID(inputSchema: unknown): boolean {
@@ -161,6 +265,36 @@ function argsRecord(input: unknown): Record<string, unknown> | undefined {
   return input && typeof input === "object" && !Array.isArray(input)
     ? input as Record<string, unknown>
     : undefined
+}
+
+function normalizeRootArgs(item: Definition, args: unknown, rootID?: OxpSchema.RootID) {
+  return Effect.gen(function* () {
+    if (rootID === undefined) return { args } as const
+    if (!descriptorProof(item).acceptsRootID) {
+      return {
+        args,
+        brokerNormalized: ["ignored top-level rootID for a rootless OpenFork capability"],
+      } as const
+    }
+    const record = argsRecord(args)
+    if (!record) return { args } as const
+    const nested = record.rootID
+    if (nested !== undefined && nested !== rootID) {
+      return yield* new OxpError.InvalidArgument({
+        detail: "Conflicting rootID values were supplied at the capability broker and capability argument levels",
+      })
+    }
+    if (nested === undefined) {
+      return {
+        args: { ...record, rootID },
+        brokerNormalized: ["promoted top-level rootID into OpenFork capability arguments"],
+      } as const
+    }
+    return {
+      args,
+      brokerNormalized: ["deduplicated identical top-level rootID from OpenFork capability.call"],
+    } as const
+  })
 }
 
 const layer = Layer.effect(
@@ -181,6 +315,8 @@ const layer = Layer.effect(
     const symbols = yield* OxpSymbols.Service
     const test = yield* OxpTest.Service
     const typecheck = yield* OxpTypecheck.Service
+    const usage = yield* OxpUsage.Service
+    const models = yield* OxpModels.Service
     const write = yield* OxpWrite.Service
     const schedule = yield* OxpSchedule.Service
     const scheduleManagement = yield* OxpScheduleManagement.Service
@@ -499,9 +635,10 @@ const layer = Layer.effect(
           workspaceTier: 3,
           mutation: "write",
           schema: OxpSwarm.Parameters,
+          focusActions: SWARM_FOCUSED_ACTIONS,
           execute: (input, signal) =>
             Schema.decodeUnknownEffect(OxpSwarm.Parameters)(input, { onExcessProperty: "error" }).pipe(
-              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP Swarm arguments" })),
+              Effect.mapError(() => new OxpError.InvalidArgument({ detail: swarmArgumentDiagnostic(input) })),
               Effect.flatMap((params) => swarm.execute(params, signal)),
             ),
         },
@@ -615,6 +752,7 @@ const layer = Layer.effect(
           namespace: "openfork",
           description: OxpProse.capabilityDescription("project"),
           authority: "read",
+          authorities: ["read", "process"],
           exposure: "brokered",
           workspaceTier: 3,
           mutation: "none",
@@ -722,6 +860,44 @@ const layer = Layer.effect(
         },
       ],
       [
+        "usage",
+        {
+          id: "usage",
+          nativeToolID: "usage",
+          namespace: "openfork",
+          description: OxpProse.capabilityDescription("usage"),
+          authority: "sessionSupervision",
+          exposure: "brokered",
+          workspaceTier: 1,
+          mutation: "none",
+          schema: OxpUsage.Parameters,
+          execute: (input, signal) =>
+            Schema.decodeUnknownEffect(OxpUsage.Parameters)(input, { onExcessProperty: "error" }).pipe(
+              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "OXP usage requires action=context and an explicit sessionID" })),
+              Effect.flatMap((params) => usage.execute(params, signal)),
+            ),
+        },
+      ],
+      [
+        "models",
+        {
+          id: "models",
+          nativeToolID: "models",
+          namespace: "openfork",
+          description: OxpProse.capabilityDescription("models"),
+          authority: "read",
+          exposure: "brokered",
+          workspaceTier: 0,
+          mutation: "none",
+          schema: OxpModels.Parameters,
+          execute: (input, signal) =>
+            Schema.decodeUnknownEffect(OxpModels.Parameters)(input, { onExcessProperty: "error" }).pipe(
+              Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP models query arguments" })),
+              Effect.flatMap((params) => models.execute(params, signal)),
+            ),
+        },
+      ],
+      [
         "web",
         {
           id: "web",
@@ -814,29 +990,210 @@ const layer = Layer.effect(
       ],
     ])
 
-    const visible = Effect.fn("OxpCapability.visible")(function* () {
-      const allowed = yield* authority.discover({ plane: "augmentation", operation: "capability.list" })
-      return allowed ? [...definitions.values()] : []
+    // The native OXP definition map is built exactly once per runtime and has
+    // no dynamic registrations after Code is installed. Avoid rebuilding its
+    // stable ranking generation and local catalog on every Code discovery.
+    // External MCP inventory remains fetched/authorized per request below.
+    let codeRankingVersion: string | undefined
+    let codeLocalCatalog: readonly { ref: string; description: string }[] | undefined
+    definitions.set("code", {
+      id: "code",
+      namespace: "openfork",
+      nativeToolID: "code",
+      description: OxpCode.DESCRIPTION,
+      authority: "code",
+      exposure: "brokered",
+      workspaceTier: 3,
+      // Generated code may compose mutating leaves; leaf definitions still own
+      // exact mutation classification and authorization.
+      mutation: "write",
+      schema: OxpCode.Parameters,
+      execute: (input, signal, context) =>
+        Schema.decodeUnknownEffect(OxpCode.Parameters)(input, { onExcessProperty: "error" }).pipe(
+          Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OXP Code arguments" })),
+          Effect.flatMap((params) =>
+            Effect.gen(function* () {
+              yield* authority.authorize({
+                plane: "augmentation",
+                operation: `code.${params.action}`,
+                phase: params.action === "run" ? "control" : "discover",
+              })
+              const { rootID, ...codeInput } = params
+              let criticalLeafError: OxpError.Error | undefined
+              // Code.run may compose several authorized leaf calls. Only the
+              // final MCP result carries model-facing image/audio bytes; the
+              // interpreter retains compact handles, never inline base64.
+              const mediaContent: NonNullable<OxpResult.CapabilityResult["mediaContent"]>[number][] = []
+              let mediaBytes = 0
+              const collectMedia = (result: OxpResult.CapabilityResult) => {
+                for (const item of result.mediaContent ?? []) {
+                  if (mediaContent.length >= 4 || mediaBytes + item.data.length > 4 * 1024 * 1024) break
+                  mediaBytes += item.data.length
+                  mediaContent.push(item)
+                }
+              }
+              const preserveCriticalLeafError = <A, E extends OxpError.Error, R>(effect: Effect.Effect<A, E, R>) =>
+                effect.pipe(
+                  Effect.tapError((error) =>
+                    Effect.sync(() => {
+                      if (error._tag === "OXP_AMBIGUOUS_EXTERNAL_RESULT" && !criticalLeafError) {
+                        criticalLeafError = error
+                      }
+                    }),
+                  ),
+                )
+              const external = yield* ExternalCode.execute(codeInput, {
+                // Reuse the broker's reviewed actions as read-only retrieval
+                // hints. They remain internal: Code.search returns only refs and
+                // bounded summaries, never action maps or eagerly loaded schema.
+                rankVersion: (codeRankingVersion ??= JSON.stringify([...definitions.values()]
+                  .map((item) => [item.id, Object.keys(item.focusActions ?? {}).sort()]))),
+                rank: (items, query) => OxpCapabilitySearch.rankCapabilities(
+                  items.map((item) => ({
+                    id: item.ref,
+                    description: item.description,
+                    namespace: item.ref.startsWith("mcp:") ? "mcp" as const : "openfork" as const,
+                    focusActions: item.ref.startsWith("mcp:")
+                      ? undefined
+                      : definitions.get(item.ref)?.focusActions,
+                    item,
+                  })),
+                  query,
+                ).map(({ item }) => item),
+                list: () =>
+                  Effect.gen(function* () {
+                    const local = (codeLocalCatalog ??= [...definitions.values()]
+                      .filter((entry) => entry.id !== "code" && entry.id !== "file.transfer")
+                      .map((entry) => ({ ref: entry.id, description: entry.description })))
+                    if (!rootID) return local
+                    const mcpVisible = yield* authority.discover({
+                      plane: "augmentation",
+                      operation: "integration.mcp.list",
+                    })
+                    if (!mcpVisible) return local
+                    const remote = yield* mcp.list(rootID)
+                    return [
+                      ...local,
+                      ...remote.map((entry) => ({
+                        ref: `mcp:${entry.id}`,
+                        description: entry.description,
+                      })),
+                    ]
+                  }),
+                describe: (ref) =>
+                  Effect.gen(function* () {
+                    if (ref.startsWith("mcp:")) {
+                      if (!rootID) {
+                        return yield* new OxpError.RootRequired({
+                          detail: "OXP Code MCP capabilities require an explicit approved root",
+                        })
+                      }
+                      const descriptor = yield* mcp.describe(rootID, ref.slice(4))
+                      return {
+                        ref: `mcp:${descriptor.capability.id}`,
+                        description: descriptor.capability.description,
+                        inputSchema: descriptor.inputSchema,
+                      }
+                    }
+                    if (ref === "code" || ref === "file.transfer") {
+                      return yield* new OxpError.NotFound({ detail: `Capability is not callable from OXP Code: ${ref}` })
+                    }
+                    const target = yield* get(ref)
+                    const descriptor = descriptorOf(target)
+                    return {
+                      ref: target.id,
+                      description: target.description,
+                      inputSchema: descriptor.inputSchema,
+                    }
+                  }),
+                call: (ref, args) =>
+                  Effect.gen(function* () {
+                    if (ref.startsWith("mcp:")) {
+                      if (!rootID) {
+                        return yield* new OxpError.RootRequired({
+                          detail: "OXP Code MCP capabilities require an explicit approved root",
+                        })
+                      }
+                      const descriptor = yield* mcp.describe(rootID, ref.slice(4))
+                      const result = yield* preserveCriticalLeafError(
+                        mcp.call(
+                          rootID,
+                          descriptor.capability.id,
+                          descriptor.contract,
+                          args,
+                          signal,
+                        ),
+                      )
+                      collectMedia(result)
+                      return {
+                        value: result.structured ?? result.output,
+                        ...(result.attachments?.length ? { attachments: result.attachments } : {}),
+                        ...(result.mutation ? { mutation: result.mutation } : {}),
+                      }
+                    }
+                    if (ref === "code" || ref === "file.transfer") {
+                      return yield* new OxpError.NotFound({ detail: `Capability is not callable from OXP Code: ${ref}` })
+                    }
+                    const target = yield* get(ref)
+                    const normalized = yield* normalizeRootArgs(target, args, rootID)
+                    const result = yield* preserveCriticalLeafError(target.execute(normalized.args, signal, context))
+                    collectMedia(result)
+                    return {
+                      value: result.structured ?? result.output,
+                      ...(result.attachments?.length ? { attachments: result.attachments } : {}),
+                      ...(result.mutation ? { mutation: result.mutation } : {}),
+                    }
+                  }),
+              }).pipe(
+                Effect.mapError((error) =>
+                  error instanceof ExternalCode.InvalidRequest
+                    ? new OxpError.InvalidArgument({ detail: error.detail })
+                    : error,
+                ),
+              )
+              if (criticalLeafError) return yield* criticalLeafError
+              return {
+                title: `Code ${params.action}`,
+                output: JSON.stringify(external),
+                structured: external,
+                ...(external.action === "run" && mediaContent.length ? { mediaContent } : {}),
+                ...(external.action === "run" && external.attachments?.length
+                  ? { attachments: external.attachments }
+                  : {}),
+                metadata: {
+                  action: params.action,
+                  stateless: true,
+                  ...(rootID ? { rootID } : {}),
+                },
+                ...(external.action === "run" && external.mutation ? { mutation: external.mutation } : {}),
+              } satisfies OxpResult.CapabilityResult
+            }),
+          ),
+        ),
+    })
+
+    // Definition identity, loading policy and descriptions are immutable within
+    // this runtime. Build the no-query catalogs once, not on every tools/list
+    // discovery. Authority is deliberately NOT cached: each invocation still
+    // passes both authorization and discoverability checks.
+    const definitionsByLoad = Object.freeze({
+      all: Object.freeze([...definitions.values()]),
+      default: Object.freeze([...definitions.values()].filter((item) => ToolExposure.loadPolicy(item.nativeToolID ?? item.id) === "default")),
+      lazy: Object.freeze([...definitions.values()].filter((item) => ToolExposure.loadPolicy(item.nativeToolID ?? item.id) === "lazy")),
+    })
+    const rowsByID = new Map(definitionsByLoad.all.map((item) => [item.id, catalogRow(item)] as const))
+    const unfiltered = Object.freeze({
+      all: Object.freeze([...rowsByID.values()].sort((a, b) => a.id.localeCompare(b.id))),
+      default: Object.freeze([...rowsByID.values()].filter((row) => row.load === "default").sort((a, b) => a.id.localeCompare(b.id))),
+      lazy: Object.freeze([...rowsByID.values()].filter((row) => row.load === "lazy").sort((a, b) => a.id.localeCompare(b.id))),
     })
 
     const list = Effect.fn("OxpCapability.list")(function* (query?: string, load: ListLoad = "all") {
       yield* authority.authorize({ plane: "augmentation", operation: "capability.list", phase: "discover" })
-      const terms = query
-        ?.trim()
-        .toLowerCase()
-        .split(/[^a-z0-9]+/)
-        .filter(Boolean) ?? []
-      return (yield* visible())
-        .filter((item) => load === "all" || ToolExposure.loadPolicy(item.nativeToolID ?? item.id) === load)
-        .filter((item) => {
-          if (terms.length === 0) return true
-          const haystack = `${item.id} ${item.description}`
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, " ")
-          return terms.every((term) => haystack.includes(term))
-        })
-        .sort((a, b) => a.id.localeCompare(b.id))
-        .map(catalogRow)
+      const discoverable = yield* authority.discover({ plane: "augmentation", operation: "capability.list" })
+      if (!discoverable) return []
+      if (!query?.trim()) return unfiltered[load]
+      return OxpCapabilitySearch.rankCapabilities(definitionsByLoad[load], query).map((item) => rowsByID.get(item.id)!)
     })
 
     const get = Effect.fn("OxpCapability.get")(function* (id: string) {
@@ -845,10 +1202,15 @@ const layer = Layer.effect(
       return item
     })
 
-    const describe = Effect.fn("OxpCapability.describe")(function* (id: string) {
+    const describe = Effect.fn("OxpCapability.describe")(function* (id: string, focusAction?: string, guidanceMode: OxpSchemaProjection.GuidanceMode = "balanced") {
       yield* authority.authorize({ plane: "augmentation", operation: "capability.describe", phase: "discover" })
       const item = yield* get(id)
-      return descriptorOf(item)
+      if (focusAction && !focusedSchemaOf(item, focusAction, guidanceMode)) {
+        return yield* new OxpError.InvalidArgument({
+          detail: "focusAction requires a unique discriminated action/operation branch. Omit focusAction to inspect the complete canonical schema.",
+        })
+      }
+      return descriptorOf(item, focusAction, guidanceMode)
     })
 
     const call = Effect.fn("OxpCapability.call")(function* (
@@ -871,7 +1233,7 @@ const layer = Layer.effect(
       const namespace = input.namespace ?? "openfork"
 
       if (input.action === "list") {
-        if (input.capability !== undefined || input.args !== undefined || input.contract !== undefined || input.source_file !== undefined) {
+        if (input.capability !== undefined || input.args !== undefined || input.contract !== undefined || input.source_file !== undefined || input.focusAction !== undefined || input.guidanceMode !== undefined) {
           return yield* new OxpError.InvalidArgument({ detail: "capability, contract, args, and source_file are not valid for capability.list" })
         }
         if (namespace === "mcp") {
@@ -925,6 +1287,9 @@ const layer = Layer.effect(
           return yield* new OxpError.InvalidArgument({ detail: "contract, args, and source_file are only valid for capability.call" })
         }
         if (namespace === "mcp") {
+          if (input.focusAction !== undefined || input.guidanceMode !== undefined) {
+            return yield* new OxpError.InvalidArgument({ detail: "focusAction and guidanceMode are only supported for OpenFork capabilities" })
+          }
           if (!input.rootID) {
             return yield* new OxpError.RootRequired({
               detail: "namespace=mcp capability.describe requires rootID",
@@ -945,7 +1310,7 @@ const layer = Layer.effect(
             },
           } satisfies OxpResult.CapabilityResult
         }
-        const result = yield* describe(input.capability)
+        const result = yield* describe(input.capability, input.focusAction, input.guidanceMode)
         return {
           title: `capability ${input.capability}`,
           output: JSON.stringify(result),
@@ -958,7 +1323,13 @@ const layer = Layer.effect(
         } satisfies OxpResult.CapabilityResult
       }
 
+      if (input.focusAction !== undefined) {
+        return yield* new OxpError.InvalidArgument({ detail: "focusAction is describe-only. Call with the focused descriptor contract and the corresponding action in args." })
+      }
       if (namespace === "mcp") {
+        if (input.guidanceMode !== undefined) {
+          return yield* new OxpError.InvalidArgument({ detail: "guidanceMode is only supported for OpenFork capability.call" })
+        }
         if (input.source_file !== undefined) {
           return yield* new OxpError.InvalidArgument({ detail: "source_file is only valid for OpenFork file.transfer" })
         }
@@ -979,41 +1350,36 @@ const layer = Layer.effect(
       if (input.source_file !== undefined && item.id !== "file.transfer") {
         return yield* new OxpError.InvalidArgument({ detail: "source_file is only valid for capability=file.transfer" })
       }
-      const descriptor = descriptorOf(item)
-      const issue = BrokerContract.violation({
+      const mode = input.guidanceMode ?? "balanced"
+      let issue = BrokerContract.violationExpected({
         broker: "capability",
         target: item.id,
-        description: item.description,
-        schema: descriptor.inputSchema,
+        expected: descriptorProof(item, undefined, mode).contract,
         contract: input.contract,
         discovery: `Call capability with action="describe" and capability="${item.id}"`,
       })
-      if (issue) return yield* new OxpError.InvalidArgument({ detail: issue })
-      let args = input.source_file === undefined
-        ? input.args ?? {}
-        : { ...((input.args && typeof input.args === "object" && !Array.isArray(input.args)) ? input.args : {}), source_file: input.source_file }
-      let brokerNormalized: string[] | undefined
-      if (input.rootID !== undefined) {
-        if (schemaAcceptsRootID(descriptor.inputSchema)) {
-          const record = argsRecord(args)
-          if (record) {
-            const nested = record.rootID
-            if (nested !== undefined && nested !== input.rootID) {
-              return yield* new OxpError.InvalidArgument({
-                detail: "Conflicting rootID values were supplied at the capability broker and capability argument levels",
-              })
-            }
-            if (nested === undefined) {
-              args = { ...record, rootID: input.rootID }
-              brokerNormalized = ["promoted top-level rootID into OpenFork capability arguments"]
-            } else {
-              brokerNormalized = ["deduplicated identical top-level rootID from OpenFork capability.call"]
-            }
-          }
-        } else {
-          brokerNormalized = ["ignored top-level rootID for a rootless OpenFork capability"]
+      // A focused description proves one exact operation. Never accept that
+      // token for a *different* action; leaf validation remains authoritative.
+      if (issue) {
+        const record = argsRecord(input.args)
+        const action = record?.operation ?? record?.action
+        if (typeof action === "string" && focusedSchemaOf(item, action, mode)) {
+          issue = BrokerContract.violationExpected({
+            broker: "capability",
+            target: item.id,
+            expected: descriptorProof(item, action, mode).contract,
+            contract: input.contract,
+            discovery: `Call capability.describe with focusAction="${action}" to obtain its current focused contract`,
+          })
         }
       }
+      if (issue) return yield* new OxpError.InvalidArgument({ detail: issue })
+      let args: unknown = input.source_file === undefined
+        ? input.args ?? {}
+        : { ...((input.args && typeof input.args === "object" && !Array.isArray(input.args)) ? input.args : {}), source_file: input.source_file }
+      const normalized = yield* normalizeRootArgs(item, args, input.rootID)
+      args = normalized.args
+      const brokerNormalized = normalized.brokerNormalized
       const result = yield* call(input.capability, args, signal, context)
       return brokerNormalized
         ? {
@@ -1049,6 +1415,8 @@ export const node = makeGlobalNode({
     OxpSymbols.node,
     OxpTest.node,
     OxpTypecheck.node,
+    OxpUsage.node,
+    OxpModels.node,
     OxpWrite.node,
     OxpSchedule.node,
     OxpScheduleManagement.node,

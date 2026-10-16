@@ -2,7 +2,15 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { BrowserHostBroker, BrowserOperationFailedError } from "@opencode-ai/core/browser/host-broker"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { DEFAULT_TIMEOUT_MS, OperationInput, OperationOutput, toBrowserError, type OperationName } from "@/browser/shared"
+import {
+  DEFAULT_TIMEOUT_MS,
+  isDispatchedUnconfirmed,
+  OperationInput,
+  OperationOutput,
+  toBrowserError,
+  type OperationName,
+} from "@/browser/shared"
+import { ExchangeBrowser } from "@/exchange/browser"
 import { OxpAuthority } from "./authority"
 import { OxpError } from "./error"
 import { OxpResult } from "./result"
@@ -55,22 +63,28 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/OxpBrowser") {}
 export const use = serviceUse(Service)
 
-const VISUAL_ROOT_OPERATIONS = new Set<OperationName>([
-  "visual_capture",
-  "visual_diff",
-  "visual_record",
-  "visual_history",
-  "visual_artifact",
-])
-
-function mapBrowserError(error: BrowserHostBroker.BrowserErrorClass): OxpError.Error {
+function mapBrowserError(error: BrowserHostBroker.BrowserErrorClass, operation: OperationName): OxpError.Error {
   const projected = toBrowserError({
     tag: error._tag,
     message: error.message,
     retryable: error.retryable,
     details: error.details,
+    certainty: error.certainty,
   })
   const metadata = { browserError: projected._tag, retryable: projected.retryable }
+  // The broker lost the outcome of an envelope it had already handed to the
+  // host. A mutating operation MAY have executed, so it maps to the existing
+  // OXP ambiguous-external-result contract — which `OxpResult.projectError`
+  // already projects as `retryable: false`. Read-only operations carry no
+  // external effect and stay ordinary repeatable failures.
+  if (isDispatchedUnconfirmed(projected) && ExchangeBrowser.isMutating(operation)) {
+    return new OxpError.AmbiguousExternalResult({
+      detail:
+        `browser.${operation} was dispatched to the Desktop host but its result could not be confirmed; ` +
+        `the operation may already have changed browser state. Inspect browser state (status/snapshot) before replaying it.`,
+      metadata: { ...metadata, operation, dispatchCertainty: projected.certainty ?? "dispatched_unconfirmed" },
+    })
+  }
   switch (projected._tag) {
     case "BrowserPermissionDenied":
       return new OxpError.AuthDenied({ detail: OxpError.boundDetail(projected.message), metadata })
@@ -109,7 +123,7 @@ const layer = Layer.effect(
       signal?: AbortSignal,
     ) {
       const operation = input.operation as OperationName
-      const visualRoot = VISUAL_ROOT_OPERATIONS.has(operation)
+      const visualRoot = ExchangeBrowser.requiresRoot(operation)
       if (visualRoot && !input.rootID) {
         return yield* new OxpError.RootRequired({ detail: `browser.${operation} requires an explicit approved root` })
       }
@@ -138,15 +152,27 @@ const layer = Layer.effect(
         },
         { signal },
       )
-      if (!response.ok) return yield* mapBrowserError(BrowserHostBroker.BrowserError.fromPayload(response.error))
+      if (!response.ok) {
+        return yield* mapBrowserError(BrowserHostBroker.BrowserError.fromPayload(response.error), operation)
+      }
       yield* authority.revalidate(admission, "egress")
 
       const result = yield* Schema.decodeUnknownEffect(OperationOutput[operation] as Schema.Decoder<unknown, never>)(response.result).pipe(
         Effect.mapError(
           (cause) =>
-            new OxpError.DependencyUnavailable({
-              detail: `Desktop browser returned an invalid ${operation} result: ${String(cause)}`,
-            }),
+            // The host answered `ok`, so the operation DID run; only the payload
+            // was unreadable. For a mutating caller that is response loss, not a
+            // safely repeatable dependency failure.
+            ExchangeBrowser.isMutating(operation)
+              ? new OxpError.AmbiguousExternalResult({
+                  detail:
+                    `Desktop browser committed browser.${operation} but returned an unreadable result; ` +
+                    `inspect browser state before replaying it.`,
+                  metadata: { operation, retryable: false },
+                })
+              : new OxpError.DependencyUnavailable({
+                  detail: `Desktop browser returned an invalid ${operation} result: ${String(cause)}`,
+                }),
         ),
       )
       return {
@@ -160,7 +186,7 @@ const layer = Layer.effect(
           ...(response.snapshotAfter ? { snapshotAfter: response.snapshotAfter } : {}),
         },
         mutation: {
-          attempted: operation !== "status" && operation !== "snapshot" && operation !== "screenshot" && operation !== "query" && operation !== "visual_history" && operation !== "visual_artifact" && operation !== "react_inspect" && operation !== "extensions_list",
+          attempted: ExchangeBrowser.isMutating(operation),
           committed: response.ok,
         },
       } satisfies OxpResult.CapabilityResult

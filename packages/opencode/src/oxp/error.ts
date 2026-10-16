@@ -130,6 +130,12 @@ export class DependencyUnavailable extends Schema.TaggedErrorClass<DependencyUna
   }
 }
 
+export class Internal extends Schema.TaggedErrorClass<Internal>()("OXP_INTERNAL", fields) {
+  override get message() {
+    return this.detail
+  }
+}
+
 export class ProviderAccountUnavailable extends Schema.TaggedErrorClass<ProviderAccountUnavailable>()(
   "OXP_PROVIDER_ACCOUNT_UNAVAILABLE",
   fields,
@@ -183,6 +189,7 @@ export type Error =
   | Timeout
   | Cancelled
   | DependencyUnavailable
+  | Internal
   | ProviderAccountUnavailable
   | RouteBindingUnavailable
   | IntegrationOffline
@@ -203,6 +210,7 @@ const tags = new Set([
   "OXP_TIMEOUT",
   "OXP_CANCELLED",
   "OXP_DEPENDENCY_UNAVAILABLE",
+  "OXP_INTERNAL",
   "OXP_PROVIDER_ACCOUNT_UNAVAILABLE",
   "OXP_ROUTE_BINDING_UNAVAILABLE",
   "OXP_INTEGRATION_OFFLINE",

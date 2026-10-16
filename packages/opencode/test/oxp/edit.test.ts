@@ -33,6 +33,78 @@ beforeEach(async () => {
 afterAll(async () => fs.rm(suite, { recursive: true, force: true }))
 
 describe("OxpEdit", () => {
+  it.live("resolves repeated exact text only with deliberate source selection", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const edit = yield* OxpEdit.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ write: true })
+    const target = path.join(rootDir, "repeated.ts")
+    yield* Effect.promise(() => fs.writeFile(target, "const value = 1\nconst value = 1\n", "utf8"))
+
+    const ambiguous = yield* edit.execute({
+      rootID: root.id, path: "repeated.ts", oldString: "const value = 1", newString: "const value = 2",
+    }).pipe(Effect.flip)
+    expect(ambiguous._tag).toBe("OXP_CONFLICT")
+    expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("const value = 1\nconst value = 1\n")
+
+    const selected = yield* edit.execute({
+      rootID: root.id, path: "repeated.ts", oldString: "const value = 1", newString: "const value = 2",
+      selection: { mode: "one", atLine: 2 },
+    })
+    expect(selected.mutation).toEqual({ attempted: true, committed: true })
+    expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("const value = 1\nconst value = 2\n")
+
+    const countMismatch = yield* edit.execute({
+      rootID: root.id, path: "repeated.ts", oldString: "const value", newString: "let value",
+      selection: { mode: "all", expectedMatches: 3 },
+    }).pipe(Effect.flip)
+    expect(countMismatch._tag).toBe("OXP_CONFLICT")
+    expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("const value = 1\nconst value = 2\n")
+
+    const all = yield* edit.execute({
+      rootID: root.id, path: "repeated.ts", oldString: "const value", newString: "let value",
+      selection: { mode: "all", expectedMatches: 2 },
+    })
+    expect(all.mutation).toEqual({ attempted: true, committed: true })
+    expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("let value = 1\nlet value = 2\n")
+
+    yield* edit.execute({ rootID: root.id, path: "repeated.ts", content: "value\nvalue\nvalue\n" })
+    const subset = yield* edit.execute({
+      rootID: root.id, path: "repeated.ts", oldString: "value", newString: "selected",
+      selection: { mode: "selected", atLines: [3, 1] },
+    })
+    expect(subset.metadata?.applied).toBe(2)
+    expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("selected\nvalue\nselected\n")
+  }))
+
+  it.live("returns recoverable context for six ambiguous exact candidates within the OXP error bound", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const edit = yield* OxpEdit.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ write: true })
+    const original = Array.from({ length: 6 }, (_, i) =>
+      `before_${i}\ntarget\nafter_${i}`
+    ).join("\n") + "\n"
+    const file = path.join(rootDir, "six.txt")
+    yield* Effect.promise(() => fs.writeFile(file, original))
+    const failure = yield* edit.execute({
+      rootID: root.id, path: "six.txt", oldString: "target", newString: "updated",
+    }).pipe(Effect.flip)
+    expect(failure._tag).toBe("OXP_CONFLICT")
+    expect(failure.detail).toContain("match 2-2")
+    expect(failure.detail).toContain("match 17-17")
+    expect(failure.detail.length).toBeLessThanOrEqual(1024)
+    expect(yield* Effect.promise(() => fs.readFile(file, "utf8"))).toBe(original)
+  }))
+
   it.live("returns typed root-required for relative edits without explicit root identity", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const edit = yield* OxpEdit.Service

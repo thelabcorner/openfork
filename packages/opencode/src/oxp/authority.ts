@@ -85,6 +85,7 @@ export function classify(plane: OxpSchema.Plane, operation: string): OxpSchema.A
     return "read"
   }
   if (operation === "capability.list" || operation === "capability.describe") return "catalog"
+  if (operation === "code" || operation.startsWith("code.")) return "code"
   if (operation === "write" || operation === "edit" || operation === "patch" || operation === "memory.write" || operation === "sqlite.write" || operation === "refactor.write" || operation === "json.write" || operation === "archive.write") return "write"
   if (operation === "git" || operation.startsWith("git.")) return "git"
   if (operation === "test.run") return "process"
@@ -114,6 +115,8 @@ function grantAllows(grant: OxpSchema.Grant, authority: OxpSchema.AuthorityClass
     case "integrations":
     case "browser":
       return grant[authority]
+    case "code":
+      return grant.code ?? false
     case "automation":
       return grant.automation === true
     case "filesSend":
@@ -138,7 +141,7 @@ function requiresRoot(plane: OxpSchema.Plane, operation: string, authority: OxpS
     // selection preference, not connector-level authority.
     return true
   }
-  if (authority === "integrations" || authority === "browser") return false
+  if (authority === "integrations" || authority === "browser" || authority === "code") return false
   if (operation === "capability.list" || operation === "capability.describe" || operation.startsWith("info.")) return false
   if (operation === "runtime" || operation.startsWith("runtime.")) return false
   return true

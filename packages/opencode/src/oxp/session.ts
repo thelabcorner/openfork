@@ -40,6 +40,7 @@ export const ACTIONS = [
     "children",
     "selection",
     "set_selection",
+    "steer",
     "send",
     "turn",
     "background_subagents",
@@ -63,6 +64,7 @@ export const DIRECT_ACTIONS = [
     "children",
     "selection",
     "set_selection",
+    "steer",
     "send",
     "turn",
     "background_subagents",
@@ -101,6 +103,7 @@ export const Parameters = Schema.Struct({
   tool: Schema.optional(Schema.String.check(Schema.isMaxLength(128))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
+  ranking: Schema.optional(Schema.Literals(["recent", "relevance"])),
   beforeMessageID: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),
   model: Schema.optional(OxpSchema.ModelSelection),
   text: Schema.optional(PromptTextInput),
@@ -119,6 +122,7 @@ export const DirectParameters = Schema.Struct({
   search: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
   roots: Schema.optional(Schema.Boolean),
   includeArchived: Schema.optional(Schema.Boolean),
+  ranking: Schema.optional(Schema.Literals(["recent", "relevance"])),
   beforeMessageID: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),
   model: Schema.optional(OxpSchema.ModelSelection),
   text: Schema.optional(PromptTextInput),
@@ -171,14 +175,14 @@ const layer = Layer.effect(
     const control = yield* OxpSessionControl.Service
     const supervision = yield* OxpSupervision.Service
     const roots = yield* OxpRoot.Service
-    const { readDb } = yield* Database.Service
+    const { readDb, scanDb, withScanDb } = yield* Database.Service
 
     const requirePlane = Effect.fnUntraced(function* (operation: string) {
       const allowed = yield* authority.discover({ plane: "supervision", operation })
       if (!allowed) return yield* new OxpError.AuthDenied({ detail: "OXP Session supervision is not enabled" })
     })
 
-    const project = (row: SessionInspection.SessionRow, admission: OxpAuthority.Admission) => {
+    const project = (row: SessionInspection.SessionRow, admission: OxpAuthority.Admission, observedAt: number) => {
       const root = admission.root
       if (!root || !("path" in root)) {
         throw new OxpError.NotFound({ detail: "Session is not available to OXP supervision" })
@@ -209,7 +213,13 @@ const layer = Layer.effect(
         cost: row.cost,
         tokens: row.tokens,
         createdAt: row.createdAt,
+        createdAtIso: new Date(row.createdAt).toISOString(),
         updatedAt: row.updatedAt,
+        updatedAtIso: new Date(row.updatedAt).toISOString(),
+        updatedAtBasis: "session_record" as const,
+        updatedAgeMs: Math.max(0, observedAt - row.updatedAt),
+        observedAt,
+        observedAtIso: new Date(observedAt).toISOString(),
       }
     }
 
@@ -277,8 +287,8 @@ const layer = Layer.effect(
         const delegated = error.kind === "delegated_worker"
         return new OxpError.Conflict({
           detail: delegated
-            ? "This Session is an OXP delegated worker; use openfork_worker continue with this Session ID instead of openfork_session send/turn"
-            : `This Session is host-owned by ${error.kind}; use the producer-specific control surface instead of openfork_session send/turn`,
+            ? "This Session is an OXP delegated worker; use openfork_worker continue with this Session ID instead of openfork_session steer/send/turn"
+            : `This Session is host-owned by ${error.kind}; use the producer-specific control surface instead of openfork_session steer/send/turn`,
           metadata: {
             sessionID: error.sessionID.slice(0, 256),
             parentID: error.parentID.slice(0, 256),
@@ -334,9 +344,10 @@ const layer = Layer.effect(
     const projectSafe = Effect.fnUntraced(function* (
       row: SessionInspection.SessionRow,
       admission: OxpAuthority.Admission,
+      observedAt = Date.now(),
     ) {
       return yield* Effect.try({
-        try: () => project(row, admission),
+        try: () => project(row, admission, observedAt),
         catch: (cause) =>
           OxpError.isError(cause)
             ? cause
@@ -431,6 +442,7 @@ const layer = Layer.effect(
 
       if (input.action === "list") {
         const requested = Math.min(input.limit ?? 50, MAX_LIST)
+        const retrievedAt = Date.now()
         const rows: Array<ReturnType<typeof project>> = []
         let before: SessionInspection.ListInput["before"]
         let scanned = 0
@@ -463,11 +475,18 @@ const layer = Layer.effect(
               ),
             )
             if (!admitted.ok) continue
-            rows.push(yield* projectSafe(row, admitted.admission))
+            rows.push(yield* projectSafe(row, admitted.admission, retrievedAt))
           }
         }
 
         const result = {
+          temporal: {
+            retrievedAt,
+            retrievedAtIso: new Date(retrievedAt).toISOString(),
+            order: "session_record_updated_desc" as const,
+            updatedAtBasis: "session_record" as const,
+            note: "updatedAt is durable Session-record mutation time, not guaranteed conversation activity. Use session.search latestAt for matching conversation recency; current runtime facts require live supervision state.",
+          },
           sessions: rows,
           scanned,
           truncated: !exhausted && scanned >= MAX_SCAN,
@@ -502,8 +521,12 @@ const layer = Layer.effect(
           .flatMap((admission) => admission.root ? [admission.root] : [])
           .sort((a, b) => b.canonicalPath.length - a.canonicalPath.length)
 
-        const result = yield* ExchangeSessionSearch.execute(
-          readDb,
+        // Supervised full-text search may execute a long FTS5 plan. Never
+        // pin OXP's latency-sensitive read connection while a worker needs
+        // session.get/messages/interrupt. The dedicated worker-backed scan
+        // handle owns its own SQLite connection and admission permit.
+        const runSearch = (reader: Database.DatabaseShape) => ExchangeSessionSearch.execute(
+          reader,
           {
             ...(query ? { query } : {}),
             ...(tool ? { tool } : {}),
@@ -511,6 +534,7 @@ const layer = Layer.effect(
             ...(input.parentID ? { parentID: SessionSchema.ID.make(input.parentID) } : {}),
             ...(input.roots !== undefined ? { roots: input.roots } : {}),
             includeArchived: input.includeArchived === true,
+            ranking: input.ranking ?? "recent",
             limit: Math.min(input.limit ?? 20, MAX_LIST),
             scopeLabel: input.rootID ? "root:" + input.rootID : "approved-roots",
           },
@@ -528,6 +552,13 @@ const layer = Layer.effect(
               return roots.toVirtualPath(entry.root, directory)
             },
           },
+        )
+        // A whole search gets its own pooled read-only connection, so
+        // expensive FTS cannot monopolize the only scanner while a supervisor
+        // needs to search/cancel another worker.
+        const result = yield* (withScanDb
+          ? withScanDb(runSearch)
+          : Effect.flatMap(scanDb(), runSearch)
         ).pipe(Effect.mapError(mapSearchError))
 
         return {
@@ -568,6 +599,7 @@ const layer = Layer.effect(
       }
 
       if (input.action === "messages") {
+        const retrievedAt = Date.now()
         const page = yield* inspection.messages({
           sessionID: nativeID,
           limit: Math.min(input.limit ?? 20, MAX_MESSAGES),
@@ -577,12 +609,28 @@ const layer = Layer.effect(
           const compact = truncateUtf8(message.text, MAX_MESSAGE_TEXT_BYTES)
           return {
             ...message,
+            createdAtIso: new Date(message.createdAt).toISOString(),
+            ageMs: Math.max(0, retrievedAt - message.createdAt),
+            ...(message.completedAt === undefined
+              ? {}
+              : { completedAtIso: new Date(message.completedAt).toISOString() }),
             text: compact.text,
             truncated: message.truncated || compact.truncated,
           }
         })
+        const oldest = messages[0]
+        const newest = messages.at(-1)
         const result = {
           sessionID,
+          temporal: {
+            retrievedAt,
+            retrievedAtIso: new Date(retrievedAt).toISOString(),
+            order: "oldest_to_newest" as const,
+            pagingDirection: "toward_older_messages" as const,
+            ...(oldest ? { oldestAt: oldest.createdAt, oldestAtIso: oldest.createdAtIso } : {}),
+            ...(newest ? { newestAt: newest.createdAt, newestAtIso: newest.createdAtIso } : {}),
+            note: "createdAt is conversation event time. Later messages normally supersede older mutable-state claims unless historical context was requested; live repository/runtime state remains authoritative.",
+          },
           messages,
           more: page.more,
           ...(page.beforeMessageID ? { beforeMessageID: page.beforeMessageID } : {}),
@@ -596,6 +644,7 @@ const layer = Layer.effect(
       }
 
       if (input.action === "children") {
+        const retrievedAt = Date.now()
         const children = yield* inspection.children(nativeID, Math.min(input.limit ?? 50, MAX_LIST))
         const visible = []
         for (const child of children) {
@@ -608,9 +657,18 @@ const layer = Layer.effect(
             ),
           )
           if (!admitted.ok) continue
-          visible.push(yield* projectSafe(child, admitted.admission))
+          visible.push(yield* projectSafe(child, admitted.admission, retrievedAt))
         }
-        const result = { parentID: sessionID, sessions: visible }
+        const result = {
+          parentID: sessionID,
+          temporal: {
+            retrievedAt,
+            retrievedAtIso: new Date(retrievedAt).toISOString(),
+            order: "session_record_updated_desc" as const,
+            note: "Child rows are ordered by durable Session-record update time; updatedAt does not by itself prove runtime liveness or current task authority.",
+          },
+          sessions: visible,
+        }
         return {
           title: "OpenFork child Sessions",
           output: JSON.stringify(result),
@@ -758,7 +816,7 @@ const layer = Layer.effect(
         } satisfies OxpResult.CapabilityResult
       }
 
-      if (input.action === "send" || input.action === "turn") {
+      if (input.action === "steer" || input.action === "send" || input.action === "turn") {
         if (!input.text || input.text.trim().length === 0) {
           return yield* new OxpError.InvalidArgument({
             detail: "session." + input.action + " requires non-empty text",
@@ -769,18 +827,22 @@ const layer = Layer.effect(
           text: input.text,
           actorRef: supervision.actorRef(admitted),
         }
+        const runtimeTarget = supervision.runtimeTarget({ row: target.row, admission: admitted })
         const result = yield* (
-          input.action === "send"
-            ? control.send(supervision.runtimeTarget({ row: target.row, admission: admitted }), promptInput)
-            : control.turn(
-                supervision.runtimeTarget({ row: target.row, admission: admitted }),
-                promptInput,
-                signal,
-              )
+          input.action === "steer"
+            ? control.steer(runtimeTarget, promptInput)
+            : input.action === "send"
+              ? control.send(runtimeTarget, promptInput)
+              : control.turn(runtimeTarget, promptInput, signal)
         ).pipe(Effect.mapError((error) => mapControlError(error)))
+        const execution =
+          result.paused ? "paused" : result.resultMessageID ? "completed" : "pending"
         const structured = {
           sessionID,
           action: input.action,
+          delivery: input.action === "steer" ? "safe_boundary" : "queued_turn",
+          waited: input.action === "turn" && !result.paused,
+          execution,
           admittedMessageID: result.admittedMessageID,
           paused: result.paused,
           ...(result.resultMessageID

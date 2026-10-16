@@ -1,19 +1,26 @@
-import { Cause, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import { OxpSessionControl } from "./session-control"
 import { OxpRuntimeV1 } from "./runtime-v1"
+import { requireResumeReady } from "@/session/resume-recovery"
 
 type BasicAction = "pause" | "resume" | "abort" | "archive" | "unarchive" | "delete"
+
+type PromptWaitResult = {
+  readonly paused: boolean
+  readonly resultMessageID?: string
+}
 
 type StartedPrompt = {
   readonly admittedMessageID: string
   readonly paused: boolean
-  readonly fiber?: Fiber.Fiber<{ readonly info: { readonly id: string } }, never>
+  readonly fiber?: Fiber.Fiber<PromptWaitResult, unknown>
 }
 
 async function runtimeModules() {
   const [
     { Session },
     { SessionPrompt },
+    { SessionExecutionOwner },
     { SessionID },
     { SessionV2, SessionSchema },
     { ModelV2 },
@@ -23,12 +30,16 @@ async function runtimeModules() {
     { BackgroundJob },
      { Todo },
     { SessionTurnProvenance },
-     { CheckpointTool },
-     { GoalAgent },
-     { MessageID },
+    { SessionInput },
+    { SessionMessage },
+    { SessionMetadataOwnership },
+    { CheckpointTool },
+    { GoalAgent },
+    { MessageID },
   ] = await Promise.all([
     import("@/session/session"),
     import("@/session/prompt"),
+    import("@opencode-ai/core/session/execution-owner"),
     import("@/session/schema"),
     import("@opencode-ai/core/session"),
     import("@opencode-ai/core/model"),
@@ -36,15 +47,19 @@ async function runtimeModules() {
     import("@/provider/provider"),
     import("@/agent/agent"),
     import("@/background/job"),
-     import("@/session/todo"),
+    import("@/session/todo"),
     import("@opencode-ai/core/v1/session-turn-provenance"),
-      import("@/tool/checkpoint"),
-      import("@opencode-ai/core/goal/agent"),
-      import("@/session/schema"),
+    import("@opencode-ai/core/session/input"),
+    import("@opencode-ai/schema/session-message"),
+    import("@opencode-ai/core/session/metadata-ownership"),
+    import("@/tool/checkpoint"),
+    import("@opencode-ai/core/goal/agent"),
+    import("@/session/schema"),
   ])
   return {
     Session,
     SessionPrompt,
+    SessionExecutionOwner,
     SessionID,
     SessionV2,
     SessionSchema,
@@ -53,11 +68,14 @@ async function runtimeModules() {
     Provider,
     Agent,
     BackgroundJob,
-     Todo,
+    Todo,
     SessionTurnProvenance,
-      CheckpointTool,
-      GoalAgent,
-      MessageID,
+    SessionInput,
+    SessionMessage,
+    SessionMetadataOwnership,
+    CheckpointTool,
+    GoalAgent,
+    MessageID,
   }
 }
 
@@ -213,22 +231,69 @@ const ensurePromptSelection = (
     }
   })
 
-const startPrompt = (
-  scope: Scope.Scope,
+const assertOxpPromptable = (
+  runtime: Awaited<ReturnType<typeof runtimeModules>>,
+  session: { readonly id: string; readonly parentID?: string; readonly metadata?: Readonly<Record<string, unknown>> },
+) =>
+  Effect.gen(function* () {
+    const metadata = session.metadata
+    const specialAgent = runtime.SessionMetadataOwnership.specialAgentKind(metadata)
+    const kind =
+      specialAgent ??
+      (runtime.SessionMetadataOwnership.hasScheduledTaskOrigin(metadata)
+        ? "scheduled_task"
+        : runtime.SessionMetadataOwnership.hasWorkerDelegationOrigin(metadata)
+          ? "delegated_worker"
+          : undefined)
+    if (!kind) return
+    return yield* Effect.fail(
+      new OxpSessionControl.HostOwned(
+        String(session.id),
+        String(session.parentID ?? session.id),
+        String(kind),
+      ),
+    )
+  })
+
+const selectedExecution = (
+  runtime: Awaited<ReturnType<typeof runtimeModules>>,
+  selected: {
+    readonly agent: string
+    readonly model: {
+      readonly providerID: string
+      readonly modelID: string
+      readonly accountID?: string
+      readonly variant?: string
+    }
+  },
+) =>
+  runtime.ModelV2.Ref.make({
+    providerID: runtime.ProviderV2.ID.make(selected.model.providerID),
+    id: runtime.ModelV2.ID.make(selected.model.modelID),
+    ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
+    ...(selected.model.variant
+      ? { variant: runtime.ModelV2.VariantID.make(selected.model.variant) }
+      : {}),
+  })
+
+const startSteer = (
   target: OxpSessionControl.Target,
   input: OxpSessionControl.PromptInput,
 ) =>
-  enter<StartedPrompt>(
+  enter<OxpSessionControl.PromptResult>(
     target,
     (runtime) =>
       Effect.gen(function* () {
         const v1Sessions = yield* runtime.Session.Service
         const prompt = yield* runtime.SessionPrompt.Service
         const sessionID = runtime.SessionID.make(target.sessionID)
+        const before = yield* v1Sessions.get(sessionID)
+        yield* assertOxpPromptable(runtime, before)
+
         const selected = yield* ensurePromptSelection(runtime, target, input.actorRef)
         yield* commitGuard(target)
         const admitted = yield* prompt
-          .hostPrompt(
+          .steer(
             {
               sessionID,
               agent: selected.agent,
@@ -238,7 +303,6 @@ const startPrompt = (
                 ...(selected.model.accountID ? { accountID: selected.model.accountID } : {}),
               },
               ...(selected.model.variant ? { variant: selected.model.variant } : {}),
-              noReply: true,
               parts: [{ type: "text", text: input.text }],
             },
             {
@@ -258,26 +322,100 @@ const startPrompt = (
             ),
           )
         const current = yield* v1Sessions.get(sessionID)
-        if (current.pausedAt !== undefined) {
+        return {
+          admittedMessageID: String(admitted.info.id),
+          paused: current.pausedAt !== undefined,
+        }
+      }),
+  )
+
+const startQueuedPrompt = (
+  scope: Scope.Scope,
+  target: OxpSessionControl.Target,
+  input: OxpSessionControl.PromptInput,
+  waitForExactTurn: boolean,
+) =>
+  enter<StartedPrompt>(
+    target,
+    (runtime) =>
+      Effect.gen(function* () {
+        const v1Sessions = yield* runtime.Session.Service
+        const prompt = yield* runtime.SessionPrompt.Service
+        const sessionID = runtime.SessionID.make(target.sessionID)
+        const before = yield* v1Sessions.get(sessionID)
+        yield* assertOxpPromptable(runtime, before)
+
+        const selected = yield* ensurePromptSelection(runtime, target, input.actorRef)
+        const executionModel = selectedExecution(runtime, selected)
+        yield* commitGuard(target)
+        const admitted = yield* prompt
+          .admitSynthetic({
+            id: runtime.SessionMessage.ID.create(),
+            sessionID,
+            content: { text: input.text },
+            origin: runtime.SessionInput.SyntheticOrigin.make({
+              producer: runtime.SessionTurnProvenance.Source.OxpSupervisor,
+              actor: { type: "host" },
+              ref: input.actorRef,
+            }),
+            admissionClass: "host",
+            delivery: "queue",
+            execution: {
+              agent: selected.agent,
+              model: executionModel,
+            },
+          })
+          .pipe(
+            Effect.mapError((error) =>
+              error instanceof runtime.SessionPrompt.HostOwnedSessionError
+                ? new OxpSessionControl.HostOwned(
+                    String(error.sessionID),
+                    String(error.parentID),
+                    String(error.kind),
+                  )
+                : error,
+            ),
+          )
+
+        const admittedMessageID = String(admitted.id)
+        const current = yield* v1Sessions.get(sessionID)
+        if (current.pausedAt !== undefined || !waitForExactTurn) {
           return {
-            admittedMessageID: admitted.info.id,
-            paused: true,
+            admittedMessageID,
+            paused: current.pausedAt !== undefined,
           }
         }
 
-        const run = prompt.loop({ sessionID }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("OXP Session supervised turn failed", {
+        const exact = Effect.gen(function* () {
+          while (true) {
+            const completed = yield* v1Sessions.findMessage(
               sessionID,
-              cause: Cause.pretty(cause),
-            }).pipe(Effect.andThen(Effect.failCause(cause))),
-          ),
-        )
-        const fiber = yield* run.pipe(
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+              (message) =>
+                message.info.role === "assistant" &&
+                String(message.info.parentID) === admittedMessageID &&
+                (message.info.time.completed !== undefined || message.info.error !== undefined),
+            )
+            if (Option.isSome(completed)) {
+              return {
+                paused: false,
+                resultMessageID: String(completed.value.info.id),
+              } satisfies PromptWaitResult
+            }
+
+            const state = yield* v1Sessions.get(sessionID)
+            if (state.pausedAt !== undefined) {
+              return { paused: true } satisfies PromptWaitResult
+            }
+
+            // admitSynthetic already owns durable wake/recovery semantics. Poll
+            // only the exact assistant boundary so this waiter cannot accidentally
+            // settle on an older run or over-wait for later queued turns.
+            yield* Effect.sleep("50 millis")
+          }
+        })
+        const fiber = yield* exact.pipe(Effect.forkIn(scope, { startImmediately: true }))
         return {
-          admittedMessageID: admitted.info.id,
+          admittedMessageID,
           paused: false,
           fiber,
         }
@@ -301,8 +439,8 @@ async function waitForPrompt(
     if (Exit.isFailure(exit)) throw Cause.squash(exit.cause)
     return {
       admittedMessageID: started.admittedMessageID,
-      paused: false,
-      resultMessageID: exit.value.info.id,
+      paused: exit.value.paused,
+      ...(exit.value.resultMessageID ? { resultMessageID: exit.value.resultMessageID } : {}),
     }
   }
 
@@ -321,8 +459,8 @@ async function waitForPrompt(
     if (Exit.isFailure(exit)) throw Cause.squash(exit.cause)
     return {
       admittedMessageID: started.admittedMessageID,
-      paused: false,
-      resultMessageID: exit.value.info.id,
+      paused: exit.value.paused,
+      ...(exit.value.resultMessageID ? { resultMessageID: exit.value.resultMessageID } : {}),
     }
   } finally {
     if (onAbort) signal.removeEventListener("abort", onAbort)
@@ -355,8 +493,20 @@ function runBasic(
         }
 
         if (action === "abort") {
+          const ownership = yield* runtime.SessionExecutionOwner.Service
+          const before = yield* ownership.snapshot(sessionID)
           yield* commitGuard(target)
           yield* prompt.cancel(sessionID)
+          const after = yield* ownership.snapshot(sessionID)
+          if (
+            before.ownerID &&
+            before.ownerID === after.ownerID &&
+            before.generation === after.generation
+          ) {
+            return yield* Effect.fail(new Error(
+              "OXP Session abort could not quiesce the observed live execution generation; abort was not completed.",
+            ))
+          }
           return
         }
 
@@ -391,15 +541,33 @@ function runBasic(
           return
         }
 
+        // Distinguish healthy contention from a dead generation fenced by
+        // unresolved effects before advertising a successful Resume.
+        yield* commitGuard(target)
+        yield* requireResumeReady(sessionID)
         yield* commitGuard(target)
         yield* sessions.setPaused({ sessionID, pausedAt: undefined })
+        // A quiescent Session needs an explicit wake to drain work admitted
+        // while paused. A busy Session is benign contention: its current
+        // generation promotes pending inbox work (or releaseIfDrained observes
+        // it atomically), so failure to acquire locally must not surface as a
+        // failed resume.
         yield* prompt.loop({ sessionID }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("OXP Session resume drain failed", {
+          Effect.catchCause((cause) => {
+            const error = Cause.squash(cause)
+            if (
+              error instanceof runtime.Session.BusyError ||
+              (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
+            ) {
+              return Effect.logInfo("OXP Session resume wake coalesced with existing Session owner", {
+                sessionID,
+              })
+            }
+            return Effect.logWarning("OXP Session resume wake did not acquire/run locally", {
               sessionID,
-              cause,
-            }),
-          ),
+              cause: Cause.pretty(cause),
+            })
+          }),
           Effect.forkIn(scope, { startImmediately: true }),
           Effect.asVoid,
         )
@@ -419,15 +587,16 @@ export const layer = Layer.effect(
       unarchive: (target) => runBasic(scope, target, "unarchive"),
       delete: (target) => runBasic(scope, target, "delete"),
       setSelection,
+      steer: startSteer,
       send: (target, input) =>
-        startPrompt(scope, target, input).pipe(
+        startQueuedPrompt(scope, target, input, false).pipe(
           Effect.map((started) => ({
             admittedMessageID: started.admittedMessageID,
             paused: started.paused,
           })),
         ),
       turn: (target, input, signal) =>
-        startPrompt(scope, target, input).pipe(
+        startQueuedPrompt(scope, target, input, true).pipe(
           Effect.flatMap((started) =>
             Effect.tryPromise({
               try: () => waitForPrompt(started, signal),

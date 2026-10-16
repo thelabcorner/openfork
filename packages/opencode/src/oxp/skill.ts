@@ -14,6 +14,9 @@ export const Parameters = Schema.Struct({
   rootID: OxpSchema.RootID.annotate({
     description: "Approved OXP root whose project-local skills may be discovered or loaded.",
   }),
+  workdir: Schema.optional(Schema.String).annotate({
+    description: "Optional nested project directory within the approved root. Skill list/search and name-based load use its local skill folders; explicit filePath remains root-relative.",
+  }),
   ...ExchangeSkill.Parameters.fields,
 })
 export type Input = Schema.Schema.Type<typeof Parameters>
@@ -77,10 +80,32 @@ const layer = Layer.effect(
         return yield* new OxpError.RootRequired({ detail: "skill requires one explicit approved root" })
       }
       const root = admission.root
-      const { rootID: _rootID, ...params } = input
+      let discoveryRoot = root.canonicalPath
+      let scopedWorkdir: typeof admission | undefined
+      if (input.workdir !== undefined) {
+        if (!input.workdir.trim()) {
+          return yield* new OxpError.InvalidArgument({ detail: "skill workdir must name a nonempty nested directory" })
+        }
+        scopedWorkdir = yield* authority.authorize({
+          plane: "augmentation",
+          operation: "skill.read",
+          phase: "read",
+          rootID: input.rootID,
+          path: input.workdir,
+        })
+        if (!scopedWorkdir.root || !("path" in scopedWorkdir.root)) {
+          return yield* new OxpError.InvalidArgument({ detail: "skill workdir must resolve inside the approved root" })
+        }
+        discoveryRoot = scopedWorkdir.root.path
+        const directory = yield* fs.stat(discoveryRoot).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (!directory || directory.type !== "Directory") {
+          return yield* new OxpError.InvalidArgument({ detail: "skill workdir must name an existing directory" })
+        }
+      }
+      const { rootID: _rootID, workdir: _workdir, ...params } = input
 
       const result = yield* ExchangeSkill.execute(fs, params, {
-        rootPath: root.canonicalPath,
+        rootPath: discoveryRoot,
         signal,
         resolvePath: (value) =>
           authority
@@ -108,7 +133,16 @@ const layer = Layer.effect(
               }),
             ),
         toVirtualPath: (absolutePath) => roots.toVirtualPath(root.root, absolutePath),
-        revalidate: () => authority.revalidate(admission, "egress").pipe(Effect.asVoid, Effect.mapError(authorityError)),
+        revalidate: () =>
+          Effect.gen(function* () {
+            yield* authority.revalidate(admission, "egress")
+            if (scopedWorkdir) {
+              const fresh = yield* authority.revalidate(scopedWorkdir, "egress")
+              if (!fresh.root || !("path" in fresh.root) || fresh.root.path !== discoveryRoot) {
+                return yield* new OxpError.AuthRevoked({ detail: "skill workdir identity changed before data egress" })
+              }
+            }
+          }).pipe(Effect.mapError(authorityError)),
       }).pipe(Effect.mapError(mapExchangeError))
 
       return {

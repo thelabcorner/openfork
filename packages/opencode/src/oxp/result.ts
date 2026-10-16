@@ -16,6 +16,11 @@ export interface CapabilityResult {
   readonly output: string
   readonly structured?: unknown
   readonly attachments?: readonly Attachment[]
+  /** MCP unstructured media content; intentionally absent from structured results. */
+  readonly mediaContent?: readonly (
+    | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+    | { readonly type: "audio"; readonly data: string; readonly mimeType: string }
+  )[]
   readonly metadata?: Readonly<Record<string, unknown>>
   readonly mutation?: MutationResult
   /**
