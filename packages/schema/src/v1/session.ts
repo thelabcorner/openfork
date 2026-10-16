@@ -11,6 +11,7 @@ import { ascending } from "../identifier"
 import { SessionID } from "../session-id"
 import { WorkspaceID } from "../workspace-id"
 import { SessionTurnProvenance as SharedTurnProvenance } from "../session-turn-provenance"
+import { ProviderRouteIntent } from "../model-select/provider-route-intent"
 import { PermissionV1 } from "./permission"
 
 const Timestamp = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
@@ -199,6 +200,10 @@ export const CompactionPart = Schema.Struct({
   auto: Schema.Boolean,
   continueAfter: Schema.optional(Schema.Boolean),
   overflow: Schema.optional(Schema.Boolean),
+  /** New checkpoints require explicit promotion; absent means legacy committed semantics. */
+  pending: Schema.optional(Schema.Boolean),
+  /** Exact promoted assistant; distinguishes retries from abandoned candidates. */
+  checkpoint_message_id: Schema.optional(MessageID),
   tail_start_id: Schema.optional(MessageID),
 }).annotate({ identifier: "CompactionPart" })
 export type CompactionPart = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPart>>
@@ -265,23 +270,42 @@ export const ToolStatePending = Schema.Struct({
 }).annotate({ identifier: "ToolStatePending" })
 export type ToolStatePending = Types.DeepMutable<Schema.Schema.Type<typeof ToolStatePending>>
 
+const ToolMetadata = Schema.StructWithRest(
+  Schema.Struct({
+    trace: optional(Schema.suspend(() => CodeRunTrace)),
+  }),
+  [Schema.Record(Schema.String, Schema.Any)],
+)
+
+/**
+ * Tool metadata is intentionally open-ended across the protocol. Code adds a
+ * schema-owned trace field, but must never narrow metadata emitted by every
+ * other tool (diffs, files, exit codes, background state, session IDs, etc.).
+ */
+export type ToolMetadataValue = {
+  trace?: CodeRunTrace
+  [key: string]: any
+}
+
 export const ToolStateRunning = Schema.Struct({
   status: Schema.Literal("running"),
   input: Schema.Record(Schema.String, Schema.Any),
   title: Schema.optional(Schema.String),
-  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
+  metadata: Schema.optional(ToolMetadata),
   time: Schema.Struct({
     start: NonNegativeInt,
   }),
 }).annotate({ identifier: "ToolStateRunning" })
-export type ToolStateRunning = Types.DeepMutable<Schema.Schema.Type<typeof ToolStateRunning>>
+export type ToolStateRunning = Omit<Types.DeepMutable<Schema.Schema.Type<typeof ToolStateRunning>>, "metadata"> & {
+  metadata?: ToolMetadataValue
+}
 
 export const ToolStateCompleted = Schema.Struct({
   status: Schema.Literal("completed"),
   input: Schema.Record(Schema.String, Schema.Any),
   output: Schema.String,
   title: Schema.String,
-  metadata: Schema.Record(Schema.String, Schema.Any),
+  metadata: ToolMetadata,
   time: Schema.Struct({
     start: NonNegativeInt,
     end: NonNegativeInt,
@@ -289,19 +313,23 @@ export const ToolStateCompleted = Schema.Struct({
   }),
   attachments: Schema.optional(Schema.Array(FilePart)),
 }).annotate({ identifier: "ToolStateCompleted" })
-export type ToolStateCompleted = Types.DeepMutable<Schema.Schema.Type<typeof ToolStateCompleted>>
+export type ToolStateCompleted = Omit<Types.DeepMutable<Schema.Schema.Type<typeof ToolStateCompleted>>, "metadata"> & {
+  metadata: ToolMetadataValue
+}
 
 export const ToolStateError = Schema.Struct({
   status: Schema.Literal("error"),
   input: Schema.Record(Schema.String, Schema.Any),
   error: Schema.String,
-  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
+  metadata: Schema.optional(ToolMetadata),
   time: Schema.Struct({
     start: NonNegativeInt,
     end: NonNegativeInt,
   }),
 }).annotate({ identifier: "ToolStateError" })
-export type ToolStateError = Types.DeepMutable<Schema.Schema.Type<typeof ToolStateError>>
+export type ToolStateError = Omit<Types.DeepMutable<Schema.Schema.Type<typeof ToolStateError>>, "metadata"> & {
+  metadata?: ToolMetadataValue
+}
 
 export const ToolState = Schema.Union([
   ToolStatePending,
@@ -314,16 +342,60 @@ export const ToolState = Schema.Union([
 })
 export type ToolState = ToolStatePending | ToolStateRunning | ToolStateCompleted | ToolStateError
 
+export const CODE_RUN_TRACE_MAX_ID_CHARS = 1024 as const
+export const CODE_RUN_TRACE_MAX_REF_CHARS = 8192 as const
+export const CODE_RUN_TRACE_MAX_TITLE_CHARS = 256 as const
+export const CODE_RUN_TRACE_MAX_FRAMES = 256 as const
+
+const CodeRunTraceID = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(CODE_RUN_TRACE_MAX_ID_CHARS))
+const CodeRunTraceRef = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(CODE_RUN_TRACE_MAX_REF_CHARS))
+
+export const CodeRunTraceFrame = Schema.Struct({
+  frameID: CodeRunTraceID,
+  parentFrameID: optional(CodeRunTraceID),
+  ref: CodeRunTraceRef,
+  kind: Schema.Literals(["native", "lazy", "mcp", "mcp-resource", "saved"]),
+  depth: NonNegativeInt,
+  startedAt: NonNegativeInt,
+  finishedAt: optional(NonNegativeInt),
+  durationMs: optional(NonNegativeInt),
+  status: Schema.Literals(["running", "succeeded", "failed", "cancelled"]),
+  title: optional(Schema.String.check(Schema.isMaxLength(CODE_RUN_TRACE_MAX_TITLE_CHARS))),
+  attachmentCount: optional(NonNegativeInt),
+}).annotate({ identifier: "CodeRunTraceFrame" })
+export type CodeRunTraceFrame = Types.DeepMutable<Schema.Schema.Type<typeof CodeRunTraceFrame>>
+
+export const CodeRunTrace = Schema.Struct({
+  version: Schema.Literal(1),
+  rootFrameID: CodeRunTraceID,
+  frames: Schema.Array(CodeRunTraceFrame).check(Schema.isMaxLength(CODE_RUN_TRACE_MAX_FRAMES)),
+  counters: Schema.Struct({
+    calls: NonNegativeInt,
+    failed: NonNegativeInt,
+    active: NonNegativeInt,
+  }),
+  truncated: optional(
+    Schema.Struct({
+      frames: optional(NonNegativeInt),
+    }),
+  ),
+}).annotate({ identifier: "CodeRunTrace" })
+export type CodeRunTrace = Types.DeepMutable<Schema.Schema.Type<typeof CodeRunTrace>>
+export type CodeRunTraceView = Schema.Schema.Type<typeof CodeRunTrace>
+/** Browser-safe guard for clients consuming Code ToolPart metadata. */
+export const isCodeRunTrace: (value: unknown) => value is CodeRunTraceView = Schema.is(CodeRunTrace)
+
 export const ToolPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("tool"),
   callID: Schema.String,
   tool: Schema.String,
   state: ToolState,
-  metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
+  metadata: Schema.optional(ToolMetadata),
 }).annotate({ identifier: "ToolPart" })
-export type ToolPart = Omit<Types.DeepMutable<Schema.Schema.Type<typeof ToolPart>>, "state"> & {
+export type ToolPart = Omit<Types.DeepMutable<Schema.Schema.Type<typeof ToolPart>>, "state" | "metadata"> & {
   state: ToolState
+  metadata?: ToolMetadataValue
 }
 
 const messageBase = {
@@ -384,6 +456,7 @@ export const User = Schema.Struct({
     accountID: Schema.optional(Schema.String),
     variant: Schema.optional(Schema.String),
     subProvider: Schema.optional(Schema.String),
+    routeIntent: Schema.optional(ProviderRouteIntent.Info),
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
@@ -595,9 +668,12 @@ const SessionModel = Schema.Struct({
   /** Stable provider-account selection retained across current/V1 Session projection. */
   accountID: optional(Schema.String),
   variant: optional(Schema.String),
+  routeIntent: optional(ProviderRouteIntent.Info),
 })
 
 export const SessionInfo = Schema.Struct({
+  /** Producer-projected human conversation/control access, independent of configuration ownership. */
+  humanInterjection: Schema.optional(Schema.Boolean),
   id: SessionID,
   slug: Schema.String,
   projectID: Project.ID,

@@ -28,6 +28,14 @@ export const MessageGroup = HttpApiGroup.make("server.message")
       query: SessionMessagesQuery,
       success: Schema.Struct({
         data: Schema.Array(SessionMessage.Message),
+        windowed: Schema.Array(
+          Schema.Struct({
+            messageID: SessionMessage.ID,
+            omittedContentItems: Schema.Number,
+            truncatedStrings: Schema.Number,
+          }),
+        ),
+        bytes: Schema.Number,
         cursor: Schema.Struct({
           previous: Schema.String.pipe(Schema.optional),
           next: Schema.String.pipe(Schema.optional),
@@ -39,7 +47,7 @@ export const MessageGroup = HttpApiGroup.make("server.message")
         identifier: "v2.session.messages",
         summary: "Get session messages",
         description:
-          "Retrieve projected messages for a session. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.",
+          "Retrieve byte-bounded timeline message projections for a session. Windowed messages include omission counts and remain available through the keyed full-message endpoint. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.",
       }),
     ),
   )

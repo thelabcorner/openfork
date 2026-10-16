@@ -26,6 +26,17 @@ describe("ProviderRouteIntent", () => {
     expect(() => decodeIntent({ kind: "account", accountID: "" })).toThrow()
     expect(() => decodeIntent({ kind: "account" })).toThrow()
   })
+
+  test("only Adaptive and Round Robin are valid automatic account-routing strategies", () => {
+    expect(ProviderRouteIntent.effectiveStrategy(undefined)).toBe("adaptive")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto" }))).toBe("adaptive")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto", strategy: "adaptive" }))).toBe("adaptive")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "auto", strategy: "round-robin" }))).toBe("round-robin")
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "account", accountID: "a" }))).toBeUndefined()
+    expect(ProviderRouteIntent.effectiveStrategy(decodeIntent({ kind: "public" }))).toBeUndefined()
+    expect(() => decodeIntent({ kind: "auto", strategy: "auto" })).toThrow()
+    expect(() => decodeIntent({ kind: "auto", strategy: "concentrate" })).toThrow()
+  })
 })
 
 describe("ScheduledTask.Action route intent", () => {

@@ -280,6 +280,8 @@ import type {
   PartUpdateResponses,
   PathGetErrors,
   PathGetResponses,
+  PermissionAutoAcceptPolicyErrors,
+  PermissionAutoAcceptPolicyResponses,
   PermissionListErrors,
   PermissionListResponses,
   PermissionReplyErrors,
@@ -301,9 +303,15 @@ import type {
   ProjectListResponses,
   ProjectUpdateErrors,
   ProjectUpdateResponses,
+  PromptCancelRevisionErrors,
+  PromptCancelRevisionResponses,
   PromptInput,
   PromptReviseErrors,
   PromptReviseResponses,
+  PromptRevisionProgressErrors,
+  PromptRevisionProgressResponses,
+  PromptRevisionRunStatusErrors,
+  PromptRevisionRunStatusResponses,
   ProviderAuthErrors,
   ProviderAuthResponses,
   ProviderListErrors,
@@ -312,6 +320,7 @@ import type {
   ProviderOauthAuthorizeResponses,
   ProviderOauthCallbackErrors,
   ProviderOauthCallbackResponses,
+  ProviderRouteIntent,
   ProviderSettingsAuthErrors,
   ProviderSettingsAuthResponses,
   ProviderSettingsConnectKeyErrors,
@@ -411,6 +420,10 @@ import type {
   ScheduledTaskUpdateResponses,
   SessionAbortErrors,
   SessionAbortResponses,
+  SessionAttachmentIndexErrors,
+  SessionAttachmentIndexResponses,
+  SessionAttachmentStatusErrors,
+  SessionAttachmentStatusResponses,
   SessionChildrenErrors,
   SessionChildrenResponses,
   SessionCommandErrors,
@@ -420,7 +433,11 @@ import type {
   SessionContextForkOriginErrors,
   SessionContextForkOriginResponses,
   SessionContextLedgerErrors,
+  SessionContextLedgerPageErrors,
+  SessionContextLedgerPageResponses,
   SessionContextLedgerResponses,
+  SessionContextLedgerTotalsErrors,
+  SessionContextLedgerTotalsResponses,
   SessionContextOperation,
   SessionContextOpsHistoryErrors,
   SessionContextOpsHistoryResponses,
@@ -471,12 +488,30 @@ import type {
   SessionGroupSetPolicyResponses,
   SessionInitErrors,
   SessionInitResponses,
+  SessionLimitRecoveryAutoResumeErrors,
+  SessionLimitRecoveryAutoResumeResponses,
+  SessionLimitRecoveryCancelErrors,
+  SessionLimitRecoveryCancelResponses,
+  SessionLimitRecoveryGetErrors,
+  SessionLimitRecoveryGetResponses,
+  SessionLimitRecoveryResumeErrors,
+  SessionLimitRecoveryResumeResponses,
+  SessionLimitRecoverySnoozeErrors,
+  SessionLimitRecoverySnoozeResponses,
+  SessionLimitRecoveryWakeErrors,
+  SessionLimitRecoveryWakeResponses,
   SessionListErrors,
   SessionListResponses,
   SessionMessageErrors,
+  SessionMessagePartsErrors,
+  SessionMessagePartsResponses,
   SessionMessageResponses,
   SessionMessagesErrors,
   SessionMessagesResponses,
+  SessionMessageTimelinePartsErrors,
+  SessionMessageTimelinePartsResponses,
+  SessionMessageToolOutputErrors,
+  SessionMessageToolOutputResponses,
   SessionNullableArchivedTimestamp,
   SessionPauseErrors,
   SessionPauseResponses,
@@ -498,6 +533,10 @@ import type {
   SessionStatusResponses,
   SessionSummarizeErrors,
   SessionSummarizeResponses,
+  SessionSwitchModelErrors,
+  SessionSwitchModelResponses,
+  SessionTimelinePartsBatchErrors,
+  SessionTimelinePartsBatchResponses,
   SessionTodoErrors,
   SessionTodoResponses,
   SessionUnrevertErrors,
@@ -559,6 +598,25 @@ import type {
   SystemOneInferErrors,
   SystemOneInferInput,
   SystemOneInferResponses,
+  TelegramBeginPairingErrors,
+  TelegramBeginPairingResponses,
+  TelegramCheckPairingErrors,
+  TelegramCheckPairingResponses,
+  TelegramConfigureErrors,
+  TelegramConfigureResponses,
+  TelegramDisconnectErrors,
+  TelegramDisconnectResponses,
+  TelegramQuotaStatusErrors,
+  TelegramQuotaStatusResponses,
+  TelegramQuotaSubscription,
+  TelegramQuotaUpdateErrors,
+  TelegramQuotaUpdateResponses,
+  TelegramStatusErrors,
+  TelegramStatusResponses,
+  TelegramTestErrors,
+  TelegramTestResponses,
+  TelegramUpdateErrors,
+  TelegramUpdateResponses,
   TextPartInput,
   ToolCatalogErrors,
   ToolCatalogResponses,
@@ -2664,9 +2722,9 @@ export class Global extends HeyApiClient {
   }
 
   /**
-   * Rename or archive OXP activity history
+   * Rename, regenerate the title, or archive OXP activity history
    *
-   * Update local presentation/history state only. This never mutates resources referenced by the activity.
+   * Update local presentation/history state only. Title regeneration derives a compact label from bounded, redacted OXP tool-call evidence. This never mutates resources referenced by the activity.
    */
   public oxpActivityUpdate<ThrowOnError extends boolean = false>(
     parameters: {
@@ -2796,9 +2854,9 @@ export class Global extends HeyApiClient {
   }
 
   /**
-   * Estimate OXP context exposure without workspace bootstrap
+   * Estimate OXP tool and surrounding model token usage without workspace bootstrap
    *
-   * Read a compact Core-owned OXP context-footprint projection. Exact boundary and retained historical observations remain provenance-labelled; missing historical mass may use calibrated donors. Repeated exposure is a geometric context-residency sensitivity model, not provider-reported usage or trace-conserved causal attribution.
+   * Read a compact Core-owned OXP usage projection. OXP request/result payloads are measured at the tool boundary and converted to estimated tokens with a calibrated tokenizer ratio; missing historical payloads may use calibrated donors. A separate empirical model, trained and session-disjoint validated against OpenFork usage records, estimates surrounding model usage from OXP-visible activity. Neither estimate is provider-reported ChatGPT usage.
    */
   public oxpAttribution<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -2980,6 +3038,114 @@ export class Global extends HeyApiClient {
   }
 }
 
+export class Message extends HeyApiClient {
+  /**
+   * Inspect message content progressively
+   *
+   * Return bounded slices of stored part JSON for an explicitly opened detail surface. Pages contain at most 16 1,024-code-point slices, and oversized parts continue by Unicode code-point offset without entering the shared session timeline store.
+   */
+  public parts<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionMessagePartsResponses, SessionMessagePartsErrors, ThrowOnError>({
+      url: "/session/{sessionID}/message/{messageID}/parts",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Load complete timeline content progressively
+   *
+   * Return complete stored timeline parts in bounded pages. Pages are capped by item count and encoded bytes; a single oversized part is returned alone so every stored part remains reachable.
+   */
+  public timelineParts<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionMessageTimelinePartsResponses,
+      SessionMessageTimelinePartsErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/message/{messageID}/timeline-parts",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Read a durable tool output page
+   *
+   * Return one bounded Unicode-code-point page of the full tool output retained for this persisted tool part. The session/message/part ownership is checked before reading; pages remain available for the lifetime of the owning session message.
+   */
+  public toolOutput<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageID: string
+      partID: string
+      offset?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "messageID" },
+            { in: "path", key: "partID" },
+            { in: "query", key: "offset" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionMessageToolOutputResponses,
+      SessionMessageToolOutputErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/message/{messageID}/tool-output/{partID}",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Session2 extends HeyApiClient {
   /**
    * Get working-session status
@@ -3070,6 +3236,7 @@ export class Session2 extends HeyApiClient {
         providerID: string
         accountID?: string
         variant?: string
+        routeIntent?: ProviderRouteIntent
       }
       metadata?: {
         [key: string]: unknown
@@ -3345,6 +3512,7 @@ export class Session2 extends HeyApiClient {
         providerID: string
         modelID: string
         accountID?: string
+        routeIntent?: ProviderRouteIntent
       }
       agent?: string
       noReply?: boolean
@@ -3460,6 +3628,42 @@ export class Session2 extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<SessionMessageResponses, SessionMessageErrors, ThrowOnError>({
       url: "/session/{sessionID}/message/{messageID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Recover complete timeline parts for a loaded session page
+   *
+   * Return complete stored parts for an explicit bounded message set, globally ordered by PartID and capped at 512 parts or 2 MiB per page (one oversized part may be returned alone). Each part carries its owning message ID.
+   */
+  public timelinePartsBatch<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      messageIDs: Array<string> | string
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "messageIDs" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionTimelinePartsBatchResponses,
+      SessionTimelinePartsBatchErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/timeline-parts",
       ...options,
       ...params,
     })
@@ -3838,6 +4042,55 @@ export class Session2 extends HeyApiClient {
   }
 
   /**
+   * Switch the active model
+   *
+   * Interrupt a live provider generation and continue the same task with the selected model.
+   */
+  public switchModel<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      assistantMessageID?: string
+      requestSentAt?: number
+      providerID?: string
+      modelID?: string
+      accountID?: string
+      variant?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "assistantMessageID" },
+            { in: "body", key: "requestSentAt" },
+            { in: "body", key: "providerID" },
+            { in: "body", key: "modelID" },
+            { in: "body", key: "accountID" },
+            { in: "body", key: "variant" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionSwitchModelResponses, SessionSwitchModelErrors, ThrowOnError>({
+      url: "/session/{sessionID}/model-switch",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Send async message
    *
    * Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.
@@ -3852,6 +4105,7 @@ export class Session2 extends HeyApiClient {
         providerID: string
         modelID: string
         accountID?: string
+        routeIntent?: ProviderRouteIntent
       }
       agent?: string
       noReply?: boolean
@@ -3914,6 +4168,7 @@ export class Session2 extends HeyApiClient {
       agent?: string
       model?: string
       accountID?: string
+      routeIntent?: ProviderRouteIntent
       arguments?: string
       command?: string
       variant?: string
@@ -3940,6 +4195,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "agent" },
             { in: "body", key: "model" },
             { in: "body", key: "accountID" },
+            { in: "body", key: "routeIntent" },
             { in: "body", key: "arguments" },
             { in: "body", key: "command" },
             { in: "body", key: "variant" },
@@ -3976,6 +4232,7 @@ export class Session2 extends HeyApiClient {
         providerID: string
         modelID: string
         accountID?: string
+        routeIntent?: ProviderRouteIntent
       }
       command?: string
     },
@@ -4080,6 +4337,11 @@ export class Session2 extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+
+  private _message?: Message
+  get message2(): Message {
+    return (this._message ??= new Message({ client: this.client }))
   }
 }
 
@@ -4976,6 +5238,213 @@ export class RevisionDraft extends HeyApiClient {
       ThrowOnError
     >({
       url: "/revision-draft/consume",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Prompt extends HeyApiClient {
+  /**
+   * Read live prompt revision progress
+   *
+   * Latest-value read of one in-flight Prompt Revisor operation, keyed by the client-owned correlation id sent with the revise request. Advisory display state only; null while idle or after settle. Process-global memory only and never materializes a workspace Instance.
+   */
+  public revisionProgress<ThrowOnError extends boolean = false>(
+    parameters: {
+      operationID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "operationID" }] }])
+    return (options?.client ?? this.client).get<
+      PromptRevisionProgressResponses,
+      PromptRevisionProgressErrors,
+      ThrowOnError
+    >({
+      url: "/prompt/revise/progress",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Read a detached revision run's lifecycle state
+   *
+   * Process-global running/failed lookup for one stable revision target. Null when no run is in flight and no bounded-TTL failure is retained. Never materializes a workspace Instance.
+   */
+  public revisionRunStatus<ThrowOnError extends boolean = false>(
+    parameters: {
+      kind: "prompt" | "goal" | "scheduled_task"
+      key: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "kind" },
+            { in: "query", key: "key" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      PromptRevisionRunStatusResponses,
+      PromptRevisionRunStatusErrors,
+      ThrowOnError
+    >({
+      url: "/prompt/revise/run",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cancel an in-flight revision run
+   *
+   * Explicit first-class cancellation for a detached Prompt Revisor run. A client disconnect only abandons a waiter; this endpoint actually ends the run. When both sides know the correlation id, a mismatched cancel is refused. Never materializes a workspace Instance.
+   */
+  public cancelRevision<ThrowOnError extends boolean = false>(
+    parameters?: {
+      kind?: "prompt" | "goal" | "scheduled_task"
+      key?: string
+      operationID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "kind" },
+            { in: "body", key: "key" },
+            { in: "body", key: "operationID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      PromptCancelRevisionResponses,
+      PromptCancelRevisionErrors,
+      ThrowOnError
+    >({
+      url: "/prompt/revise/cancel",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Revise a draft prompt
+   *
+   * Rewrite a draft prompt with an optional dedicated model, bounded read-only workspace reconnaissance, and session-owned clarification through the canonical question lifecycle.
+   */
+  public revise<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      prompt?: string
+      purpose?: "prompt" | "goal" | "scheduled_task"
+      target?: {
+        kind: "prompt" | "goal" | "scheduled_task"
+        key: string
+        sourceFingerprint: string
+      }
+      operationID?: string
+      draft?: {
+        mentions: Array<
+          | {
+              id: string
+              type: "file"
+              token: string
+              path: string
+              selection?: {
+                startLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                startChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              }
+            }
+          | {
+              id: string
+              type: "agent"
+              token: string
+              name: string
+            }
+          | {
+              id: string
+              type: "skill"
+              token: string
+              name: string
+            }
+          | {
+              id: string
+              type: "reference"
+              token: string
+              name: string
+              path: string
+            }
+          | {
+              id: string
+              type: "resource"
+              token: string
+              name: string
+              clientName: string
+              uri: string
+            }
+        >
+        attachments: Array<{
+          id: string
+          type: "image"
+          filename: string
+          mime: string
+        }>
+      }
+      sessionID?: string
+      includeSessionContext?: boolean
+      guidance?: string
+      model?: ModelRef
+      fallbackModel?: ModelRef
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "prompt" },
+            { in: "body", key: "purpose" },
+            { in: "body", key: "target" },
+            { in: "body", key: "operationID" },
+            { in: "body", key: "draft" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "includeSessionContext" },
+            { in: "body", key: "guidance" },
+            { in: "body", key: "model" },
+            { in: "body", key: "fallbackModel" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PromptReviseResponses, PromptReviseErrors, ThrowOnError>({
+      url: "/prompt/revise",
       ...options,
       ...params,
       headers: {
@@ -6122,6 +6591,366 @@ export class Swarm extends HeyApiClient {
   }
 }
 
+export class Telegram extends HeyApiClient {
+  public status<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<TelegramStatusResponses, TelegramStatusErrors, ThrowOnError>({
+      url: "/global/telegram",
+      ...options,
+    })
+  }
+
+  public update<ThrowOnError extends boolean = false>(
+    parameters?: {
+      enabled?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "enabled" }] }])
+    return (options?.client ?? this.client).patch<TelegramUpdateResponses, TelegramUpdateErrors, ThrowOnError>({
+      url: "/global/telegram",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public disconnect<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).delete<TelegramDisconnectResponses, TelegramDisconnectErrors, ThrowOnError>(
+      { url: "/global/telegram/bot", ...options },
+    )
+  }
+
+  public configure<ThrowOnError extends boolean = false>(
+    parameters?: {
+      token?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "token" }] }])
+    return (options?.client ?? this.client).post<TelegramConfigureResponses, TelegramConfigureErrors, ThrowOnError>({
+      url: "/global/telegram/bot",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public beginPairing<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      TelegramBeginPairingResponses,
+      TelegramBeginPairingErrors,
+      ThrowOnError
+    >({ url: "/global/telegram/pairing", ...options })
+  }
+
+  public checkPairing<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<
+      TelegramCheckPairingResponses,
+      TelegramCheckPairingErrors,
+      ThrowOnError
+    >({ url: "/global/telegram/pairing/check", ...options })
+  }
+
+  public test<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<TelegramTestResponses, TelegramTestErrors, ThrowOnError>({
+      url: "/global/telegram/test",
+      ...options,
+    })
+  }
+
+  public quotaStatus<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<TelegramQuotaStatusResponses, TelegramQuotaStatusErrors, ThrowOnError>({
+      url: "/global/telegram/services/quota",
+      ...options,
+    })
+  }
+
+  public quotaUpdate<ThrowOnError extends boolean = false>(
+    parameters?: {
+      enabled?: boolean
+      subscriptions?: Array<TelegramQuotaSubscription>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "enabled" },
+            { in: "body", key: "subscriptions" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      TelegramQuotaUpdateResponses,
+      TelegramQuotaUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/global/telegram/services/quota",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class SessionLimitRecovery extends HeyApiClient {
+  public cancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      generation?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "generation" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      SessionLimitRecoveryCancelResponses,
+      SessionLimitRecoveryCancelErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<
+      SessionLimitRecoveryGetResponses,
+      SessionLimitRecoveryGetErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery",
+      ...options,
+      ...params,
+    })
+  }
+
+  public autoResume<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      generation?: number
+      enabled?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "generation" },
+            { in: "body", key: "enabled" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      SessionLimitRecoveryAutoResumeResponses,
+      SessionLimitRecoveryAutoResumeErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery/auto-resume",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public resume<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      generation?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "generation" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionLimitRecoveryResumeResponses,
+      SessionLimitRecoveryResumeErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery/resume",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public snooze<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      generation?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "generation" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionLimitRecoverySnoozeResponses,
+      SessionLimitRecoverySnoozeErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery/snooze-until-reset",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  public wake<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      generation?: number
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "generation" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionLimitRecoveryWakeResponses,
+      SessionLimitRecoveryWakeErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/limit-recovery/wake",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class SessionAttachment extends HeyApiClient {
+  public index<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      cursor?: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "cursor" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionAttachmentIndexResponses,
+      SessionAttachmentIndexErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/attachment",
+      ...options,
+      ...params,
+    })
+  }
+
+  public status<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<
+      SessionAttachmentStatusResponses,
+      SessionAttachmentStatusErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/attachment/status",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Oauth2 extends HeyApiClient {
   /**
    * Start OAuth authorization
@@ -6294,7 +7123,7 @@ export class Permission extends HeyApiClient {
       requestID: string
       directory?: string
       workspace?: string
-      reply?: "once" | "always" | "reject"
+      reply?: "once" | "run" | "always" | "reject"
       message?: string
     },
     options?: Options<never, ThrowOnError>,
@@ -6336,7 +7165,7 @@ export class Permission extends HeyApiClient {
       permissionID: string
       directory?: string
       workspace?: string
-      response?: "once" | "always" | "reject"
+      response?: "once" | "run" | "always" | "reject"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -6356,6 +7185,51 @@ export class Permission extends HeyApiClient {
     )
     return (options?.client ?? this.client).post<PermissionRespondResponses, PermissionRespondErrors, ThrowOnError>({
       url: "/session/{sessionID}/permissions/{permissionID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Synchronize permission auto-accept policy
+   *
+   * Merge missing startup preferences or patch explicit session/directory choices for an explicit workspace location.
+   */
+  public autoAcceptPolicy<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      autoAccept?: {
+        [key: string]: boolean
+      }
+      mode?: "hydrate" | "patch"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "autoAccept" },
+            { in: "body", key: "mode" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<
+      PermissionAutoAcceptPolicyResponses,
+      PermissionAutoAcceptPolicyErrors,
+      ThrowOnError
+    >({
+      url: "/permission/auto-accept",
       ...options,
       ...params,
       headers: {
@@ -6620,7 +7494,7 @@ export class Config2 extends HeyApiClient {
   /**
    * Get configuration
    *
-   * Retrieve the current OpenFork configuration settings and preferences.
+   * Retrieve the effective OpenFork configuration for an explicit workspace.
    */
   public get<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -6849,9 +7723,9 @@ export class Tool extends HeyApiClient {
   }
 
   /**
-   * Kill a shell execution
+   * Stop a tool execution
    *
-   * Terminate one live shell execution: either the foreground tool call identified by callID (the command process tree is force-killed and the agent continues with an aborted result) or a background job identified by jobId.
+   * Request cancellation of a foreground tool call or background job. Stop reconciles an unresolved call whose executor is proven dead by pausing the Session, recording unfinished results as unknown, and releasing only its exact execution generation. Live owners receive a durable interrupt request.
    */
   public kill<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -7510,38 +8384,6 @@ export class Instance extends HeyApiClient {
   }
 }
 
-export class Path extends HeyApiClient {
-  /**
-   * Get paths
-   *
-   * Retrieve the current working directory and related path information for the OpenFork instance.
-   */
-  public get<ThrowOnError extends boolean = false>(
-    parameters?: {
-      directory?: string
-      workspace?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).get<PathGetResponses, PathGetErrors, ThrowOnError>({
-      url: "/path",
-      ...options,
-      ...params,
-    })
-  }
-}
-
 export class Diff extends HeyApiClient {
   /**
    * Get raw VCS diff
@@ -7575,36 +8417,6 @@ export class Diff extends HeyApiClient {
 }
 
 export class Vcs extends HeyApiClient {
-  /**
-   * Get VCS info
-   *
-   * Retrieve version control system (VCS) information for the current project, such as git branch.
-   */
-  public get<ThrowOnError extends boolean = false>(
-    parameters?: {
-      directory?: string
-      workspace?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).get<VcsGetResponses, VcsGetErrors, ThrowOnError>({
-      url: "/vcs",
-      ...options,
-      ...params,
-    })
-  }
-
   /**
    * Get VCS status
    *
@@ -7706,6 +8518,36 @@ export class Vcs extends HeyApiClient {
     })
   }
 
+  /**
+   * Get VCS info
+   *
+   * Retrieve version control branch metadata for the explicitly routed workspace.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<VcsGetResponses, VcsGetErrors, ThrowOnError>({
+      url: "/vcs",
+      ...options,
+      ...params,
+    })
+  }
+
   private _diff?: Diff
   get diff2(): Diff {
     return (this._diff ??= new Diff({ client: this.client }))
@@ -7802,6 +8644,38 @@ export class Formatter extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<FormatterStatusResponses, FormatterStatusErrors, ThrowOnError>({
       url: "/formatter",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Path extends HeyApiClient {
+  /**
+   * Get paths
+   *
+   * Retrieve process path metadata for the explicitly routed workspace.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<PathGetResponses, PathGetErrors, ThrowOnError>({
+      url: "/path",
       ...options,
       ...params,
     })
@@ -8115,36 +8989,6 @@ export class Project extends HeyApiClient {
   }
 
   /**
-   * Get current project
-   *
-   * Retrieve the currently active project that OpenFork is working with.
-   */
-  public current<ThrowOnError extends boolean = false>(
-    parameters?: {
-      directory?: string
-      workspace?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).get<ProjectCurrentResponses, ProjectCurrentErrors, ThrowOnError>({
-      url: "/project/current",
-      ...options,
-      ...params,
-    })
-  }
-
-  /**
    * Initialize git repository
    *
    * Create a git repository for the current project and return the refreshed project info.
@@ -8244,6 +9088,36 @@ export class Project extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<ProjectDirectoriesResponses, ProjectDirectoriesErrors, ThrowOnError>({
       url: "/project/{projectID}/directories",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get current project
+   *
+   * Retrieve project information for the explicitly routed workspace.
+   */
+  public current<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ProjectCurrentResponses, ProjectCurrentErrors, ThrowOnError>({
+      url: "/project/current",
       ...options,
       ...params,
     })
@@ -8705,6 +9579,82 @@ export class SessionContext extends HeyApiClient {
       ThrowOnError
     >({
       url: "/session/{sessionID}/context/ledger",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Page context ledger without hydrating the entire transcript
+   *
+   * Keyset pagination for ordinary V1 sessions; canonical compaction-aware fallback.
+   */
+  public ledgerPage<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      limit?: number
+      cursor?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "cursor" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextLedgerPageResponses,
+      SessionContextLedgerPageErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/ledger/page",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get authoritative Context totals independently of message paging
+   *
+   * Read-only SQLite aggregate from durable part facts; missing totals indicate legacy, opaque, or compaction history.
+   */
+  public ledgerTotals<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextLedgerTotalsResponses,
+      SessionContextLedgerTotalsErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/ledger/totals",
       ...options,
       ...params,
     })
@@ -10231,113 +11181,6 @@ export class Tui extends HeyApiClient {
   }
 }
 
-export class Prompt extends HeyApiClient {
-  /**
-   * Revise a draft prompt
-   *
-   * Rewrite a draft prompt with an optional dedicated model, bounded read-only workspace reconnaissance, and session-owned clarification through the canonical question lifecycle.
-   */
-  public revise<ThrowOnError extends boolean = false>(
-    parameters?: {
-      directory?: string
-      workspace?: string
-      prompt?: string
-      purpose?: "prompt" | "goal" | "scheduled_task"
-      target?: {
-        kind: "prompt" | "goal" | "scheduled_task"
-        key: string
-        sourceFingerprint: string
-      }
-      draft?: {
-        mentions: Array<
-          | {
-              id: string
-              type: "file"
-              token: string
-              path: string
-              selection?: {
-                startLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-                startChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-                endLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-                endChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
-              }
-            }
-          | {
-              id: string
-              type: "agent"
-              token: string
-              name: string
-            }
-          | {
-              id: string
-              type: "skill"
-              token: string
-              name: string
-            }
-          | {
-              id: string
-              type: "reference"
-              token: string
-              name: string
-              path: string
-            }
-          | {
-              id: string
-              type: "resource"
-              token: string
-              name: string
-              clientName: string
-              uri: string
-            }
-        >
-        attachments: Array<{
-          id: string
-          type: "image"
-          filename: string
-          mime: string
-        }>
-      }
-      sessionID?: string
-      includeSessionContext?: boolean
-      guidance?: string
-      model?: ModelRef
-      fallbackModel?: ModelRef
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "directory" },
-            { in: "query", key: "workspace" },
-            { in: "body", key: "prompt" },
-            { in: "body", key: "purpose" },
-            { in: "body", key: "target" },
-            { in: "body", key: "draft" },
-            { in: "body", key: "sessionID" },
-            { in: "body", key: "includeSessionContext" },
-            { in: "body", key: "guidance" },
-            { in: "body", key: "model" },
-            { in: "body", key: "fallbackModel" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).post<PromptReviseResponses, PromptReviseErrors, ThrowOnError>({
-      url: "/prompt/revise",
-      ...options,
-      ...params,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-        ...params.headers,
-      },
-    })
-  }
-}
-
 export class Health extends HeyApiClient {
   /**
    * Check server health
@@ -11512,7 +12355,7 @@ export class Session3 extends HeyApiClient {
   /**
    * Get session messages
    *
-   * Retrieve projected messages for a session. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.
+   * Retrieve byte-bounded timeline message projections for a session. Windowed messages include omission counts and remain available through the keyed full-message endpoint. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline.
    */
   public messages<ThrowOnError extends boolean = false>(
     parameters: {
@@ -13315,6 +14158,11 @@ export class OpencodeClient extends HeyApiClient {
     return (this._revisionDraft ??= new RevisionDraft({ client: this.client }))
   }
 
+  private _prompt?: Prompt
+  get prompt(): Prompt {
+    return (this._prompt ??= new Prompt({ client: this.client }))
+  }
+
   private _scheduledTask?: ScheduledTask
   get scheduledTask(): ScheduledTask {
     return (this._scheduledTask ??= new ScheduledTask({ client: this.client }))
@@ -13323,6 +14171,21 @@ export class OpencodeClient extends HeyApiClient {
   private _swarm?: Swarm
   get swarm(): Swarm {
     return (this._swarm ??= new Swarm({ client: this.client }))
+  }
+
+  private _telegram?: Telegram
+  get telegram(): Telegram {
+    return (this._telegram ??= new Telegram({ client: this.client }))
+  }
+
+  private _sessionLimitRecovery?: SessionLimitRecovery
+  get sessionLimitRecovery(): SessionLimitRecovery {
+    return (this._sessionLimitRecovery ??= new SessionLimitRecovery({ client: this.client }))
+  }
+
+  private _sessionAttachment?: SessionAttachment
+  get sessionAttachment(): SessionAttachment {
+    return (this._sessionAttachment ??= new SessionAttachment({ client: this.client }))
   }
 
   private _provider?: Provider
@@ -13390,11 +14253,6 @@ export class OpencodeClient extends HeyApiClient {
     return (this._instance ??= new Instance({ client: this.client }))
   }
 
-  private _path?: Path
-  get path(): Path {
-    return (this._path ??= new Path({ client: this.client }))
-  }
-
   private _vcs?: Vcs
   get vcs(): Vcs {
     return (this._vcs ??= new Vcs({ client: this.client }))
@@ -13413,6 +14271,11 @@ export class OpencodeClient extends HeyApiClient {
   private _formatter?: Formatter
   get formatter(): Formatter {
     return (this._formatter ??= new Formatter({ client: this.client }))
+  }
+
+  private _path?: Path
+  get path(): Path {
+    return (this._path ??= new Path({ client: this.client }))
   }
 
   private _mcp?: Mcp
@@ -13458,11 +14321,6 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
-  }
-
-  private _prompt?: Prompt
-  get prompt(): Prompt {
-    return (this._prompt ??= new Prompt({ client: this.client }))
   }
 
   private _v2?: V2

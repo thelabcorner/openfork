@@ -99,7 +99,10 @@ export type ModelRequirement = typeof ModelRequirement.Type
 
 export interface MemberExecutionProfile extends Schema.Schema.Type<typeof MemberExecutionProfile> {}
 export const MemberExecutionProfile = Schema.Struct({
-  agent: Agent.ID,
+  agent: Agent.ID.annotate({
+    description:
+      "Agent mode for this managed worker; fixed to swarm-m by the Swarm role. Select provider/model independently.",
+  }),
   model: Model.Ref,
   permissionBoundary: Permission.Boundary,
   /**

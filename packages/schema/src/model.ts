@@ -4,6 +4,7 @@ import { Schema } from "effect"
 import { optional } from "./schema"
 import { Provider } from "./provider"
 import { statics } from "./schema"
+import { ProviderRouteIntent } from "./model-select/provider-route-intent"
 
 export const ID = Schema.String.pipe(Schema.brand("ModelV2.ID"))
 export type ID = typeof ID.Type
@@ -21,6 +22,8 @@ export const Ref = Schema.Struct({
    */
   accountID: Schema.String.pipe(optional),
   variant: VariantID.pipe(optional),
+  /** Account-selection preference; separate from model and account identity. */
+  routeIntent: ProviderRouteIntent.Info.pipe(optional),
 }).annotate({ identifier: "Model.Ref" })
 export interface Ref extends Schema.Schema.Type<typeof Ref> {}
 

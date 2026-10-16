@@ -1,11 +1,27 @@
 #!/usr/bin/env bun
 import { fileURLToPath } from "url"
+import { readFile, rename, unlink, writeFile } from "node:fs/promises"
+import * as prettier from "prettier"
 
 const dir = fileURLToPath(new URL("..", import.meta.url))
 process.chdir(dir)
 
 import { $ } from "bun"
 import path from "path"
+
+// Windows tooling can map generated source files while this process is alive.
+// Replace complete files atomically instead of truncating a mapped destination.
+async function writeGenerated(file: string, source: string) {
+  const temporary = `${file}.${process.pid}.sdk-build.tmp`
+  try {
+    await writeFile(temporary, source, "utf8")
+    await rename(temporary, file)
+  } finally {
+    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
+  }
+}
 
 import { createClient } from "@hey-api/openapi-ts"
 import { PRODUCT_DOCS_URL } from "../../../core/src/brand"
@@ -17,7 +33,7 @@ const opencode = path.resolve(dir, "../../opencode")
 // the generator command successful but no openapi.json on disk. Capture the
 // canonical producer's stdout and materialize the file ourselves.
 const openapi = await $`bun dev generate`.cwd(opencode).text()
-await Bun.write(path.join(dir, "openapi.json"), openapi)
+await writeGenerated(path.join(dir, "openapi.json"), openapi)
 
 const document = (await Bun.file("./openapi.json").json()) as {
   components?: { schemas?: Record<string, unknown> }
@@ -52,7 +68,7 @@ async function syncFrozenLegacyDescription(property: string, marker: string, des
   }
   const replacement = ["  /**", `   * ${description}`, "   */"].join("\n")
   source = source.slice(0, commentStart) + replacement + source.slice(commentEnd + "  */".length)
-  await Bun.write(path, source)
+  await writeGenerated(path, source)
 }
 if (schemas) {
   const reachable = new Set<string>()
@@ -77,7 +93,7 @@ if (schemas) {
   for (const name of Object.keys(schemas)) {
     if (/^SessionNext\w+1$/.test(name) && !reachable.has(name)) delete schemas[name]
   }
-  await Bun.write("./openapi.json", JSON.stringify(document))
+  await writeGenerated("./openapi.json", JSON.stringify(document))
 }
 
 await createClient({
@@ -138,7 +154,27 @@ const historyTypesPatched = generatedTypes.replace(
 if (historyTypesPatched === generatedTypes) {
   throw new Error("Session history numeric query patch did not apply")
 }
-await Bun.write("./src/v2/gen/types.gen.ts", historyTypesPatched)
+// Effect's Schema.Finite serializes a hypothetical nonfinite numeric union in
+// OpenAPI. Context-ledger revisions are monotonically incremented finite
+// integers on the actual wire; keep the generated SDK faithful to that domain
+// invariant instead of widening them to "NaN"/"Infinity" strings.
+const normalizeLedgerRevision = (source: string, type: string) => {
+  const begin = source.indexOf(`export type ${type} = {`)
+  const end = source.indexOf(`export type ${type.slice(0, -1)} =`, begin)
+  if (begin < 0 || end < 0) throw new Error(`Context ledger generated type missing: ${type}`)
+  const body = source.slice(begin, end)
+  const revision = /revision:\s*number(?:\s*\|\s*[\'"](?:NaN|Infinity|-Infinity)[\'"])+/g
+  if (!revision.test(body)) {
+    // Accept a future generator that already emits the correct finite-number
+    // contract; only fail if the named revision field disappeared altogether.
+    if (/\brevision:\s*number\b/.test(body)) return source
+    throw new Error(`Context ledger revision schema changed: ${type}`)
+  }
+  return source.slice(0, begin) + body.replace(revision, "revision: number") + source.slice(end)
+}
+const normalizedLedgerPage = normalizeLedgerRevision(historyTypesPatched, "SessionContextLedgerPageResponses")
+const normalizedLedgerTypes = normalizeLedgerRevision(normalizedLedgerPage, "SessionContextLedgerTotalsResponses")
+await writeGenerated("./src/v2/gen/types.gen.ts", normalizedLedgerTypes)
 
 const generatedSdk = await Bun.file("./src/v2/gen/sdk.gen.ts").text()
 const historySdkPatched = generatedSdk.replace(
@@ -148,7 +184,7 @@ const historySdkPatched = generatedSdk.replace(
 if (historySdkPatched === generatedSdk) {
   throw new Error("Session history numeric SDK patch did not apply")
 }
-await Bun.write("./src/v2/gen/sdk.gen.ts", historySdkPatched)
+await writeGenerated("./src/v2/gen/sdk.gen.ts", historySdkPatched)
 
 // Patch a @hey-api/openapi-ts codegen bug: SseFn incorrectly passes the
 // endpoint's TError into the second generic of ServerSentEventsResult, which
@@ -167,7 +203,7 @@ const sseTypesPatched = sseTypesSource.replace(
 if (sseTypesPatched === sseTypesSource && !sseTypesSource.includes("=> Promise<ServerSentEventsResult<TData>>")) {
   throw new Error(`SseFn patch did not apply; @hey-api/openapi-ts output may have changed (${sseTypesPath})`)
 }
-await Bun.write(sseTypesPath, sseTypesPatched)
+await writeGenerated(sseTypesPath, sseTypesPatched)
 
 const patchSseParser = async (path: string, importPath: string) => {
   let source = await Bun.file(path).text()
@@ -199,16 +235,16 @@ const patchSseParser = async (path: string, importPath: string) => {
       "          }",
       "        }",
       "",
-      "        signal.addEventListener(\"abort\", abortHandler)",
+      '        signal.addEventListener("abort", abortHandler)',
       "",
       "        try {",
       "          while (true) {",
       "            const { done, value } = await reader.read()",
-      "            for (const frame of parser.push(value ?? \"\", done)) {",
+      '            for (const frame of parser.push(value ?? "", done)) {',
       "              let data: unknown",
       "              let parsedJson = false",
       "              if (frame.hasData) {",
-      "                const rawData = frame.data ?? \"\"",
+      '                const rawData = frame.data ?? ""',
       "                try {",
       "                  data = JSON.parse(rawData)",
       "                  parsedJson = true",
@@ -253,37 +289,66 @@ const patchSseParser = async (path: string, importPath: string) => {
       "const reader = response.body.getReader()\n        const decoder = new TextDecoder()",
     )
   }
-  if (!source.includes("const decoder = new TextDecoder()")) throw new Error("SSE byte reader patch did not apply: " + path)
-  source = source.replace('parser.push(value ?? "", done)', 'parser.push(decoder.decode(value, { stream: !done }), done)')
+  if (!source.includes("const decoder = new TextDecoder()"))
+    throw new Error("SSE byte reader patch did not apply: " + path)
+  source = source.replace(
+    'parser.push(value ?? "", done)',
+    "parser.push(decoder.decode(value, { stream: !done }), done)",
+  )
   if (!source.includes("let connectedAt = 0")) {
     source = source.replace(/let attempt = 0;?/, "let attempt = 0\n    let connectedAt = 0")
   }
   if (!source.includes("connectedAt = Date.now()\n        const reader")) {
-    source = source.replace("const reader = response.body", "connectedAt = Date.now()\n        const reader = response.body")
+    source = source.replace(
+      "const reader = response.body",
+      "connectedAt = Date.now()\n        const reader = response.body",
+    )
   }
   if (!source.includes("Date.now() - connectedAt >= 30_000")) {
-    source = source.replace("if (frame.hasData) {\n                yield", [
-      "// Any complete frame, including a heartbeat, proves socket liveness.",
-      "              if (Date.now() - connectedAt >= 30_000) {",
-      "                attempt = 1",
-      "                connectedAt = Date.now()",
-      "              }",
-      "              if (frame.hasData) {",
-      "                yield",
-    ].join("\n"))
+    source = source.replace(
+      "if (frame.hasData) {\n                yield",
+      [
+        "// Any complete frame, including a heartbeat, proves socket liveness.",
+        "              if (Date.now() - connectedAt >= 30_000) {",
+        "                attempt = 1",
+        "                connectedAt = Date.now()",
+        "              }",
+        "              if (frame.hasData) {",
+        "                yield",
+      ].join("\n"),
+    )
   }
-  source = source.replace(/await sleep\(backoff(?: \/ 2 \+ Math.random\(\) \* \(backoff \/ 2\))?\)/g, "await sleep(Math.random() * backoff)")
-  source = source.replace(/(if \(Date.now\(\) - connectedAt >= 30_000\) \{\s*)attempt = 0\s*retryDelay = sseDefaultRetryDelay \?\? 3000/, "$1attempt = 1")
+  source = source.replace(
+    /await sleep\(backoff(?: \/ 2 \+ Math.random\(\) \* \(backoff \/ 2\))?\)/g,
+    "await sleep(Math.random() * backoff)",
+  )
+  source = source.replace(
+    /(if \(Date.now\(\) - connectedAt >= 30_000\) \{\s*)attempt = 0\s*retryDelay = sseDefaultRetryDelay \?\? 3000/,
+    "$1attempt = 1",
+  )
   source = source.replace(/(?<!await |void )reader.cancel\(\);?/g, "void reader.cancel().catch(() => {})")
-  source = source.replace(/(?<!await reader.cancel\(\).catch\(\(\) => \{\}\)\n          )reader.releaseLock\(\);?/, "await reader.cancel().catch(() => {})\n          reader.releaseLock()")
-  await Bun.write(path, source)
+  source = source.replace(
+    /(?<!await reader.cancel\(\).catch\(\(\) => \{\}\)\n          )reader.releaseLock\(\);?/,
+    "await reader.cancel().catch(() => {})\n          reader.releaseLock()",
+  )
+  await writeGenerated(path, source)
 }
 
 await patchSseParser("./src/gen/core/serverSentEvents.gen.ts", "../../sse-parser.js")
 await patchSseParser("./src/v2/gen/core/serverSentEvents.gen.ts", "../../../sse-parser.js")
 
-await $`bun prettier --write src/gen`
-await $`bun prettier --write src/v2`
+if (process.platform === "win32") {
+  for (const directory of ["src/gen", "src/v2"]) {
+    for await (const file of new Bun.Glob("**/*.ts").scan({ cwd: path.resolve(directory), absolute: true })) {
+      const source = await readFile(file, "utf8")
+      const formatted = await prettier.format(source, { ...(await prettier.resolveConfig(file)), filepath: file })
+      if (formatted !== source) await writeGenerated(file, formatted)
+    }
+  }
+} else {
+  await $`bun prettier --write src/gen`
+  await $`bun prettier --write src/v2`
+}
 await $`rm -rf dist`
 await $`bun tsc`
 await $`rm openapi.json`

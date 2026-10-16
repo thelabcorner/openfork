@@ -3,9 +3,75 @@ export type { FileSystemEntry as LocationFileSystemEntry } from "./gen/types.gen
 
 import { createClient } from "./gen/client/client.gen.js"
 import { type Config } from "./gen/client/types.gen.js"
-import { OpencodeClient } from "./gen/sdk.gen.js"
+import {
+  Message as SessionMessageReadClient,
+  OpencodeClient as GeneratedOpencodeClient,
+  Session2 as SessionReadClient,
+} from "./gen/sdk.gen.js"
+import type { Part } from "./gen/types.gen.js"
 import { wrapClientError } from "../error-interceptor.js"
-export { type Config as OpencodeClientConfig, OpencodeClient }
+export { type Config as OpencodeClientConfig }
+
+type TimelinePartsMethod = (input: { sessionID: string; messageID: string; cursor?: string }) => Promise<{
+  data?: { data: Part[]; nextCursor?: string }
+  error?: unknown
+  response?: Response
+}>
+
+/**
+ * The full OpenCode HTTP API contains a retained V1 session-read surface in
+ * addition to the generated `/api/*` client. Keep that narrow adapter explicit
+ * so first-party V1 callers can use its bootstrap-free `/session/*` routes
+ * without hand-editing generated endpoints or migrating onto the current API.
+ */
+export class OpencodeClient extends GeneratedOpencodeClient {
+  /**
+   * First-party Tier-0 profiling endpoints added after the frozen generated SDK.
+   *
+   * Uses the same authenticated, configured SDK transport; unlike passing an
+   * extra key into a generated endpoint method, this preserves additive query
+   * parameters such as includeWorkload and never loses their values to the
+   * generator's older query allowlist. Remove after the generated API catches up.
+   */
+  public analyticsProjection(
+    path: "/usage/workload" | "/global/oxp/attribution",
+    query: Record<string, string | number | undefined>,
+    options?: { signal?: AbortSignal },
+  ) {
+    return this.client.get({
+      url: path,
+      query,
+      throwOnError: true,
+      signal: options?.signal,
+    })
+  }
+
+  private _sessionRead?: SessionReadClient &
+    Pick<SessionMessageReadClient, "parts"> & {
+      timelineParts: TimelinePartsMethod
+      timelinePartsBatch: SessionReadClient["timelinePartsBatch"]
+      toolOutput: SessionMessageReadClient["toolOutput"]
+    }
+
+  get sessionRead(): SessionReadClient &
+    Pick<SessionMessageReadClient, "parts"> & {
+      timelineParts: TimelinePartsMethod
+      timelinePartsBatch: SessionReadClient["timelinePartsBatch"]
+      toolOutput: SessionMessageReadClient["toolOutput"]
+    } {
+    if (this._sessionRead) return this._sessionRead
+    const session = new SessionReadClient({ client: this.client })
+    const message = new SessionMessageReadClient({ client: this.client })
+    const timelineParts = Reflect.get(message, "timelineParts")
+    if (typeof timelineParts !== "function") throw new Error("The generated SDK is missing the timeline-parts read")
+    return (this._sessionRead = Object.assign(session, {
+      parts: message.parts.bind(message),
+      timelineParts: timelineParts.bind(message) as TimelinePartsMethod,
+      timelinePartsBatch: session.timelinePartsBatch.bind(session),
+      toolOutput: message.toolOutput.bind(message),
+    }))
+  }
+}
 
 function pick(value: string | null, fallback?: string, encode?: (value: string) => string) {
   if (!value) return

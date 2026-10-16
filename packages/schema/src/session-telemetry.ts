@@ -28,6 +28,7 @@ export type Tokens = typeof Tokens.Type
 export const Model = Schema.Struct({
   providerID: Schema.String,
   modelID: Schema.String,
+  accountID: Schema.optional(Schema.String),
   name: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
   contextLimit: Schema.optional(Schema.Finite),
@@ -65,6 +66,8 @@ export const Info = Schema.Struct({
   turnStartedAt: Schema.optional(Schema.Finite),
   phaseStartedAt: Schema.optional(Schema.Finite),
   updatedAt: Schema.Finite,
+  /** Live provider request is a compaction summary; absent from settled storage. */
+  isCompaction: Schema.optional(Schema.Boolean),
   /**
    * Producer-monotonic elapsed time captured with this projection. These values
    * are authoritative for live duration math and are immune to wall-clock/NTP

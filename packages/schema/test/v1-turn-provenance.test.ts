@@ -28,6 +28,8 @@ describe("V1 user-turn provenance", () => {
       GoalProgress: "goal.progress",
       GoalContinuation: "goal.continuation",
       RecoveryContinuation: "recovery.continuation",
+      ModelSwitch: "model.switch",
+      ProviderTimeoutContinuation: "provider.timeout.continuation",
       UnknownFinishContinuation: "provider.unknown-finish.continuation",
       Compaction: "compaction",
       CompactionReplay: "compaction.replay",

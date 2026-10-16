@@ -55,4 +55,12 @@ describe("OFXP protocol schema", () => {
     expect(decoded.source).toEqual({ kind: "external", principal: "oxp:connector-test" })
     expect(decoded.sourceSessionID).toBeUndefined()
   })
+
+  test("accepts legacy peer grants without the newer Code authority and keeps it deny-by-default", () => {
+    const { code: _code, ...legacy } = Ofxp.DENY_GRANT
+    const decoded = Schema.decodeUnknownSync(Ofxp.Grant)(legacy)
+    expect(decoded.code).toBeUndefined()
+    expect({ ...Ofxp.DENY_GRANT, ...decoded }.code).toBe(false)
+    expect(Schema.decodeUnknownSync(Ofxp.Grant)({ ...legacy, code: true }).code).toBe(true)
+  })
 })

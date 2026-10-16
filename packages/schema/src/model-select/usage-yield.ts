@@ -264,18 +264,33 @@ export function nativePricingFromCatalogCost(cost: CatalogCost): NativePricing {
   }
 }
 
+// Historical provider snapshots can have input/output prices without a cache
+// object. Use the input rate when no cache discount is published; zero would
+// incorrectly make these models look cheaper. Hoist the function because bulk
+// provider ranking calls nativePricingFromModelCost for every paid model.
+function nativeModelRates(value: ModelCostRates): ModelCostRates {
+  return {
+    input: value.input,
+    output: value.output,
+    cache: {
+      read: value.cache?.read ?? value.input,
+      write: value.cache?.write ?? value.input,
+    },
+  }
+}
+
 /** Compile a `ModelCost` snapshot into `NativePricing`. */
 export function nativePricingFromModelCost(cost: ModelCost): NativePricing {
   const tiers = (cost.tiers ?? [])
     .filter((row) => row.tier.type === "context" && Number.isFinite(row.tier.size) && row.tier.size >= 0)
     .map((row) => ({
       thresholdTokens: row.tier.size,
-      prices: { input: row.input, output: row.output, cache: { read: row.cache.read, write: row.cache.write } },
+      prices: nativeModelRates(row),
     }))
   return {
-    base: { input: cost.input, output: cost.output, cache: { read: cost.cache.read, write: cost.cache.write } },
+    base: nativeModelRates(cost),
     tiers,
-    ...(cost.experimentalOver200K ? { over200K: cost.experimentalOver200K } : {}),
+    ...(cost.experimentalOver200K ? { over200K: nativeModelRates(cost.experimentalOver200K) } : {}),
   }
 }
 
@@ -338,9 +353,14 @@ export function compilePricingRegimes(
       ]
     }
   }
-  const native = nativePricingFromModelCost(baseCost)
-  if (native.tiers.length > 0 || native.over200K) {
-    return [{ kind: "native-context", ...native }]
+  // The vast majority of catalog rows are flat. Avoid allocating a native
+  // pricing object, its tier array, and copied cache rates for every model
+  // that cannot possibly activate a native threshold/over-200K regime.
+  if (baseCost.tiers?.length || baseCost.experimentalOver200K) {
+    const native = nativePricingFromModelCost(baseCost)
+    if (native.tiers.length > 0 || native.over200K) {
+      return [{ kind: "native-context", ...native }]
+    }
   }
   if (thresholdPricing && thresholdPricing.length === 2) {
     // Ensure deterministic order: the ≤ row first (cheaper tier usually).
@@ -378,6 +398,30 @@ export function priceWorkload(
   regimeLabel: string | undefined
 } {
   const effectiveWorkload = applyHitRate(workload, hitRate)
+
+  // The bulk model selector compiles nearly every paid model to exactly one
+  // flat or native-context regime. Avoid allocating/filtering multiple arrays
+  // for every corpus tuple in that hot path. Mixed/custom regime sets retain
+  // their existing, fully general selection logic below.
+  if (regimes.length === 1) {
+    const only = regimes[0]!
+    if (only.kind === "flat")
+      return { expected: tokenCost(effectiveWorkload, only.prices), best: undefined, worst: undefined, regimeLabel: undefined }
+    if (only.kind === "native-context") {
+      const selected = selectNativePrices(only, effectiveWorkload.contextTokens)
+      return {
+        expected: tokenCost(effectiveWorkload, selected.prices),
+        best: undefined,
+        worst: undefined,
+        regimeLabel:
+          selected.thresholdTokens !== Number.NEGATIVE_INFINITY
+            ? `> ${selected.thresholdTokens.toLocaleString()}`
+            : selected.prices === only.over200K
+              ? "> 200,000"
+              : undefined,
+      }
+    }
+  }
 
   const timeRegimes = regimes.filter((r): r is Extract<PricingRegime, { kind: "time" }> => r.kind === "time")
   if (timeRegimes.length === 2) {
@@ -448,6 +492,38 @@ export function priceWorkload(
  * Shared by `priceWorkload` and the per-regime diagnostic pricer so both apply
  * exactly the same re-split.
  */
+/**
+ * Scalar ranking projection: skip the diagnostic result object and hit-rate
+ * workload clone when a model uses a flat or native-context pricing regime.
+ * Keep the same operation order as tokenCost/applyHitRate for exact parity.
+ * Time and custom two-row regimes still use priceWorkload's canonical logic.
+ */
+export function priceWorkloadExpected(workload: Workload, regimes: PricingRegime[], hitRate?: number): number {
+  const only = regimes[0]
+  if (regimes.length !== 1 || (only?.kind !== "flat" && only?.kind !== "native-context"))
+    return priceWorkload(workload, regimes, hitRate).expected
+  let fresh = workload.freshInputTokens
+  let cached = workload.cachedReadTokens
+  let contextTokens = workload.contextTokens
+  if (hitRate !== undefined && hitRate !== null && Number.isFinite(hitRate)) {
+    let h = hitRate > 1 ? hitRate / 100 : hitRate
+    h = Math.max(0, Math.min(1, h))
+    const totalPrompt = fresh + cached
+    if (totalPrompt > 0) {
+      cached = Math.round(totalPrompt * h)
+      fresh = totalPrompt - cached
+      contextTokens = totalPrompt + (workload.cacheWriteTokens ?? 0)
+    }
+  }
+  const prices = only.kind === "flat" ? only.prices : selectNativePrices(only, contextTokens).prices
+  return (
+    fresh * prices.input +
+    cached * (prices.cache?.read ?? prices.input) +
+    (workload.cacheWriteTokens ?? 0) * (prices.cache?.write ?? prices.input) +
+    workload.outputTokens * prices.output
+  ) / 1_000_000
+}
+
 function applyHitRate(workload: Workload, hitRate: number | undefined | null): Workload {
   if (hitRate === undefined || hitRate === null || !Number.isFinite(hitRate)) return workload
   let h = hitRate > 1 ? hitRate / 100 : hitRate

@@ -3,6 +3,9 @@ import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { projectSessionActivity } from "./session-activity-proof"
+import { stopLeftObservedGenerationOwned } from "./session-stop-confirmation"
 import { DateTime, Effect, Schema, Stream } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
@@ -59,6 +62,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
     const session = yield* SessionV2.Service
     const events = yield* EventV2.Service
     const telemetry = yield* SessionTelemetry.Service
+    const executionOwner = yield* SessionExecutionOwner.Service
     // Checkpoint/Snapshot are Location-scoped: they are provided per-request by
     // SessionLocationMiddleware (LocationServices), never at group-construction
     // time — requesting them here crashes the server at startup.
@@ -188,19 +192,18 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.active",
         Effect.fn(function* () {
-          // This is the renderer's one process-wide cold-start reconciliation
-          // surface. Core execution.active covers the current runner (including
-          // the small pre-provider window); SessionTelemetry also sees legacy/V1
-          // processors and current provider phases. Union both without
-          // bootstrapping any workspace. Paused IDs are durable and win in the
-          // transient overlap window.
-          const paused = yield* session.paused
-          const running = new Set([...(yield* session.active), ...(yield* telemetry.active)])
-          const data = new Map<string, { type: "running" | "paused" }>(
-            Array.from(running, (sessionID) => [sessionID, { type: "running" as const }]),
-          )
-          for (const sessionID of paused) data.set(sessionID, { type: "paused" as const })
-          return { data: Object.fromEntries(data) }
+          // This is the renderer's process-wide cold-start proof surface.
+          // Telemetry.active is NOT execution proof: its last non-idle phase
+          // can survive a crashed or forcibly killed Session indefinitely.
+          // Only the Core live-run coordinator and a generation-matched V1
+          // execution activation can assert running. Unverified durable
+          // leases remain fenced but are never presented as running.
+          const [running, v1, paused] = yield* Effect.all([
+            session.active,
+            executionOwner.listWorking(),
+            session.paused,
+          ])
+          return { data: projectSessionActivity(running, v1, paused) }
         }),
       )
       .handle(
@@ -504,7 +507,21 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.interrupt",
         Effect.fn(function* (ctx) {
           yield* requirePublicMutableSession(ctx.params.sessionID)
+          const before = yield* executionOwner.snapshot(ctx.params.sessionID)
           yield* session.interrupt(ctx.params.sessionID)
+          // Current-protocol NoContent acknowledges that the HTTP handler
+          // finished. That is NOT proof of Stop when the executor was owned by
+          // another runtime, or cancellation only recorded an interrupt
+          // request. The shared composer/tab/context Stop must not treat an
+          // unchanged generation as successfully quiesced.
+          if (before.ownerID) {
+            const after = yield* executionOwner.snapshot(ctx.params.sessionID)
+            if (stopLeftObservedGenerationOwned(before, after)) {
+              return yield* new InvalidRequestError({
+                message: "Session Stop could not be confirmed; the observed execution generation remains owned",
+              })
+            }
+          }
           return HttpApiSchema.NoContent.make()
         }),
       )

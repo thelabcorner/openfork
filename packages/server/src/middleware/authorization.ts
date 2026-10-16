@@ -6,10 +6,9 @@ export { Authorization } from "@opencode-ai/protocol/middleware/authorization"
 import { hasPtyConnectTicketURL } from "@opencode-ai/protocol/groups/pty"
 import { Effect, Encoding, Layer, Option, Redacted } from "effect"
 import { HttpEffect, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { authChallenge } from "../auth-challenge"
 
 const AUTH_TOKEN_QUERY = "auth_token"
-const WWW_AUTHENTICATE = 'Basic realm="Secure Area"'
-
 function emptyCredential() {
   return { username: "", password: Redacted.make("") }
 }
@@ -91,7 +90,7 @@ export const authorizationLayer = Layer.effect(
         if (ServerAuth.authorized(credential, config)) return yield* effect
         if (yield* deviceAuthorized(url, request, credential, devices)) return yield* effect
         yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-          Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
+          Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", authChallenge({ apiRequest: true }))),
         )
         return yield* new UnauthorizedError({ message: "Authentication required" })
       }),

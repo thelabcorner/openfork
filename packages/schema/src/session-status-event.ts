@@ -29,6 +29,13 @@ export const Info = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("busy"),
   }),
+  // The durable generation remains fenced, but its executor has been proven
+  // absent: either the foreign process is dead or this process has no exact
+  // local activation for the generation. Consumers must offer recovery
+  // controls and must not present it as a live generation.
+  Schema.Struct({
+    type: Schema.Literal("interrupted"),
+  }),
 ]).annotate({ identifier: "SessionStatus" })
 export type Info = Schema.Schema.Type<typeof Info>
 

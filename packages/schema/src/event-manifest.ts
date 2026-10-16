@@ -27,6 +27,7 @@ import { Swarm } from "./swarm"
 import { ServerEvent } from "./server-event"
 import { SessionCompactionEvent } from "./session-compaction-event"
 import { SessionGroup } from "./session-group"
+import { SessionLimitRecovery } from "./session-limit-recovery"
 import { SessionEvent } from "./session-event"
 import { SessionStatusEvent } from "./session-status-event"
 import { SessionTelemetry } from "./session-telemetry"
@@ -71,6 +72,7 @@ export const ServerDefinitions = Event.inventory(
   ...ServerEvent.Definitions,
   ...SessionTodo.Event.Definitions,
   ...SessionGroup.Event.Definitions,
+  ...SessionLimitRecovery.Definitions,
 )
 
 export const Definitions = Event.inventory(
@@ -80,6 +82,7 @@ export const Definitions = Event.inventory(
   ...featureDefinitions,
   ...SessionTodo.Event.Definitions,
   ...SessionGroup.Event.Definitions,
+  ...SessionLimitRecovery.Definitions,
   ...LspEvent.Definitions,
   ...PermissionV1.Event.Definitions,
   ...TuiEvent.Definitions,

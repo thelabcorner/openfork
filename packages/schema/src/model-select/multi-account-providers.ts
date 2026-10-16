@@ -7,7 +7,6 @@ export type MultiAccountProvider = AccountModelProvider & {
   aliasMarkers: readonly string[]
   policies: readonly AutoPolicy[]
   headroomKind: "credits" | "window"
-  autoLabelKey: string
 }
 
 export const MULTI_ACCOUNT_PROVIDERS = {
@@ -18,7 +17,6 @@ export const MULTI_ACCOUNT_PROVIDERS = {
     aliasMarkers: ["#ctx-"],
     policies: ["sticky"],
     headroomKind: "credits",
-    autoLabelKey: "dialog.model.account.auto",
   },
   opencode: {
     id: "opencode",
@@ -27,7 +25,6 @@ export const MULTI_ACCOUNT_PROVIDERS = {
     aliasMarkers: [],
     policies: ["sticky"],
     headroomKind: "window",
-    autoLabelKey: "dialog.model.account.auto",
   },
   "opencode-go": {
     id: "opencode-go",
@@ -36,7 +33,6 @@ export const MULTI_ACCOUNT_PROVIDERS = {
     aliasMarkers: [],
     policies: ["sticky"],
     headroomKind: "window",
-    autoLabelKey: "dialog.model.account.auto",
   },
 } as const satisfies Record<string, MultiAccountProvider>
 

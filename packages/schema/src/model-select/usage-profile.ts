@@ -15,15 +15,60 @@ export type PricingEntry = {
   timeRegime?: "peak" | "off-peak"
 }
 type CacheEntry = { fetchedAt: number; entries: ProfileEntry[] }
+type PricingCacheEntry = { fetchedAt: number; entries: PricingEntry[] }
 
 const SOURCE_URL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
 const CACHE_KEY = "opencode.go-usage-profile.v1"
+const PRICING_CACHE_KEY = "openfork.go-pricing-table.v1"
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const RETRY_AFTER_FAILURE_MS = 60 * 1000
 
 let memoryCache: CacheEntry | undefined
-let inflight: Promise<CacheEntry | undefined> | undefined
-let pricingCache: { fetchedAt: number; entries: PricingEntry[] } | undefined
-let pricingInflight: Promise<PricingEntry[]> | undefined
+let pricingCache: PricingCacheEntry | undefined
+const validCacheTimestamp = (time: number) =>
+  Number.isFinite(time) && time > 0 && time <= Date.now() + 5 * 60_000
+
+function readPricingCache(): PricingCacheEntry | undefined {
+  if (pricingCache) return pricingCache
+  if (typeof localStorage === "undefined") return undefined
+  try {
+    const raw = localStorage.getItem(PRICING_CACHE_KEY)
+    if (!raw) return undefined
+    const parsed = JSON.parse(raw) as PricingCacheEntry
+    // Never treat a malformed persisted object as a fresh pricing document.
+    if (
+      !parsed ||
+      !validCacheTimestamp(parsed.fetchedAt) ||
+      !Array.isArray(parsed.entries) ||
+      parsed.entries.length === 0 ||
+      !parsed.entries.every(
+        (entry) =>
+          entry !== null &&
+          Array.isArray(entry.names) &&
+          entry.names.every((name) => typeof name === "string") &&
+          entry.pricing !== null &&
+          Number.isFinite(entry.pricing?.input) &&
+          Number.isFinite(entry.pricing?.output) &&
+          Number.isFinite(entry.pricing?.cache?.read) &&
+          Number.isFinite(entry.pricing?.cache?.write),
+      )
+    ) return undefined
+    pricingCache = parsed
+    return parsed
+  } catch {
+    return undefined
+  }
+}
+
+function writePricingCache(entry: PricingCacheEntry) {
+  pricingCache = entry
+  if (typeof localStorage === "undefined") return
+  try {
+    localStorage.setItem(PRICING_CACHE_KEY, JSON.stringify(entry))
+  } catch {
+    // Quota/private-mode failure cannot prevent in-memory use of the table.
+  }
+}
 
 function readCache(): CacheEntry | undefined {
   if (memoryCache) return memoryCache
@@ -31,7 +76,24 @@ function readCache(): CacheEntry | undefined {
   try {
     const raw = localStorage.getItem(CACHE_KEY)
     if (!raw) return undefined
-    memoryCache = JSON.parse(raw) as CacheEntry
+    const parsed = JSON.parse(raw) as CacheEntry
+    if (
+      !parsed ||
+      !validCacheTimestamp(parsed.fetchedAt) ||
+      !Array.isArray(parsed.entries) ||
+      parsed.entries.length === 0 ||
+      !parsed.entries.every(
+        (entry) =>
+          entry !== null &&
+          Array.isArray(entry.names) &&
+          entry.names.every((name) => typeof name === "string") &&
+          entry.profile !== null &&
+          Number.isFinite(entry.profile?.input) &&
+          Number.isFinite(entry.profile?.cached) &&
+          Number.isFinite(entry.profile?.output),
+      )
+    ) return undefined
+    memoryCache = parsed
     return memoryCache
   } catch {
     return undefined
@@ -141,17 +203,23 @@ function parsePricingTable(markdown: string): PricingEntry[] {
 export type UsageTables = { profile: ProfileEntry[]; pricing: PricingEntry[] }
 
 let tablesInflight: Promise<UsageTables | undefined> | undefined
+let retryAfterFailure = 0
 
 // Fetches and parses the source doc once, returning both tables. Replaces the
 // previous two independent fetches of the same URL (profile + pricing) so the
 // model selector opens with a single network round-trip and parse pass.
 export async function getUsageTables(): Promise<UsageTables> {
   const cachedProfile = readCache()
-  const cachedPricing = pricingCache
+  const cachedPricing = readPricingCache()
   const profileFresh = cachedProfile && Date.now() - cachedProfile.fetchedAt < CACHE_TTL_MS
   const pricingFresh = cachedPricing && Date.now() - cachedPricing.fetchedAt < CACHE_TTL_MS
   if (profileFresh && pricingFresh) {
     return { profile: cachedProfile!.entries, pricing: cachedPricing!.entries }
+  }
+  // Opening/closing a selector while GitHub is unavailable must not cause
+  // one failed network request per reopen. Keep stale data and bound retries.
+  if (Date.now() < retryAfterFailure && !tablesInflight) {
+    return { profile: cachedProfile?.entries ?? [], pricing: cachedPricing?.entries ?? [] }
   }
   if (!tablesInflight) {
     tablesInflight = fetch(SOURCE_URL)
@@ -159,11 +227,24 @@ export async function getUsageTables(): Promise<UsageTables> {
       .then((markdown) => {
         const profile = parseProfileTable(markdown)
         const pricing = parsePricingTable(markdown)
+        retryAfterFailure =
+          profile.length > 0 && pricing.length > 0 ? 0 : Date.now() + RETRY_AFTER_FAILURE_MS
         if (profile.length > 0) writeCache({ fetchedAt: Date.now(), entries: profile })
-        if (pricing.length > 0) pricingCache = { fetchedAt: Date.now(), entries: pricing }
-        return { profile, pricing }
+        if (pricing.length > 0) writePricingCache({ fetchedAt: Date.now(), entries: pricing })
+        // A successful HTTP response is not necessarily a valid usage-table
+        // revision (upstream documentation can change format independently).
+        // Retain each previous nonempty table until its replacement parses.
+        // Otherwise an unrelated doc edit temporarily resets every model's
+        // corpus/threshold ranking to the empty-table fallback.
+        return {
+          profile: profile.length > 0 ? profile : cachedProfile?.entries ?? [],
+          pricing: pricing.length > 0 ? pricing : cachedPricing?.entries ?? [],
+        }
       })
-      .catch(() => ({ profile: cachedProfile?.entries ?? [], pricing: cachedPricing?.entries ?? [] }))
+      .catch(() => {
+        retryAfterFailure = Date.now() + RETRY_AFTER_FAILURE_MS
+        return { profile: cachedProfile?.entries ?? [], pricing: cachedPricing?.entries ?? [] }
+      })
       .finally(() => {
         tablesInflight = undefined
       })
@@ -175,41 +256,17 @@ export async function getUsageTables(): Promise<UsageTables> {
 export async function getUsageProfileTable(): Promise<ProfileEntry[]> {
   const cached = readCache()
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.entries
-  if (!inflight) {
-    inflight = fetch(SOURCE_URL)
-      .then((res) => (res.ok ? res.text() : Promise.reject(new Error(`status ${res.status}`))))
-      .then((markdown) => {
-        const entries = parseProfileTable(markdown)
-        if (entries.length === 0) return cached
-        const entry: CacheEntry = { fetchedAt: Date.now(), entries }
-        writeCache(entry)
-        return entry
-      })
-      .catch(() => cached)
-      .finally(() => {
-        inflight = undefined
-      })
-  }
-  const result = await inflight
-  return result?.entries ?? cached?.entries ?? []
+  // Both tables are parsed from the same remote document. A concurrent
+  // selector, pricing panel, and Capacity caller must share one request.
+  const tables = await getUsageTables()
+  return tables.profile.length > 0 ? tables.profile : cached?.entries ?? []
 }
 
 export async function getUsagePricingTable(): Promise<PricingEntry[]> {
-  if (pricingCache && Date.now() - pricingCache.fetchedAt < CACHE_TTL_MS) return pricingCache.entries
-  if (!pricingInflight) {
-    pricingInflight = fetch(SOURCE_URL)
-      .then((response) => (response.ok ? response.text() : Promise.reject(new Error(`status ${response.status}`))))
-      .then((markdown) => {
-        const entries = parsePricingTable(markdown)
-        if (entries.length > 0) pricingCache = { fetchedAt: Date.now(), entries }
-        return entries
-      })
-      .catch(() => pricingCache?.entries ?? [])
-      .finally(() => {
-        pricingInflight = undefined
-      })
-  }
-  return pricingInflight
+  const cached = readPricingCache()
+  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.entries
+  const tables = await getUsageTables()
+  return tables.pricing.length > 0 ? tables.pricing : cached?.entries ?? []
 }
 
 const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "")
@@ -279,9 +336,11 @@ export function collectThresholdPricingFromIndex(
   index: ThresholdIndex,
   model: { name: string; family?: string; id: string },
 ): Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: { input: number; output: number; cache: { read: number; write: number } } }> | undefined {
+  // Most catalogs have no published Go-style context tiers; reject the empty
+  // table before normalizing three names for every model in the selector.
+  if (index.length === 0) return undefined
   const candidates = [model.family, model.name, model.id].filter((x): x is string => !!x).map(normalize)
   if (candidates.length === 0) return undefined
-  if (index.length === 0) return undefined
   const matched: Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: ModelCostLike }> = []
   for (const { entry, keys } of index) {
     let hit = false
@@ -297,6 +356,9 @@ export function collectThresholdPricingFromIndex(
         operator: entry.threshold!.operator,
         cost: { input: entry.pricing.input, output: entry.pricing.output, cache: { read: entry.pricing.cache.read, write: entry.pricing.cache.write } },
       })
+      // Exactly two rows must match for a valid tier. A third match proves
+      // this model is ambiguous regardless of any later table entries.
+      if (matched.length > 2) return undefined
     }
   }
   // §8 requires exactly one ≤ and one > with the same threshold token.

@@ -163,6 +163,10 @@ export type AgentsListOutput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
     readonly request: {
       readonly headers: { readonly [x: string]: string }
@@ -295,6 +299,10 @@ export type SessionsListOutput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
     readonly cost: number
     readonly tokens: {
@@ -375,6 +383,10 @@ export type SessionsSearchOutput = {
         readonly providerID: string
         readonly accountID?: string
         readonly variant?: string
+        readonly routeIntent?:
+          | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+          | { readonly kind: "public" }
+          | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
       }
       readonly cost: number
       readonly tokens: {
@@ -433,6 +445,10 @@ export type SessionsCreateInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["id"]
@@ -444,6 +460,10 @@ export type SessionsCreateInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["agent"]
@@ -455,6 +475,10 @@ export type SessionsCreateInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["model"]
@@ -466,6 +490,10 @@ export type SessionsCreateInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly location?: { readonly directory: string; readonly workspaceID?: string } | null
   }["location"]
@@ -482,6 +510,10 @@ export type SessionsCreateOutput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
     readonly cost: number
     readonly tokens: {
@@ -527,11 +559,15 @@ export type SessionsTelemetryOutput = {
       readonly turnStartedAt?: number | undefined
       readonly phaseStartedAt?: number | undefined
       readonly updatedAt: number
+      readonly isCompaction?: boolean | undefined
+      readonly turnElapsedMs?: number | undefined
+      readonly phaseElapsedMs?: number | undefined
       readonly sampledAt?: number | undefined
       readonly model?:
         | {
             readonly providerID: string
             readonly modelID: string
+            readonly accountID?: string | undefined
             readonly name?: string | undefined
             readonly variant?: string | undefined
             readonly contextLimit?: number | undefined
@@ -542,6 +578,7 @@ export type SessionsTelemetryOutput = {
             readonly model: {
               readonly providerID: string
               readonly modelID: string
+              readonly accountID?: string | undefined
               readonly name?: string | undefined
               readonly variant?: string | undefined
               readonly contextLimit?: number | undefined
@@ -595,6 +632,10 @@ export type SessionsGetOutput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
     readonly cost: number
     readonly tokens: {
@@ -639,6 +680,10 @@ export type SessionsSwitchModelInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
   }["model"]
 }
@@ -832,6 +877,10 @@ export type SessionsContextOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
       }
     | {
@@ -918,6 +967,10 @@ export type SessionsContextOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
@@ -1071,6 +1124,10 @@ export type SessionsHistoryOutput = {
             readonly providerID: string
             readonly accountID?: string
             readonly variant?: string
+            readonly routeIntent?:
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
         }
       }
@@ -1196,9 +1253,13 @@ export type SessionsHistoryOutput = {
               readonly providerID: string
               readonly accountID?: string
               readonly variant?: string
+              readonly routeIntent?:
+                | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+                | { readonly kind: "public" }
+                | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
             }
             readonly routeIntent?:
-              | { readonly kind: "auto" }
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1243,9 +1304,13 @@ export type SessionsHistoryOutput = {
               readonly providerID: string
               readonly accountID?: string
               readonly variant?: string
+              readonly routeIntent?:
+                | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+                | { readonly kind: "public" }
+                | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
             }
             readonly routeIntent?:
-              | { readonly kind: "auto" }
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
               | { readonly kind: "public" }
               | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
@@ -1267,6 +1332,14 @@ export type SessionsHistoryOutput = {
           readonly messageID: string
           readonly reason: "cancelled" | "superseded" | "user_superseded" | "expired" | "policy"
         }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.input.completed"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string; readonly messageID: string }
       }
     | {
         readonly id: string
@@ -1346,6 +1419,10 @@ export type SessionsHistoryOutput = {
             readonly providerID: string
             readonly accountID?: string
             readonly variant?: string
+            readonly routeIntent?:
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly snapshot?: string
           readonly requestSentAt?: number
@@ -1760,6 +1837,10 @@ export type SessionsEventsOutput =
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
       }
     }
@@ -1885,9 +1966,13 @@ export type SessionsEventsOutput =
             readonly providerID: string
             readonly accountID?: string
             readonly variant?: string
+            readonly routeIntent?:
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly routeIntent?:
-            | { readonly kind: "auto" }
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -1932,9 +2017,13 @@ export type SessionsEventsOutput =
             readonly providerID: string
             readonly accountID?: string
             readonly variant?: string
+            readonly routeIntent?:
+              | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+              | { readonly kind: "public" }
+              | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
           }
           readonly routeIntent?:
-            | { readonly kind: "auto" }
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
             | { readonly kind: "public" }
             | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
@@ -1956,6 +2045,14 @@ export type SessionsEventsOutput =
         readonly messageID: string
         readonly reason: "cancelled" | "superseded" | "user_superseded" | "expired" | "policy"
       }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.input.completed"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string; readonly messageID: string }
     }
   | {
       readonly id: string
@@ -2035,6 +2132,10 @@ export type SessionsEventsOutput =
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly snapshot?: string
         readonly requestSentAt?: number
@@ -2414,6 +2515,10 @@ export type SessionsRegenerateTitleInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly prompt?: string | null
   }["model"]
@@ -2423,6 +2528,10 @@ export type SessionsRegenerateTitleInput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     } | null
     readonly prompt?: string | null
   }["prompt"]
@@ -2472,6 +2581,10 @@ export type SessionsMessageOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
       }
     | {
@@ -2558,6 +2671,10 @@ export type SessionsMessageOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
@@ -2857,6 +2974,10 @@ export type MessagesListOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
       }
     | {
@@ -2943,6 +3064,10 @@ export type MessagesListOutput = {
           readonly providerID: string
           readonly accountID?: string
           readonly variant?: string
+          readonly routeIntent?:
+            | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+            | { readonly kind: "public" }
+            | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
         }
         readonly content: ReadonlyArray<
           | { readonly type: "text"; readonly id: string; readonly text: string }
@@ -3040,6 +3165,12 @@ export type MessagesListOutput = {
         readonly time: { readonly created: number }
       }
   >
+  readonly windowed: ReadonlyArray<{
+    readonly messageID: string
+    readonly omittedContentItems: number | "Infinity" | "-Infinity" | "NaN"
+    readonly truncatedStrings: number | "Infinity" | "-Infinity" | "NaN"
+  }>
+  readonly bytes: number | "Infinity" | "-Infinity" | "NaN"
   readonly cursor: { readonly previous?: string | null; readonly next?: string | null }
 }
 
@@ -3725,6 +3856,10 @@ export type CommandsListOutput = {
       readonly providerID: string
       readonly accountID?: string
       readonly variant?: string
+      readonly routeIntent?:
+        | { readonly kind: "auto"; readonly strategy?: "adaptive" | "round-robin" }
+        | { readonly kind: "public" }
+        | { readonly kind: "account"; readonly accountID: string; readonly pin?: "hard" | "soft" }
     }
     readonly subtask?: boolean
   }>
