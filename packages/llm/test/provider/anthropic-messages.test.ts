@@ -59,17 +59,19 @@ describe("Anthropic Messages route", () => {
 
   it.effect("sends interleaved-thinking beta header and beta endpoint for native Anthropic", () =>
     Effect.gen(function* () {
-      let url = ""
-      let beta: string | null = null
-      let version: string | null = null
+      const observed: { url: string; beta: string | null; version: string | null } = {
+        url: "",
+        beta: null,
+        version: null,
+      }
       yield* LLMClient.generate(request).pipe(
         Effect.provide(
           dynamicResponse((input) =>
             Effect.gen(function* () {
               const web = yield* HttpClientRequest.toWeb(input.request).pipe(Effect.orDie)
-              url = web.url
-              beta = web.headers.get("anthropic-beta")
-              version = web.headers.get("anthropic-version")
+              observed.url = web.url
+              observed.beta = web.headers.get("anthropic-beta")
+              observed.version = web.headers.get("anthropic-version")
               return input.respond(
                 sseEvents(
                   { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
@@ -85,9 +87,9 @@ describe("Anthropic Messages route", () => {
         ),
       )
 
-      expect(url).toContain("/messages?beta=true")
-      expect(version).toBe("2023-06-01")
-      expect(beta?.split(",") ?? []).toContain("interleaved-thinking-2025-05-14")
+      expect(observed.url).toContain("/messages?beta=true")
+      expect(observed.version).toBe("2023-06-01")
+      expect(observed.beta?.split(",") ?? []).toContain("interleaved-thinking-2025-05-14")
     }),
   )
 
