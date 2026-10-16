@@ -1,160 +1,204 @@
-import { HoverCard as Kobalte } from "@kobalte/core/hover-card"
-import { createMemo, createSignal, type JSXElement } from "solid-js"
-import type { ServerCtx } from "@/context/global"
-import { ServerConnection } from "@/context/server"
+import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { Portal } from "solid-js/web"
 import { useSessionGroups } from "@/context/session-groups"
-import { SessionPreviewCard, type SessionPreviewData } from "@/components/session-preview/session-preview-card"
-import {
-  buildSessionPreviewIndex,
-  sessionPreviewGroupOnly,
-  sessionPreviewRelationships,
-  type SessionPreviewRelationships,
-} from "@/components/session-preview/session-preview-model"
+import { useServer } from "@/context/server"
+import { previewGroupScopeMatches } from "@/context/session-group-preview-index"
+import { useTabs, tabKey } from "@/context/tabs"
+import { displayName, projectForSessionIndexed } from "@/pages/layout/helpers"
+import { SessionPreviewCard } from "@/components/session-preview/session-preview-card"
+import type { SessionPreviewRelationships } from "@/components/session-preview/session-preview-model"
+import { sessionPreviewProjectionCache } from "@/components/session-preview/session-preview-cache"
+import type { TabPreviewIntent } from "./titlebar-tab-preview-controller"
 import "./titlebar-tab-popover.css"
 
-// Initial hover delay before the preview appears, per design.
-const OPEN_DELAY = 450
-// Interactive previews need enough grace to cross the small trigger/content
-// gutter without feeling sticky after the pointer genuinely leaves.
-const CLOSE_DELAY = 140
-// After a preview closes, hovering a neighbouring tab within this window skips
-// the open delay — mirrors the tooltip's skipDelayDuration so moving across
-// tabs doesn't re-wait the full delay each time.
-const SKIP_WINDOW = 500
-let lastClosedAt = 0
-
-export type TabPreviewData = SessionPreviewData
-
 /**
- * Kobalte HoverCard adapter around the canonical `SessionPreviewCard`.
- *
- * This component owns only positioning/animation/open-close choreography
- * (skip-window, warm streak, context-menu-open blocking a premature close).
- * All relationship classification and presentation live in the shared
- * `session-preview-model`/`SessionPreviewCard` used by both the titlebar and
- * the Chat Sidebar's pooled hover controller.
- *
- * The SessionGroup snapshot this reads is the same reactive query the Chat
- * Sidebar uses; because this component itself is lazy-imported and only
- * mounted after the tab's hover-delay bootstrap fires, opening it is the
- * first moment that query activates for the titlebar surface.
+ * One mounted SessionPreviewCard and one Portal for the entire tab strip.
+ * The pointer controller switches intent; no hover-card providers or wrapper
+ * elements are ever installed around individual tab links/actions.
  */
 export function TabPreviewPopover(props: {
-  trigger: JSXElement
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  data: TabPreviewData
-  server?: ServerConnection.Key
-  serverCtx?: () => ServerCtx | undefined
-  currentSessionID?: string
-  /** Group tabs describe a SessionGroup directly instead of one Session's memberships. */
-  groupID?: string
+  intent: () => TabPreviewIntent | undefined
+  onContentEnter: () => void
+  onContentLeave: () => void
+  onContextMenuOpenChange: (open: boolean) => void
+  onClose: () => void
 }) {
   const sessionGroups = useSessionGroups()
-  let triggerEl: HTMLDivElement | undefined
-  let contentEl: HTMLDivElement | undefined
-
-  // When opened during a rapid tab-hopping streak, this preview appears and
-  // disappears instantly (no repeated enter/exit animation) — only the first,
-  // "cold" preview animates. Mirrors how browsers reuse one tab tooltip.
-  const [instant, setInstant] = createSignal(false)
-  const [contextMenuOpen, setContextMenuOpen] = createSignal(false)
-
-  const index = createMemo(() => buildSessionPreviewIndex(sessionGroups.list()))
-  const relationships = createMemo<SessionPreviewRelationships | undefined>(() => {
-    if (props.currentSessionID) {
-      return sessionPreviewRelationships({
-        sessionID: props.currentSessionID,
-        groups: sessionGroups.list(),
-        index: index(),
-      })
-    }
-    if (props.groupID) {
-      const group = sessionGroups.byID(props.groupID)
-      return group ? { sections: [sessionPreviewGroupOnly(group)], specialAgents: [] } : undefined
-    }
-    return undefined
+  const selectedServer = useServer()
+  const tabs = useTabs()
+  const intent = props.intent
+  const previewActive = createMemo(() => !!intent())
+  const tab = () => intent()?.tab
+  // Memoizing the *scope keys*, not the whole hover intent, prevents remote
+  // snapshot/observer churn while moving between tabs on the same server.
+  const server = createMemo(() => tab()?.server)
+  const serverCtx = () => intent()?.serverCtx()
+  const sessionID = createMemo(() => {
+    const value = tab()
+    return value?.type === "session" ? value.sessionId : undefined
   })
-  // Mouse-interactable (pointer-events + Kobalte's safe-area cursor bridge)
-  // whenever there is a server to navigate against — NOT gated on whether
-  // relationships exist. A standalone session's preview is header-only but
-  // still needs the safe-area bridge, or the pointer leaving the trigger for
-  // the small trigger/content gutter reads as "left the hover zone" and
-  // Kobalte closes it before the cursor ever reaches the card.
-  const interactive = createMemo(() => !!props.server)
-
-  // ---- Open/close lifecycle ---------------------------------------------
-  const warm = () => Date.now() - lastClosedAt < SKIP_WINDOW
-  // Kobalte reads openDelay lazily when the pointer enters the trigger, so this
-  // resolves the skip window per-hover.
-  const resolveOpenDelay = () => (warm() ? 0 : OPEN_DELAY)
-  const handleOpenChange = (open: boolean) => {
-    // A context menu is portalled outside the hover-card subtree. Keep this
-    // owner mounted while that menu is open or moving the pointer into the menu
-    // would dispose the row (and therefore the menu) underneath the user.
-    if (!open && contextMenuOpen()) return
-    if (open) setInstant(warm())
-    else lastClosedAt = Date.now()
-    props.onOpenChange(open)
+  const groupID = createMemo(() => {
+    const value = tab()
+    return value?.type === "group" ? value.groupId : undefined
+  })
+  const previewKey = () => {
+    const value = tab()
+    return value ? [value.server, value.type, value.type === "session" ? value.sessionId : value.groupId].join(":") : undefined
   }
+  const groupScopeMatches = createMemo(() => previewGroupScopeMatches(server(), selectedServer.key))
+  const activeSelectedServer = createMemo(() => previewActive() && groupScopeMatches())
+  createEffect(() => {
+    if (activeSelectedServer()) sessionGroups.activateUrgent()
+  })
+  const remoteGroups = createMemo(() => {
+    const key = server()
+    if (!previewActive() || groupScopeMatches() || !key) return
+    return sessionGroups.remotePreview(key)
+  })
+  createEffect(() => {
+    const key = server()
+    if (!previewActive() || groupScopeMatches() || !key) return
+    onCleanup(sessionGroups.observeRemotePreview(key))
+  })
+  const index = createMemo(() => {
+    if (!sessionID()) return
+    if (groupScopeMatches()) return sessionGroups.previewIndex()
+    const groups = remoteGroups()
+    return groups ? sessionGroups.remotePreviewIndex(groups) : undefined
+  })
+  const selectedGroup = createMemo(() => {
+    const id = groupID()
+    if (!id) return
+    return groupScopeMatches()
+      ? sessionGroups.byID(id)
+      : remoteGroups()?.find((value) => value.id === id)
+  })
+  const relationships = createMemo<SessionPreviewRelationships | undefined>(() => {
+    if (!intent()) return
+    const id = sessionID()
+    if (id) {
+      const groups = groupScopeMatches() ? sessionGroups.list() : remoteGroups()
+      const idx = index()
+      if (!groups || !idx) return
+      return sessionPreviewProjectionCache.session({ sessionID: id, groups, index: idx })
+    }
+    const group = selectedGroup()
+    return group ? { sections: [sessionPreviewProjectionCache.group(group)], specialAgents: [] } : undefined
+  })
+  const data = createMemo(() => {
+    const value = tab()
+    if (!value) return {}
+    if (value.type === "group") {
+      return { title: selectedGroup()?.name ?? tabs.info[tabKey(value)]?.title }
+    }
+    const ctx = serverCtx()
+    const session = ctx?.sync.session.peek(value.sessionId)
+    const project = session && projectForSessionIndexed(session, ctx?.projects.index())
+    const home = ctx?.sync.data.path.home
+    return {
+      title: session?.title ?? tabs.info[tabKey(value)]?.title,
+      directory: session?.directory,
+      project,
+      projectName: session ? displayName(project ?? { worktree: session.directory }) : undefined,
+      path: session ? (home ? session.directory.replace(home, "~") : session.directory) : undefined,
+      serverName: intent()?.serverLabel(),
+    }
+  })
 
-  const handleContextMenuOpenChange = (open: boolean) => {
-    setContextMenuOpen(open)
-    if (open) {
-      props.onOpenChange(true)
+  let contentEl: HTMLDivElement | undefined
+  let positionFrame = 0
+  const [position, setPosition] = createSignal<{ x: number; y: number }>()
+  const updatePosition = () => {
+    const current = intent()
+    if (!current || !current.anchor.isConnected) {
+      if (current) props.onClose()
       return
     }
-    // If the pointer returned to the preview while the menu was open, let the
-    // normal hover lifecycle retain it. Otherwise close immediately after the
-    // menu is dismissed instead of leaving an orphaned preview on screen.
-    requestAnimationFrame(() => {
-      if (triggerEl?.matches(":hover") || contentEl?.matches(":hover")) return
-      lastClosedAt = Date.now()
-      props.onOpenChange(false)
+    const rect = current.anchor.getBoundingClientRect()
+    const size = contentEl?.getBoundingClientRect()
+    const width = size?.width || 320
+    const height = size?.height || 160
+    const margin = 8
+    const x = Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin))
+    let y = rect.bottom + 6
+    if (y + height > window.innerHeight - margin) y = rect.top - height - 6
+    y = Math.max(margin, Math.min(y, window.innerHeight - height - margin))
+    const next = { x: Math.round(x), y: Math.round(y) }
+    const previous = position()
+    if (previous?.x === next.x && previous.y === next.y) return
+    setPosition(next)
+  }
+  const queuePosition = () => {
+    if (positionFrame) return
+    positionFrame = requestAnimationFrame(() => {
+      positionFrame = 0
+      updatePosition()
     })
   }
+  createEffect(() => {
+    const current = intent()
+    if (!current) {
+      setPosition(undefined)
+      return
+    }
+    // The same DOM node is repositioned on a new tab, never re-created.
+    const theme = current.anchor.closest("[data-theme]")?.getAttribute("data-theme")
+    if (contentEl && theme) contentEl.setAttribute("data-theme", theme)
+    setPosition(undefined)
+    queuePosition()
+  })
+  // Dormant previews retain one card/virtualizer without retaining global
+  // geometry listeners. A boolean memo also avoids listener churn when the
+  // inspector is repopulated while moving rapidly between neighboring tabs.
+  createEffect(() => {
+    if (!previewActive()) return
+    const onGeometryChange = () => queuePosition()
+    window.addEventListener("resize", onGeometryChange, { passive: true })
+    window.addEventListener("scroll", onGeometryChange, { capture: true, passive: true })
+    onCleanup(() => {
+      window.removeEventListener("resize", onGeometryChange)
+      window.removeEventListener("scroll", onGeometryChange, true)
+    })
+  })
+  onCleanup(() => {
+    if (positionFrame) cancelAnimationFrame(positionFrame)
+  })
 
   return (
-    <Kobalte
-      open={props.open}
-      onOpenChange={handleOpenChange}
-      openDelay={resolveOpenDelay()}
-      closeDelay={CLOSE_DELAY}
-      // Decorative previews can disappear as soon as the trigger is left.
-      // Interactive previews are, so preserve Kobalte's safe-area bridge
-      // between the tab and the portalled card.
-      ignoreSafeArea={!interactive()}
-      placement="bottom-start"
-      gutter={6}
-    >
-      <Kobalte.Trigger ref={triggerEl} as="div" data-component="session-tab-popover-trigger" tabIndex={-1}>
-        {props.trigger}
-      </Kobalte.Trigger>
-      <Kobalte.Portal>
-        <Kobalte.Content
+    <Portal>
+        <div
           ref={(el) => {
             contentEl = el
-            // Portalled content lives outside the themed subtree, so mirror the
-            // active theme like the v2 tooltip does.
-            const theme = triggerEl?.closest("[data-theme]")?.getAttribute("data-theme")
+            const theme = intent()?.anchor.closest("[data-theme]")?.getAttribute("data-theme")
             if (theme) el.setAttribute("data-theme", theme)
+            queuePosition()
           }}
           data-component="session-tab-popover"
-          data-interactive={interactive() || undefined}
-          data-instant={instant() || undefined}
+          data-interactive
+          style={{
+            display: intent() ? "block" : "none",
+            position: "fixed",
+            left: `${position()?.x ?? 0}px`,
+            top: `${position()?.y ?? 0}px`,
+            visibility: position() ? "visible" : "hidden",
+            "max-height": "calc(100vh - 16px)",
+            "max-width": "calc(100vw - 16px)",
+          }}
+          onPointerEnter={props.onContentEnter}
+          onPointerLeave={props.onContentLeave}
         >
           <SessionPreviewCard
-            data={props.data}
+            data={data()}
             relationships={relationships}
-            currentSessionID={props.currentSessionID}
-            server={props.server}
-            serverCtx={props.serverCtx}
-            active={() => props.open}
-            onOpenSession={() => props.onOpenChange(false)}
-            onRowContextMenuOpenChange={handleContextMenuOpenChange}
+            currentSessionID={sessionID()}
+            previewKey={previewKey()}
+            server={server()}
+            serverCtx={serverCtx}
+            active={() => !!intent()}
+            onOpenSession={props.onClose}
+            onRowContextMenuOpenChange={props.onContextMenuOpenChange}
           />
-        </Kobalte.Content>
-      </Kobalte.Portal>
-    </Kobalte>
+        </div>
+    </Portal>
   )
 }

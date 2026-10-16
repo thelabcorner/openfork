@@ -25,6 +25,34 @@ export function appTabBaseHref(page: AppTabPage) {
   return `/${page}`
 }
 
+/** OXP parent activity is a durable identity, not a singleton page selection. */
+export function oxpActivityIDFromPathname(pathname: string): string | undefined {
+  const segments = pathname.split("/").filter(Boolean)
+  if (segments.length !== 3 || segments[0] !== "oxp" || segments[1] !== "activity" || !segments[2]) return
+  try {
+    return decodeURIComponent(segments[2])
+  } catch {
+    return
+  }
+}
+
+export function oxpActivityIDFromHref(href?: string): string | undefined {
+  return oxpActivityIDFromPathname(href?.split(/[?#]/, 1)[0] ?? "")
+}
+
+/**
+ * Application tabs normally have one identity per page. OXP detail routes are
+ * different: a parent activity is a separate reader/tab, just like a Session.
+ * Query/hash changes must never create additional tabs for the same activity.
+ */
+export function appTabKey(page: AppTabPage, href?: string) {
+  if (page !== "oxp") return `app:${page}`
+  // The tab store validates hrefs on write and restore. This is a hot identity
+  // lookup: avoid a URL allocation for each tab on selection, drag and sorting.
+  const activityID = oxpActivityIDFromHref(href)
+  return activityID ? `app:oxp:${encodeURIComponent(activityID)}` : "app:oxp"
+}
+
 /**
  * App-tab hrefs are persisted and later fed back into the router. Keep them
  * internal and pinned to the tab's own surface so corrupted/stale persisted
