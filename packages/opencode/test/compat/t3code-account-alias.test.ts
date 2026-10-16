@@ -70,7 +70,7 @@ describe("T3 Code account-qualified model aliases (retained v1 path)", () => {
     ])
 
     // 1. OpenFork emits the alias into GET /provider.
-    const aliasIDs = Object.keys(projected.providers[providerID]!.models).filter((id) =>
+    const aliasIDs = Object.keys(modelsOf(projected, providerID)).filter((id) =>
       id.includes(T3_CODE_ACCOUNT_MODEL_MARKER),
     )
     expect(aliasIDs).toHaveLength(1)
@@ -98,7 +98,7 @@ describe("T3 Code account-qualified model aliases (retained v1 path)", () => {
       row(provider, model, "opencode-account:beta", "Beta"),
     ])
 
-    const resolved = Object.keys(projected.providers[providerID]!.models).map((id) =>
+    const resolved = Object.keys(modelsOf(projected, providerID)).map((id) =>
       canonicalT3CodeModelRef({ providerID, modelID: id }, environment).accountID,
     )
     // Dedup is by PHYSICAL account identity, never by provider family, so both
@@ -107,7 +107,7 @@ describe("T3 Code account-qualified model aliases (retained v1 path)", () => {
       "opencode-account:alpha",
       "opencode-account:beta",
     ])
-    expect(Object.keys(projected.providers[providerID]!.models)).toContain(baseModelID)
+    expect(Object.keys(modelsOf(projected, providerID))).toContain(baseModelID)
   })
 
   test("is idempotent so repeated catalog reads cannot duplicate alias rows", () => {
@@ -118,8 +118,8 @@ describe("T3 Code account-qualified model aliases (retained v1 path)", () => {
     const once = projectT3CodeAccountModels({ [providerID]: provider } as any, rows)
     const twice = projectT3CodeAccountModels(once.providers as any, rows)
 
-    expect(Object.keys(twice.providers[providerID]!.models).sort()).toEqual(
-      Object.keys(once.providers[providerID]!.models).sort(),
+    expect(Object.keys(modelsOf(twice, providerID)).sort()).toEqual(
+      Object.keys(modelsOf(once, providerID)).sort(),
     )
   })
 
@@ -165,8 +165,8 @@ describe("T3 Code account-qualified model aliases (retained v1 path)", () => {
 
     // The account-neutral base row must survive untouched, so default model
     // resolution can never be captured by an account-qualified alias.
-    expect(projected.providers[providerID]!.models[baseModelID]).toBeDefined()
-    expect(projected.providers[providerID]!.models[baseModelID]).toEqual(model)
+    expect(modelsOf(projected, providerID)[baseModelID]).toBeDefined()
+    expect(modelsOf(projected, providerID)[baseModelID]).toEqual(model)
     expect(before).toEqual([baseModelID])
   })
 

@@ -138,7 +138,7 @@ describe("audited legacy operation matrix over real HTTP", () => {
     const body = response.json as Record<string, unknown>
     expect(typeof body).toBe("object")
     for (const status of Object.values(body)) {
-      expect(["idle", "busy", "retry"]).toContain((status as { type?: string }).type)
+      expect(["idle", "busy", "retry"]).toContain((status as { type?: string }).type ?? "")
     }
   })
 

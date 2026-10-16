@@ -229,7 +229,7 @@ describe("the compatibility projection never writes back into the canonical cata
       env: [],
       options: {},
       models: { [modelID]: model },
-    } as never
+    }
     const providers = { [providerID]: provider } as never
     const before = JSON.stringify(providers)
 
