@@ -100,6 +100,179 @@ const waitFor = <A>(effect: Effect.Effect<A | undefined, unknown, never>) =>
   })
 
 describe("ScheduledTaskRunner", () => {
+  it.effect("long-lived host reclaims a crashed foreign peer without restarting its own runner", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0)
+      const tasks = yield* ScheduledTask.Service
+      const runner = yield* ScheduledTaskRunner.Service
+      const { db } = yield* Database.Service
+      yield* runner.start({ startupGraceMs: 0 })
+      const task = yield* tasks.create(createInput({ name: "crashed-foreign-worker" }))
+      const fireFor = task.nextRunAt!
+      yield* db.insert(ScheduledTaskLeaseTable).values({
+        task_id: task.id,
+        lease_id: "dead-foreign-generation",
+        owner: "scheduled-owner:other-process",
+        acquired_at: T0 - 600_000,
+        heartbeat_at: T0 - 600_000,
+        fire_for: fireFor,
+        attempt: 1,
+      }).run().pipe(Effect.orDie)
+      yield* db.insert(ScheduledTaskRunTable).values({
+        id: ScheduledTaskModel.RunID.create(),
+        task_id: task.id,
+        fire_for: fireFor,
+        status: "running",
+        trigger: "schedule",
+        attempt: 1,
+        started_at: T0 - 600_000,
+      }).run().pipe(Effect.orDie)
+      yield* TestClock.adjust(60_000)
+      yield* waitFor(
+        Effect.gen(function* () {
+          const rows = yield* tasks.listRuns({ taskID: task.id })
+          return rows[0]?.status === "abandoned" ? true : undefined
+        }),
+      )
+      const lease = yield* db.select().from(ScheduledTaskLeaseTable)
+        .where(eq(ScheduledTaskLeaseTable.task_id, task.id)).get().pipe(Effect.orDie)
+      expect(lease?.owner).toBeNull()
+      expect((yield* tasks.listRuns({ taskID: task.id }))[0]?.status).toBe("abandoned")
+      expect(executorCalls).toHaveLength(0)
+    }),
+  )
+
+  it.effect("a revoked heartbeat interrupts execution and refuses stale success settlement", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0)
+      const tasks = yield* ScheduledTask.Service
+      const runner = yield* ScheduledTaskRunner.Service
+      const { db } = yield* Database.Service
+      const task = yield* tasks.create(createInput({
+        name: "revoked-lease-stops-execution",
+        schedule: { kind: "once", at: T0 + 1000 },
+      }))
+      const entered = yield* Deferred.make<void>()
+      const blocked = yield* Deferred.make<void>()
+      let finished = false
+      executorHook = () => Effect.gen(function* () {
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(blocked)
+        finished = true
+        return { status: "succeeded" as const }
+      })
+      yield* runner.start({ startupGraceMs: 0 })
+      yield* TestClock.setTime(task.nextRunAt!)
+      yield* runner.poke()
+      yield* Deferred.await(entered)
+      yield* db.update(ScheduledTaskLeaseTable)
+        .set({ owner: "other-runtime-generation" })
+        .where(eq(ScheduledTaskLeaseTable.task_id, task.id))
+        .run().pipe(Effect.orDie)
+      yield* TestClock.adjust(ScheduledTaskLease.HEARTBEAT_INTERVAL_MS + 100)
+      yield* waitFor(
+        Effect.gen(function* () {
+          const active = yield* runner.activeRuns()
+          return active === 0 ? true : undefined
+        }),
+      )
+      expect(finished).toBe(false)
+      expect((yield* tasks.listRuns({ taskID: task.id }))[0]?.status).toBe("running")
+      expect(executorCalls).toHaveLength(1)
+    }),
+  )
+
+  it.effect("startup does not steal a live lease from a sibling graph using the same process owner", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0)
+      const tasks = yield* ScheduledTask.Service
+      const leases = yield* ScheduledTaskLease.Service
+      const runner = yield* ScheduledTaskRunner.Service
+      const task = yield* tasks.create(createInput({ name: "sibling-live-lease" }))
+      const lease = yield* leases.claim({ taskID: task.id, fireFor: task.nextRunAt!, now: T0 })
+      expect(lease).toBeDefined()
+      yield* runner.start({ startupGraceMs: 0 })
+      const surviving = yield* leases.held()
+      expect(surviving).toEqual([expect.objectContaining({ leaseID: lease!.leaseID })])
+      expect(yield* runner.activeRuns()).toBe(0)
+      expect(executorCalls).toHaveLength(0)
+      yield* leases.release({ leaseID: lease!.leaseID })
+    }),
+  )
+
+  it.effect("startup fence: queued events and manual pokes cannot dispatch before lease recovery", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0)
+      const tasks = yield* ScheduledTask.Service
+      const runner = yield* ScheduledTaskRunner.Service
+      const created = yield* tasks.create(createInput({
+        schedule: { kind: "once", at: T0 + 10_000 },
+      }))
+
+      // The normal auto-start still has its 30s grace. Advance only 10s,
+      // deliberately making this task due before recovery can run.
+      yield* TestClock.setTime(T0 + 10_000)
+      yield* runner.poke()
+      expect(yield* runner.activeTimerCount()).toBe(0)
+      expect(yield* runner.activeRuns()).toBe(0)
+      expect(executorCalls).toHaveLength(0)
+      expect(yield* tasks.listRuns({ taskID: created.id })).toHaveLength(0)
+
+      // Explicit recovery is the one entry point that activates the scheduler.
+      yield* runner.start({ startupGraceMs: 0 })
+      const runs = yield* waitFor(
+        Effect.gen(function* () {
+          const rows = yield* tasks.listRuns({ taskID: created.id })
+          return rows.some((row) => row.status === "succeeded") ? rows : undefined
+        }),
+      )
+      expect(runs).toHaveLength(1)
+      expect(executorCalls).toHaveLength(1)
+      yield* runner.poke()
+      expect(yield* tasks.listRuns({ taskID: created.id })).toHaveLength(1)
+    }),
+  )
+
+  it.effect("lost lease during a running task never permits stale-owner success settlement", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(T0)
+      const tasks = yield* ScheduledTask.Service
+      const runner = yield* ScheduledTaskRunner.Service
+      const { db } = yield* Database.Service
+      const entered = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      executorHook = () => Effect.gen(function* () {
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(finish)
+        return { status: "succeeded" as const }
+      })
+      const created = yield* tasks.create(createInput())
+      yield* runner.start({ startupGraceMs: 0 })
+      yield* TestClock.setTime(created.nextRunAt!)
+      yield* runner.poke()
+      yield* Deferred.await(entered)
+
+      // Model an authoritative lease transfer while the older executor still
+      // has local work. This is not a permitted claim path; it tests failure
+      // containment when external state invalidates an owner's CAS.
+      yield* db.update(ScheduledTaskLeaseTable)
+        .set({ owner: "another-runtime-generation" })
+        .where(eq(ScheduledTaskLeaseTable.task_id, created.id))
+        .run().pipe(Effect.orDie)
+      yield* TestClock.adjust(ScheduledTaskLease.HEARTBEAT_INTERVAL_MS + 1_000)
+      for (let turn = 0; turn < 10; turn++) yield* Effect.yieldNow
+      yield* Deferred.succeed(finish, undefined)
+      yield* waitFor(
+        runner.activeRuns().pipe(Effect.map((count) => count === 0 ? true : undefined)),
+      )
+      const runs = yield* tasks.listRuns({ taskID: created.id })
+      expect(runs).toHaveLength(1)
+      // This owner must not stamp success after losing the exact lease.
+      expect(runs[0]?.status).toBe("running")
+      expect(executorCalls).toHaveLength(1)
+    }),
+  )
+
   it.effect("D4/N2: 200 tasks and the idle reconciliation floor still own exactly one timer", () =>
     Effect.gen(function* () {
       const tasks = yield* ScheduledTask.Service

@@ -20,6 +20,7 @@ import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { Agent as AgentModel } from "@opencode-ai/schema/agent"
 import { Swarm } from "@opencode-ai/schema/swarm"
 import { SwarmRecovery } from "@/swarm/recovery"
+import { SwarmContainment } from "@/swarm/containment"
 import { testEffect } from "../lib/effect"
 
 const currentID = "runtime-owner:recovery-current" as RuntimeOwner.ID
@@ -49,7 +50,7 @@ const runtimeLayer = Layer.succeed(
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, EventV2.node, SwarmV2.node, RuntimeOwner.node, SwarmRecovery.node]),
+    LayerNode.group([Database.node, EventV2.node, SwarmV2.node, RuntimeOwner.node, SwarmContainment.node, SwarmRecovery.node]),
     [
       [Database.node, Database.layerFromPath(":memory:")],
       [RuntimeOwner.node, runtimeLayer],
@@ -176,6 +177,25 @@ const lease = (db: Effect.Success<typeof setup>["db"], taskID: Swarm.TaskID) =>
     .pipe(Effect.orDie)
 
 describe("SwarmRecovery", () => {
+  for (const sessions of [1, 3, 6]) it.effect(`coalesces aggregate age scans across ${sessions} sessions' repeated operational wakes`, () =>
+    Effect.gen(function* () {
+      const state = yield* setup
+      const containment = yield* SwarmContainment.Service
+      const original = containment.reconcile
+      let scans = 0
+      Object.defineProperty(containment, "reconcile", { configurable: true, value: (input: Parameters<typeof original>[0]) => {
+        scans++
+        return original(input)
+      } })
+      yield* Effect.gen(function* () {
+        for (let wake = 0; wake < sessions * 20; wake++) yield* state.recovery.reconcile({ now: 10_000 + wake })
+        expect(scans).toBe(1)
+        yield* state.recovery.reconcile({ now: 10_000 + SwarmRecovery.AGGREGATE_RECHECK_MS })
+        expect(scans).toBe(2)
+      }).pipe(Effect.ensuring(Effect.sync(() => Object.defineProperty(containment, "reconcile", { configurable: true, value: original }))))
+    }),
+  )
+
   it.effect("uses heartbeat only as suspicion and proven death as retirement authority", () =>
     Effect.gen(function* () {
       const state = yield* setup

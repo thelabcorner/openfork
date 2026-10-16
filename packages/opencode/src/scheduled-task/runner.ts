@@ -1,5 +1,6 @@
-import { Clock, Context, Deferred, Effect, Fiber, Layer, Option, Ref, Scope, Semaphore } from "effect"
+import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Ref, Scope, Semaphore } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { isSqliteBusy } from "@opencode-ai/core/database/sqlite-busy"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
@@ -8,12 +9,23 @@ import { ScheduledTaskWake } from "./wake"
 
 /** 02 § 5.1: never arm a multi-hour timer; re-read the clock every minute. */
 export const MAX_SLEEP_MS = 60_000
+// An overdue cursor owned by a living peer (or still inside its jitter window)
+// must not re-arm a zero-delay timer forever. This floor costs a few seconds of
+// unattended retry responsiveness in exchange for bounded SQL/CPU pressure.
+export const OVERDUE_POLL_MS = 5_000
 
 /** 02 § 4.2 guard 4: do not stampede overdue tasks while the process boots. */
 export const STARTUP_GRACE_MS = 30_000
 
 /** 02 § 7: bound the number of Session materializations per wake. */
 export const DISPATCH_CONCURRENCY = 2
+export const LEASE_UNVERIFIED_STOP_MS =
+  ScheduledTaskLease.LEASE_TTL_MS - ScheduledTaskLease.HEARTBEAT_INTERVAL_MS
+
+/** Bound crash-recovery work per lifecycle while giving unrelated Sessions a
+ * chance to acquire the WAL writer between small lease-reclamation pages. */
+export const MAX_LIFECYCLE_RECOVERY_PAGES = 64
+export const RECOVERY_BATCH_COOLDOWN_MS = 100
 
 export interface Interface {
   /** Recovery + first arm. Idempotent. */
@@ -130,6 +142,7 @@ const layer = Layer.effect(
             yield* tasks.skipSettled({
               taskID: plan.task.id,
               fireFor: plan.fireFor,
+              leaseID: lease.leaseID,
               now: yield* Clock.currentTimeMillis,
               ...(current?.nextRunAt !== undefined ? { nextRunAt: current.nextRunAt } : {}),
             })
@@ -150,28 +163,102 @@ const layer = Layer.effect(
             yield* tasks.skipSettled({
               taskID: plan.task.id,
               fireFor: plan.fireFor,
+              leaseID: lease.leaseID,
               now: yield* Clock.currentTimeMillis,
             })
             return
           }
 
-          // Heartbeat fiber is scoped to the run fiber so it cannot outlive it.
+          // A heavily contended primary writer can delay recordRunStart long
+          // after claim(). Refresh and validate exact lease authority on the
+          // isolated liveness connection immediately before any provider/tool
+          // effect. Losing this race must not admit a second executor.
+          const admitted = yield* leases.heartbeat({
+            leaseID: lease.leaseID,
+            now: yield* Clock.currentTimeMillis,
+          })
+          if (!admitted) {
+            return yield* Effect.die(new Error("Scheduled Task start refused: exact lease ownership lost"))
+          }
+
+          const leaseLost = yield* Ref.make(false)
+          const lostSignal = yield* Deferred.make<void>()
+          let lastConfirmedLeaseAt = performance.now()
+          const stopOnLeaseLoss = Effect.fnUntraced(function* (reason: string) {
+            if (yield* Ref.get(leaseLost)) return
+            yield* Ref.set(leaseLost, true)
+            yield* Deferred.succeed(lostSignal, undefined)
+            yield* Effect.logWarning("Scheduled Task execution fenced after losing lease proof", {
+              taskID: plan.task.id,
+              reason,
+            })
+          })
+          // A writer can remain unacknowledged even while the async heartbeat
+          // fiber is waiting for its native SQL worker. An independent timer
+          // fences execution BEFORE a delayed heartbeat reaches the lease TTL.
+          // Never continue external effects indefinitely without ownership
+          // evidence, even if this sacrifices forward progress under load.
           yield* Effect.forkScoped(
             Effect.gen(function* () {
+              for (;;) {
+                yield* Effect.sleep(Duration.seconds(5))
+                if (performance.now() - lastConfirmedLeaseAt < LEASE_UNVERIFIED_STOP_MS) continue
+                yield* stopOnLeaseLoss("heartbeat-unverified")
+                return
+              }
+            }),
+          )
+          // Heartbeat fiber is scoped to the run fiber so it cannot outlive it.
+          // One transient busy-timeout must not permanently silence the lease.
+          yield* Effect.forkScoped(
+            Effect.gen(function* () {
+              let failures = 0
               while (true) {
-                yield* Effect.sleep(ScheduledTaskLease.HEARTBEAT_INTERVAL_MS)
-                yield* leases.heartbeat({ leaseID: lease.leaseID, now: yield* Clock.currentTimeMillis })
+                const waitMs = failures === 0
+                  ? ScheduledTaskLease.HEARTBEAT_INTERVAL_MS
+                  : Math.min(30_000, 1_000 * 2 ** Math.min(failures, 5))
+                yield* Effect.sleep(Duration.millis(waitMs))
+                const attempt = yield* Effect.exit(
+                  leases.heartbeat({ leaseID: lease.leaseID, now: yield* Clock.currentTimeMillis }),
+                )
+                if (Exit.isFailure(attempt)) {
+                  if (Cause.hasInterrupts(attempt.cause)) return yield* Effect.failCause(attempt.cause)
+                  failures++
+                  if (failures === 1 || failures % 10 === 0) {
+                    yield* Effect.logWarning("Scheduled Task heartbeat retrying after database failure", {
+                      taskID: plan.task.id,
+                      consecutiveFailures: failures,
+                    })
+                  }
+                  continue
+                }
+                failures = 0
+                if (attempt.value) {
+                  lastConfirmedLeaseAt = performance.now()
+                  continue
+                }
+                yield* stopOnLeaseLoss("lease-revoked")
+                return
               }
             }),
           )
 
-          const outcome = yield* executor.execute({
-            task: current,
-            runID: started.run.id,
-            attempt: lease.attempt,
-            fireFor: plan.fireFor,
-            leaseID: lease.leaseID,
-          })
+          const outcome = yield* Effect.raceFirst(
+            executor.execute({
+              task: current,
+              runID: started.run.id,
+              attempt: lease.attempt,
+              fireFor: plan.fireFor,
+              leaseID: lease.leaseID,
+            }),
+            Deferred.await(lostSignal).pipe(
+              Effect.andThen(Effect.die(new Error("Scheduled Task execution stopped: lease proof lost"))),
+            ),
+          )
+
+          // Another owner or recovery operation has the authoritative lease.
+          // Do not assert a success/terminal outcome from a stale generation.
+          if (yield* Ref.get(leaseLost)) return
 
           // Unconditional settlement: the executor encodes failures instead of
           // failing, so there is no path that skips this.
@@ -199,6 +286,10 @@ const layer = Layer.effect(
     })
 
     const wake: () => Effect.Effect<void> = Effect.fn("ScheduledTaskRunner.wake")(function* () {
+      // Pokes and durable mutation events can arrive during the startup grace
+      // period, before old leases have been recovered. The first post-recovery
+      // due scan is authoritative; pre-start notifications cannot run tasks.
+      if (!(yield* Ref.get(state)).started) return
       // Serialized: a manual poke and a fired timer must not both fork a batch.
       yield* wakeLock.withPermit(wakeBody())
     })
@@ -255,6 +346,8 @@ const layer = Layer.effect(
 
     const armImpl: Effect.Effect<void> = Effect.gen(function* () {
       const previous = yield* Ref.get(state)
+      // Do not arm a timer from a mutation before recovery has settled.
+      if (!previous.started) return
       // While a dispatch batch is draining, its completion owns the re-arm.
       if (previous.dispatching > 0) {
         yield* cancelTimer()
@@ -268,7 +361,9 @@ const layer = Layer.effect(
         yield* Ref.update(state, (current) => ({ ...current, generation }))
         return
       }
-      const delay = Math.min(Math.max(next - now, 0), MAX_SLEEP_MS)
+      const delay = next <= now
+        ? OVERDUE_POLL_MS
+        : Math.min(next - now, MAX_SLEEP_MS)
       yield* installTimer(delay, wake())
     })
 
@@ -297,6 +392,46 @@ const layer = Layer.effect(
         yield* wake()
       }).pipe(Effect.withSpan("ScheduledTaskRunner.reconcileIdle"))
 
+    const recoverLeasePages = Effect.fn("ScheduledTaskRunner.recoverLeasePages")(function* (
+      now: number,
+      publish: boolean,
+      pageBudget = MAX_LIFECYCLE_RECOVERY_PAGES,
+    ) {
+      for (let page = 0; page < pageBudget; page++) {
+        const reclaimed = yield* leases.recoverStale({
+          now,
+          // Startup cannot assume it owns every lease with the module-scoped
+          // PROCESS_OWNER_ID: an independently provisioned service graph in
+          // the same OS process may still be executing. Old process generations
+          // have different random owner ids and are reclaimed by staleness.
+          // Teardown is ALSO not permitted to sweep the process owner: two
+          // independent runtime graphs may execute in one OS process. A
+          // process-global owner id is insufficient proof that this particular
+          // scoped runner owns the lease. Let unfinished runs expire naturally
+          // unless they were settled with their exact lease token.
+          includeOwn: false,
+          limit: ScheduledTaskLease.STALE_RECOVERY_BATCH_SIZE,
+        })
+        if (publish) {
+          yield* Effect.forEach(
+            reclaimed,
+            (item) => item.run
+              ? events.publish(ScheduledTask.Event.RunSettled, { taskID: item.taskID, run: item.run })
+              : Effect.void,
+            { discard: true },
+          )
+        }
+        if (reclaimed.length < ScheduledTaskLease.STALE_RECOVERY_BATCH_SIZE) return true
+        // No long-running IMMEDIATE transaction spanning the whole backlog.
+        yield* Effect.yieldNow
+      }
+      yield* Effect.logWarning("Scheduled Task lease recovery reached per-pass page budget; another pass is required", {
+        maxPages: pageBudget,
+        pageSize: ScheduledTaskLease.STALE_RECOVERY_BATCH_SIZE,
+      })
+      return false
+    })
+
     const start: Interface["start"] = Effect.fn("ScheduledTaskRunner.start")(function* (options) {
       const grace = options?.startupGraceMs ?? STARTUP_GRACE_MS
       if (grace > 0) yield* Effect.sleep(grace)
@@ -306,15 +441,31 @@ const layer = Layer.effect(
           const now = yield* Clock.currentTimeMillis
           // Startup recovery: leases owned by this process cannot be live yet,
           // so reclaiming them is safe; stale peer leases are always reclaimed.
-          const reclaimed = yield* leases.recoverStale({ now, includeOwn: true })
-          yield* Effect.forEach(
-            reclaimed,
-            (item) =>
-              item.run
-                ? events.publish(ScheduledTask.Event.RunSettled, { taskID: item.taskID, run: item.run })
-                : Effect.void,
-            { discard: true },
-          )
+          // A capped pass without a follow-up silently strands leases after
+          // sufficiently large crashes. Keep execution fenced until every
+          // stale lease is reconciled, but never hold one WAL transaction
+          // across pages or spin continuously under a huge backlog.
+          let contentionFailures = 0
+          for (;;) {
+            const result = yield* Effect.exit(recoverLeasePages(now, true))
+            if (Exit.isSuccess(result)) {
+              contentionFailures = 0
+              if (result.value) break
+              yield* Effect.sleep(Duration.millis(RECOVERY_BATCH_COOLDOWN_MS))
+              continue
+            }
+            // No external tool is replayed: recovery changes only exact
+            // durable lease identities. Native busy errors from a competing
+            // WAL writer must not permanently disable this process's runner.
+            if (!isSqliteBusy(Cause.squash(result.cause))) return yield* Effect.failCause(result.cause)
+            contentionFailures++
+            if (contentionFailures === 1 || contentionFailures % 10 === 0) {
+              yield* Effect.logWarning("Scheduled Task startup recovery is waiting for SQLite writer admission", {
+                failures: contentionFailures,
+              })
+            }
+            yield* Effect.sleep(Duration.seconds(Math.min(30, 2 ** Math.min(contentionFailures, 5))))
+          }
           yield* Ref.update(state, (current) => ({ ...current, started: true }))
           // A queued manual run is durable runnable work but intentionally does
           // not mutate the recurrence cursor. Scan once on startup so a process
@@ -350,6 +501,9 @@ const layer = Layer.effect(
         const data = event.data as { run?: { status?: string } }
         if (data.run?.status === "queued") return wake().pipe(Effect.ignore)
       }
+      // A settled batch may leave additional queued manual work. Reconcile
+      // it from durable truth instead of waiting for a recurrence-only timer.
+      if (event.type === "scheduledTask.runSettled") return wake().pipe(Effect.ignore)
       if (event.type === "scheduledTask.controlChanged") {
         const data = event.data as { control?: { paused?: boolean } }
         if (data.control?.paused === false) return wake().pipe(Effect.ignore)
@@ -358,8 +512,11 @@ const layer = Layer.effect(
     })
     yield* Effect.addFinalizer(() => unsubscribe)
 
-    // Convergent teardown (N7): interrupt the timer, abandon our in-flight
-    // leases, and leave zero held leases owned by this process.
+    // Convergent teardown: stop admissions/timers. A process owner identity is
+    // shared by independent service graphs in the same OS process, so forcing
+    // recovery here could abandon a sibling graph's LIVE execution. Scoped
+    // children are interrupted by runtime closure; any uncertain in-flight
+    // lease is deliberately left for TTL-fenced crash recovery, not replayed.
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
         yield* cancelTimer()
@@ -373,8 +530,40 @@ const layer = Layer.effect(
           started: false,
           generation: undefined,
         })
-        const now = yield* Clock.currentTimeMillis
-        yield* leases.recoverStale({ now: now - ScheduledTaskLease.LEASE_TTL_MS, includeOwn: true }).pipe(Effect.ignore)
+      }),
+    )
+
+    // This runtime can stay alive after a different Desktop/ACP process has
+    // crashed. Startup-only recovery would then leave foreign held leases
+    // permanently blocking a cursor until our OWN process happens to restart.
+    // Use one small periodic page, not an unbounded sweep. The reconciliation
+    // is idempotent, fenced by the exact stale heartbeat/lease, and never
+    // force-clears sibling graphs sharing this process owner's identity.
+    yield* Effect.forkScoped(
+      Effect.gen(function* () {
+        let nextDelayMs = 60_000
+        for (;;) {
+          yield* Effect.sleep(Duration.millis(nextDelayMs))
+          nextDelayMs = 60_000
+          const snapshot = yield* Ref.get(state)
+          // Reconciliation is maintenance. A host already executing Sessions
+          // must prioritize its own heartbeat/settlement writes; foreign dead
+          // leases can wait for its next idle interval.
+          if (!snapshot.started || snapshot.runs > 0 || snapshot.dispatching > 0) continue
+          const now = yield* Clock.currentTimeMillis
+          const result = yield* Effect.exit(recoverLeasePages(now, true, 1))
+          if (Exit.isFailure(result)) {
+            yield* Effect.logWarning("Scheduled Task foreign stale-lease sweep deferred", {
+              cause: Cause.pretty(result.cause),
+            })
+            continue
+          }
+          if (!result.value) {
+            // The page was full: drain gradually without blocking foreground
+            // writer admission or waiting another entire minute per page.
+            nextDelayMs = 5_000
+          }
+        }
       }),
     )
 

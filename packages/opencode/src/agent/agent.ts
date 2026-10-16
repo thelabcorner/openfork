@@ -19,6 +19,9 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
+import PROMPT_DREAMER from "./prompt/dreamer.txt"
+import PROMPT_SWARM_MEMBER from "./prompt/swarm-member.txt"
+import PROMPT_SWARM_COORDINATOR from "./prompt/swarm-coordinator.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import { DEFAULT_PROMPT as PROMPT_TITLE } from "@opencode-ai/core/session/title-prompt"
 import { DEFAULT_PROMPT as PROMPT_REVISOR } from "@opencode-ai/core/prompt-revisor-prompt"
@@ -298,6 +301,36 @@ const layer = Layer.effect(
             mode: native("explore").mode,
             native: true,
           },
+          dreamer: {
+            name: "dreamer",
+            description: "Host-owned special agent for background historical investigation. Searches authorized Session history and memory; never codes or edits.",
+            mode: native("dreamer").mode,
+            hidden: native("dreamer").hidden,
+            native: true,
+            prompt: PROMPT_DREAMER,
+            permission: Permission.fromConfig({ "*": "deny", session: "allow", memory: "allow" }),
+            options: {},
+          },
+          "swarm-m": {
+            name: "swarm-m",
+            description: "Native Swarm member mode for peer collaboration and task execution.",
+            prompt: PROMPT_SWARM_MEMBER,
+            permission: Permission.merge(defaults, user),
+            options: {},
+            mode: native("swarm-m").mode,
+            native: true,
+            hidden: native("swarm-m").hidden,
+          },
+          "swarm-c": {
+            name: "swarm-c",
+            description: "Native Swarm coordinator mode for delegation, review, and coordination.",
+            prompt: PROMPT_SWARM_COORDINATOR,
+            permission: Permission.merge(defaults, user),
+            options: {},
+            mode: native("swarm-c").mode,
+            native: true,
+            hidden: native("swarm-c").hidden,
+          },
           compaction: {
             name: "compaction",
             mode: native("compaction").mode,
@@ -346,6 +379,7 @@ const layer = Layer.effect(
                 read: "allow",
                 question: "allow",
                 composer_context: "allow",
+                revision_progress: "allow",
                 revised_prompt: "allow",
               }),
               user,
@@ -370,7 +404,8 @@ const layer = Layer.effect(
         }
 
         for (const [key, value] of Object.entries(cfg.agent ?? {})) {
-          if (value.disable) {
+          const swarmRolePrompt = key === "swarm-m" || key === "swarm-c"
+          if (value.disable && !swarmRolePrompt) {
             delete agents[key]
             continue
           }
@@ -385,7 +420,11 @@ const layer = Layer.effect(
             }
           if (value.model) item.model = Provider.parseModel(value.model)
           item.variant = value.variant ?? item.variant
-          item.prompt = value.prompt ?? item.prompt
+          // Keep the host-owned Swarm peer/coordinator contract present even
+          // when a project adds agent-specific guidance through config.
+          item.prompt = swarmRolePrompt
+            ? [item.prompt, value.prompt].filter((part): part is string => Boolean(part)).join("\n\n")
+            : value.prompt ?? item.prompt
           item.description = value.description ?? item.description
           item.temperature = value.temperature ?? item.temperature
           item.topP = value.top_p ?? item.topP
@@ -419,6 +458,19 @@ const layer = Layer.effect(
             agents[name].permission,
             Permission.fromConfig({ external_directory: { [Truncate.GLOB]: "allow" } }),
           )
+        }
+
+        // Dreamer is a host-owned special agent, not a delegated subagent:
+        // its policy is not editable through project config. No shell, code,
+        // task, write, plugin or broker capability is ever granted, and the
+        // special-agent exposure (hidden primary, non-delegatable) comes from
+        // the shared built-in contract so config cannot reopen Task access.
+        if (agents.dreamer) {
+          agents.dreamer.name = "dreamer"
+          agents.dreamer.prompt = PROMPT_DREAMER
+          agents.dreamer.permission = Permission.fromConfig({ "*": "deny", session: "allow", memory: "allow" })
+          agents.dreamer.mode = native("dreamer").mode
+          agents.dreamer.hidden = native("dreamer").hidden
         }
 
         const get = Effect.fnUntraced(function* (agent: string) {
@@ -488,7 +540,15 @@ const layer = Layer.effect(
           ...(input.model?.accountID
             ? { accountID: input.model.accountID }
             : { routeIntent: { kind: "auto" as const } }),
+          executionPurpose: "special-agent",
         })
+        if (Provider.isHostedZenProvider(model.providerID) && (!routed || routed.route.route.kind !== "account")) {
+          return yield* new Provider.RouteResolutionError({
+            providerID: model.providerID,
+            modelID: model.modelID,
+            cause: new Error("No authoritative OpenCode route resolved for hosted Agent.generate"),
+          })
+        }
         const resolved =
           routed?.model ?? (yield* provider.getModel(model.providerID, model.modelID, input.model?.accountID))
         const route = routeAttribution(routed)

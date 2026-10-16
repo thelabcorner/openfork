@@ -11,6 +11,8 @@ import { SwarmContainment } from "./containment"
 export const OWNER_SUSPECT_MS = RuntimeOwner.HEARTBEAT_INTERVAL_MS * 3
 export const OWNER_RECHECK_MS = RuntimeOwner.HEARTBEAT_INTERVAL_MS
 export const OWNER_SCAN_BATCH = 32
+/** Aggregate age checks share the global deadline owner; no per-aggregate timers. */
+export const AGGREGATE_RECHECK_MS = 60_000
 
 export interface ReconcileResult {
   readonly scannedOwners: number
@@ -57,6 +59,7 @@ export const layer = Layer.effect(
     const runtime = yield* RuntimeOwner.Service
     const containment = yield* SwarmContainment.Service
     const state = yield* Ref.make<ScanState>({})
+    const aggregateProbeAt = yield* Ref.make(0)
     const lock = Semaphore.makeUnsafe(1)
 
     const reconcile: Interface["reconcile"] = Effect.fn("SwarmRecovery.reconcile")(function* (input) {
@@ -65,7 +68,14 @@ export const layer = Layer.effect(
           const now = input?.now ?? Date.now()
           // Converge provably inert aggregates first. A crash mid-closure simply
           // re-derives the same candidate set on the next sweep.
-          const aggregates = yield* containment.reconcile()
+          // Aggregate age is not changed by every delivery/lease wake. Running
+          // the same indexed aggregate scans on each owner page or event is
+          // redundant work; one shared age deadline owns this observation.
+          const aggregateDeadline = yield* Ref.get(aggregateProbeAt)
+          const aggregates = now >= aggregateDeadline
+            ? yield* containment.reconcile({ now })
+            : { closedCreating: 0, staleActive: 0 }
+          if (now >= aggregateDeadline) yield* Ref.set(aggregateProbeAt, now + AGGREGATE_RECHECK_MS)
           const previous = yield* Ref.get(state)
           const owners = yield* swarm.activeLeaseOwnerProcessIDs({
             excludeProcessOwner: runtime.id,

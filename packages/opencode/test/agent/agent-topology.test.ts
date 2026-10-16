@@ -46,6 +46,51 @@ it.instance("built-in catalog matches the shared agent contract topology", () =>
   }),
 )
 
+it.instance("host-owned special-agent built-ins ship hidden, primary, and non-delegatable", () =>
+  Effect.gen(function* () {
+    expect(AgentContract.SpecialBuiltInTopology.map((item) => item.id).toSorted()).toEqual([
+      "compaction",
+      "dreamer",
+      "prompt-revisor",
+      "summary",
+      "title",
+    ])
+    for (const item of AgentContract.SpecialBuiltInTopology) {
+      expect(item.mode).toBe("primary")
+      expect(item.hidden).toBe(true)
+      expect(AgentContract.exposure({ mode: item.mode, hidden: item.hidden }).delegation).toBe(false)
+      expect(AgentContract.isSpecialAgentID(item.id)).toBe(true)
+    }
+    // Classification is closed to built-ins: delegated workers and role agents
+    // stay outside the special class, and custom ids can never join it.
+    expect(AgentContract.isSpecialAgentID("general")).toBe(false)
+    expect(AgentContract.isSpecialAgentID("swarm-m")).toBe(false)
+    expect(AgentContract.isSpecialAgentID("swarm-c")).toBe(false)
+    expect(AgentContract.isSpecialAgentID("studio-subagent")).toBe(false)
+
+    // The runtime catalog resolves Dreamer through the same special-agent
+    // classification the shared contract declares, not as a subagent class.
+    const dreamer = yield* Agent.Service.use((svc) => svc.get("dreamer"))
+    expect(dreamer?.mode).toBe("primary")
+    expect(dreamer?.hidden).toBe(true)
+  }),
+)
+
+it.instance("registers dedicated hidden Swarm role agents with their own prompts", () =>
+  Effect.gen(function* () {
+    const agents = yield* Agent.Service.use((svc) => svc.list())
+    const member = agents.find((item) => item.name === "swarm-m")
+    const coordinator = agents.find((item) => item.name === "swarm-c")
+
+    expect(member).toMatchObject({ mode: "subagent", hidden: true, native: true })
+    expect(member?.prompt).toContain("durable peer")
+    expect(member?.prompt).toContain("lazy-loaded")
+    expect(coordinator).toMatchObject({ mode: "primary", hidden: true, native: true })
+    expect(coordinator?.prompt).toContain("coordinator of an OpenFork native Swarm")
+    expect(coordinator?.prompt).toContain("lazy-loaded")
+  }),
+)
+
 it.instance("built-in modes split exactly into composer-only and delegation-only", () =>
   Effect.gen(function* () {
     const agents = yield* Agent.Service.use((svc) => svc.list())

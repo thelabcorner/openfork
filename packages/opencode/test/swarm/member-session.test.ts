@@ -123,7 +123,7 @@ const fsMock = Layer.mock(FSUtil.Service, {
   resolve: (path: string) => Effect.succeed(path),
 } as never)
 const agentMock = Layer.mock(Agent.Service, {
-  get: (name: string) => Effect.succeed(name === "build" ? ({ name: "build" } as never) : undefined),
+  get: (name: string) => Effect.succeed(name === "build" || name === "swarm-m" ? ({ name } as never) : undefined),
 } as never)
 const providerMock = Layer.mock(Provider.Service, {
   getModel: () =>
@@ -235,6 +235,7 @@ describe("SwarmMemberSession", () => {
         { action: "bash", resource: "*", effect: "deny" },
       ])
       expect(sessions.get(first.sessionID)?.parentID).toBeUndefined()
+      expect(String(sessions.get(first.sessionID)?.agent)).toBe("swarm-m")
       expect(sessions.get(first.sessionID)?.model).toEqual(profile.model)
 
       order = []
