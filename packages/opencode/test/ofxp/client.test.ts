@@ -59,6 +59,45 @@ function hello(value: Ofxp.PeerIdentity): Ofxp.Hello {
 }
 
 describe("OFXP semantic client", () => {
+  it.live("gives stateless Code runs the full confined-runtime timeout budget", Effect.gen(function* () {
+    const source = identity("Timeout Source")
+    const target = identity("Timeout Target")
+    const peers = yield* OfxpPeer.Service
+    yield* peers.trust({ identity: target.identity })
+    let observedTimeout: number | undefined
+    const manager = {
+      request: async (
+        _peerID: Ofxp.PeerID,
+        _endpoints: readonly OfxpConnectionManager.TargetEndpoint[],
+        _method: string,
+        _body?: unknown,
+        timeoutMs?: number,
+      ) => {
+        observedTimeout = timeoutMs
+        return { ok: false, error: { code: "NOT_FOUND", message: "synthetic", retryable: false } }
+      },
+    } as unknown as OfxpConnectionManager.Manager
+    const client = new OfxpClient.Client(source.identity, peers, manager, () => [])
+
+    yield* client.invoke({
+      peerID: target.key.peerID,
+      sourceSessionID: SessionID.descending(),
+      capability: "code",
+      contract: "synthetic",
+      args: { action: "run", code: "return 1" },
+    })
+    expect(observedTimeout).toBe(125_000)
+
+    yield* client.invoke({
+      peerID: target.key.peerID,
+      sourceSessionID: SessionID.descending(),
+      capability: "read",
+      contract: "synthetic",
+      args: { path: "README.md" },
+    })
+    expect(observedTimeout).toBeUndefined()
+  }))
+
   it.live("performs lazy root/list/describe/call over one negotiated pooled connection", Effect.gen(function* () {
     const tmp = yield* Effect.acquireRelease(Effect.promise(() => tmpdir()), (item) => Effect.promise(() => item[Symbol.asyncDispose]()))
     const repo = path.join(tmp.path, "repo")

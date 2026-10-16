@@ -16,6 +16,11 @@ import { ExchangeRead } from "./read"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const ExactSelection = Schema.Union([
+  Schema.Struct({ mode: Schema.Literal("one"), atLine: PositiveInt }),
+  Schema.Struct({ mode: Schema.Literal("selected"), atLines: Schema.Array(PositiveInt).check(Schema.isMinLength(1), Schema.isMaxLength(128)) }),
+  Schema.Struct({ mode: Schema.Literal("all"), expectedMatches: Schema.optional(PositiveInt) }),
+])
 
 const BatchOp = Schema.Union([
   Schema.Struct({ line: PositiveInt, newText: Schema.String, oldText: Schema.optional(Schema.String) }),
@@ -34,6 +39,7 @@ export const Parameters = Schema.Struct({
   oldString: Schema.optional(Schema.String),
   newString: Schema.optional(Schema.String),
   replaceAll: Schema.optional(Schema.Boolean),
+  selection: Schema.optional(ExactSelection),
   edits: Schema.optional(Schema.Array(BatchOp).check(Schema.isMaxLength(128))),
   line: Schema.optional(PositiveInt),
   startLine: Schema.optional(PositiveInt),
@@ -94,7 +100,7 @@ function detail(error: unknown) {
 }
 
 function shape(input: Input) {
-  const exact = input.oldString !== undefined || input.newString !== undefined || input.replaceAll !== undefined
+  const exact = input.oldString !== undefined || input.newString !== undefined || input.replaceAll !== undefined || input.selection !== undefined
   const strategy =
     input.edits !== undefined ||
     input.line !== undefined ||
@@ -110,6 +116,12 @@ function shape(input: Input) {
   if (exact) {
     if (input.oldString === undefined || input.newString === undefined) {
       throw new ExchangeError.InvalidArgument({ detail: "Exact edit requires both oldString and newString" })
+    }
+    if (input.selection !== undefined && input.selection.mode !== "all" && input.replaceAll === true) {
+      throw new ExchangeError.InvalidArgument({ detail: "selection.mode one conflicts with replaceAll:true" })
+    }
+    if (input.selection?.mode === "all" && input.replaceAll === false) {
+      throw new ExchangeError.InvalidArgument({ detail: "selection.mode all conflicts with replaceAll:false" })
     }
     if (input.oldString === "") {
       throw new ExchangeError.InvalidArgument({
@@ -142,7 +154,7 @@ function build(input: Input, filePath: string, displayPath: string, bytes: Uint8
         isNew: false,
       })
     }
-    const resolved = resolveReplacement(source.text, oldValue.value, newValue.value, input.replaceAll)
+    const resolved = resolveReplacement(source.text, oldValue.value, newValue.value, input.replaceAll, input.selection)
     let spans = resolved.spans
     if (newValue.value === "") spans = spans.map((span) => absorbDeletionNewline(source.text, span).value)
     return buildPlan({
@@ -237,7 +249,12 @@ export function execute<E>(
           : new ExchangeError.Conflict({ detail: detail(error) }),
     })
     const warnings = [...initialPlan.warnings]
-    if (input.groundedFingerprint === undefined && LINE_TARGETED.has(strategyName(input))) {
+    if (
+      input.groundedFingerprint === undefined &&
+      (LINE_TARGETED.has(strategyName(input)) ||
+        input.selection?.mode === "one" ||
+        input.selection?.mode === "selected")
+    ) {
       warnings.push(
         input.ungroundedWarning ??
           "This file has no prior read-grounding record for this external principal. The edit is still verified against current content, but read it first when relying on line coordinates.",

@@ -1,9 +1,12 @@
 import { Effect, Option } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 import { ReadFilesystem } from "@/read/filesystem"
-import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { renderGrep } from "@/tool/read/inspect"
+import { isPdfAttachment, isVideoAttachment, isAudioAttachment, isAmbiguousTsPath, resolveAttachmentMime } from "@/util/media"
+import { videoContactSheetEvidence } from "./media-preview"
 import { ExchangeAttribution } from "./attribution"
 import { ExchangeError } from "./error"
 
@@ -29,18 +32,29 @@ export interface Result {
   readonly title?: string
   readonly output: string
   readonly attachments?: readonly Attachment[]
+  /** MCP-native visual/audio content; NEVER included in structuredContent. */
+  readonly mediaContent?: readonly (
+    | { readonly type: "image"; readonly data: string; readonly mimeType: string }
+    | { readonly type: "audio"; readonly data: string; readonly mimeType: string }
+  )[]
   readonly metadata?: Readonly<Record<string, unknown>>
 }
 
 export interface Input {
   /** Already-authorized canonical local target. Never resolved from caller cwd. */
   readonly path: string
+  /** Optional symbol-locator snapshot that a subsequent window must still match. */
+  readonly expectedFingerprint?: string
   /** Public/root-relative spelling safe to cross the external boundary. */
   readonly displayPath: string
-  readonly action?: "read" | "tail"
+  readonly action?: "read" | "tail" | "grep"
+  readonly pattern?: string
+  readonly ripgrep?: Ripgrep.Interface
   readonly offset?: number
   readonly limit?: number
   readonly signal?: AbortSignal
+  /** Explicit OXP single-target multimodal presentation, with bounded bytes. */
+  readonly inlineMedia?: boolean
   readonly projectionMarker?: string
   /**
    * Optional boundary attribution folded into the single read record. It is the
@@ -136,33 +150,17 @@ function project(result: Result, marker: string) {
   const metadata: Record<string, unknown> = {
     ...result.metadata,
     projectionTruncated: projected.truncated,
-    truncated:
-      projected.truncated || result.metadata?.truncated === true,
+    truncated: projected.truncated || result.metadata?.truncated === true,
   }
-  if (
-    projected.truncated &&
-    typeof result.metadata?.offset === "number"
-  ) {
+  if (projected.truncated && typeof result.metadata?.offset === "number") {
     const retryOffset = result.metadata.offset
     const nextOffset = result.metadata.nextOffset
-    const span =
-      typeof nextOffset === "number" && nextOffset > retryOffset
-        ? nextOffset - retryOffset
-        : undefined
-    const retainedRatio =
-      projected.originalBytes > 0
-        ? projected.retainedBytes / projected.originalBytes
-        : 0
+    const span = typeof nextOffset === "number" && nextOffset > retryOffset ? nextOffset - retryOffset : undefined
+    const retainedRatio = projected.originalBytes > 0 ? projected.retainedBytes / projected.originalBytes : 0
     const recommendedLimit =
       span === undefined
         ? Math.max(1, OUTPUT_LINES - 16)
-        : Math.max(
-            1,
-            Math.min(
-              OUTPUT_LINES - 16,
-              Math.floor(span * retainedRatio * 0.8),
-            ),
-          )
+        : Math.max(1, Math.min(OUTPUT_LINES - 16, Math.floor(span * retainedRatio * 0.8)))
     delete metadata.nextOffset
     metadata.retryOffset = retryOffset
     metadata.recommendedLimit = recommendedLimit
@@ -178,17 +176,19 @@ function project(result: Result, marker: string) {
  * Principal-neutral read execution. The caller owns trust/root resolution and
  * supplies a live egress guard; this function owns filesystem semantics only.
  */
-export function execute<E>(
-  fs: FSUtil.Interface,
-  input: Input,
-  hooks: Hooks<E>,
-): Effect.Effect<Execution, Error | E> {
+export function execute<E>(fs: FSUtil.Interface, input: Input, hooks: Hooks<E>): Effect.Effect<Execution, Error | E> {
   return Effect.gen(function* () {
     if (input.signal?.aborted) return yield* new Cancelled({ detail: "Read was cancelled" })
     const action = input.action ?? "read"
     const before = yield* fs.stat(input.path).pipe(Effect.mapError(dependency))
+    if (input.expectedFingerprint !== undefined && statFingerprint(before) !== input.expectedFingerprint) {
+      return yield* new Conflict({ detail: "File changed since symbol location; retry before relying on this window" })
+    }
 
     if (before.type === "Directory") {
+      if (action === "grep") {
+        return yield* new InvalidArgument({ detail: "File grep requires a text file, not a directory" })
+      }
       const items = yield* ReadFilesystem.list(fs, input.path).pipe(Effect.mapError(dependency))
       const limit = yield* positive(
         input.limit,
@@ -200,7 +200,8 @@ export function execute<E>(
         offset = Math.max(1, items.length - Math.min(limit, items.length) + 1)
         start = offset - 1
       }
-      const rows = action === "tail" ? items.slice(Math.max(0, items.length - limit)) : items.slice(start, start + limit)
+      const rows =
+        action === "tail" ? items.slice(Math.max(0, items.length - limit)) : items.slice(start, start + limit)
       const usedOffset = action === "tail" ? Math.max(1, items.length - rows.length + 1) : offset
       const truncated = usedOffset - 1 + rows.length < items.length
       yield* hooks.revalidate().pipe(Effect.asVoid)
@@ -235,15 +236,77 @@ export function execute<E>(
       ReadFilesystem.SAMPLE_BYTES,
       input.signal,
     ).pipe(Effect.mapError(dependency))
-    const mime = sniffAttachmentMime(sample, FSUtil.mimeType(input.path))
-    if (SUPPORTED_IMAGE_MIMES.has(mime) || isPdfAttachment(mime)) {
+    const mime = resolveAttachmentMime(sample, input.path, FSUtil.mimeType(input.path))
+    const tsSource = isAmbiguousTsPath(input.path) && mime === "text/plain"
+    const tsTranslation = isAmbiguousTsPath(input.path) && mime === "application/xml"
+    if (isAmbiguousTsPath(input.path) && mime === "application/octet-stream") {
+      return yield* new InvalidArgument({
+        detail: "Ambiguous .ts/.mts file: not verified UTF-8 TypeScript and not structurally verified MPEG-TS. Inspect packet cadence/encoding; refusing binary-as-source guessing.",
+      })
+    }
+    if (SUPPORTED_IMAGE_MIMES.has(mime) || isPdfAttachment(mime) || isVideoAttachment(mime) || isAudioAttachment(mime)) {
+      let mediaContent: Result["mediaContent"]
+      let mediaReason: string | undefined
+      let mediaDelivery: "descriptor-only" | "inline-image" | "inline-audio" | "sampled-video" = "descriptor-only"
+      let videoEvidence: { intervalSeconds: number; durationSeconds?: number; maxFrames: number } | undefined
+      // A descriptor does not imply that an external model sees the media.
+      // Only the opt-in bounded single-target transport supplies MCP image/audio
+      // content. No raw video block exists in MCP; send a contact sheet instead.
+      if (input.inlineMedia && (isVideoAttachment(mime) || isAudioAttachment(mime) || SUPPORTED_IMAGE_MIMES.has(mime))) {
+        const size = Number(before.size)
+        const max = isVideoAttachment(mime) ? 20 * 1024 * 1024 : isAudioAttachment(mime) ? 2 * 1024 * 1024 : 4 * 1024 * 1024
+        if (size > 0 && size <= max) {
+          yield* hooks.revalidate().pipe(Effect.asVoid)
+          const bytes = yield* fs.readFile(input.path).pipe(Effect.mapError(dependency))
+          if (input.signal?.aborted) return yield* new Cancelled({ detail: "Read was cancelled" })
+          if (bytes.byteLength <= max) {
+            if (isVideoAttachment(mime)) {
+              const preview = yield* Effect.promise(() => videoContactSheetEvidence(bytes, input.signal))
+              if (input.signal?.aborted) return yield* new Cancelled({ detail: "Read was cancelled during video sampling" })
+              if (preview) {
+                mediaContent = [{ type: "image", mimeType: "image/jpeg", data: preview.data }]
+                mediaDelivery = "sampled-video"
+                videoEvidence = {
+                  intervalSeconds: preview.intervalSeconds,
+                  ...(preview.durationSeconds === undefined ? {} : { durationSeconds: preview.durationSeconds }),
+                  maxFrames: preview.maxFrames,
+                }
+              } else {
+                mediaReason = "Could not extract a video contact sheet; FFmpeg may be unavailable or the video may be invalid."
+              }
+            } else {
+              const data = Buffer.from(bytes).toString("base64")
+              mediaContent = isAudioAttachment(mime)
+                ? [{ type: "audio", mimeType: mime, data }]
+                : [{ type: "image", mimeType: mime, data }]
+              mediaDelivery = isAudioAttachment(mime) ? "inline-audio" : "inline-image"
+            }
+          } else {
+            mediaReason = "File changed or exceeded the inline media limit during reading."
+          }
+        } else {
+          mediaReason = size === 0 ? "Empty media file." : `Exceeds the ${max / (1024 * 1024)} MiB inline media limit.`
+        }
+      }
+      if (!input.inlineMedia) mediaReason = "This read returns an attachment handle, not decoded media; read the file individually to request media content."
+      if (isPdfAttachment(mime)) mediaReason = "PDF handle only; this MCP read path does not render PDF pages."
       yield* hooks.revalidate().pipe(Effect.asVoid)
       yield* recordRead(input)
+      const kind = isVideoAttachment(mime) ? "Video" : isAudioAttachment(mime) ? "Audio" :
+        isPdfAttachment(mime) ? "PDF" : "Image"
+      const status = mediaDelivery === "sampled-video"
+        ? `Sampled video contact sheet attached: up to six frames approximately every ${videoEvidence!.intervalSeconds.toFixed(2)} seconds ${videoEvidence!.durationSeconds === undefined ? "from the beginning (whole-file coverage not established)" : "distributed over the video's probed duration"}. Individual transient frames may be missed.`
+        : mediaDelivery === "inline-image" || mediaDelivery === "inline-audio"
+          ? `${kind} bytes attached as native MCP ${isAudioAttachment(mime) ? "audio" : "image"} content.`
+          : `${kind} descriptor only; content NOT delivered to the model. ${mediaReason ?? "No media preview available."}`
       return {
         result: project(
           {
             title: input.displayPath,
-            output: isPdfAttachment(mime) ? "PDF attachment available" : "Image attachment available",
+            // External callers receive an approved-root descriptor, not the
+            // file bytes. The transport owns any separate media transfer.
+            output: `${kind} attachment available (${Number(before.size)} bytes; ${mime}). ${status}`,
+            ...(mediaContent ? { mediaContent } : {}),
             attachments: [
               {
                 kind: "file",
@@ -253,7 +316,15 @@ export function execute<E>(
                 bytes: Number(before.size),
               },
             ],
-            metadata: { action: "read", path: input.displayPath, attachment: true, truncated: false },
+            metadata: {
+              action: "read", path: input.displayPath, attachment: true, mediaType: mime,
+              mediaBytes: Number(before.size), truncated: false, grounded: false,
+              mediaDelivery,
+              ...(mime === "video/mp2t" ? { detectedFileKind: "mpeg-transport-stream", detection: "packet-sync-verified" } : {}),
+              ...(mediaReason ? { mediaReason } : {}),
+              ...(videoEvidence ? { videoSampling: videoEvidence } : {}),
+              ...(mediaContent?.length ? { previewType: isVideoAttachment(mime) ? "contact-sheet" : "native-media" } : {}),
+            },
           },
           input.projectionMarker ?? "<note>Read output truncated; narrow the read window</note>",
         ),
@@ -264,34 +335,79 @@ export function execute<E>(
       return yield* new InvalidArgument({ detail: "This binary file type is not supported by the read surface" })
     }
 
+    if (action === "grep") {
+      if (!input.pattern?.trim() || input.pattern.length > 1024) {
+        return yield* new InvalidArgument({
+          detail: "File grep requires a non-empty pattern of at most 1024 characters",
+        })
+      }
+      if (!input.ripgrep) return yield* new DependencyUnavailable({ detail: "File grep service is unavailable" })
+      const found = yield* ReadFilesystem.grep(fs, input.ripgrep, input.path, input.pattern, input.signal).pipe(
+        Effect.mapError(dependency),
+      )
+      const after = yield* fs.stat(input.path).pipe(Effect.mapError(dependency))
+      if (after.type !== "File" || statFingerprint(before) !== statFingerprint(after)) {
+        return yield* new Conflict({ detail: "File changed during grep; retry before relying on the matches" })
+      }
+      yield* hooks.revalidate().pipe(Effect.asVoid)
+      yield* recordRead(input)
+      const output = renderGrep(input.displayPath, input.pattern, found.hits, found.truncated)
+      return {
+        result: project(
+          {
+            title: `grep ${input.displayPath}`,
+            output,
+            metadata: {
+              action: "grep",
+              path: input.displayPath,
+              matches: found.hits.length,
+              truncated: found.truncated,
+            },
+          },
+          input.projectionMarker ?? "<note>File grep output truncated; narrow the pattern</note>",
+        ),
+        // Grep exposes snippets and offsets, not a full read fingerprint.
+        // It must NOT elevate the caller's edit/patch prior-read grounding.
+      }
+    }
+
     const limit = yield* positive(
       input.limit,
       action === "tail" ? ReadFilesystem.DEFAULT_TAIL : ReadFilesystem.DEFAULT_READ_LIMIT,
     )
     const offset = yield* positive(input.offset, 1)
-    const file = yield* (action === "tail"
-      ? ReadFilesystem.tail(fs, input.path, limit, input.signal)
-      : ReadFilesystem.clampRead(fs, input.path, { limit, offset, signal: input.signal })
+    const file = yield* (
+      action === "tail"
+        ? ReadFilesystem.tail(fs, input.path, limit, input.signal)
+        : ReadFilesystem.clampRead(fs, input.path, { limit, offset, signal: input.signal })
     ).pipe(Effect.mapError(dependency))
 
     const after = yield* fs.stat(input.path).pipe(Effect.mapError(dependency))
     if (after.type !== "File" || statFingerprint(before) !== statFingerprint(after)) {
-      return yield* new Conflict({ detail: "File changed while it was being read; retry before relying on this content" })
+      return yield* new Conflict({
+        detail: "File changed while it was being read; retry before relying on this content",
+      })
     }
     yield* hooks.revalidate().pipe(Effect.asVoid)
     yield* recordRead(input)
     const rendered = renderWindow(input.displayPath, file)
     return {
       result: project(
-        {
-          title: input.displayPath,
-          output: rendered.output,
-          metadata: {
-            action,
-            path: input.displayPath,
-            lines: file.count,
-            offset: file.offset,
-            ...(rendered.nextOffset === undefined ? {} : { nextOffset: rendered.nextOffset }),
+          {
+            title: input.displayPath,
+            output: tsSource
+              ? "<note>Verified UTF-8 text with .ts/.mts extension (TypeScript source candidate), not MPEG transport-stream video. Compilation/syntax not verified.</note>\n" + rendered.output
+              : tsTranslation
+                ? "<note>Qt Linguist XML translation catalog detected from .ts content, not TypeScript or MPEG-TS video.</note>\n" + rendered.output
+                : rendered.output,
+            metadata: {
+              action,
+              path: input.displayPath,
+              lines: file.count,
+              offset: file.offset,
+              ...(tsSource ? { detectedFileKind: "typescript-candidate", detection: "verified-text-not-video" } : {}),
+              ...(tsTranslation ? { detectedFileKind: "qt-translation", detection: "xml-content-header" } : {}),
+              ...(rendered.nextOffset === undefined ? {} : { nextOffset: rendered.nextOffset }),
             truncated: rendered.truncated,
           },
         },

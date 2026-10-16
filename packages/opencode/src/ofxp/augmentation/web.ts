@@ -8,7 +8,7 @@ import { ExchangeError } from "@/exchange/error"
 import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { Parameters as WebParameters } from "@/tool/web"
 import { executeFetch } from "@/tool/webfetch"
-import { callProvider, flagMap, providersOutput, selectWebSearchProvider, webSearchProviderLabel } from "@/tool/websearch"
+import { executeWebSearch, flagMap, providersOutput, webSearchProviderLabel } from "@/tool/websearch"
 import type { PeerCertificateIdentity } from "../certificate"
 
 export const Parameters = WebParameters
@@ -78,10 +78,8 @@ export const execute = Effect.fn("OfxpWebCapability.execute")(function* (
         : call.context.source?.kind === "external"
           ? call.context.source.principal
           : "unknown")
-    const provider = selectWebSearchProvider(`${peer.peerID}:${source}`, flagsByProvider, input.provider)
-    const output = yield* callProvider(
+    const searched = yield* executeWebSearch(
       deps.http,
-      provider,
       {
         action: "search",
         query: input.query,
@@ -92,13 +90,18 @@ export const execute = Effect.fn("OfxpWebCapability.execute")(function* (
         ...(input.provider === undefined ? {} : { provider: input.provider }),
       },
       { sessionID: `${peer.peerID}:${source}` },
+      flagsByProvider,
     ).pipe(
       Effect.mapError((error) => new ExchangeError.DependencyUnavailable({ detail: `Web search failed: ${String(error)}` })),
     )
     result = {
-      title: `${webSearchProviderLabel(provider)} "${input.query}"`,
-      output: output ?? "No search results found. Please try a different query.",
-      metadata: { action, provider },
+      title: `${webSearchProviderLabel(searched.provider)} "${input.query}"`,
+      output: searched.output,
+      metadata: {
+        action,
+        provider: searched.provider,
+        attemptedProviders: searched.attempts.map((attempt) => attempt.provider),
+      },
     }
   }
 

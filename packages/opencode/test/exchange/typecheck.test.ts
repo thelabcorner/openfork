@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto"
 import { Effect } from "effect"
 import { ExchangeError } from "@/exchange/error"
 import { ExchangeTypecheck } from "@/exchange/typecheck"
+import { supportsBunTypecheck } from "@/tool/typecheck-scope"
 import type { ExchangeOwnedCommand } from "@/exchange/owned-command"
 
 const suite = path.join(os.tmpdir(), `opencode-exchange-typecheck-${randomUUID()}`)
@@ -50,8 +51,7 @@ function hooks(
         ? Effect.fail(new ExchangeError.PathEscape({ detail: "outside test root" }))
         : Effect.succeed(resolved)
     },
-    toVirtualPath: (absolutePath: string) =>
-      "/" + path.relative(suite, absolutePath).split(path.sep).join("/"),
+    toVirtualPath: (absolutePath: string) => "/" + path.relative(suite, absolutePath).split(path.sep).join("/"),
     run: (request: Omit<ExchangeOwnedCommand.Input, "workdir"> & { readonly cwd: string }) => {
       calls.push(request.argv)
       if (request.argv[0] === "git" && request.argv.includes("rev-parse")) {
@@ -93,6 +93,19 @@ function hooks(
   }
 }
 
+function expectCompilerCall(argv: readonly string[] | undefined) {
+  expect(argv).toBeDefined()
+  if (supportsBunTypecheck() && Bun.which("bun")) {
+    expect(argv?.[1]).toBe("--check")
+    expect(argv).toContain("--tsconfig-override")
+    expect(argv).toContain("--no-pretty")
+  } else {
+    expect(argv?.[0]).toBe("node")
+    expect(argv).toContain("--pretty")
+    expect(argv).toContain("--project")
+  }
+}
+
 describe("ExchangeTypecheck", () => {
   test("skips Git discovery for explicit-tsconfig file scope", async () => {
     await prepare()
@@ -116,8 +129,7 @@ describe("ExchangeTypecheck", () => {
     })
     expect(calls.some((argv) => argv[0] === "git")).toBe(false)
     expect(calls).toHaveLength(1)
-    expect(calls[0]?.[0]).toBe("node")
-    expect(calls[0]).toContain("--project")
+    expectCompilerCall(calls[0])
   })
 
   test("retains Git discovery for changed scope even with explicit tsconfig", async () => {
@@ -141,7 +153,7 @@ describe("ExchangeTypecheck", () => {
     })
     expect(calls.some((argv) => argv[0] === "git" && argv.includes("rev-parse"))).toBe(true)
     expect(calls.some((argv) => argv[0] === "git" && argv.includes("--cached"))).toBe(true)
-    expect(calls.at(-1)?.[0]).toBe("node")
+    expectCompilerCall(calls.at(-1))
   })
 
   test("distinguishes selected-file diagnostics from imported dependency diagnostics", async () => {

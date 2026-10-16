@@ -12,6 +12,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionSearch } from "@opencode-ai/core/session/search"
 import { partSearchText } from "@opencode-ai/core/session/search-text"
 import {
   MessageTable,
@@ -245,6 +246,8 @@ describe("OFXP Session search supervision adapter", () => {
       }
 
       yield* seedSearchCoverage()
+      // This fixture writes PartTable directly, bypassing the producer.
+      yield* SessionSearch.repairChunk(db, { maxRows: 32 })
 
       const result = yield* OfxpSessionSearch.execute(
         { db, peers, roots },

@@ -4,7 +4,10 @@ import { Effect, Schema } from "effect"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { SessionID } from "@opencode-ai/schema/session-id"
+import { HOST_LIMITS } from "@/code/execution"
 import { OfxpConnectionManager } from "./connection-manager"
+
+const CODE_RUN_REQUEST_TIMEOUT_MS = HOST_LIMITS.timeoutMs + 5_000
 
 export class PeerUnavailableError extends Schema.TaggedErrorClass<PeerUnavailableError>()("OfxpClient.PeerUnavailableError", {
   peerID: Ofxp.PeerID,
@@ -90,6 +93,7 @@ export class Client {
     body: unknown,
     schema: S,
     signal?: AbortSignal,
+    timeoutMs?: number,
   ): Effect.Effect<S["Type"], Error | OfxpPeer.OfxpPeerSchema.NotFoundError> {
     return Effect.gen(
       function* (this: Client) {
@@ -97,7 +101,7 @@ export class Client {
         const denied = trustError(record)
         if (denied) return yield* denied
         const raw = yield* Effect.tryPromise({
-          try: () => this.connections.request<unknown>(peerID, this.endpoints(peerID), method, body, undefined, signal),
+          try: () => this.connections.request<unknown>(peerID, this.endpoints(peerID), method, body, timeoutMs, signal),
           catch: (cause) =>
             new PeerUnavailableError({
               peerID,
@@ -150,6 +154,14 @@ export class Client {
       contract: input.contract,
       args: input.args,
     }
-    return this.request(input.peerID, "capability.call", body, Ofxp.CapabilityResponse, signal)
+    const timeoutMs =
+      input.capability === "code" &&
+      typeof input.args === "object" &&
+      input.args !== null &&
+      !Array.isArray(input.args) &&
+      (input.args as { action?: unknown }).action === "run"
+        ? CODE_RUN_REQUEST_TIMEOUT_MS
+        : undefined
+    return this.request(input.peerID, "capability.call", body, Ofxp.CapabilityResponse, signal, timeoutMs)
   }
 }

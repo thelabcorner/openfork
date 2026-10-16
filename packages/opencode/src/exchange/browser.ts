@@ -5,6 +5,7 @@ import { Effect, Schema } from "effect"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import {
   DEFAULT_TIMEOUT_MS,
+  isDispatchedUnconfirmed,
   OperationInput,
   OperationOutput,
   type OperationName,
@@ -90,7 +91,20 @@ export interface Result {
   readonly mutation: { readonly attempted: boolean; readonly committed: boolean }
 }
 
-function mapBrowserError(error: BrowserHostBroker.BrowserErrorClass): ExchangeError.Error {
+function mapBrowserError(error: BrowserHostBroker.BrowserErrorClass, operation: OperationName): ExchangeError.Error {
+  // The broker lost the outcome of an envelope it had already handed to the
+  // host. A mutating operation MAY have executed, so it must not be replayed
+  // blindly: that is the repository's AmbiguousCommit contract, and recovery is
+  // by state inspection. Read-only operations carry no external effect, so the
+  // same uncertainty stays an ordinary repeatable dependency failure.
+  if (isDispatchedUnconfirmed(error) && isMutating(operation)) {
+    return new ExchangeError.AmbiguousCommit({
+      detail:
+        `browser.${operation} was dispatched to the Desktop host but its result could not be confirmed; ` +
+        `the operation may already have changed browser state. Inspect browser state (status/snapshot) before replaying it.`,
+      targetRef: `browser:${operation}`,
+    })
+  }
   switch (error._tag) {
     case "BrowserPermissionDenied":
       return new ExchangeError.AuthorityDenied({ detail: error.message })
@@ -221,11 +235,22 @@ export const execute = Effect.fn("ExchangeBrowser.execute")(function* (input: In
     },
     { signal: context.signal },
   )
-  if (!response.ok) return yield* mapBrowserError(BrowserHostBroker.BrowserError.fromPayload(response.error))
+  if (!response.ok) return yield* mapBrowserError(BrowserHostBroker.BrowserError.fromPayload(response.error), operation)
 
   const decoded = yield* Schema.decodeUnknownEffect(OperationOutput[operation] as Schema.Decoder<unknown, never>)(response.result).pipe(
     Effect.mapError(
-      () => new ExchangeError.DependencyUnavailable({ detail: `Desktop browser returned an invalid ${operation} result` }),
+      () =>
+        // The host answered `ok`, so the operation DID run; only the payload was
+        // unreadable. That is response loss for a mutating caller: the effect
+        // happened and must not be replayed blindly.
+        isMutating(operation)
+          ? new ExchangeError.AmbiguousCommit({
+              detail:
+                `Desktop browser committed browser.${operation} but returned an unreadable result; ` +
+                `inspect browser state before replaying it.`,
+              targetRef: `browser:${operation}`,
+            })
+          : new ExchangeError.DependencyUnavailable({ detail: `Desktop browser returned an invalid ${operation} result` }),
     ),
   )
   const visual = yield* Effect.try({
