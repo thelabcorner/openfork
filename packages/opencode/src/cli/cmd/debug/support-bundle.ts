@@ -165,13 +165,16 @@ export const SupportBundleCommand = effectCmd({
       }),
   handler: Effect.fn("Cli.debug.supportBundle")(function* (args: {
     out?: string
-    logBytes: number
-    logLines: number
+    "log-bytes": number
+    "log-lines": number
     compact: boolean
     explain: boolean
   }) {
+    // Yargs retains dashed option keys; never read imaginary camelCase fields.
     const rawLines =
-      args.logBytes > 0 ? tailLines(yield* Effect.promise(() => readRecentLogLines(Global.Path.log, args.logBytes)), args.logLines) : []
+      args["log-bytes"] > 0
+        ? tailLines((yield* Effect.promise(() => readRecentLogLines(Global.Path.log, args["log-bytes"]))).join("\n"), args["log-lines"])
+        : []
 
     // Only the fields the core section spec declares are supplied. Anything else is
     // dropped by the allowlist, so passing extra keys would be misleading dead weight.

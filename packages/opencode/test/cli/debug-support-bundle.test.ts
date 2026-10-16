@@ -75,7 +75,7 @@ describe("debug support-bundle composition", () => {
     const ids = Object.keys(bundle.sections).toSorted()
     const accounted = [...bundle.included, ...bundle.excluded.map((entry) => entry.id)].toSorted()
 
-    expect(accounted).toEqual(ids)
+    expect(accounted).toEqual(ids as typeof accounted)
     expect(new Set(accounted).size).toBe(accounted.length)
   })
 
