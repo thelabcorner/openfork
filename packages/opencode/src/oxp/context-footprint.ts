@@ -1,6 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/server"
 
 export const BOUNDARY_CONTEXT_SCHEMA = "oxp-boundary-primary-text/v1" as const
+const HAS_HIGH_SURROGATE = /[\uD800-\uDBFF]/
 
 /**
  * Count Unicode code points without allocating an Array.from/string iterator.
@@ -11,6 +12,11 @@ export const BOUNDARY_CONTEXT_SCHEMA = "oxp-boundary-primary-text/v1" as const
  * projections.
  */
 export function codePointLength(value: string) {
+  // Most tool payloads are source text / JSON without supplementary-plane
+  // characters. Let the native regexp engine scan those strings and avoid a
+  // JavaScript charCodeAt loop (while preserving SQLite length(TEXT) units).
+  // An unpaired high surrogate falls through to the exact pairing loop.
+  if (!HAS_HIGH_SURROGATE.test(value)) return value.length
   let count = value.length
   for (let index = 0; index + 1 < value.length; index += 1) {
     const lead = value.charCodeAt(index)

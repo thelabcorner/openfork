@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect } from "bun:test"
+import { afterAll, beforeEach, describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -11,13 +11,48 @@ import { Global } from "@opencode-ai/core/global"
 import { OxpCapability } from "@/oxp/capability"
 import { OxpConfig } from "@/oxp/config"
 import { OxpMcpControl } from "@/oxp/mcp-control"
+import { mediaOutput } from "@/oxp/mcp"
 import { OxpRoot } from "@/oxp/root"
 import { OxpSessionControl } from "@/oxp/session-control"
 import { OxpSystemOneControl } from "@/oxp/system-one-control"
 import { testEffect } from "../lib/effect"
 
 const suite = path.join(os.tmpdir(), `opencode-oxp-mcp-${randomUUID()}`)
+test("OXP MCP bridge preserves bounded valid image/audio and rejects oversized or malformed media", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64")
+  const wav = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]).toString("base64")
+  const blocks = mediaOutput({
+    content: [
+      { type: "text", text: "done" },
+      { type: "image", mimeType: "image/png", data: png },
+      { type: "audio", mimeType: "audio/wav", data: wav },
+      { type: "image", mimeType: "image/png", data: wav },
+      { type: "audio", mimeType: "audio/wav", data: png },
+      { type: "image", mimeType: "image/svg+xml", data: "AAEC" },
+      { type: "image", mimeType: "image/png", data: "NOT BASE64" },
+      { type: "image", mimeType: "image/jpeg", data: "A".repeat(4 * 1024 * 1024 + 4) },
+    ],
+  })
+  expect(blocks).toEqual([
+    { type: "image", mimeType: "image/png", data: png },
+    { type: "audio", mimeType: "audio/wav", data: wav },
+  ])
+})
 const configDir = path.join(suite, ".config")
+test("OXP imported media stays within one bounded aggregate transfer budget", () => {
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(2 * 1024 * 1024),
+  ]).toString("base64")
+  const accepted = mediaOutput({
+    content: [
+      { type: "image", mimeType: "image/png", data: png },
+      { type: "image", mimeType: "image/png", data: png },
+    ],
+  })
+  expect(accepted).toHaveLength(1)
+  expect(accepted[0]?.data).toBe(png)
+})
 const stateDir = path.join(suite, ".state")
 
 const readTool: OxpMcpControl.Tool = {
@@ -99,6 +134,7 @@ const noSessionControl = Layer.succeed(
     unarchive: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
     delete: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
     setSelection: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
+    steer: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
     send: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
     turn: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
     backgroundSubagents: () => Effect.die("OXP MCP tests must not enter Session runtime control"),
@@ -149,6 +185,98 @@ const prepare = Effect.fnUntraced(function* () {
 })
 
 describe("OXP external MCP capability broker", () => {
+  it.live(
+    "projects MCP capabilities into stateless OXP Code without widening integrations authority",
+    Effect.gen(function* () {
+      const { config, root } = yield* prepare()
+      const capability = yield* OxpCapability.Service
+      catalog = [readTool]
+      yield* config.setGrant({ code: true })
+
+      const codeDescription = yield* capability.execute({ action: "describe", capability: "code" })
+      const codeContract = (JSON.parse(codeDescription.output) as { contract: string }).contract
+      const mcpRef = "mcp:alpha%2Fserver/lookup%2Fitem"
+
+      const searched = yield* capability.execute({
+        action: "call",
+        capability: "code",
+        contract: codeContract,
+        rootID: root.id,
+        args: { action: "search", query: "lookup item" },
+      })
+      expect((searched.structured as { items?: Array<{ ref: string }> }).items?.map((item) => item.ref)).toContain(mcpRef)
+
+      const described = yield* capability.execute({
+        action: "call",
+        capability: "code",
+        contract: codeContract,
+        rootID: root.id,
+        args: { action: "describe", ref: mcpRef },
+      })
+      expect((described.structured as { item?: { signature?: string } }).item?.signature).toContain(JSON.stringify(mcpRef))
+
+      const ran = yield* capability.execute({
+        action: "call",
+        capability: "code",
+        contract: codeContract,
+        rootID: root.id,
+        args: {
+          action: "run",
+          code: `return await call(${JSON.stringify(mcpRef)}, { id: "42" })`,
+        },
+      })
+      expect((ran.structured as { ok?: boolean; value?: unknown }).ok).toBe(true)
+      expect((ran.structured as { value?: unknown }).value).toEqual({ ok: true })
+      expect(calls).toEqual([{ server: "alpha/server", tool: "lookup/item", args: { id: "42" } }])
+
+      yield* config.setGrant({ integrations: false })
+      const denied = yield* capability.execute({
+        action: "call",
+        capability: "code",
+        contract: codeContract,
+        rootID: root.id,
+        args: {
+          action: "run",
+          code: `return await call(${JSON.stringify(mcpRef)}, { id: "43" })`,
+        },
+      })
+      expect((denied.structured as { ok?: boolean; error?: { kind?: string } }).ok).toBe(false)
+      expect((denied.structured as { error?: { kind?: string } }).error?.kind).toBe("ToolFailure")
+      expect(calls).toHaveLength(1)
+    }),
+  )
+
+  it.live(
+    "preserves ambiguous external mutation state across the OXP Code boundary",
+    Effect.gen(function* () {
+      const { config, root } = yield* prepare()
+      const capability = yield* OxpCapability.Service
+      catalog = [mutationTool]
+      yield* config.setGrant({ code: true })
+      callFailure = new Error("external result is unknown")
+
+      const codeDescription = yield* capability.execute({ action: "describe", capability: "code" })
+      const codeContract = (JSON.parse(codeDescription.output) as { contract: string }).contract
+      const mcpRef = "mcp:writer/publish"
+      const ambiguous = yield* capability
+        .execute({
+          action: "call",
+          capability: "code",
+          contract: codeContract,
+          rootID: root.id,
+          args: {
+            action: "run",
+            code: `return await call(${JSON.stringify(mcpRef)}, { value: "x" })`,
+          },
+        })
+        .pipe(Effect.flip)
+
+      expect(ambiguous._tag).toBe("OXP_AMBIGUOUS_EXTERNAL_RESULT")
+      expect(ambiguous.detail).toContain("commit state is unknown")
+      expect(calls).toEqual([{ server: "writer", tool: "publish", args: { value: "x" } }])
+    }),
+  )
+
   it.live(
     "requires explicit root + integrations authority before dynamic discovery",
     Effect.gen(function* () {
@@ -396,7 +524,9 @@ describe("OXP external MCP capability broker", () => {
           args: { value: "hello" },
         },
       ])
-      expect(result.output).toBe("native text")
+      expect(result.output).toContain("native text")
+      expect(result.output).toContain('omitted="1"')
+      expect(result.output).toContain("Do not infer their contents")
       expect(result.output).not.toContain("OMITTED")
       expect(result.structured).toEqual({ ok: true })
       expect(result.metadata).toMatchObject({

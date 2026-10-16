@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test"
-import { Effect, ManagedRuntime, Option } from "effect"
+import { Deferred, Effect, ManagedRuntime, Option } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { AppRuntime } from "@/effect/app-runtime"
@@ -29,6 +29,7 @@ const isTitleRequest = (hit: { body: Record<string, unknown> }) => {
 }
 
 const response = (text: string) => reply().text(text).stop().item()
+const deferredAsPromise = <A>(deferred: Deferred.Deferred<A>) => Effect.runPromise(Deferred.await(deferred))
 
 const isGoalAuditorRequest = (hit: { body: Record<string, unknown> }) => {
   const tools = hit.body.tools
@@ -220,6 +221,243 @@ describe("OxpSessionControlV1 supervised turn lifetime", () => {
 
       expect(text).toContain("session control send result")
     } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 60_000)
+
+  test("send admitted while a discovery turn is busy is durably drained instead of sitting inert", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    const gate = Effect.runSync(Deferred.make<void>())
+    await llmRuntime.runPromise(
+      llm.pushMatch(
+        (hit) => !isTitleRequest(hit),
+        reply().wait(deferredAsPromise(gate)).text("initial discovery result").stop().item(),
+      ),
+    )
+    await llmRuntime.runPromise(
+      llm.pushMatch((hit) => !isTitleRequest(hit), response("canonical handoff executed")),
+    )
+
+    const tmp = await tmpdir({ config: testProviderConfig(llm.url) })
+    try {
+      const session = await AppRuntime.runPromise(
+        inInstance(
+          tmp.path,
+          Session.Service.use((sessions) => sessions.create({ title: "OXP busy send drain" })),
+        ),
+      )
+      const target: OxpSessionControl.Target = {
+        directory: tmp.path,
+        sessionID: session.id,
+      }
+      const discoveryText = "perform initial discovery only"
+      const handoffText = "execute the latest canonical implementation handoff"
+
+      await controlRuntime.runPromise(
+        OxpSessionControl.Service.use((control) =>
+          control.send(target, {
+            actorRef: "oxp:test-busy-send-discovery",
+            text: discoveryText,
+          }),
+        ),
+      )
+
+      await llmRuntime.runPromise(
+        pollWithTimeout(
+          llm.hits.pipe(
+            Effect.map((hits) =>
+              hits.some(
+                (hit) =>
+                  !isTitleRequest(hit) &&
+                  JSON.stringify(hit.body).includes(discoveryText),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+          "initial OXP discovery turn never entered the provider",
+          "20 seconds",
+        ),
+      )
+
+      const handoff = await controlRuntime.runPromise(
+        OxpSessionControl.Service.use((control) =>
+          control.send(target, {
+            actorRef: "oxp:test-busy-send-handoff",
+            text: handoffText,
+          }),
+        ),
+      )
+      expect(handoff.paused).toBe(false)
+
+      await Effect.runPromise(Deferred.succeed(gate, undefined).pipe(Effect.asVoid))
+
+      const executed = await AppRuntime.runPromise(
+        inInstance(
+          tmp.path,
+          Session.Service.use((sessions) =>
+            pollWithTimeout(
+              Effect.gen(function* () {
+                const messages = yield* sessions.messages({ sessionID: session.id })
+                const assistant = messages.find(
+                  (message) =>
+                    message.info.role === "assistant" &&
+                    String(message.info.parentID) === handoff.admittedMessageID &&
+                    message.info.time.completed !== undefined,
+                )
+                if (!assistant) return undefined
+                const text = assistant.parts
+                  .filter(
+                    (part): part is Extract<(typeof assistant.parts)[number], { type: "text" }> =>
+                      part.type === "text",
+                  )
+                  .map((part) => part.text)
+                  .join("")
+                return text.includes("canonical handoff executed") ? assistant : undefined
+              }),
+              "queued OXP handoff remained inert after the discovery turn settled",
+              "20 seconds",
+            ),
+          ),
+        ),
+      )
+
+      if (executed.info.role !== "assistant") throw new Error("expected the queued OXP handoff to complete as an assistant turn")
+      expect(String(executed.info.parentID)).toBe(handoff.admittedMessageID)
+      const providerHits = await llmRuntime.runPromise(llm.hits)
+      expect(
+        providerHits.some(
+          (hit) => !isTitleRequest(hit) && JSON.stringify(hit.body).includes(handoffText),
+        ),
+      ).toBe(true)
+    } finally {
+      await Effect.runPromise(Deferred.succeed(gate, undefined).pipe(Effect.ignore))
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 60_000)
+
+  test("turn waits for its exact busy-session handoff rather than the older discovery turn", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    const discoveryGate = Effect.runSync(Deferred.make<void>())
+    const handoffGate = Effect.runSync(Deferred.make<void>())
+    await llmRuntime.runPromise(
+      llm.pushMatch(
+        (hit) => !isTitleRequest(hit),
+        reply().wait(deferredAsPromise(discoveryGate)).text("discovery completed").stop().item(),
+      ),
+    )
+    await llmRuntime.runPromise(
+      llm.pushMatch(
+        (hit) => !isTitleRequest(hit),
+        reply().wait(deferredAsPromise(handoffGate)).text("exact handoff completed").stop().item(),
+      ),
+    )
+
+    const tmp = await tmpdir({ config: testProviderConfig(llm.url) })
+    try {
+      const session = await AppRuntime.runPromise(
+        inInstance(
+          tmp.path,
+          Session.Service.use((sessions) => sessions.create({ title: "OXP exact busy turn fence" })),
+        ),
+      )
+      const target: OxpSessionControl.Target = {
+        directory: tmp.path,
+        sessionID: session.id,
+      }
+      const discoveryText = "inspect the codebase before implementation"
+      const handoffText = "now execute the canonical implementation"
+
+      await controlRuntime.runPromise(
+        OxpSessionControl.Service.use((control) =>
+          control.send(target, {
+            actorRef: "oxp:test-exact-turn-discovery",
+            text: discoveryText,
+          }),
+        ),
+      )
+      await llmRuntime.runPromise(
+        pollWithTimeout(
+          llm.hits.pipe(
+            Effect.map((hits) =>
+              hits.some(
+                (hit) =>
+                  !isTitleRequest(hit) &&
+                  JSON.stringify(hit.body).includes(discoveryText),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+          "initial OXP discovery turn never entered the provider",
+          "20 seconds",
+        ),
+      )
+
+      let turnSettled = false
+      const turn = controlRuntime
+        .runPromise(
+          OxpSessionControl.Service.use((control) =>
+            control.turn(target, {
+              actorRef: "oxp:test-exact-turn-handoff",
+              text: handoffText,
+            }),
+          ),
+        )
+        .then((result) => {
+          turnSettled = true
+          return result
+        })
+
+      await Effect.runPromise(Deferred.succeed(discoveryGate, undefined).pipe(Effect.asVoid))
+      await llmRuntime.runPromise(
+        pollWithTimeout(
+          llm.hits.pipe(
+            Effect.map((hits) =>
+              hits.some(
+                (hit) =>
+                  !isTitleRequest(hit) &&
+                  JSON.stringify(hit.body).includes(handoffText),
+              )
+                ? true
+                : undefined,
+            ),
+          ),
+          "queued OXP exact handoff never entered the provider after discovery settled",
+          "20 seconds",
+        ),
+      )
+
+      // The old discovery run has already completed. The exact-turn fence must
+      // remain pending while the handoff's own provider cycle is still held.
+      expect(turnSettled).toBe(false)
+
+      await Effect.runPromise(Deferred.succeed(handoffGate, undefined).pipe(Effect.asVoid))
+      const result = await turn
+      expect(result.paused).toBe(false)
+      expect(result.resultMessageID).toBeDefined()
+
+      const exact = await AppRuntime.runPromise(
+        inInstance(
+          tmp.path,
+          Session.Service.use((sessions) =>
+            sessions.findMessage(
+              session.id,
+              (message) =>
+                message.info.role === "assistant" &&
+                String(message.info.id) === result.resultMessageID,
+            ),
+          ),
+        ),
+      )
+      expect(Option.isSome(exact)).toBe(true)
+      if (Option.isSome(exact)) {
+        if (exact.value.info.role !== "assistant") throw new Error("expected the exact OXP turn result to be an assistant")
+        expect(String(exact.value.info.parentID)).toBe(result.admittedMessageID)
+      }
+    } finally {
+      await Effect.runPromise(Deferred.succeed(discoveryGate, undefined).pipe(Effect.ignore))
+      await Effect.runPromise(Deferred.succeed(handoffGate, undefined).pipe(Effect.ignore))
       await tmp[Symbol.asyncDispose]()
     }
   }, 60_000)

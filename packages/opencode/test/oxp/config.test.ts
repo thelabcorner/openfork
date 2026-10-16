@@ -75,10 +75,10 @@ describe("OxpConfig", () => {
   )
 
   it.live(
-    "normalizes legacy configs with no automation grant to false without rewriting them",
+    "normalizes new default-off grants in legacy configs without rewriting them",
     Effect.gen(function* () {
       const legacy = OxpSchema.defaults(OxpSchema.ConnectorID.make(randomUUID()))
-      const { automation: _automation, ...legacyGrant } = legacy.grant
+      const { automation: _automation, code: _code, ...legacyGrant } = legacy.grant
       const bytes = JSON.stringify({ ...legacy, grant: legacyGrant }, null, 2) + "\\n"
       yield* Effect.promise(() => fs.writeFile(configFile, bytes, { mode: 0o600 }))
 
@@ -86,8 +86,10 @@ describe("OxpConfig", () => {
       const current = yield* config.get()
 
       expect(current.grant.automation).toBe(false)
+      expect(current.grant.code).toBe(false)
       expect(yield* Effect.promise(() => fs.readFile(configFile, "utf8"))).toBe(bytes)
       expect(bytes).not.toContain('"automation"')
+      expect(bytes).not.toContain('"code"')
     }),
   )
 

@@ -25,7 +25,11 @@ describe("OXP Gate C surface/performance proof", () => {
     // Titles, outputSchema, security metadata, invocation UX, native file
     // parameters, and Swarm are intentional permanent-contract bytes. Guard
     // against accidental growth while reporting the older pre-contract baseline.
-    expect(bytes).toBeLessThanOrEqual(40_000)
+    // The current executable contract includes focused broker guidance and
+    // richer Session supervision metadata. Retain an explicit budget with
+    // headroom rather than claiming the obsolete 2025-era 40 KiB envelope.
+    // Any future expansion must justify its recurring model/context cost.
+    expect(bytes).toBeLessThanOrEqual(47_000)
   })
 
   test("keeps every permanent OXP tool description canonical, concise, and decision-useful", () => {
@@ -36,7 +40,14 @@ describe("OXP Gate C surface/performance proof", () => {
       expect(description).toBe(canonical[tool.name])
       if (description === undefined) throw new Error(`OXP tool ${tool.name} has no description`)
       expect(description.length).toBeGreaterThanOrEqual(90)
-      expect(description.length).toBeLessThanOrEqual(180)
+      // Session supervision needs blocked-request/continuation guidance on the
+      // permanent tool; broker guidance is intentionally more explicit than
+      // ordinary direct tools. Bound each reviewed exception separately.
+      const maxLength = tool.name === "openfork_session" ? 500
+        : tool.name === "capability" ? 220
+        : tool.name === "openfork_diagnostics" ? 200
+        : 180
+      expect(description.length).toBeLessThanOrEqual(maxLength)
       expect(description).not.toContain("\n")
     }
   })
@@ -51,7 +62,7 @@ describe("OXP Gate C surface/performance proof", () => {
     expect(broker).toBeDefined()
     const schema = broker!.inputSchema as { properties?: Record<string, unknown> }
     expect(Object.keys(schema.properties ?? {}).sort()).toEqual(
-      ["action", "args", "capability", "contract", "load", "namespace", "query", "rootID", "source_file"].sort(),
+      ["action", "args", "capability", "contract", "focusAction", "guidanceMode", "load", "namespace", "query", "rootID", "source_file"].sort(),
     )
     const encoded = JSON.stringify(broker!.inputSchema)
     expect(encoded).not.toContain("compareJsonText")
@@ -69,7 +80,10 @@ describe("OXP Gate C surface/performance proof", () => {
     }
     const report = { medianMs: median(samples), p95Ms: p95(samples), samples: samples.length }
     console.log("OXP_GATE_C_PERF", JSON.stringify(report))
-    expect(report.medianMs).toBeLessThan(1)
+    // The canonical manifest list is immutable: warm listing must not redo
+    // schema serialization or sorting. This detects accidental O(N*schema)
+    // regressions that the old 1ms ceiling would silently permit.
+    expect(report.medianMs).toBeLessThan(0.05)
     expect(report.p95Ms).toBeLessThan(5)
   })
 })

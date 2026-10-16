@@ -176,6 +176,46 @@ describe("OxpAuthority", () => {
   )
 
   it.live(
+    "keeps Code as an independent default-off rootless authority",
+    Effect.gen(function* () {
+      const authority = yield* OxpAuthority.Service
+      const config = yield* OxpConfig.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+
+      const denied = yield* attempt(
+        authority.authorize({
+          plane: "augmentation",
+          operation: "code.run",
+          phase: "control",
+        }),
+      )
+      expect(denied._tag).toBe("Left")
+      if (denied._tag === "Left") expect(denied.left._tag).toBe("OXP_AUTH_DENIED")
+
+      yield* config.setGrant({ read: false, code: true })
+      const visible = yield* authority.discover({
+        plane: "augmentation",
+        operation: "code.search",
+      })
+      const admitted = yield* authority.authorize({
+        plane: "augmentation",
+        operation: "code.run",
+        phase: "control",
+      })
+
+      expect(visible).toBe(true)
+      expect(admitted.authority).toBe("code")
+      expect(admitted.root).toBeUndefined()
+
+      yield* config.setGrant({ code: false })
+      const revoked = yield* attempt(authority.revalidate(admitted, "commit"))
+      expect(revoked._tag).toBe("Left")
+      if (revoked._tag === "Left") expect(revoked.left._tag).toBe("OXP_AUTH_REVOKED")
+    }),
+  )
+
+  it.live(
     "keeps session supervision and request supervision as distinct authorities",
     Effect.gen(function* () {
       const authority = yield* OxpAuthority.Service

@@ -1,12 +1,9 @@
-import { randomBytes, timingSafeEqual } from "node:crypto"
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import type { Socket } from "node:net"
 import path from "node:path"
-import { Context, Effect, Layer, Result, Schema } from "effect"
+import { Cause, Context, Effect, Layer, Result, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { CodingActivity } from "@opencode-ai/core/coding-activity"
-import { createMcpHandler, fromJsonSchema, Server, type CallToolResult, type Tool } from "@modelcontextprotocol/server"
+import type { CallToolResult } from "@modelcontextprotocol/server"
 import { OxpAuthority } from "./authority"
 import { OxpAttribution } from "./attribution"
 import { OxpCapability } from "./capability"
@@ -19,24 +16,23 @@ import { OxpSurface } from "./surface"
 import { OxpSession } from "./session"
 import { OxpRequest } from "./request"
 import { OxpWorker } from "./worker"
-import { OxpParentToolEpoch } from "./parent-tool-epoch"
+import { OxpParentToolEpoch, type ParentCorrelation } from "./parent-tool-epoch"
+import { OxpSessionTitle } from "./session-title"
 import { OxpActivityRecorder } from "./activity-recorder"
 import { OxpActivityIdentity } from "./activity-identity"
+import { OxpDiagnostics } from "./diagnostics"
 import { OxpRuntimeRefresh } from "./runtime-refresh"
+import { AX_IMPLEMENTATION } from "./ax-revisions"
 import { resultContextChars } from "./context-footprint"
+import { createLatencyHistogram, type LatencySnapshot } from "./latency-histogram"
+import { OXP_STATIC_TRANSPORT } from "./transport-manifest"
+import { startLeanOxpListener } from "./transport-listener"
 
-const MAX_BODY_BYTES = 8 * 1024 * 1024
-const TOOL_LIST_PAGE_BYTES = 2 * 1024 * 1024
-// The public tunnel identity is intentionally stable. Address the MCP server
-// identity by the schema-rich surface fingerprint so reconnecting clients have
-// an explicit protocol-visible cache key change whenever tools/instructions do.
-const VERSION = `0.1.0+schema.${OxpSurface.FINGERPRINT.slice(0, 12)}`
+// Public re-export for existing callers and parity fixtures; the implementation
+// is now in the schema-only transport plane rather than the execution service.
+export { paginateToolList } from "./transport-pagination"
 
-interface Cursor {
-  readonly v: 1
-  readonly offset: number
-  readonly fingerprint: string
-}
+
 
 export interface Endpoint {
   readonly port: number
@@ -59,6 +55,8 @@ export interface Metrics {
   readonly conversationCorrelatedCalls: number
   readonly unattributedParentCalls: number
   readonly trackedParents: number
+  /** Lifetime, bounded, coarse-bucket milliseconds; never stores request data. */
+  readonly latency?: Readonly<Record<"toolCall" | "dispatch" | "activityBegin" | "activitySettle" | "mcpTransport", LatencySnapshot>>
 }
 
 export interface Interface {
@@ -66,114 +64,24 @@ export interface Interface {
   readonly active: () => Endpoint | undefined
   readonly stop: () => Effect.Effect<void>
   readonly metrics: () => Metrics
+  /** First-call proof for the host's eager-schema-free listener. Generating
+   * tools/list stays Tier-0; dispatch is denied if the source schema changed. */
+  readonly validateManifest: () => boolean
+  /** Same authorized execution envelope as the listener, exposed for the
+   * independently bound host transport; never a bypass to leaf authority. */
+  readonly execute: (
+    name: string,
+    args: unknown,
+    meta: Readonly<Record<string, unknown>> | undefined,
+    signal: AbortSignal,
+  ) => Promise<ExecutedToolCall>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/OxpServer") {}
 export const use = serviceUse(Service)
 
-function safeEqual(a: string, b: string) {
-  const left = Buffer.from(a)
-  const right = Buffer.from(b)
-  return left.length === right.length && timingSafeEqual(left, right)
-}
-
-function encodeCursor(cursor: Cursor) {
-  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url")
-}
-
-function decodeCursor(value: string | undefined, fingerprint: string, length: number) {
-  if (value === undefined) return 0
-  if (value.length > 1024) throw new Error("Invalid tools/list cursor")
-  try {
-    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<Cursor>
-    if (
-      parsed.v !== 1 ||
-      parsed.fingerprint !== fingerprint ||
-      !Number.isSafeInteger(parsed.offset) ||
-      (parsed.offset ?? -1) < 0 ||
-      (parsed.offset ?? 0) > length
-    ) {
-      throw new Error("stale")
-    }
-    return parsed.offset!
-  } catch {
-    throw new Error("Invalid or stale tools/list cursor; restart discovery from the first page")
-  }
-}
-
-export function paginateToolList(
-  tools: readonly Tool[],
-  cursor?: string,
-  byteBudget = TOOL_LIST_PAGE_BYTES,
-): { readonly tools: Tool[]; readonly nextCursor?: string } {
-  const ordered = [...tools].sort((a, b) => a.name.localeCompare(b.name))
-  // The permanent OXP surface is immutable and overwhelmingly dominates this
-  // path. Reuse its precomputed surface fingerprint rather than canonicalizing
-  // and hashing the full (schema-rich) manifest on every tools/list request.
-  const fingerprint =
-    tools === OxpSurface.TOOLS ? OxpSurface.FINGERPRINT : OxpSurface.toolProjectionFingerprint(ordered)
-  const offset = decodeCursor(cursor, fingerprint, ordered.length)
-  const budget = Math.max(1, Math.floor(byteBudget))
-  const page: Tool[] = []
-  let bytes = 0
-  let index = offset
-  while (index < ordered.length) {
-    const tool = ordered[index]!
-    const cost = Buffer.byteLength(JSON.stringify(tool), "utf8") + 1
-    if (page.length > 0 && bytes + cost > budget) break
-    page.push(tool)
-    bytes += cost
-    index++
-  }
-  return {
-    tools: page,
-    ...(index < ordered.length ? { nextCursor: encodeCursor({ v: 1, offset: index, fingerprint }) } : {}),
-  }
-}
-
-function jsonError(res: ServerResponse, status: number, error: string) {
-  const body = JSON.stringify({ error })
-  res.writeHead(status, {
-    "content-type": "application/json",
-    "cache-control": "no-store",
-    "content-length": Buffer.byteLength(body),
-  })
-  res.end(body)
-}
-
-async function boundedBody(req: IncomingMessage): Promise<{ readonly body?: unknown; readonly error?: string }> {
-  const chunks: Buffer[] = []
-  let bytes = 0
-  try {
-    for await (const raw of req) {
-      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
-      bytes += chunk.length
-      if (bytes > MAX_BODY_BYTES) return { error: "payload_too_large" }
-      chunks.push(chunk)
-    }
-    const text = Buffer.concat(chunks).toString("utf8")
-    return { body: text ? JSON.parse(text) : undefined }
-  } catch {
-    return { error: "invalid_json" }
-  }
-}
-
-export function bridgeRequestCancellation(req: IncomingMessage, res: ServerResponse) {
-  const controller = new AbortController()
-  const onAborted = () => controller.abort()
-  const onResponseClose = () => {
-    if (!res.writableFinished) controller.abort()
-  }
-  req.once("aborted", onAborted)
-  res.once("close", onResponseClose)
-  return {
-    signal: controller.signal,
-    dispose() {
-      req.off("aborted", onAborted)
-      res.off("close", onResponseClose)
-    },
-  }
-}
+export { projectInternalErrorBody } from "./transport-incident"
+export { bridgeRequestCancellation } from "./transport-listener"
 
 type AfterResponse = NonNullable<OxpResult.CapabilityResult["afterResponse"]>
 type ExecutedToolCall = {
@@ -181,85 +89,8 @@ type ExecutedToolCall = {
   readonly afterResponse?: AfterResponse
 }
 
-async function endResponse(res: ServerResponse, body: Buffer | undefined): Promise<boolean> {
-  if (res.destroyed && !res.writableFinished) return false
-  return new Promise<boolean>((resolve) => {
-    let settled = false
-    const finish = (value: boolean) => {
-      if (settled) return
-      settled = true
-      res.off("finish", onFinish)
-      res.off("close", onClose)
-      resolve(value)
-    }
-    const onFinish = () => finish(true)
-    const onClose = () => finish(res.writableFinished)
-    res.once("finish", onFinish)
-    res.once("close", onClose)
-    res.end(body)
-  })
-}
 
-async function handleMcpRequest(
-  handler: ReturnType<typeof createMcpHandler>,
-  req: IncomingMessage,
-  res: ServerResponse,
-  parsedBody: unknown,
-  takeAfterResponse?: (request: Request) => AfterResponse | undefined,
-) {
-  const cancellation = bridgeRequestCancellation(req, res)
-  const headers = new Headers()
-  for (const [name, raw] of Object.entries(req.headers)) {
-    if (raw === undefined || name.toLowerCase() === "content-length") continue
-    if (Array.isArray(raw)) {
-      for (const value of raw) headers.append(name, value)
-    } else {
-      headers.set(name, raw)
-    }
-  }
-  const request = new Request(`http://127.0.0.1${req.url ?? "/"}`, {
-    method: req.method ?? "POST",
-    headers,
-    body: parsedBody === undefined ? undefined : JSON.stringify(parsedBody),
-    signal: cancellation.signal,
-  })
-  try {
-    const response = await handler.fetch(request)
-    if (cancellation.signal.aborted || res.destroyed) return
-    const responseHeaders: Record<string, string> = {}
-    response.headers.forEach((value, key) => {
-      responseHeaders[key] = value
-    })
-    const body = response.body ? Buffer.from(await response.arrayBuffer()) : undefined
-    if (body) responseHeaders["content-length"] = String(body.byteLength)
-    res.writeHead(response.status, responseHeaders)
-    const finished = await endResponse(res, body)
-    if (finished) {
-      const afterResponse = takeAfterResponse?.(request)
-      if (afterResponse) {
-        await Promise.resolve(afterResponse()).catch(() => undefined)
-      }
-    }
-  } finally {
-    cancellation.dispose()
-  }
-}
-
-function allowedRequest(req: IncomingMessage, port: number) {
-  const host = (req.headers.host ?? "").toLowerCase()
-  const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`])
-  if (!allowedHosts.has(host)) return false
-  const origin = req.headers.origin
-  if (!origin) return true
-  try {
-    const parsed = new URL(origin)
-    return parsed.protocol === "http:" && allowedHosts.has(parsed.host.toLowerCase()) && parsed.pathname === "/"
-  } catch {
-    return false
-  }
-}
-
-function toolResult(result: OxpResult.CapabilityResult): CallToolResult {
+export function toolResult(result: OxpResult.CapabilityResult): CallToolResult {
   const projected = {
     output: result.output,
     ...(result.structured === undefined ? {} : { data: result.structured }),
@@ -268,7 +99,7 @@ function toolResult(result: OxpResult.CapabilityResult): CallToolResult {
     ...(result.mutation ? { mutation: result.mutation } : {}),
   }
   return {
-    content: [{ type: "text", text: result.output }],
+    content: [{ type: "text", text: result.output }, ...(result.mediaContent ?? [])],
     structuredContent: projected,
   }
 }
@@ -298,6 +129,67 @@ function establishesDurableContinuation(name: string, args: unknown) {
 export function durableContinuationObserved(name: string, args: unknown, error?: OxpError.Error) {
   if (!establishesDurableContinuation(name, args)) return false
   return error === undefined || error.metadata?.committed === true
+}
+
+function requiresParentConversationContext(name: string, args: unknown) {
+  if (name !== "capability" || !args || typeof args !== "object" || Array.isArray(args)) return false
+  const input = args as Record<string, unknown>
+  // Only the browser capability binds a local browser principal to the
+  // ChatGPT conversation. Other OXP calls must remain available when the
+  // optional activity-correlation key cannot be read.
+  return input.action === "call" && input.capability === "browser" && input.namespace !== "mcp"
+}
+
+function boundaryFailure(error: unknown): OxpError.Error {
+  if (OxpError.isError(error)) return error
+  return internalFailure(error, "tool_boundary")
+}
+
+function internalFailure(
+  cause: unknown,
+  phase: OxpDiagnostics.Phase,
+  tool?: string,
+  action?: string,
+): OxpError.Internal {
+  let incidentID = "unavailable"
+  try {
+    const safeTool = tool && OxpSurface.TOOLS.some((definition) => definition.name === tool) ? tool : undefined
+    const incident = OxpDiagnostics.record({
+      cause,
+      phase,
+      tool: safeTool,
+      action,
+      surfaceFingerprint: OxpSurface.FINGERPRINT,
+    })
+    incidentID = incident.id
+    console.error(`[OXP] incident ${incident.id} (${phase}, ${incident.tool ?? "unknown"}): ${incident.errorName}${incident.errorCode ? `/${incident.errorCode}` : ""}`)
+  } catch {
+    // Diagnostics must never replace the underlying tool failure.
+  }
+  return new OxpError.Internal({
+    detail: `Unexpected OXP failure${incidentID === "unavailable" ? " (diagnostic recording unavailable)" : ` recorded as ${incidentID}. Read recent incidents with openfork_info action=status; use action=diagnostics with incidentID=${incidentID} when available.`}`,
+    ...(incidentID === "unavailable" ? {} : { metadata: { incidentID } }),
+  })
+}
+
+function reportTransportFailure(cause: unknown, phase: "mcp_transport" | "request_body") {
+  try {
+    const incident = OxpDiagnostics.record({ cause, phase, surfaceFingerprint: OxpSurface.FINGERPRINT })
+    try {
+      console.error(`[OXP] incident ${incident.id} (${phase}): ${incident.errorName}${incident.errorCode ? `/${incident.errorCode}` : ""}`)
+    } catch {
+      // Logging is best-effort; the incident remains queryable over OXP.
+    }
+    return incident.id
+  } catch {
+    // A broken diagnostic sink must not compound a transport failure.
+    return undefined
+  }
+}
+
+function reportActivityFailure(cause: unknown, name: string, args: unknown) {
+  const action = record(args)?.action
+  internalFailure(cause, "activity_recording", name, typeof action === "string" ? action : undefined)
 }
 
 /**
@@ -463,6 +355,13 @@ const layer = Layer.effect(
     const activity = yield* OxpActivityRecorder.Service
     const activityIdentity = yield* OxpActivityIdentity.Service
     const parentEpochs = OxpParentToolEpoch.makeTracker()
+    const latency = {
+      toolCall: createLatencyHistogram(),
+      dispatch: createLatencyHistogram(),
+      activityBegin: createLatencyHistogram(),
+      activitySettle: createLatencyHistogram(),
+      mcpTransport: createLatencyHistogram(),
+    }
     let current: Endpoint | undefined
     const metricState: {
       lastRequestAt?: number
@@ -479,7 +378,17 @@ const layer = Layer.effect(
       supervisionCalls: 0,
       delegationCalls: 0,
     }
-    const metrics = (): Metrics => Object.freeze({ ...metricState, ...parentEpochs.stats() })
+    const metrics = (): Metrics => Object.freeze({
+      ...metricState,
+      ...parentEpochs.stats(),
+      latency: Object.freeze({
+        toolCall: latency.toolCall.snapshot(),
+        dispatch: latency.dispatch.snapshot(),
+        activityBegin: latency.activityBegin.snapshot(),
+        activitySettle: latency.activitySettle.snapshot(),
+        mcpTransport: latency.mcpTransport.snapshot(),
+      }),
+    })
 
     /**
      * Emits canonical CodingActivity for the file operations this success
@@ -524,6 +433,7 @@ const layer = Layer.effect(
       args: unknown,
       signal: AbortSignal,
       context: OxpCapability.CallContext = {},
+      parentCorrelation?: ParentCorrelation,
     ) {
       if (signal.aborted) return yield* new OxpError.Cancelled({ detail: "OXP request was cancelled" })
       if (
@@ -606,6 +516,15 @@ const layer = Layer.effect(
           operation: `info.${input.action}`,
           phase: "discover",
         })
+        // sessionTitle is handshake metadata for the status action only. It is
+        // optional at the transport so older clients keep working, but the
+        // agent contract requires it: a missing title leaves the session's
+        // row anonymous while invalid titles fail compactly.
+        if (input.sessionTitle !== undefined && input.action !== "status") {
+          return yield* new OxpError.InvalidArgument({
+            detail: "sessionTitle is only valid with openfork_info action=status",
+          })
+        }
         if (input.action === "capabilities") {
           const rows = yield* capability.list(undefined, "all")
           return {
@@ -613,21 +532,71 @@ const layer = Layer.effect(
             structured: { capabilities: rows },
           } satisfies OxpResult.CapabilityResult
         }
+        if (input.action === "diagnostics") {
+          const incidents = OxpDiagnostics.list({ limit: input.limit, id: input.incidentID })
+          const report = {
+            incidents,
+            capacity: 64,
+            retained: OxpDiagnostics.size(),
+            latency: metrics().latency,
+            note: "Process-local diagnostics; no arguments, tool results, prompts, credentials, or absolute paths are retained.",
+          }
+          return {
+            output: JSON.stringify(report, null, 2),
+            structured: report,
+          } satisfies OxpResult.CapabilityResult
+        }
+        let sessionTitle: string | undefined
+        let sessionPersisted = false
+        if (input.action === "status" && input.sessionTitle !== undefined) {
+          const normalized = OxpSessionTitle.normalizeSessionTitle(input.sessionTitle)
+          if (!normalized.ok) {
+            return yield* new OxpError.InvalidArgument({
+              detail:
+                normalized.reason === "blank"
+                  ? "sessionTitle is required for the initial OXP status handshake"
+                  : `sessionTitle must be at most ${OxpSessionTitle.MAX_TITLE_BYTES} bytes`,
+            })
+          }
+          sessionTitle = normalized.title
+          const registered = yield* activity.registerSession({ parentCorrelation, title: normalized.title })
+          sessionPersisted = registered.persisted
+        }
         if (input.action === "status") {
           const state = yield* config.get()
           const runtime = yield* Effect.promise(() => OxpRuntimeRefresh.status())
-          const publicRoots = yield* Effect.forEach(state.roots, (root) =>
-            roots.verify(root).pipe(
-              Effect.as({ id: root.id, alias: root.alias, available: true }),
-              Effect.catch(() => Effect.succeed({ id: root.id, alias: root.alias, available: false })),
-            ),
+          const publicRoots = yield* Effect.forEach(
+            state.roots,
+            (root) =>
+              roots.verify(root).pipe(
+                Effect.as({ id: root.id, alias: root.alias, available: true }),
+                Effect.catch(() => Effect.succeed({ id: root.id, alias: root.alias, available: false })),
+              ),
+            // Availability probes are independent: preserve per-root realpath
+            // and identity revalidation without serializing unrelated volumes.
+            { concurrency: 4 },
           )
           const status = {
             surfaceVersion: OxpSurface.MAJOR_VERSION,
             schemaFingerprint: OxpSurface.FINGERPRINT,
+            // On-demand broker semantics can change without changing the
+            // permanent MCP manifest. Report them separately so a stable
+            // surface fingerprint cannot masquerade as a fresh deployment.
+            implementation: { ax: AX_IMPLEMENTATION },
             connector: state.connector,
             configRevision: state.revision,
             runtime,
+            // Keep diagnostics available through `status`, whose published
+            // connector schema predates the optional action on some MCP
+            // clients. This surfaces failures that could not be returned from
+            // the original request.
+            diagnostics: {
+              capacity: 64,
+              retained: OxpDiagnostics.size(),
+              incidents: OxpDiagnostics.list({ limit: 5 }),
+            },
+            sessionTitle: sessionTitle ?? null,
+            sessionPersisted,
             enabled: state.enabled,
             roots: publicRoots,
             // Project only authority that is executable on this versioned MCP
@@ -638,6 +607,7 @@ const layer = Layer.effect(
               write: state.grant.write,
               git: state.grant.git,
               process: state.grant.process,
+              code: state.grant.code ?? false,
               browser: state.grant.browser,
               automation: state.grant.automation ?? false,
               sessionSupervision: state.grant.sessionSupervision,
@@ -654,261 +624,192 @@ const layer = Layer.effect(
         return yield* new OxpError.InvalidArgument({ detail: "Unknown OpenFork info action" })
       }
 
+      if (name === "openfork_diagnostics") {
+        // The OXP endpoint's unguessable local URL is the authorization
+        // boundary for this minimal operational read. Do not consult config,
+        // workspace roots, activity storage, or SQLite here: those may be the
+        // very dependencies that caused the incident being inspected.
+        const input = yield* Schema.decodeUnknownEffect(OxpSurface.DiagnosticsParameters)(args, {
+          onExcessProperty: "error",
+        }).pipe(Effect.mapError(() => new OxpError.InvalidArgument({ detail: "Invalid OpenFork diagnostics arguments" })))
+        const report = {
+          incidents: OxpDiagnostics.list({ limit: input.limit, id: input.incidentID }),
+          capacity: 64,
+          retained: OxpDiagnostics.size(),
+          latency: metrics().latency,
+          note: "Process-local diagnostics; no arguments, tool results, prompts, credentials, or absolute paths are retained.",
+        }
+        return {
+          output: JSON.stringify(report, null, 2),
+          structured: report,
+        } satisfies OxpResult.CapabilityResult
+      }
+
       return yield* new OxpError.NotFound({ detail: `Unknown OXP tool: ${name}` })
     })
 
-    const start = Effect.fn("OxpServer.start")(function* () {
-      if (current) return yield* new OxpError.Busy({ detail: "OXP MCP endpoint is already running" })
-      const started = yield* Effect.tryPromise({
-        try: async () => {
-          const token = randomBytes(32).toString("base64url")
-          const basePath = `/mcp/${token}`
-          const metadataPath = `/.well-known/oauth-protected-resource${basePath}`
-          let endpointUrl = ""
-          let port = 0
-          let stopPromise: Promise<void> | undefined
-          const sockets = new Set<Socket>()
-
-          const executeToolCall = async (
-            name: string,
-            args: unknown,
-            requestMeta: Readonly<Record<string, unknown>> | undefined,
-            signal: AbortSignal,
-          ): Promise<ExecutedToolCall> => {
-            const parentCorrelation = OxpParentToolEpoch.parentCorrelation(requestMeta)
-            const continuity = parentEpochs.observe(parentCorrelation)
-            const activityInput = {
-              parentCorrelation,
-              ...(continuity.state === "unattributed" ? {} : { observedEpoch: continuity.epoch }),
-              ...(continuity.state !== "unattributed" && continuity.shouldRemind
-                ? { continuityMarker: "handoff_advisory" as const }
-                : {}),
-              tool: name,
-              args,
-            } satisfies OxpActivityRecorder.BeginInput
-            metricState.calls += 1
-            if (name === "openfork_session" || name === "openfork_request") metricState.supervisionCalls += 1
-            else if (name === "openfork_worker") metricState.delegationCalls += 1
-            else metricState.augmentationCalls += 1
-            metricState.lastOperationAt = Date.now()
-            return Effect.runPromise(
-              Effect.gen(function* () {
-                const recording = yield* activity.begin(activityInput)
-                const callContext: OxpCapability.CallContext =
-                  parentCorrelation?.scope === "conversation"
-                    ? { parentConversationRef: (yield* activityIdentity.pseudonymize(parentCorrelation)).digest }
-                    : {}
-                return yield* dispatch(name, args, signal, callContext).pipe(
-                  Effect.matchEffect({
-                    onFailure: (error) =>
-                      Effect.gen(function* () {
-                        metricState.failures += 1
-                        if (durableContinuationObserved(name, args, error)) {
-                          parentEpochs.markDurableContinuation(parentCorrelation)
-                        }
-                        const finalResult = withContinuity(
-                          toolError(error),
-                          continuity,
-                          parentEpochs.hasDurableContinuation(parentCorrelation),
-                        )
-                        yield* activity.failure(recording, activityInput, error, resultContextChars(finalResult))
-                        return { result: finalResult }
-                      }),
-                    onSuccess: (result) =>
-                      Effect.gen(function* () {
-                        yield* fileActivity(name, args, result)
-                        if (durableContinuationObserved(name, args)) {
-                          parentEpochs.markDurableContinuation(parentCorrelation)
-                        }
-                        const finalResult = withContinuity(
-                          toolResult(result),
-                          continuity,
-                          parentEpochs.hasDurableContinuation(parentCorrelation),
-                        )
-                        yield* activity.success(recording, activityInput, result, resultContextChars(finalResult))
-                        return {
-                          result: finalResult,
-                          ...(result.afterResponse ? { afterResponse: result.afterResponse } : {}),
-                        }
-                      }),
+    const executeToolCall = async (
+      name: string,
+      args: unknown,
+      requestMeta: Readonly<Record<string, unknown>> | undefined,
+      signal: AbortSignal,
+    ): Promise<ExecutedToolCall> => {
+      const operationAt = performance.now()
+      const parentCorrelation = OxpParentToolEpoch.parentCorrelation(requestMeta)
+      const continuity = parentEpochs.observe(parentCorrelation)
+      const activityInput = {
+        parentCorrelation,
+        ...(continuity.state === "unattributed" ? {} : { observedEpoch: continuity.epoch }),
+        ...(continuity.state !== "unattributed" && continuity.shouldRemind
+          ? { continuityMarker: "handoff_advisory" as const }
+          : {}),
+        tool: name,
+        args,
+      } satisfies OxpActivityRecorder.BeginInput
+      metricState.calls += 1
+      if (name === "openfork_session" || name === "openfork_request") metricState.supervisionCalls += 1
+      else if (name === "openfork_worker") metricState.delegationCalls += 1
+      else metricState.augmentationCalls += 1
+      metricState.lastOperationAt = Date.now()
+      let recording: OxpActivityRecorder.Handle | undefined
+      const isInfoRead = name === "openfork_info" || name === "openfork_diagnostics"
+      try {
+        return await Effect.runPromise(
+          Effect.gen(function* () {
+            if (!isInfoRead) {
+              const activityAt = performance.now()
+              recording = yield* activity.begin(activityInput).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.sync(() => {
+                    reportActivityFailure(Cause.squash(cause), name, args)
+                    return undefined
                   }),
-                )
+                ),
+                Effect.ensuring(Effect.sync(() => latency.activityBegin.observe(performance.now() - activityAt))),
+              )
+            }
+            const callContext: OxpCapability.CallContext =
+              parentCorrelation?.scope === "conversation" && requiresParentConversationContext(name, args)
+                ? { parentConversationRef: (yield* activityIdentity.pseudonymize(parentCorrelation)).digest }
+                : {}
+            const dispatchAt = performance.now()
+            return yield* dispatch(name, args, signal, callContext, parentCorrelation).pipe(
+              Effect.ensuring(Effect.sync(() => latency.dispatch.observe(performance.now() - dispatchAt))),
+              Effect.matchEffect({
+                onFailure: (error) =>
+                  Effect.gen(function* () {
+                    metricState.failures += 1
+                    if (durableContinuationObserved(name, args, error)) {
+                      parentEpochs.markDurableContinuation(parentCorrelation)
+                    }
+                    const finalResult = withContinuity(
+                      toolError(error),
+                      continuity,
+                      parentEpochs.hasDurableContinuation(parentCorrelation),
+                    )
+                    if (!isInfoRead) {
+                      const settlementAt = performance.now()
+                      yield* activity.failure(recording, activityInput, error, resultContextChars(finalResult)).pipe(
+                        Effect.catchCause((cause) =>
+                          Effect.sync(() => reportActivityFailure(Cause.squash(cause), name, args)),
+                        ),
+                        Effect.ensuring(Effect.sync(() => latency.activitySettle.observe(performance.now() - settlementAt))),
+                      )
+                    }
+                    return { result: finalResult }
+                  }),
+                onSuccess: (result) =>
+                  Effect.gen(function* () {
+                    yield* fileActivity(name, args, result)
+                    if (durableContinuationObserved(name, args)) {
+                      parentEpochs.markDurableContinuation(parentCorrelation)
+                    }
+                    const finalResult = withContinuity(
+                      toolResult(result),
+                      continuity,
+                      parentEpochs.hasDurableContinuation(parentCorrelation),
+                    )
+                    if (!isInfoRead) {
+                      const settlementAt = performance.now()
+                      yield* activity.success(recording, activityInput, result, resultContextChars(finalResult)).pipe(
+                        Effect.catchCause((cause) =>
+                          Effect.sync(() => reportActivityFailure(Cause.squash(cause), name, args)),
+                        ),
+                        Effect.ensuring(Effect.sync(() => latency.activitySettle.observe(performance.now() - settlementAt))),
+                      )
+                    }
+                    return {
+                      result: finalResult,
+                      ...(result.afterResponse ? { afterResponse: result.afterResponse } : {}),
+                    }
+                  }),
               }),
             )
-          }
+          }),
+        )
+      } catch (cause) {
+        // MCP handlers turn an escaped exception into JSON-RPC
+        // -32603, which makes every operation look like a connector
+        // outage. Keep failures at the tool boundary and preserve the
+        // distinction between a tool error and a transport failure.
+        const error = boundaryFailure(cause)
+        metricState.failures += 1
+        const finalResult = withContinuity(
+          toolError(error),
+          continuity,
+          parentEpochs.hasDurableContinuation(parentCorrelation),
+        )
+        if (!isInfoRead) {
+          const settlementAt = performance.now()
+          await Effect.runPromise(
+            activity.failure(recording, activityInput, error, resultContextChars(finalResult)),
+          ).catch((cause) => reportActivityFailure(cause, name, args))
+            .finally(() => latency.activitySettle.observe(performance.now() - settlementAt))
+        }
+        return { result: finalResult }
+      } finally {
+        latency.toolCall.observe(performance.now() - operationAt)
+      }
+    }
 
-          const afterResponses = new WeakMap<Request, AfterResponse>()
-          const mcpHandler = createMcpHandler(
-            (requestContext) => {
-              const outputSchema =
-                requestContext.era === "legacy" ? OxpSurface.LEGACY_OUTPUT_SCHEMA : OxpSurface.OUTPUT_SCHEMA
-              const tools =
-                requestContext.era === "legacy"
-                  ? OxpSurface.TOOLS.map((tool) => ({
-                      ...tool,
-                      outputSchema,
-                    }))
-                  : OxpSurface.TOOLS
-              const mcp = new Server(
-                { name: "OpenFork OXP", version: VERSION },
-                { capabilities: { tools: {} }, instructions: OxpSurface.SERVER_INSTRUCTIONS },
-              )
-              const outputValidator = fromJsonSchema(outputSchema)
-              mcp.setRequestHandler("tools/list", async (request) => paginateToolList(tools, request.params?.cursor))
-              mcp.setRequestHandler("tools/call", async (request, ctx) => {
-                const executed = await executeToolCall(
-                  request.params.name,
-                  request.params.arguments ?? {},
-                  request.params._meta,
-                  ctx.mcpReq.signal,
-                )
-                const result = executed.result
-                if (executed.afterResponse && requestContext.requestInfo) {
-                  afterResponses.set(requestContext.requestInfo, executed.afterResponse)
-                }
-                if (result.structuredContent !== undefined) {
-                  const validation = await outputValidator["~standard"].validate(result.structuredContent)
-                  if (validation.issues?.length) {
-                    return {
-                      content: [
-                        { type: "text" as const, text: "OXP_INTERNAL: structured result violated outputSchema" },
-                      ],
-                      isError: true,
-                    }
-                  }
-                }
-                return mcp.projectCallToolResult(result, outputSchema)
-              })
-              return mcp
-            },
-            { legacy: "stateless" },
-          )
+    const validateManifest = () => !(
+        OxpSurface.FINGERPRINT !== OXP_STATIC_TRANSPORT.fingerprint ||
+        OxpSurface.MAJOR_VERSION !== OXP_STATIC_TRANSPORT.majorVersion ||
+        OxpSurface.SERVER_INSTRUCTIONS !== OXP_STATIC_TRANSPORT.instructions ||
+        JSON.stringify(OxpSurface.TOOLS) !== JSON.stringify(OXP_STATIC_TRANSPORT.tools) ||
+        JSON.stringify(OxpSurface.OUTPUT_SCHEMA) !== JSON.stringify(OXP_STATIC_TRANSPORT.outputSchema) ||
+        JSON.stringify(OxpSurface.LEGACY_OUTPUT_SCHEMA) !== JSON.stringify(OXP_STATIC_TRANSPORT.legacyOutputSchema)
+      )
 
-          const server = createServer((req, res) => {
-            const pathOnly = (req.url ?? "").split("?", 1)[0] ?? ""
-            if (!allowedRequest(req, port)) {
-              req.resume()
-              jsonError(res, 403, "forbidden")
-              return
-            }
-            if (safeEqual(pathOnly, metadataPath)) {
-              req.resume()
-              if (req.method !== "GET") {
-                jsonError(res, 405, "method_not_allowed")
-                return
-              }
-              const body = JSON.stringify({
-                resource: endpointUrl,
-                resource_name: "OpenFork OXP",
-                authorization_servers: [],
-                scopes_supported: [],
-              })
-              res.writeHead(200, {
-                "content-type": "application/json",
-                "cache-control": "no-store",
-                "content-length": Buffer.byteLength(body),
-              })
-              res.end(body)
-              return
-            }
-            if (!safeEqual(pathOnly, basePath)) {
-              req.resume()
-              jsonError(res, 404, "not_found")
-              return
-            }
-            if (req.method !== "POST") {
-              req.resume()
-              jsonError(res, 405, "method_not_allowed")
-              return
-            }
-            metricState.lastRequestAt = Date.now()
-            const declaredRaw = req.headers["content-length"]
-            if (declaredRaw !== undefined) {
-              const declared = Number(declaredRaw)
-              if (!Number.isSafeInteger(declared) || declared < 0) {
-                req.resume()
-                jsonError(res, 400, "invalid_content_length")
-                return
-              }
-              if (declared > MAX_BODY_BYTES) {
-                req.resume()
-                jsonError(res, 413, "payload_too_large")
-                return
-              }
-            }
-            // Always own request-body bounding before the MCP SDK. Stateless
-            // transports are request-scoped so consuming the body once here is
-            // deterministic and concurrent requests never share transport state.
-            void boundedBody(req).then(async (parsed) => {
-              if (parsed.error) {
-                // boundedBody intentionally stops retaining bytes at the cap.
-                // Drain the remainder without buffering so a chunked oversized
-                // sender cannot leave unread request data pinning this socket.
-                req.resume()
-                jsonError(res, parsed.error === "payload_too_large" ? 413 : 400, parsed.error)
-                return
-              }
-              try {
-                await handleMcpRequest(mcpHandler, req, res, parsed.body, (request) => {
-                  const afterResponse = afterResponses.get(request)
-                  afterResponses.delete(request)
-                  return afterResponse
-                })
-              } catch {
-                if (!res.headersSent) jsonError(res, 500, "mcp_transport_error")
-                else res.end()
-              }
-            })
-          })
-          server.headersTimeout = 30_000
-          server.requestTimeout = 300_000
-          server.on("connection", (socket) => {
-            sockets.add(socket)
-            socket.once("close", () => sockets.delete(socket))
-          })
-          await new Promise<void>((resolve, reject) => {
-            server.once("error", reject)
-            server.listen(0, "127.0.0.1", () => {
-              server.off("error", reject)
-              resolve()
-            })
-          })
-          const address = server.address()
-          if (!address || typeof address === "string") {
-            throw new Error("OXP MCP server did not bind a TCP port")
-          }
-          port = address.port
-          endpointUrl = `http://127.0.0.1:${port}${basePath}`
-          const metadataUrl = `http://127.0.0.1:${port}${metadataPath}`
-
-          const endpoint: Endpoint = Object.freeze({
-            port,
-            url: endpointUrl,
-            metadataUrl,
-            surfaceFingerprint: OxpSurface.FINGERPRINT,
-            stop: (options: { readonly forceAfterMs?: number } = {}) =>
-              (stopPromise ??= (async () => {
-                const { forceAfterMs } = options
-                await mcpHandler.close().catch(() => undefined)
-                await new Promise<void>((resolve) => {
-                  const force = forceAfterMs
-                    ? setTimeout(() => {
-                        for (const socket of sockets) socket.destroy()
-                        resolve()
-                      }, forceAfterMs)
-                    : undefined
-                  force?.unref?.()
-                  server.close(() => {
-                    if (force) clearTimeout(force)
-                    resolve()
-                  })
-                })
-                if (current === endpoint) current = undefined
-              })()),
-          })
-          return endpoint
-        },
+    const start = Effect.fn("OxpServer.start")(function* () {
+      if (current) return yield* new OxpError.Busy({ detail: "OXP MCP endpoint is already running" })
+      // Before opening a socket, ensure the generated static schema exactly
+      // matches the executable source owner. Never serve a stale contract.
+      if (!validateManifest()) {
+        return yield* new OxpError.DependencyUnavailable({
+          detail: "OXP static transport manifest is stale; regenerate and verify the authoritative tool contract before starting",
+        })
+      }
+      // Both eager service tests and the lazy production host now use exactly
+      // one HTTP/MCP implementation, avoiding diverging Host/Origin checks,
+      // cancellation fences, buffering, and post-response commit receipts.
+      const listener = yield* Effect.tryPromise({
+        try: () => startLeanOxpListener({
+          execute: executeToolCall,
+          internalError: (cause, phase, name, action) =>
+            toolError(internalFailure(cause, phase, name, action)),
+          onRequest: () => { metricState.lastRequestAt = Date.now() },
+          onTransportDuration: (ms) => latency.mcpTransport.observe(ms),
+          onTransportError: reportTransportFailure,
+        }),
         catch: () => new OxpError.DependencyUnavailable({ detail: "Unable to start the local OXP MCP endpoint" }),
+      })
+      let closed: Promise<void> | undefined
+      const started: Endpoint = Object.freeze({
+        ...listener,
+        stop: (options = {}) => (closed ??= listener.stop(options).finally(() => {
+          if (current === started) current = undefined
+        })),
       })
       current = started
       return started
@@ -920,7 +821,7 @@ const layer = Layer.effect(
       yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
     })
 
-    return Service.of({ start, active: () => current, stop, metrics })
+    return Service.of({ start, active: () => current, stop, metrics, validateManifest, execute: executeToolCall })
   }),
 )
 

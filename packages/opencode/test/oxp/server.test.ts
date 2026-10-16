@@ -19,6 +19,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { Global } from "@opencode-ai/core/global"
+import { MAX_SOURCE_BYTES } from "@/code/input-admission"
 import { OxpConfig } from "@/oxp/config"
 import { OxpAgentCatalog } from "@/oxp/agent-catalog"
 import { OxpModelCatalog } from "@/oxp/model-catalog"
@@ -29,6 +30,8 @@ import {
   bridgeRequestCancellation,
   durableContinuationObserved,
   paginateToolList,
+  projectInternalErrorBody,
+  toolResult,
 } from "@/oxp/server"
 import { OxpError } from "@/oxp/error"
 import { OxpRuntimeRefresh } from "@/oxp/runtime-refresh"
@@ -37,9 +40,30 @@ import { OxpSurface } from "@/oxp/surface"
 import { OxpWorkerControl } from "@/oxp/worker-control"
 import { OxpMcpControl } from "@/oxp/mcp-control"
 import { OxpSystemOneControl } from "@/oxp/system-one-control"
+import { OxpDiagnostics } from "@/oxp/diagnostics"
+import { AX_IMPLEMENTATION } from "@/oxp/ax-revisions"
 import { testEffect } from "../lib/effect"
 
 const suite = path.join(os.tmpdir(), `opencode-oxp-server-${randomUUID()}`)
+
+test("OXP MCP projection includes native image/audio content without duplicating bytes in structured metadata", () => {
+  const result = toolResult({
+    output: "Media attachment available",
+    mediaContent: [
+      { type: "image", mimeType: "image/jpeg", data: "/9j/" },
+      { type: "audio", mimeType: "audio/wav", data: "AAEC" },
+    ],
+    attachments: [{ kind: "file", handle: "/approved/media.mp4", mediaType: "video/mp4" }],
+  })
+  expect(result.content).toEqual([
+    { type: "text", text: "Media attachment available" },
+    { type: "image", mimeType: "image/jpeg", data: "/9j/" },
+    { type: "audio", mimeType: "audio/wav", data: "AAEC" },
+  ])
+  expect(JSON.stringify(result.structuredContent)).not.toContain("/9j/")
+  expect(JSON.stringify(result.structuredContent)).not.toContain("AAEC")
+  expect(result.structuredContent).toMatchObject({ attachments: [{ mediaType: "video/mp4" }] })
+})
 const configDir = path.join(suite, ".config")
 const stateDir = path.join(suite, ".state")
 const noSessionControl = Layer.succeed(
@@ -52,6 +76,7 @@ const noSessionControl = Layer.succeed(
     unarchive: () => Effect.die("server test must not enter Session runtime control"),
     delete: () => Effect.die("server test must not enter Session runtime control"),
     setSelection: () => Effect.die("server test must not enter Session runtime control"),
+    steer: () => Effect.die("server test must not enter Session runtime control"),
     send: () => Effect.die("server test must not enter Session runtime control"),
     turn: () => Effect.die("server test must not enter Session runtime control"),
     backgroundSubagents: () => Effect.die("server test must not enter Session runtime control"),
@@ -274,6 +299,63 @@ describe("OxpServer", () => {
     expect(() =>
       paginateToolList([...synthetic, { ...synthetic[0]!, name: "new_tool" }], first.nextCursor, 600),
     ).toThrow(/stale tools\/list cursor/i)
+  })
+
+  test("caches canonical list pagination while invalidating mutable custom projections", () => {
+    const names: string[] = []
+    let cursor: string | undefined
+    do {
+      const page = paginateToolList(OxpSurface.TOOLS, cursor, 600)
+      names.push(...page.tools.map((tool) => tool.name))
+      cursor = page.nextCursor
+    } while (cursor)
+    expect(names).toEqual(OxpSurface.TOOLS.map((tool) => tool.name).toSorted())
+
+    const mutable = Array.from({ length: 8 }, (_, index) => ({
+      ...OxpSurface.TOOLS[0]!,
+      name: `mutable_${index}`,
+      description: "original",
+    }))
+    const first = paginateToolList(mutable, undefined, 600)
+    expect(first.nextCursor).toBeDefined()
+    mutable[0]!.description = "changed".repeat(30)
+    expect(() => paginateToolList(mutable, first.nextCursor, 600)).toThrow(/stale/i)
+  })
+
+  test("returns the incident ID in valid JSON-RPC transport errors", () => {
+    const incidentID = "9c2ef6c1-2069-4a44-9d6a-b6cc155f8f32"
+    expect(
+      projectInternalErrorBody(
+        { jsonrpc: "2.0", id: 42, method: "tools/call" },
+        incidentID,
+      ),
+    ).toEqual({
+      jsonrpc: "2.0",
+      id: 42,
+      error: {
+        code: -32603,
+        message: `Unexpected OXP transport failure recorded as ${incidentID}; query openfork_diagnostics with incidentID=${incidentID}.`,
+      },
+    })
+    expect(
+      projectInternalErrorBody(
+        [
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { jsonrpc: "2.0", id: "call-1", method: "tools/call" },
+        ],
+        incidentID,
+      ),
+    ).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: "call-1",
+        error: {
+          code: -32603,
+          message: `Unexpected OXP transport failure recorded as ${incidentID}; query openfork_diagnostics with incidentID=${incidentID}.`,
+        },
+      },
+    ])
+    expect(projectInternalErrorBody({ jsonrpc: "2.0", method: "notifications/initialized" }, incidentID)).toBeUndefined()
   })
 
   it.live(
@@ -506,6 +588,88 @@ describe("OxpServer", () => {
     { timeout: 20_000 },
   )
 
+  it.live(
+    "executes brokered Code Mode end-to-end over the real OXP MCP transport",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const server = yield* OxpServer.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ code: true })
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-code-e2e", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+      try {
+        yield* Effect.promise(() => client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))))
+        const listed = yield* Effect.promise(() => client.listTools())
+        expect(listed.tools.some((tool) => tool.name === "code")).toBe(false)
+        expect(listed.tools.find((tool) => tool.name === "capability")?.description).toMatch(
+          /Code Mode: describe code, then call code/i,
+        )
+
+        const described = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: { action: "describe", namespace: "openfork", capability: "code" },
+          }),
+        )
+        expect(described.isError).not.toBe(true)
+        const descriptor = JSON.parse(
+          described.content.find((item) => item.type === "text")?.text ?? "{}",
+        ) as { contract?: string; capability?: { id?: string; authority?: string; exposure?: string } }
+        expect(descriptor.capability).toMatchObject({ id: "code", authority: "code", exposure: "brokered" })
+        expect(descriptor.contract).toMatch(/^broker-v1:[0-9a-f]{24}$/)
+
+        const ran = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "call",
+              namespace: "openfork",
+              capability: "code",
+              contract: descriptor.contract,
+              args: {
+                action: "run",
+                code: "return input.value + 2",
+                input: { value: 40 },
+              },
+            },
+          }),
+        )
+        expect(ran.isError).not.toBe(true)
+        expect(ran.structuredContent).toMatchObject({
+          data: { action: "run", ok: true, value: 42 },
+          metadata: { action: "run", stateless: true },
+        })
+
+        const rejected = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "call",
+              namespace: "openfork",
+              capability: "code",
+              contract: descriptor.contract,
+              args: { action: "run", code: "x".repeat(MAX_SOURCE_BYTES + 1) },
+            },
+          }),
+        )
+        expect(rejected.isError).toBe(true)
+        expect(rejected.structuredContent).toMatchObject({
+          error: { code: "OXP_INVALID_ARGUMENT", retryable: false },
+        })
+        expect(rejected.content.find((item) => item.type === "text")?.text).toContain(
+          `${MAX_SOURCE_BYTES}-byte source limit`,
+        )
+      } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 20_000 },
+  )
+
 
   it.live(
     "arms a changed runtime trial only after the real MCP response finishes",
@@ -666,6 +830,72 @@ describe("OxpServer", () => {
   )
 
   it.live(
+    "keeps incident retrieval available when config-backed OXP calls become unavailable",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const server = yield* OxpServer.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-independent-diagnostics-test", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+      try {
+        yield* Effect.promise(() =>
+          client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))),
+        )
+
+        const incidentID = OxpDiagnostics.record({
+          cause: new TypeError("private error detail must not be returned"),
+          phase: "tool_boundary",
+          tool: "openfork_info",
+          action: "capabilities",
+          surfaceFingerprint: OxpSurface.FINGERPRINT,
+        }).id
+
+        // This diagnostic read is authorized by the secret local OXP endpoint
+        // itself and remains available when config-backed authority checks fail.
+        yield* config.setEnabled(false)
+        const unavailableInfo = yield* Effect.promise(() =>
+          client.callTool({ name: "openfork_info", arguments: { action: "status" } }),
+        )
+        expect(unavailableInfo.isError).toBe(true)
+        const diagnostics = yield* Effect.promise(() =>
+          client.callTool({
+            name: "openfork_diagnostics",
+            arguments: { incidentID },
+          }),
+        )
+        expect(diagnostics.isError).not.toBe(true)
+        const report = diagnostics.structuredContent as {
+          data?: {
+            incidents?: Array<{ id: string; errorName: string }>
+            latency?: {
+              toolCall: { count: number; p95UpperMs?: number }
+              dispatch: { count: number }
+              activityBegin: { count: number }
+              mcpTransport: { count: number }
+            }
+          }
+        }
+        expect(report.data?.incidents).toMatchObject([{ id: incidentID }])
+        expect(report.data?.incidents?.[0]?.errorName).toBe("TypeError")
+        expect(report.data?.latency?.toolCall.count).toBeGreaterThanOrEqual(1)
+        expect(report.data?.latency?.dispatch.count).toBeGreaterThanOrEqual(1)
+        expect(report.data?.latency?.activityBegin.count).toBe(0)
+        expect(report.data?.latency?.mcpTransport.count).toBeGreaterThanOrEqual(1)
+        expect(report.data?.latency?.toolCall.p95UpperMs).toBeGreaterThan(0)
+        expect(JSON.stringify(diagnostics)).not.toContain("private error detail must not be returned")
+      } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 20_000 },
+  )
+
+  it.live(
     "binds parent-tool epochs only to documented ChatGPT conversation metadata",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service
@@ -728,11 +958,212 @@ describe("OxpServer", () => {
           unattributedParentCalls: 1,
         })
         const rows = yield* activities.list()
-        expect(rows).toHaveLength(2)
-        expect(rows.map((row) => row.call_count).sort()).toEqual([1, 2])
+        expect(rows).toHaveLength(0)
         const serialized = JSON.stringify(rows)
         expect(serialized).not.toContain("conversation-a")
         expect(serialized).not.toContain("conversation-b")
+      } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 20_000 },
+  )
+
+  it.live(
+    "status handshake registers the session title on the canonical activity row",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const server = yield* OxpServer.Service
+      const activities = yield* OxpActivityInspection.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-session-title-test", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+      const call = (openaiSession?: string, sessionTitle?: string) =>
+        client.callTool({
+          name: "openfork_info",
+          arguments: {
+            action: "status",
+            ...(sessionTitle !== undefined ? { sessionTitle } : {}),
+          },
+          ...(openaiSession ? { _meta: { "openai/session": openaiSession } } : {}),
+        })
+
+      try {
+        yield* Effect.promise(() =>
+          client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))),
+        )
+        expect(client.getProtocolEra()).toBe("modern")
+
+        const anonymous = yield* Effect.promise(() => call("conv-anon"))
+        expect(anonymous.isError).not.toBe(true)
+        // The static manifest fingerprint can remain unchanged when only
+        // on-demand capability ranking, guidance or activity recovery changes.
+        // A real MCP status reply must declare those implementation revisions.
+        const status = anonymous.structuredContent as { data?: { implementation?: { ax?: unknown } } }
+        expect(status.data?.implementation?.ax ?? (anonymous.structuredContent as any)?.implementation?.ax)
+          .toEqual(AX_IMPLEMENTATION)
+        expect(JSON.stringify(anonymous.structuredContent)).toContain('"sessionTitle":null')
+        expect(JSON.stringify(anonymous.structuredContent)).toContain('"sessionPersisted":false')
+        expect(yield* activities.list()).toHaveLength(0)
+
+        const titled = yield* Effect.promise(() => call("conv-title-a", "Design GitHub Tool"))
+        expect(titled.isError).not.toBe(true)
+        expect(JSON.stringify(titled.structuredContent)).toContain('"sessionTitle":"Design GitHub Tool"')
+        expect(JSON.stringify(titled.structuredContent)).toContain('"sessionPersisted":true')
+        expect(yield* activities.list()).toHaveLength(1)
+        expect((yield* activities.list())[0]?.title).toBe("Design GitHub Tool")
+
+        yield* Effect.promise(() => call("conv-title-a", "ArcFit Hardening"))
+        const refreshed = yield* activities.list()
+        expect(refreshed).toHaveLength(1)
+        expect(refreshed[0]?.title).toBe("ArcFit Hardening")
+
+        yield* Effect.promise(() => call("conv-title-b", "Vectorizer Research Corpus"))
+        expect(yield* activities.list()).toHaveLength(2)
+
+        const blank = yield* Effect.promise(() => call("conv-title-a", "   "))
+        expect(blank.isError).toBe(true)
+        expect(JSON.stringify(blank)).toContain("sessionTitle is required")
+
+        const wrongAction = yield* Effect.promise(() =>
+          client.callTool({
+            name: "openfork_info",
+            arguments: { action: "capabilities", sessionTitle: "X" },
+          }),
+        )
+        expect(wrongAction.isError).toBe(true)
+        expect(JSON.stringify(wrongAction)).toContain("sessionTitle is only valid")
+      } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 20_000 },
+  )
+
+  it.live(
+    "keeps ordinary calls independent of a malformed correlation key and contains browser binding failures",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
+      const server = yield* OxpServer.Service
+      const rootDir = path.join(suite, "correlation-key-workspace")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      yield* Effect.promise(() => fs.writeFile(path.join(rootDir, "hello.txt"), "correlated read succeeded\n"))
+      const root = yield* roots.approve(rootDir)
+      yield* Effect.promise(() => fs.writeFile(path.join(configDir, "oxp-activity.key"), "malformed-correlation-key\n"))
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true, process: true, sessionSupervision: "approved-roots" })
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-correlation-failure-test", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+
+      try {
+        yield* Effect.promise(() =>
+          client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))),
+        )
+
+        const status = yield* Effect.promise(() =>
+          client.callTool({
+            name: "openfork_info",
+            arguments: { action: "status" },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(status.isError).not.toBe(true)
+
+        const capabilities = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: { action: "list", namespace: "openfork", load: "default" },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(capabilities.isError).not.toBe(true)
+        expect(capabilities.content.find((item) => item.type === "text")?.text).toContain("read")
+
+        const read = yield* Effect.promise(() =>
+          client.callTool({
+            name: "read",
+            arguments: { rootID: root.id, path: "hello.txt" },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(read.isError).not.toBe(true)
+        expect(read.content.find((item) => item.type === "text")?.text).toContain("correlated read succeeded")
+
+        const processDescriptor = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: { action: "describe", namespace: "openfork", capability: "process" },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(processDescriptor.isError).not.toBe(true)
+        const descriptor = JSON.parse(
+          processDescriptor.content.find((item) => item.type === "text")?.text ?? "{}",
+        ) as { contract?: string }
+        expect(descriptor.contract).toMatch(/^broker-v1:[0-9a-f]{24}$/)
+
+        const processCall = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "call",
+              namespace: "openfork",
+              capability: "process",
+              contract: descriptor.contract,
+              args: {
+                action: "start",
+                rootID: root.id,
+                argv: [process.execPath, "-e", "process.stdout.write('oxp-process-correlation-ok')"],
+                mode: "foreground",
+                yieldMs: 5_000,
+              },
+            },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(processCall.isError).not.toBe(true)
+        expect(JSON.stringify(processCall.structuredContent)).toContain("oxp-process-correlation-ok")
+
+        const sessions = yield* Effect.promise(() =>
+          client.callTool({
+            name: "openfork_session",
+            arguments: { action: "list", rootID: root.id, limit: 10 },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(sessions.isError).not.toBe(true)
+        expect(sessions.structuredContent).toMatchObject({
+          data: { sessions: [], scanned: 0, truncated: false },
+        })
+
+        const browser = yield* Effect.promise(() =>
+          client.callTool({
+            name: "capability",
+            arguments: {
+              action: "call",
+              namespace: "openfork",
+              capability: "browser",
+              contract: "broker-v1:000000000000000000000000",
+              args: {},
+            },
+            _meta: { "openai/session": "correlation-key-unavailable" },
+          }),
+        )
+        expect(browser.isError).toBe(true)
+        expect(browser.structuredContent).toMatchObject({
+          error: { code: "OXP_DEPENDENCY_UNAVAILABLE" },
+        })
+        expect(JSON.stringify(browser)).not.toContain("SECRET_KEY_MATERIAL")
       } finally {
         yield* Effect.promise(() => client.close().catch(() => undefined))
         yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
@@ -768,6 +1199,49 @@ describe("OxpServer", () => {
         yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
       }
     }),
+  )
+
+  it.live(
+    "preserves request isolation and bounded latency counters under 100 overlapping real MCP calls",
+    Effect.gen(function* () {
+      const config = yield* OxpConfig.Service
+      const server = yield* OxpServer.Service
+      yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
+      const endpoint = yield* server.start()
+      const client = new ModernClient(
+        { name: "oxp-mcp-concurrency-test", version: "1.0.0" },
+        { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+      )
+      try {
+        yield* Effect.promise(() => client.connect(new ModernStreamableHTTPClientTransport(new URL(endpoint.url))))
+        const count = 100
+        const calls = Array.from({ length: count }, (_, index) =>
+          client.callTool({
+            name: index % 2 ? "openfork_diagnostics" : "openfork_info",
+            arguments: index % 2 ? {} : { action: "status" },
+          }),
+        )
+        const results = yield* Effect.promise(() => Promise.all(calls))
+        expect(results).toHaveLength(count)
+        for (let i = 0; i < results.length; i++) {
+          expect(results[i]!.isError).not.toBe(true)
+          const output = results[i]!.structuredContent as { data?: { schemaFingerprint?: string; incidents?: unknown[] } }
+          if (i % 2) expect(Array.isArray(output.data?.incidents)).toBe(true)
+          else expect(output.data?.schemaFingerprint).toBe(OxpSurface.FINGERPRINT)
+        }
+        const counters = server.metrics()
+        expect(counters.calls).toBeGreaterThanOrEqual(count)
+        expect(counters.latency?.toolCall.count).toBeGreaterThanOrEqual(count)
+        expect(counters.latency?.dispatch.count).toBeGreaterThanOrEqual(count)
+        expect(counters.latency?.activityBegin.count).toBe(0)
+        expect(counters.latency?.mcpTransport.count).toBeGreaterThanOrEqual(count)
+      } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
+        yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
+      }
+    }),
+    { timeout: 30_000 },
   )
 
   it.live(

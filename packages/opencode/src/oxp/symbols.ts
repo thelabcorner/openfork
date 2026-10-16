@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Symbols } from "@/symbols/service"
 import { OxpAuthority } from "./authority"
 import { OxpError } from "./error"
@@ -11,6 +12,9 @@ import { OxpSchema } from "./schema"
 export const Parameters = Schema.Struct({
   rootID: OxpSchema.RootID.annotate({
     description: "Approved OXP root that owns the symbol-analysis scope.",
+  }),
+  workdir: Schema.optional(Schema.String).annotate({
+    description: "Optional nested project directory within the approved root, used as the default search scope. Explicit path/file values remain root-relative and must stay inside this scope.",
   }),
   ...Symbols.Parameters.fields,
 })
@@ -32,6 +36,7 @@ const layer = Layer.effect(
     const authority = yield* OxpAuthority.Service
     const roots = yield* OxpRoot.Service
     const symbols = yield* Symbols.Service
+    const fs = yield* FSUtil.Service
 
     const execute = Effect.fn("OxpSymbols.execute")(function* (input: Input, signal?: AbortSignal) {
       if (signal?.aborted) return yield* new OxpError.Cancelled({ detail: "OXP symbols request was cancelled" })
@@ -47,7 +52,30 @@ const layer = Layer.effect(
       }
       const root = admission.root
 
-      const { rootID: _rootID, ...symbolInput } = input
+      let directory = root.canonicalPath
+      let scopedWorkdir: typeof admission | undefined
+      if (input.workdir !== undefined) {
+        if (!input.workdir.trim()) {
+          return yield* new OxpError.InvalidArgument({ detail: "symbols workdir must name a nonempty nested directory" })
+        }
+        scopedWorkdir = yield* authority.authorize({
+          plane: "augmentation",
+          operation: "symbols",
+          phase: "read",
+          rootID: input.rootID,
+          path: input.workdir,
+        })
+        if (!scopedWorkdir.root || !("path" in scopedWorkdir.root)) {
+          return yield* new OxpError.InvalidArgument({ detail: "symbols workdir must resolve inside the approved root" })
+        }
+        directory = scopedWorkdir.root.path
+        const stat = yield* fs.stat(directory).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (!stat || stat.type !== "Directory") {
+          return yield* new OxpError.InvalidArgument({ detail: "symbols workdir must name an existing directory" })
+        }
+      }
+
+      const { rootID: _rootID, workdir: _workdir, ...symbolInput } = input
       let resolvedPath = symbolInput.path
       let resolvedFile = symbolInput.file
 
@@ -87,8 +115,8 @@ const layer = Layer.effect(
 
       const result = yield* symbols
         .execute(resolved, {
-          directory: root.canonicalPath,
-          worktree: root.canonicalPath,
+          directory,
+          worktree: directory,
           abort: signal,
         })
         .pipe(
@@ -112,6 +140,12 @@ const layer = Layer.effect(
         )
 
       yield* authority.revalidate(admission, "egress")
+      if (scopedWorkdir) {
+        const fresh = yield* authority.revalidate(scopedWorkdir, "egress")
+        if (!fresh.root || !("path" in fresh.root) || fresh.root.path !== directory) {
+          return yield* new OxpError.AuthRevoked({ detail: "symbols workdir identity changed before data egress" })
+        }
+      }
       return {
         title: result.title,
         output: result.output,
@@ -126,7 +160,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [OxpAuthority.node, OxpRoot.node, Symbols.node],
+  deps: [OxpAuthority.node, OxpRoot.node, Symbols.node, FSUtil.node],
 })
 
 export * as OxpSymbols from "./symbols"

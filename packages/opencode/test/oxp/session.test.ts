@@ -13,6 +13,7 @@ import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionSearch } from "@opencode-ai/core/session/search"
 import { partSearchText } from "@opencode-ai/core/session/search-text"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -33,7 +34,7 @@ type ControlCall =
       input: OxpSessionControl.SelectionInput
     }
   | {
-      action: "send" | "turn"
+      action: "steer" | "send" | "turn"
       target: OxpSessionControl.Target
       input: OxpSessionControl.PromptInput
     }
@@ -88,6 +89,17 @@ const controlLayer = Layer.succeed(
         target,
         Effect.sync(() => {
           controlCalls.push({ action: "set_selection", target, input })
+        }),
+      ),
+    steer: (target, input) =>
+      guarded(
+        target,
+        Effect.sync(() => {
+          controlCalls.push({ action: "steer", target, input })
+          return {
+            admittedMessageID: "msg_oxp_steer",
+            paused: false,
+          }
         }),
       ),
     send: (target, input) =>
@@ -495,11 +507,25 @@ describe("OxpSession", () => {
     yield* config.setGrant({ sessionSupervision: "approved-roots" })
 
     const listed = yield* sessions.execute({ action: "list", roots: true })
-    const listData = listed.structured as { sessions: Array<any> }
+    const listData = listed.structured as { temporal: Record<string, unknown>; sessions: Array<any> }
+    expect(listData.temporal).toMatchObject({
+      retrievedAt: expect.any(Number),
+      retrievedAtIso: expect.any(String),
+      order: "session_record_updated_desc",
+      updatedAtBasis: "session_record",
+    })
     expect(listData.sessions.map((item) => item.id)).toEqual([approvedID])
     expect(JSON.stringify(listed)).not.toContain(approvedDir)
     expect(JSON.stringify(listed)).not.toContain(outsideDir)
     expect(listData.sessions[0]?.location).toEqual({ rootID: root.id, path: "/" + root.alias })
+    expect(listData.sessions[0]).toMatchObject({
+      createdAtIso: expect.any(String),
+      updatedAtIso: expect.any(String),
+      updatedAtBasis: "session_record",
+      updatedAgeMs: expect.any(Number),
+      observedAt: expect.any(Number),
+      observedAtIso: expect.any(String),
+    })
     expect(listData.sessions[0]?.model).toMatchObject({
       providerID: "workbuddy",
       modelID: "deepseek-v4.1-flash",
@@ -512,7 +538,22 @@ describe("OxpSession", () => {
     const messages = yield* sessions.execute({ action: "messages", sessionID: approvedID })
     expect(messages.output).toContain("hello from supervised session")
     expect(messages.output).toContain('"owner":"user"')
+    expect((messages.structured as any).temporal).toMatchObject({
+      retrievedAt: expect.any(Number),
+      retrievedAtIso: expect.any(String),
+      order: "oldest_to_newest",
+      pagingDirection: "toward_older_messages",
+    })
+    expect((messages.structured as any).messages[0]).toMatchObject({
+      createdAtIso: expect.any(String),
+      ageMs: expect.any(Number),
+    })
     const children = yield* sessions.execute({ action: "children", sessionID: approvedID })
+    expect((children.structured as any).temporal).toMatchObject({
+      retrievedAt: expect.any(Number),
+      retrievedAtIso: expect.any(String),
+      order: "session_record_updated_desc",
+    })
     expect((children.structured as { sessions: Array<any> }).sessions.map((item) => item.id)).toEqual([childID])
     const selected = yield* sessions.execute({ action: "selection", sessionID: approvedID })
     expect(selected.structured).toMatchObject({
@@ -586,6 +627,8 @@ describe("OxpSession", () => {
       })
       .run()
       .pipe(Effect.orDie)
+    // This fixture writes PartTable directly, bypassing SessionProjector.
+    yield* SessionSearch.repairChunk(db, { maxRows: 64 })
 
     const outsideMessage = SessionV1.MessageID.make("msg_oxp_outside_rank")
     yield* db
@@ -710,7 +753,7 @@ describe("OxpSession", () => {
     expect(controlCalls).toHaveLength(1)
   }))
 
-  it.live("admits send and turn as externally attributed Session supervision and distinguishes cancelled waiting from failed admission", Effect.gen(function* () {
+  it.live("makes steer, send, and turn execution guarantees explicit while preserving cancelled-wait durability", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service
     const sessions = yield* OxpSession.Service
@@ -726,22 +769,47 @@ describe("OxpSession", () => {
     yield* config.setGrant({ sessionSupervision: "approved-roots" })
     const connector = (yield* config.get()).connector.id
 
+    const steered = yield* sessions.execute({
+      action: "steer",
+      sessionID: approvedID,
+      text: "incorporate this at the next safe boundary",
+    })
+    expect(steered.structured).toMatchObject({
+      sessionID: approvedID,
+      action: "steer",
+      delivery: "safe_boundary",
+      waited: false,
+      execution: "pending",
+      admittedMessageID: "msg_oxp_steer",
+      paused: false,
+    })
+    expect(controlCalls[0]).toMatchObject({
+      action: "steer",
+      input: {
+        text: "incorporate this at the next safe boundary",
+        actorRef: "oxp:" + connector,
+      },
+    })
+
     const sent = yield* sessions.execute({
       action: "send",
       sessionID: approvedID,
-      text: "supervised work",
+      text: "queue this as a new turn",
     })
     expect(sent.structured).toMatchObject({
       sessionID: approvedID,
       action: "send",
+      delivery: "queued_turn",
+      waited: false,
+      execution: "pending",
       admittedMessageID: "msg_oxp_send",
       paused: false,
     })
     expect(sent.mutation).toEqual({ attempted: true, committed: true })
-    expect(controlCalls[0]).toMatchObject({
+    expect(controlCalls[1]).toMatchObject({
       action: "send",
       input: {
-        text: "supervised work",
+        text: "queue this as a new turn",
         actorRef: "oxp:" + connector,
       },
     })
@@ -749,9 +817,14 @@ describe("OxpSession", () => {
     const turned = yield* sessions.execute({
       action: "turn",
       sessionID: approvedID,
-      text: "finish this turn",
+      text: "finish this exact turn",
     })
     expect(turned.structured).toMatchObject({
+      sessionID: approvedID,
+      action: "turn",
+      delivery: "queued_turn",
+      waited: true,
+      execution: "completed",
       admittedMessageID: "msg_oxp_turn",
       resultMessageID: "msg_oxp_result",
     })

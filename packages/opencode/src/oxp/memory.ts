@@ -42,6 +42,7 @@ const layer = Layer.effect(
     const authority = yield* OxpAuthority.Service
 
     const execute = Effect.fn("OxpMemory.execute")(function* (input: Input, signal?: AbortSignal) {
+      const startedAt = performance.now()
       if (signal?.aborted) return yield* new OxpError.Cancelled({ detail: "OXP memory operation was cancelled" })
       const readOnly = READ_ACTIONS.has(input.action)
       const admission = yield* authority.authorize({
@@ -55,22 +56,54 @@ const layer = Layer.effect(
       }
       const root = admission.root
       const { rootID: _rootID, ...params } = input
+      // Memory read grants do NOT imply Session supervision grants. Federated
+      // recall is an opt-in cross-plane lookup, never an authority escalation.
+      const wantsHistory = input.action === "search" && input.sources !== "memory"
+      const sessionAdmission = wantsHistory
+        ? yield* authority.authorize({
+            plane: "supervision",
+            operation: "session.search",
+            phase: "supervise",
+            rootID: input.rootID,
+          }).pipe(Effect.catch((error) =>
+            error._tag === "OXP_AUTH_DENIED" || error._tag === "OXP_AUTH_REVOKED"
+              ? Effect.succeed(undefined)
+              : Effect.fail(error),
+          ))
+        : undefined
+      const authorizedAt = performance.now()
       const result = yield* ExchangeMemory.executeRuntime(params, {
         rootPath: root.canonicalPath,
         signal,
+        sessionSearchAuthorized: sessionAdmission !== undefined,
         ...(readOnly
           ? {}
           : {
               beforeMutation: () => authority.revalidate(admission, "commit").pipe(Effect.asVoid),
             }),
       }).pipe(Effect.mapError((error) => mapExchangeError(error, signal)))
+      const completedAt = performance.now()
 
       yield* authority.revalidate(admission, "egress")
+      if (sessionAdmission) yield* authority.revalidate(sessionAdmission, "supervise")
+      const exitedAt = performance.now()
       return {
         title: `Memory ${input.action}`,
         output: result.output,
         structured: result.structured,
-        metadata: { action: input.action, rootID: input.rootID },
+        // End-to-end connector timing can be compared with these server-side
+        // stages to distinguish host execution from transport/queue delays.
+        metadata: {
+          action: input.action,
+          rootID: input.rootID,
+          ...(result.metadata.runtimeTimingMs ? { runtimeTimingMs: result.metadata.runtimeTimingMs } : {}),
+          timingMs: {
+            authorization: Math.round(authorizedAt - startedAt),
+            execution: Math.round(completedAt - authorizedAt),
+            egress: Math.round(exitedAt - completedAt),
+            total: Math.round(exitedAt - startedAt),
+          },
+        },
         ...(readOnly ? {} : { mutation: result.mutation }),
       } satisfies OxpResult.CapabilityResult
     })

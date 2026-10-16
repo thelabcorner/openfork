@@ -23,6 +23,18 @@ describe("OXP Gate C endpoint boundary", () => {
     }
   })
 
+  test("keeps the complete Codex MCP routing and trust contract in the first 512 instruction characters", () => {
+    const prefix = OxpSurface.SERVER_INSTRUCTIONS.slice(0, 512)
+    expect(prefix).toContain("no backing OpenFork Session")
+    expect(prefix).toContain("no implicit ChatGPT workspace")
+    expect(prefix).toContain("openfork_info(action=status")
+    expect(prefix).toContain("capability.list")
+    expect(prefix).toContain("capability.describe")
+    expect(prefix).toContain("capability.call")
+    expect(prefix).toContain("Discovery never grants authority")
+    expect(prefix).toContain("Never blindly retry a write with an unknown commit outcome")
+  })
+
   test("surface instructions encode support-not-initiation semantics and no implicit workspace", async () => {
     const text = await fs.readFile(path.resolve(import.meta.dir, "../../src/oxp/surface.ts"), "utf8")
     expect(text).toMatch(/serves the current ChatGPT\/OpenAI agent/)
@@ -32,15 +44,19 @@ describe("OXP Gate C endpoint boundary", () => {
     expect(text).toMatch(/call openai_files directly/i)
     expect(text).toMatch(/OXP owns the OpenAI connection/i)
     expect(text).toMatch(/Never read secrets or build auth in process/i)
+    expect(text).toMatch(/Code Mode is brokered/i)
+    expect(text).toMatch(/capability describe code, then capability call code/i)
+    expect(text).toMatch(/Every generated leaf retains its own authority/i)
     expect(text).not.toMatch(/credentialRef|use .*credential capability/i)
   })
 
   test("model-facing prose explains the upstream boundary and routes auth to purpose-specific capabilities", async () => {
     const text = await fs.readFile(path.resolve(import.meta.dir, "../../src/oxp/prose.ts"), "utf8")
     expect(text).toMatch(/Upstream may reject model-authored authentication before OXP/i)
-    expect(text).toMatch(/purpose-specific tools/i)
-    expect(text).toMatch(/Do not route authenticated work through this generic broker/i)
+    expect(text).toMatch(/Use direct tools for authenticated work/i)
+    expect(text).toMatch(/focusAction selects one operation/i)
     expect(text).toMatch(/trusted OpenAI connection/i)
+    expect(text).toMatch(/Code Mode: describe code, then call code/i)
     expect(text).not.toMatch(/credentialRef|stored-credential HTTPS/i)
   })
 
@@ -63,13 +79,10 @@ describe("OXP Gate C endpoint boundary", () => {
     expect(process?.description).toMatch(/process remains unrestricted/i)
     expect(process?.description).toMatch(/opaque handle/i)
     expect(process?.description).toMatch(/never PID/i)
-    expect(session?.description).toMatch(/root-scoped search/i)
-    expect(session?.description).toMatch(/tool:read term/i)
-    expect(session?.description).toMatch(/no hydration/i)
-    expect(session?.description).toMatch(/list\/get/i)
-    expect(session?.description).toMatch(/send\/turn/i)
-    expect(session?.description).toMatch(/todos\/goals/i)
-    expect(session?.description).toMatch(/checkpoints/i)
+    expect(session?.description).toMatch(/turn waits exact turn/i)
+    expect(session?.description).toMatch(/send queues/i)
+    expect(session?.description).toMatch(/steer safe-boundary/i)
+    expect(session?.description).toMatch(/send\/steer admit, not execute/i)
   })
 
   test("generic credential product is absent from the OXP model-visible surface", async () => {
@@ -279,22 +292,28 @@ describe("OXP Gate C endpoint boundary", () => {
     const readSchema = read!.inputSchema as {
       type?: string
       oneOf?: Branch[]
-      properties?: Record<string, { minimum?: number; maximum?: number; minItems?: number; maxItems?: number }>
+      properties?: Record<string, { minimum?: number; maximum?: number; minItems?: number; maxItems?: number; anyOf?: Array<{ type?: string; minimum?: number; maximum?: number; minItems?: number; maxItems?: number }> }>
       additionalProperties?: boolean
     }
     expect(readSchema.type).toBe("object")
     expect(readSchema.additionalProperties).toBe(false)
-    expect(readSchema.properties?.offset?.minimum).toBe(1)
-    expect(readSchema.properties?.offset?.maximum).toBe(10_000_000)
-    expect(readSchema.properties?.limit?.minimum).toBe(1)
-    expect(readSchema.properties?.limit?.maximum).toBe(10_000)
-    expect(readSchema.properties?.reads?.minItems).toBe(1)
-    expect(readSchema.properties?.reads?.maxItems).toBe(8)
+    const readOffset = readSchema.properties?.offset?.anyOf
+    const readLimit = readSchema.properties?.limit?.anyOf
+    expect(readOffset?.find((schema) => schema.type === "integer")?.minimum).toBe(1)
+    expect(readOffset?.find((schema) => schema.type === "integer")?.maximum).toBe(10_000_000)
+    expect(readOffset?.some((schema) => schema.type === "null")).toBe(true)
+    expect(readLimit?.find((schema) => schema.type === "integer")?.minimum).toBe(1)
+    expect(readLimit?.find((schema) => schema.type === "integer")?.maximum).toBe(10_000)
+    expect(readLimit?.some((schema) => schema.type === "null")).toBe(true)
+    const readBatch = readSchema.properties?.reads?.anyOf
+    expect(readBatch?.find((schema) => schema.type === "array")?.minItems).toBe(1)
+    expect(readBatch?.find((schema) => schema.type === "array")?.maxItems).toBe(8)
+    expect(readBatch?.some((schema) => schema.type === "null")).toBe(true)
     const readBranches = readSchema.oneOf ?? []
     expect(readBranches).toHaveLength(2)
     const singleRead = readBranches.find((branch) => branch.required?.includes("path"))
     const batchRead = readBranches.find((branch) => branch.required?.includes("reads"))
-    expect(singleRead?.properties?.action?.enum).toEqual(["read", "tail"])
+    expect(singleRead?.properties?.action?.enum).toEqual(["read", "tail", "grep", "outline", "around"])
     expect(singleRead?.properties).toHaveProperty("offset")
     expect(batchRead?.properties?.action?.const).toBe("read")
     expect(batchRead?.properties).not.toHaveProperty("path")
@@ -339,14 +358,16 @@ describe("OXP Gate C endpoint boundary", () => {
 
   test("disabled host state stays on the config/root graph until endpoint activation", async () => {
     const text = await fs.readFile(path.resolve(import.meta.dir, "../../src/oxp/host.ts"), "utf8")
-    const idle = text.slice(text.indexOf("const idleLayer"), text.indexOf("const activeLayer"))
-    const active = text.slice(text.indexOf("const activeLayer"), text.indexOf("const makeIdleRuntime"))
+    const active = await fs.readFile(path.resolve(import.meta.dir, "../../src/oxp/active-runtime.ts"), "utf8")
+    const idle = text.slice(text.indexOf("const idleLayer"), text.indexOf("const makeIdleRuntime"))
     expect(idle).toContain("LayerNode.group([OxpConfig.node, OxpRoot.node])")
     expect(idle).not.toContain("OxpServer.node")
     expect(idle).not.toContain("CrossSpawnSpawner.node")
     expect(active).toMatch(
       /LayerNode\.group\(\[\s*CrossSpawnSpawner\.node,\s*OxpConfig\.node,\s*OxpRoot\.node,\s*OxpAgentCatalog\.node,\s*OxpModelCatalog\.node,\s*OxpServer\.node,\s*\]\)/,
     )
+    expect(active).toContain("activeLayer ??= buildActiveLayer()")
+    expect(text).toContain('import("./active-runtime")')
     expect(text).toContain("if (!activeRuntime) await retireIdleRuntime()")
     expect(text).toContain("There must never be two live OxpConfig caches")
   })
@@ -354,7 +375,7 @@ describe("OXP Gate C endpoint boundary", () => {
   test("fixed info schema advertises only actions with live Gate C owners", async () => {
     const text = await fs.readFile(path.resolve(import.meta.dir, "../../src/oxp/surface.ts"), "utf8")
     const info = text.slice(text.indexOf("export const InfoParameters"), text.indexOf("export type InfoInput"))
-    expect(info).toContain('["status", "capabilities"]')
+    expect(info).toContain('["status", "capabilities", "diagnostics"]')
     expect(info).not.toMatch(/providers|models|agents|limits|usage/)
   })
 

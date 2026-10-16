@@ -100,7 +100,20 @@ export interface Interface {
   readonly unarchive: (target: Target) => Effect.Effect<void, Error>
   readonly delete: (target: Target) => Effect.Effect<void, Error>
   readonly setSelection: (target: Target, input: SelectionInput) => Effect.Effect<void, Error>
+  /**
+   * Durable safe-boundary guidance. Returns after admission; execution may
+   * occur on the current generation's next provider-cycle boundary.
+   */
+  readonly steer: (target: Target, input: PromptInput) => Effect.Effect<PromptResult, Error>
+  /**
+   * Durable queued turn. Returns after admission/wake, not after execution.
+   */
   readonly send: (target: Target, input: PromptInput) => Effect.Effect<PromptResult, Error>
+  /**
+   * Durable queued turn with an exact execution fence. Returns only after the
+   * admitted turn itself reaches a completed assistant boundary, unless paused
+   * or the caller stops waiting.
+   */
   readonly turn: (
     target: Target,
     input: PromptInput,

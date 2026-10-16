@@ -31,18 +31,18 @@ const Name = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256))
 const Workdir = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096))
 
 const WorkerStart = Schema.Struct({
-  title: Schema.optional(Name),
-  prompt: Text,
-  agent: Schema.optional(Name),
-  model: Schema.optional(OxpSchema.ModelSelection),
-  nestedDelegation: Schema.optional(Schema.Boolean),
+  title: Schema.optional(Name).annotate({ description: "Optional durable worker title, distinct from the instruction prompt." }),
+  prompt: Text.annotate({ description: "Complete objective and acceptance criteria for this worker, maximum 64 KiB." }),
+  agent: Schema.optional(Name).annotate({ description: "Agent identifier from agent_catalog; otherwise use configured delegation policy." }),
+  model: Schema.optional(OxpSchema.ModelSelection).annotate({ description: "Model selection from model_catalog, including provider and reasoning variant when applicable." }),
+  nestedDelegation: Schema.optional(Schema.Boolean).annotate({ description: "Whether this worker may delegate further; omit unless explicitly necessary." }),
 }).annotate({ identifier: "Oxp.WorkerStart" })
 
 const WorkerContinue = Schema.Struct({
-  workerID: ID,
-  prompt: Text,
-  agent: Schema.optional(Name),
-  model: Schema.optional(OxpSchema.ModelSelection),
+  workerID: ID.annotate({ description: "Existing worker ID returned by start/list; do not create a replacement for ordinary continuation." }),
+  prompt: Text.annotate({ description: "New instructions for the existing worker, not a second worker launch." }),
+  agent: Schema.optional(Name).annotate({ description: "Optional agent selection override for this continuation." }),
+  model: Schema.optional(OxpSchema.ModelSelection).annotate({ description: "Optional model selection override for this continuation." }),
 }).annotate({ identifier: "Oxp.WorkerContinue" })
 
 export const Parameters = Schema.Struct({
@@ -68,32 +68,32 @@ export const Parameters = Schema.Struct({
     "batch_wait",
     "batch_cancel",
     "batch_continue",
-  ]),
-  rootID: Schema.optional(OxpSchema.RootID),
-  workdir: Schema.optional(Workdir),
-  providerID: Schema.optional(Name),
-  modelID: Schema.optional(Name),
-  workerID: Schema.optional(ID),
-  batchID: Schema.optional(ID),
-  title: Schema.optional(Name),
-  prompt: Schema.optional(Text),
-  agent: Schema.optional(Name),
-  model: Schema.optional(OxpSchema.ModelSelection),
-  expectedModel: Schema.optional(OxpSchema.ModelSelection),
-  nestedDelegation: Schema.optional(Schema.Boolean),
+  ]).annotate({ description: "Discover via model_catalog/agent_catalog; start creates, continue reuses, wait/result inspect liveness, batch_* handles durable groups." }),
+  rootID: Schema.optional(OxpSchema.RootID).annotate({ description: "Approved root for launch and root-owned settings; not an arbitrary filesystem path." }),
+  workdir: Schema.optional(Workdir).annotate({ description: "Existing directory relative to the approved root; defaults to root. Must not escape the root." }),
+  providerID: Schema.optional(Name).annotate({ description: "Model provider filter/selection where supported; prefer model_catalog for valid identifiers." }),
+  modelID: Schema.optional(Name).annotate({ description: "Model ID filter/selection where supported; prefer model_catalog rather than guessing." }),
+  workerID: Schema.optional(ID).annotate({ description: "Durable worker ID for get, wait, result, continue, cancel or set_selection." }),
+  batchID: Schema.optional(ID).annotate({ description: "Durable batch ID returned by batch_start; use with batch_get, batch_wait and batch_cancel." }),
+  title: Schema.optional(Name).annotate({ description: "Optional durable title for a newly created worker." }),
+  prompt: Schema.optional(Text).annotate({ description: "Instruction text for start/continue, including concrete acceptance criteria." }),
+  agent: Schema.optional(Name).annotate({ description: "Agent ID from agent_catalog; an explicit selection overrides the configured preference." }),
+  model: Schema.optional(OxpSchema.ModelSelection).annotate({ description: "Explicit provider/model/variant selection, validated by the host." }),
+  expectedModel: Schema.optional(OxpSchema.ModelSelection).annotate({ description: "Optimistic precondition for set_selection; prevents overwriting a concurrently changed selection." }),
+  nestedDelegation: Schema.optional(Schema.Boolean).annotate({ description: "Allow delegated workers to spawn descendants only when the task requires it." }),
   timeoutMs: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 30_000 })),
-  ),
+  ).annotate({ description: "Bounded time to await a worker/batch; zero polls state without blocking." }),
   limit: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: MAX_WORKERS })),
-  ),
-  includeArchived: Schema.optional(Schema.Boolean),
+  ).annotate({ description: "Limit list results to at most 100 workers." }),
+  includeArchived: Schema.optional(Schema.Boolean).annotate({ description: "Include archived workers in list-style reads." }),
   workers: Schema.optional(
     Schema.Array(WorkerStart).check(Schema.isMaxLength(MAX_BATCH_WORKERS)),
-  ),
+  ).annotate({ description: "batch_start: up to 16 independent worker requests; stage smaller batches to localize failures." }),
   continuations: Schema.optional(
     Schema.Array(WorkerContinue).check(Schema.isMaxLength(MAX_BATCH_WORKERS)),
-  ),
+  ).annotate({ description: "batch_continue: existing worker IDs with prompts; avoid redundant worker creation." }),
 })
 export type Input = Schema.Schema.Type<typeof Parameters>
 

@@ -7,10 +7,9 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Parameters as WebParameters } from "@/tool/web"
 import { executeFetch } from "@/tool/webfetch"
 import {
-  callProvider,
+  executeWebSearch,
   flagMap,
   providersOutput,
-  selectWebSearchProvider,
   webSearchProviderLabel,
 } from "@/tool/websearch"
 import { OxpAuthority } from "./authority"
@@ -100,10 +99,8 @@ const layer = Layer.effect(
 
       if (!input.query) return yield* new OxpError.InvalidArgument({ detail: "web.search requires query" })
       const state = yield* config.get()
-      const provider = selectWebSearchProvider(String(state.connector.id), flagsByProvider, input.provider)
-      const result = yield* callProvider(
+      const result = yield* executeWebSearch(
         http,
-        provider,
         {
           action: "search",
           query: input.query,
@@ -114,13 +111,18 @@ const layer = Layer.effect(
           ...(input.provider === undefined ? {} : { provider: input.provider }),
         },
         { sessionID: `oxp:${state.connector.id}` },
+        flagsByProvider,
       ).pipe(Effect.mapError((error) => dependency(`Web search failed: ${String(error)}`)))
       yield* authority.revalidate(admission, "egress")
       if (signal?.aborted) return yield* new OxpError.Cancelled({ detail: "OXP web request was cancelled" })
       return {
-        title: `${webSearchProviderLabel(provider)} \"${input.query}\"`,
-        output: result ?? "No search results found. Please try a different query.",
-        metadata: { action, provider },
+        title: `${webSearchProviderLabel(result.provider)} \"${input.query}\"`,
+        output: result.output,
+        metadata: {
+          action,
+          provider: result.provider,
+          attemptedProviders: result.attempts.map((attempt) => attempt.provider),
+        },
       } satisfies OxpResult.CapabilityResult
     })
 
