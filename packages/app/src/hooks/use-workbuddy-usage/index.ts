@@ -2,6 +2,7 @@ import { createMemo } from "solid-js"
 import type { Accessor } from "solid-js"
 import { useLimits, type LimitsState } from "@/hooks/use-limits"
 import { parseWorkBuddyKey, workBuddyCredits, workBuddyAccountCreditsExhausted, type ProviderResult } from "@/utils/limits-format"
+import { roundWorkBuddyRate } from "@/utils/workbuddy-limits"
 import { splitMultiAccountModelID } from "@/utils/model-account-identity"
 
 /**
@@ -213,7 +214,10 @@ export function useWorkBuddyUsage(options?: { now?: Accessor<number>; limits?: L
       if (!requests || requests <= 0) continue
       const average = report.creditsObserved / requests
       if (!Number.isFinite(average) || average <= 0) continue
-      return average
+      // Dividing two integers otherwise leaks a raw full-precision float
+      // (e.g. `1.563970588235294`) into the picker badge; round it to the
+      // catalog's 2-decimal precision so measured and published rates match.
+      return roundWorkBuddyRate(average)
     }
     return undefined
   }

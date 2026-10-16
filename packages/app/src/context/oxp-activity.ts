@@ -8,6 +8,7 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useServerSDK } from "./server-sdk"
+import { useTabs } from "./tabs"
 
 type InvocationDetailState = {
   data?: OxpInvocationDetailInfo
@@ -81,6 +82,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
   name: "OxpActivity",
   init: () => {
     const serverSDK = useServerSDK()
+    const tabs = useTabs()
     const [state, setState] = createStore({
       summaries: {} as Record<string, OxpParentActivitySummary>,
       details: {} as Record<string, DetailState>,
@@ -556,12 +558,24 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       return response.data
     }
 
+    const regenerateTitle = async (activityID: string) => {
+      const response = await sdk().oxpActivityUpdate(
+        { activityID, globalOxpActivityPatch: { regenerateTitle: true } },
+        { throwOnError: true },
+      )
+      if (response.data) await refreshOne(activityID)
+      return response.data
+    }
+
     const remove = async (activityID: string) => {
       const response = await sdk().oxpActivityDelete(
         { activityID },
         { throwOnError: true },
       )
-      if (response.data?.deleted) drop(activityID)
+      if (response.data?.deleted) {
+        drop(activityID)
+        tabs.removeOxpActivityTab(activityID)
+      }
       return response.data?.deleted ?? false
     }
 
@@ -594,6 +608,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
             return
           case "oxpActivity.removed":
             drop(event.properties.activityID)
+            tabs.removeOxpActivityTab(event.properties.activityID)
             return
           case "oxpActivity.invocation.started":
           case "oxpActivity.invocation.settled":
@@ -652,6 +667,7 @@ export const { use: useOxpActivity, provider: OxpActivityProvider } = createSimp
       refreshInvocations,
       loadMore,
       rename,
+      regenerateTitle,
       archive,
       remove,
     }

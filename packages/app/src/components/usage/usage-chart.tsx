@@ -3,6 +3,8 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { formatNumber, formatTokens, formatUSD, formatUSDCompact } from "./usage-format"
+import { usageCalendarWindow } from "./usage-calendar-window"
+import { nearestUsageTimeIndex, usageTimeRatio } from "./usage-chart-time"
 
 type Summary = UsageSummaryResponse
 
@@ -99,8 +101,10 @@ export function UsageAreaChart(props: { periods: Summary["periods"]; metric: Met
     const data = list()
     const count = data.length
     if (count === 0) return []
+    const start = data[0]!.start
+    const end = data[count - 1]!.start
     return data.map((period, index) => {
-      const x = (index / Math.max(1, count - 1)) * WIDTH
+      const x = usageTimeRatio(start, end, period.start, index, count) * WIDTH
       const y = HEIGHT - PAD_Y - (max() > 0 ? (valueFor(period, props.metric) / max()) * (HEIGHT - PAD_Y * 2) : 0)
       return { x, y, period }
     })
@@ -122,7 +126,7 @@ export function UsageAreaChart(props: { periods: Summary["periods"]; metric: Met
     const rect = event.currentTarget.getBoundingClientRect()
     if (rect.width <= 0) return
     const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
-    setHoverIndex(Math.round(ratio * (count - 1)))
+    setHoverIndex(nearestUsageTimeIndex(list(), ratio))
   }
 
   const hovered = () => {
@@ -244,8 +248,10 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
     const data = list()
     const count = data.length
     if (count === 0) return []
+    const start = data[0]!.start
+    const end = data[count - 1]!.start
     return data.map((period, index) => {
-      const x = (index / Math.max(1, count - 1)) * HERO_WIDTH
+      const x = usageTimeRatio(start, end, period.start, index, count) * HERO_WIDTH
       const y = HERO_HEIGHT - HERO_PAD_Y - (max() > 0 ? (heroValueFor(period, props.metric) / max()) * (HERO_HEIGHT - HERO_PAD_Y * 2) : 0)
       return { x, y, period }
     })
@@ -267,7 +273,7 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
     const rect = event.currentTarget.getBoundingClientRect()
     if (rect.width <= 0) return
     const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
-    setHoverIndex(Math.round(ratio * (count - 1)))
+    setHoverIndex(nearestUsageTimeIndex(list(), ratio))
   }
 
   const hovered = () => {
@@ -302,7 +308,7 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
   const xLabels = createMemo(() => {
     const pts = points()
     if (pts.length < 2) return []
-    const mid = pts[Math.floor((pts.length - 1) / 2)]
+    const mid = pts[nearestUsageTimeIndex(list(), 0.5)]
     return [pts[0], mid, pts[pts.length - 1]]
   })
 
@@ -557,14 +563,17 @@ const HEATMAP_MAX_DAYS = 120
 const CELL = 12
 
 /** GitHub-contribution-style monthly token/cost heatmap from day buckets. */
-export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric }) {
+export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric; since: number; until: number }) {
   const language = useLanguage()
   const [hovered, setHovered] = createSignal<UsageHoverTooltipData | null>(null)
   const dateFormatter = createMemo(() =>
     new Intl.DateTimeFormat(language.intl(), { weekday: "short", month: "short", day: "numeric" }),
   )
   const cells = createMemo(() => {
-    const days = props.days.slice(-HEATMAP_MAX_DAYS)
+    // Sparse active-day rows must be expanded into actual calendar dates:
+    // consecutive active records can be weeks apart, and a sampled history
+    // must never compress elapsed time into adjacent heatmap cells.
+    const days = usageCalendarWindow(props.days, props.since, props.until, HEATMAP_MAX_DAYS)
     const max = Math.max(...days.map((day) => valueFor(day, props.metric)), 1)
     return days.map((day) => ({
       start: day.start,

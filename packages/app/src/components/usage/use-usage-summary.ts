@@ -1,6 +1,9 @@
-import { createResource, onCleanup, type Accessor } from "solid-js"
+import { createEffect, createResource, onCleanup, type Accessor } from "solid-js"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { useServerSDK } from "@/context/server-sdk"
+import { usageSummaryCacheKey } from "./usage-summary-cache"
+
+export { usageSummaryCacheKey } from "./usage-summary-cache"
 
 export const USAGE_WINDOWS = [
   { key: "1h", labelKey: "usage.window.1h", ms: 3_600_000, resolution: "hour" },
@@ -16,10 +19,6 @@ export const USAGE_WINDOWS = [
 export type UsageWindowDef = (typeof USAGE_WINDOWS)[number]
 
 export const USAGE_WINDOW_MAP = new Map<string, UsageWindowDef>(USAGE_WINDOWS.map((window) => [window.key, window]))
-
-export function usageSummaryCacheKey(serverScope: string, windowKey: string, projectID: string | null) {
-  return `${serverScope}\u0000${windowKey}\u0000${projectID ?? ""}`
-}
 
 // Client-side memo so switching back to a previously-viewed range (or
 // reopening the panel) renders instantly instead of round-tripping the server.
@@ -84,7 +83,12 @@ export function createUsageSummary(input: {
       } catch (error) {
         if (controller.signal.aborted) return null
         throw error
+      } finally {
+        if (activeController === controller) activeController = undefined
       }
+      // A fetch that resolved despite cancellation must not populate the
+      // shared cache or reintroduce an inactive page's obsolete snapshot.
+      if (controller.signal.aborted) return null
       const data = response.data ?? null
       if (data) {
         clientCache.delete(key)
@@ -98,6 +102,11 @@ export function createUsageSummary(input: {
       return data
     },
   )
+  // Disabling the summary (e.g. while viewing OXP) must interrupt its
+  // in-flight producer immediately, not wait for another summary fetch.
+  createEffect(() => {
+    if (input.active?.() === false) activeController?.abort()
+  })
   onCleanup(() => activeController?.abort())
   return summary
 }

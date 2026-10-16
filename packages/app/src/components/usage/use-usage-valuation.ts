@@ -89,11 +89,11 @@ function toCatalog(providers: readonly ValuationProvider[]): CheapnessModel[] {
 
 function sameIdentities(
   previous: readonly { providerID: string; modelID: string }[],
-  next: readonly { providerID: string; modelID: string }[],
+  next: ReadonlyMap<string, { providerID: string; modelID: string }>,
 ) {
   return (
-    previous.length === next.length &&
-    previous.every((item, index) => item.providerID === next[index].providerID && item.modelID === next[index].modelID)
+    previous.length === next.size &&
+    previous.every((item) => next.has(`${item.providerID}\u0000${item.modelID}`))
   )
 }
 
@@ -162,10 +162,12 @@ export function createUsageValuation(
   const usedModels = createMemo((previous: readonly { providerID: string; modelID: string }[]) => {
     const unique = new Map<string, { providerID: string; modelID: string }>()
     for (const row of rows()) unique.set(`${row.providerID}\u0000${row.modelID}`, row)
-    const next = [...unique.values()].sort(
+    // Skip O(u log u) sorting and reference churn on every streaming usage
+    // update unless the distinct model identities actually changed.
+    if (sameIdentities(previous, unique)) return previous
+    return [...unique.values()].sort(
       (a, b) => a.providerID.localeCompare(b.providerID) || a.modelID.localeCompare(b.modelID),
     )
-    return sameIdentities(previous, next) ? previous : next
   }, [])
 
   const fuzzyFallback = createMemo(() => {

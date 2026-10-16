@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { useLanguage } from "@/context/language"
+import { sortedUsagePrefix } from "@/components/usage/usage-prefix-sort"
 import {
   formatDuration,
   formatNumber,
@@ -79,15 +80,24 @@ export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric
     ),
   )
 
-  const models = createMemo(() =>
-    [...maintenance().models].sort(
-      props.metric === "cost"
-        ? (a, b) => b.cost + b.estimatedCost - (a.cost + a.estimatedCost) || b.totalTokens - a.totalTokens
-        : (a, b) => b.totalTokens - a.totalTokens || b.cost + b.estimatedCost - (a.cost + a.estimatedCost),
-    ),
-  )
-  const visibleModels = createMemo(() => models().slice(0, modelLimit()))
-  const hiddenModels = createMemo(() => Math.max(0, models().length - visibleModels().length))
+  const visibleModels = createMemo(() => {
+    const source = maintenance().models
+    // The server orders maintenance models by cost, then tokens. Retain this
+    // ordered prefix unchanged for cost mode. For tokens mode, stable sorting
+    // preserves the server's cost order for equal token counts, exactly the
+    // previous secondary comparator, without ranking invisible model rows.
+    if (props.metric === "cost") return source.slice(0, modelLimit())
+    if (source.length <= 512)
+      return [...source]
+        .sort(
+          (a, b) =>
+            b.totalTokens - a.totalTokens ||
+            b.cost + b.estimatedCost - (a.cost + a.estimatedCost),
+        )
+        .slice(0, modelLimit())
+    return sortedUsagePrefix(source, modelLimit(), (row) => row.totalTokens, "desc")
+  })
+  const hiddenModels = createMemo(() => Math.max(0, maintenance().models.length - visibleModels().length))
 
   return (
     <div class="flex flex-col gap-3">
@@ -247,7 +257,7 @@ export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric
       </div>
 
       <Panel title={language.t("usage.maintenance.models")} tooltip={language.t("usage.maintenance.modelsHelp")} flush>
-        <Show when={models().length > 0} fallback={<EmptyLine>{language.t("usage.maintenance.empty")}</EmptyLine>}>
+        <Show when={maintenance().models.length > 0} fallback={<EmptyLine>{language.t("usage.maintenance.empty")}</EmptyLine>}>
           <div class="overflow-x-auto">
             <div class="min-w-[720px]">
               <div class="grid grid-cols-[minmax(180px,1.2fr)_minmax(220px,1.6fr)_80px_100px_88px] items-center border-b border-[var(--usage-line)] px-3 py-1.5 text-[9px] font-[560] uppercase tracking-[0.05em] text-v2-text-text-faint">

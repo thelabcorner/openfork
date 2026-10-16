@@ -4,6 +4,9 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { useLanguage } from "@/context/language"
 import "./oxp-attribution.css"
+import { OxpApiCostPanel } from "./oxp-api-cost-panel"
+import { OxpWorkloadPanel, type OxpWorkloadProfile } from "./oxp-workload-panel"
+import type { OxpLocalDonor } from "./oxp-local-donor"
 
 type Source = OxpAttributionSnapshot["totals"]["bySource"][number]["source"]
 
@@ -75,11 +78,13 @@ function Metric(props: { label: string; value: string; detail?: string; tooltip?
 }
 
 export function OxpAttributionPanel(props: {
-  snapshot?: OxpAttributionSnapshot
+  snapshot?: OxpAttributionSnapshot & { workload?: OxpWorkloadProfile }
   loading?: boolean
   error?: unknown
   onRefresh?: () => void
   title?: string
+  donor?: OxpLocalDonor
+  modelDonors?: Readonly<Record<string, OxpLocalDonor>>
 }) {
   const language = useLanguage()
   const snapshot = () => props.snapshot
@@ -87,7 +92,7 @@ export function OxpAttributionPanel(props: {
   const sourceRows = () => {
     const rows = new Map(snapshot()?.totals.bySource.map((row) => [row.source, row]))
     return SOURCE_ORDER.map((source) => rows.get(source)).filter(
-      (row): row is NonNullable<typeof row> => !!row && (row.uniqueChars > 0 || row.tokens > 0),
+      (row): row is NonNullable<typeof row> => !!row && (row.chars > 0 || row.tokens > 0),
     )
   }
 
@@ -136,33 +141,45 @@ export function OxpAttributionPanel(props: {
             <div data-slot="oxp-attribution-stats">
               <Metric
                 primary
-                label={language.t("oxpActivity.attribution.exposure")}
+                label={language.t("oxpActivity.attribution.oxpTokens")}
                 value={compact(value().totals.tokens)}
-                detail={language.t("oxpActivity.attribution.tokenEquivalent")}
-                tooltip={language.t("oxpActivity.attribution.exposureHelp")}
+                detail={language.t("oxpActivity.attribution.tokenEstimate")}
+                tooltip={language.t("oxpActivity.attribution.oxpTokensHelp")}
               />
               <Metric
-                label={language.t("oxpActivity.attribution.unique")}
-                value={compact(value().totals.uniqueTokens)}
-                detail={language.t("oxpActivity.attribution.tokenEquivalent")}
-                tooltip={language.t("oxpActivity.attribution.uniqueHelp")}
+                label={language.t("oxpActivity.attribution.surroundingTokens")}
+                value={compact(value().totals.estimatedSurroundingTokens)}
+                detail={language.t("oxpActivity.attribution.tokenEstimate")}
+                tooltip={language.t("oxpActivity.attribution.surroundingTokensHelp")}
               />
               <Metric
-                label={language.t("oxpActivity.attribution.amplification")}
-                value={value().totals.amplification === null ? "—" : `${value().totals.amplification.toFixed(2)}×`}
-                detail={language.t("oxpActivity.attribution.residency")}
+                label={language.t("oxpActivity.attribution.totalTokens")}
+                value={compact(value().totals.estimatedTotalTokens)}
+                detail={language.t("oxpActivity.attribution.tokenEstimate")}
+                tooltip={language.t("oxpActivity.attribution.totalTokensHelp")}
               />
               <Metric
-                label={language.t("oxpActivity.attribution.rounds")}
-                value={compact(value().totals.inferredRounds)}
+                label={language.t("oxpActivity.attribution.turns")}
+                value={compact(value().totals.inferredTurns)}
                 detail={language.t("oxpActivity.attribution.inferred")}
               />
               <Metric
                 label={language.t("oxpActivity.attribution.calls")}
                 value={compact(value().totals.calls)}
-                detail={language.t("oxpActivity.attribution.footprintInputs")}
+                detail={language.t("oxpActivity.attribution.toolCalls")}
               />
             </div>
+
+            <Show when={value().workload}>
+              {(workload) => <OxpWorkloadPanel profile={workload()} />}
+            </Show>
+
+            <OxpApiCostPanel
+              oxpTokens={value().totals.tokens}
+              surroundingTokens={value().totals.estimatedSurroundingTokens}
+              donor={props.donor}
+              modelDonors={props.modelDonors}
+            />
 
             <div data-slot="oxp-attribution-grid">
               <section data-slot="oxp-attribution-section">
@@ -176,8 +193,9 @@ export function OxpAttributionPanel(props: {
                       <tr>
                         <th>{language.t("oxpActivity.attribution.tool")}</th>
                         <th>{language.t("oxpActivity.attribution.calls")}</th>
-                        <th>{language.t("oxpActivity.attribution.uniqueShort")}</th>
-                        <th>{language.t("oxpActivity.attribution.exposureShort")}</th>
+                        <th>{language.t("oxpActivity.attribution.request")}</th>
+                        <th>{language.t("oxpActivity.attribution.result")}</th>
+                        <th>{language.t("oxpActivity.attribution.tokens")}</th>
                         <th>{language.t("oxpActivity.attribution.share")}</th>
                       </tr>
                     </thead>
@@ -187,7 +205,8 @@ export function OxpAttributionPanel(props: {
                           <tr>
                             <td data-cell="name">{row.tool}</td>
                             <td>{row.calls.toLocaleString(language.intl())}</td>
-                            <td>{compact(row.uniqueTokens)}</td>
+                            <td>{compact(row.requestTokens)}</td>
+                            <td>{compact(row.resultTokens)}</td>
                             <td>{compact(row.tokens)}</td>
                             <td>{percent(row.tokens, value().totals.tokens)}</td>
                           </tr>
@@ -223,38 +242,28 @@ export function OxpAttributionPanel(props: {
                   </div>
                 </section>
 
-                <section data-slot="oxp-attribution-section">
-                  <header data-slot="oxp-attribution-section-header">
-                    <span>{language.t("oxpActivity.attribution.sensitivity")}</span>
-                    <span>ρ</span>
-                  </header>
-                  <div data-slot="oxp-attribution-sensitivity">
-                    <For each={[value().sensitivity.low, value().sensitivity.calibrated, value().sensitivity.high]}>
-                      {(point) => (
-                        <div
-                          data-slot="oxp-attribution-sensitivity-row"
-                          data-active={point.rho === value().sensitivity.calibrated.rho ? "true" : undefined}
-                        >
-                          <span>ρ {point.rho.toFixed(2)}</span>
-                          <span>{compact(point.tokens)}</span>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </section>
-
                 <section data-slot="oxp-attribution-method">
                   <div>
                     <span>{language.t("oxpActivity.attribution.model")}</span>
-                    <strong>Geometric residency · ρ {value().model.rho.toFixed(2)}</strong>
+                    <strong>OpenFork empirical turn model</strong>
                   </div>
                   <div>
                     <span>{language.t("oxpActivity.attribution.calibration")}</span>
-                    <strong>{value().model.calibration.observations.toLocaleString(language.intl())} calls</strong>
+                    <strong>
+                      {value().model.calibration.observations.toLocaleString(language.intl())}{" "}
+                      {language.t("oxpActivity.attribution.turnsPaired")}
+                    </strong>
                   </div>
                   <div>
-                    <span>{language.t("oxpActivity.attribution.causal")}</span>
-                    <strong>{language.t("oxpActivity.attribution.traceUnavailable")}</strong>
+                    <span>{language.t("oxpActivity.attribution.validation")}</span>
+                    <strong>
+                      {(value().model.calibration.validation.cvSessionWAPE * 100).toFixed(0)}% WAPE ·{" "}
+                      {(value().model.calibration.validation.cvSessionMedianAPE * 100).toFixed(0)}% median
+                    </strong>
+                  </div>
+                  <div>
+                    <span>{language.t("oxpActivity.attribution.turnBoundary")}</span>
+                    <strong>{(value().model.turnGapThresholdMs / 1000).toFixed(1)}s calibrated gap</strong>
                   </div>
                   <div>
                     <span>{language.t("oxpActivity.attribution.schemaTax")}</span>

@@ -1,4 +1,5 @@
 import { createSignal } from "solid-js"
+import { sortedUsagePrefix } from "./usage-prefix-sort"
 
 export type SortDirection = "asc" | "desc"
 
@@ -33,7 +34,7 @@ export function createColumnSort<Row, Col extends string>(
     setDirection("desc")
   }
 
-  const sort = (rows: Row[]): Row[] => {
+  const sort = (rows: readonly Row[]): Row[] => {
     const col = column()
     const dir = direction() === "asc" ? 1 : -1
     return [...rows].sort((a, b) => {
@@ -44,5 +45,16 @@ export function createColumnSort<Row, Col extends string>(
     })
   }
 
-  return { column, direction, toggle, syncDefault, sort }
+  /** Rank only the currently visible prefix, without sorting hidden rows. */
+  const prefix = (rows: readonly Row[], limit: number): Row[] => {
+    if (!Number.isFinite(limit) || limit <= 0) return limit === Infinity ? sort(rows) : []
+    const count = Math.floor(limit)
+    if (rows.length <= 512) return sort(rows).slice(0, count)
+    // Capture reactive sort state once, not for each of thousands of rows.
+    const col = column()
+    const dir = direction()
+    return sortedUsagePrefix(rows, count, (row) => getValue(row, col), dir)
+  }
+
+  return { column, direction, toggle, syncDefault, sort, prefix }
 }

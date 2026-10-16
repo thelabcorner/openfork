@@ -1,4 +1,4 @@
-import { createMemo, createSignal, ErrorBoundary, Match, startTransition, Switch } from "solid-js"
+import { createMemo, createSignal, ErrorBoundary, lazy, Match, Show, startTransition, Suspense, Switch } from "solid-js"
 import { Icon } from "@opencode-ai/ui/icon"
 import { TabsV2 } from "@opencode-ai/ui/v2/tabs-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
@@ -11,14 +11,22 @@ import { UsagePageHeader, type UsageProjectOption } from "@/pages/usage/usage-pa
 import { UsagePageHero } from "@/pages/usage/usage-page-hero"
 import { UsageOverviewCache, UsageOverviewStats } from "@/pages/usage/usage-page-overview"
 import { UsageSubsidyPanel } from "@/pages/usage/usage-page-subsidy"
-import { UsagePageModels } from "@/pages/usage/usage-page-models"
-import { UsagePageActivity } from "@/pages/usage/usage-page-activity"
-import { UsagePageMaintenance } from "@/pages/usage/usage-page-maintenance"
-import { UsagePageOxp } from "@/pages/usage/usage-page-oxp"
 import { createUsageValuation } from "@/pages/usage/use-usage-valuation"
 
+// Only Overview is on the first-paint path. The other sections carry large
+// charts, sortable tables or attribution UI; defer their JS until selected.
+const UsagePageModels = lazy(() => import("@/pages/usage/usage-page-models").then((m) => ({ default: m.UsagePageModels })))
+const UsagePageActivity = lazy(() => import("@/pages/usage/usage-page-activity").then((m) => ({ default: m.UsagePageActivity })))
+const UsagePagePerformance = lazy(() =>
+  import("@/pages/usage/usage-page-performance").then((m) => ({ default: m.UsagePagePerformance })),
+)
+const UsagePageMaintenance = lazy(() =>
+  import("@/pages/usage/usage-page-maintenance").then((m) => ({ default: m.UsagePageMaintenance })),
+)
+const UsagePageOxp = lazy(() => import("@/pages/usage/usage-page-oxp").then((m) => ({ default: m.UsagePageOxp })))
+
 type Metric = "cost" | "tokens"
-type Section = "overview" | "models" | "activity" | "oxp" | "maintenance"
+type Section = "overview" | "models" | "performance" | "activity" | "oxp" | "maintenance"
 
 export function UsagePage() {
   const language = useLanguage()
@@ -28,6 +36,9 @@ export function UsagePage() {
   const [metric, setMetric] = createSignal<Metric>("cost")
   const [refreshTick, setRefreshTick] = createSignal(0)
   const [section, setSection] = createSignal<Section>("overview")
+  // The pricing catalog and cross-provider model grouping are only needed by
+  // these two views. Activity, Maintenance and OXP must not pay for either.
+  const needsModelValuation = createMemo(() => section() === "overview" || section() === "models")
 
   const windowDef = createMemo(() => USAGE_WINDOWS.find((w) => w.key === windowKey()) ?? USAGE_WINDOWS[5])
   const summary = createUsageSummary({
@@ -60,6 +71,9 @@ export function UsagePage() {
       .map((project) => ({ projectID: project.id, name: project.name || project.worktree }))
       .sort((a, b) => a.name.localeCompare(b.name)),
   )
+  const projectNames = createMemo(() =>
+    Object.fromEntries(projectOptions().map((project) => [project.projectID, project.name])),
+  )
 
   // Solid resource accessors re-throw the fetch error on every read once a
   // resource has errored (that's what lets Suspense/ErrorBoundary catch it) —
@@ -77,7 +91,11 @@ export function UsagePage() {
   // fallback maps, and the free/subsidised usage valuation derived from them.
   // Every catalog consumer on the page goes through this, so they can never
   // disagree about a model's identity or what it is worth.
-  const valuation = createUsageValuation(() => data()?.models ?? [])
+  const valuation = createUsageValuation(() => data()?.models ?? [], undefined, {
+    // Overlap the inexpensive catalog request with the summary request on the
+    // default Overview route instead of serializing first paint on data().
+    enabled: needsModelValuation,
+  })
 
   // Model *naming* shares the same catalog as model *pricing*. It previously
   // came from `useModels`, which only exposes connected providers — so on this
@@ -87,7 +105,9 @@ export function UsagePage() {
     valuation.catalog().map((m) => ({ providerID: m.provider.id, modelID: m.id, name: m.name, family: m.family })),
   )
   const identify = createMemo(() => createCatalogIdentify(catalog()))
-  const modelGroups = createMemo<ModelGroup[]>(() => groupModelsByName(data()?.models ?? [], identify()))
+  const modelGroups = createMemo<ModelGroup[]>(() =>
+    needsModelValuation() ? groupModelsByName(data()?.models ?? [], identify()) : [],
+  )
 
   const totalCost = () => {
     const value = data()
@@ -127,8 +147,12 @@ export function UsagePage() {
         <Icon name="models" />
         {language.t("usage.nav.models")}
       </TabsV2.Trigger>
-      <TabsV2.Trigger value="activity">
-        <Icon name="usage" />
+       <TabsV2.Trigger value="performance">
+         <Icon name="usage" />
+         Performance
+       </TabsV2.Trigger>
+       <TabsV2.Trigger value="activity">
+         <Icon name="usage" />
         {language.t("usage.nav.activity")}
       </TabsV2.Trigger>
       <TabsV2.Trigger value="oxp">
@@ -192,51 +216,49 @@ export function UsagePage() {
         </div>
 
         <div class="min-h-0 flex-1">
-          <Switch>
+          {/* Keep one stable tab shell through summary load/error transitions
+              and OXP navigation. The rail must remain usable even when the
+              Usage endpoint is unavailable; OXP has an independent producer. */}
+          <TabsV2
+            orientation="vertical"
+            variant="settings"
+            value={section()}
+            onChange={(value) => void startTransition(() => setSection(value as Section))}
+            class="h-full"
+          >
+            <UsageNavigation />
+            <Switch>
             <Match when={section() === "oxp"}>
-              <TabsV2
-                orientation="vertical"
-                variant="settings"
-                value={section()}
-                onChange={(value) =>
-                  void startTransition(() => setSection(value as Section))
-                }
-                class="h-full"
-              >
-                <UsageNavigation />
                 <TabsV2.Content value="oxp">
                   <div class="mx-auto flex h-full w-full max-w-[1400px] flex-col gap-3 p-4">
-                    <UsagePageOxp
-                      active
-                      since={oxpRange().since}
-                      until={oxpRange().until}
-                      refreshTick={refreshTick()}
-                    />
+                    <Suspense fallback={<Spinner class="size-4 text-v2-icon-icon-muted" />}>
+                      <UsagePageOxp
+                        active
+                        since={oxpRange().since}
+                        until={oxpRange().until}
+                        refreshTick={refreshTick()}
+                        donorRows={projectID() === null ? data()?.models : undefined}
+                      />
+                    </Suspense>
                   </div>
                 </TabsV2.Content>
-              </TabsV2>
             </Match>
             <Match when={summary.error}>
-              <div class="flex h-full items-center justify-center py-16 text-center text-[11px] font-[440] text-v2-text-text-faint">
-                {language.t("usage.error")}
-              </div>
+              <TabsV2.Content value={section()}>
+                <div class="flex h-full items-center justify-center py-16 text-center text-[11px] font-[440] text-v2-text-text-faint">
+                  {language.t("usage.error")}
+                </div>
+              </TabsV2.Content>
             </Match>
             <Match when={summary.loading && !data()}>
-              <div class="flex h-full min-h-40 items-center justify-center gap-2 py-16 text-[11px] font-[440] text-v2-text-text-faint">
-                <Spinner class="size-4 text-v2-icon-icon-muted" />
-                {language.t("usage.loading")}
-              </div>
+              <TabsV2.Content value={section()}>
+                <div class="flex h-full min-h-40 items-center justify-center gap-2 py-16 text-[11px] font-[440] text-v2-text-text-faint">
+                  <Spinner class="size-4 text-v2-icon-icon-muted" />
+                  {language.t("usage.loading")}
+                </div>
+              </TabsV2.Content>
             </Match>
             <Match when={data()}>
-              <TabsV2
-                orientation="vertical"
-                variant="settings"
-                value={section()}
-                onChange={(value) => void startTransition(() => setSection(value as Section))}
-                class="h-full"
-              >
-                <UsageNavigation />
-
                 <TabsV2.Content value="overview">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
                     <UsagePageHero
@@ -258,35 +280,61 @@ export function UsagePage() {
 
                 <TabsV2.Content value="models">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
-                    <UsagePageModels
-                      data={data()!}
-                      modelGroups={modelGroups()}
-                      valuation={valuation}
-                      providerName={providerName}
-                    />
+                    <Show when={section() === "models"}>
+                      <Suspense fallback={<Spinner class="size-4 text-v2-icon-icon-muted" />}>
+                        <UsagePageModels
+                          data={data()!}
+                          modelGroups={modelGroups()}
+                          valuation={valuation}
+                          providerName={providerName}
+                        />
+                      </Suspense>
+                    </Show>
                   </div>
                 </TabsV2.Content>
 
+                <TabsV2.Content value="performance">
+                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
+                     <Show when={section() === "performance"}>
+                       <Suspense fallback={<Spinner class="size-4 text-v2-icon-icon-muted" />}>
+                          <UsagePagePerformance data={data()!} projectID={projectID()} refreshTick={refreshTick()}
+                            projectNames={projectNames()}
+                            onProjectSelect={(id) => void startTransition(() => setProjectID(id))} />
+                       </Suspense>
+                     </Show>
+                   </div>
+                 </TabsV2.Content>
+
                 <TabsV2.Content value="activity">
-                  <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
-                    <UsagePageActivity data={data()!} metric={metric()} projectID={projectID()} />
+                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
+                    <Show when={section() === "activity"}>
+                      <Suspense fallback={<Spinner class="size-4 text-v2-icon-icon-muted" />}>
+                        <UsagePageActivity data={data()!} metric={metric()} projectID={projectID()} />
+                      </Suspense>
+                    </Show>
                   </div>
                 </TabsV2.Content>
 
 
                 <TabsV2.Content value="maintenance">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
-                    <UsagePageMaintenance data={data()!} metric={metric()} />
+                    <Show when={section() === "maintenance"}>
+                      <Suspense fallback={<Spinner class="size-4 text-v2-icon-icon-muted" />}>
+                        <UsagePageMaintenance data={data()!} metric={metric()} />
+                      </Suspense>
+                    </Show>
                   </div>
                 </TabsV2.Content>
-              </TabsV2>
             </Match>
             <Match when={true}>
-              <div class="flex h-full items-center justify-center py-16 text-center text-[11px] font-[440] text-v2-text-text-faint">
-                {language.t("usage.empty")}
-              </div>
+              <TabsV2.Content value={section()}>
+                <div class="flex h-full items-center justify-center py-16 text-center text-[11px] font-[440] text-v2-text-text-faint">
+                  {language.t("usage.empty")}
+                </div>
+              </TabsV2.Content>
             </Match>
-          </Switch>
+            </Switch>
+          </TabsV2>
         </div>
       </ErrorBoundary>
     </div>
