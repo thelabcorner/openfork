@@ -46,13 +46,28 @@ on:
         description: "Optional commit/ref to enumerate release notes from (default: push range)"
         required: false
         type: string
+      release_class:
+        description: "Release contract. 'cli-only' (default) = CLI archives are the whole payload and desktop installers are best-effort extras. 'desktop' = every declared desktop platform MUST publish its full installer set; publication fails closed instead of shipping a partial desktop release."
+        required: false
+        default: cli-only
+        type: choice
+        options:
+          - cli-only
+          - desktop
+      desktop_platforms:
+        description: "Comma-separated desktop platform labels required when release_class=desktop (default: all four). Choose from 'macOS x64,macOS arm64,Windows x64,Linux x64'."
+        required: false
+        type: string
 
 concurrency:
   group: dev-pre-release-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only by default. Each job below re-grants `contents: write` explicitly
+# because all four publish into the same draft release; a read-only workflow
+# default means a job added later cannot silently inherit release write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   GH_REPO: thelabcorner/openfork
@@ -61,13 +76,18 @@ jobs:
   notes:
     name: Version, notes, and draft pre-release
     runs-on: ubuntu-latest
+    permissions:
+      # Creates the tag and the draft release the other jobs upload into.
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       base: ${{ steps.version.outputs.base }}
+      release_class: ${{ steps.releaseclass.outputs.release_class }}
+      desktop_platforms: ${{ steps.releaseclass.outputs.desktop_platforms }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -91,6 +111,24 @@ jobs:
           else
             echo "base=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
+
+      # Resolve the release contract BEFORE anything is published, so an
+      # unusable value (unknown class, unknown desktop label, desktop class with
+      # no platforms) fails the run here rather than at the undraft gate.
+      - name: Resolve release class and desktop platform set
+        id: releaseclass
+        shell: bash
+        env:
+          RAW_CLASS: ${{ inputs.release_class }}
+          RAW_PLATFORMS: ${{ inputs.desktop_platforms }}
+        run: |
+          set -euo pipefail
+          CLASS="${RAW_CLASS:-cli-only}"
+          PLATFORMS="${RAW_PLATFORMS:-}"
+          echo "release_class=$CLASS" >> "$GITHUB_OUTPUT"
+          echo "desktop_platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+          echo "Declared release class: $CLASS"
+          echo "Declared desktop platforms: ${PLATFORMS:-<all>}"
 
       - name: Generate release notes enumerating all changes
         shell: bash
@@ -144,7 +182,7 @@ jobs:
             --notes-file release-notes.md
 
       - name: Upload release notes artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-notes
           path: release-notes.md
@@ -154,12 +192,15 @@ jobs:
     needs: notes
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      # build.ts runs `gh release upload` against the draft release (GH_TOKEN).
+      contents: write
     env:
       CI: "true"
       HUSKY: "0"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
@@ -179,7 +220,7 @@ jobs:
         run: ls -la packages/opencode/dist/*.zip packages/opencode/dist/*.tar.gz
 
       - name: Upload CLI archives as workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: openfork-cli-all-targets
           path: |
@@ -192,6 +233,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     continue-on-error: true
+    permissions:
+      # `gh release upload` of the installers into the draft release.
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -217,7 +261,7 @@ jobs:
       NODE_OPTIONS: --max-old-space-size=4096
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
@@ -282,7 +326,7 @@ jobs:
 
       - name: Upload installers as workflow artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: openfork-desktop-${{ matrix.label }}
           path: |
@@ -299,14 +343,105 @@ jobs:
     needs: [notes, build-cli, build-desktop]
     if: always() && needs.build-cli.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      # `gh release edit --draft=false` publishes the release.
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download release notes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-notes
+
+      # ---- Release integrity gate -------------------------------------------
+      # Everything below runs BEFORE the undraft. The draft is the only mutable
+      # state here, so every failure still leaves a repairable draft instead of a
+      # published release that is short an asset.
+      #
+      # Order is load-bearing:
+      #   1. plan   - resolve the declared inventory (deterministic, no network)
+      #   2. check  - fail closed against the assets actually on the draft
+      #   3. manifest- hash the exact downloaded payload into SHA256SUMS
+      #   4. verify - re-download the published assets and re-hash them
+      #   5. undraft- only now is the release published
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Declare expected inventory for this release
+        id: plan
+        shell: bash
+        env:
+          RELEASE_CLASS: ${{ needs.notes.outputs.release_class }}
+          DESKTOP_PLATFORMS: ${{ needs.notes.outputs.desktop_platforms }}
+        run: |
+          set -euo pipefail
+          # An explicit argument array, not `${VAR:+--desktop "$VAR"}`: that
+          # optional-expansion form drops the value under `set -u`, which would
+          # silently widen or narrow a declared desktop promise instead of
+          # failing closed.
+          ARGS=(--class "$RELEASE_CLASS")
+          if [ -n "$DESKTOP_PLATFORMS" ]; then
+            ARGS+=(--desktop "$DESKTOP_PLATFORMS")
+          fi
+          bun ./packages/opencode/script/release-assets.ts plan "${ARGS[@]}" | tee plan.txt
+
+      - name: Fail closed if the draft is missing expected assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.notes.outputs.tag }}
+          RELEASE_CLASS: ${{ needs.notes.outputs.release_class }}
+          DESKTOP_PLATFORMS: ${{ needs.notes.outputs.desktop_platforms }}
+        run: |
+          set -euo pipefail
+          # List the assets GitHub actually holds on the draft. This is the real
+          # published payload, not what the build jobs believed they uploaded.
+          gh release view "$TAG" --json assets --jq '.assets[].name' > draft-assets.txt
+          echo "Draft assets:"; sed 's/^/  /' draft-assets.txt
+          # Same explicit-array construction as the plan step, so the check can
+          # never run against a different platform set than the one declared.
+          ARGS=(--class "$RELEASE_CLASS" --assets draft-assets.txt)
+          if [ -n "$DESKTOP_PLATFORMS" ]; then
+            ARGS+=(--desktop "$DESKTOP_PLATFORMS")
+          fi
+          if ! bun ./packages/opencode/script/release-assets.ts check "${ARGS[@]}"; then
+            echo "::error::Release inventory incomplete for declared class '$RELEASE_CLASS'. The release stays a draft."
+            exit 1
+          fi
+
+      - name: Generate and publish the SHA256 manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Hash the exact bytes that will be published, not the build workspace.
+          rm -rf release-payload
+          mkdir -p release-payload
+          gh release download "$TAG" --dir release-payload --clobber
+          bun ./packages/opencode/script/release-assets.ts manifest --dir release-payload
+          cat release-payload/SHA256SUMS
+          gh release upload "$TAG" release-payload/SHA256SUMS --clobber
+
+      - name: Verify draft assets against SHA256SUMS before publishing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Fresh directory: this reads back through the upload path rather than
+          # reusing the files hashed a step earlier.
+          rm -rf release-verify
+          mkdir -p release-verify
+          gh release download "$TAG" --dir release-verify --clobber
+          if ! bun ./packages/opencode/script/release-assets.ts verify --dir release-verify; then
+            echo "::error::Draft release assets do not match SHA256SUMS. The release stays a draft."
+            exit 1
+          fi
 
       - name: Publish (undraft) the pre-release
         env:
@@ -318,6 +453,25 @@ jobs:
             --prerelease \
             --notes-file release-notes.md
 
+      # Post-publish verification. The pre-undraft step above proves the bytes
+      # GitHub accepted; this proves the bytes a consumer actually downloads
+      # from the published release still hash to the same SHA256SUMS. Same
+      # manifest, same helper -- only the release's visibility has changed.
+      - name: Verify published assets by re-download and re-hash
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf release-postverify
+          mkdir -p release-postverify
+          gh release download "$TAG" --dir release-postverify --clobber
+          if ! bun ./packages/opencode/script/release-assets.ts verify --dir release-postverify; then
+            echo "::error::PUBLISHED release assets do not match SHA256SUMS. The release is already public and its assets must be repaired by hand."
+            exit 1
+          fi
+
       - name: Summarize published assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -326,6 +480,8 @@ jobs:
             echo "## OpenFork dev pre-release ${{ needs.notes.outputs.version }}"
             echo
             echo "- Tag: \`${{ needs.notes.outputs.tag }}\`"
+            echo "- Release class: \`${{ needs.notes.outputs.release_class }}\`"
+            echo "- Verified: inventory gate + SHA256SUMS re-download check passed (before and after publish)"
             echo "- Runner: GitHub-hosted (homelab/self-hosted never used)"
             echo "- Desktop jobs: \`${{ needs.build-desktop.result }}\`"
             echo
