@@ -12,6 +12,7 @@ export function normalizeSessionInfo(input: SessionInfo | Session): Session {
     directory: input.location.directory,
     path: input.subpath,
     parentID: input.parentID,
+    humanInterjection: "humanInterjection" in input && input.humanInterjection === true,
     cost: input.cost,
     tokens: input.tokens,
     title: withTimestampedFallback(input),

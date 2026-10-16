@@ -1,4 +1,4 @@
-import { Component, createMemo, Show } from "solid-js"
+import { Component, createMemo, onMount, Show } from "solid-js"
 import { useSync } from "@/context/sync"
 import { Dialog } from "@opencode-ai/ui/dialog"
 import { List } from "@opencode-ai/ui/list"
@@ -17,6 +17,8 @@ const statusLabels = {
 export const DialogSelectMcp: Component = () => {
   const sync = useSync()
   const language = useLanguage()
+
+  onMount(() => sync().mcp.ensure())
 
   const items = createMemo(() =>
     Object.entries(sync().data.mcp ?? {})

@@ -1,5 +1,14 @@
 export type PathKey = string & { _brand: "PathKey" }
 
+/** Workspace API calls require an explicit absolute location. `global` is a
+ * server event-stream sentinel, never a workspace directory. */
+export function isAbsoluteWorkspaceDirectory(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value === "global") return false
+  if (value.startsWith("/")) return true
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true
+  return /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(value)
+}
+
 const isDrive = (value: string) => {
   if (value.length !== 2) return false
   const code = value.charCodeAt(0)

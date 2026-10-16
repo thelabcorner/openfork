@@ -22,8 +22,13 @@ type WindowSummary = {
   projectionMs: number
   projectionRuns: number
   projectionTurns: number
+  projectionScanRows: number
+  projectionScanRowsByPass: Record<string, number>
   rowsBuilt: number
   rowsMs: number
+  rowIndexRowsVisited: number
+  rowIndexFullRebuildRows: number
+  rowIndexTailRows: number
   slowRows: number
   estimateCacheResets: number
   reconnects: number
@@ -176,8 +181,13 @@ function freshWindow(): WindowSummary {
     projectionMs: 0,
     projectionRuns: 0,
     projectionTurns: 0,
+    projectionScanRows: 0,
+    projectionScanRowsByPass: {},
     rowsBuilt: 0,
     rowsMs: 0,
+    rowIndexRowsVisited: 0,
+    rowIndexFullRebuildRows: 0,
+    rowIndexTailRows: 0,
     slowRows: 0,
     estimateCacheResets: 0,
     reconnects: 0,
@@ -311,6 +321,13 @@ export const phaseTrace = {
     window_.projectionRuns += 1
     window_.projectionTurns = turns
   },
+  /** Number of rows traversed by a full projection pass, for opt-in attribution. */
+  projectionScan(pass: "messages" | "assistant-parents" | "session-structure" | "context-structure" | "group-turns", rows: number) {
+    if (!enabled || !(rows >= 0)) return
+    window_.projectionScanRows += rows
+    window_.projectionScanRowsByPass[pass] = (window_.projectionScanRowsByPass[pass] ?? 0) + rows
+    ensureTimer()
+  },
   /** One constructed turn row. Only records a ring entry above threshold. */
   row(key: string, ms: number) {
     if (!enabled || !(ms >= 0)) return
@@ -320,6 +337,14 @@ export const phaseTrace = {
     window_.slowRows += 1
     ring.push({ t: Date.now(), phase: "row.slow", key: key.slice(0, 128), ms: Math.round(ms * 100) / 100 })
     if (ring.length > MAX_RING) ring.splice(0, ring.length - MAX_RING)
+  },
+  /** Rows read or rewritten while updating the timeline's key/message indexes. */
+  rowIndex(kind: "full-rebuild" | "tail-update", rows: number) {
+    if (!enabled || !(rows >= 0)) return
+    window_.rowIndexRowsVisited += rows
+    if (kind === "full-rebuild") window_.rowIndexFullRebuildRows += rows
+    else window_.rowIndexTailRows += rows
+    ensureTimer()
   },
   /** Frame-monitor sample: worst rAF gap and stall count for the window. */
   frameSample(maxMs: number, stalls: number) {

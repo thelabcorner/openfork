@@ -1,7 +1,9 @@
-export type ServerRequestPriority = "critical" | "interactive" | "background"
+export type ServerRequestPriority = "control" | "critical" | "interactive" | "background"
 
 export type ServerRequestSchedulerOptions = {
-  /** Total requests admitted through this scheduler at once. */
+  /** Independent admission capacity reserved for control-plane requests. Defaults to one. */
+  controlConcurrency?: number
+  /** Ordinary requests admitted through this pool at once; control has separate capacity. */
   concurrency?: number
   /** Background work may never occupy more than this many scheduler slots. */
   backgroundConcurrency?: number
@@ -50,16 +52,16 @@ const abortError = () => new DOMException("The request was aborted", "AbortError
  * not compose: their aggregate can still fill every localhost HTTP connection
  * and make a user navigation wait behind speculative work.
  *
- * This scheduler provides one ordering point for those producers. Background
- * work is capped separately so it can use otherwise-idle transport capacity
- * without occupying the whole pool. Critical/interactive work always drains
- * before queued background work.
+ * Ordinary producers share one ordering point. Control-plane work has a
+ * separate bounded lane; background ordinary work is capped separately so it
+ * can use otherwise-idle capacity without occupying the whole pool.
  *
  * The scheduler deliberately does not own the long-lived SSE stream. It gates
  * finite request/response work only.
  */
 export function createServerRequestScheduler(options: ServerRequestSchedulerOptions = {}) {
   const now = options.now ?? (() => performance.now())
+  const controlConcurrency = Math.max(1, Math.floor(options.controlConcurrency ?? 1))
   const concurrency = Math.max(1, Math.floor(options.concurrency ?? 5))
   const backgroundConcurrency = Math.max(
     1,
@@ -76,23 +78,26 @@ export function createServerRequestScheduler(options: ServerRequestSchedulerOpti
   const nonCriticalConcurrency = concurrency - criticalReserve
 
   const queues: Record<ServerRequestPriority, QueueEntry<unknown>[]> = {
+    control: [],
     critical: [],
     interactive: [],
     background: [],
   }
   const queuedByKey = new Map<string, Set<QueueEntry<unknown>>>()
   let active = 0
+  let activeControl = 0
   let activeCritical = 0
   let activeInteractive = 0
   let activeBackground = 0
   let maxActive = 0
+  let maxActiveControl = 0
   let maxActiveBackground = 0
   let completed = 0
   let maxQueued = 0
-  const waitTotal = { critical: 0, interactive: 0, background: 0 }
-  const waitMax = { critical: 0, interactive: 0, background: 0 }
-  const serviceTotal = { critical: 0, interactive: 0, background: 0 }
-  const serviceMax = { critical: 0, interactive: 0, background: 0 }
+  const waitTotal = { control: 0, critical: 0, interactive: 0, background: 0 }
+  const waitMax = { control: 0, critical: 0, interactive: 0, background: 0 }
+  const serviceTotal = { control: 0, critical: 0, interactive: 0, background: 0 }
+  const serviceMax = { control: 0, critical: 0, interactive: 0, background: 0 }
   const activeByKind = new Map<string, number>()
   const queuedByKind = new Map<string, number>()
   const maxQueuedByKind = new Map<string, number>()
@@ -173,9 +178,52 @@ export function createServerRequestScheduler(options: ServerRequestSchedulerOpti
   }
 
   const pump = () => {
+    while (activeControl < controlConcurrency) {
+      removeAbortedHead("control")
+      const controlEntry = queues.control.shift()
+      if (!controlEntry) break
+      unindex(controlEntry)
+      if (controlEntry.signal?.aborted) {
+        controlEntry.reject(abortError())
+        continue
+      }
+
+      activeControl += 1
+      bump(activeByKind, controlEntry.kind, 1)
+      maxActiveControl = Math.max(maxActiveControl, activeControl)
+      const startedAt = now()
+      const waited = Math.max(0, startedAt - controlEntry.enqueuedAt)
+      waitTotal.control += waited
+      waitMax.control = Math.max(waitMax.control, waited)
+      observe(waitByKind, controlEntry.kind, waited)
+      const finish = () => {
+        const serviceMs = Math.max(0, now() - startedAt)
+        serviceTotal.control += serviceMs
+        serviceMax.control = Math.max(serviceMax.control, serviceMs)
+        observe(serviceByKind, controlEntry.kind, serviceMs)
+        activeControl -= 1
+        completed += 1
+        bump(activeByKind, controlEntry.kind, -1)
+        bump(completedByKind, controlEntry.kind, 1)
+        pump()
+      }
+      void Promise.resolve()
+        .then(controlEntry.run)
+        .then(
+          (value) => {
+            finish()
+            controlEntry.resolve(value)
+          },
+          (error) => {
+            finish()
+            controlEntry.reject(error)
+          },
+        )
+    }
+
     while (active < concurrency) {
       const entry = take()
-      if (!entry) return
+      if (!entry) break
       if (entry.signal?.aborted) {
         entry.reject(abortError())
         continue
@@ -248,7 +296,10 @@ export function createServerRequestScheduler(options: ServerRequestSchedulerOpti
       queues[priority].push(entry as QueueEntry<unknown>)
       bump(queuedByKind, entry.kind, 1)
       maxQueuedByKind.set(entry.kind, Math.max(maxQueuedByKind.get(entry.kind) ?? 0, queuedByKind.get(entry.kind) ?? 0))
-      maxQueued = Math.max(maxQueued, queues.critical.length + queues.interactive.length + queues.background.length)
+      maxQueued = Math.max(
+        maxQueued,
+        queues.control.length + queues.critical.length + queues.interactive.length + queues.background.length,
+      )
       if (entry.key) {
         const indexed = queuedByKey.get(entry.key) ?? new Set<QueueEntry<unknown>>()
         indexed.add(entry as QueueEntry<unknown>)
@@ -277,7 +328,7 @@ export function createServerRequestScheduler(options: ServerRequestSchedulerOpti
     })
   }
 
-  const rank: Record<ServerRequestPriority, number> = { background: 0, interactive: 1, critical: 2 }
+  const rank: Record<ServerRequestPriority, number> = { background: 0, interactive: 1, critical: 2, control: 3 }
   const promote = (key: string, priority: ServerRequestPriority) => {
     const entries = queuedByKey.get(key)
     if (!entries) return false
@@ -302,11 +353,14 @@ export function createServerRequestScheduler(options: ServerRequestSchedulerOpti
     promote,
     snapshot: () => ({
       active,
+      activeControl,
       activeCritical,
       activeInteractive,
       activeBackground,
       maxActive,
+      maxActiveControl,
       maxActiveBackground,
+      queuedControl: queues.control.length,
       queuedCritical: queues.critical.length,
       queuedInteractive: queues.interactive.length,
       queuedBackground: queues.background.length,

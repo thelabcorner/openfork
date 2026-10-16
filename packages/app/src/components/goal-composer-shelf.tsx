@@ -1515,6 +1515,10 @@ function GoalAuditorModelPicker(props: {
   const language = useLanguage()
   const model = {
     ...local.model,
+    // Goal model configuration stores only provider/model identity. It does
+    // not own a session route policy, so this shared picker must not expose
+    // routing choices that this adapter cannot persist.
+    routeIntent: undefined,
     current: () => {
       const saved = props.value
       if (!saved) return undefined

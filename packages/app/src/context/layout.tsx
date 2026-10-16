@@ -153,6 +153,9 @@ const normalizeStoredSessionTabs = (key: string, tabs: SessionTabs) => {
 
 export const { use: useLayout, provider: LayoutProvider } = createSimpleContext({
   name: "Layout",
+  // The app shell is long-lived, but the lazily loaded shared chat sidebar is
+  // hot-replaced independently. Reuse the context token across those updates.
+  hmrKey: "@opencode-ai/app/Layout",
   gate: false,
   init: () => {
     const serverSdk = useServerSDK()

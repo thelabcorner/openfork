@@ -1,5 +1,5 @@
 import { base64Encode } from "@opencode-ai/core/util/encode"
-import { ServerConnection } from "@/context/server"
+import type { ServerConnection } from "@/context/server"
 import { decode64 } from "@/utils/base64"
 
 export function sessionHref(server: ServerConnection.Key, sessionID: string) {
@@ -19,7 +19,10 @@ export function requireServerKey(segment: string | undefined) {
 export function parseServerKey(segment: string | undefined) {
   const key = decode64(segment)
   if (!key || base64Encode(key) !== segment) return
-  return ServerConnection.Key.make(key)
+  // Key.make is a nominal type assertion, not a runtime validator. Decoding
+  // and canonical re-encoding above are the real validity checks; don't pull
+  // the full server provider/runtime into every small URL parser.
+  return key as ServerConnection.Key
 }
 
 export function legacySessionServer(

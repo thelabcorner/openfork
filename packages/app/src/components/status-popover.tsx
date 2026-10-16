@@ -24,6 +24,10 @@ export function StatusPopover() {
   const global = useGlobal()
   const sync = useSync()
   const [shown, setShown] = createSignal(false)
+  const open = (value: boolean) => {
+    setShown(value)
+    if (value) sync().mcp.ensure()
+  }
   const serverHealth = () => global.servers.health[server.key]?.healthy
   const ready = createMemo(() => serverHealth() === false || (sync().data.mcp_ready && sync().data.lsp_ready))
   const attention = createMemo(() =>
@@ -41,7 +45,7 @@ export function StatusPopover() {
   return (
     <Popover
       open={shown()}
-      onOpenChange={setShown}
+      onOpenChange={open}
       triggerAs={Button}
       triggerProps={{
         variant: "ghost",
@@ -93,6 +97,10 @@ function DirectoryStatusPopover() {
   const global = useGlobal()
   const sync = useSync()
   const [shown, setShown] = createSignal(false)
+  const open = (value: boolean) => {
+    setShown(value)
+    if (value) sync().mcp.ensure()
+  }
   const serverHealth = () => global.servers.health[ServerConnection.key(server().server)]?.healthy
   const ready = createMemo(() => serverHealth() === false || (sync().data.mcp_ready && sync().data.lsp_ready))
   const attention = createMemo(() =>
@@ -113,7 +121,7 @@ function DirectoryStatusPopover() {
     attention: attention(),
     issue: issue(),
     label: language.t("status.popover.trigger"),
-    onOpenChange: setShown,
+    onOpenChange: open,
     body: () => (
       <StatusPopoverBody shown={shown()}>
         <Body shown={shown} />

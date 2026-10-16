@@ -12,6 +12,7 @@ import { useSettings } from "@/context/settings"
 import { useSDK } from "@/context/sdk"
 import { useTabs } from "@/context/tabs"
 import { RoutePlaceholder } from "@/components/route-placeholder"
+import { LimitRecoveryProvider } from "@/context/limit-recovery"
 import { swarmDict } from "@/i18n/en-swarm"
 import { createSessionLineage } from "@/pages/session/session-lineage"
 import {
@@ -20,6 +21,7 @@ import {
   parseServerKey,
   sessionHref,
 } from "@/utils/session-route"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 
 const SessionPage = lazy(() => import("@/pages/session").then((module) => ({ default: module.SessionPage })))
 const SessionRouteErrorBoundary = lazy(() =>
@@ -59,7 +61,7 @@ export function SessionRouteController() {
   createEffect(() => {
     if (!settings.general.newLayoutDesigns()) return
     if (params.id || search.draftId) return
-    if (!tabs.ready() || !sdk().directory) return
+    if (!tabs.ready() || !isAbsoluteWorkspaceDirectory(sdk().directory)) return
     void tabs.newDraft({ server: server.key, directory: sdk().directory }, search.prompt)
   })
 
@@ -85,9 +87,11 @@ function TargetServerRoute(props: ParentProps) {
       <ServerSDKProvider server={conn}>
         <PersonalUsageProvider>
           <ServerSyncProvider server={conn}>
-            <GoalsProvider>
-              <ForkUsageProvider>{props.children}</ForkUsageProvider>
-            </GoalsProvider>
+            <LimitRecoveryProvider>
+              <GoalsProvider>
+                <ForkUsageProvider>{props.children}</ForkUsageProvider>
+              </GoalsProvider>
+            </LimitRecoveryProvider>
           </ServerSyncProvider>
         </PersonalUsageProvider>
       </ServerSDKProvider>

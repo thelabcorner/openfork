@@ -94,6 +94,39 @@ bottom-up architecture rules.
   only to the explicit Reveal/Open/Open-With interaction and must stay bounded;
   it must not add timeline-render scans, per-span observers, or background I/O.
 
+## Message timeline loading presentation
+
+- A timeline may display its centered loading animation only on the first cold
+  open, before any content has been painted or initial hydration completed.
+  Once paintable content or an initial ready state exists for a session, never
+  show that animation again for that session in this renderer.
+- Background refetches, pagination, hydration, stream repair, virtualizer
+  remounts and cache reconciliation must keep the current timeline visible
+  without an overlaid spinner or "loading/recovering" status row.
+- Errors that require action may show a compact retry status. Do not expose
+  successful background recovery work as a new loading phase.
+- Test cold open, first paint, later readiness regression, navigation away/back,
+  and multiple session identities whenever the loader policy changes.
+
+## Chat sidebar virtual list geometry
+
+- Fixed-height blocks (section header, session, cluster header/member,
+  show-more/less) must use the shared height contract in
+  `src/pages/session/v2/chat-sidebar-virtual-layout.ts`. Never measure these
+  with a synchronous ref: it can see a zero-height pre-child DOM element and
+  collapse subsequent virtual rows. Intrinsically sized sections use deferred
+  DOM measurement after children mount.
+- All virtual sidebar blocks must remain absolutely positioned in their
+  one shared tree coordinate system. Sticky headers must be represented by a
+  clamped virtual translation, never by changing `position` to `sticky`.
+- Density changes invalidate measurement caches; routine telemetry, status,
+  and streaming updates must not invalidate all row sizes or create fresh
+  estimateSize closures on each virtualizer options read.
+- Preserve clipping/one-row ownership so titles, metadata, badges and
+  section headings cannot paint into adjacent row slots. Assert browser DOM
+  rectangles for initial hydration, density changes, show-more expansion,
+  and scrolling in `e2e/regression/chat-sidebar-nonoverlap.spec.ts`.
+
 ## Debugging
 
 - NEVER try to restart the app, or the server process, EVER.

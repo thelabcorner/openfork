@@ -14,6 +14,7 @@ import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTerminal } from "@/context/terminal"
 import { showToast } from "@/utils/toast"
+import { stopSession } from "@/utils/session-stop"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { findLast } from "@opencode-ai/core/util/array"
 import { createSessionTabs } from "@/pages/session/helpers"
@@ -23,13 +24,15 @@ import { useSessionLayout } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
 import { createSessionOwnership } from "./session-ownership"
 import { useLocal } from "@/context/local"
-import { isTitleRegenerationPending, beginTitleRegeneration, endTitleRegeneration, type TabSessionApi } from "@/components/titlebar-tab-actions"
-import { isSemanticUserMessage } from "@/utils/session-message"
+import { isTitleRegenerationPending, type TabSessionApi } from "@/components/titlebar-tab-actions"
+import { createSessionTitleRegeneration } from "@/components/session-title-regeneration"
 
 export type SessionCommandContext = {
   navigateMessageByOffset: (offset: number) => void
   setActiveMessage: (message: UserMessage | undefined) => void
   focusInput: () => void
+  hasVisibleUserMessage: () => boolean
+  userMessages: () => UserMessage[]
   fileBrowser?: () => boolean
   find?: {
     open: () => void
@@ -93,22 +96,12 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     if (!id) return false
     return (sync().data as { session_paused?: (id: string) => boolean }).session_paused?.(id) ?? false
   }
-  const regenerateTitle = () => {
-    const id = params.id
-    if (!id || isTitleRegenerationPending(id)) return
-    beginTitleRegeneration(id)
-    void (sdk().api.session as TabSessionApi)
-      .regenerateTitle({ sessionID: id })
-      .then(() => showToast({ title: language.t("toast.title.regenerated"), variant: "success" }))
-      .catch((err) =>
-        showToast({
-          title: language.t("toast.title.failed"),
-          description: err instanceof Error ? err.message : undefined,
-          variant: "error",
-        }),
-      )
-      .finally(() => endTitleRegeneration(id))
-  }
+  const titleRegeneration = createSessionTitleRegeneration({
+    sessionID: () => params.id,
+    session: () => info(),
+    api: () => sdk().api.session as TabSessionApi,
+  })
+  const regenerateTitle = () => titleRegeneration.run()
   const normalizeTab = (tab: string) => {
     if (!tab.startsWith("file://")) return tab
     return file.tab(tab)
@@ -122,19 +115,6 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const activeFileTab = tabState.activeFileTab
   const closableTab = tabState.closableTab
   const shown = settings.visibility.fileTree
-
-  const messages = () => {
-    const id = params.id
-    if (!id) return []
-    return sync().data.message[id] ?? []
-  }
-  const userMessages = () => messages().filter(isSemanticUserMessage)
-  const visibleUserMessages = () => {
-    const revert = info()?.revert?.messageID
-    if (!revert) return userMessages()
-    const boundary = userMessages().findIndex((message) => message.id === revert)
-    return boundary < 0 ? userMessages() : userMessages().slice(0, boundary)
-  }
 
   const showAllFiles = () => {
     if (layout.fileTree.tab() !== "changes") return
@@ -372,15 +352,18 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const directory = sdk().directory
     const promptSession = prompt.capture()
     const revert = info()?.revert?.messageID
-    const messages = userMessages()
+    const messages = actions.userMessages()
     const boundary = revert ? messages.findIndex((message) => message.id === revert) : messages.length
     if (boundary < 0) return
     const message = messages[boundary - 1]
     if (!message) return
     const parts = sync().data.part[message.id]
 
-    if (sync().data.session_working(sessionID)) {
-      await session.interrupt({ sessionID }).catch(() => {})
+    if (sync().data.session_working(sessionID) ||
+      sync().data.session_status[sessionID]?.type === "interrupted") {
+      // Do not stage a revert while a potentially still-owned generation is
+      // uncontained. The server's exact-generation Stop must succeed first.
+      await stopSession(session, sessionID)
     }
 
     await runCommand({
@@ -399,7 +382,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     if (!sessionID) return
     const owner = sessionOwnership.capture()
     const session = sdk().api.session
-    const messages = userMessages()
+    const messages = actions.userMessages()
     const promptSession = prompt.capture()
 
     const revertMessageID = info()?.revert?.messageID
@@ -497,10 +480,17 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.session.stop"),
       description: language.t("command.session.stop.description"),
       slash: "stop",
-      disabled: !params.id || !sync().data.session_working(params.id),
+      disabled: !params.id || (!sync().data.session_working(params.id) &&
+        sync().data.session_status[params.id]?.type !== "interrupted"),
       onSelect: () => {
         if (!params.id) return
-        void sdk().api.session.interrupt({ sessionID: params.id })
+        void stopSession(sdk().api.session, params.id).catch((error) => {
+          showToast({
+            variant: "error",
+            title: language.t("common.requestFailed"),
+            description: error instanceof Error ? error.message : String(error),
+          })
+        })
       },
     }),
     sessionCommand({
@@ -543,7 +533,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.session.undo"),
       description: language.t("command.session.undo.description"),
       slash: "undo",
-      disabled: !params.id || visibleUserMessages().length === 0,
+      disabled: !params.id || !actions.hasVisibleUserMessage(),
       onSelect: undo,
     }),
     sessionCommand({
@@ -559,7 +549,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.session.compact"),
       description: language.t("command.session.compact.description"),
       slash: "compact",
-      disabled: !params.id || visibleUserMessages().length === 0,
+      disabled: !params.id || !actions.hasVisibleUserMessage(),
       onSelect: compact,
     }),
     sessionCommand({
@@ -567,7 +557,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.session.fork"),
       description: language.t("command.session.fork.description"),
       slash: "fork",
-      disabled: !params.id || visibleUserMessages().length === 0,
+      disabled: !params.id || !actions.hasVisibleUserMessage(),
       onSelect: fork,
     }),
     sessionCommand({

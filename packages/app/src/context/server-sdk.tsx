@@ -26,6 +26,7 @@ import {
   type ServerRequestScheduler,
 } from "@/utils/server-request-scheduler"
 import { createLatestStateRequest } from "./latest-state-request"
+import { createServerEventLifetime } from "./server-event-lifetime"
 import {
   STREAM_PROGRESS_EVENT,
   STREAM_SESSION_STALE_EVENT,
@@ -125,6 +126,30 @@ export function adaptServerEvent(event: NativeEvent): ServerEvent {
   if (event.type === "question.v2.rejected")
     return { id: event.id, type: "question.rejected", properties: event.data, current: event } as ServerEvent
   return { id: event.id, type: event.type, properties: event.data, current: event } as ServerEvent
+}
+
+/**
+ * The compatibility `/global/event` stream retains the native event type and
+ * data, but its legacy envelope omits `current`. Reattach that native view for
+ * session.next events so the session store can use the authoritative V2
+ * reducer instead of silently dropping the prompted/synthetic timeline root.
+ * Keep this projection narrow: older event families still use their existing
+ * compatibility reducers.
+ */
+export function adaptLegacySessionEvent(event: Event): ServerEvent {
+  if (!event.type.startsWith("session.next.")) return event as ServerEvent
+  if (event.properties === null || typeof event.properties !== "object") return event as ServerEvent
+  const data = event.properties as Record<string, unknown>
+  if (typeof data.sessionID !== "string") return event as ServerEvent
+
+  return {
+    ...event,
+    current: {
+      id: event.id,
+      type: event.type,
+      data: event.properties,
+    } as NativeSessionEvent,
+  } as ServerEvent
 }
 
 function estimateQueuedEventBytes(payload: ServerEvent) {
@@ -740,10 +765,18 @@ export function streamContentSessionsForVisibility(sessions: readonly string[], 
   return hidden ? [] : sessions
 }
 
+export function repairActiveSessionContentAfterGap(
+  sessions: Iterable<string>,
+  invalidate: StreamContentInvalidator | undefined,
+) {
+  if (!invalidate) return
+  for (const sessionID of sessions) invalidate(sessionID, true)
+}
+
 export function streamInterestUpdatePriority(_sessions: readonly string[]): ServerRequestPriority {
-  // Both directions are control: activation starts visible content; clearing
-  // interest releases server/event work on hide, stop or timeline teardown.
-  return "critical"
+  // Keep this mutation off the ordinary finite-request FIFO: it admits or
+  // releases live session content and must remain responsive under hydration.
+  return "control"
 }
 
 type ServerEventEmitter = ReturnType<typeof createGlobalEmitter<{ [key: string]: ServerEvent }>>
@@ -803,6 +836,8 @@ type ServerSDKBase = {
     on: ServerEventEmitter["on"]
     listen: ServerEventEmitter["listen"]
     start: () => Promise<void> | undefined
+    /** Temporary stream lease for committed inactive-server inspector views. */
+    acquire: () => () => void
     setStreamContentInterest: (interest: StreamContentInterest, invalidate?: StreamContentInvalidator) => () => void
     setStreamContentSessions: (sessions: Iterable<string>) => void
   }
@@ -815,11 +850,10 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   const platform = usePlatform()
   const abort = new AbortController()
   // One scheduler per live server context. The SSE stream intentionally stays
-  // outside this gate: it is long-lived and must never consume a finite-request
-  // permit. Five finite slots plus the stream also matches the practical
-  // localhost HTTP/1.x pressure point without allowing speculative work to own
-  // every request lane.
-  const requests = createServerRequestScheduler({ concurrency: 5, backgroundConcurrency: 2 })
+  // outside this gate. Session-interest mutations use the scheduler's separate
+  // single-request control lane, so ordinary finite work cannot occupy their
+  // admission slot; speculative work remains bounded in the ordinary pool.
+  const requests = createServerRequestScheduler({ concurrency: 5, backgroundConcurrency: 2, controlConcurrency: 1 })
   const streamSubscriber = createStreamSubscriberID()
   let streamSessions: string[] = []
   let streamSessionSet = new Set<string>()
@@ -1240,7 +1274,9 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
             // promise client; the generated SDK transport carries the SSE cursor
             // correctly but its checked-in event union can lag one schema field
             // until codegen runs. Normalize through the protocol-owned adapter.
-            const payload = legacy ? (event.payload as unknown as Event) : adaptServerEvent(event as NativeEvent)
+            const payload = legacy
+              ? adaptLegacySessionEvent(event.payload as unknown as Event)
+              : adaptServerEvent(event as NativeEvent)
             const dispatchedAt = performance.now()
             receive({ directory, payload })
             phaseTrace.dispatch(performance.now() - dispatchedAt)
@@ -1254,6 +1290,12 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
                   ? (payload.properties as Record<string, unknown> | undefined)
                   : (payload as { data?: Record<string, unknown> }).data
               phaseTrace.gap({ requested: gapProps?.requested, latest: gapProps?.latest })
+              // A cursor gap can include lost timeline content for every
+              // currently interested session. The global connected barrier
+              // below repairs indexes, but only this session owner can hydrate
+              // authoritative history for active timelines. Snapshot the
+              // bounded advertised set because invalidation may resume interest.
+              repairActiveSessionContentAfterGap([...streamSessionSet], streamContentInvalidator)
               receive({
                 directory,
                 payload: { id: payload.id, type: "server.connected", properties: { repair: true } } as ServerEvent,
@@ -1354,9 +1396,16 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     attempt?.abort()
   }
 
+  // The full ServerSync retains the existing persistent stream via pin().
+  // An inactive-server inspector instead holds a cancellable temporary
+  // lease, sharing that same socket if ServerSync is already active.
+  const streamLifetime = createServerEventLifetime({
+    begin: () => { void start() },
+    stop,
+  })
   onMount(() => {
-    makeEventListener(window, "pagehide", stop)
-    makeEventListener(window, "pageshow", (event) => resumeStreamAfterPageShow(event, start))
+    makeEventListener(window, "pagehide", streamLifetime.pagehide)
+    makeEventListener(window, "pageshow", (event) => resumeStreamAfterPageShow(event, streamLifetime.pageshow))
     makeEventListener(document, "visibilitychange", () => {
       hidden = document.visibilityState === "hidden"
       // Visibility changes the EFFECTIVE transport interest even when the set
@@ -1399,7 +1448,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   })
 
   onCleanup(() => {
-    stop()
+    streamLifetime.dispose()
     abort.abort()
     if (timer !== undefined) clearTimeout(timer)
     timer = undefined
@@ -1425,7 +1474,14 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
       throwOnError: true,
       directory,
     })
-  const api = createCompatibleApi({ protocol, current: currentApi, legacy, server: server.http, fetch: platform.fetch })
+  const api = createCompatibleApi({
+    protocol,
+    current: currentApi,
+    legacy,
+    server: server.http,
+    fetch: platform.fetch,
+    scheduleControl: (kind, run) => requests.schedule("control", run, { kind }),
+  })
 
   return {
     server,
@@ -1441,7 +1497,11 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     event: {
       on: emitter.on.bind(emitter),
       listen: emitter.listen.bind(emitter),
-      start,
+      start: () => {
+        streamLifetime.pin()
+        return run
+      },
+      acquire: streamLifetime.acquire,
       setStreamContentInterest(interest, invalidate) {
         streamContentInterest = interest
         streamContentInvalidator = invalidate
@@ -1512,6 +1572,7 @@ function createDirSdkContext(directory: string, serverSDK: ServerSDKBase) {
       server: serverSDK.server.http,
       fetch: serverSDK.fetch,
       directory,
+      scheduleControl: (kind, run) => serverSDK.requests.schedule("control", run, { kind }),
     }),
     event: emitter,
     get url() {

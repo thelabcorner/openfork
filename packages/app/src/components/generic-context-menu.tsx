@@ -1,6 +1,7 @@
 import { lazy, Show, Suspense, type ParentProps } from "solid-js"
 import { createStore } from "solid-js/store"
 import { captureContextMenuSelection, type ContextMenuSelectionSnapshot } from "./context-menu-selection"
+import { contextMenuPosition } from "./context-menu-position"
 
 const GenericContextMenuContent = lazy(() =>
   import("./generic-context-menu-content").then((m) => ({ default: m.GenericContextMenuContent })),
@@ -23,7 +24,11 @@ export function GenericContextMenuProvider(props: ParentProps) {
     if (targetEl?.closest('[data-component="menu-v2-content"]')) return
     const selection = captureContextMenuSelection(targetEl)
     event.preventDefault()
-    setState({ open: true, request: { x: event.clientX, y: event.clientY, selection } })
+    const cursor = contextMenuPosition(
+      event,
+      targetEl ?? (event.currentTarget instanceof Element ? event.currentTarget : document.documentElement),
+    )
+    setState({ open: true, request: { ...cursor, selection } })
   }
 
   return (

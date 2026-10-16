@@ -17,8 +17,10 @@ import { useSearchParams } from "@solidjs/router"
 import { useTabs, type DraftTab } from "@/context/tabs"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { RoutePlaceholder } from "@/components/route-placeholder"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 
 const NewSession = lazy(() => import("@/pages/new-session"))
+const ErrorPage = lazy(() => import("@/pages/error").then((module) => ({ default: module.ErrorPage })))
 
 function DraftProviders(props: ParentProps) {
   return (
@@ -77,6 +79,9 @@ export default function DraftRoute() {
       <Show when={draftKey()} keyed fallback={<Navigate href="/" />}>
         {(_) => {
           const found = draft()!
+          if (!isAbsoluteWorkspaceDirectory(found.directory)) {
+            return <ErrorPage error={new Error("Saved session draft has no explicit absolute workspace directory")} />
+          }
           return (
             <Show
               when={platform.platform === "pwa" || settings.general.newLayoutDesigns()}

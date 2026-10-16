@@ -38,6 +38,23 @@ export const WORKBUDDY_LIMIT_RESEARCH = {
 
 export type WorkBuddyResearchModelId = keyof typeof WORKBUDDY_LIMIT_RESEARCH.models
 
+/**
+ * Normalize a per-request WorkBuddy credit rate to the 2-decimal precision the
+ * catalog publishes (`x0.03`, `x1.33`, `x3.47`).
+ *
+ * Catalog rates arrive as short decimal strings, but the picker prefers a rate
+ * measured from real usage (`creditsObserved / usedObserved`). Dividing two
+ * integers yields a raw full-precision float — e.g. `1.563970588235294` — which
+ * then leaked verbatim into the `x<rate>` badge while every published row stayed
+ * clean. Rounding at the producer keeps measured and published rates in the same
+ * display vocabulary. Non-finite or non-positive inputs are returned unchanged
+ * so callers keep their existing "unknown rate" handling.
+ */
+export function roundWorkBuddyRate(rate: number): number {
+  if (!Number.isFinite(rate) || rate <= 0) return rate
+  return Math.round(rate * 100) / 100
+}
+
 export type WorkBuddyModelLimitReport = {
   accountId: string
   model: string

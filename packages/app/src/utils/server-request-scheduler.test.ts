@@ -8,6 +8,77 @@ const deferred = <T>() => {
 }
 
 describe("createServerRequestScheduler", () => {
+  test("admits one independent control request while the ordinary pool is fully occupied", async () => {
+    const scheduler = createServerRequestScheduler({ concurrency: 3 })
+    const holds = Array.from({ length: 3 }, () => deferred<void>())
+    const ordinary = holds.map((hold, index) =>
+      scheduler.schedule("critical", () => hold.promise, { kind: `held-${index}` }),
+    )
+    await Promise.resolve()
+    expect(scheduler.snapshot().active).toBe(3)
+
+    let controlStarted = false
+    await scheduler.schedule("control", async () => {
+      controlStarted = true
+    }, { kind: "stream-interest" })
+
+    expect(controlStarted).toBe(true)
+    expect(scheduler.snapshot()).toMatchObject({
+      active: 3,
+      activeControl: 0,
+      maxActiveControl: 1,
+      completedByKind: { "stream-interest": 1 },
+    })
+    holds.forEach((hold) => hold.resolve())
+    await Promise.all(ordinary)
+  })
+
+  test("bounds control concurrency and supports queued abort and promotion", async () => {
+    const scheduler = createServerRequestScheduler({ concurrency: 1 })
+    const ordinaryHold = deferred<void>()
+    const controlHold = deferred<void>()
+    const control = scheduler.schedule("control", () => controlHold.promise, { kind: "control-active" })
+    await Promise.resolve()
+    let contentStarted = false
+    const ordinary = scheduler.schedule("critical", async () => {
+      contentStarted = true
+      await ordinaryHold.promise
+    }, { kind: "session-content" })
+    await Promise.resolve()
+    expect(contentStarted).toBe(true)
+
+    const queuedControl = scheduler.schedule("control", async () => undefined, { kind: "control-queued" })
+    const controlController = new AbortController()
+    const abortedControl = scheduler.schedule("control", async () => undefined, {
+      kind: "control-aborted",
+      signal: controlController.signal,
+    })
+    const controller = new AbortController()
+    const aborted = scheduler.schedule("background", async () => undefined, {
+      key: "session:cancelled",
+      signal: controller.signal,
+    })
+    const promoted = scheduler.schedule("background", async () => undefined, {
+      key: "session:promoted",
+      kind: "session-prefetch",
+    })
+    expect(scheduler.snapshot()).toMatchObject({ active: 1, activeControl: 1, queuedControl: 2 })
+
+    controlController.abort()
+    await expect(abortedControl).rejects.toMatchObject({ name: "AbortError" })
+    controller.abort()
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" })
+    expect(scheduler.promote("session:promoted", "control")).toBe(true)
+    expect(scheduler.snapshot().queuedControl).toBe(2)
+
+    controlHold.resolve()
+    await Promise.all([control, queuedControl, promoted])
+    expect(scheduler.snapshot()).toMatchObject({ active: 1, activeControl: 0, maxActiveControl: 1 })
+    ordinaryHold.resolve()
+    await ordinary
+    expect(scheduler.snapshot().completedByKind["session-prefetch"]).toBe(1)
+  })
+
   test("reserves capacity by capping background concurrency", async () => {
     const scheduler = createServerRequestScheduler({ concurrency: 4, backgroundConcurrency: 2 })
     const a = deferred<void>()
@@ -220,7 +291,7 @@ describe("createServerRequestScheduler", () => {
     expect(snap.serviceByKind["file-tree"]).toEqual({ count: 1, totalMs: 17, maxMs: 17 })
     expect(snap.waitByKind["session-list"]).toEqual({ count: 1, totalMs: 10, maxMs: 10 })
     expect(snap.serviceByKind["session-list"]).toEqual({ count: 1, totalMs: 6, maxMs: 6 })
-    expect(snap.serviceTotal).toEqual({ critical: 6, interactive: 17, background: 0 })
+    expect(snap.serviceTotal).toEqual({ control: 0, critical: 6, interactive: 17, background: 0 })
     expect(snap.maxQueuedByKind["session-list"]).toBe(1)
   })
 

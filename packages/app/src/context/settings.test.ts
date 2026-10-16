@@ -5,6 +5,7 @@ import {
   isAppUpgrade,
   layoutTransitionState,
   maximumSunsetTimeout,
+  normalizeModelSelectorBehaviorSettings,
   newLayoutDesignsDefault,
   nextSunsetCheckDelay,
   resolveNewLayoutDesigns,
@@ -62,6 +63,39 @@ describe("prompt revision automation", () => {
     ).toEqual({
       autoBeforeSend: true,
       autoSendAfterRevision: undefined,
+    })
+  })
+})
+
+describe("model selector behavior", () => {
+  test("defaults both independent behaviors off", () => {
+    expect(normalizeModelSelectorBehaviorSettings(undefined)).toEqual({
+      autoInterruptOnModelSelectorChange: false,
+      autoUpdateModelSelectorOnGeneratingMismatch: false,
+    })
+  })
+
+  test("allows both behaviors to be enabled at the same time", () => {
+    expect(
+      normalizeModelSelectorBehaviorSettings({
+        autoInterruptOnModelSelectorChange: true,
+        autoUpdateModelSelectorOnGeneratingMismatch: true,
+      }),
+    ).toEqual({
+      autoInterruptOnModelSelectorChange: true,
+      autoUpdateModelSelectorOnGeneratingMismatch: true,
+    })
+  })
+
+  test("normalizes persisted non-true values independently", () => {
+    expect(
+      normalizeModelSelectorBehaviorSettings({
+        autoInterruptOnModelSelectorChange: false,
+        autoUpdateModelSelectorOnGeneratingMismatch: true,
+      }),
+    ).toEqual({
+      autoInterruptOnModelSelectorChange: false,
+      autoUpdateModelSelectorOnGeneratingMismatch: true,
     })
   })
 })

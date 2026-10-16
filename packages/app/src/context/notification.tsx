@@ -19,6 +19,8 @@ import { ServerConnection, useServer } from "./server"
 import { type DraftTab, useTabs } from "./tabs"
 import { requireServerKey } from "@/utils/session-route"
 import type { ServerScope } from "@/utils/server-scope"
+import { resolveNotificationSession } from "./notification-session"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 
 const ERROR_SOUND_DEBOUNCE_MS = 5_000
 let lastErrorSoundTime = 0
@@ -243,6 +245,10 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
         unseen: (session: string) => selected().session.unseen(session),
         unseenCount: (session: string) => selected().session.unseenCount(session),
         unseenHasError: (session: string) => selected().session.unseenHasError(session),
+        // Sparse authoritative notification projections for dense cross-session
+        // lists. Avoid creating N reactive subscriptions to unseenCount(id).
+        unseenCounts: () => selected().session.unseenCounts(),
+        unseenErrors: () => selected().session.unseenErrors(),
         markViewed: (session: string) => selected().session.markViewed(session),
       },
       project: {
@@ -371,14 +377,7 @@ function createServerNotificationState(input: {
   }
 
   const lookup = async (directory: string, sessionID?: string) => {
-    if (!sessionID) return undefined
-    const sync = serverSync().ensureDirSyncContext(directory)
-    const session = sync.session.get(sessionID)
-    if (session) return session
-    return sync.session
-      .sync(sessionID)
-      .then(() => sync.session.get(sessionID))
-      .catch(() => undefined)
+    return resolveNotificationSession(serverSync().session, directory, sessionID)
   }
 
   const viewedInCurrentSession = (directory: string, sessionID?: string) => {
@@ -395,32 +394,33 @@ function createServerNotificationState(input: {
     directory: string,
     event: { properties: { sessionID?: string } },
     time: number,
-    viewed: boolean,
   ) => {
     const sessionID = event.properties.sessionID
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return
       if (!session) return
       if (session.parentID) return
+      const sessionDirectory = session.directory
+      const viewed = viewedInCurrentSession(sessionDirectory, sessionID)
 
       if (settings.sounds.agentEnabled()) {
         void playSoundById(settings.sounds.agent())
       }
 
       const sessionTitle = notificationSessionTitle(session.title, sessionID ?? "session")
-      const projectName = notificationProjectName(directory)
+      const projectName = notificationProjectName(sessionDirectory)
       const notificationTitle = `${language.t("notification.session.responseReady.title")} · ${sessionTitle}`
       const notificationDescription = `${projectName} · ${language.t("notification.session.responseReady.description")}`
 
       append({
-        directory,
+        directory: sessionDirectory,
         time,
         viewed,
         type: "turn-complete",
         session: sessionID,
       })
 
-      const href = `/${base64Encode(directory)}/session/${sessionID}`
+      const href = `/${base64Encode(sessionDirectory)}/session/${sessionID}`
       if (settings.notifications.agent()) {
         void platform.notify(notificationTitle, notificationDescription, () => input.navigate(href))
       }
@@ -434,13 +434,15 @@ function createServerNotificationState(input: {
   ) => {
     const sessionID = event.properties.sessionID
     const error = "error" in event.properties ? event.properties.error : undefined
+    if (isBenignSessionError(error)) return
     console.error("[session.error] " + JSON.stringify({ directory, sessionID, error: SessionError.summary(error) }))
     if (!sessionID) return
-    if (isBenignSessionError(error)) return
 
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return
       if (session?.parentID) return
+      const sessionDirectory = session?.directory ?? directory
+      if (!isAbsoluteWorkspaceDirectory(sessionDirectory)) return
 
       if (settings.sounds.errorsEnabled()) {
         const now = Date.now()
@@ -451,7 +453,7 @@ function createServerNotificationState(input: {
       }
 
       append({
-        directory,
+        directory: sessionDirectory,
         time,
         viewed: false,
         type: "error",
@@ -460,10 +462,10 @@ function createServerNotificationState(input: {
       })
       const description = sessionErrorDescription(error, language.t("notification.session.error.fallbackDescription"))
       const sessionTitle = notificationSessionTitle(session?.title, sessionID)
-      const projectName = notificationProjectName(directory)
+      const projectName = notificationProjectName(sessionDirectory)
       const notificationTitle = `${language.t("notification.session.error.title")} · ${sessionTitle}`
       const notificationDescription = `${projectName} · ${description}`
-      const href = `/${base64Encode(directory)}/session/${sessionID}`
+      const href = `/${base64Encode(sessionDirectory)}/session/${sessionID}`
       if (settings.notifications.errors()) {
         void platform.notify(notificationTitle, notificationDescription, () => input.navigate(href))
       }
@@ -487,11 +489,10 @@ function createServerNotificationState(input: {
     const directory = e.name
     const time = Date.now()
     const sessionID = event.properties.sessionID
-    const viewed = event.type === "session.idle" ? viewedInCurrentSession(directory, sessionID) : false
     const apply = () => {
       if (meta.disposed) return
       if (event.type === "session.idle") {
-        handleSessionIdle(directory, event, time, viewed)
+        handleSessionIdle(directory, event, time)
         return
       }
       handleSessionError(directory, event, time)
@@ -518,6 +519,12 @@ function createServerNotificationState(input: {
     session: {
       all(session: string) {
         return index.session.all[session] ?? empty
+      },
+      unseenCounts() {
+        return index.session.unseenCount
+      },
+      unseenErrors() {
+        return index.session.unseenHasError
       },
       unseen(session: string) {
         return index.session.unseen[session] ?? empty

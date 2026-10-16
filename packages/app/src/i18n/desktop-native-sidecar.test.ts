@@ -7,5 +7,8 @@ describe("desktop sidecar liveness copy", () => {
     expect(DESKTOP_NATIVE_ENGLISH["desktop.sidecar.unresponsive.description"]).toBeTruthy()
     expect(DESKTOP_NATIVE_ENGLISH["desktop.sidecar.recovered.title"]).toBeTruthy()
     expect(DESKTOP_NATIVE_ENGLISH["desktop.sidecar.recovered.description"]).toBeTruthy()
+    expect(DESKTOP_NATIVE_ENGLISH["desktop.sidecar.stopped.title"]).toBeTruthy()
+    expect(DESKTOP_NATIVE_ENGLISH["desktop.sidecar.stopped.description"]).toBeTruthy()
+    expect(DESKTOP_NATIVE_ENGLISH["desktop.recovery.action.relaunch"]).toBeTruthy()
   })
 })

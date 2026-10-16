@@ -16,8 +16,9 @@ import { useServerSDK } from "./server-sdk"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
 import { Model as ModelContract } from "@opencode-ai/schema/model"
+import type { Info as ProviderRouteIntentInfo } from "@opencode-ai/schema/model-select/provider-route-intent"
 
-export type ModelKey = { providerID: string; modelID: string; variant?: string }
+export type ModelKey = { providerID: string; modelID: string; variant?: string; routeIntent?: ProviderRouteIntentInfo }
 
 type State = {
   agent?: string
@@ -56,6 +57,13 @@ const clone = (value: State | undefined) => {
     ...value,
     model: value.model ? { ...value.model } : undefined,
   } satisfies State
+}
+
+function inheritRouteIntent(item: ModelKey | undefined, previous: ModelKey | undefined) {
+  if (!item || item.routeIntent || previous?.providerID !== item.providerID || previous.routeIntent?.kind !== "auto")
+    return item
+  if (splitModelIDForProvider(item.modelID, item.providerID).accountID) return item
+  return { ...item, routeIntent: previous.routeIntent }
 }
 
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
@@ -248,12 +256,14 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       },
     }
 
-    const current = () => {
-      const item = firstModel(
+    const currentKey = () =>
+      firstModel(
         () => scope()?.model,
         () => agent.current()?.model,
         fallback,
       )
+    const current = () => {
+      const item = currentKey()
       if (!item) return
       return models.find(item)
     }
@@ -272,9 +282,16 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const snapshot = () => {
       const model = current()
+      const key = currentKey()
       return {
         agent: agent.current()?.name,
-        model: model ? { providerID: model.provider.id, modelID: model.id } : undefined,
+        model: model
+          ? {
+              providerID: model.provider.id,
+              modelID: model.id,
+              ...(key?.routeIntent ? { routeIntent: key.routeIntent } : {}),
+            }
+          : undefined,
         variant: selected(),
       } satisfies State
     }
@@ -298,6 +315,9 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
     const model = {
       ready: models.ready,
       current,
+      routeIntent: {
+        current: () => currentKey()?.routeIntent,
+      },
       recent,
       list: models.list,
       cycle(direction: 1 | -1) {
@@ -317,21 +337,23 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         model.set({ providerID: entry.provider.id, modelID: entry.id })
       },
       set(item: ModelKey | undefined, options?: { recent?: boolean }) {
-        startTransition(() =>
-          batch(() => {
-            setStore("last", {
-              type: "model",
-              agent: agent.current()?.name,
-              model: item ?? null,
-              variant: selected(),
-            })
-            write({ model: item })
-            if (!item) return
-            models.setVisibility(item, true)
-            if (!options?.recent) return
-            models.recent.push(item)
-          }),
-        )
+        // Model selection is execution input, not merely presentation state.
+        // Commit it synchronously so an immediate composer submit snapshots the
+        // model the picker just selected instead of the previous session model.
+        batch(() => {
+          item = inheritRouteIntent(item, currentKey())
+          setStore("last", {
+            type: "model",
+            agent: agent.current()?.name,
+            model: item ?? null,
+            variant: selected(),
+          })
+          write({ model: item })
+          if (!item) return
+          models.setVisibility(item, true)
+          if (!options?.recent) return
+          models.recent.push(item)
+        })
       },
       visible(item: ModelKey) {
         return models.visible(item)
