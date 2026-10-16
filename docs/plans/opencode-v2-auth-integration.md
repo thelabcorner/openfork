@@ -960,7 +960,7 @@ Preserve these locked semantics from the donor when forward-porting:
 
 - stable opaque credential handles;
 - session affinity;
-- `concentrate` and `session-round-robin` policies;
+- `concentrate`, quota-aware `session-round-robin`, and naive `round-robin` policies;
 - explicit hard/soft pins;
 - typed health/eligibility;
 - capacity gates;
@@ -1274,56 +1274,56 @@ Resolution order for OpenCode generation:
 1. explicit account pin -> exact account route or fail closed;
 2. explicit public pin -> `opencode:public` only if the model is independently public
    eligible; otherwise fail closed;
-3. existing durable Session route binding -> preserve its route kind while still valid;
-4. for an unbound Session, apply the provider-level free-route preference:
-   - `public-first-for-free` (**OpenCode default**): when the selected model has a current
-     trusted public capability, choose the genuine public route. If that public route is
-     temporarily quota-exhausted/cooling-down or request-admission-rejected, surface that
-     public-route state; do **not** silently use an account. If the model is affirmatively
-     no longer a public capability, normal account routing may apply and the UI must no
-     longer present it as Public free;
-   - `account-first` (explicit compatibility override): choose through
-     ProviderAccountRouter when an eligible account exists, otherwise use public when
-     the model is public eligible;
-5. otherwise fail with a typed no-eligible-route result.
+3. existing healthy account binding -> preserve its account for session affinity;
+4. Auto on an existing Public binding -> try eligible subscription accounts first, then
+   retain Public if none qualify;
+5. for an unbound Auto Session, choose an eligible subscription account, otherwise use
+   Public only when the model is currently public-eligible. Adaptive uses complete fresh
+   quota-reset data to rank accounts and falls back to round-robin when that data is
+   incomplete; Round-robin always uses the durable cursor without quota scoring;
+6. otherwise fail with a typed no-eligible-route result.
 
-OpenCode should default to `public-first-for-free` because selecting a model whose current
-provider capability is explicitly **free/public** should not silently consume or bind a
-user account merely because one exists. This is stronger than today's Zen pool behavior,
-where a populated pool overrides the SDK `"public"` bootstrap sentinel.
+Adaptive is the default model-picker policy for hosted OpenCode and OpenCode Go. It uses
+subscription access before the Public lane, matching the user's explicit choice to route
+through connected accounts. Public remains a genuine credential-free fallback for free
+OpenCode models when no subscription candidate qualifies. This is a fork-owned routing
+policy; it does not change the upstream wire contract.
 
 Be precise about upstream parity: the current Core OpenCode provider plugin uses the
 `"public"` sentinel only when it sees no configured key/active connection, and in that
-anonymous state disables models with positive input cost. OpenFork's decision to keep/
-prefer a deliberate public route **even while accounts also exist locally** is a
+anonymous state disables models with positive input cost. OpenFork's decision to prefer
+eligible subscriptions for Auto while preserving explicit Public selection is a
 fork-owned routing/UX policy. The wire route itself remains the same upstream public
 contract; we are not claiming upstream makes the same local selection choice.
 
-The cutover is deliberately non-disruptive:
+Session routing remains stable while preserving the selected policy:
 
-- existing durable Session bindings remain exactly where they are;
+- a healthy account binding remains sticky when the user changes routing policy;
+- an Auto-bound Public session may move to a newly eligible account; explicit Public stays
+  Public;
 - explicit account pins remain strongest and fail closed;
-- users who intentionally want account routing for free models can choose an account or
-  set `account-first`;
-- public quota/cooldown/admission failure under `public-first-for-free` never becomes an
-  implicit paid/account request; and
-- only new/unbound Auto routing changes.
+- an ineligible Auto account can fail over to another eligible account, then Public only
+  when the model is currently public-eligible;
+- explicit Public never hops to an account because of quota, cooldown, or admission
+  failures; and
+- the selected strategy applies to new route assignments and failovers, not healthy sticky
+  account bindings.
 
 Extend the existing shared router configuration rather than inventing an OpenCode-only
 config domain:
 
 ~~~ts
 type ProviderRoutingConfig = {
-  defaultMode: "concentrate" | "session-round-robin"
+  defaultMode: "concentrate" | "session-round-robin" | "round-robin"
   defaultFreeRoutePreference: "account-first" | "public-first-for-free"
   providers?: Record<string, {
-    mode?: "concentrate" | "session-round-robin"
+    mode?: "concentrate" | "session-round-robin" | "round-robin"
     freeRoutePreference?: "account-first" | "public-first-for-free"
   }>
 }
 
-// effective built-in default:
-// providers.opencode.freeRoutePreference ??= "public-first-for-free"
+// effective hosted OpenCode model-picker default:
+// Auto/Adaptive prefers eligible subscriptions and uses Public only as fallback.
 // providers without a validated public lane ignore this setting.
 ~~~
 
@@ -1438,7 +1438,7 @@ type DurableProviderRouteBinding = {
   // account route only
   accountID?: string
   credentialHandle?: string
-  mode?: "concentrate" | "session-round-robin"
+  mode?: "concentrate" | "session-round-robin" | "round-robin"
   pin?: "hard" | "soft"
 
   routeRevision: number
@@ -1465,8 +1465,8 @@ Persistence rules:
 
 The account-router's additional policy state also needs a durable owner:
 
-- one cursor row per affinity domain (`epoch`, `lastAssignedHandle`) for
-  session-round-robin;
+- one cursor row per affinity domain (`epoch`, `lastAssignedHandle`) for both
+  round-robin modes;
 - durable assignment count / last-assigned metadata where `concentrate` depends on
   historical use;
 - active binding count is derived from the binding table, or updated transactionally with
@@ -1899,13 +1899,17 @@ At model/route selection, OpenCode may expose:
 
 Provider routing settings should expose:
 
-- account routing mode: `concentrate` / `session-round-robin`;
+- account routing mode: `concentrate` / `session-round-robin` / `round-robin`;
 - free-route preference: `account-first` / `public-first-for-free`.
 
-For **OpenCode**, the built-in default is `public-first-for-free`: a new/unbound Session
-selecting a currently validated public/free model should actually use the free public
-lane. `account-first` remains an explicit compatibility/user override. Existing durable
-bindings are never rewritten by changing this preference.
+For hosted OpenCode models, the model picker calls the former `Auto` choice **Adaptive**.
+Adaptive prefers eligible subscription accounts, uses reset-time quota urgency when every
+eligible account has comparable current quota-window data, and otherwise rotates evenly.
+Public is the fallback when no subscription account is eligible. **Round-robin** skips quota
+scoring and rotates evenly through eligible accounts. Healthy account bindings remain sticky; an Auto
+session bound to Public can move to an eligible subscription account when the next request
+uses Adaptive or Round-robin, and an unavailable account can fall back to Public when that
+route is eligible. Explicit account pins remain fail-closed until the user selects Auto.
 
 UI state must distinguish:
 
@@ -3367,7 +3371,7 @@ Gate:
 - System One Session-owned public/account inference uses the parent lease; standalone
   explicit Public/account routes compile exactly once and cannot be overridden by the Zen
   pool; `affinityID` never changes route kind;
-- `concentrate` and `session-round-robin` preserve healthy account affinity across a
+- all three account modes preserve healthy account affinity across a
   process restart;
 - concurrent routers/processes cannot double-assign a stale round-robin cursor or overwrite
   a newer route revision;
@@ -3602,11 +3606,11 @@ synthetic directory.
 - zero credentials may show `connected=false` and `publicAvailable=true` simultaneously;
 - trusted+advertised public models remain visible/selectable while disconnected;
 - paid/account-only models are not presented as publicly runnable;
-- route chooser distinguishes Auto / Public free / real accounts;
+- route chooser distinguishes Adaptive / Round-robin / Public free / real accounts;
 - Public free is disabled for a model that is not currently public-eligible;
-- `public-first-for-free` is the effective built-in OpenCode default;
-- `account-first` / `public-first-for-free` preference persists globally and is not
-  writable from project config;
+- Adaptive account-first is the hosted OpenCode/Go model-picker default; Public is fallback;
+- the selected account strategy follows the model/session choice and cannot be overridden
+  by project config;
 - route-specific errors are distinct: public catalog, auth missing, account missing,
   public quota, and hosted admission.
 
@@ -3616,19 +3620,22 @@ synthetic directory.
 - account-pinned request;
 - removed pinned account fails closed;
 - before P5A, active/default switch preserves the legacy unpinned behavior;
-- after P5A, active/default switch does not move an existing healthy session binding and
-  can affect only future/unbound routing where the configured policy explicitly uses it;
+- after P5A, active/default switch does not move an existing healthy account binding; an
+  Auto-bound Public session may move to an eligible account on its next request;
 - zero-credential Zen public/free primary generation succeeds;
 - adding one OAuth credential does not delete or hide the public model catalog;
 - removing the last OAuth/API-key credential restores/retains public eligibility without restart;
-- a Session already bound `routeKind=public` remains public across credential add/select/remove;
-- with a populated account pool, a public-bound Session still sends the public sentinel
-  rather than being rewritten by `pool.defaultAccount()`;
+- an explicitly Public-bound Session remains public across credential add/select/remove;
+- with a populated account pool, an explicitly Public-bound Session still sends the public
+  sentinel rather than being rewritten by `pool.defaultAccount()`;
 - a public route-scoped provider client is never reused for an account route and vice versa;
-- a Session already bound to an account does not silently become public;
+- a healthy account-bound Session stays on its account; an Auto account route may use
+  Public only after no subscription account remains eligible and the model is public;
 - explicit Public free selection succeeds even when accounts exist, for a public-eligible model;
-- `public-first-for-free` is the OpenCode default for new/unbound Sessions;
-- `account-first` and `public-first-for-free` affect only new/unbound routing;
+- Adaptive and Round-robin both prefer eligible subscription accounts; Adaptive uses
+  comparable current reset-window data when available and Round-robin never fetches quota
+  for ranking;
+- Auto-bound Public routes can promote to eligible accounts; explicit Public remains pinned;
 - Zen explicit @zen account unaffected;
 - Go direct-auth precedence unaffected;
 - Go never public-fallbacks.
@@ -3687,8 +3694,26 @@ For a public route, assert:
 - authenticated-client cache entries are isolated by handle/revision;
 - an opaque OAuth account ID that does not start with `zen-` survives
   Session/OXP/scheduler selection without being forced into the legacy suffix ABI;
-- `concentrate` preserves already-used accounts while healthy;
-- `session-round-robin` assigns new sessions evenly and keeps them sticky;
+- `concentrate` preserves already-used accounts while healthy for callers that
+  choose that policy;
+- hosted Zen/Go Adaptive uses quota-aware `session-round-robin` to spread new session
+  bindings across eligible subscription accounts, then keeps each healthy account
+  binding sticky;
+- Go Adaptive uses fresh per-key quota windows to prefer the highest normalized
+  remaining-allowance-per-time-to-reset score across current windows; equal
+  scores use the durable round-robin cursor, and incomplete/stale snapshots fall
+  back to plain round-robin;
+- Round-robin skips quota scoring and uses the durable cursor over all eligible
+  subscription accounts;
+- hosted OpenCode Auto routing prefers eligible subscriptions, then falls back to Public;
+- this is a best-effort allocation heuristic: percentage windows do not reveal
+  absolute entitlement sizes or predict future prompt/token demand, so Auto must
+  not claim a provable global maximum;
+- selecting Adaptive or Round-robin clears a hard account pin from an earlier turn while
+  keeping a healthy session route sticky; the selected strategy applies to new route
+  assignments and actual failovers;
+- quota exhaustion with no upstream reset hint is periodically re-probed rather
+  than permanently excluding the credential until process restart;
 - configured durable affinity survives process restart;
 - concurrent routing owners cannot corrupt the round-robin cursor or route revision;
 - explicit hard pin never silently switches;
@@ -4003,13 +4028,14 @@ The port is complete only when all are true.
 21. The shared provider-neutral router **semantics** are forward-ported behind a
     durable routing owner rather than reimplementing policy inside OpenCode auth or
     adopting the donor's process-local Maps as production state.
-22. Multiple Console OAuth accounts can participate in `concentrate` and
-    `session-round-robin` routing while remaining session-affine, account-capability
-    isolated, and cache isolated.
+22. Multiple Console OAuth accounts can participate in `concentrate`,
+    `session-round-robin`, and `round-robin` routing while remaining session-affine,
+    account-capability isolated, and cache isolated.
 23. Credential refresh/rotation never changes the stable router handle or silently
     rebinds a healthy session.
-24. Public and account route bindings are distinct; adding/removing/selecting credentials
-    cannot silently move an already-bound healthy Session between them.
+24. Public and account route bindings are distinct; explicit Public and healthy account
+    bindings stay stable across credential changes. Auto-bound Public may promote to an
+    eligible subscription on a later request.
 25. `FreeTierError`/`MissingSessionID`/equivalent service-admission failure alone never
     causes credential invalidation, account rotation, or public/account hopping; only
     independently proven account-local auth/quota state may affect account health.
@@ -4031,12 +4057,12 @@ The port is complete only when all are true.
     compatibility version; changing the former does not change hosted OpenCode identity,
     and advancing the latter requires a verified upstream sync plus refreshed wire
     fixtures.
-32. For new/unbound OpenCode Sessions, Auto defaults to `public-first-for-free` when the
-    selected model is currently public-eligible; explicit account pins and existing
-    durable bindings remain authoritative.
-33. Under `public-first-for-free`, public quota/cooldown/request-admission failure never
-    silently becomes an account request. Account use requires explicit account intent or
-    the user-selected `account-first` policy.
+32. Hosted OpenCode model-picker Adaptive defaults to eligible subscriptions first and
+    Public only when no subscription candidate qualifies; Round-robin rotates evenly
+    without quota scoring.
+33. Explicit Public quota/cooldown/request-admission failure never silently becomes an
+    account request. Auto may use Public only as fallback after subscription candidates
+    are ineligible.
 34. Explicit Public survives OXP normalization, scheduled-task persistence, delegation/
     nested delegation, special-agent execution, restart, and a populated account pool
     without acquiring an accountID.

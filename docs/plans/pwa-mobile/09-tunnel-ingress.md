@@ -27,7 +27,8 @@ GET /instance/identity   (unauthenticated, cache-control: no-store)
 mobile pin check: sameNetworkIdentity(pinned, live)
         │  only on match
         ▼
-device credential (Authorization: Basic device:<token>)
+device credential (Bearer in bootstrap probes; the shared runtime accepts
+    authenticated device-token transports)
 ```
 
 ## Cold start
@@ -36,7 +37,9 @@ device credential (Authorization: Basic device:<token>)
 credentials and compares it against the pin stored under
 `opencode.mobile.networkIdentity.v1`. On mismatch or an unreachable probe the
 restore stops with an explicit message and sends nothing. Legacy unpinned
-pairings upgrade to a pin after their first successful authenticated restore.
+pairings must be re-paired before any stored token is transmitted. The new
+pairing ceremony probes public identity before the code claim and after issuing
+the token; identity loss or change discards the received token.
 
 A login-page or proxy interstitial cannot be pinned: the probe requires JSON and
 the identity projection parser rejects anything else, so a Cloudflare Access

@@ -3435,7 +3435,10 @@ Use:
 
 ### 20.4 External guests and cross-Swarm messaging
 
-Delete silent guest auto-registration and `force:true` authority bypasses.
+Delete silent guest auto-registration and boolean-only `force:true` authority
+bypasses. OpenFork now supports explicit one-operation forced actions through the
+separate, action-scoped `swarm.force` permission; see
+[`swarm-forced-operations.md`](../../architecture/swarm-forced-operations.md).
 
 Rules:
 
@@ -3448,8 +3451,11 @@ Rules:
 4. cross-Swarm communication never pretends the sender belongs to the
    destination Swarm.
 
-If external-participant/cross-Swarm messaging remains a product requirement,
-introduce an explicit attenuated grant rather than a boolean bypass:
+External-participant/cross-Swarm messaging uses the explicit tool permission ask
+as a one-operation attenuated grant. Source and target are scoped to the current
+project, and the sender keeps its true source membership rather than receiving a
+synthetic destination member. Broader guest/join workflows still require a
+durable grant design such as:
 
 ```ts
 type SwarmGrant = {
@@ -4251,4 +4257,3 @@ permission system, one model system, explicit provenance, and a first-class P2P
 collaboration layer.
 
 That is the architecture the implementation phase should optimize around.
-
