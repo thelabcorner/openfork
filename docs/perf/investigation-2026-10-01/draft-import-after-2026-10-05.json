@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "sourceEvidence": "packages/desktop/test/.fg-d36ea05a-jJbQQd/evidence.json",
+  "sourceFingerprint": "ed306e77406748620e528c61e071ff6319955f774d8270e29da8c4f7cc334076",
+  "sourceFingerprintAfterRun": "ed306e77406748620e528c61e071ff6319955f774d8270e29da8c4f7cc334076",
+  "assertions": 137,
+  "loadedDraftModules": [
+    "draft-route.tsx",
+    "new-session.tsx",
+    "new-session-enhanced.tsx"
+  ],
+  "routeModuleMarks": [
+    {
+      "name": "draft-route.tsx",
+      "startTime": 7574.700000047684
+    },
+    {
+      "name": "new-session-import-start",
+      "startTime": 7583.700000047684
+    },
+    {
+      "name": "new-session-import-resolved",
+      "startTime": 7613.5
+    },
+    {
+      "name": "new-session.tsx",
+      "startTime": 7613.399999976158
+    },
+    {
+      "name": "new-session-enhanced-import-start",
+      "startTime": 7627.800000071526
+    },
+    {
+      "name": "new-session-enhanced-import-resolved",
+      "startTime": 9255.899999976158
+    },
+    {
+      "name": "new-session-enhanced.tsx",
+      "startTime": 9255.899999976158
+    }
+  ],
+  "composerUsableMs": 2002.8999999761581,
+  "fastInputMs": 33.5,
+  "baselineSource": "packages/desktop/test/.fg-6bb9d3d2-tJFmBy/evidence.json",
+  "baselineComposerUsableMs": 2506.3000000715256,
+  "baselineLoadedDraftModules": [
+    "draft-route.tsx",
+    "new-session.tsx",
+    "session-composer-region.tsx",
+    "session-composer-state.ts",
+    "session-composer-region-controller.ts",
+    "new-session-enhanced.tsx"
+  ],
+  "sessionScenarios": [
+    {
+      "count": 1,
+      "admissionMs": 30.5,
+      "selectedTailMs": 0.19999992847442627
+    },
+    {
+      "count": 3,
+      "admissionMs": 56,
+      "selectedTailMs": 103.40000009536743
+    },
+    {
+      "count": 6,
+      "admissionMs": 104.20000004768372,
+      "selectedTailMs": 188.79999995231628
+    }
+  ],
+  "reasoningFirstPaintMs": 112,
+  "stopAckMs": 62,
+  "gapHistoryReads": 1,
+  "gapSseReopens": 1,
+  "maxLongAnimationFrameMs": 124.39999997615814,
+  "rendererErrors": [],
+  "consoleErrors": [],
+  "limitations": [
+    "One before/after development-renderer pair is not a stable latency distribution.",
+    "The negative module-load invariants prove unnecessary work was removed, not that all cold loading is solved.",
+    "Enhanced import still took about 1.6 seconds in this run.",
+    "The running application was not restarted."
+  ]
+}

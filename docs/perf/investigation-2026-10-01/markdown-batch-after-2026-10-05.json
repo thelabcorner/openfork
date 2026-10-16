@@ -1,0 +1,754 @@
+{
+  "electron": "42.3.3",
+  "node": "24.15.0",
+  "chromium": "148.0.7778.218",
+  "profile": {
+    "userData": "C:\\Users\\slooshied\\WebstormProjects\\opencode\\packages\\desktop\\test\\.electron-markdown-gate-upJg2p\\electron-profile\\user-data",
+    "sessionData": "C:\\Users\\slooshied\\WebstormProjects\\opencode\\packages\\desktop\\test\\.electron-markdown-gate-upJg2p\\electron-profile\\session-data",
+    "logs": "C:\\Users\\slooshied\\WebstormProjects\\opencode\\packages\\desktop\\test\\.electron-markdown-gate-upJg2p\\electron-profile\\logs",
+    "crashDumps": "C:\\Users\\slooshied\\WebstormProjects\\opencode\\packages\\desktop\\test\\.electron-markdown-gate-upJg2p\\electron-profile\\crash-dumps"
+  },
+  "visibilityState": "visible",
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "sessionStoreSeeded": true,
+      "activeInterestAtConcurrency": true,
+      "interestDuringGapPreserved": true,
+      "interestReleased": true,
+      "gapLatched": true,
+      "gapRepaired": true,
+      "repairedText": true,
+      "staleSuperseded": true,
+      "offscreenWorkerJobs": 0,
+      "offscreenMarkerRendered": false,
+      "reenteredTailPriority": true,
+      "initialWorkerDone": 28,
+      "expectedInitialWorkerDone": 28,
+      "initialTailDone": 1,
+      "historyChars": 78893,
+      "backgroundHistoryChars": 4194304,
+      "backgroundHistoryBytes": 8388608,
+      "backgroundStillRunningWhenTailFinished": true,
+      "backgroundParseMs": [
+        13603.199999928474
+      ],
+      "tailDomCommitMsBySession": [
+        33
+      ],
+      "tailWorkerDoneMs": 45.8,
+      "framesUntilDomCommit": 2,
+      "framesUntilTailWorker": 1,
+      "animationFramesDuringProgress": 3,
+      "renderedMarkerCount": 1,
+      "allMarkers": true,
+      "workerEvents": 5,
+      "workerKinds": [
+        "project",
+        "highlight",
+        "parse"
+      ],
+      "workerPriorities": [
+        "tail",
+        "visible",
+        "background"
+      ],
+      "tailWorkerEvents": 2,
+      "tailWorkerKinds": [
+        "project",
+        "highlight"
+      ],
+      "tailWorkerStatuses": [
+        "ok",
+        "ok"
+      ],
+      "tailWorkerServiceMs": [
+        0.5999999046325684,
+        0.5
+      ],
+      "tailQueueWaitMs": [
+        0,
+        5.899999976158142
+      ],
+      "maxTailQueueWaitMs": 5.9,
+      "historyBlocks": 29,
+      "richInlineCodeNodes": 802,
+      "completenessStages": {
+        "initial": 802,
+        "stale": 802,
+        "repaired": 802
+      },
+      "denseCodeCooperativeMounts": 1,
+      "denseCodeTrace": [
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        }
+      ],
+      "denseCodeBySession": [
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        }
+      ],
+      "maximumFrameGapMs": 17.5,
+      "historyNodeIdentityPreserved": true,
+      "effectBlockCount": 29,
+      "blockWritesOnTail": 3,
+      "fullBlockWritesOnTail": 1,
+      "blockSkipsOnTail": 0,
+      "parseEventsOnTail": 2,
+      "highlightEventsOnTail": 1,
+      "tailHighlightLanes": [
+        1
+      ],
+      "codeUpdateTokenSum": 2023,
+      "shikiBySession": [
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        }
+      ],
+      "visibleMarkdownRoots": 1,
+      "frameWork": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "reservedJobs": 0,
+        "reservedBytes": 0,
+        "waitingDemand": 0,
+        "waitingDemandBytes": 0,
+        "completed": 29,
+        "frame": 9
+      },
+      "teardownMarkdownRoots": 0
+    },
+    {
+      "concurrency": 3,
+      "sessionStoreSeeded": true,
+      "activeInterestAtConcurrency": true,
+      "interestDuringGapPreserved": true,
+      "interestReleased": true,
+      "gapLatched": true,
+      "gapRepaired": true,
+      "repairedText": true,
+      "staleSuperseded": true,
+      "offscreenWorkerJobs": 0,
+      "offscreenMarkerRendered": false,
+      "reenteredTailPriority": true,
+      "initialWorkerDone": 84,
+      "expectedInitialWorkerDone": 84,
+      "initialTailDone": 3,
+      "historyChars": 236679,
+      "backgroundHistoryChars": 4194304,
+      "backgroundHistoryBytes": 8388608,
+      "backgroundStillRunningWhenTailFinished": true,
+      "backgroundParseMs": [
+        12905
+      ],
+      "tailDomCommitMsBySession": [
+        41.8,
+        42.1,
+        62.6
+      ],
+      "tailWorkerDoneMs": 79.7,
+      "framesUntilDomCommit": 4,
+      "framesUntilTailWorker": 1,
+      "animationFramesDuringProgress": 5,
+      "renderedMarkerCount": 3,
+      "allMarkers": true,
+      "workerEvents": 13,
+      "workerKinds": [
+        "project",
+        "highlight",
+        "parse"
+      ],
+      "workerPriorities": [
+        "tail",
+        "visible",
+        "background"
+      ],
+      "tailWorkerEvents": 6,
+      "tailWorkerKinds": [
+        "project",
+        "project",
+        "project",
+        "highlight",
+        "highlight",
+        "highlight"
+      ],
+      "tailWorkerStatuses": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "tailWorkerServiceMs": [
+        0.10000002384185791,
+        0.09999990463256836,
+        0,
+        0.20000004768371582,
+        0,
+        0.20000004768371582
+      ],
+      "tailQueueWaitMs": [
+        0,
+        0.20000004768371582,
+        0.3999999761581421,
+        0.2999999523162842,
+        0.5,
+        0.3999999761581421
+      ],
+      "maxTailQueueWaitMs": 0.5,
+      "historyBlocks": 29,
+      "richInlineCodeNodes": 802,
+      "completenessStages": {
+        "initial": 802,
+        "stale": 802,
+        "repaired": 802
+      },
+      "denseCodeCooperativeMounts": 3,
+      "denseCodeTrace": [
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        }
+      ],
+      "denseCodeBySession": [
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        }
+      ],
+      "maximumFrameGapMs": 33.4,
+      "historyNodeIdentityPreserved": true,
+      "effectBlockCount": 29,
+      "blockWritesOnTail": 9,
+      "fullBlockWritesOnTail": 3,
+      "blockSkipsOnTail": 0,
+      "parseEventsOnTail": 4,
+      "highlightEventsOnTail": 3,
+      "tailHighlightLanes": [
+        1,
+        1,
+        1
+      ],
+      "codeUpdateTokenSum": 6069,
+      "shikiBySession": [
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        }
+      ],
+      "visibleMarkdownRoots": 1,
+      "frameWork": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "reservedJobs": 0,
+        "reservedBytes": 0,
+        "waitingDemand": 0,
+        "waitingDemandBytes": 0,
+        "completed": 110,
+        "frame": 25
+      },
+      "teardownMarkdownRoots": 0
+    },
+    {
+      "concurrency": 6,
+      "sessionStoreSeeded": true,
+      "activeInterestAtConcurrency": true,
+      "interestDuringGapPreserved": true,
+      "interestReleased": true,
+      "gapLatched": true,
+      "gapRepaired": true,
+      "repairedText": true,
+      "staleSuperseded": true,
+      "offscreenWorkerJobs": 0,
+      "offscreenMarkerRendered": false,
+      "reenteredTailPriority": true,
+      "initialWorkerDone": 168,
+      "expectedInitialWorkerDone": 168,
+      "initialTailDone": 6,
+      "historyChars": 473358,
+      "backgroundHistoryChars": 4194304,
+      "backgroundHistoryBytes": 8388608,
+      "backgroundStillRunningWhenTailFinished": true,
+      "backgroundParseMs": [
+        12986.899999976158
+      ],
+      "tailDomCommitMsBySession": [
+        39.1,
+        71.9,
+        104.9,
+        132.3,
+        184.4,
+        184.8
+      ],
+      "tailWorkerDoneMs": 192.5,
+      "framesUntilDomCommit": 10,
+      "framesUntilTailWorker": 1,
+      "animationFramesDuringProgress": 11,
+      "renderedMarkerCount": 6,
+      "allMarkers": true,
+      "workerEvents": 25,
+      "workerKinds": [
+        "project",
+        "highlight",
+        "parse"
+      ],
+      "workerPriorities": [
+        "tail",
+        "visible",
+        "background"
+      ],
+      "tailWorkerEvents": 12,
+      "tailWorkerKinds": [
+        "project",
+        "project",
+        "project",
+        "project",
+        "project",
+        "project",
+        "highlight",
+        "highlight",
+        "highlight",
+        "highlight",
+        "highlight",
+        "highlight"
+      ],
+      "tailWorkerStatuses": [
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok",
+        "ok"
+      ],
+      "tailWorkerServiceMs": [
+        0.19999992847442627,
+        0.09999990463256836,
+        0,
+        0.09999990463256836,
+        0.10000002384185791,
+        0.09999990463256836,
+        0.30000007152557373,
+        0.10000002384185791,
+        0.10000002384185791,
+        0,
+        0,
+        0.10000002384185791
+      ],
+      "tailQueueWaitMs": [
+        0,
+        0.5,
+        0.6999999284744263,
+        0.8000000715255737,
+        1,
+        1.2000000476837158,
+        1.1999999284744263,
+        1.2000000476837158,
+        1.1999999284744263,
+        1.100000023841858,
+        1.1999999284744263,
+        1.100000023841858
+      ],
+      "maxTailQueueWaitMs": 1.2,
+      "historyBlocks": 29,
+      "richInlineCodeNodes": 802,
+      "completenessStages": {
+        "initial": 802,
+        "stale": 802,
+        "repaired": 802
+      },
+      "denseCodeCooperativeMounts": 6,
+      "denseCodeTrace": [
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "code-mount",
+          "chars": 85,
+          "tokenCount": 26
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        },
+        {
+          "action": "cooperative-code-mount",
+          "chars": 8422,
+          "tokenCount": 2009
+        }
+      ],
+      "denseCodeBySession": [
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        },
+        {
+          "present": true,
+          "pending": false,
+          "textLength": 8410,
+          "tokenSpanCount": 2009,
+          "lastEntryPresent": true
+        }
+      ],
+      "maximumFrameGapMs": 50.1,
+      "historyNodeIdentityPreserved": true,
+      "effectBlockCount": 29,
+      "blockWritesOnTail": 18,
+      "fullBlockWritesOnTail": 6,
+      "blockSkipsOnTail": 0,
+      "parseEventsOnTail": 7,
+      "highlightEventsOnTail": 6,
+      "tailHighlightLanes": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "codeUpdateTokenSum": 12138,
+      "shikiBySession": [
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        },
+        {
+          "hasShiki": true,
+          "tokenSpanCount": 26,
+          "styledSpanCount": 21,
+          "matches": true
+        }
+      ],
+      "visibleMarkdownRoots": 1,
+      "frameWork": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "reservedJobs": 0,
+        "reservedBytes": 0,
+        "waitingDemand": 0,
+        "waitingDemandBytes": 0,
+        "completed": 269,
+        "frame": 53
+      },
+      "teardownMarkdownRoots": 0
+    },
+    {
+      "scenario": "rich-first-paint",
+      "rawSyntaxSeen": false,
+      "mutations": 15,
+      "headingPreserved": true,
+      "markerVisible": true
+    },
+    {
+      "scenario": "batched-rich-first-paint",
+      "firstPaintMs": 16.200000047683716,
+      "totalRenderMs": 715.6000000238419,
+      "parsesAtFirstPaint": 1,
+      "expectedParses": 161,
+      "rawSyntaxSeen": false,
+      "headingPreserved": true,
+      "bodyExact": true
+    },
+    {
+      "scenario": "oversized-rich-markdown",
+      "inputBytes": 1440118,
+      "markerVisible": true,
+      "bodyExact": true,
+      "strongCount": 1,
+      "reenteredRichBody": true,
+      "continuationIdentityPreserved": true,
+      "pendingCount": 0,
+      "maximumFrameGapMs": 16.8,
+      "largeWorkAfterTeardown": {
+        "queuedJobs": 0,
+        "activeJobs": 0,
+        "pendingRequests": 0
+      }
+    },
+    {
+      "scenario": "oversized-plaintext-fallback",
+      "inputBytes": 9227534,
+      "overPerJobLimit": true,
+      "markerVisible": true,
+      "outputTextLength": 4613767,
+      "diagnostics": {
+        "ready": true,
+        "blockCount": 1,
+        "pendingCount": 0,
+        "workerEvents": [],
+        "effects": [
+          {
+            "textChars": 4613767,
+            "blockCount": 1
+          }
+        ]
+      },
+      "coldHiddenWorkerJobs": 0,
+      "coldHiddenWorkerEvents": [],
+      "coldHiddenHasContentBlock": false,
+      "coldHiddenPlaceholderHeight": 320,
+      "maximumFrameGapMs": 16.8,
+      "domCommit": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "waitingComponents": 0,
+        "frameCount": 922,
+        "maxBatchChars": 65536,
+        "maxBatchNodes": 128,
+        "maxBatchSteps": 128,
+        "maxRichParsesPerFrame": 1,
+        "completedJobs": 54
+      },
+      "frameWork": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "reservedJobs": 0,
+        "reservedBytes": 0,
+        "waitingDemand": 0,
+        "waitingDemandBytes": 0,
+        "completed": 470,
+        "frame": 114
+      },
+      "teardownMarkdownRoots": 0
+    },
+    {
+      "scenario": "oversized-fenced-code-fallback",
+      "inputBytes": 9120066,
+      "overPerJobLimit": true,
+      "expectedTextLength": 4560022,
+      "outputTextLength": 4560022,
+      "diagnostics": {
+        "ready": true,
+        "blockCount": 1,
+        "pendingCount": 0,
+        "virtualizedSourceControl": true,
+        "visibleLineCount": 61,
+        "workerEvents": [],
+        "largeBlockEvents": [
+          {
+            "action": "oversized-plain-code",
+            "mode": "full",
+            "chars": 4560033
+          }
+        ],
+        "longTasks": [],
+        "effects": [
+          {
+            "textChars": 4560033,
+            "blockCount": 1
+          }
+        ]
+      },
+      "codeShell": true,
+      "oversizedCodeScrollable": true,
+      "copyControl": true,
+      "copyWasPending": true,
+      "clipboardTextLength": 4560022,
+      "clipboardExact": true,
+      "markerVisible": true,
+      "coldHiddenWorkerJobs": 0,
+      "coldHiddenHasContentBlock": false,
+      "maximumFrameGapMs": 16.7,
+      "domCommit": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "waitingComponents": 0,
+        "frameCount": 922,
+        "maxBatchChars": 65536,
+        "maxBatchNodes": 128,
+        "maxBatchSteps": 128,
+        "maxRichParsesPerFrame": 1,
+        "completedJobs": 54
+      },
+      "frameWork": {
+        "queuedJobs": 0,
+        "queuedBytes": 0,
+        "reservedJobs": 0,
+        "reservedBytes": 0,
+        "waitingDemand": 0,
+        "waitingDemandBytes": 0,
+        "completed": 470,
+        "frame": 114
+      },
+      "teardownMarkdownRoots": 0
+    }
+  ]
+}
