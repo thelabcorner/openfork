@@ -61,19 +61,33 @@ See [`docs/architecture/compatibility-boundary.md`](docs/architecture/compatibil
 
 ### Concrete fork delta
 
-The current branch is built from OpenCode release tags. Against the tracked `v1.18.30` release baseline, these major OpenFork subsystems are fork additions rather than upstream surfaces:
+The current branch is built from OpenCode release tags. The committed comparison
+below is against the release OpenFork actually merged: **OpenCode \`v1.18.34\`**
+(\`aec0b9a6d8898f68f923aaf08b7306d931fd9d76\`). \`upstream/dev\` is a separate
+moving reference and is not silently counted as part of the fork delta.
 
-| Subsystem | OpenCode `v1.18.30` | OpenFork |
+| Subsystem | Stock OpenCode \`v1.18.34\` | OpenFork |
 | --- | --- | --- |
-| Built-in desktop browser | Not present | Main-process tab authority, `<webview>` presentation, CDP automation, annotations, recording, viewport tools, and Chrome bridge |
-| Mobile / PWA package | Not present | Dedicated mobile client with replay-first transport and bounded renderer work |
-| Goal Mode | Not present | Durable goals, worker focus, continuation reservations, semantic auditor |
-| Quota subsystem | Not present | Provider quota adapters, Limits UI, account-aware usage and routing |
-| Session groups | Not present | Durable grouping, locked membership, subagent auto-grouping, tree UI |
-| SPAD supervision | Not present | Bounded supervision and degeneration handling |
-| Checkpoint tool | Not present | Agent-accessible recovery checkpoints |
+| **OXP / ChatGPT external-agent surface** | Absent | Dedicated Secure-MCP endpoint, approved-root authority, capability projection, Session supervision, durable delegated workers/batches, file exchange, runtime refresh, desktop tunnel lifecycle, and parent-tool-epoch continuity |
+| **OFXP / OpenFork Network** | Absent | Peer identity/trust, root-bounded grants, invocation receipts, ambiguity-safe remote execution, discovery/reconciliation, and mobile peer pinning |
+| **Native Swarm** | Absent | Durable multi-Session collaboration, DAG work, peer mail, claims/deliverables, process-global orchestration, API/tool adapters, and dedicated UI |
+| **Goal Mode** | No equivalent durable Goal/Auditor domain | Intrinsically autonomous worker → independent-auditor cycles with durable recovery, focused-Goal inheritance, explicit blocker semantics, and independently verified completion |
+| **Code orchestration** | Contains the \`packages/codemode\` interpreter and the older \`execute\` integration | Fork-owned static \`code\` contract with search/describe/run/save/call, compressed capability brokerage, replay/saved revisions, and native/ACP/OXP/OFXP projections |
+| **Built-in desktop browser** | No equivalent integrated hosted-browser product subsystem | Main-process tab authority, \`<webview>\` presentation, CDP automation, agent/human arbitration, annotations, recording, visual capture/diff, viewport tools, and existing-Chrome control |
+| **Mobile / PWA package** | No \`packages/mobile\` | Independently hosted thin PWA over the shared app runtime with pairing, push/deep links, OFXP identity pinning, replay-first reconnect, and bounded renderer/event work |
+| **Session groups / provenance / supervision** | No OpenFork durable SessionGroup/provenance/SPAD domains | Durable grouping and locked membership, producer-stamped turn provenance, SessionTelemetry, subagent grouping, pause/resume/control, and SPAD degeneration supervision |
+| **Provider routing, usage, limits, and capacity** | Has provider rate-limit/quota concepts and hosted Console quota surfaces, but not OpenFork's local operational stack | Multi-account route intent and retry authority, provider quota adapters, usage ledger, Limits/capacity projections, account-aware model selection, and Zen/Go routing behavior |
+| **Scheduled/background autonomy** | Has background-job primitives, but no OpenFork durable scheduled-task domain | Cross-process scheduled tasks plus substantially extended background/monitor lifecycle integrated with Sessions, Goals, tools, and supervision |
+| **Agent tool surface** | Exposes the stock tool set, including separate \`glob\`/\`grep\`, web tools, and \`execute\` | Expanded project/symbols/test/typecheck/refactor/Git/find/patch/archive/background/browser/checkpoint/session/swarm/SQLite/JSON/SymPy surface, with compact/lazy brokerage and consolidated semantic tools |
+| **Agent-accessible checkpoints** | Internal checkpoint concepts exist, but not this fork control surface | First-class recovery checkpoint tool integrated with Session control and fork supervision |
+| **WakaTime** | No first-party process-global OpenFork exporter | Opt-in process-global coding-activity export with restart-persistent project rate limiting and distinct OpenFork/OXP/OFXP attribution |
+| **System One / Jev** | Hosted Console/Zen System One proxy exists | Local typed non-chat \`system-one\` primitive, provider/account orchestration, Tier-2 inference API, generated SDK surface, and fail-closed separation from conversational model selection |
+| **Product scope / distribution** | Ships the broader OpenCode workspace and upstream distribution assumptions | Fork-owned executable/config/update/release identity plus automatic pruning of hosted web/console/stats/enterprise and other out-of-scope upstream product packages |
 
-This table is intentionally tied to the release baseline that OpenFork actually merged. `upstream/dev` can change independently between releases.
+For the detailed semantic inventory, source/test anchors, intentional negative
+space, and important “inherited vs fork-owned” distinctions, see
+[\`docs/map/upstream-fork.md\`](docs/map/upstream-fork.md) and
+[\`FORK.md\`](FORK.md).
 
 ## Performance
 

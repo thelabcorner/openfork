@@ -13,6 +13,37 @@ upstream-vs-fork boundaries, and source-tree lookup. The map is an orientation
 layer; this file and `FORK.md` remain authoritative when a rule or ownership
 decision is normative.
 
+### Universal executable tool-surface parity invariant
+
+Read `docs/architecture/tool-surface-parity.md` before adding or changing
+any native tool, lazy tool, registry, Code tool gateway, or tool-capable transport.
+**A provider-callable tool/action MUST execute with semantically equivalent
+behavior across every applicable supported entry point**: normal OpenFork
+chat/worker Sessions, native and lazy `@tool`, Code Mode, OXP, OFXP, ACP,
+MCP, and other explicitly supported clients, APIs, or execution gateways.
+No registration, catalog listing, coverage table, or schema declaration
+counts as execution. A supported surface with no executable dispatch path is
+an architecture failure, not a completed parity cell.
+
+- Implement domain semantics once behind a shared authoritative owner.
+  The V1 `ToolRegistry` owns production native built-in identity;
+  `exchange/tool-coverage.ts` owns external semantic dispositions. Each
+  surface still needs a **real dispatcher-backed execution test**; mapping
+  alone proves nothing. The OXP-specific ledger and verifier remain at
+  `docs/architecture/oxp-native-tool-parity.md`.
+- Do not fabricate `Tool.Context`, Sessions, principals, workspaces, roots,
+  accounts or credentials. Session-local work requires legitimate Session
+  ownership/supervision; peer/external work requires independent grants.
+  Do not re-export inbound MCP/plugin tools without explicit authorization.
+- Preserve lazy discoverability and compact catalogs, the host Code gateway,
+  per-action authority, cancel/receipt/replay semantics, and leaf/egress
+  revocation checks. Equal discoverability does not mean equal privileges.
+- New/modified tools must update a surface-by-surface action matrix,
+  implementation/exception evidence, authorization tests, negative tests,
+  executable parity gates, and the relevant agent/map documents **in the
+  same change**. Scope differences need narrow, reviewed, tested security
+  or lifecycle exceptions; never silently claim universal parity.
+
 ### Goal Mode intrinsic-autonomy invariant
 
 Before changing Goal execution, scheduling integration, Goal UI/API contracts, or
