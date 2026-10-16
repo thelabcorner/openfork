@@ -153,7 +153,7 @@ describe("hosted Muse reasoning replay", () => {
     const sdk = createOpenAI({
       apiKey: "test-only",
       baseURL: "https://example.invalid/v1",
-      fetch: async (_url, init) => {
+      fetch: Object.assign(async (_url: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
         wire = JSON.parse(String(init?.body))
         return new Response(JSON.stringify({
           id: "resp_test",
@@ -166,7 +166,7 @@ describe("hosted Muse reasoning replay", () => {
           ],
           usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
         }), { status: 200, headers: { "content-type": "application/json" } })
-      },
+      }, { preconnect: fetch.preconnect }),
     })
     const source: ModelMessage[] = [
       {
