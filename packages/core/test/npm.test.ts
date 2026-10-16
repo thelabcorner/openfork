@@ -37,6 +37,33 @@ describe("Npm.sanitize", () => {
   })
 })
 
+describe("Npm.shouldRefreshPackageCache", () => {
+  test("refreshes moving registry selectors and local directories", () => {
+    for (const spec of [
+      "acme-plugin",
+      "acme-plugin@latest",
+      "acme-plugin@next",
+      "acme-plugin@^1.2.3",
+      "acme-plugin@~1.2.3",
+      "acme-plugin@*",
+      "acme-plugin@file:../acme-plugin",
+      "alias-plugin@npm:acme-plugin@latest",
+    ]) {
+      expect(Npm.shouldRefreshPackageCache(spec), spec).toBe(true)
+    }
+  })
+
+  test("keeps immutable package selectors cache-stable", () => {
+    for (const spec of [
+      "acme-plugin@1.2.3",
+      "acme-plugin@git+https://github.com/example/acme-plugin.git#0123456789abcdef0123456789abcdef01234567",
+      "https://registry.example.test/acme-plugin-1.2.3.tgz",
+    ]) {
+      expect(Npm.shouldRefreshPackageCache(spec), spec).toBe(false)
+    }
+  })
+})
+
 describe("Npm.add", () => {
   test("reifies when package cache directory exists without the package installed", async () => {
     await using tmp = await tmpdir()
@@ -90,6 +117,21 @@ describe("Npm.add", () => {
     })
     await Bun.write(path.join(scoped, "dist", "index.js"), "export const createScoped = () => 'scoped'\n")
 
+    const importOnly = path.join(tmp.path, "import-only-provider")
+    await writePackage(importOnly, {
+      name: "import-only-provider",
+      type: "module",
+      main: "./dist/index.js",
+      exports: {
+        ".": {
+          types: "./dist/index.d.ts",
+          import: "./dist/index.js",
+        },
+      },
+    })
+    await Bun.write(path.join(importOnly, "dist", "index.js"), "export const createImportOnly = () => 'esm-only'\n")
+    await Bun.write(path.join(importOnly, "dist", "index.d.ts"), "export declare const createImportOnly: () => string\n")
+
     const proc = Bun.spawn(
       [
         node,
@@ -102,6 +144,7 @@ describe("Npm.add", () => {
         for (const [spec, name] of [
           [${JSON.stringify(`dual-provider@file:${dual}`)}, "createDual"],
           [${JSON.stringify(`@fixture/scoped-provider@file:${scoped}`)}, "createScoped"],
+          [${JSON.stringify(`import-only-provider@file:${importOnly}`)}, "createImportOnly"],
         ]) {
           const result = await Npm.add(spec)
           assert.ok(result.entrypoint?.startsWith("file://"), "entrypoint is a file URL: " + result.entrypoint)

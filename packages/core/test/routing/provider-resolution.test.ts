@@ -171,6 +171,7 @@ function harness(options?: {
         if (!live || live.routeRevision !== request.current.routeRevision) {
           return Effect.succeed({ state: "stale" } as const)
         }
+        const pin = request.current.routeKind === "account" ? request.current.pin : undefined
         const next = accountBinding(
           {
             kind: "account",
@@ -178,7 +179,7 @@ function harness(options?: {
             accountID: selected.accountID,
             credentialHandle: selected.credentialHandle,
             mode: request.mode,
-            ...(request.current.pin ? { pin: request.current.pin } : {}),
+            ...(pin ? { pin } : {}),
           },
           {
             routeRevision: request.current.routeRevision + 1,
@@ -284,6 +285,33 @@ describe("ProviderRouteResolution", () => {
     expect(h.commits).toHaveLength(0)
   })
 
+  test("existing Public binding changes to an account only when Public loses eligibility", async () => {
+    const h = harness({ initial: binding({ kind: "public", providerID }) })
+    const result = await run(h.resolver.resolve(input({
+      freeRoutePreference: "account-first",
+      allowPublic: false,
+      publicEligible: false,
+    })))
+    expect(result.lease.route).toMatchObject({ kind: "account", accountID: "acct-a" })
+    expect(result.lease.routeRevision).toBe(2)
+    expect(h.routes.current()).toMatchObject({ routeKind: "account", reason: "failover" })
+    expect(h.commits).toHaveLength(1)
+    expect(h.routes.calls.cas).toBe(0)
+  })
+
+  test("a Public binding remains unchanged when neither Public nor an account is eligible", async () => {
+    const original = binding({ kind: "public", providerID })
+    const h = harness({ initial: original })
+    const error = await run(h.resolver.resolve(input({
+      allowPublic: false,
+      publicEligible: false,
+      candidates: [],
+    })).pipe(Effect.flip))
+    expect(error._tag).toBe("ProviderRouteResolution.BoundRouteUnavailable")
+    expect(h.routes.current()).toEqual(original)
+    expect(h.routes.calls.cas).toBe(0)
+  })
+
   test("existing account binding remains exact account when Public becomes available", async () => {
     const initial = binding({
       kind: "account",
@@ -367,7 +395,7 @@ describe("ProviderRouteResolution", () => {
     expect(h.routes.current()).toBeUndefined()
   })
 
-  test("removed hard-pinned account fails closed without account commit or cross-kind fallback", async () => {
+  test("Auto clears a previous-turn hard pin and fails over to an eligible account", async () => {
     const initial = binding({
       kind: "account",
       providerID,
@@ -377,21 +405,17 @@ describe("ProviderRouteResolution", () => {
       pin: "hard",
     })
     const h = harness({ initial })
-    const result = await run(
-      h.resolver
-        .resolve(
-          input({
-            candidates: [accountB],
-          }),
-        )
-        .pipe(Effect.flip),
-    )
+    const result = await run(h.resolver.resolve(input({ candidates: [accountB] })))
 
-    expect(result._tag).toBe("ProviderRouteResolution.BoundRouteUnavailable")
-    if (result._tag !== "ProviderRouteResolution.BoundRouteUnavailable") return
-    expect(result.hardPin).toBe(true)
-    expect(h.commits).toHaveLength(0)
-    expect(h.routes.calls.cas).toBe(0)
+    expect(result.lease.route).toMatchObject({
+      kind: "account",
+      accountID: "acct-b",
+      credentialHandle: "cred_b",
+    })
+    expect(result.lease.routeRevision).toBe(3)
+    expect(h.routes.current()).toMatchObject({ routeKind: "account", accountID: "acct-b" })
+    expect(h.commits).toHaveLength(1)
+    expect(h.routes.calls.cas).toBe(1)
   })
 
   test("soft account failover stays account-kind and excludes the failed handle", async () => {

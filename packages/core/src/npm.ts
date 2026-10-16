@@ -1,6 +1,7 @@
 export * as Npm from "./npm"
 
 import path from "path"
+import { existsSync, readFileSync } from "node:fs"
 import { createRequire } from "module"
 import { pathToFileURL } from "url"
 import npa from "npm-package-arg"
@@ -14,6 +15,7 @@ import { filesystem } from "./effect/app-node-platform"
 import { LayerNode } from "./effect/layer-node"
 import { makeRuntime } from "./effect/runtime"
 import { NpmConfig } from "./npm-config"
+import { KeyedMutex } from "./effect/keyed-mutex"
 
 export class InstallFailedError extends Schema.TaggedErrorClass<InstallFailedError>()("NpmInstallFailedError", {
   add: Schema.Array(Schema.String).pipe(Schema.optional),
@@ -49,18 +51,79 @@ export function sanitize(pkg: string) {
   return Array.from(pkg, (char) => (illegal.has(char) || char.charCodeAt(0) < 32 ? "_" : char)).join("")
 }
 
+/**
+ * Package specs whose resolved contents may legitimately change without the
+ * config string changing. Exact semver versions stay immutable/offline-fast;
+ * tags, ranges, and local directory specs are refreshed once per Npm service
+ * lifetime before their first use.
+ */
+export function shouldRefreshPackageCache(pkg: string) {
+  try {
+    const parsed = npa(pkg)
+    const target = parsed.type === "alias" ? (parsed as npa.AliasResult).subSpec : parsed
+    return target?.type === "tag" || target?.type === "range" || target?.type === "directory"
+  } catch {
+    return false
+  }
+}
+
+const nodeImportConditions = new Set(["node", "import", "node-addons", "default"])
+
+function packageImportTarget(value: unknown): string | undefined {
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = packageImportTarget(item)
+      if (hit) return hit
+    }
+    return
+  }
+  if (!value || typeof value !== "object") return
+  for (const [condition, nested] of Object.entries(value)) {
+    if (!nodeImportConditions.has(condition)) continue
+    const hit = packageImportTarget(nested)
+    if (hit) return hit
+  }
+}
+
+function packageImportEntryPoint(dir: string): string | undefined {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as Record<string, unknown>
+    const exports = pkg.exports
+    const rootExport =
+      exports && typeof exports === "object" && !Array.isArray(exports) && "." in exports
+        ? (exports as Record<string, unknown>)["."]
+        : exports
+    const target =
+      packageImportTarget(rootExport) ??
+      (typeof pkg.module === "string" ? pkg.module : undefined) ??
+      (typeof pkg.main === "string" ? pkg.main : undefined)
+    if (!target || target.startsWith("node:")) return
+    const resolved = path.resolve(dir, target)
+    if (!FSUtil.contains(dir, resolved) || !existsSync(resolved)) return
+    return pathToFileURL(resolved).href
+  } catch {
+    return
+  }
+}
+
 const resolveEntryPoint = (name: string, dir: string): EntryPoint => {
   let entrypoint: string | undefined
   try {
     // Node only honors the parent argument behind --experimental-import-meta-resolve, and
-    // import() of the bare package directory fails with ERR_UNSUPPORTED_DIR_IMPORT. require
-    // resolution picks the "require"/"default" export target, which import() loads fine.
+    // import() of a bare package directory fails with ERR_UNSUPPORTED_DIR_IMPORT. Prefer
+    // require resolution when the package exposes that condition because importing the
+    // resolved CJS/default file is valid and preserves historical behavior.
     entrypoint =
       typeof Bun !== "undefined"
         ? import.meta.resolve(name, dir)
         : pathToFileURL(createRequire(path.join(dir, "package.json")).resolve(name)).href
   } catch {
-    entrypoint = undefined
+    // ESM-only packages can intentionally expose only the "import" condition.
+    // createRequire().resolve() reports ERR_PACKAGE_PATH_NOT_EXPORTED for those
+    // even though Node can import the package. Resolve that package-local target
+    // from its manifest instead of treating a valid persistent cache as corrupt.
+    entrypoint = typeof Bun === "undefined" ? packageImportEntryPoint(dir) : undefined
   }
   return {
     directory: dir,
@@ -84,6 +147,8 @@ const layer = Layer.effect(
     const global = yield* Global.Service
     const fs = yield* FileSystem.FileSystem
     const flock = yield* EffectFlock.Service
+    const refreshLocks = KeyedMutex.makeUnsafe<string>()
+    const refreshed = new Set<string>()
     const directory = (pkg: string) => path.join(global.cache, "packages", sanitize(pkg))
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
@@ -129,19 +194,48 @@ const layer = Layer.effect(
           return pkg
         }
       })()
+      const packageDir = path.join(dir, "node_modules", name)
+      const mutable = shouldRefreshPackageCache(pkg)
 
-      if (yield* afs.existsSafe(path.join(dir, "node_modules", name))) {
-        return resolveEntryPoint(name, path.join(dir, "node_modules", name))
-      }
+      return yield* refreshLocks.withLock(dir)(
+        Effect.gen(function* () {
+          const installed = yield* afs.existsSafe(packageDir)
+          if (installed && (!mutable || refreshed.has(dir))) {
+            return resolveEntryPoint(name, packageDir)
+          }
 
-      const tree = yield* reify({ dir, add: [pkg] })
-      const first = tree.edgesOut.values().next().value?.to
-      if (!first) {
-        const result = resolveEntryPoint(name, path.join(dir, "node_modules", name))
-        if (result.entrypoint) return result
-        return yield* new InstallFailedError({ add: [pkg], dir })
-      }
-      return resolveEntryPoint(first.name, first.path)
+          // Moving tags/ranges must not be frozen forever by the persistent
+          // package cache. Refresh at most once per process/service lifetime:
+          // after a module has been imported, changing its files underneath the
+          // same Node process would not provide reliable hot-update semantics.
+          if (mutable) refreshed.add(dir)
+
+          const tree = yield* reify({ dir, add: [pkg] }).pipe(
+            Effect.catch((error) => {
+              // Preserve OpenFork's offline cache behavior. A moving spec that
+              // cannot reach its registry may keep using a previously valid
+              // installation, but we do not retry it for every workspace.
+              if (installed) {
+                const cached = resolveEntryPoint(name, packageDir)
+                if (cached.entrypoint) return Effect.succeed(undefined)
+              }
+              if (mutable) refreshed.delete(dir)
+              return Effect.fail(error)
+            }),
+          )
+
+          if (!tree) return resolveEntryPoint(name, packageDir)
+
+          const first = tree.edgesOut.values().next().value?.to
+          if (!first) {
+            const result = resolveEntryPoint(name, packageDir)
+            if (result.entrypoint) return result
+            if (mutable) refreshed.delete(dir)
+            return yield* new InstallFailedError({ add: [pkg], dir })
+          }
+          return resolveEntryPoint(first.name, first.path)
+        }),
+      )
     }, Effect.scoped)
 
     const install: Interface["install"] = Effect.fn("Npm.install")(function* (dir, input) {

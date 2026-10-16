@@ -32,7 +32,7 @@ const KIND_ORDER: ReadonlyArray<MemorySchema.Kind> = [
 ]
 
 export interface Interface {
-  /** Renders the current projection for a topic, rebuilding it when dirty. */
+  /** Renders from canonical entries, without persisting or mutating a read. */
   readonly render: (topic: { id: string; key: string; title: string; description: string }) => Effect.Effect<string>
   readonly renderMap: (topics: MemorySchema.Topic[]) => string
 }
@@ -52,9 +52,10 @@ const layer = Layer.effect(
     }) {
       const entries = yield* store.topicEntries(topic.id)
       const text = renderProjection(topic, entries)
-      // Persisting the derived view keeps repeated opens cheap; it is always
-      // regenerated from entries, so staleness can only cost a rebuild.
-      yield* store.setProjection(topic.id, text).pipe(Effect.ignore)
+      // open() is a read path. Updating this derived cache previously acquired
+      // SQLite's single writer lane on every open, despite rebuilding the
+      // projection on every call. Rebuilding directly is both fresher and
+      // avoids hidden write contention.
       return text
     })
 

@@ -7,6 +7,7 @@ import { sql } from "drizzle-orm"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "../src/database/sqlite.bun"
 import { DatabaseMigration } from "../src/database/migration"
+import { makeSqliteMaintenanceQuietGate } from "../src/database/sqlite-maintenance"
 import {
   decrementEventPayloadRefs,
   EVENT_PAYLOAD_ORPHAN_GRACE_MS,
@@ -113,6 +114,48 @@ describe("Event payload ownership", () => {
               SELECT refs FROM event_payload_meta WHERE payload_id = 'healthy'
             `).pipe(Effect.orDie),
           ).toEqual({ refs: 2 })
+        }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("busy foreground admission times out orphan cleanup without deleting or holding a writer", async () => {
+    const { dir, path } = tempDb()
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* makeDatabase
+          yield* DatabaseMigration.apply(db)
+          const now = EVENT_PAYLOAD_ORPHAN_GRACE_MS * 2
+          yield* db.run(sql`
+            INSERT INTO event_payload_meta (payload_id, chunk_count, refs, time_touched)
+            VALUES ('quiet-budget', 1, 0, 1)
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event_payload_chunk (payload_id, chunk_index, text, time_created)
+            VALUES ('quiet-budget', 0, 'body', 1)
+          `).pipe(Effect.orDie)
+
+          const started = performance.now()
+          const deferred = yield* reclaimOrphanedEventPayloads(db, {
+            now,
+            quietGate: makeSqliteMaintenanceQuietGate(db, { quietMs: 60_000, pollMs: 100 }),
+            quietWaitBudgetMs: 35,
+          })
+          expect(deferred).toEqual({ reclaimed: 0, hasMore: true, deferred: true })
+          expect(performance.now() - started).toBeLessThan(600)
+          expect(yield* db.get(sql`SELECT refs FROM event_payload_meta WHERE payload_id = 'quiet-budget'`)).toEqual({ refs: 0 })
+          expect(yield* db.get(sql`SELECT text FROM event_payload_chunk WHERE payload_id = 'quiet-budget'`)).toEqual({ text: "body" })
+
+          const released = yield* reclaimOrphanedEventPayloads(db, {
+            now,
+            quietGate: makeSqliteMaintenanceQuietGate(db, { quietMs: 0 }),
+            quietWaitBudgetMs: 200,
+          })
+          expect(released).toEqual({ reclaimed: 1, hasMore: false })
+          expect(yield* db.get(sql`SELECT refs FROM event_payload_meta WHERE payload_id = 'quiet-budget'`)).toBeUndefined()
         }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
       )
     } finally {

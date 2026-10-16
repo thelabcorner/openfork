@@ -76,6 +76,17 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("decodes usage-limit recovery options while preserving explicit false values", () =>
+    Effect.sync(() => {
+      expect(Schema.decodeUnknownSync(ConfigV1.Info)({ usage_limit_recovery: {} }).usage_limit_recovery).toEqual({})
+      expect(
+        Schema.decodeUnknownSync(ConfigV1.Info)({
+          usage_limit_recovery: { auto_resume: false, snooze_until_reset: true },
+        }).usage_limit_recovery,
+      ).toEqual({ auto_resume: false, snooze_until_reset: true })
+    }),
+  )
+
   it.effect("migrates arbitrary v1 configuration into valid v2 configuration", () =>
     Effect.sync(() => {
       FastCheck.assert(
@@ -84,6 +95,87 @@ describe("Config", () => {
         }),
         { numRuns: 100 },
       )
+    }),
+  )
+
+  it.effect("normalizes legacy execute permission without overriding explicit code", () =>
+    Effect.sync(() => {
+      const legacyFirst = Schema.decodeUnknownSync(ConfigV1.Info)({
+        permission: { execute: "deny", code: "allow", "*": "ask" },
+      })
+      expect(legacyFirst.permission).toEqual({ code: "allow", "*": "ask" })
+
+      const legacyLast = Schema.decodeUnknownSync(ConfigV1.Info)({
+        permission: { code: "allow", execute: "deny" },
+      })
+      expect(legacyLast.permission).toEqual({ code: "allow" })
+    }),
+  )
+
+  it.effect("migrates legacy tools.execute to code while explicit tools.code always wins", () =>
+    Effect.sync(() => {
+      expect(
+        ConfigMigrateV1.migrate({
+          tools: { execute: false },
+        }).permissions,
+      ).toEqual([{ action: "code", resource: "*", effect: "deny" }])
+
+      expect(
+        ConfigMigrateV1.migrate({
+          tools: { code: true, execute: false },
+        }).permissions,
+      ).toEqual([{ action: "code", resource: "*", effect: "allow" }])
+
+      expect(
+        ConfigMigrateV1.migrate({
+          tools: { execute: false, code: true },
+        }).permissions,
+      ).toEqual([{ action: "code", resource: "*", effect: "allow" }])
+    }),
+  )
+
+  it.effect("normalizes agent.tools.execute to code and preserves explicit agent code precedence", () =>
+    Effect.sync(() => {
+      const decoded = Schema.decodeUnknownSync(ConfigV1.Info)({
+        agent: {
+          legacy: {
+            tools: { execute: false },
+          },
+          explicit: {
+            tools: { execute: false },
+            permission: { code: "allow" },
+          },
+          ordered: {
+            tools: { code: true, execute: false },
+          },
+        },
+      })
+
+      expect(decoded.agent?.legacy?.permission).toEqual({ code: "deny" })
+      expect(decoded.agent?.explicit?.permission).toEqual({ code: "allow" })
+      expect(decoded.agent?.ordered?.permission).toEqual({ code: "allow" })
+      expect(decoded.agent?.legacy?.permission).not.toHaveProperty("execute")
+      expect(decoded.agent?.explicit?.permission).not.toHaveProperty("execute")
+
+      const migrated = ConfigMigrateV1.migrate({
+        agent: {
+          legacy: { tools: { execute: false } },
+          explicit: { tools: { execute: false }, permission: { code: "allow" } },
+          ordered: { tools: { code: true, execute: false } },
+        },
+      })
+      expect(migrated.agents?.legacy?.permissions).toEqual([
+        { action: "code", resource: "*", effect: "deny" },
+      ])
+      expect(migrated.agents?.explicit?.permissions).toEqual([
+        { action: "code", resource: "*", effect: "deny" },
+        { action: "code", resource: "*", effect: "allow" },
+      ])
+      expect(migrated.agents?.ordered?.permissions).toEqual([
+        { action: "code", resource: "*", effect: "allow" },
+      ])
+      expect(migrated.agents?.legacy?.permissions?.some((rule) => rule.action === "execute")).toBe(false)
+      expect(migrated.agents?.explicit?.permissions?.some((rule) => rule.action === "execute")).toBe(false)
     }),
   )
 

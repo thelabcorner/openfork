@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { and, asc, eq, inArray, lt, sql } from "drizzle-orm"
 import type { DatabaseShape } from "./database/database"
 import type { SqliteMaintenanceQuietGate } from "./database/sqlite-maintenance"
@@ -210,6 +210,9 @@ export const reclaimOrphanedEventPayloads = Effect.fnUntraced(function* (
     readonly now?: number
     readonly limit?: number
     readonly quietGate?: SqliteMaintenanceQuietGate
+    /** Whole-pass foreground-quiet admission budget. On expiration return
+     * with hasMore=true WITHOUT acquiring any SQLite writer reservation. */
+    readonly quietWaitBudgetMs?: number
   },
 ) {
   const now = options?.now ?? Date.now()
@@ -224,8 +227,19 @@ export const reclaimOrphanedEventPayloads = Effect.fnUntraced(function* (
     .pipe(Effect.orDie)
 
   let reclaimed = 0
+  const idleDeadline = options?.quietWaitBudgetMs === undefined
+    ? undefined
+    : performance.now() + Math.max(0, options.quietWaitBudgetMs)
   for (const candidate of candidates.slice(0, limit)) {
-    if (options?.quietGate) yield* options.quietGate.wait()
+    if (options?.quietGate) {
+      if (idleDeadline === undefined) yield* options.quietGate.wait()
+      else {
+        const remaining = idleDeadline - performance.now()
+        if (remaining <= 0) return { reclaimed, hasMore: true, deferred: true }
+        const admitted = yield* Effect.timeoutOption(options.quietGate.wait(), Math.ceil(remaining))
+        if (Option.isNone(admitted)) return { reclaimed, hasMore: true, deferred: true }
+      }
+    }
     const deleted = yield* db
       .transaction(
         (tx) =>

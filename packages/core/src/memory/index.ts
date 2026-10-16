@@ -29,13 +29,15 @@ const MAX_CONTENT = 8000
 const MAX_TITLE = 200
 const DEFAULT_TOPIC = "general"
 
-/** Topic keys seeded for every project so the map is never empty. */
-const SEED_TOPICS: ReadonlyArray<{ key: string; title: string; description: string }> = [
-  { key: "architecture", title: "Architecture", description: "Structure, boundaries, and design rationale." },
-  { key: "workflows", title: "Workflows", description: "Build, test, release, and repo conventions." },
-  { key: "known-failures", title: "Known failures", description: "Rejected approaches and recurring regressions." },
-  { key: "user-corrections", title: "User corrections", description: "Explicit corrections of agent behavior." },
-]
+// Do not run the secondary exact-anchor FTS lane for ubiquitous routing terms.
+// It materially helps rare source symbols after top-N truncation, but adds a
+// second SQLite rank scan to generic requests such as "memory latency".
+const COMMON_ANCHORS = new Set([
+  "memory", "memories", "latency", "search", "session", "sessions",
+  "project", "projects", "retrieval", "context", "runtime", "openfork",
+  "opencode", "history", "historical", "query", "queries", "tool", "tools",
+])
+
 
 export type MemoryError =
   | MemorySchema.NotFoundError
@@ -45,10 +47,16 @@ export type MemoryError =
 export interface Interface {
   readonly map: (context: MemorySchema.Context) => Effect.Effect<string>
   readonly topics: (context: MemorySchema.Context) => Effect.Effect<MemorySchema.Topic[]>
+  /** One read projection for callers displaying a map and its topic count. */
+  readonly mapDetails: (context: MemorySchema.Context) => Effect.Effect<{
+    map: string
+    topics: MemorySchema.Topic[]
+  }>
   readonly search: (input: MemorySchema.SearchInput) => Effect.Effect<MemorySchema.SearchHit[]>
   readonly get: (input: {
     id: string
     context: MemorySchema.Context
+    trackAccess?: boolean
   }) => Effect.Effect<MemorySchema.Entry, MemorySchema.NotFoundError>
   readonly evidence: (id: string) => Effect.Effect<MemorySchema.Evidence[]>
   readonly timeline: (input: {
@@ -96,61 +104,101 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
       if (includeGlobal) clauses.push(sql`(e.scope = 'global' AND e.project_id IS NULL)`)
       if (includeProject) clauses.push(sql`(e.scope = 'project' AND e.project_id = ${context.projectID})`)
       if (includeWorkspace && context.workspaceID)
-        clauses.push(sql`(e.scope = 'workspace' AND e.workspace_id = ${context.workspaceID})`)
+        clauses.push(sql`(e.scope = 'workspace' AND e.project_id = ${context.projectID} AND e.workspace_id = ${context.workspaceID})`)
       if (clauses.length === 0) return sql`1 = 0`
       return sql`(${sql.join(clauses, sql` OR `)})`
     }
 
-    const seedTopics = Effect.fn("Memory.seedTopics")(function* (context: MemorySchema.Context) {
-      for (const topic of SEED_TOPICS) {
-        yield* store.upsertTopic({
-          scope: "project",
-          projectID: context.projectID,
-          workspaceID: null,
-          key: topic.key,
-          title: topic.title,
-          description: topic.description,
-        })
-      }
+    const topics = Effect.fn("Memory.topics")(function* (context: MemorySchema.Context) {
+      return yield* store.topics(context)
+    })
+
+    const mapDetails = Effect.fn("Memory.mapDetails")(function* (context: MemorySchema.Context) {
+      if (!enabled()) return { map: "", topics: [] as MemorySchema.Topic[] }
+      // One read snapshot; no implicit topic writes, and no duplicated
+      // topic+entry-count queries when the caller needs both projections.
+      const list = yield* topics(context)
+      return { map: MemoryProjection.renderMap(list), topics: list }
     })
 
     const map = Effect.fn("Memory.map")(function* (context: MemorySchema.Context) {
-      if (!enabled()) return yield* Effect.succeed("")
-      yield* seedTopics(context)
-      const topics = yield* store.topics(context)
-      const rendered = MemoryProjection.renderMap(topics)
-      return rendered.length === 0 ? "" : rendered
-    })
-
-    const topics = Effect.fn("Memory.topics")(function* (context: MemorySchema.Context) {
-      yield* seedTopics(context)
-      return yield* store.topics(context)
+      return (yield* mapDetails(context)).map
     })
 
     const search = Effect.fn("Memory.search")(function* (input: MemorySchema.SearchInput) {
       if (!enabled()) return [] as MemorySchema.SearchHit[]
-      const limit = Math.min(Math.max(input.limit ?? DEFAULT_LIMIT, 1), MAX_LIMIT)
+      const requestedLimit = input.limit ?? DEFAULT_LIMIT
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(MAX_LIMIT, Math.floor(requestedLimit)))
+        : DEFAULT_LIMIT
       const match = MemoryAnchors.matchQuery(input.query)
-      const terms = MemoryAnchors.queryTerms(input.query)
       if (!match) return [] as MemorySchema.SearchHit[]
+      if (input.kinds?.length === 0) return [] as MemorySchema.SearchHit[]
+
+      // Filter eligibility before FTS ranking. Otherwise a rare requested
+      // memory kind can disappear behind a top-N pool of unrelated kinds.
+      // History includes superseded/quarantined, never forgotten tombstones.
+      const eligibleStatuses = input.includeHistory
+        ? sql`e.status IN ('active', 'superseded', 'quarantined')`
+        : sql`e.status = 'active'`
+      const eligibleKinds = input.kinds?.length
+        ? sql` AND e.kind IN (${sql.join(input.kinds.map((kind) => sql`${kind}`), sql`, `)})`
+        : sql``
 
       // Rank in the FTS layer first (narrow rowid+score rows), then join only
       // the top-N. The scope filter is applied BEFORE ranking by intersecting
       // FTS matches with scoped rowids, so bm25 sort stays bounded by the
       // scoped set and cross-project rows can never enter the ranking.
-      const ranked = sql`
+      const rankedFTS = sql`
         SELECT f.rowid AS rowid, bm25(memory_entry_fts) AS score
         FROM memory_entry_fts f
         JOIN (
           SELECT e.rowid
           FROM memory_entry e
           WHERE ${scopeClause(input.context, input.scope)}
-            AND e.status = 'active'
+            AND ${eligibleStatuses}${eligibleKinds}
         ) scoped ON scoped.rowid = f.rowid
         WHERE memory_entry_fts MATCH ${match}
         ORDER BY bm25(memory_entry_fts)
         LIMIT ${limit * 4}`
-      const anchors = MemoryAnchors.extract(input.query).map((anchor) => anchor.normalized)
+      const queryAnchors = MemoryAnchors.extract(input.query)
+      const anchors = queryAnchors.map((anchor) => anchor.normalized)
+
+      // A post-FTS exact-anchor boost cannot recover an exact source symbol
+      // discarded by the FTS top-N LIMIT. Include a second *indexed* candidate
+      // lane from memory_anchor.normalized, but require the SAME FTS MATCH and
+      // scope/status/kind checks so no weakly related anchor-only hit leaks in.
+      // Both lanes are bounded before the wider row/evidence hydration.
+      const exactAnchors = [...new Set(queryAnchors
+        .filter((anchor) => !COMMON_ANCHORS.has(anchor.normalized) &&
+          (anchor.normalized.length >= 8 ||
+            (anchor.normalized.length >= 3 && anchor.kind !== "identifier") ||
+            /[a-z][0-9]|[0-9][a-z]/.test(anchor.normalized)))
+        .map((anchor) => anchor.normalized))].slice(0, 8)
+      const ranked = exactAnchors.length === 0 ? rankedFTS : sql`
+        WITH fts_candidates AS (${rankedFTS}),
+        exact_candidate_ids AS (
+          SELECT DISTINCT e.rowid
+          FROM memory_anchor a
+          JOIN memory_entry e ON e.id = a.memory_id
+          WHERE a.normalized IN (${sql.join(exactAnchors.map((anchor) => sql`${anchor}`), sql`, `)})
+            AND ${scopeClause(input.context, input.scope)}
+            AND ${eligibleStatuses}${eligibleKinds}
+          ORDER BY e.time_updated DESC
+          LIMIT ${limit * 12}
+        ),
+        exact_candidates AS (
+          SELECT f.rowid AS rowid, bm25(memory_entry_fts) AS score
+          FROM memory_entry_fts f
+          JOIN exact_candidate_ids x ON x.rowid = f.rowid
+          WHERE memory_entry_fts MATCH ${match}
+          LIMIT ${limit * 8}
+        )
+        SELECT rowid, min(score) AS score FROM (
+          SELECT rowid, score FROM fts_candidates
+          UNION ALL
+          SELECT rowid, score FROM exact_candidates
+        ) GROUP BY rowid`
 
       const rows = yield* store.searchRanked({
         ranked,
@@ -161,19 +209,23 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
       })
 
       // Bump usage off the read critical path (no write amplification per open).
-      yield* store.touch(rows.map((row) => row.id)).pipe(
-        Effect.ignore,
-        Effect.forkIn(scope),
-      )
+      if (input.trackAccess !== false) {
+        yield* store.touch(rows.map((row) => row.id)).pipe(
+          Effect.ignore,
+          Effect.forkIn(scope),
+        )
+      }
 
       return rows
     })
 
-    const get = Effect.fn("Memory.get")(function* (input: { id: string; context: MemorySchema.Context }) {
+    const get = Effect.fn("Memory.get")(function* (input: { id: string; context: MemorySchema.Context; trackAccess?: boolean }) {
       const entry = yield* store.get(input.id)
       if (!entry) return yield* new MemorySchema.NotFoundError({ id: input.id })
       if (!visible(entry, input.context)) return yield* new MemorySchema.NotFoundError({ id: input.id })
-      yield* store.touch([entry.id]).pipe(Effect.ignore, Effect.forkIn(scope))
+      if (input.trackAccess !== false) {
+        yield* store.touch([entry.id]).pipe(Effect.ignore, Effect.forkIn(scope))
+      }
       return entry
     })
 
@@ -262,7 +314,12 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
       const hash = MemorySchema.contentHash({ scope, kind, stableKey: input.stableKey, content })
 
       // Exact duplicate in the same slot is a NOOP, not a second row.
-      const existing = yield* store.findByHash({ scope, hash })
+       const existing = yield* store.findByHash({
+         scope,
+         projectID: scope === "global" ? null : input.context.projectID,
+         workspaceID: scope === "workspace" ? input.context.workspaceID : null,
+         hash,
+       })
       if (existing) return existing
 
       const entry = yield* store.insert({
@@ -314,14 +371,15 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
       yield* store.tombstone(entry, input.reason).pipe(Effect.orDie)
     })
 
-    return Service.of({ map, topics, search, get, evidence, timeline, open, remember, forget })
+    return Service.of({ map, topics, mapDetails, search, get, evidence, timeline, open, remember, forget })
   }),
 )
 
 function visible(entry: MemorySchema.Entry, context: MemorySchema.Context): boolean {
   if (entry.scope === "global") return true
   if (entry.scope === "project") return entry.project_id === context.projectID
-  return entry.workspace_id !== null && entry.workspace_id === context.workspaceID
+  return entry.project_id === context.projectID &&
+    entry.workspace_id !== null && entry.workspace_id === context.workspaceID
 }
 
 function sourceOrigin(evidence: ReadonlyArray<{ source_type: MemorySchema.EvidenceSource }>): MemorySchema.Origin {

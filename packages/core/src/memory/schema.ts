@@ -204,6 +204,8 @@ export const SearchInput = Schema.Struct({
   limit: Schema.optional(Schema.Number),
   /** Include superseded/quarantined rows. Default false (current truth only). */
   includeHistory: Schema.optional(Schema.Boolean),
+  /** Host-only opt-out of last-used telemetry updates for strict inspection agents. */
+  trackAccess: Schema.optional(Schema.Boolean),
 }).annotate({ identifier: "MemorySearchInput" })
 export type SearchInput = typeof SearchInput.Type
 

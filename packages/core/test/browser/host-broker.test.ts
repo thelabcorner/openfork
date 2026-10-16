@@ -412,12 +412,15 @@ interface HostHandle {
   readonly url: string
   readonly close: () => Promise<void>
   readonly abortCalls: () => number
+  /** How many operation envelopes actually reached the host. */
   readonly release: () => void
+  readonly requestCount: () => number
 }
 
 function startHost(behavior: Behavior): Promise<HostHandle> {
   return new Promise((resolve) => {
     let abortCalls = 0
+    let requestCalls = 0
     let release: () => void = () => {}
     const pending: Array<{ res: ServerResponse }> = []
     const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -431,9 +434,11 @@ function startHost(behavior: Behavior): Promise<HostHandle> {
       req.on("data", (chunk) => (body += chunk))
       req.on("end", () => {
         if (behavior.type === "close") {
+          requestCalls++
           req.socket.destroy()
           return
         }
+        requestCalls++
         if (behavior.type === "hold") {
           pending.push({ res })
           return
@@ -479,6 +484,7 @@ function startHost(behavior: Behavior): Promise<HostHandle> {
           }),
         abortCalls: () => abortCalls,
         release,
+        requestCount: () => requestCalls,
       })
     })
   })
@@ -488,6 +494,20 @@ const withHost = (behavior: Behavior) => <A, E, R>(use: (host: HostHandle) => Ef
   Effect.gen(function* () {
     const host = yield* Effect.promise(() => startHost(behavior))
     return yield* use(host).pipe(Effect.ensuring(Effect.promise(() => host.close())))
+  })
+
+/**
+ * Wait until an operation envelope has actually reached the host.
+ *
+ * Tests that assert post-forward certainty must prove the forward HAPPENED, so
+ * they wait on the host's published arrival counter rather than on wall-clock.
+ */
+const untilRequested = (host: HostHandle) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 400; attempt++) {
+      if (host.requestCount() > 0) return
+      yield* Effect.sleep("5 millis")
+    }
   })
 
 // --- registry (window-keyed) --------------------------------------------------
@@ -766,6 +786,97 @@ describe("BrowserHostBroker dispatch", () => {
   )
 })
 
+// --- forward-boundary certainty ----------------------------------------------
+//
+// Once the envelope reaches the host transport, a lost response cannot prove the
+// operation did NOT run. That certainty is carried as a verified payload field
+// (never inferred from message text) so mutating callers can refuse to replay
+// blindly while read-only callers stay safely repeatable.
+
+describe("BrowserHostBroker dispatch certainty", () => {
+  it.live("a pre-dispatch rejection is not_dispatched and stays retryable", () =>
+    Effect.gen(function* () {
+      const broker = yield* BrowserHostBroker.Service
+      const response = yield* broker.dispatch(statusRequest())
+      expect(response.ok).toBe(false)
+      if (response.ok) return
+      expect(response.error.tag).toBe("BrowserHostUnavailable")
+      expect(response.error.certainty).toBe("not_dispatched")
+      expect(response.error.retryable).toBe(true)
+    }),
+  )
+
+  it.live("an ownership rejection is not_dispatched", () =>
+    withHost({ type: "ok" })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_a", "ses_other")))
+        const response = yield* broker.dispatch(request({ tabId: "tab_a" }))
+        expect(response.ok).toBe(false)
+        if (response.ok) return
+        expect(response.error.tag).toBe("BrowserPermissionDenied")
+        expect(response.error.certainty).toBe("not_dispatched")
+        expect(host.requestCount()).toBe(0)
+      }),
+    ),
+  )
+
+  it.live("an already-aborted signal is not_dispatched and never reaches the host", () =>
+    withHost({ type: "ok" })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        const controller = new AbortController()
+        controller.abort()
+        const response = yield* broker.dispatch(statusRequest({ timeoutMs: 30_000 }), { signal: controller.signal })
+        expect(response.ok).toBe(false)
+        if (response.ok) return
+        expect(response.error.tag).toBe("BrowserControlInterrupted")
+        expect(response.error.certainty).toBe("not_dispatched")
+        expect(response.error.retryable).toBe(true)
+        yield* Effect.sleep("50 millis")
+        expect(host.requestCount()).toBe(0)
+      }),
+    ),
+  )
+
+  it.live("transport loss after the forward is dispatched_unconfirmed and not retryable", () =>
+    withHost({ type: "close" })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_m", "ses_1")))
+        const response = yield* broker.dispatch(
+          request({ operation: { name: "click", input: {} }, tabId: "tab_m" }),
+        )
+        expect(response.ok).toBe(false)
+        if (response.ok) return
+        expect(response.error.certainty).toBe("dispatched_unconfirmed")
+        expect(response.error.retryable).toBe(false)
+        expect(host.requestCount()).toBe(1)
+      }),
+    ),
+  )
+
+  it.live("a host-reported error arm carries no certainty (the host answered)", () =>
+    withHost({ type: "error", tag: "BrowserOperationFailed" })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_m", "ses_1")))
+        const response = yield* broker.dispatch(
+          request({ operation: { name: "click", input: {} }, tabId: "tab_m" }),
+        )
+        expect(response.ok).toBe(false)
+        if (response.ok) return
+        expect(response.error.tag).toBe("BrowserOperationFailed")
+        expect(response.error.certainty).toBeUndefined()
+      }),
+    ),
+  )
+})
+
 // --- replacement + abort ------------------------------------------------------
 
 describe("BrowserHostBroker replacement + abort", () => {
@@ -822,6 +933,60 @@ describe("BrowserHostBroker replacement + abort", () => {
         const outcome = yield* Fiber.join(fiber)
         expect(outcome.ok).toBe(false)
         if (!outcome.ok) expect(outcome.error.tag).toBe("BrowserControlInterrupted")
+      }),
+    ),
+  )
+
+  // The envelope was already handed to the host when the interruption won the
+  // race, so a mutating operation may have executed. Recording that as
+  // dispatched_unconfirmed is what stops a caller from replaying it blindly.
+  it.live("superseding an in-flight MUTATION is dispatched_unconfirmed and not retryable", () =>
+    withHost({ type: "hold" })((oldHost) =>
+      withHost({ type: "ok" })((newHost) =>
+        Effect.gen(function* () {
+          const broker = yield* BrowserHostBroker.Service
+          yield* broker.register({ ...baseHello, connectionId: "conn-old", callbackUrl: oldHost.url })
+          yield* broker.pushEvent(stateChanged(agentTab("tab_m", "ses_1")))
+          const scope = yield* Effect.scope
+          const fiber = yield* broker
+            .dispatch(request({ operation: { name: "click", input: {} }, tabId: "tab_m", timeoutMs: 30_000 }))
+            .pipe(Effect.forkIn(scope))
+          yield* untilRequested(oldHost)
+          yield* broker.register({ ...baseHello, connectionId: "conn-new", callbackUrl: newHost.url })
+          const outcome = yield* Fiber.join(fiber)
+          expect(outcome.ok).toBe(false)
+          if (outcome.ok) return
+          expect(outcome.error.tag).toBe("BrowserControlInterrupted")
+          expect(outcome.error.certainty).toBe("dispatched_unconfirmed")
+          expect(outcome.error.retryable).toBe(false)
+          expect(oldHost.requestCount()).toBeGreaterThanOrEqual(1)
+        }),
+      ),
+    ),
+  )
+
+  it.live("aborting an in-flight MUTATION is dispatched_unconfirmed and not retryable", () =>
+    withHost({ type: "hold" })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_m", "ses_1")))
+        const controller = new AbortController()
+        const scope = yield* Effect.scope
+        const fiber = yield* broker
+          .dispatch(request({ operation: { name: "click", input: {} }, tabId: "tab_m", timeoutMs: 30_000 }), {
+            signal: controller.signal,
+          })
+          .pipe(Effect.forkIn(scope))
+        yield* untilRequested(host)
+        controller.abort()
+        const outcome = yield* Fiber.join(fiber)
+        expect(outcome.ok).toBe(false)
+        if (outcome.ok) return
+        expect(outcome.error.tag).toBe("BrowserControlInterrupted")
+        expect(outcome.error.certainty).toBe("dispatched_unconfirmed")
+        expect(outcome.error.retryable).toBe(false)
+        expect(host.requestCount()).toBeGreaterThanOrEqual(1)
       }),
     ),
   )

@@ -9,16 +9,19 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SkillV2 } from "@opencode-ai/core/skill"
 import { SkillDiscovery } from "@opencode-ai/core/skill/discovery"
+import { SkillRevision } from "@opencode-ai/core/skill/revision"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const urls = new Map<string, AbsolutePath[]>()
 let pulls = 0
+let blockPulls = false
 const discovery = Layer.succeed(
   SkillDiscovery.Service,
   SkillDiscovery.Service.of({
     pull: (url) => {
       pulls++
+      if (blockPulls) return Effect.never
       return Effect.succeed(urls.get(url) ?? [])
     },
   }),
@@ -116,8 +119,85 @@ describe("SkillV2", () => {
 
           expect((yield* skill.list()).map((item) => item.name)).toEqual(["deploy"])
           expect((yield* skill.list()).map((item) => item.name)).toEqual(["deploy"])
+          // Registration admits off the send path; explicit reads reuse that
+          // admission instead of re-pulling the same remote source.
           expect(pulls).toBe(1)
           expect(SkillV2.available(yield* skill.list(), (yield* agents.get(AgentV2.ID.make("reviewer")))!)).toEqual([])
+        }),
+      ),
+    ),
+  )
+
+  it.live("reads the admitted snapshot without any remote discovery", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await fs.mkdir(path.join(tmp.path, "deploy"), { recursive: true })
+            await write(tmp.path, "deploy", "Deploy production")
+          })
+          urls.set("https://example.test/skills/", [AbsolutePath.make(tmp.path)])
+
+          // A remote source whose discovery would never complete. Any read path
+          // that reached discovery would hang instead of returning, so a prompt
+          // arriving here cannot be blocking on a socket.
+          blockPulls = true
+          pulls = 0
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) => editor.source({ type: "url", url: "https://example.test/skills/" }))
+          // Registration records intent and performs no discovery at all.
+          expect(pulls).toBe(0)
+          expect(yield* skill.admitted()).toEqual([])
+          expect(yield* skill.admit("deploy")).toBeUndefined()
+          expect(yield* skill.admitted()).toEqual([])
+
+          // An explicit refresh is the only discovering step, and it is the only
+          // one that reaches the network.
+          blockPulls = false
+          pulls = 0
+          yield* skill.refresh()
+          expect(pulls).toBe(1)
+          expect((yield* skill.admitted()).map((entry) => entry.info.name)).toEqual(["deploy"])
+
+          // Once admitted, snapshot reads stay free forever.
+          pulls = 0
+          expect(yield* skill.admit("deploy")).toBeDefined()
+          expect((yield* skill.admitted()).map((entry) => entry.info.name)).toEqual(["deploy"])
+          expect(pulls).toBe(0)
+        }),
+      ),
+    ),
+  )
+
+  it.live("publishes an admitted revision for a remote skill that a later explicit read reuses", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const directory = path.join(tmp.path, "deploy")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(directory, { recursive: true })
+            await write(tmp.path, "deploy", "Deploy production")
+            await fs.writeFile(path.join(directory, "reference.md"), "notes")
+          })
+          urls.set("https://example.test/skills/", [AbsolutePath.make(tmp.path)])
+
+          pulls = 0
+          const skill = yield* SkillV2.Service
+          yield* skill.transform((editor) => editor.source({ type: "url", url: "https://example.test/skills/" }))
+          yield* skill.list()
+
+          const admission = yield* skill.admit("deploy")
+          expect(admission?.revision.origin).toBe("remote")
+          expect(SkillRevision.identity(admission!.revision).startsWith("remote:")).toBe(true)
+          const pinned = SkillRevision.identity(admission!.revision)
+          expect(pinned).toBe(SkillRevision.identity((yield* skill.admit("deploy"))!.revision))
+          expect(yield* skill.admitted()).toHaveLength(1)
         }),
       ),
     ),

@@ -11,6 +11,26 @@ This folder owns Core's one local tool representation, process and Location regi
 
 Do not add a second executable entry type, registry-owned executor, authorization callback, output-path callback, or legacy normalization path.
 
+## Cross-surface executable parity
+
+Before changing a Core built-in, application registration, tool definition,
+or invocation contract, read the root `AGENTS.md` and
+`docs/architecture/tool-surface-parity.md`. A tool class supported by normal
+chat/worker Sessions, Code Mode, OXP, OFXP, ACP, MCP, or another tool-capable
+entry point must have an executable, semantically equivalent path there
+or an explicitly documented, reviewed, tested boundary. Catalog visibility
+and static coverage mappings do **not** prove that execution works.
+
+Core remains the owner of its canonical tool registration/settlement; the V1
+production `ToolRegistry` remains a distinct lifecycle. Share domain
+services and schemas where appropriate, but do not add a second Core registry
+or make external protocols own leaf semantics. The host adapters preserve
+actual Session/Location context, explicit peer/root principals, lazy loading,
+leaf authorization, revocation, cancellation, outputs, and settlement.
+Dynamic application/MCP registrations do not become remotely exportable merely
+because they exist. Require dispatcher-backed parity tests and update the
+tool-by-surface matrix when changing any supported execution contract.
+
 ## Construction
 
 Tool schemas and projection use `input` and `output` terminology. A tool value is opaque: its codecs, executor, definition derivation, and catalog permission declaration are private runtime details.
