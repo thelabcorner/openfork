@@ -17,7 +17,8 @@ export const { use: useMarked, provider: MarkedProvider } = createSimpleContext(
         langs: [],
         preferredHighlighter: "shiki-wasm",
       })
-      const name = language in bundledLanguages ? language : "text"
+      const languageID = language.trim().split(/\s+/, 1)[0]?.toLowerCase()
+      const name = languageID && Object.hasOwn(bundledLanguages, languageID) ? languageID : "text"
       if (!highlighter.getLoadedLanguages().includes(name)) await highlighter.loadLanguage(name as BundledLanguage)
       return highlighter.codeToHtml(code, {
         lang: name,

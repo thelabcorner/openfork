@@ -9,6 +9,30 @@
     --syntax-property: light-dark(#a753ae, #fab283);
     --syntax-type: light-dark(#8a6f00, #fcd53a);
     --syntax-critical: light-dark(#ff8c00, #fab283);
+    --syntax-code-foreground: light-dark(#262626, #bcbec4);
+    --syntax-code-comment: light-dark(#70757c, #7b7f86);
+    --syntax-code-regexp: light-dark(#a13a00, #e8bf6a);
+    --syntax-code-keyword: light-dark(#0033b3, #cf8e6d);
+    --syntax-code-string: light-dark(#067d17, #6aab73);
+    --syntax-code-primitive: light-dark(#00627a, #56a8f5);
+    --syntax-code-operator: light-dark(#555555, #bcbec4);
+    --syntax-code-variable: light-dark(#262626, #bcbec4);
+    --syntax-code-property: light-dark(#871094, #c77dbb);
+    --syntax-code-type: light-dark(#7a3e9d, #c77dbb);
+    --syntax-code-constant: light-dark(#1750eb, #2aacb8);
+    --syntax-code-punctuation: light-dark(#666666, #a0a0a0);
+    --syntax-code-object: light-dark(#262626, #bcbec4);
+    --syntax-code-function: light-dark(#00627a, #56a8f5);
+    --syntax-code-method: light-dark(#00627a, #56a8f5);
+    --syntax-code-parameter: light-dark(#262626, #bcbec4);
+    --syntax-code-number: light-dark(#1750eb, #2aacb8);
+    --syntax-code-decorator: light-dark(#9b6a00, #e8bf6a);
+    --syntax-code-tag: light-dark(#0033b3, #cf8e6d);
+    --syntax-code-attribute: light-dark(#871094, #c77dbb);
+    --syntax-code-builtin: light-dark(#00627a, #8888c6);
+    --syntax-code-namespace: light-dark(#7a3e9d, #c77dbb);
+    --syntax-code-label: light-dark(#005fad, #56a8f5);
+    --syntax-code-info: light-dark(#005fad, #56a8f5);
   }
 
   :root {
@@ -142,6 +166,7 @@
 
     --font-family-text: "Inter", sans-serif;
     --v2-font-family-sans: "Inter", sans-serif;
+    --v2-font-family-mono: var(--font-family-mono);
   }
 
   /* OS preference fallback (no JS needed) */
