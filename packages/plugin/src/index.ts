@@ -245,9 +245,9 @@ export type ProviderHook = {
   id: string
   models?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
   /**
-   * Optional demand-driven model discovery. Unlike `models`, this is not part
-   * of passive all-provider catalog initialization; the host invokes it when
-   * this provider is actually selected.
+   * Optional live model discovery. Unlike `models`, this does not block
+   * passive all-provider catalog initialization; by default the host invokes
+   * it when this provider is actually selected.
    */
   discoverModels?: (provider: ProviderV2, ctx: ProviderHookContext) => Promise<Record<string, ModelV2>>
   /**

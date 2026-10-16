@@ -76,12 +76,15 @@ import { useClipboard } from "../../context/clipboard"
 import { nextThinkingMode, reasoningSummary, useThinkingMode, type ThinkingMode } from "../../context/thinking"
 import { getScrollAcceleration } from "../../util/scroll"
 import { collapseToolOutput } from "../../util/collapse-tool-output"
+import { codeTracePresentation } from "../../util/code-trace-presentation"
 import { usePluginRuntime } from "../../plugin/runtime"
 import { DialogRetryAction } from "../../component/dialog-retry-action"
 import { getRevertDiffFiles } from "../../util/revert-diff"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useOpencodeKeymap } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
 import { LocationProvider } from "../../context/location"
+import { isCodeRunTrace } from "@opencode-ai/core/v1/session"
+import { isUnavailableReasoningSentinel } from "@opencode-ai/core/reasoning-sentinel"
 
 addDefaultParsers(parsers.parsers)
 
@@ -1606,11 +1609,14 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   // layout never shifts. Click to open the full markdown block, click to close.
   const [expanded, setExpanded] = createSignal(false)
 
+  const unavailable = createMemo(() => isUnavailableReasoningSentinel(props.part.text))
   const content = createMemo(() => {
-    // OpenRouter encrypts some reasoning blocks; drop the placeholder.
+    // Preserve provider bytes in history, but do not render missing-reasoning
+    // notices or OpenRouter encrypted-content placeholders as actual thoughts.
+    if (unavailable()) return ""
     return props.part.text.replace("[REDACTED]", "").trim()
   })
-  const opaque = createMemo(() => !content() && Boolean(props.part.metadata))
+  const opaque = createMemo(() => !unavailable() && !content() && Boolean(props.part.metadata))
   // Reasoning is finalized when the server sets `time.end` (see processor.ts).
   // Flips independently of the parent message completing.
   const isDone = createMemo(() => props.part.time.end !== undefined)
@@ -1784,8 +1790,8 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={display() === "task"}>
           <Task {...toolprops} />
         </Match>
-        <Match when={display() === "execute"}>
-          <Execute {...toolprops} />
+        <Match when={display() === "code"}>
+          <Code {...toolprops} />
         </Match>
         <Match when={display() === "apply_patch"}>
           <ApplyPatch {...toolprops} />
@@ -2369,35 +2375,31 @@ export function formatCompletedSubagentDetail(toolcalls: number, duration: strin
   return `${formatSubagentToolcalls(toolcalls)} · ${duration}`
 }
 
-type ExecuteCall = { tool: string; status: "running" | "completed" | "error"; input?: Record<string, unknown> }
-
-function executeCalls(value: unknown): ExecuteCall[] {
-  if (!Array.isArray(value)) return []
-  return value.flatMap((call) => {
-    const item = recordValue(call)
-    const tool = stringValue(item?.tool)
-    const status = stringValue(item?.status)
-    if (!tool || !status || !["running", "completed", "error"].includes(status)) return []
-    return [{ tool, status: status as ExecuteCall["status"], input: recordValue(item?.input) }]
-  })
-}
-
-// The `execute` tool streams child tool calls through metadata, not a child session like Task.
-function Execute(props: ToolProps) {
+function Code(props: ToolProps) {
   const ctx = use()
   const { theme } = useTheme()
   const isLoading = createMemo(() => props.part.state.status === "pending" || props.part.state.status === "running")
-  const calls = createMemo(() => executeCalls(props.metadata.toolCalls))
+  const action = createMemo(() => stringValue(props.metadata.action) ?? stringValue(props.input.action) ?? "run")
+  const trace = createMemo(() => (isCodeRunTrace(props.metadata.trace) ? props.metadata.trace : undefined))
+  const saved = createMemo(() => recordValue(props.metadata.saved))
   const output = createMemo(() => stripAnsi(props.output?.trim() ?? ""))
   const hasRuntimeError = createMemo(() => props.metadata.error === true)
   const outputPreview = createMemo(() => collapseToolOutput(output(), 4, 4 * Math.max(20, ctx.width - 6)).output)
   const showOutput = createMemo(() => output() && hasRuntimeError())
   const content = createMemo(() => {
-    const lines = ["execute"]
-    for (const call of calls()) {
-      const args = input(call.input ?? {})
-      lines.push(`↳ ${call.tool}${args ? ` ${args}` : ""}${call.status === "error" ? " (failed)" : ""}`)
-    }
+    const target =
+      action() === "call"
+        ? stringValue(props.input.tool)
+        : action() === "describe"
+          ? stringValue(props.input.ref)
+          : action() === "search"
+            ? stringValue(props.input.target) ?? "callable"
+            : stringValue(props.metadata.runID)
+    const lines = [`code ${action()}${target ? `  ${target}` : ""}`]
+    const savedID = stringValue(saved()?.id)
+    if (savedID) lines.push(`↳ saved ${savedID}`)
+    const currentTrace = trace()
+    if (currentTrace) lines.push(...codeTracePresentation(currentTrace))
     return lines.join("\n")
   })
 
@@ -2407,7 +2409,7 @@ function Execute(props: ToolProps) {
         icon={hasRuntimeError() ? "✗" : props.part.state.status === "completed" ? "✓" : "│"}
         color={hasRuntimeError() ? theme.error : undefined}
         spinner={isLoading()}
-        pending="execute"
+        pending="code"
         complete={true}
         part={props.part}
       >
@@ -2680,7 +2682,7 @@ const toolDisplays = new Set([
   "todowrite",
   "question",
   "skill",
-  "execute",
+  "code",
 ])
 
 export function toolDisplay(tool: string) {
