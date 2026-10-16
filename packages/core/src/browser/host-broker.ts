@@ -56,11 +56,34 @@ export type BrowserErrorTag =
   | "BrowserStaleRefError"
   | "BrowserNotAReactAppError"
 
+/**
+ * Forward-boundary certainty for a BROKER-generated failure.
+ *
+ * This is a verified property of WHERE the failure happened, never inferred
+ * from message text:
+ *
+ * - `not_dispatched` — the broker rejected the request before any envelope
+ *   reached the host, so no host-side effect can have occurred.
+ * - `dispatched_unconfirmed` — the envelope was already handed to the host
+ *   transport and the outcome was lost (transport failure or transport
+ *   timeout), the connection was superseded, or the caller aborted mid-flight.
+ *   A mutating operation MAY have executed, so callers must inspect browser
+ *   state before replaying instead of retrying.
+ *
+ * Absent means a host-reported error arm: the host itself answered, so the
+ * broker has no post-forward uncertainty to record.
+ */
+export const BrowserErrorCertainty = Schema.Literals(["not_dispatched", "dispatched_unconfirmed"]).annotate({
+  identifier: "BrowserHostBroker.BrowserErrorCertainty",
+})
+export type BrowserErrorCertainty = Schema.Schema.Type<typeof BrowserErrorCertainty>
+
 export interface BrokerError {
   readonly tag: BrowserErrorTag
   readonly message: string
   readonly retryable: boolean
   readonly details?: unknown
+  readonly certainty?: BrowserErrorCertainty
 }
 
 export interface HostCapabilities {
@@ -283,6 +306,7 @@ const BrokerErrorSchema = Schema.Struct({
   message: Schema.String,
   retryable: Schema.Boolean,
   details: Schema.optional(Schema.Unknown),
+  certainty: Schema.optional(BrowserErrorCertainty),
 })
 
 const BrokerResponseSchema = Schema.Union([
@@ -307,6 +331,7 @@ const BrowserErrorFields = {
   message: Schema.String,
   retryable: Schema.Boolean,
   details: Schema.optional(Schema.Unknown),
+  certainty: Schema.optional(BrowserErrorCertainty),
 }
 
 export class BrowserHostUnavailableError extends Schema.TaggedErrorClass<BrowserHostUnavailableError>()(
@@ -456,12 +481,16 @@ const ErrorDefaults: Record<BrowserErrorTag, { readonly retryable: boolean; read
 
 export const BrowserError = {
   /** Build the typed error class for a payload tag with sane defaults. */
-  make: (tag: BrowserErrorTag, input?: Partial<{ message: string; retryable: boolean; details: unknown }>): BrowserErrorClass => {
+  make: (
+    tag: BrowserErrorTag,
+    input?: Partial<{ message: string; retryable: boolean; details: unknown; certainty: BrowserErrorCertainty }>,
+  ): BrowserErrorClass => {
     const defaults = ErrorDefaults[tag]
     const fields = {
       message: input?.message ?? defaults.message,
       retryable: input?.retryable ?? defaults.retryable,
       details: input?.details,
+      ...(input?.certainty === undefined ? {} : { certainty: input.certainty }),
     }
     switch (tag) {
       case "BrowserHostUnavailable": return new BrowserHostUnavailableError(fields)
@@ -733,14 +762,54 @@ const layer = Layer.effect(
       elapsedMs: Date.now() - startedAt,
     })
 
-    const unavailable = (requestId: string, startedAt: number, details?: unknown): BrokerResponseError =>
+    const unavailable = (
+      requestId: string,
+      startedAt: number,
+      details?: unknown,
+      certainty?: BrowserErrorCertainty,
+    ): BrokerResponseError =>
       errorResponse(
         requestId,
         {
           tag: "BrowserHostUnavailable",
           message: HOST_UNAVAILABLE_MESSAGE,
-          retryable: true,
+          // A lost post-forward response is never safely repeatable: the host may
+          // already have executed a mutating operation.
+          retryable: certainty !== "dispatched_unconfirmed",
           ...(details === undefined ? {} : { details }),
+          ...(certainty === undefined ? {} : { certainty }),
+        },
+        startedAt,
+      )
+
+    /** Provably rejected before any envelope reached the host: safe to repeat. */
+    const notDispatched = (
+      requestId: string,
+      startedAt: number,
+      error: Pick<BrokerError, "tag" | "message" | "retryable"> & { readonly details?: unknown },
+    ): BrokerResponseError =>
+      errorResponse(requestId, { ...error, certainty: "not_dispatched" }, startedAt)
+
+    /**
+     * The envelope already reached the host transport and the outcome was lost.
+     * Mutating callers must inspect browser state before replaying; read-only
+     * callers may safely repeat.
+     */
+    const unconfirmed = (
+      requestId: string,
+      startedAt: number,
+      message: string,
+      cause: InterruptCause,
+      operation: string,
+    ): BrokerResponseError =>
+      errorResponse(
+        requestId,
+        {
+          tag: "BrowserControlInterrupted",
+          message,
+          retryable: false,
+          certainty: "dispatched_unconfirmed",
+          details: { cause, operation, requestId },
         },
         startedAt,
       )
@@ -987,50 +1056,53 @@ const layer = Layer.effect(
       const requestId = request.requestId ?? crypto.randomUUID()
       const principal = principalFromRequest(request)
       if (!principal) {
-        return errorResponse(
-          requestId,
-          { tag: "BrowserOperationFailed", message: "Browser request has no valid control principal", retryable: false },
-          startedAt,
-        )
+        return notDispatched(requestId, startedAt, {
+          tag: "BrowserOperationFailed",
+          message: "Browser request has no valid control principal",
+          retryable: false,
+        })
       }
       const connection = resolveWindow(request)
-      if (!connection) return unavailable(requestId, startedAt)
+      if (!connection) return unavailable(requestId, startedAt, undefined, "not_dispatched")
+
+      // An already-aborted signal is provably pre-dispatch: no envelope was
+      // ever handed to the host, so nothing can have executed and the caller may
+      // safely repeat. This check must stay ahead of the forward.
+      if (options.signal?.aborted) {
+        return notDispatched(requestId, startedAt, {
+          tag: "BrowserControlInterrupted",
+          message: "Browser operation was aborted before dispatch.",
+          retryable: true,
+        })
+      }
 
       const visualOperation = requestedVisualOperation(request.operation.name)
       if (visualOperation && !supportsVisualOperation(connection.registration.capabilities, visualOperation)) {
-        return errorResponse(
-          requestId,
-          {
-            tag: "BrowserUnsupportedOperation",
-            message: `The browser host does not advertise SnapEye ${visualOperation} support.`,
-            retryable: false,
-            details: { operation: visualOperation, visual: connection.registration.capabilities.visual ?? null },
-          },
-          startedAt,
-        )
+        return notDispatched(requestId, startedAt, {
+          tag: "BrowserUnsupportedOperation",
+          message: `The browser host does not advertise SnapEye ${visualOperation} support.`,
+          retryable: false,
+          details: { operation: visualOperation, visual: connection.registration.capabilities.visual ?? null },
+        })
       }
       const visualFeature = requestedVisualFeature(request.operation.name)
       if (visualFeature && !supportsVisualFeature(connection.registration.capabilities, visualFeature)) {
-        return errorResponse(
-          requestId,
-          {
-            tag: "BrowserUnsupportedOperation",
-            message: `The browser host does not advertise SnapEye ${visualFeature} support.`,
-            retryable: false,
-            details: { feature: visualFeature, visual: connection.registration.capabilities.visual ?? null },
-          },
-          startedAt,
-        )
+        return notDispatched(requestId, startedAt, {
+          tag: "BrowserUnsupportedOperation",
+          message: `The browser host does not advertise SnapEye ${visualFeature} support.`,
+          retryable: false,
+          details: { feature: visualFeature, visual: connection.registration.capabilities.visual ?? null },
+        })
       }
 
       const windowId = connection.registration.windowId
       const resolution = resolveDispatch({ request, windowId, tabs: [...tabs.values()] })
       if (resolution.kind === "error") {
-        return errorResponse(
-          requestId,
-          { tag: resolution.tag, message: resolution.message, retryable: resolution.tag === "BrowserTabNotFound" },
-          startedAt,
-        )
+        return notDispatched(requestId, startedAt, {
+          tag: resolution.tag,
+          message: resolution.message,
+          retryable: resolution.tag === "BrowserTabNotFound",
+        })
       }
 
       const { registration } = connection
@@ -1119,20 +1191,12 @@ const layer = Layer.effect(
       if (outcome.kind === "error") return outcome.response
       if (outcome.cause === "abort") {
         yield* fireAbort(registration, requestId)
-        return errorResponse(
-          requestId,
-          { tag: "BrowserControlInterrupted", message: outcome.message, retryable: true },
-          startedAt,
-        )
+        return unconfirmed(requestId, startedAt, outcome.message, "abort", request.operation.name)
       }
       if (outcome.cause === "superseded") {
-        return errorResponse(
-          requestId,
-          { tag: "BrowserControlInterrupted", message: outcome.message, retryable: true },
-          startedAt,
-        )
+        return unconfirmed(requestId, startedAt, outcome.message, "superseded", request.operation.name)
       }
-      return unavailable(requestId, startedAt, outcome.message)
+      return unavailable(requestId, startedAt, outcome.message, "dispatched_unconfirmed")
     })
 
     const abort = Effect.fn("BrowserHostBroker.abort")(function* (requestId: string) {

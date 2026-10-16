@@ -6,6 +6,7 @@ import { Effect, Layer, Schema } from "effect"
 import { makeLocationNode } from "../effect/app-node"
 import { FSUtil } from "../fs-util"
 import { SkillV2 } from "../skill"
+import { SkillRevision } from "../skill/revision"
 import { PermissionV2 } from "../permission"
 import { ToolRegistry } from "./registry"
 import { Tool } from "./tool"
@@ -54,6 +55,11 @@ export const toModelOutput = (skill: SkillV2.Info, files: ReadonlyArray<string>)
 const unableToLoad = (name: string, error?: unknown) =>
   new ToolFailure({ message: `Unable to load skill ${name}`, error })
 
+const revisionChanged = (name: string, pinned: string, observed: string) =>
+  new ToolFailure({
+    message: `Skill ${name} no longer matches the revision it was admitted at (${pinned} -> ${observed}). Its instructions and resources can no longer be read as one revision, so they were not loaded. Load the skill again to read its current bytes.`,
+  })
+
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const tools = yield* Tools.Service
@@ -69,9 +75,24 @@ const layer = Layer.effectDiscard(
           toModelOutput: ({ output }) => [{ type: "text", text: output.output }],
           execute: (input, context) =>
             Effect.gen(function* () {
-              const current = yield* skills.list()
-              const skill = current.find((skill) => skill.name === input.name)
-              if (!skill) return yield* unableToLoad(input.name)
+              const admission = yield* skills.admit(input.name)
+              if (!admission) return yield* unableToLoad(input.name)
+              const { info: skill, directory } = admission
+              // Fail closed before authorizing. The pinned revision describes
+              // bytes admitted earlier; a concurrent source refresh can replace
+              // the shared package directory, and then the instructions and the
+              // resources beside them no longer belong to one revision. The
+              // model must not be asked to approve a load that cannot be
+              // served, and must be told to re-select instead of silently
+              // receiving a mix of two revisions.
+              const observed = yield* SkillRevision.packageOf(fs, skill.location)
+              const revision = SkillRevision.identify(admission.revision.origin, skill.content, observed.resources)
+              if (!SkillRevision.equals(revision, admission.revision))
+                return yield* revisionChanged(
+                  input.name,
+                  SkillRevision.identity(admission.revision),
+                  SkillRevision.identity(revision),
+                )
               return yield* Effect.gen(function* () {
                 yield* permission.assert({
                   action: name,
@@ -81,7 +102,6 @@ const layer = Layer.effectDiscard(
                   agent: context.agent,
                   source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
                 })
-                const directory = path.dirname(skill.location)
                 const files =
                   path.basename(skill.location) === "SKILL.md"
                     ? (yield* fs.glob("**/*", { cwd: directory, absolute: true, include: "file", dot: true }))

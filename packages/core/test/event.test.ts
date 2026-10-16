@@ -29,13 +29,22 @@ const locationLayer = Layer.succeed(
   Location.Service,
   Location.Service.of(
     location({ directory: AbsolutePath.make("project"), workspaceID: WorkspaceV2.ID.make("wrk_test") }),
-  ),
+  )
 )
 const Message = EventV2.define({
   type: "test.message",
   schema: {
     text: Schema.String,
   },
+})
+
+const SessionSignalA = EventV2.define({
+  type: "test.session-signal-a",
+  schema: { sessionID: Schema.String, text: Schema.String },
+})
+const SessionSignalB = EventV2.define({
+  type: "test.session-signal-b",
+  schema: { sessionID: Schema.String, text: Schema.String },
 })
 
 const SyncMessage = EventV2.define({
@@ -243,6 +252,35 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("validates admission before projectors and rolls back refused durable events", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = EventV2.ID.create()
+      const sequence: string[] = []
+      yield* events.project(SyncMessage, () =>
+        Effect.sync(() => { sequence.push("projector") }),
+      )
+      const refused = yield* events.publish(
+        SyncMessage, { id: aggregateID, text: "invalid" },
+        { admit: (seq) => Effect.gen(function* () {
+          sequence.push(`admit:${seq}`)
+          return yield* Effect.die("admission refused")
+        }) },
+      ).pipe(Effect.exit)
+      expect(String(refused)).toContain("admission refused")
+      expect(sequence).toEqual(["admit:0"])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
+      expect(yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).all()).toEqual([])
+      const accepted = yield* events.publish(
+        SyncMessage, { id: aggregateID, text: "valid" },
+        { admit: (seq) => Effect.sync(() => { sequence.push(`admit:${seq}`) }) },
+      )
+      expect(accepted.durable?.seq).toBe(0)
+      expect(sequence).toEqual(["admit:0", "admit:0", "projector"])
+    }),
+  )
+
   it.effect("rolls back the durable event and projector when the local commit fails", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -400,6 +438,49 @@ describe("EventV2", () => {
       yield* events.publish(Message, { text: "after-unsubscribe" })
 
       expect(received).toEqual(["accepted"])
+    }),
+  )
+
+  it.effect("registers one indexed multi-session/multi-type watcher without duplicates, leakage, or lost unsubscribe", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const received: string[] = []
+      const unsubscribe = yield* events.listenSessionTypes(
+        [SessionSignalA, SessionSignalB, SessionSignalA],
+        ["session-a", "session-b", "session-a"],
+        (event) => Effect.sync(() => received.push(`${event.type}:${(event.data as { text: string }).text}`)),
+      )
+      yield* events.publish(SessionSignalA, { sessionID: "session-a", text: "one" })
+      yield* events.publish(SessionSignalB, { sessionID: "session-b", text: "two" })
+      yield* events.publish(SessionSignalB, { sessionID: "session-z", text: "unrelated" })
+      yield* events.publish(SessionSignalA, { sessionID: "session-c", text: "unrelated" })
+      expect(received).toEqual(["test.session-signal-a:one", "test.session-signal-b:two"])
+      yield* unsubscribe
+      yield* events.publish(SessionSignalA, { sessionID: "session-a", text: "after detach" })
+      expect(received).toHaveLength(2)
+    }),
+  )
+
+  it.effect("isolates a 100-Session indexed batch during high-rate unrelated traffic", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const targetIDs = Array.from({ length: 100 }, (_, index) => `session-target-${index}`)
+      let deliveries = 0
+      const detach = yield* events.listenSessionTypes(
+        [SessionSignalA, SessionSignalB], targetIDs,
+        () => Effect.sync(() => { deliveries++ }),
+      )
+      for (let index = 0; index < 2_000; index++) {
+        yield* events.publish(SessionSignalA, { sessionID: `unrelated-${index % 100}`, text: "background" })
+      }
+      expect(deliveries).toBe(0)
+      for (const sessionID of targetIDs) {
+        yield* events.publish(SessionSignalB, { sessionID, text: "targeted" })
+      }
+      expect(deliveries).toBe(100)
+      yield* detach
+      yield* events.publish(SessionSignalA, { sessionID: targetIDs[0]!, text: "after unsubscribe" })
+      expect(deliveries).toBe(100)
     }),
   )
 
@@ -572,6 +653,19 @@ describe("EventV2", () => {
         expect.objectContaining({ data: { text: "overflow" } }),
         last,
       ])
+    }),
+  )
+
+  it.effect("bounds typed volatile subscriptions and surfaces overflow instead of losing an event silently", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const stream = yield* EventV2.subscribeBounded(events, Message, 1, 1024)
+      yield* events.publish(Message, { text: "one" })
+      yield* events.publish(Message, { text: "two" })
+      const exit = yield* stream.pipe(Stream.runCollect, Effect.exit)
+      expect(Exit.findErrorOption(exit).pipe(Option.getOrUndefined)).toBeInstanceOf(EventV2.SubscriberOverflowError)
+      // No global callback was added: another Session/stream keeps publishing.
+      expect((yield* events.publish(Message, { text: "three" })).data.text).toBe("three")
     }),
   )
 

@@ -100,9 +100,25 @@ SQLite's default DEFERRED behavior.
   should remain DEFERRED; do not acquire the writer slot for snapshot reads.
 - Background maintenance owns a dedicated connection, a short busy timeout, and
   bounded idempotent retry/backoff. Foreground domain transactions own priority.
+- A maintenance writer must not join a foreground writer backlog for many
+  seconds merely because foreground BEGIN retry uses 15 seconds. The current
+  shared BEGIN admission contract is 350ms maintenance, 3s control, 15s
+  foreground. Maintenance may defer its work instead of monopolizing resources.
+- Never use an unbounded audit-retention DELETE on a historical multi-GiB
+  database. Use a small rowid-keyset batch, age revalidation inside the
+  transaction and a durable cursor across background worker restarts, rather
+  than building another large index during process bootstrap.
 - Do not paper over a stale-snapshot bug by replaying an arbitrary high-level
   business transaction after it has made decisions from an old snapshot. Fix
   writer ownership at the transaction boundary.
+- **Only a rejected native BEGIN is unconditionally safe to retry.** The
+  SQLite adapters own that bounded retry before any user statement executes.
+  Do not wrap an entire `db.transaction(work)` in a generic busy retry:
+  projector/admission callbacks, generation increments, DDL and a COMMIT
+  with lost acknowledgment may already have executed. Propagate post-BEGIN
+  failures and preserve unknown outcomes rather than replaying effects.
+  Retrying a single independently idempotent conditional SQL statement may
+  remain appropriate when its exact CAS semantics make repetition safe.
 - `busy_timeout` cannot repair `SQLITE_BUSY_SNAPSHOT` (extended code 517);
   waiting cannot make an obsolete snapshot writable.
 

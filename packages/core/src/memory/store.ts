@@ -64,7 +64,7 @@ export interface Interface {
   ) => Effect.Effect<{ id: string; key: string; title: string; description: string } | undefined>
   readonly topics: (context: MemorySchema.Context) => Effect.Effect<MemorySchema.Topic[]>
   readonly markTopicDirty: (topicID: string) => Effect.Effect<void>
-  readonly findByHash: (input: { scope: MemorySchema.Scope; hash: string }) => Effect.Effect<MemorySchema.Entry | undefined>
+  readonly findByHash: (input: { scope: MemorySchema.Scope; projectID: string | null; workspaceID: string | null; hash: string }) => Effect.Effect<MemorySchema.Entry | undefined>
   readonly insert: (input: InsertInput) => Effect.Effect<MemorySchema.Entry, unknown>
   readonly get: (id: string) => Effect.Effect<MemorySchema.Entry | undefined>
   readonly evidence: (id: string) => Effect.Effect<MemorySchema.Evidence[]>
@@ -167,7 +167,8 @@ const layer = Layer.effect(
         .where(
           sql`(${MemoryTopicTable.scope} = 'global' AND ${MemoryTopicTable.project_id} IS NULL)
               OR (${MemoryTopicTable.scope} = 'project' AND ${MemoryTopicTable.project_id} = ${context.projectID})
-              OR (${MemoryTopicTable.scope} = 'workspace' AND ${MemoryTopicTable.workspace_id} = ${context.workspaceID})`,
+              OR (${MemoryTopicTable.scope} = 'workspace' AND ${MemoryTopicTable.project_id} = ${context.projectID}
+                  AND ${MemoryTopicTable.workspace_id} = ${context.workspaceID})`,
         )
         .all()
         .pipe(Effect.orDie)
@@ -205,11 +206,17 @@ const layer = Layer.effect(
         .where(
           and(
             eq(MemoryTopicTable.key, key),
-            sql`(${MemoryTopicTable.scope} = 'global' AND ${MemoryTopicTable.project_id} IS NULL)
+            // Parenthesize the *whole* scope disjunction: otherwise the
+            // preceding topic-key predicate applies only to the global arm.
+            sql`((${MemoryTopicTable.scope} = 'global' AND ${MemoryTopicTable.project_id} IS NULL)
                 OR (${MemoryTopicTable.scope} = 'project' AND ${MemoryTopicTable.project_id} = ${context.projectID})
-                OR (${MemoryTopicTable.scope} = 'workspace' AND ${MemoryTopicTable.workspace_id} = ${context.workspaceID})`,
+                OR (${MemoryTopicTable.scope} = 'workspace' AND ${MemoryTopicTable.project_id} = ${context.projectID}
+                    AND ${MemoryTopicTable.workspace_id} = ${context.workspaceID}))`,
           ),
         )
+        .orderBy(sql`CASE ${MemoryTopicTable.scope}
+          WHEN 'workspace' THEN 3 WHEN 'project' THEN 2 ELSE 1 END DESC,
+          ${MemoryTopicTable.time_updated} DESC, ${MemoryTopicTable.id} DESC`)
         .get()
         .pipe(Effect.orDie)
       if (!row) return undefined
@@ -224,11 +231,21 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
     })
 
+    // Memory identity includes the authoritative project/workspace, not just a
+    // user-visible scope label. Reusing a hash in another project must not
+    // return that project's entry or mutate its keyed lineage.
+    const identity = (scope: MemorySchema.Scope, projectID: string | null, workspaceID: string | null) =>
+      and(
+        eq(MemoryEntryTable.scope, scope),
+        projectID === null ? isNull(MemoryEntryTable.project_id) : eq(MemoryEntryTable.project_id, projectID),
+        workspaceID === null ? isNull(MemoryEntryTable.workspace_id) : eq(MemoryEntryTable.workspace_id, workspaceID),
+      )
+
     const findByHash: Interface["findByHash"] = Effect.fn("MemoryStore.findByHash")(function* (input) {
       const row = yield* db
         .select()
         .from(MemoryEntryTable)
-        .where(and(eq(MemoryEntryTable.scope, input.scope), eq(MemoryEntryTable.content_hash, input.hash)))
+        .where(and(identity(input.scope, input.projectID, input.workspaceID), eq(MemoryEntryTable.content_hash, input.hash)))
         .get()
         .pipe(Effect.orDie)
       return row ? yield* hydrate(row) : undefined
@@ -248,6 +265,19 @@ const layer = Layer.effect(
       const superseded = yield* db.transaction(
         (tx) =>
           Effect.gen(function* () {
+            // The suppression check belongs inside the same immediate write
+            // transaction as admission. Checking before insertion alone would
+            // race an in-flight forget and resurrect forbidden content.
+            const suppressed = yield* tx.select({ id: MemorySuppressionTable.id }).from(MemorySuppressionTable)
+              .where(and(
+                eq(MemorySuppressionTable.scope, input.scope),
+                input.projectID == null ? isNull(MemorySuppressionTable.project_id) : eq(MemorySuppressionTable.project_id, input.projectID),
+                input.workspaceID == null ? isNull(MemorySuppressionTable.workspace_id) : eq(MemorySuppressionTable.workspace_id, input.workspaceID),
+                eq(MemorySuppressionTable.content_hash, input.hash),
+              )).get().pipe(Effect.orDie)
+            if (suppressed) return yield* new MemorySchema.ValidationError({
+              reason: "This memory was forgotten and cannot be re-ingested from the same evidence.",
+            })
             let previous: Row | undefined
             if (input.supersedeKey) {
               previous = yield* tx
@@ -255,7 +285,7 @@ const layer = Layer.effect(
               .from(MemoryEntryTable)
               .where(
                 and(
-                  eq(MemoryEntryTable.scope, input.scope),
+                   identity(input.scope, input.projectID ?? null, input.workspaceID ?? null),
                   eq(MemoryEntryTable.stable_key, input.supersedeKey),
                   eq(MemoryEntryTable.status, "active"),
                 ),
@@ -392,7 +422,10 @@ const layer = Layer.effect(
       for (const row of rows) {
         const label = row.kind === "identifier" ? row.value : `${row.kind}:${row.value}`
         const list = map.get(row.memory_id) ?? []
-        if (list.length < 8) list.push(label)
+        // All bounded indexed anchors (at most 32/entry) are needed for
+        // scoring; hiding anchors after the first eight previously made
+        // late source symbols impossible to boost. Only truncate display.
+        list.push(label)
         map.set(row.memory_id, list)
       }
       return map
@@ -485,12 +518,16 @@ const layer = Layer.effect(
       const wanted = new Set(input.anchors)
 
       const scored = rows.map((row) => {
-        const anchors = anchorMap.get(row.id) ?? []
-        const normalized = anchors.map((anchor) => anchor.replace(/^[a-z]+:/, "")).map(MemoryAnchors.normalize)
-        const exact = normalized.filter((value) => wanted.has(value)).length
+        const allAnchors = anchorMap.get(row.id) ?? []
+        const normalized = new Set(allAnchors
+          .map((anchor) => anchor.replace(/^[a-z]+:/, ""))
+          .map(MemoryAnchors.normalize))
+        // The same normalized token can have multiple anchor kinds; duplicate
+        // representations must not inflate a document's relevance score.
+        const exact = [...normalized].filter((value) => wanted.has(value)).length
         const base = -row.score
         const boost = exact * 2
-        return { row, anchors, score: Number((base + boost).toFixed(4)) }
+        return { row, anchors: allAnchors.slice(0, 8), score: Number((base + boost).toFixed(4)) }
       })
 
       scored.sort((a, b) => b.score - a.score || b.row.time_updated - a.row.time_updated)
@@ -522,15 +559,29 @@ const layer = Layer.effect(
     })
 
     const timeline: Interface["timeline"] = Effect.fn("MemoryStore.timeline")(function* (input) {
+      // History must enforce the same visibility as get/search. Previously
+      // these project/workspace IDs were accepted but never used.
+      const visible = sql`(
+        (${MemoryEntryTable.scope} = 'global' AND ${MemoryEntryTable.project_id} IS NULL AND ${MemoryEntryTable.workspace_id} IS NULL)
+        OR (${MemoryEntryTable.scope} = 'project' AND ${MemoryEntryTable.project_id} = ${input.projectID} AND ${MemoryEntryTable.workspace_id} IS NULL)
+        OR (${MemoryEntryTable.scope} = 'workspace' AND ${MemoryEntryTable.project_id} = ${input.projectID} AND ${MemoryEntryTable.workspace_id} = ${input.workspaceID})
+      )`
       const seed = input.id
-        ? yield* db.select().from(MemoryEntryTable).where(eq(MemoryEntryTable.id, input.id)).get().pipe(Effect.orDie)
+        ? yield* db.select().from(MemoryEntryTable)
+            .where(and(eq(MemoryEntryTable.id, input.id), visible)).get().pipe(Effect.orDie)
         : input.key
           ? yield* db
               .select()
               .from(MemoryEntryTable)
-              .where(eq(MemoryEntryTable.stable_key, input.key))
-              .all()
-              .pipe(Effect.orDie, Effect.map((rows) => rows[0]))
+              .where(and(eq(MemoryEntryTable.stable_key, input.key), visible))
+              // Prefer the most-specific visible fact when a stable key is
+              // reused across global, project and workspace scopes.
+              .orderBy(sql`CASE ${MemoryEntryTable.scope}
+                WHEN 'workspace' THEN 3 WHEN 'project' THEN 2 ELSE 1 END DESC,
+                ${MemoryEntryTable.time_updated} DESC, ${MemoryEntryTable.id} DESC`)
+              .limit(1)
+              .get()
+              .pipe(Effect.orDie)
           : undefined
       if (!seed) return [] as MemorySchema.Entry[]
 
@@ -540,9 +591,9 @@ const layer = Layer.effect(
       while (cursor && !ids.has(cursor)) {
         ids.add(cursor)
         const next: { superseded_by_id: string | null } | undefined = yield* db
-          .select({ superseded_by_id: MemoryEntryTable.superseded_by_id })
-          .from(MemoryEntryTable)
-          .where(eq(MemoryEntryTable.id, cursor))
+            .select({ superseded_by_id: MemoryEntryTable.superseded_by_id })
+            .from(MemoryEntryTable)
+            .where(and(eq(MemoryEntryTable.id, cursor), visible))
           .get()
           .pipe(Effect.orDie)
         cursor = next?.superseded_by_id ?? null
@@ -551,9 +602,9 @@ const layer = Layer.effect(
       while (cursor && !ids.has(cursor)) {
         ids.add(cursor)
         const previous: { supersedes_id: string | null } | undefined = yield* db
-          .select({ supersedes_id: MemoryEntryTable.supersedes_id })
-          .from(MemoryEntryTable)
-          .where(eq(MemoryEntryTable.id, cursor))
+            .select({ supersedes_id: MemoryEntryTable.supersedes_id })
+            .from(MemoryEntryTable)
+            .where(and(eq(MemoryEntryTable.id, cursor), visible))
           .get()
           .pipe(Effect.orDie)
         cursor = previous?.supersedes_id ?? null
@@ -562,7 +613,7 @@ const layer = Layer.effect(
       const rows = yield* db
         .select()
         .from(MemoryEntryTable)
-        .where(inArray(MemoryEntryTable.id, [...ids]))
+        .where(and(inArray(MemoryEntryTable.id, [...ids]), visible))
         .all()
         .pipe(Effect.orDie)
       const entries = yield* Effect.forEach(rows, hydrate)

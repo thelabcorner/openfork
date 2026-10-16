@@ -9,49 +9,10 @@ import { makeGlobalNode } from "../effect/app-node"
 import { httpClient } from "../effect/app-node-platform"
 import { AbsolutePath } from "../schema"
 import { LEGACY_SKILL_VERSION_FILENAME, SKILL_VERSION_FILENAME } from "../storage-identity"
+import { SkillPathSafety } from "./path-safety"
 
 const skillConcurrency = 4
 const fileConcurrency = 8
-
-function isSafeSegment(value: string) {
-  return (
-    value.length > 0 &&
-    value !== "." &&
-    value !== ".." &&
-    !value.includes("/") &&
-    !value.includes("\\") &&
-    !value.includes("\0")
-  )
-}
-
-function isSafeRelativePath(value: string) {
-  const segments = value.split("/")
-  return (
-    value.length > 0 &&
-    !value.includes("\\") &&
-    !value.includes("\0") &&
-    !value.includes("?") &&
-    !value.includes("#") &&
-    !URL.canParse(value) &&
-    !path.posix.isAbsolute(value) &&
-    !path.win32.isAbsolute(value) &&
-    segments.every((segment) => {
-      try {
-        const decoded = decodeURIComponent(segment)
-        return (
-          decoded.length > 0 &&
-          decoded !== "." &&
-          decoded !== ".." &&
-          !decoded.includes("/") &&
-          !decoded.includes("\\") &&
-          !decoded.includes("\0")
-        )
-      } catch {
-        return false
-      }
-    })
-  )
-}
 
 class IndexSkill extends Schema.Class<IndexSkill>("SkillDiscovery.IndexSkill")({
   name: Schema.String,
@@ -98,7 +59,11 @@ const layer = Layer.effect(
 
     return Service.of({
       pull: Effect.fn("SkillDiscovery.pull")(function* (url) {
-        const base = url.endsWith("/") ? url : `${url}/`
+        const base = SkillPathSafety.canonicalSourceUrl(url)
+        if (!base) {
+          yield* Effect.logWarning("invalid skill source url", { url })
+          return []
+        }
         const source = new URL(base)
         const index = new URL("index.json", source).href
         const data = yield* HttpClientRequest.get(index).pipe(
@@ -111,80 +76,81 @@ const layer = Layer.effect(
         )
         if (!data) return []
 
-        const sourceRoot = path.resolve(global.cache, "skills", Bun.hash(base).toString(16))
+        const sourceRoot = path.resolve(global.cache, "skills", SkillPathSafety.sourceNamespace(base))
         return yield* Effect.forEach(
           data.skills.flatMap((skill) => {
-            if (!isSafeSegment(skill.name)) {
-              return []
-            }
             if (!skill.files.includes("SKILL.md") && !skill.files.includes(`${skill.name}.md`)) {
               return []
             }
 
-            const root = path.resolve(sourceRoot, skill.name)
-            if (!FSUtil.contains(sourceRoot, root) || root === sourceRoot) {
-              return []
-            }
+            // Remote-controlled name -> filesystem directory, validated and
+            // containment-proved before it can become a write target.
+            const root = SkillPathSafety.resolveSkillRoot(sourceRoot, skill.name)
+            if (!root) return []
 
-            const skillUrl = new URL(`${encodeURIComponent(skill.name)}/`, source)
+            const skillBase = new URL(`${encodeURIComponent(skill.name)}/`, source).href
+            const token = crypto.randomUUID()
+            const staging = `${root}.tmp-${token}`
+            const backup = `${root}.old-${token}`
             const versionFile = path.join(root, SKILL_VERSION_FILENAME)
             const legacyVersionFile = path.join(root, LEGACY_SKILL_VERSION_FILENAME)
-            const files = skill.files.map((file) => {
-              if (!isSafeRelativePath(file)) return undefined
-              let resource: URL
-              try {
-                resource = new URL(file, skillUrl)
-              } catch {
-                return undefined
-              }
-              if (resource.origin !== source.origin) return undefined
 
-              const destination = path.resolve(root, file)
-              if (!FSUtil.contains(root, destination) || destination === root) return undefined
-              return {
-                url: resource.href,
-                destination,
-                file,
-              }
+            // Every remote-controlled file entry must resolve to BOTH a
+            // same-origin URL and a contained destination under the live root
+            // and the staging root. One unsafe entry rejects the whole skill
+            // rather than silently skipping the file.
+            const files = skill.files.map((file) => {
+              const resource = SkillPathSafety.resolveResourceUrl(source, skillBase, file)
+              const destination = SkillPathSafety.resolveSkillFile(root, file)
+              const staged = SkillPathSafety.resolveContained(staging, file)
+              if (!resource || !destination || !staged) return undefined
+              return { url: resource.href, destination, staged, file }
             })
             if (files.some((file) => file === undefined)) {
               return []
             }
-            return [{ skill, root, versionFile, legacyVersionFile, files: files as { url: string; destination: string; file: string }[] }]
+            return [
+              {
+                skill,
+                root,
+                staging,
+                backup,
+                versionFile,
+                legacyVersionFile,
+                files: files as { url: string; destination: string; staged: string; file: string }[],
+              },
+            ]
           }),
-          ({ skill, root, versionFile, legacyVersionFile, files }) =>
+          ({ skill, root, staging, backup, versionFile, legacyVersionFile, files }) =>
             Effect.gen(function* () {
               const version = skill.version
-            const current =
-              version === undefined
-                ? undefined
-                : yield* Effect.gen(function* () {
-                    const canonical = yield* fs
-                      .readFileStringSafe(versionFile)
-                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
-                    if (canonical !== undefined) return canonical
-                    const legacy = yield* fs
-                      .readFileStringSafe(legacyVersionFile)
-                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
-                    if (legacy !== undefined) {
-                      yield* fs.writeFileString(versionFile, legacy).pipe(Effect.ignore)
-                      yield* fs.remove(legacyVersionFile, { force: true }).pipe(Effect.ignore)
-                    }
-                    return legacy
-                  })
+              const current =
+                version === undefined
+                  ? undefined
+                  : yield* Effect.gen(function* () {
+                      const canonical = yield* fs
+                        .readFileStringSafe(versionFile)
+                        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                      if (canonical !== undefined) return canonical
+                      const legacy = yield* fs
+                        .readFileStringSafe(legacyVersionFile)
+                        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                      if (legacy !== undefined) {
+                        yield* fs.writeFileString(versionFile, legacy).pipe(Effect.ignore)
+                        yield* fs.remove(legacyVersionFile, { force: true }).pipe(Effect.ignore)
+                      }
+                      return legacy
+                    })
               if (version === undefined || current === version) {
                 yield* Effect.forEach(files, (file) => download(file.url, file.destination), {
                   concurrency: fileConcurrency,
                   discard: true,
                 })
               } else {
-                const token = crypto.randomUUID()
-                const staging = `${root}.tmp-${token}`
-                const backup = `${root}.old-${token}`
                 yield* Effect.gen(function* () {
                   const downloaded = yield* Effect.forEach(
                     files,
-                    (file) => download(file.url, path.resolve(staging, file.file)),
+                    (file) => download(file.url, file.staged),
                     { concurrency: fileConcurrency },
                   )
                   if (!downloaded.every(Boolean)) return

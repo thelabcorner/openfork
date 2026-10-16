@@ -27,10 +27,12 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { Reference } from "@opencode-ai/core/reference"
 import {
+  assembleSessionContext,
   PromptRevisor,
   sanitizeQuestion,
 } from "@opencode-ai/core/prompt-revisor"
 import { RevisionDraftTable } from "@opencode-ai/core/revision-draft.sql"
+import { RevisionProgress } from "@opencode-ai/core/revision-progress"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
@@ -144,7 +146,7 @@ const models = SessionRunnerModel.layerWith(
 )
 
 const integrationLayer = AppNodeBuilder.build(
-  LayerNode.group([PromptRevisor.node, Database.node, EventV2.node, QuestionV2.node]),
+  LayerNode.group([PromptRevisor.node, Database.node, EventV2.node, QuestionV2.node, RevisionProgress.node]),
   [
     [LayerNodePlatform.llmClient, llmClient],
     [FileSystem.node, filesystem],
@@ -239,6 +241,27 @@ describe("PromptRevisor", () => {
     })
     expect(question.options).toEqual([])
     expect(question.custom).toBe(true)
+  })
+
+  test("drops continuation noise from assembled conversation context", () => {
+    const context = assembleSessionContext([
+      sessionUser(""),
+      sessionUser("continue"),
+      sessionUser("project updated, sorry"),
+      sessionUser("proceed comprehensively"),
+      sessionUser("ok"),
+      sessionUser("continue the parser fix in packages/core"),
+      sessionUser("why does the parser fail on CRLF input?"),
+      sessionAssistant("The parser splits on LF only."),
+    ])
+    expect(context).not.toContain("<user>\n\n</user>")
+    expect(context).not.toContain("<user>\ncontinue\n</user>")
+    expect(context).not.toContain("<user>\nok\n</user>")
+    expect(context).not.toContain("proceed comprehensively")
+    expect(context).not.toContain("project updated")
+    expect(context).toContain("continue the parser fix in packages/core")
+    expect(context).toContain("why does the parser fail on CRLF input?")
+    expect(context).toContain("The parser splits on LF only.")
   })
 
   it.effect("does not expose question without a durable Session owner", () =>
@@ -685,6 +708,44 @@ describe("PromptRevisor", () => {
       }),
   )
 
+  it.effect("omits continuation-noise turns from the outbound conversation context", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [revisionResponse("Noise-free revision content")]
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_noise")
+      sessionInfo = {
+        id: sessionID,
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      sessionMessages = [
+        sessionUser("continue"),
+        sessionUser("proceed comprehensively"),
+        sessionUser("project updated, sorry"),
+        sessionUser("Why does the parser fail on CRLF input?"),
+      ]
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+
+      const result = yield* (yield* PromptRevisor.Service).revise({
+        prompt: "Fix the parser bug.",
+        model: modelRef,
+        sessionID,
+      })
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Noise-free revision content" })
+      const outbound = JSON.stringify(generatedRequests[0]!.messages)
+      expect(outbound).toContain("Why does the parser fail on CRLF input?")
+      expect(outbound).not.toContain("<user>\\ncontinue\\n</user>")
+      expect(outbound).not.toContain("proceed comprehensively")
+      expect(outbound).not.toContain("project updated, sorry")
+    }),
+  )
+
   it.effect("default runtime shares required-to-auto capability learning across revisions", () =>
     Effect.gen(function* () {
       resetToolChoiceCapabilityMemory()
@@ -699,13 +760,13 @@ describe("PromptRevisor", () => {
             parameter: "tool_choice",
           }),
         }),
-        revisionResponse("Adaptive revision"),
+        revisionResponse("Adaptive revision content"),
         revisionResponse("Remembered adaptive revision"),
       ]
 
       const revisor = yield* PromptRevisor.Service
       const first = yield* revisor.revise({ prompt: "Improve this.", model: modelRef })
-      expect(first).toMatchObject({ type: "revision", prompt: "Adaptive revision" })
+      expect(first).toMatchObject({ type: "revision", prompt: "Adaptive revision content" })
       expect(generatedRequests.slice(0, 2).map((request) => request.toolChoice?.type)).toEqual(["required", "auto"])
 
       const second = yield* revisor.revise({ prompt: "Improve this again.", model: modelRef })
@@ -761,7 +822,9 @@ describe("PromptRevisor", () => {
       configEntries = []
       generatedRequests.length = 0
       generatedResponses = [
-        revisionResponse("Inspect {{ref:bad_file}}.", [{ id: "bad_file", type: "file", path: "null" }]),
+        revisionResponse("Inspect {{ref:bad_file}} before changing anything.", [
+          { id: "bad_file", type: "file", path: "null" },
+        ]),
         revisionResponse("Inspect the relevant implementation files and fix the issue."),
       ]
 
@@ -1050,6 +1113,70 @@ describe("PromptRevisor", () => {
     }),
   )
 
+  it.effect("rejects a trivial revised_prompt payload and forces a substantive retry", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        callResponse("revised_prompt", { content: "hello", references: [] }, "trivial-revision"),
+        revisionResponse("Recovered substantive revision"),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Recovered substantive revision")
+      expect(requests).toHaveLength(2)
+      // The corrective turn settles the failed terminal call as a host protocol
+      // error and re-exposes only the terminal tool.
+      expect(requests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+      const retry = JSON.stringify(requests[1]!.messages)
+      expect(retry).toContain("Protocol error")
+      expect(retry).toContain("Protocol correction")
+      // Auditor parity: the corrective turn re-asserts the privileged revisor
+      // identity, not just the generic protocol prompt.
+      expect(retry).toContain("PROMPT REVISOR REMINDER")
+      expect(retry).toContain("trivial")
+      expect(retry).toContain("substantive")
+    }),
+  )
+
+  it.effect("never accepts a trivial revised_prompt even after the repair budget is exhausted", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = ["a", "hello", "hello world", "hi there"].map((content, index) =>
+        callResponse("revised_prompt", { content, references: [] }, `trivial-${index}`),
+      )
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const exit = yield* (yield* PromptRevisor.Service)
+        .reviseWithRuntime({ prompt: "Improve this.", model: modelRef }, runtime)
+        .pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      const error = Cause.squash(exit.cause) as PromptRevisor.UnavailableError
+      expect(String(error.message)).toContain("trivial")
+      expect(requests).toHaveLength(4)
+    }),
+  )
+
   it.effect("repairs mixed terminal tool usage before accepting revised_prompt", () =>
     Effect.gen(function* () {
       configEntries = []
@@ -1169,7 +1296,11 @@ describe("PromptRevisor", () => {
       const mixed = () =>
         multiCallResponse(
           { id: "stray-read", name: "read", input: { path: "src/index.ts" } },
-          { id: "mixed-revision", name: "revised_prompt", input: { content: "Salvaged revision", references: [] } },
+          {
+            id: "mixed-revision",
+            name: "revised_prompt",
+            input: { content: "Salvaged revision content", references: [] },
+          },
         )
       const responses = [mixed(), mixed(), mixed(), mixed()]
       const runtime: PromptRevisor.Runtime = {
@@ -1183,7 +1314,7 @@ describe("PromptRevisor", () => {
       )
       expect(result.type).toBe("revision")
       if (result.type !== "revision") return
-      expect(result.prompt).toBe("Salvaged revision")
+      expect(result.prompt).toBe("Salvaged revision content")
     }),
   )
 
@@ -1642,7 +1773,7 @@ describe("PromptRevisor", () => {
           })
         },
         generate: (request) => {
-          const response = revisionResponse("Route-settled revision")
+          const response = revisionResponse("Route-settled revision content")
           return Effect.gen(function* () {
             if (request.publish) {
               for (const event of response.events) yield* request.publish(event)
@@ -1656,7 +1787,7 @@ describe("PromptRevisor", () => {
         { prompt: "Improve this.", model: modelRef, sessionID },
         runtime,
       )
-      expect(result).toMatchObject({ type: "revision", prompt: "Route-settled revision" })
+      expect(result).toMatchObject({ type: "revision", prompt: "Route-settled revision content" })
       expect(resolvedSession?.id).toBe(sessionID)
 
       const usage = yield* readDb
@@ -1687,7 +1818,7 @@ describe("PromptRevisor", () => {
         Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
       generatedResponses = [
         callResponse("read", { path: "src/feature.ts" }, "slow-read"),
-        revisionResponse("Reminded revision"),
+        revisionResponse("Reminded revision content"),
       ]
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
@@ -1698,7 +1829,7 @@ describe("PromptRevisor", () => {
 
       const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
 
-      expect(result).toMatchObject({ type: "revision", prompt: "Reminded revision" })
+      expect(result).toMatchObject({ type: "revision", prompt: "Reminded revision content" })
       expect(generatedRequests).toHaveLength(2)
       expect(JSON.stringify(generatedRequests[0]!.messages)).not.toContain("PROMPT REVISOR REMINDER")
       const reminder = JSON.stringify(generatedRequests[1]!.messages)
@@ -1889,12 +2020,12 @@ describe("PromptRevisor", () => {
       generatedRequests.length = 0
       generatedResponses = [
         textResponse("Here is a prose rewrite without the required tool call."),
-        revisionResponse("Corrected revision"),
+        revisionResponse("Corrected revision content"),
       ]
 
       const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
 
-      expect(result).toMatchObject({ type: "revision", prompt: "Corrected revision" })
+      expect(result).toMatchObject({ type: "revision", prompt: "Corrected revision content" })
       expect(JSON.stringify(generatedRequests[0]!.messages)).not.toContain("PROMPT REVISOR REMINDER")
       const correction = JSON.stringify(generatedRequests[1]!.messages)
       expect(correction).toContain("PROMPT REVISOR REMINDER")
@@ -1912,7 +2043,7 @@ describe("PromptRevisor", () => {
         Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
       generatedResponses = [
         callResponse("read", { path: "src/feature.ts" }, "slow-read"),
-        revisionResponse("Pressured revision"),
+        revisionResponse("Pressured revision content"),
       ]
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
@@ -1923,11 +2054,230 @@ describe("PromptRevisor", () => {
 
       const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Improve this.", model: modelRef })
 
-      expect(result).toMatchObject({ type: "revision", prompt: "Pressured revision" })
+      expect(result).toMatchObject({ type: "revision", prompt: "Pressured revision content" })
       const pressured = JSON.stringify(generatedRequests[1]!.messages)
       expect(pressured).toContain("time limit reached")
       expect(pressured).toContain("one final five-minute window")
       expect(pressured).toContain("revised_prompt")
+    }),
+  )
+
+  it.effect("keeps unlimited progress outside the reconnaissance budget and clears the projection on settle", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const progress = yield* RevisionProgress.Service
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const observed: Array<number | undefined> = []
+      const responses = [
+        callResponse("revision_progress", { percent: 10, phase: "reading", note: "scanning files" }, "progress-1"),
+        callResponse("revision_progress", { percent: 40 }, "progress-2"),
+        callResponse("read", { path: "src/feature.ts" }, "read-after-progress"),
+        revisionResponse("Progressed revision content"),
+      ]
+      fileRead = (path) =>
+        Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          fileRead = () => Effect.die("unexpected read")
+        }),
+      )
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.gen(function* () {
+            observed.push((yield* progress.latest("op-progress"))?.percent)
+            return responses.shift()!
+          })
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef, operationID: "op-progress" },
+        runtime,
+      )
+
+      // Two free progress turns, one real reconnaissance turn, then the commit:
+      // if a progress-only turn consumed a reconnaissance round, the read would
+      // have been forced into the terminal protocol instead of dispatching.
+      expect(requests).toHaveLength(4)
+      expect(result).toMatchObject({ type: "revision", prompt: "Progressed revision content", rounds: 2 })
+      expect(result.type === "revision" ? result.tools : []).toEqual(["read", "revised_prompt"])
+      expect(observed).toEqual([undefined, 10, 40, 40])
+      // Progress-only turns are coalesced out of the model-facing conversation:
+      // unlimited updates cannot grow the prompt sent back to the provider.
+      expect(JSON.stringify(requests[1]!.messages)).not.toContain("revision_progress")
+      expect(JSON.stringify(requests[3]!.messages)).not.toContain("revision_progress")
+      // Settle clears the advisory projection entirely.
+      expect(yield* progress.latest("op-progress")).toBeUndefined()
+    }),
+  )
+
+  it.effect("excludes revision_progress from terminal-only rounds", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        callResponse("read", { path: "src/feature.ts" }, "read-progress-exclusion-1"),
+        callResponse("read", { path: "src/feature.ts" }, "read-progress-exclusion-2"),
+        revisionResponse("Terminal round now exposes only revised_prompt"),
+      ]
+      fileRead = (path) =>
+        Effect.succeed({ content: new TextEncoder().encode(`export const file = "${path}"`), mime: "text/plain" })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          fileRead = () => Effect.die("unexpected read")
+        }),
+      )
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef, operationID: "op-terminal" },
+        runtime,
+      )
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Terminal round now exposes only revised_prompt" })
+      expect(requests).toHaveLength(3)
+      expect(requests[0]!.tools.map((tool) => tool.name)).toContain("revision_progress")
+      expect(requests.at(-1)!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+      expect(requests.at(-1)!.toolChoice).toBe("required")
+    }),
+  )
+
+  it.effect("rejects revised_prompt combined with revision_progress like any extra tool", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        multiCallResponse(
+          {
+            id: "revision-mixed",
+            name: "revised_prompt",
+            input: { content: "Combined revision content.", references: [] },
+          },
+          { id: "progress-mixed", name: "revision_progress", input: { percent: 50 } },
+        ),
+        revisionResponse("Clean revision content"),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef, operationID: "op-mixed" },
+        runtime,
+      )
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Clean revision content" })
+      expect(result.type === "revision" ? result.tools : []).toEqual(["revised_prompt"])
+      expect(requests).toHaveLength(2)
+      expect(JSON.stringify(requests[1]!.messages)).toContain("must be the only tool call")
+      expect(requests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+    }),
+  )
+
+  it.effect("ignores an invalid progress payload without failing the revision", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        callResponse("revision_progress", { percent: "ninety" }, "bad-progress"),
+        revisionResponse("Recovered revision content"),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef, operationID: "op-invalid" },
+        runtime,
+      )
+
+      expect(result).toMatchObject({ type: "revision", prompt: "Recovered revision content" })
+      expect(result.type === "revision" ? result.tools : []).toEqual(["revised_prompt"])
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("coalesces progress tool calls out of the durable revision transcript", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        callResponse("revision_progress", { percent: 30, phase: "drafting" }, "durable-progress"),
+        revisionResponse("Durable progress revision"),
+      ]
+      const sessionID = SessionSchema.ID.make("ses_prompt_revisor_progress")
+      sessionInfo = {
+        id: sessionID,
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          sessionInfo = undefined
+          sessionMessages = []
+        }),
+      )
+      // Host-child provisioning only accepts a parent that exists durably.
+      const projectID = ProjectV2.ID.make("prompt-revisor-progress-project")
+      const { db, readDb } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: projectID, worktree: AbsolutePath.make(process.cwd()), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: projectID,
+          slug: sessionID,
+          directory: AbsolutePath.make(process.cwd()),
+          title: "Prompt revisor progress",
+          version: "test",
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const result = yield* (yield* PromptRevisor.Service).revise({
+        prompt: "Improve this.",
+        model: modelRef,
+        sessionID,
+        operationID: "op-durable",
+      })
+      expect(result.type).toBe("revision")
+
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: sessionID,
+        agent: "prompt_revisor",
+      })
+      const history = yield* SessionHistory.load(readDb, transcriptID)
+      const tools = history.flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.filter((part) => part.type === "tool").map((part) => part.name)
+          : [],
+      )
+      // The advisory tool call never becomes durable transcript state; only the
+      // committed revision remains as this operation's tool record.
+      expect(tools).not.toContain("revision_progress")
+      expect(tools).toContain("revised_prompt")
     }),
   )
 })

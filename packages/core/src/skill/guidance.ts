@@ -5,11 +5,14 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { AgentV2 } from "../agent"
 import { PermissionV2 } from "../permission"
 import { SkillV2 } from "../skill"
+import { SkillRevision } from "../skill/revision"
 import { SystemContext } from "../system-context/index"
 
 const Summary = Schema.Struct({
   name: Schema.String,
   description: Schema.String,
+  origin: Schema.String,
+  revision: Schema.String,
 })
 type Summary = typeof Summary.Type
 
@@ -25,6 +28,8 @@ const render = (skills: ReadonlyArray<Summary>) =>
             "  <skill>",
             `    <name>${skill.name}</name>`,
             `    <description>${skill.description}</description>`,
+            `    <origin>${skill.origin}</origin>`,
+            `    <revision>${skill.revision}</revision>`,
             "  </skill>",
           ]),
           "</available_skills>",
@@ -46,12 +51,24 @@ const layer = Layer.effect(
       load: Effect.fn("SkillGuidance.load")(function* (selection) {
         const agent = selection.info
         if (!agent) return SystemContext.empty
-        const permitted = SkillV2.available(yield* skills.list(), agent)
+        const permitted = (yield* skills.admitted()).filter((entry) => SkillV2.permitted(entry.info, agent))
         if (permitted.length === 0 && PermissionV2.evaluate("skill", "*", agent.permissions).effect === "deny")
           return SystemContext.empty
         const available = permitted
-          .flatMap((skill) =>
-            skill.description === undefined ? [] : [{ name: skill.name, description: skill.description }],
+          // Semantic provenance only: which source published this skill and
+          // which immutable revision was admitted. `info.location` stays
+          // host-local — it is private filesystem topology, not prompt content.
+          .flatMap((entry: SkillRevision.Admitted) =>
+            entry.info.description === undefined
+              ? []
+              : [
+                  {
+                    name: entry.info.name,
+                    description: entry.info.description,
+                    origin: entry.revision.origin,
+                    revision: SkillRevision.identity(entry.revision),
+                  },
+                ],
           )
           .toSorted((a, b) => a.name.localeCompare(b.name))
         return SystemContext.make({

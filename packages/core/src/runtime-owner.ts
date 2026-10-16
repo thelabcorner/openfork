@@ -3,6 +3,7 @@ export * as RuntimeOwner from "./runtime-owner"
 import { eq } from "drizzle-orm"
 import { Cause, Context, Duration, Effect, Fiber, Layer, Scope, Semaphore } from "effect"
 import { Database } from "./database/database"
+import { retrySqliteBusyCause } from "./database/sqlite-busy"
 import { makeGlobalNode } from "./effect/app-node"
 import { RuntimeOwnerTable } from "./runtime-owner.sql"
 
@@ -40,6 +41,20 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 
 export const HEARTBEAT_INTERVAL_MS = 30_000
 
+// RuntimeOwner can be instantiated by more than one independently compiled
+// service graph in the same Node process (for example the global Session and
+// Swarm/OXP graphs). Those graphs still describe one process and must share one
+// durable owner identity, otherwise a recovery claim held by one graph looks
+// like a foreign live process to another graph with the same PID.
+const PROCESS_STARTED_AT = Math.trunc(Date.now() - process.uptime() * 1_000)
+const PROCESS_OWNER_ID = ("runtime-owner:" + crypto.randomUUID()) as ID
+
+export function belongsToCurrentProcess(owner: Snapshot) {
+  // PID alone is not a process identity: Windows and POSIX can reuse it after
+  // exit. The owner row's start time must fall within this process lifetime.
+  return owner.pid === process.pid && owner.startedAt >= PROCESS_STARTED_AT - 5_000
+}
+
 export interface MakeOptions {
   readonly id?: ID
   readonly pid?: number
@@ -48,42 +63,54 @@ export interface MakeOptions {
 }
 
 export const make = Effect.fn("RuntimeOwner.make")(function* (options: MakeOptions = {}) {
-  const { db, readDb } = yield* Database.Service
+  const { db, readDb, controlDb } = yield* Database.Service
   const scope = yield* Scope.Scope
-  const id = options.id ?? (("runtime-owner:" + crypto.randomUUID()) as ID)
+  const id = options.id ?? PROCESS_OWNER_ID
   const pid = options.pid ?? process.pid
-  const startedAt = options.startedAt ?? Date.now()
+  const startedAt = options.startedAt ?? PROCESS_STARTED_AT
   const heartbeatIntervalMs = Math.max(10, Math.floor(options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS))
   const mutex = Semaphore.makeUnsafe(1)
   let retainCount = 0
   let heartbeat: Fiber.Fiber<void, never> | undefined
 
   const ensureRow = Effect.fn("RuntimeOwner.ensureRow")(function* () {
-    const now = Date.now()
-    yield* db
-      .insert(RuntimeOwnerTable)
-      .values({
-        id,
-        pid,
-        started_at: startedAt,
-        heartbeat_at: now,
-        control_epoch: 0,
-      })
-      .onConflictDoUpdate({
-        target: RuntimeOwnerTable.id,
-        set: { pid, heartbeat_at: now },
-      })
-      .run()
-      .pipe(Effect.orDie)
+    yield* retrySqliteBusyCause(
+      () => Effect.gen(function* () {
+        const writer = controlDb ? yield* controlDb() : db
+        const now = Date.now()
+        yield* writer
+          .insert(RuntimeOwnerTable)
+          .values({
+            id,
+            pid,
+            started_at: startedAt,
+            heartbeat_at: now,
+            control_epoch: 0,
+          })
+          .onConflictDoUpdate({
+            target: RuntimeOwnerTable.id,
+            set: { pid, heartbeat_at: now },
+          })
+          .run()
+          .pipe(Effect.orDie)
+      }),
+      { maxElapsedMs: 15_000, delayMs: 50, maxDelayMs: 500 },
+    )
   })
 
   const beat = Effect.fn("RuntimeOwner.heartbeat")(function* () {
-    yield* db
-      .update(RuntimeOwnerTable)
-      .set({ heartbeat_at: Date.now() })
-      .where(eq(RuntimeOwnerTable.id, id))
-      .run()
-      .pipe(Effect.orDie)
+    yield* retrySqliteBusyCause(
+      () => Effect.gen(function* () {
+        const writer = controlDb ? yield* controlDb() : db
+        yield* writer
+          .update(RuntimeOwnerTable)
+          .set({ heartbeat_at: Date.now() })
+          .where(eq(RuntimeOwnerTable.id, id))
+          .run()
+          .pipe(Effect.orDie)
+      }),
+      { maxElapsedMs: 15_000, delayMs: 50, maxDelayMs: 500 },
+    )
   })
 
   const startHeartbeat = Effect.fn("RuntimeOwner.startHeartbeat")(function* () {
@@ -127,7 +154,11 @@ export const make = Effect.fn("RuntimeOwner.make")(function* (options: MakeOptio
   )
 
   const snapshot = Effect.fn("RuntimeOwner.snapshot")(function* (ownerID: ID) {
-    const row = yield* readDb
+    // Runtime liveness is control-plane authority, not interactive history.
+    // An analytical SELECT can monopolize readDb for minutes; do not make
+    // heartbeat/death proof or Session interrupt wait for that lane.
+    const reader = controlDb ? yield* controlDb() : readDb
+    const row = yield* reader
       .select()
       .from(RuntimeOwnerTable)
       .where(eq(RuntimeOwnerTable.id, ownerID))

@@ -8,6 +8,7 @@ import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SkillV2 } from "@opencode-ai/core/skill"
+import { SkillRevision } from "@opencode-ai/core/skill/revision"
 import { SkillTool } from "@opencode-ai/core/tool/skill"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -16,6 +17,22 @@ import { it } from "./lib/effect"
 import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
 
 const sessionID = SessionV2.ID.make("ses_skill_tool_test")
+const encode = (value: string) => new TextEncoder().encode(value)
+
+/**
+ * Build the admission a real SkillV2 would have published for `info`. Using the
+ * production digest helpers keeps the pinned revision honest: the tool
+ * re-derives the package from disk and compares it against exactly this.
+ */
+const admit = (
+  info: SkillV2.Info,
+  origin: SkillRevision.Origin,
+  resources: SkillRevision.Resource[],
+): SkillRevision.Admitted => ({
+  info,
+  revision: SkillRevision.identify(origin, info.content, resources),
+  directory: path.dirname(info.location),
+})
 
 describe("SkillTool", () => {
   it.live("lists available skills, authorizes the selected name, and loads model-facing content", () =>
@@ -39,8 +56,11 @@ describe("SkillTool", () => {
             location: AbsolutePath.make(location),
             content: "# Effect\n\nGuidance",
           }
-          let current = [info]
+          let current = [
+            admit(info, "directory", [{ path: "reference.md", digest: SkillRevision.fileDigest(encode("reference")) }]),
+          ]
           const assertions: PermissionV2.AssertInput[] = []
+          const calls = { list: 0, refresh: 0 }
           let deny = false
           const permission = Layer.succeed(
             PermissionV2.Service,
@@ -56,13 +76,23 @@ describe("SkillTool", () => {
               list: () => Effect.die("unused"),
             }),
           )
+          // Selection reads the admitted snapshot only. It must never discover or
+          // re-admit, or the model could be served a revision other than the one
+          // it was shown.
           const skills = Layer.succeed(
             SkillV2.Service,
             SkillV2.Service.of({
               transform: (_transform) => Effect.die("unused"),
               reload: () => Effect.die("unused"),
               sources: () => Effect.die("unused"),
-              list: () => Effect.succeed(current),
+              admitted: () => Effect.succeed(current),
+              admit: (name: string) => Effect.succeed(current.find((entry) => entry.info.name === name)),
+              list: () =>
+                Effect.sync(() => {
+                  calls.list++
+                  return current.map((entry) => entry.info)
+                }),
+              refresh: () => Effect.sync(() => void calls.refresh++),
             }),
           )
           const skillToolLayer = AppNodeBuilder.build(
@@ -121,6 +151,25 @@ describe("SkillTool", () => {
               }),
             ).toEqual({ type: "error", value: "Unable to load skill effect" })
             deny = false
+            const authorizedBeforeDrift = assertions.length
+            // Same byte length, different bytes: the pinned package no longer
+            // describes these bytes, so the load must fail closed instead of
+            // mixing admitted instructions with replaced resources.
+            yield* Effect.promise(() => fs.writeFile(reference, "referencf"))
+            const drifted = yield* executeTool(registry, {
+              sessionID,
+              ...toolIdentity,
+              call: { type: "tool-call", id: "call-drifted-skill", name: "skill", input: { name: "effect" } },
+            })
+            expect(drifted.type).toBe("error")
+            expect(drifted.value).toContain("no longer matches the revision it was admitted at")
+            // It must not fall back to refreshing into a different revision, and
+            // it must tell the model how to recover.
+            expect(drifted.value).toContain("Load the skill again")
+            expect(drifted.value).not.toContain(directory)
+            // A drifted selection is never authorized.
+            expect(assertions).toHaveLength(authorizedBeforeDrift)
+
             const flat = SkillV2.Info.make({
               name: "public",
               description: "Public guidance",
@@ -133,7 +182,7 @@ describe("SkillTool", () => {
                 fs.writeFile(path.join(tmp.path, "secret.md"), "secret"),
               ]),
             )
-            current = [flat]
+            current = [admit(flat, "directory", [])]
             expect(
               yield* executeTool(registry, {
                 sessionID,
@@ -141,6 +190,9 @@ describe("SkillTool", () => {
                 call: { type: "tool-call", id: "call-flat-skill", name: "skill", input: { name: "public" } },
               }),
             ).toEqual({ type: "text", value: SkillTool.toModelOutput(flat, []) })
+
+            // Selection performed no discovery and no refresh at any point.
+            expect(calls).toEqual({ list: 0, refresh: 0 })
           }).pipe(Effect.provide(skillToolLayer))
         }),
       ),

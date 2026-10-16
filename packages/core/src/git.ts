@@ -153,6 +153,11 @@ export interface Interface {
     >
     /** Tracked paths only (`ls-files --cached`); no worktree walk. */
     readonly tracked: (input: { repository: Repository }) => Effect.Effect<readonly RelativePath[], OperationError>
+    /** Git-resolved ignored untracked paths, collapsing fully ignored directories. */
+    readonly ignoredDirectories: (input: { repository: Repository; scope?: RelativePath }) => Effect.Effect<{
+      readonly paths: readonly RelativePath[]
+      readonly truncated: boolean
+    }, OperationError>
   }
   readonly tree: {
     readonly capture: (input: {
@@ -335,11 +340,14 @@ const layer = Layer.effect(
     const repositoryArgs = (repository: Repository, args: string[]) =>
       GitRuntime.args(["--git-dir", repository.gitDirectory, "--work-tree", repository.worktree, ...args])
 
+    const MAX_IGNORED_PROJECTION_BYTES = 2 * 1024 * 1024
+    const MAX_IGNORED_PROJECTION_PATHS = 512
+
     const repositoryOperation = Effect.fnUntraced(function* (
       operationName: OperationError["operation"],
       repository: Repository,
       args: string[],
-      options?: { stdin?: string; env?: Record<string, string> },
+      options?: { stdin?: string; env?: Record<string, string>; maxOutputBytes?: number },
     ) {
       const result = yield* proc
         .run(
@@ -348,7 +356,7 @@ const layer = Layer.effect(
             env: options?.env,
             extendEnv: true,
           }),
-          { stdin: options?.stdin },
+          { stdin: options?.stdin, maxOutputBytes: options?.maxOutputBytes },
         )
         .pipe(
           Effect.mapError(
@@ -362,7 +370,8 @@ const layer = Layer.effect(
           ),
         )
       const text = result.stdout.toString("utf8")
-      if (result.exitCode === 0) return { text, stderr: result.stderr.toString("utf8") }
+      if (result.exitCode === 0)
+        return { text, stderr: result.stderr.toString("utf8"), truncated: result.stdoutTruncated }
       return yield* new OperationError({
         operation: operationName,
         directory: repository.worktree,
@@ -570,6 +579,47 @@ const layer = Layer.effect(
         .split("\0")
         .filter(Boolean)
         .map((item) => RelativePath.make(item))
+    })
+
+    const ignoredIndexDirectories = Effect.fn("Git.index.ignoredDirectories")(function* (input: {
+      repository: Repository
+      scope?: RelativePath
+    }) {
+      const scope = input.scope?.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "")
+      const result = yield* repositoryOperation("list_files", input.repository, [
+        "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--full-name", "-z",
+        ...(scope ? ["--", `:(literal)${scope}`] : []),
+      ], { maxOutputBytes: MAX_IGNORED_PROJECTION_BYTES })
+      const entries: string[] = []
+      let cursor = 0
+      let truncated = result.truncated
+      while (cursor < result.text.length && entries.length <= MAX_IGNORED_PROJECTION_PATHS) {
+        const end = result.text.indexOf("\0", cursor)
+        if (end < 0) {
+          // A byte-truncated final entry may be a partial path; don't hand it
+          // to the native watcher. Earlier complete entries remain valid.
+          truncated = true
+          break
+        }
+        if (end > cursor) entries.push(result.text.slice(cursor, end))
+        cursor = end + 1
+      }
+      if (entries.length > MAX_IGNORED_PROJECTION_PATHS) {
+        entries.length = MAX_IGNORED_PROJECTION_PATHS
+        truncated = true
+      }
+      const scoped = scope
+        ? entries.flatMap((item) => {
+            const normalized = item.replace(/\\?\/$/, "")
+            if (normalized === scope) return ["**"]
+            if (normalized.startsWith(`${scope}/`)) return [normalized.slice(scope.length + 1)]
+            return []
+          })
+        : entries.map((item) => item.replace(/\\?\/$/, ""))
+      return {
+        paths: scoped.filter(Boolean).map((item) => RelativePath.make(item)),
+        truncated,
+      }
     })
 
     const writeTree = Effect.fn("Git.tree.write")(function* (repository: Repository) {
@@ -1017,7 +1067,7 @@ const layer = Layer.effect(
       sync: { fetchRemotes: fetch, fetchBranch, checkoutRemoteBranch: checkout, resetHard: reset },
       change: { capture, apply, discard },
       worktree: { create: worktreeCreate, remove: worktreeRemove, list: worktreeList },
-      index: { refresh, ignored, list: listIndexFiles, tracked: trackedIndexFiles },
+      index: { refresh, ignored, list: listIndexFiles, tracked: trackedIndexFiles, ignoredDirectories: ignoredIndexDirectories },
       tree: {
         capture: captureTree,
         write: writeTree,

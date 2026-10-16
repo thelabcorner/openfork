@@ -115,6 +115,9 @@ describe("Yield Statistics moments", () => {
     const snapshot = snapshotYieldStatistic(state)
     expect(snapshot.sessions.completedBlocks).toBe(2)
     expect(snapshot.sessions.completedRequests).toBe(3)
+    // A second snapshot is already fully settled and does not need to create
+    // another state wrapper or repeat the moment updates.
+    expect(snapshotYieldStatistic(snapshot)).toBe(snapshot)
 
     const blocks = sessionMomentsFor(snapshot, 8)!
     const blockMean = meanVector(blocks)![0]

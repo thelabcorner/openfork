@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
@@ -31,6 +31,10 @@ import { Flag } from "./flag/flag"
 import { EventTrace } from "./event-trace"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
+import { Flock } from "./util/flock"
+import { makeSqliteMaintenanceQuietGate } from "./database/sqlite-maintenance"
+import { RUNTIME_LOCK_DIRNAME } from "./storage-identity"
+import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
@@ -772,6 +776,8 @@ export interface PublishOptions {
   readonly id?: ID
   readonly metadata?: Record<string, unknown>
   readonly location?: Location.Ref
+  /** Validate admission under the durable event's writer transaction, before projectors. Not replayed. */
+  readonly admit?: (seq: number) => Effect.Effect<void>
   /** Local operational projection committed atomically with a new durable event. Not replayed or serialized. */
   readonly commit?: (seq: number) => Effect.Effect<void>
 }
@@ -793,6 +799,27 @@ export interface Interface {
    * so high-rate unrelated events never invoke its callback.
    */
   readonly listenType: <D extends Definition>(definition: D, listener: Subscriber<D>) => Effect.Effect<Unsubscribe>
+  /**
+   * Subscribe to one event type for one Session. Unlike listenType + an
+   * in-callback session filter, unrelated Sessions do not invoke this handler.
+   * This is a local routing optimization, not a new authorization boundary.
+   * Event data without a string sessionID never reaches this index.
+   */
+  readonly listenSessionType: <D extends Definition>(
+    definition: D,
+    sessionID: string,
+    listener: Subscriber<D>,
+  ) => Effect.Effect<Unsubscribe>
+  /**
+   * Atomically register a single batch waiter across addressed Session IDs and
+   * event types. Dispatch remains indexed (never process-global), ordering is
+   * unchanged, and one unsubscribe releases the entire registration.
+   */
+  readonly listenSessionTypes: (
+    definitions: readonly Definition[],
+    sessionIDs: readonly string[],
+    listener: Subscriber,
+  ) => Effect.Effect<Unsubscribe>
   /**
    * Subscribe synchronously to one event type at one exact Location. High-rate
    * location services should prefer this over `listen()` so events from another
@@ -999,6 +1026,31 @@ export const allBounded = (events: Interface, capacity: number, maxBytes = 8 * 1
     return subscriber.stream
   })
 
+/**
+ * Explicit memory-bounded volatile type stream. Overflow FAILS this subscriber
+ * with SubscriberOverflowError; it must resubscribe/recover as appropriate.
+ * Durable consumers needing lossless resume MUST use durable(aggregateID)
+ * with a sequence cursor, never this live-only API.
+ */
+export const subscribeBounded = <D extends Definition>(
+  events: Interface,
+  definition: D,
+  capacity: number,
+  maxBytes = 8 * 1024 * 1024,
+) =>
+  Effect.gen(function* () {
+    const subscriber = yield* makeByteBoundedSubscriberQueue<Payload<D>>({
+      capacity,
+      maxBytes,
+      sizeOf: estimateEventBytes,
+      typeOf: (event) => event.type,
+    })
+    const unsubscribe = yield* events.listenType(definition, (event) =>
+      Effect.sync(() => subscriber.offer(event)))
+    yield* Effect.addFinalizer(() => unsubscribe)
+    return subscriber.stream
+  })
+
 export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
 }
@@ -1016,16 +1068,79 @@ export const layerWith = (options?: LayerOptions) =>
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
       const typeListeners = new Map<string, Subscriber[]>()
+      const sessionTypeListeners = new Map<string, Subscriber[]>()
       const locatedListeners = new Map<string, Subscriber[]>()
       const directoryListeners = new Map<string, Subscriber[]>()
       const directoryTypeListeners = new Map<string, Subscriber[]>()
       const aggregateListeners = new Map<string, Subscriber[]>()
-      const { db, readDb } = yield* Database.Service
-      yield* reclaimOrphanedEventPayloads(db)
+       const { db, readDb, filename } = yield* Database.Service
+       // Orphan cleanup is never a Session/HTTP startup dependency. The
+       // maintenance owner is isolated from the foreground writer and has a
+       // cross-process lease. Stagger it away from 10s planner optimization
+       // and 30s WAL checkpoint startup passes.
+       if (filename === ":memory:") {
+         yield* reclaimOrphanedEventPayloads(db)
+       } else {
+         yield* Effect.gen(function* () {
+           yield* Effect.sleep(Duration.minutes(2))
+           for (;;) {
+             const outcome = yield* Effect.scoped(
+               Flock.effect(`event-payload-reclaim:${filename}`, {
+                 dir: join(dirname(filename), RUNTIME_LOCK_DIRNAME),
+                 protectLiveProcess: true,
+                 staleMs: 60_000,
+                 timeoutMs: 100,
+                 baseDelayMs: 25,
+                 maxDelayMs: 50,
+               }).pipe(
+                 Effect.andThen(
+                   Database.withBackfillDb(
+                     filename,
+                     (maintenance) => Effect.gen(function* () {
+                       const quietGate = makeSqliteMaintenanceQuietGate(maintenance, {
+                         quietMs: 500,
+                         pollMs: 100,
+                       })
+                       for (let page = 0; page < 32; page++) {
+                         // A continually busy host must not retain a
+                         // cross-process Flock + SQLite worker indefinitely
+                         // while waiting for a quiet period that never comes.
+                         const result = yield* reclaimOrphanedEventPayloads(maintenance, {
+                           quietGate,
+                           quietWaitBudgetMs: 10_000,
+                         })
+                         // Do not spin through another 31 ten-second idle
+                         // waits under sustained writes while holding the
+                         // process-global maintenance lease. Yield ownership
+                         // immediately and retry on the five-minute cooldown.
+                         if (result.deferred) return true
+                         if (!result.hasMore) return false
+                         // Bounded per-page work; a large abandoned-payload
+                         // backlog cannot produce a continuous write storm.
+                         yield* Effect.sleep(Duration.millis(250))
+                       }
+                       return true
+                     }),
+                     { busyTimeoutMs: 0, asyncWorker: true },
+                   ),
+                 ),
+               ),
+             ).pipe(
+               Effect.map((hasMore) => ({ ok: true as const, hasMore })),
+               Effect.catchCause(() => Effect.succeed({ ok: false as const, hasMore: false })),
+             )
+             // Under long-lived runtimes, process crashes can leave orphans
+             // after the first cleanup. Retry a backlog slowly; check idle
+             // stores infrequently. A busy/failed pass never tight-loops.
+             yield* Effect.sleep(outcome.ok && outcome.hasMore ? Duration.minutes(5) : Duration.hours(6))
+           }
+         }).pipe(Effect.forkScoped)
+       }
 
       const locatedKey = (type: string, location: Location.Ref) =>
         `${type}\0${location.directory}\0${location.workspaceID ?? ""}`
       const directoryTypeKey = (type: string, directory: string) => `${type}\0${directory}`
+      const sessionTypeKey = (type: string, sessionID: string) => `${type}\0${sessionID}`
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -1058,6 +1173,7 @@ export const layerWith = (options?: LayerOptions) =>
           readonly strictOwner?: boolean
         },
         commit?: (seq: number) => Effect.Effect<void>,
+        admit?: (seq: number) => Effect.Effect<void>,
       ) {
         return Effect.gen(function* () {
           const durable = definition?.durable
@@ -1096,16 +1212,36 @@ export const layerWith = (options?: LayerOptions) =>
               // Drizzle does not stringify under the global writer permit.
               const staged = yield* stageEventPayload(db, encodedText)
               const storedData = staged ? preencodeJson(staged) : preencodedJsonText(encodedText)
-              const sparseCheckpoint = definition.type === Event.Compacted.type
-              const storedType = versionedType(definition.type, durable.version)
-              let transactionStarted = 0
-              return yield* Effect.uninterruptible(
-                Effect.gen(function* () {
-                  const committed = yield* db
-                    .transaction(
-                      () =>
-                        Effect.gen(function* () {
-                          if (EventTrace.active()) transactionStarted = performance.now()
+               const sparseCheckpoint = definition.type === Event.Compacted.type
+               const storedType = versionedType(definition.type, durable.version)
+               let transactionStarted = 0
+               // The existing transaction trace starts inside the callback,
+               // after BEGIN IMMEDIATE and connection-permit admission. It
+               // therefore cannot identify the writer-wait stalls seen under
+               // competing Sessions. Capture the boundary separately without
+               // recording aggregate or Session identity.
+               const tracing = EventTrace.active()
+                let beginWaitMs = 0
+               let writerStarted = 0
+               return yield* Effect.uninterruptible(
+                 Effect.gen(function* () {
+                   if (tracing) writerStarted = performance.now()
+                     // The native SQLite adapter already retries ONLY a
+                     // failed BEGIN while no user statement has executed.
+                     // Never wrap the entire transaction in a BUSY retry:
+                     // admission/projector/commit effects may already have
+                     // run, and a failed COMMIT must remain outcome-unknown.
+                     const committed = yield* db.transaction(
+                       () =>
+                         Effect.gen(function* () {
+                           if (tracing) {
+                             transactionStarted = performance.now()
+                              // Include all failed BEGIN attempts, permit
+                              // admission and jitter sleeps, not just the last
+                              // successful retry. Otherwise diagnostic data
+                              // systematically hides the worst contention.
+                              beginWaitMs = transactionStarted - writerStarted
+                           }
                           const row = yield* db
                             .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
                             .from(EventSequenceTable)
@@ -1196,6 +1332,10 @@ export const layerWith = (options?: LayerOptions) =>
                             ...event,
                             durable: { aggregateID, seq, version: durable.version },
                           } as Payload
+                          // Admission must see authoritative writer-transaction
+                          // state, not an earlier WAL reader snapshot. A refusal
+                          // leaves zero durable events/projector writes/notifies.
+                          if (admit) yield* admit(seq)
                           for (const projector of list) {
                             yield* projector(committed)
                           }
@@ -1249,12 +1389,14 @@ export const layerWith = (options?: LayerOptions) =>
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },
-                    )
-                    .pipe(Effect.orDie)
-                  if (transactionStarted > 0) {
-                    const elapsed = performance.now() - transactionStarted
-                    EventTrace.timing("durable.transaction", elapsed)
-                    EventTrace.timing(`durable.transaction.${definition.type}`, elapsed)
+                       ).pipe(Effect.orDie)
+                   if (tracing && transactionStarted > 0) {
+                     EventTrace.timing("durable.begin.wait", beginWaitMs)
+                     EventTrace.timing(`durable.begin.wait.${definition.type}`, beginWaitMs)
+                     EventTrace.timing("durable.writer.total", performance.now() - writerStarted)
+                     const elapsed = performance.now() - transactionStarted
+                     EventTrace.timing("durable.transaction", elapsed)
+                     EventTrace.timing(`durable.transaction.${definition.type}`, elapsed)
                   }
                   if (committed) {
                     yield* Effect.forEach(
@@ -1271,9 +1413,12 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      function publishEvent<D extends Definition>(definition: D, event: Payload<D>, commit?: PublishOptions["commit"]) {
+      function publishEvent<D extends Definition>(
+        definition: D, event: Payload<D>,
+        commit?: PublishOptions["commit"], admit?: PublishOptions["admit"],
+      ) {
         return Effect.gen(function* () {
-          if (!definition?.durable && commit)
+          if (!definition?.durable && (commit || admit))
             return yield* Effect.die(
               new InvalidDurableEventError({
                 type: event.type,
@@ -1281,7 +1426,7 @@ export const layerWith = (options?: LayerOptions) =>
               }),
             )
           if (definition?.durable) {
-            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit)
+            const committed = yield* commitDurableEvent(definition, event as Payload, undefined, commit, admit)
             if (committed) {
               event = {
                 ...event,
@@ -1391,6 +1536,25 @@ export const layerWith = (options?: LayerOptions) =>
               )
             }
           }
+          // Session-indexed listeners keep the publication cost proportional
+          // to observers of the actual Session rather than every active waiter
+          // sharing this event type. No database, allocation, or fanout work
+          // is needed when there is no registered listener for this Session.
+          const sessionID = (event.data as { sessionID?: unknown } | null)?.sessionID
+          if (typeof sessionID === "string") {
+            const key = sessionTypeKey(event.type, sessionID)
+            const specific = sessionTypeListeners.get(key)
+            if (specific?.length === 1) {
+              const listener = specific[0]!
+              yield* observe(event, listener, () => removeFrom(sessionTypeListeners, key, listener))
+            } else if (specific && specific.length > 1) {
+              // Preserve per-session event order and the synchronous listener
+              // lifecycle. This merely eliminates nonmatching callbacks.
+              for (const listener of specific.slice()) {
+                yield* observe(event, listener, () => removeFrom(sessionTypeListeners, key, listener))
+              }
+            }
+          }
           if (event.location) {
             const key = locatedKey(event.type, event.location)
             const located = locatedListeners.get(key)
@@ -1475,6 +1639,7 @@ export const layerWith = (options?: LayerOptions) =>
               data,
             } as Payload<D>,
             options?.commit,
+            options?.admit,
           )
         })
       }
@@ -1695,6 +1860,39 @@ export const layerWith = (options?: LayerOptions) =>
           return Effect.sync(() => removeFrom(typeListeners, key, subscriber))
         })
 
+      const listenSessionType = <D extends Definition>(
+        definition: D,
+        sessionID: string,
+        listener: Subscriber<D>,
+      ): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const key = sessionTypeKey(definition.type, sessionID)
+          const list = sessionTypeListeners.get(key) ?? []
+          const subscriber = listener as Subscriber
+          list.push(subscriber)
+          sessionTypeListeners.set(key, list)
+          return Effect.sync(() => removeFrom(sessionTypeListeners, key, subscriber))
+        })
+
+      const listenSessionTypes: Interface["listenSessionTypes"] = (definitions, sessionIDs, listener) =>
+        Effect.sync(() => {
+          const keys: string[] = []
+          const types = [...new Set(definitions.map((definition) => definition.type))]
+          const sessions = [...new Set(sessionIDs)]
+          for (const sessionID of sessions) {
+            for (const type of types) {
+              const key = sessionTypeKey(type, sessionID)
+              const list = sessionTypeListeners.get(key) ?? []
+              list.push(listener)
+              sessionTypeListeners.set(key, list)
+              keys.push(key)
+            }
+          }
+          return Effect.sync(() => {
+            for (const key of keys) removeFrom(sessionTypeListeners, key, listener)
+          })
+        })
+
       const listenLocation = <D extends Definition>(
         definition: D,
         location: Location.Ref,
@@ -1762,6 +1960,8 @@ export const layerWith = (options?: LayerOptions) =>
         durable,
         listen,
         listenType,
+        listenSessionType,
+      listenSessionTypes,
         listenLocation,
         listenDirectory,
         listenDirectoryAll,

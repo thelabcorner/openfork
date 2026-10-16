@@ -16,6 +16,41 @@ const it = testEffect(LayerNode.compile(Git.node))
 const bare = testEffect(Layer.empty)
 
 describe("Git", () => {
+  it.live("projects ignored directories with Git's tracked and negation semantics", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (root) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await initRepo(root.path)
+            await fs.writeFile(path.join(root.path, ".gitignore"), "large/*\n!large/keep/\n!large/keep/tracked.txt\n")
+            await fs.mkdir(path.join(root.path, "large", "keep"), { recursive: true })
+            await fs.mkdir(path.join(root.path, "large", "generated"), { recursive: true })
+            await fs.writeFile(path.join(root.path, "large", "keep", "tracked.txt"), "tracked\n")
+            await fs.writeFile(path.join(root.path, "large", "forced.txt"), "tracked despite ignore\n")
+            await fs.writeFile(path.join(root.path, "large", "generated", "ignored.txt"), "ignored\n")
+            await $`git add .gitignore large/keep/tracked.txt`.cwd(root.path).quiet()
+            await $`git add -f large/forced.txt`.cwd(root.path).quiet()
+            await $`git commit -m ignored-projection`.cwd(root.path).quiet()
+          })
+          const git = yield* Git.Service
+          const repository = yield* git.repo.discover(AbsolutePath.make(root.path))
+          if (!repository) throw new Error("Repository not found")
+          const projection = yield* git.index.ignoredDirectories({ repository })
+          expect(projection.truncated).toBe(false)
+          expect(projection.paths.map(String)).toEqual(["large/generated"])
+          const nested = yield* git.index.ignoredDirectories({ repository, scope: RelativePath.make("large") })
+          expect(nested.paths.map(String)).toEqual(["generated"])
+          const ignoredRoot = yield* git.index.ignoredDirectories({
+            repository,
+            scope: RelativePath.make("large/generated"),
+          })
+          expect(ignoredRoot.paths.map(String)).toEqual(["**"])
+        }),
+      (root) => Effect.promise(() => root[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("clones a remote and reads checkout metadata", () =>
     withRemote((fixture) =>
       Effect.gen(function* () {
