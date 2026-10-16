@@ -17,6 +17,7 @@ export interface RunnerHistoryProjection {
     readonly resetBoundary?: SessionMessage.ID
     readonly messages: ReadonlyMap<string, SessionMessage.Synthetic>
   }>
+  readonly updateMessages: (messages: readonly SessionMessage.Message[]) => Effect.Effect<void>
   readonly close: Effect.Effect<void>
 }
 
@@ -66,6 +67,14 @@ function makeProjection(initial: readonly Entry[]) {
     entries[index] = { seq: current.seq, message }
     version++
     cachedView = undefined
+  }
+
+  const updateMessages = (messages: readonly SessionMessage.Message[]) => {
+    for (const message of messages) {
+      const index = byID.get(message.id)
+      if (index === undefined) continue
+      replace(index, message)
+    }
   }
 
   const adapter: SessionMessageUpdater.Adapter = {
@@ -161,7 +170,7 @@ function makeProjection(initial: readonly Entry[]) {
     messages: new Map(stateBySource) as ReadonlyMap<string, SessionMessage.Synthetic>,
   })
 
-  return { apply, view, stateProjections }
+  return { apply, view, stateProjections, updateMessages }
 }
 
 /**
@@ -254,5 +263,13 @@ export const makeRunnerHistoryProjection = Effect.fn("SessionRunnerHistory.make"
     return projection!.stateProjections()
   })
 
-  return { entries, stateProjections, close } satisfies RunnerHistoryProjection
+  const updateMessages = Effect.fnUntraced(function* (messages: readonly SessionMessage.Message[]) {
+    // Repairs are durable but carry no event. A stale/absent projection reloads
+    // from the durable snapshot on the next entries() read and therefore already
+    // observes them; only the live cached projection needs an explicit repair.
+    if (messages.length === 0 || projection === undefined || stale) return
+    projection.updateMessages(messages)
+  })
+
+  return { entries, stateProjections, updateMessages, close } satisfies RunnerHistoryProjection
 })

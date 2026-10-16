@@ -145,7 +145,17 @@ function truncateUtf8(text: string, maxBytes: number) {
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { readDb } = yield* Database.Service
+    const { readDb, withScanDb } = yield* Database.Service
+    // Full-text searches can execute native FTS5 over hundreds of thousands of
+    // rows. Never let one monopolize the latency-sensitive interactive reader
+    // (or the primary writer) while supervisors need to inspect/cancel Sessions.
+    // The production Database provides a persistent, exclusively leased,
+    // worker-backed scan connection. Legacy injected fixtures without a scan
+    // lease retain their existing reader.
+    const withSearchReader = <A, E, R>(
+      run: (reader: Database.DatabaseShape) => Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> =>
+      withScanDb ? withScanDb(run) : run(readDb)
 
     const get = Effect.fn("SessionInspection.get")(function* (sessionID: SessionSchema.ID) {
       const row = yield* readDb
@@ -203,8 +213,10 @@ const layer = Layer.effect(
       return rows.map(project)
     })
 
-    const search: Interface["search"] = (input) => SessionSearch.search(readDb, input)
-    const recall: Interface["recall"] = (input) => SessionRecall.recall(readDb, input)
+    const search: Interface["search"] = (input) =>
+      withSearchReader((reader) => SessionSearch.search(reader, input))
+    const recall: Interface["recall"] = (input) =>
+      withSearchReader((reader) => SessionRecall.recall(reader, input))
 
     const messages = Effect.fn("SessionInspection.messages")(function* (input: {
       readonly sessionID: SessionSchema.ID

@@ -9,6 +9,13 @@ export {
   AgentPartInput,
   Assistant,
   CompactionPart,
+  CodeRunTrace,
+  CodeRunTraceFrame,
+  CODE_RUN_TRACE_MAX_ID_CHARS,
+  CODE_RUN_TRACE_MAX_REF_CHARS,
+  CODE_RUN_TRACE_MAX_TITLE_CHARS,
+  CODE_RUN_TRACE_MAX_FRAMES,
+  isCodeRunTrace,
   Event,
   FilePart,
   FilePartInput,
@@ -45,6 +52,8 @@ export {
   UserTurnProvenance,
   WithParts,
 } from "@opencode-ai/schema/session-v1"
+
+export type { CodeRunTraceView } from "@opencode-ai/schema/session-v1"
 
 export const OutputLengthError = NamedError.create("MessageOutputLengthError", {})
 export const AuthError = NamedError.create("ProviderAuthError", { providerID: Schema.String, message: Schema.String })

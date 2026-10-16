@@ -49,6 +49,16 @@ export const Info = Schema.Struct({
     description:
       "Process-global OpenFork Network / OFXP runtime preferences. Workspace-scoped values are not used to grant peer authority.",
   }),
+  usage_limit_recovery: Schema.optional(
+    Schema.Struct({
+      auto_resume: Schema.optional(Schema.Boolean).annotate({
+        description: "Automatically resume usage-limited sessions when a trusted future reset is known. Defaults to false.",
+      }),
+      snooze_until_reset: Schema.optional(Schema.Boolean).annotate({
+        description: "Snooze usage-limited sessions until their known reset. Defaults to false.",
+      }),
+    }).annotate({ identifier: "UsageLimitRecoveryConfig" }),
+  ).annotate({ description: "Process-global defaults for durable usage-limit recovery." }),
   command: Schema.optional(Schema.Record(Schema.String, ConfigCommandV1.Info)).annotate({
     description: `Command configuration. See OpenFork documentation at ${PRODUCT_DOCS_URL}`,
   }),

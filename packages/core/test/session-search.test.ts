@@ -19,7 +19,7 @@ import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionSearch } from "@opencode-ai/core/session/search"
-import { partSearchText, searchText, snippet } from "@opencode-ai/core/session/search-text"
+import { partSearchText, searchText, snippet, toolRecallSearchText } from "@opencode-ai/core/session/search-text"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import {
   MessageTable,
@@ -90,6 +90,88 @@ const insertMessage = (
 }
 
 describe("SessionSearch extraction", () => {
+  it.effect("title substring search treats LIKE wildcards as literal characters", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      yield* db.insert(ProjectTable).values({
+        id: ProjectV2.ID.global, worktree: AbsolutePath.make("/approved"), sandboxes: [],
+      }).run()
+      const titles = [
+        ["ses_like_percent", "100% corner accuracy"],
+        ["ses_like_decoy", "1000 corner accuracy"],
+        ["ses_like_underscore", "shader_path attention"],
+        ["ses_like_plain", "shaderXpath attention"],
+        ["ses_like_bang", "operator! parity"],
+      ] as const
+      for (const [id, title] of titles) {
+        yield* db.insert(SessionTable).values({
+          id: SessionSchema.ID.make(id),
+          project_id: ProjectV2.ID.global,
+          slug: id,
+          directory: "/approved/work",
+          title,
+          version: "test",
+          time_created: 100,
+          time_updated: 100,
+        }).run()
+      }
+      const titleIds = (query: string) =>
+        SessionSearch.search(db, { query, limit: 10, directoryPrefixes: ["/approved"] })
+          .pipe(Effect.map((result) => result.titleMatches.map((x) => String(x.id))))
+      expect(yield* titleIds("%")).toEqual(["ses_like_percent"])
+      expect(yield* titleIds("_")).toEqual(["ses_like_underscore"])
+      expect(yield* titleIds("100%")).toEqual(["ses_like_percent"])
+      expect(yield* titleIds("operator!")).toEqual(["ses_like_bang"])
+      expect(yield* titleIds("shader_")).toEqual(["ses_like_underscore"])
+      const negativeLimit = yield* SessionSearch.search(db, {
+        query: "accuracy", limit: -1, directoryPrefixes: ["/approved"],
+      })
+      expect(negativeLimit.titleMatches).toHaveLength(1)
+      const zeroLimit = yield* SessionSearch.search(db, {
+        query: "accuracy", limit: 0, directoryPrefixes: ["/approved"],
+      })
+      expect(zeroLimit.titleMatches).toHaveLength(1)
+    }),
+  )
+
+  test("relevance rank fusion balances V1 and V2 evidence and rewards true cross-index agreement", () => {
+    const hit = (id: string, time: number): SessionSearch.SearchMessageMatch => ({
+      sessionID: SessionSchema.ID.make("ses_" + id),
+      messageID: SessionMessage.ID.make("msg_" + id),
+      sessionTitle: "Test",
+      directory: "/approved",
+      projectID: ProjectV2.ID.global,
+      time: { created: time },
+      type: "user",
+      snippet: id,
+      matchedTerms: ["vectorization"],
+    })
+    const v2 = [hit("v2_first", 80), hit("v2_second", 70), hit("v2_third", 60)]
+    const v1 = [hit("v1_first", 100), hit("v1_second", 50)]
+    const ranking = SessionSearch.mergeMatches(v2, v1, 3, "relevance")
+    // Before this fix, V1 could never enter the top 3 when V2 had 3 hits.
+    expect(ranking.map((x) => String(x.messageID))).toContain("msg_v1_first")
+    expect(ranking.map((x) => String(x.messageID))).toContain("msg_v2_first")
+    expect(ranking).toHaveLength(3)
+
+    const both = hit("cross_index", 200)
+    const combined = SessionSearch.mergeMatches([v2[0]!, both], [both, v1[0]!], 5, "relevance")
+    expect(combined[0]?.messageID).toBe(both.messageID)
+    expect(combined.filter((x) => x.messageID === both.messageID)).toHaveLength(1)
+    const inOneIndex = SessionSearch.mergeMatches(
+      [v2[0]!], [v1[0]!, v1[0]!, v1[0]!, v1[0]!], 2, "relevance")
+    expect(inOneIndex).toHaveLength(2)
+    expect(inOneIndex[0]?.messageID).toBe(v1[0]!.messageID)
+    // Repeated V1 parts must never receive cross-source agreement credit.
+    const corroborated = SessionSearch.mergeMatches(
+      [v2[0]!, both], [v1[0]!, v1[0]!, both], 3, "relevance")
+    expect(corroborated[0]?.messageID).toBe(both.messageID)
+    const recent = SessionSearch.mergeMatches(v2, v1, 2, "recent")
+    expect(recent.map((x) => String(x.messageID))).toEqual(["msg_v1_first", "msg_v2_first"])
+    expect(SessionSearch.mergeMatches([], v1, 1, "relevance")[0]?.messageID).toBe(v1[0]!.messageID)
+    expect(SessionSearch.mergeMatches(v2, [], 1, "relevance")[0]?.messageID).toBe(v2[0]!.messageID)
+  })
+
   const time = { created: DateTime.makeUnsafe(0) }
 
   it.effect("extracts user, system, and synthetic text", () =>
@@ -472,6 +554,36 @@ describe("SessionV2.search", () => {
     }),
   )
 
+  it.effect("keeps relevance as the Core default while recent ranking orders durable evidence before projection", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const session = yield* SessionV2.Service
+      const created = yield* createSession(session, "/project")
+      const older = SessionMessage.User.make({
+        id: SessionMessage.ID.make("msg_search_ranking_older"),
+        type: "user",
+        text: "temporal needle older evidence",
+        time: { created: DateTime.makeUnsafe(100) },
+      })
+      const newer = SessionMessage.User.make({
+        id: SessionMessage.ID.make("msg_search_ranking_newer"),
+        type: "user",
+        text: "temporal needle newer evidence",
+        time: { created: DateTime.makeUnsafe(200) },
+      })
+      yield* insertMessage(db, { sessionID: created.id, message: older, seq: 1, search_text: searchText(older) })
+      yield* insertMessage(db, { sessionID: created.id, message: newer, seq: 2, search_text: searchText(newer) })
+
+      const defaultOrder = yield* SessionSearch.search(db, { query: "needle", limit: 2 })
+      const relevance = yield* SessionSearch.search(db, { query: "needle", ranking: "relevance", limit: 2 })
+      expect(defaultOrder.messageMatches.map((match) => match.messageID))
+        .toEqual(relevance.messageMatches.map((match) => match.messageID))
+
+      const recent = yield* SessionSearch.search(db, { query: "needle", ranking: "recent", limit: 2 })
+      expect(recent.messageMatches.map((match) => match.messageID)).toEqual([newer.id, older.id])
+    }),
+  )
+
   it.effect("never defects on pathological user input", () =>
     Effect.gen(function* () {
       const session = yield* SessionV2.Service
@@ -674,6 +786,61 @@ describe("SessionSearch V1 part extraction", () => {
     }),
   )
 
+  it.effect("never indexes Code source/runtime input while retaining safe lineage hints", () =>
+    Effect.gen(function* () {
+      const secretSource = "const password = 'super-secret-source'; return input"
+      const secretInput = "super-secret-runtime-input"
+      const tool = SessionV1.ToolPart.make({
+        ...base,
+        type: "tool",
+        callID: "call_code_1",
+        tool: "code",
+        state: {
+          status: "completed",
+          input: {
+            action: "run",
+            code: secretSource,
+            input: { token: secretInput },
+            save: { name: "summarize_repo", scope: "project", tags: ["repo", "summary"] },
+          },
+          output: "",
+          title: "code",
+          metadata: {
+            sourceHash: "sha256:abc",
+            sourceRunID: "run:prt_source",
+            dependencies: {
+              literalRefs: ["native:find", "mcp:github/list_issues"],
+              dynamicCallTarget: false,
+            },
+          },
+          time: { start: 0, end: 1 },
+        },
+      })
+      const extracted = partSearchText(tool)
+      expect(extracted).toContain("tool:code")
+      expect(extracted).toContain("action:run")
+      expect(extracted).toContain("save:summarize_repo")
+      expect(extracted).toContain("dep:native:find")
+      expect(extracted).toContain("dep:mcp:github/list_issues")
+      expect(extracted).not.toContain(secretSource)
+      expect(extracted).not.toContain(secretInput)
+      expect(extracted).not.toContain("password")
+
+      const recall = toolRecallSearchText(
+        tool.tool,
+        tool.state.input,
+        "metadata" in tool.state ? tool.state.metadata : undefined,
+      )
+      expect(recall).not.toContain("tool:code")
+      expect(recall).toContain("action:run")
+      expect(recall).toContain("save:summarize_repo")
+      expect(recall).toContain("source:sha256:abc")
+      expect(recall).toContain("dep:native:find")
+      expect(recall).not.toContain(secretSource)
+      expect(recall).not.toContain(secretInput)
+    }),
+  )
+
   it.effect("extracts nothing for structural parts", () =>
     Effect.gen(function* () {
       const step = SessionV1.StepStartPart.make({ ...base, type: "step-start", snapshot: "abc" })
@@ -805,9 +972,15 @@ describe("SessionSearch V1 part search", () => {
         parts: [text],
       })
 
-      const result = yield* SessionSearch.search((yield* Database.Service).db, { query: "needle" })
-      // One V1 match + one V2 match from distinct messages.
-      expect(result.messageMatches.length).toBeGreaterThanOrEqual(2)
+      const result = yield* SessionSearch.search((yield* Database.Service).db, {
+        query: "needle",
+        ranking: "recent",
+      })
+      // The two stores must be globally time-merged, not concatenated V2-first.
+      expect(result.messageMatches.slice(0, 2).map((match) => String(match.messageID))).toEqual([
+        "msg_v1_needle",
+        "msg_v2_needle",
+      ])
       // Distinct message IDs only.
       const ids = new Set(result.messageMatches.map((match) => match.messageID))
       expect(ids.size).toBe(result.messageMatches.length)
@@ -874,7 +1047,7 @@ describe("SessionSearch.backfillParts", () => {
       const state = yield* db
         .select({ done: PartSearchBackfillTable.done })
         .from(PartSearchBackfillTable)
-        .where(eq(PartSearchBackfillTable.id, 1))
+        .where(eq(PartSearchBackfillTable.id, 2))
         .get()
         .pipe(Effect.orDie)
       expect(state?.done).toBe(1)
@@ -973,7 +1146,7 @@ describe("SessionSearch.backfillParts", () => {
       yield* db
         .update(PartSearchBackfillTable)
         .set({ watermark_rowid: firstRow!.rowid, done: 0 })
-        .where(eq(PartSearchBackfillTable.id, 1))
+        .where(eq(PartSearchBackfillTable.id, 2))
         .run()
         .pipe(Effect.orDie)
       yield* SessionSearch.backfillParts(db)

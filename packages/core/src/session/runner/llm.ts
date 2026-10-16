@@ -6,6 +6,7 @@ import {
   Message,
   SystemPart,
   isContextOverflowFailure,
+  isStaleReasoningFailure,
   nativeSystemMessageCapability,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
@@ -34,6 +35,7 @@ import { SessionMessage } from "../message"
 import { SessionMessageProjection } from "../message-projection"
 import { SessionRecovery } from "../recovery"
 import { SessionSchema } from "../schema"
+import { SessionStaleReasoning } from "../stale-reasoning"
 import { SessionMessageTable } from "../sql"
 import { SessionStore } from "../store"
 import { SessionTelemetry } from "../telemetry"
@@ -234,9 +236,7 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (existing) {
         if (existing.session_id !== reservation.sessionID)
-          return yield* Effect.die(
-            `Goal continuation message ${messageID} already belongs to another Session`,
-          )
+          return yield* Effect.die(`Goal continuation message ${messageID} already belongs to another Session`)
         const message = yield* SessionMessageProjection.decodeRow(db, existing)
         if (message.type !== "synthetic" || message.text !== reservation.prompt)
           return yield* Effect.die(
@@ -251,9 +251,7 @@ const layer = Layer.effect(
           ) ||
             SessionTurnProvenance.causalRootMessageID(message) !== source.message.id)
         )
-          return yield* Effect.die(
-            `Goal continuation message ${messageID} has conflicting causal provenance`,
-          )
+          return yield* Effect.die(`Goal continuation message ${messageID} has conflicting causal provenance`)
         return { state: "promoted" as const }
       }
 
@@ -293,6 +291,8 @@ const layer = Layer.effect(
       | { readonly _tag: "ContinueAfterCompaction"; readonly step: number }
       // Overflow compaction completed; rebuild once through the path without overflow recovery.
       | { readonly _tag: "ContinueAfterOverflowCompaction"; readonly step: number }
+      // Stale encrypted reasoning was stripped; rebuild once without those caller-bound blobs.
+      | { readonly _tag: "ContinueAfterStaleReasoning"; readonly step: number }
 
     class TurnTransitionError extends Error {
       constructor(readonly transition: TurnTransition) {
@@ -303,6 +303,8 @@ const layer = Layer.effect(
     const continueAfterCompaction = (step: number) => new TurnTransitionError({ _tag: "ContinueAfterCompaction", step })
     const continueAfterOverflowCompaction = (step: number) =>
       new TurnTransitionError({ _tag: "ContinueAfterOverflowCompaction", step })
+    const continueAfterStaleReasoning = (step: number) =>
+      new TurnTransitionError({ _tag: "ContinueAfterStaleReasoning", step })
 
     type RunState = {
       readonly history: RunnerHistoryProjection
@@ -393,9 +395,12 @@ const layer = Layer.effect(
     })
 
     const loadSystemContext = (sessionID: SessionSchema.ID, agent: AgentV2.Selection) =>
-      Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load(), goalContext.forSession(sessionID)], {
-        concurrency: "unbounded",
-      }).pipe(Effect.map(SystemContext.combine))
+      Effect.all(
+        [systemContext.load(), skillGuidance.load(agent), referenceGuidance.load(), goalContext.forSession(sessionID)],
+        {
+          concurrency: "unbounded",
+        },
+      ).pipe(Effect.map(SystemContext.combine))
 
     const loadSystemSurface = (sessionID: SessionSchema.ID, agent: AgentV2.Selection) =>
       loadSystemContext(sessionID, agent).pipe(Effect.flatMap(SystemContext.observeSurface))
@@ -408,6 +413,7 @@ const layer = Layer.effect(
       step: number,
       semanticStartedAt: number | undefined,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
+      recoverStaleReasoning = true,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
@@ -442,9 +448,7 @@ const layer = Layer.effect(
         if (promoted.promoted > 0) currentStep = 1
       }
       const routeIntent =
-        pendingRouteEntry?.item.type === "synthetic"
-          ? pendingRouteEntry.item.execution?.routeIntent
-          : undefined
+        pendingRouteEntry?.item.type === "synthetic" ? pendingRouteEntry.item.execution?.routeIntent : undefined
       const resolvedModel = yield* models.resolveWithInfo(session, routeIntent)
       const model = resolvedModel.model
       const system =
@@ -548,11 +552,12 @@ const layer = Layer.effect(
       let streamedAt: number | undefined
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
         withPublication(
-          publisher.publish(event, outputPaths).pipe(
-            Effect.andThen(telemetry.observe({ sessionID: session.id, event })),
-          ),
+          publisher
+            .publish(event, outputPaths)
+            .pipe(Effect.andThen(telemetry.observe({ sessionID: session.id, event }))),
         )
       let overflowFailure: ProviderErrorEvent | undefined
+      let staleReasoningFailure: ProviderErrorEvent | undefined
       const providerStream = llm.stream(request).pipe(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
@@ -561,7 +566,7 @@ const layer = Layer.effect(
             // sessions' LLM event processing, SSE delivery, or IPC. Scheduling-only;
             // per-session publication order is preserved by the withPublication semaphore.
             yield* Effect.yieldNow
-            if (overflowFailure || publisher.hasProviderError()) return
+            if (overflowFailure || staleReasoningFailure || publisher.hasProviderError()) return
             if (
               firstTokenAt === undefined &&
               (event.type === "text-start" ||
@@ -573,6 +578,10 @@ const layer = Layer.effect(
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
                 overflowFailure = event
+                return
+              }
+              if (recoverStaleReasoning && isStaleReasoningFailure(event) && !publisher.hasAssistantStarted()) {
+                staleReasoningFailure = event
                 return
               }
             }
@@ -627,8 +636,14 @@ const layer = Layer.effect(
             sessionID: session.id,
             requestSentAt: DateTime.toEpochMillis(requestSentAt),
             model: {
-              providerID: model.provider,
-              modelID: model.id,
+              ...SessionTelemetry.telemetryModelIdentity({
+                providerID: model.provider,
+                modelID: model.id,
+                ...(session.model?.accountID === undefined ? {} : { accountID: session.model.accountID }),
+                ...(resolvedModel.route?.routeKind === "account" && resolvedModel.route.accountID
+                  ? { routedAccountID: resolvedModel.route.accountID }
+                  : {}),
+              }),
               name: resolvedModel.name,
               ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
               ...(model.defaults?.limits?.context === undefined ? {} : { contextLimit: model.defaults.limits.context }),
@@ -641,19 +656,34 @@ const layer = Layer.effect(
             recoverOverflow &&
             !publisher.hasAssistantStarted() &&
             isContextOverflowFailure(overflowFailure ?? failure) &&
-            (yield*
-              restore(
-                recoverOverflow({
-                  sessionID: session.id,
-                  entries,
-                  model,
-                  request,
-                  sourceMessageID: workerTurn.message.id,
-                }),
-              ))
+            (yield* restore(
+              recoverOverflow({
+                sessionID: session.id,
+                entries,
+                model,
+                request,
+                sourceMessageID: workerTurn.message.id,
+              }),
+            ))
           )
             return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
+          if (
+            recoverStaleReasoning &&
+            !publisher.hasAssistantStarted() &&
+            !isContextOverflowFailure(staleReasoningFailure ?? failure) &&
+            isStaleReasoningFailure(staleReasoningFailure ?? failure)
+          ) {
+            // Durable repair plus an exact in-memory projection sync. The retry
+            // rebuilds its request from the active projection, so repaired rows
+            // must be visible without a full history reload.
+            const repaired = yield* restore(SessionStaleReasoning.persist(db, session.id, context))
+            if (repaired.length > 0) {
+              yield* state.history.updateMessages(repaired)
+              return yield* Effect.die(continueAfterStaleReasoning(currentStep))
+            }
+          }
           if (overflowFailure) yield* publish(overflowFailure)
+          if (staleReasoningFailure) yield* publish(staleReasoningFailure)
           const llmFailure = failure instanceof LLMError ? failure : undefined
           if (llmFailure && !publisher.hasProviderError()) {
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
@@ -805,6 +835,17 @@ const layer = Layer.effect(
               if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
               if (defect.transition._tag === "ContinueAfterOverflowCompaction")
                 return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
+              if (defect.transition._tag === "ContinueAfterStaleReasoning")
+                return yield* runTurnAttempt(
+                  state,
+                  sessionID,
+                  cycleSource,
+                  undefined,
+                  defect.transition.step,
+                  semanticStartedAt,
+                  undefined,
+                  false,
+                )
               yield* Effect.yieldNow
               return yield* runAfterOverflowCompaction(
                 state,
@@ -820,43 +861,48 @@ const layer = Layer.effect(
       },
     )
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (
-      state,
-      sessionID,
-      cycleSource,
-      promotion,
-      step,
-      semanticStartedAt,
-    ) {
-      const startedAt =
-        semanticStartedAt ?? (step === 1 ? DateTime.toEpochMillis(yield* DateTime.now) : undefined)
-      return yield* runTurnAttempt(
-        state,
-        sessionID,
-        cycleSource,
-        promotion,
-        step,
-        startedAt,
-        compaction.compactAfterOverflow,
-      ).pipe(
-        Effect.catchDefect(
-          Effect.fnUntraced(function* (defect) {
-            if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
-            yield* Effect.yieldNow
-            if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(
-                state,
-                sessionID,
-                cycleSource,
-                undefined,
-                defect.transition.step,
-                startedAt,
-              )
-            return yield* runTurn(state, sessionID, cycleSource, undefined, defect.transition.step, startedAt)
-          }),
-        ),
-      )
-    })
+    const runTurn: RunTurn = Effect.fnUntraced(
+      function* (state, sessionID, cycleSource, promotion, step, semanticStartedAt) {
+        const startedAt = semanticStartedAt ?? (step === 1 ? DateTime.toEpochMillis(yield* DateTime.now) : undefined)
+        return yield* runTurnAttempt(
+          state,
+          sessionID,
+          cycleSource,
+          promotion,
+          step,
+          startedAt,
+          compaction.compactAfterOverflow,
+        ).pipe(
+          Effect.catchDefect(
+            Effect.fnUntraced(function* (defect) {
+              if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
+              yield* Effect.yieldNow
+              if (defect.transition._tag === "ContinueAfterOverflowCompaction")
+                return yield* runAfterOverflowCompaction(
+                  state,
+                  sessionID,
+                  cycleSource,
+                  undefined,
+                  defect.transition.step,
+                  startedAt,
+                )
+              if (defect.transition._tag === "ContinueAfterStaleReasoning")
+                return yield* runTurnAttempt(
+                  state,
+                  sessionID,
+                  cycleSource,
+                  undefined,
+                  defect.transition.step,
+                  startedAt,
+                  compaction.compactAfterOverflow,
+                  false,
+                )
+              return yield* runTurn(state, sessionID, cycleSource, undefined, defect.transition.step, startedAt)
+            }),
+          ),
+        )
+      },
+    )
 
     const run = Effect.fn("SessionRunner.run")(function* (input: {
       readonly sessionID: SessionSchema.ID
@@ -880,8 +926,12 @@ const layer = Layer.effect(
           : undefined
       if (!input.force && !initialLane && !claimedAutomatic && !auditRecovery) return
       const history = yield* makeRunnerHistoryProjection({ events, readDb, sessionID: input.sessionID })
-      const state: RunState = { history, workerTurns: new Map(), recoveredInterruptedTools: false, baselineSeq: -1 }
-      return yield* Effect.gen(function* () {
+       const state: RunState = { history, workerTurns: new Map(), recoveredInterruptedTools: false, baselineSeq: -1 }
+       // A returned audit is not yet settled. Scope-owned finalization must
+       // requeue its exact lease if this long-running runner is interrupted
+       // between the evaluator response and the durable afterTurn handoff.
+       let unsettledAudit: { auditorSessionID: SessionSchema.ID; auditStartedAt: number } | undefined
+       return yield* Effect.gen(function* () {
         if (auditRecovery) {
           // The worker cycle already settled before the interruption/restart.
           // Re-audit that durable work; never rematerialize/re-execute its
@@ -889,19 +939,32 @@ const layer = Layer.effect(
           const activeEntries = yield* state.history.entries(state.baselineSeq)
           const workerTurn = yield* resolveWorkerTurn(state, input.sessionID, activeEntries)
           if (!workerTurn) {
-            yield* goalAutomation.failAudit({
+            // The completed worker reservation remains durable. A missing
+            // history/projection root during recovery is not permission to
+            // delete that reservation or strand the Goal in audit_error.
+            // Retry reconstruction on the persisted infrastructure backoff.
+            const reservation = auditRecovery.reservation
+            yield* goalAutomation.afterTurn({
               sessionID: input.sessionID,
-              error: "Goal audit recovery cannot resolve the completed worker cycle.",
+              origin: reservation ? "automatic" : "user",
+              ...(reservation ? { reservationID: reservation.id } : {}),
+              audit: {
+                ok: false,
+                retryable: true,
+                error: "Goal audit recovery cannot resolve the completed worker cycle.",
+              },
             })
           } else {
             const reservation = auditRecovery.reservation
-            const audit = yield* goalAuditor.evaluate({
-              sessionID: input.sessionID,
-              session,
-              latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
-              ...(reservation ? { reservationID: reservation.id } : {}),
-            })
-            const pendingUser =
+             const audit = yield* goalAuditor.evaluate({
+               sessionID: input.sessionID,
+               session,
+               latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
+               ...(reservation ? { reservationID: reservation.id } : {}),
+             })
+             if (audit.auditorSessionID && audit.auditStartedAt !== undefined)
+               unsettledAudit = { auditorSessionID: audit.auditorSessionID, auditStartedAt: audit.auditStartedAt }
+             const pendingUser =
               (yield* SessionInput.pendingLanes(db, input.sessionID, [
                 { admissionClass: "user", delivery: "steer" },
                 { admissionClass: "user", delivery: "queue" },
@@ -917,9 +980,10 @@ const layer = Layer.effect(
                 reservation?.expectedLatestUserSeq ?? (yield* SessionInput.latestUserSeq(db, input.sessionID)),
               ...(reservation && pendingUser ? { supersededByUser: true } : {}),
               audit,
-              requireAuditCursor: audit.auditorSessionID !== undefined,
-            })
-            yield* reconcileGoalProjection(state, input.sessionID)
+               requireAuditCursor: audit.auditorSessionID !== undefined,
+             })
+             unsettledAudit = undefined
+             yield* reconcileGoalProjection(state, input.sessionID)
             yield* telemetry.idle(input.sessionID)
           }
         }
@@ -1106,13 +1170,15 @@ const layer = Layer.effect(
           }
 
           const activeEntries = yield* state.history.entries(state.baselineSeq)
-          const audit = yield* goalAuditor.evaluate({
-            sessionID: input.sessionID,
-            session,
-            latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
-            ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
-          })
-          const pendingUserAfterAudit =
+           const audit = yield* goalAuditor.evaluate({
+             sessionID: input.sessionID,
+             session,
+             latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
+             ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
+           })
+           if (audit.auditorSessionID && audit.auditStartedAt !== undefined)
+             unsettledAudit = { auditorSessionID: audit.auditorSessionID, auditStartedAt: audit.auditStartedAt }
+           const pendingUserAfterAudit =
             pendingUser ||
             (yield* SessionInput.pendingLanes(db, input.sessionID, [
               { admissionClass: "user", delivery: "steer" },
@@ -1128,6 +1194,7 @@ const layer = Layer.effect(
             audit,
             requireAuditCursor: audit.auditorSessionID !== undefined,
           })
+          unsettledAudit = undefined
 
           // The auditor may have changed lifecycle status, blocker, criteria, or
           // step progress. Persist that authoritative state at this settled
@@ -1172,11 +1239,17 @@ const layer = Layer.effect(
           session: yield* getSession(input.sessionID),
           messages: (yield* state.history.entries(state.baselineSeq)).map((entry) => entry.message),
         })
-      }).pipe(
-        // Interrupts and defects can leave before the normal cycle boundary.
-        // Always release the live turn latch so a later run cannot inherit an
-        // old turn start timestamp.
-        Effect.ensuring(goalAutomation.requeueClaim(input.sessionID)),
+       }).pipe(
+         // A finished auditor response is still only a pending host handoff.
+         // The exact scoped lease makes an interrupt at any yield boundary
+         // recoverable, including first user cycles with no reservation.
+         Effect.ensuring(Effect.gen(function* () {
+           if (unsettledAudit) yield* goalAutomation.deferAudit(input.sessionID, unsettledAudit)
+         })),
+         // Interrupts and defects can leave before the normal cycle boundary.
+         // Always release the live turn latch so a later run cannot inherit an
+         // old turn start timestamp.
+         Effect.ensuring(goalAutomation.requeueClaim(input.sessionID)),
         Effect.ensuring(telemetry.idle(input.sessionID)),
         Effect.ensuring(history.close),
       )

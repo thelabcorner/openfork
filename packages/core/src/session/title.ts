@@ -202,15 +202,18 @@ const layer = Layer.effect(
      *
      * The catalog lookup below is a pure capability gate, never a credential
      * decision. Provider auth, Public eligibility, route health, and the
-     * committed route all come from `SessionRunnerModel.resolveWithInfo`, so a
-     * title generation can no longer pick a different account or provider than
-     * the one the Session already committed. The caller's ref is passed through
-     * whole, so an explicit `accountID` hard pin survives reconstruction instead
-     * of degrading into Auto selection.
+     * committed route all come from
+     * `SessionRunnerModel.resolveMaintenanceWithInfo`, so a title generation
+     * can no longer select, bind, or fail over the parent Session's durable
+     * route: automatic candidates inherit its exact generation while explicit
+     * overrides resolve a transient route in their own provider domain. The
+     * caller's ref is passed through whole, so an explicit `accountID` hard
+     * pin survives reconstruction instead of degrading into Auto selection.
      */
     const resolveCandidate = Effect.fn("SessionTitle.resolveCandidate")(function* (
       session: SessionSchema.Info,
       ref: Pick<ModelV2.Ref, "providerID" | "id" | "accountID" | "variant">,
+      options?: { readonly explicitOverride?: boolean },
     ) {
       const model = yield* catalog.model.get(ref.providerID, ref.id)
       // Structured title completion is a hard transport requirement now. A
@@ -219,15 +222,16 @@ const layer = Layer.effect(
       // on to the next usable model instead.
       if (model === undefined || !model.capabilities.tools || !SessionRunnerModel.supported(model)) return undefined
       const routed = yield* models
-        .resolveWithInfo({
-          ...session,
-          model: ModelV2.Ref.make({
+        .resolveMaintenanceWithInfo(
+          session,
+          ModelV2.Ref.make({
             providerID: ref.providerID,
             id: ref.id,
             ...(ref.accountID ? { accountID: ref.accountID } : {}),
             ...(ref.variant ? { variant: ref.variant } : {}),
           }),
-        })
+          { explicitOverride: options?.explicitOverride ?? false },
+        )
         .pipe(Effect.option)
       return routed._tag === "Some" ? routed.value : undefined
     })
@@ -241,23 +245,33 @@ const layer = Layer.effect(
       // separate provider-domain route. The automatic same-provider candidates
       // and the final fallback inherit the Session's existing binding, so a
       // title never silently re-selects provider auth.
-      if (requestModel) {
-        const resolved = yield* resolveCandidate(session, requestModel)
-        if (resolved) return resolved
-      }
-      const titleAgent = yield* agents.get(AgentV2.ID.make("title"))
-      if (titleAgent?.model) {
-        const resolved = yield* resolveCandidate(session, titleAgent.model)
-        if (resolved) return resolved
-      }
+       if (requestModel) {
+         const resolved = yield* resolveCandidate(session, requestModel, { explicitOverride: true })
+         if (resolved) return resolved
+         return yield* Effect.fail(
+           new Error(`Requested title model ${requestModel.providerID}/${requestModel.id} is unavailable, does not support tool calls, or has no usable provider/account route`),
+         )
+       }
+       const titleAgent = yield* agents.get(AgentV2.ID.make("title"))
+       if (titleAgent?.model) {
+         const resolved = yield* resolveCandidate(session, titleAgent.model, { explicitOverride: true })
+         if (resolved) return resolved
+         return yield* Effect.fail(
+           new Error(`Configured title model ${titleAgent.model.providerID}/${titleAgent.model.id} is unavailable, does not support tool calls, or has no usable provider/account route`),
+         )
+       }
       const smallModel = Config.latest(yield* config.entries(), "small_model")
       if (smallModel) {
         const [providerID, ...rest] = smallModel.split("/")
         if (providerID !== undefined && rest.length > 0) {
-          const resolved = yield* resolveCandidate(session, {
-            providerID: ProviderV2.ID.make(providerID),
-            id: ModelV2.ID.make(rest.join("/")),
-          })
+          const resolved = yield* resolveCandidate(
+            session,
+            {
+              providerID: ProviderV2.ID.make(providerID),
+              id: ModelV2.ID.make(rest.join("/")),
+            },
+            { explicitOverride: true },
+          )
           if (resolved) return resolved
         }
       }
@@ -268,7 +282,22 @@ const layer = Layer.effect(
           if (resolved) return resolved
         }
       }
-      return yield* models.resolveWithInfo(session)
+      // Final fallback inherits the Session's own provider-domain route as
+      // non-explicit maintenance, so no durable route is created or rebound.
+      // With no session model, mirror worker selection (default, then first
+      // supported) to name an explicit ref for the maintenance authority.
+      if (session.model) return yield* models.resolveMaintenanceWithInfo(session, session.model)
+      const usable = (model: ModelV2.Info | undefined) =>
+        model !== undefined && model.capabilities.tools && SessionRunnerModel.supported(model)
+      const catalogDefault = yield* catalog.model.default()
+      const fallbackInfo =
+        (usable(catalogDefault) ? catalogDefault : undefined) ??
+        (yield* catalog.model.available()).find((model) => usable(model))
+      if (!fallbackInfo) return yield* new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })
+      return yield* models.resolveMaintenanceWithInfo(
+        session,
+        ModelV2.Ref.make({ providerID: fallbackInfo.providerID, id: fallbackInfo.id }),
+      )
     })
 
     const applyTitle = Effect.fn("SessionTitle.applyTitle")(function* (input: {

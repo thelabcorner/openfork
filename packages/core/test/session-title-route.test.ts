@@ -44,10 +44,14 @@ const asked: string[] = []
 /** Records the ref the route authority actually received, pins included. */
 const askedRefs: (ModelV2.Ref | undefined)[] = []
 
+/** Records whether each maintenance resolution was an explicit override. */
+const askedExplicit: (boolean | undefined)[] = []
+
 /**
  * A route-authority seam that commits exactly one attribution. Title must route
- * every cascade candidate through `resolveWithInfo`; a direct `resolveRef` is a
- * defect, so it dies rather than silently serving an unrouted model.
+ * every cascade candidate through `resolveMaintenanceWithInfo`; worker routing
+ * (`resolveWithInfo`) or a direct `resolveRef` is a defect, so both die rather
+ * than silently serving an unrouted model.
  *
  * An account route deliberately carries a lease with credential material, so
  * the settlement assertions can prove it never leaks.
@@ -58,10 +62,12 @@ const committed = (route?: Attribution, model = hostedModel) =>
     SessionRunnerModel.Service.of({
       resolve: () => Effect.succeed(model),
       resolveRef: () => Effect.die("SessionTitle must not resolve an unrouted ref"),
-      resolveWithInfo: (session) =>
+      resolveWithInfo: () => Effect.die("SessionTitle must not use worker routing for maintenance"),
+      resolveMaintenanceWithInfo: (session, ref, options) =>
         Effect.sync(() => {
-          asked.push(session.model ? `${session.model.providerID}/${session.model.id}` : "<none>")
-          askedRefs.push(session.model)
+          asked.push(ref ? `${ref.providerID}/${ref.id}` : "<none>")
+          askedRefs.push(ref)
+          askedExplicit.push(options?.explicitOverride ?? false)
           return {
             model,
             name: String(model.id),
@@ -80,6 +86,7 @@ const committed = (route?: Attribution, model = hostedModel) =>
               : {}),
           } as unknown as SessionRunnerModel.ResolvedInfo
         }),
+      resolveMaintenanceRef: () => Effect.die("SessionTitle must resolve maintenance models with info"),
     }),
   )
 
@@ -102,6 +109,7 @@ const generate = (
   title: string,
   options?: {
     readonly model?: ModelV2.Ref
+    readonly sessionModel?: { readonly providerID: string; readonly id: string }
     /** Runs after `h.reset()`, so registered catalog state survives. */
     readonly prepare?: (h: ReturnType<typeof makeHarness>) => void
   },
@@ -110,8 +118,9 @@ const generate = (
     h.reset()
     asked.length = 0
     askedRefs.length = 0
+    askedExplicit.length = 0
     options?.prepare?.(h)
-    yield* insertSession(sessionID)
+    yield* insertSession(sessionID, options?.sessionModel ? { model: options.sessionModel } : undefined)
     yield* insertUserMessage(sessionID, "first message")
     h.enqueueTitle(generatedTitleCompletion(title))
     const service = yield* SessionTitle.Service
@@ -132,7 +141,9 @@ describe("Core Title committed route reaches wire and settlement", () => {
 
   it("settles the exact stable account, sends exact hosted identity, and leaks no credential material", () =>
     Effect.gen(function* () {
-      const { rows, request } = yield* generate(h, sessionID, "Routed")
+      const { rows, request } = yield* generate(h, sessionID, "Routed", {
+        sessionModel: { providerID: "opencode", id: "space-bunny-free" },
+      })
 
       // Settlement: exactly one maintenance row, attributed to the committed route.
       expect(rows.length).toBe(1)
@@ -169,7 +180,9 @@ describe("Core Title Public route stays account-free", () => {
 
   it("settles public with no account while still sending hosted identity", () =>
     Effect.gen(function* () {
-      const { rows, request } = yield* generate(h, sessionID, "Public")
+      const { rows, request } = yield* generate(h, sessionID, "Public", {
+        sessionModel: { providerID: "opencode", id: "space-bunny-free" },
+      })
       expect(rows.length).toBe(1)
       expect(rows[0]!.route_kind).toBe("public")
       expect(rows[0]!.account_id ?? null).toBeNull()
@@ -195,6 +208,7 @@ describe("Core Title candidate policy routes every candidate through the authori
       // The explicit configured candidate was handed to the route authority
       // rather than being skipped or silently replaced by the Session model.
       expect(asked).toEqual(["other/other-v1"])
+      expect(askedExplicit).toEqual([true])
       expect(rows.length).toBe(1)
       expect(rows[0]!.route_kind).toBe("public")
       expect(headers(request)["x-opencode-session"]).toBe(sessionID)
@@ -204,10 +218,14 @@ describe("Core Title candidate policy routes every candidate through the authori
   it("falls back to the Session binding when no candidate is configured", () =>
     Effect.gen(function* () {
       const sessionID = SessionV2.ID.make("ses_title_route_fallback")
-      const { rows } = yield* generate(h, sessionID, "Fallback")
+      const { rows } = yield* generate(h, sessionID, "Fallback", {
+        sessionModel: { providerID: "opencode", id: "space-bunny-free" },
+      })
       // No request model, no title-agent model, no small_model, no catalog small:
-      // the final fallback inherits the Session's own provider-domain route.
-      expect(asked).toEqual(["<none>"])
+      // the final fallback inherits the Session's own provider-domain route via
+      // a non-explicit maintenance resolution (never worker routing).
+      expect(asked).toEqual(["opencode/space-bunny-free"])
+      expect(askedExplicit).toEqual([false])
       expect(rows.length).toBe(1)
       expect(rows[0]!.route_kind).toBe("public")
     }),
@@ -225,10 +243,11 @@ const pinnedAccount = (model = hostedModel) =>
     SessionRunnerModel.Service.of({
       resolve: () => Effect.succeed(model),
       resolveRef: () => Effect.die("SessionTitle must not resolve an unrouted ref"),
-      resolveWithInfo: (session) =>
+      resolveWithInfo: () => Effect.die("SessionTitle must not use worker routing for maintenance"),
+      resolveMaintenanceWithInfo: (session, ref, options) =>
         Effect.sync(() => {
-          const ref = session.model
           askedRefs.push(ref)
+          askedExplicit.push(options?.explicitOverride ?? false)
           const accountID = ref?.accountID ?? "acct_auto_selected"
           return {
             model,
@@ -244,6 +263,7 @@ const pinnedAccount = (model = hostedModel) =>
             },
           } as unknown as SessionRunnerModel.ResolvedInfo
         }),
+      resolveMaintenanceRef: () => Effect.die("SessionTitle must resolve maintenance models with info"),
     }),
   )
 
@@ -261,6 +281,7 @@ describe("Core Title preserves an explicit accountID hard pin", () => {
 
       // The hard pin reached the route authority instead of degrading to Auto.
       expect(askedRefs.length).toBe(1)
+      expect(askedExplicit).toEqual([true])
       expect(askedRefs[0]?.providerID).toBe(otherRef().providerID)
       expect(askedRefs[0]?.id).toBe(otherRef().id)
       expect(askedRefs[0]?.accountID).toBe("acct_hard_pinned")

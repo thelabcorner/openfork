@@ -2,6 +2,28 @@ import { describe, expect, test } from "bun:test"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 
 describe("Session metadata ownership", () => {
+  test("human worker control does not transfer producer ownership or bypass mixed/malformed origins", () => {
+    const metadata = SessionMetadataOwnership.delegatedWorker({
+      producer: "oxp",
+      principalRef: "principal",
+      invocationRef: "invocation",
+      rootRef: "root",
+      agent: "build",
+      model: { providerID: "test", modelID: "model" },
+      nestedDelegation: false,
+    })
+    expect(SessionMetadataOwnership.isHumanControllableWorker(metadata)).toBe(true)
+    expect(SessionMetadataOwnership.isProducerOwned(metadata)).toBe(true)
+    for (const value of [
+      undefined,
+      {},
+      { workerDelegation: {} },
+      { ...metadata, specialAgent: "auditor" },
+      { ...metadata, scheduledTaskID: "task" },
+    ]) {
+      expect(SessionMetadataOwnership.isHumanControllableWorker(value)).toBe(false)
+    }
+  })
   test("special-agent classification is string-only and fails closed for unknown kinds", () => {
     expect(SessionMetadataOwnership.isSpecialAgent({ specialAgent: "future_agent" })).toBe(true)
     expect(SessionMetadataOwnership.specialAgentKind({ specialAgent: "future_agent" })).toBe("future_agent")
@@ -140,9 +162,7 @@ describe("Session metadata ownership", () => {
       },
     }
     const derived = SessionMetadataOwnership.forDerivedSession(source)
-    expect(
-      derived,
-    ).toEqual({
+    expect(derived).toEqual({
       ordinary: "keep",
       localMcp: { strictSubagentModelPolicy: true },
     })

@@ -11,12 +11,20 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRecovery } from "@opencode-ai/core/session/recovery"
-import { SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  PartTable,
+  SessionMessageTable,
+  SessionMessageToolOverlayTable,
+  SessionTable,
+  SessionToolRecallTable,
+  SessionV1ToolCallTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
@@ -186,6 +194,174 @@ describe("SessionRecovery", () => {
           .get()
           .pipe(Effect.orDie),
       ).toMatchObject({ settlement_event_id: null })
+
+      expect(yield* SessionRecovery.failInterruptedTools(db, events, sessionA)).toEqual({
+        candidates: 0,
+        settled: 0,
+      })
+    }),
+  )
+
+  it.effect("seals retained V1 unresolved ToolParts and is idempotent", () =>
+    Effect.gen(function* () {
+      const { db, events } = yield* setup
+      const messageID = SessionV1.MessageID.make("msg_recovery_legacy_assistant")
+      const partID = SessionV1.PartID.make("prt_recovery_legacy_tool")
+
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID: sessionA,
+        info: SessionV1.Assistant.make({
+          id: messageID,
+          sessionID: sessionA,
+          role: "assistant",
+          time: { created: 1 },
+          parentID: SessionV1.MessageID.make("msg_recovery_legacy_parent"),
+          modelID: "model" as never,
+          providerID: "provider" as never,
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/project", root: "/project" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+      })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID: sessionA,
+        time: 2,
+        part: SessionV1.ToolPart.make({
+          id: partID,
+          messageID,
+          sessionID: sessionA,
+          type: "tool",
+          callID: "call-legacy-unresolved",
+          tool: "bash",
+            state: {
+              status: "running",
+              input: { command: "touch maybe-happened" },
+              metadata: { phase: "spawned" },
+              time: { start: 2 },
+            },
+          }),
+        })
+      const originalPart = yield* db.select().from(PartTable).where(eq(PartTable.id, partID)).get().pipe(Effect.orDie)
+      expect(originalPart).toMatchObject({
+        context_projection_version: 1,
+        context_kind: "tool",
+        context_status: "running",
+        tool_identity_version: 1,
+      })
+      expect(yield* db.select().from(SessionV1ToolCallTable)
+        .where(eq(SessionV1ToolCallTable.part_id, partID)).get()).toMatchObject({
+          session_id: sessionA, message_id: messageID,
+          call_id: "call-legacy-unresolved", status: "running",
+        })
+      // A certified projection avoids JSON parsing even when the value is
+      // temporarily an opaque/non-JSON representation.
+      yield* db.run(sql`UPDATE part SET data = 'not-json' WHERE id = ${partID}`)
+      expect(yield* SessionRecovery.executionHazards(db, sessionA)).toEqual({
+        currentTool: false,
+        legacyTool: true,
+      })
+      yield* db.update(PartTable).set({ data: originalPart!.data }).where(eq(PartTable.id, partID)).run()
+      // Versions we cannot interpret, including historical v0, must use JSON
+      // rather than trusting possibly unrelated producer-written facts.
+      // Remove the independent tool-index certification to exercise legacy
+      // fallback, not merely the unrelated Context projection version.
+      yield* db.delete(SessionV1ToolCallTable).where(eq(SessionV1ToolCallTable.part_id, partID)).run()
+      yield* db.update(PartTable).set({ tool_identity_version: 0 }).where(eq(PartTable.id, partID)).run()
+      for (const version of [99, 0]) {
+        yield* db.update(PartTable).set({
+          context_projection_version: version,
+          context_kind: "text",
+          context_status: "completed",
+        }).where(eq(PartTable.id, partID)).run()
+        expect(yield* SessionRecovery.executionHazards(db, sessionA)).toEqual({
+          currentTool: false,
+          legacyTool: true,
+        })
+      }
+      yield* db.update(PartTable).set({
+        context_projection_version: 1,
+        context_kind: "tool",
+        context_status: "running",
+      }).where(eq(PartTable.id, partID)).run()
+      expect(
+        yield* db
+          .select()
+          .from(SessionToolRecallTable)
+          .where(eq(SessionToolRecallTable.part_id, partID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({
+        source: "v1_part",
+        session_id: sessionA,
+        message_id: messageID,
+        part_id: partID,
+        tool: "bash",
+        time_created: 2,
+        search_text: expect.stringContaining("touch maybe-happened"),
+      })
+      yield* db.run(sql`CREATE TABLE tool_recall_touch (count integer NOT NULL)`)
+      yield* db.run(sql`INSERT INTO tool_recall_touch (count) VALUES (0)`)
+      yield* db.run(sql`
+        CREATE TRIGGER tool_recall_touch_au
+        AFTER UPDATE ON session_tool_recall
+        BEGIN
+          UPDATE tool_recall_touch SET count = count + 1;
+        END
+      `)
+
+      expect(yield* SessionRecovery.executionHazards(db, sessionA)).toEqual({
+        currentTool: false,
+        legacyTool: true,
+      })
+      expect(yield* SessionRecovery.failInterruptedTools(db, events, sessionA)).toEqual({
+        candidates: 1,
+        settled: 1,
+      })
+      expect(yield* db.get<{ count: number }>(sql`SELECT count FROM tool_recall_touch`)).toEqual({ count: 0 })
+      expect(
+        yield* db
+          .select({ timeCreated: SessionToolRecallTable.time_created })
+          .from(SessionToolRecallTable)
+          .where(eq(SessionToolRecallTable.part_id, partID))
+          .get(),
+      ).toEqual({ timeCreated: 2 })
+      expect(yield* SessionRecovery.executionHazards(db, sessionA)).toEqual({
+        currentTool: false,
+        legacyTool: false,
+      })
+
+      const row = yield* db.select().from(PartTable).where(eq(PartTable.id, partID)).get().pipe(Effect.orDie)
+      expect(row?.data).toMatchObject({
+        type: "tool",
+        callID: "call-legacy-unresolved",
+        state: {
+          status: "error",
+          input: { command: "touch maybe-happened" },
+          error: "Tool execution interrupted (external effect unknown)",
+          metadata: { phase: "spawned", interrupted: true },
+        },
+      })
+      expect(row?.tool_identity_version).toBe(1)
+      expect(yield* db.select().from(SessionV1ToolCallTable)
+        .where(eq(SessionV1ToolCallTable.part_id, partID)).get()).toMatchObject({
+          call_id: "call-legacy-unresolved", status: "error",
+        })
+      // Historical tool source repaired into the sidecar may not have Context
+      // scalar facts or searchable text. An id-preserving part replacement
+      // still must delete the old indexed tool and its recall identity.
+      yield* db.update(PartTable).set({
+        context_projection_version: 0, context_kind: null, search_text: "",
+      }).where(eq(PartTable.id, partID)).run()
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID: sessionA, time: 12,
+        part: SessionV1.TextPart.make({
+          id: partID, messageID, sessionID: sessionA, type: "text", text: "replaced",
+        }),
+      })
+      expect(yield* db.select().from(SessionV1ToolCallTable)
+        .where(eq(SessionV1ToolCallTable.part_id, partID)).get()).toBeUndefined()
 
       expect(yield* SessionRecovery.failInterruptedTools(db, events, sessionA)).toEqual({
         candidates: 0,

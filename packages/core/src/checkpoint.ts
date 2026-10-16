@@ -11,6 +11,7 @@ import { Location } from "./location"
 import { Snapshot } from "./snapshot"
 import { SessionSchema } from "./session/schema"
 import { SessionCheckpointSearchTable, SessionCheckpointTable, SessionTable } from "./session/sql"
+import { retrySqliteBusyCause } from "./database/sqlite-busy"
 import { File } from "./file"
 
 export const ID = Schema.String.pipe(Schema.brand("SessionCheckpoint.ID"))
@@ -228,6 +229,11 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
     const snapshot = yield* Snapshot.Service
+    // The short native timeout keeps interactive work responsive even if
+    // another process owns the WAL writer reservation. Retry only complete,
+    // idempotent SQL writes; do not replay snapshot side effects or decisions.
+    const write = <A, E, R>(attempt: () => Effect.Effect<A, E, R>) =>
+      retrySqliteBusyCause(attempt, { maxElapsedMs: 15_000, delayMs: 25, maxDelayMs: 250 })
 
     const get = Effect.fn("Checkpoint.get")(function* (input: { sessionID: SessionSchema.ID; checkpointID: ID }) {
       const row = yield* db
@@ -254,7 +260,7 @@ const layer = Layer.effect(
       const id = ID.make(randomUUID())
       const epoch = yield* snapshot.epoch()
       const createdAt = yield* Clock.currentTimeMillis
-      yield* db
+      yield* write(() => db
         .insert(SessionCheckpointTable)
         .values({
           id,
@@ -278,7 +284,7 @@ const layer = Layer.effect(
           finalized_at: null,
         })
         .run()
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie))
       return (yield* get({ sessionID: input.sessionID, checkpointID: id }))!
     })
 
@@ -344,7 +350,7 @@ const layer = Layer.effect(
           row.after_snapshot === after ? Effect.void : snapshot.release(afterKey).pipe(Effect.ignore),
         ),
       )
-      const updated = yield* db
+      const updated = yield* write(() => db
         .update(SessionCheckpointTable)
         .set({
           after_snapshot: after,
@@ -360,7 +366,7 @@ const layer = Layer.effect(
         .where(and(eq(SessionCheckpointTable.id, input.checkpointID), eq(SessionCheckpointTable.status, "capturing")))
         .returning({ id: SessionCheckpointTable.id })
         .get()
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie))
       if (!updated) {
         const current = yield* db
           .select({
@@ -396,25 +402,25 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!row) return undefined
-      const updated = yield* db
+      const updated = yield* write(() => db
         .update(SessionCheckpointTable)
         .set({ status: "error", error: input.error })
         .where(and(eq(SessionCheckpointTable.id, input.checkpointID), eq(SessionCheckpointTable.status, "capturing")))
         .returning({ id: SessionCheckpointTable.id })
         .get()
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie))
       if (!updated) return undefined
       return (yield* get({ sessionID: SessionSchema.ID.make(row.session_id), checkpointID: input.checkpointID }))!
     })
 
     const transition = Effect.fn("Checkpoint.transition")(function* (input: TransitionInput) {
-      const updated = yield* db
+      const updated = yield* write(() => db
         .update(SessionCheckpointTable)
         .set({ status: input.to })
         .where(and(eq(SessionCheckpointTable.id, input.id), eq(SessionCheckpointTable.status, input.from)))
         .returning({ id: SessionCheckpointTable.id })
         .get()
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie))
       return updated !== undefined
     })
 
@@ -431,13 +437,13 @@ const layer = Layer.effect(
         const result: SessionCheckpoint[] = []
         for (const row of stuck) {
           if (row.created_at > cutoff - threshold) continue
-          const updated = yield* db
+          const updated = yield* write(() => db
             .update(SessionCheckpointTable)
             .set({ status: "error", error: { code: "stuck", message: "checkpoint never finalized" } })
             .where(and(eq(SessionCheckpointTable.id, row.id), eq(SessionCheckpointTable.status, "capturing")))
             .returning({ id: SessionCheckpointTable.id })
             .get()
-            .pipe(Effect.orDie)
+            .pipe(Effect.orDie))
           if (updated) result.push(fromRow(row))
         }
         return result
@@ -476,12 +482,12 @@ const layer = Layer.effect(
       if (!row) return []
       const currentEpoch = yield* snapshot.epoch()
       if (row.epoch !== currentEpoch) {
-        yield* db
+        yield* write(() => db
           .update(SessionCheckpointTable)
           .set({ epoch_mismatch: 1 })
           .where(eq(SessionCheckpointTable.id, row.id))
           .run()
-          .pipe(Effect.orDie)
+          .pipe(Effect.orDie))
         return yield* Effect.fail(
           new EpochMismatch({ checkpointID: ID.make(row.id), expected: row.epoch, actual: currentEpoch }),
         )
@@ -531,11 +537,11 @@ const layer = Layer.effect(
         .where(eq(SessionCheckpointTable.id, input.checkpointID))
         .get()
         .pipe(Effect.orDie)
-      yield* db
+      yield* write(() => db
         .delete(SessionCheckpointTable)
         .where(eq(SessionCheckpointTable.id, input.checkpointID))
         .run()
-        .pipe(Effect.orDie)
+        .pipe(Effect.orDie))
       // Durable ownership is removed first. A crash here may leave an orphaned
       // pin (safe/leaky); releasing first could make a still-durable checkpoint
       // unrecoverable. Normal completion retires the owner refs immediately.
@@ -550,11 +556,11 @@ const layer = Layer.effect(
           .where(and(eq(SessionCheckpointTable.session_id, input.sessionID), gt(SessionCheckpointTable.ordinal, input.ordinal)))
           .all()
           .pipe(Effect.orDie)
-        yield* db
+        yield* write(() => db
           .delete(SessionCheckpointTable)
           .where(and(eq(SessionCheckpointTable.session_id, input.sessionID), gt(SessionCheckpointTable.ordinal, input.ordinal)))
           .run()
-          .pipe(Effect.orDie)
+          .pipe(Effect.orDie))
         yield* Effect.forEach(rows, (row) => releaseRefs(row), { concurrency: 4, discard: true })
       },
     )

@@ -31,6 +31,8 @@ const capture = (snapshot?: Effect.Effect<string | undefined>) => {
     durable: () => Stream.empty,
     listen: () => Effect.succeed(Effect.void),
     listenType: () => Effect.succeed(Effect.void),
+    listenSessionType: () => Effect.succeed(Effect.void),
+    listenSessionTypes: () => Effect.succeed(Effect.void),
     listenLocation: () => Effect.succeed(Effect.void),
     listenDirectory: () => Effect.succeed(Effect.void),
     listenDirectoryAll: () => Effect.succeed(Effect.void),

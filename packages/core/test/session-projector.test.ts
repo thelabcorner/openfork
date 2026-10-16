@@ -29,6 +29,7 @@ import {
   SessionMessageTable,
   SessionMessageToolOverlayTable,
   SessionTable,
+  SessionToolRecallTable,
 } from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
@@ -179,6 +180,26 @@ describe("SessionProjector", () => {
         .insert(SessionMessageTable)
         .values([assistantRow(boundary, 1), assistantRow(SessionMessage.ID.make("msg_later"), 2)])
         .run()
+      yield* db.insert(SessionToolRecallTable).values([
+        {
+          source: "v2_message",
+          session_id: sessionID,
+          message_id: boundary,
+          part_id: "tool_before_revert",
+          tool: "read",
+          time_created: 1,
+          search_text: "before",
+        },
+        {
+          source: "v2_message",
+          session_id: sessionID,
+          message_id: "msg_later",
+          part_id: "tool_discarded",
+          tool: "read",
+          time_created: 2,
+          search_text: "discarded",
+        },
+      ]).run()
       const events = yield* EventV2.Service
       yield* events.publish(SessionEvent.RevertEvent.Staged, {
         sessionID,
@@ -205,6 +226,12 @@ describe("SessionProjector", () => {
       expect(
         (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
       ).toEqual([boundary])
+      // Reverted tool calls must disappear with their owning message. This
+      // must not require a runtime/history hydrate or an orphan-checking read.
+      expect(
+        (yield* db.select({ part_id: SessionToolRecallTable.part_id }).from(SessionToolRecallTable).all())
+          .map((row) => row.part_id),
+      ).toEqual(["tool_before_revert"])
     }),
   )
 
@@ -889,6 +916,35 @@ describe("SessionProjector", () => {
         })
 
       yield* startTool("call-one", 2)
+      expect(
+        yield* db
+          .select()
+          .from(SessionToolRecallTable)
+          .where(eq(SessionToolRecallTable.part_id, "call-one"))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({
+        source: "v2_message",
+        session_id: sessionID,
+        message_id: assistantMessageID,
+        part_id: "call-one",
+        tool: "read",
+        time_created: 3,
+        search_text: expect.stringContaining("call-one.png"),
+      })
+      expect(
+        (yield* db
+          .select({ searchText: SessionToolRecallTable.search_text })
+          .from(SessionToolRecallTable)
+          .where(eq(SessionToolRecallTable.part_id, "call-one"))
+          .get()
+          .pipe(Effect.orDie))?.searchText,
+      ).not.toContain("tool:read")
+      expect(
+        yield* db.get<{ count: number }>(
+          sql`SELECT count(*) AS count FROM session_tool_recall_fts WHERE session_tool_recall_fts MATCH 'call*'`,
+        ),
+      ).toEqual({ count: 1 })
       yield* db.run(sql`CREATE TABLE jumbo_data_touch (count integer NOT NULL)`)
       yield* db.run(sql`INSERT INTO jumbo_data_touch (count) VALUES (0)`)
       yield* db.run(sql`

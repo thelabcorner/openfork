@@ -161,6 +161,36 @@ const setupRecovery = (
   })
 
 describe("SessionExecutionOwner", () => {
+  it.effect("returns exact batched owner and heartbeat snapshots without loading any Session instance", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const owner = yield* SessionExecutionOwner.Service
+      const acquired = yield* owner.tryAcquireLocal(sessionID)
+      if (acquired.state !== "acquired") return yield* Effect.die("owner acquisition expected")
+      const other = SessionSchema.ID.make("ses_execution_owner_missing")
+      const result = yield* owner.snapshotMany([sessionID, other, sessionID])
+      expect(result.size).toBe(2)
+      expect(result.get(sessionID)).toEqual(yield* owner.snapshot(sessionID))
+      expect(result.get(other)).toEqual({ sessionID: other, generation: 0 })
+      expect(result.get(sessionID)?.runtime?.pid).toBe(process.pid)
+      expect(yield* owner.snapshotMany([])).toEqual(new Map())
+      expect(yield* owner.release(acquired.token)).toBe("released")
+      expect((yield* owner.snapshotMany([sessionID])).get(sessionID)).toEqual(yield* owner.snapshot(sessionID))
+    }),
+  )
+  it.effect("pages hundreds of addressed Sessions without fabricated owners or missing IDs", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const owner = yield* SessionExecutionOwner.Service
+      const ids = Array.from({ length: 805 }, (_, index) => SessionSchema.ID.make(`ses_owner_page_${index}`))
+      const projected = yield* owner.snapshotMany([sessionID, ...ids, ids[0]!])
+      expect(projected.size).toBe(806)
+      expect(projected.get(sessionID)).toEqual(yield* owner.snapshot(sessionID))
+      expect(projected.get(ids[0]!)).toEqual({ sessionID: ids[0]!, generation: 0 })
+      expect(projected.get(ids.at(-1)!)).toEqual({ sessionID: ids.at(-1)!, generation: 0 })
+    }),
+  )
+
   it.effect("lists globally working sessions from durable ownership without location services", () =>
     Effect.gen(function* () {
       yield* setup
@@ -168,7 +198,7 @@ describe("SessionExecutionOwner", () => {
 
       let working = yield* owner.listWorking()
       expect([...working]).toEqual([])
-      const acquired = yield* owner.tryAcquire(sessionID)
+      const acquired = yield* owner.tryAcquireLocal(sessionID)
       if (acquired.state !== "acquired") return yield* Effect.die("expected acquisition")
       working = yield* owner.listWorking()
       expect([...working]).toEqual([[sessionID, { type: "busy" }]])
@@ -222,6 +252,30 @@ describe("SessionExecutionOwner", () => {
       if (second.state !== "acquired") return
       expect(second.token.generation).toBe(2)
       expect(yield* owner.releaseIfDrained(second.token)).toBe("released")
+    }),
+  )
+
+  it.effect("does not steal a raw same-process owner whose activation vanished before tool hazard inspection", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const owner = yield* SessionExecutionOwner.Service
+      const first = yield* owner.tryAcquire(sessionID)
+      if (first.state !== "acquired") return yield* Effect.die("expected first acquisition")
+      const processState = (globalThis as typeof globalThis & { [key: symbol]: unknown })[
+        Symbol.for("openfork.session-execution-owner.activations.v1")
+      ] as { activations: Map<string, unknown> } | undefined
+      if (!processState) return yield* Effect.die("missing process activation registry")
+      // Simulate an executor crash after durable acquisition. This does not
+      // make external side effects safe to replay.
+      processState.activations.delete(sessionID)
+      expect([...(yield* owner.listWorking())]).toEqual([[sessionID, { type: "interrupted" }]])
+      const attempted = yield* owner.tryAcquireLocal(sessionID)
+      expect(attempted.state).toBe("busy")
+      expect(yield* owner.snapshot(sessionID)).toMatchObject({
+        ownerID: first.token.ownerID,
+        generation: first.token.generation,
+      })
+      expect(yield* owner.release(first.token)).toBe("released")
     }),
   )
 
@@ -390,7 +444,7 @@ describe("SessionExecutionOwner", () => {
     }),
   )
 
-  it.effect("shares one process-local activation and heals only an unregistered same-runtime owner", () =>
+  it.effect("shares exact activation for raw and local acquisition without stealing a live generation", () =>
     Effect.gen(function* () {
       yield* setup
       const owner = yield* SessionExecutionOwner.Service
@@ -410,12 +464,30 @@ describe("SessionExecutionOwner", () => {
       expect(yield* owner.localActivation(sessionID)).toBeUndefined()
 
       const raw = yield* owner.tryAcquire(sessionID)
-      if (raw.state !== "acquired") return yield* Effect.die("expected raw orphan acquisition")
-      const healed = yield* owner.tryAcquireLocal(sessionID)
-      expect(healed.state).toBe("acquired")
-      if (healed.state === "acquired") {
-        expect(healed.token.generation).toBe(raw.token.generation + 1)
-        expect(yield* owner.release(healed.token)).toBe("released")
+      if (raw.state !== "acquired") return yield* Effect.die("expected raw acquisition")
+      expect(yield* owner.localActivation(sessionID)).toEqual(raw.token)
+      // Raw acquisition is a legitimate executor generation, NOT an orphan.
+      // The old local path released this live owner and re-admitted work.
+      expect(yield* owner.tryAcquireLocal(sessionID)).toMatchObject({
+        state: "busy",
+        snapshot: { generation: raw.token.generation, ownerID: raw.token.ownerID },
+      })
+      expect(yield* owner.tryClaimRecovery(sessionID)).toMatchObject({
+        state: "blocked",
+        snapshot: { generation: raw.token.generation, ownerID: raw.token.ownerID },
+      })
+      expect(yield* owner.snapshot(sessionID)).toMatchObject({
+        generation: raw.token.generation,
+        ownerID: raw.token.ownerID,
+      })
+      expect(yield* owner.release(raw.token)).toBe("released")
+      expect(yield* owner.localActivation(sessionID)).toBeUndefined()
+
+      const next = yield* owner.tryAcquireLocal(sessionID)
+      expect(next.state).toBe("acquired")
+      if (next.state === "acquired") {
+        expect(next.token.generation).toBe(raw.token.generation + 1)
+        expect(yield* owner.release(next.token)).toBe("released")
       }
     }),
   )

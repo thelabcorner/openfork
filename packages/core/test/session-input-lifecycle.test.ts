@@ -65,7 +65,12 @@ const user = (id: SessionMessage.ID, text: string) =>
 const synthetic = (
   id: SessionMessage.ID,
   input:
-    | { admissionClass: "host"; delivery?: SessionInput.Delivery; userPreemptible?: boolean }
+    | {
+        admissionClass: "host"
+        delivery?: SessionInput.Delivery
+        userPreemptible?: boolean
+        rejectExisting?: boolean
+      }
     | {
         admissionClass: "automatic"
         delivery?: SessionInput.Delivery
@@ -102,6 +107,28 @@ const eventCount = (type: string) =>
   )
 
 describe("SessionInput generalized lifecycle", () => {
+  it.effect("can reject an existing deterministic Synthetic identity", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const id = SessionMessage.ID.make("msg_switch_attempt_identity")
+      yield* synthetic(id, { admissionClass: "host", delivery: "steer", userPreemptible: true })
+
+      const exit = yield* synthetic(id, {
+        admissionClass: "host",
+        delivery: "steer",
+        userPreemptible: true,
+        rejectExisting: true,
+      }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionInput.LifecycleConflict)
+      const pending = yield* SessionInput.findEntry((yield* Database.Service).db, id)
+      expect(pending?.id).toBe(id)
+      expect(pending?.promotedSeq).toBeUndefined()
+      expect(pending?.revokedSeq).toBeUndefined()
+    }),
+  )
+
   it.effect("distinguishes a fresh semantic User admission from an idempotent replay", () =>
     Effect.gen(function* () {
       yield* setup
@@ -209,6 +236,49 @@ describe("SessionInput generalized lifecycle", () => {
     }),
   )
 
+  it.effect("promotes one exact automatic Synthetic identity once across deterministic replay", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const frontier = yield* user(SessionMessage.ID.make("msg_auto_exact_frontier"), "original user work")
+      const id = SessionMessage.ID.make("msg_auto_exact_recovery")
+      const lane = { admissionClass: "automatic" as const, delivery: "queue" as const }
+
+      yield* synthetic(id, {
+        ...lane,
+        expectedLatestUserSeq: frontier.admittedSeq,
+      })
+      expect(
+        yield* SessionInput.promoteSyntheticByID(db, events, {
+          sessionID,
+          id,
+          ...lane,
+        }),
+      ).toEqual({ selected: 1, promoted: 1, staleRevoked: 0 })
+
+      const promoted = yield* SessionInput.findEntry(db, id)
+      expect(promoted?.promotedSeq).toBeDefined()
+      expect(promoted?.revokedSeq).toBeUndefined()
+
+      // Recovery/restart re-entry admits the same deterministic ID. It must
+      // resolve to the existing promoted row and never publish a second turn.
+      const replay = yield* synthetic(id, {
+        ...lane,
+        expectedLatestUserSeq: frontier.admittedSeq,
+      })
+      expect(replay.promotedSeq).toBe(promoted?.promotedSeq)
+      expect(
+        yield* SessionInput.promoteSyntheticByID(db, events, {
+          sessionID,
+          id,
+          ...lane,
+        }),
+      ).toEqual({ selected: 0, promoted: 0, staleRevoked: 0 })
+      expect(yield* eventCount(EventV2.versionedType(SessionEvent.SyntheticPromoted.type, 1))).toBe(1)
+    }),
+  )
+
   it.effect("lowers promoted current User input into the mature V1 transcript with explicit attachments", () =>
     Effect.gen(function* () {
       yield* setup
@@ -279,6 +349,57 @@ describe("SessionInput generalized lifecycle", () => {
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionInput.AdmissionFenceConflict)
       expect(yield* SessionInput.findEntry(db, id)).toBeUndefined()
+    }),
+  )
+
+  it.effect("resolves legacy V1 user text once at promotion before publishing the current Prompt", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const id = SessionMessage.ID.make("msg_v1_user_projection")
+      const legacyID = SessionV1.MessageID.ascending(id)
+      yield* events.publish(SessionV1.Event.MessageUpdated, {
+        sessionID,
+        info: SessionV1.User.make({
+          id: legacyID,
+          sessionID,
+          role: "user",
+          provenance: { owner: "user", source: SessionTurnProvenance.Source.Prompt },
+          time: { created: Date.now() },
+          agent: "build",
+          model: { providerID: "test-provider" as never, modelID: "test-model" as never },
+        }),
+      })
+      yield* events.publish(SessionV1.Event.PartUpdated, {
+        sessionID,
+        time: Date.now(),
+        part: SessionV1.TextPart.make({
+          id: SessionV1.PartID.ascending("prt_v1_user_projection"),
+          messageID: legacyID,
+          sessionID,
+          type: "text",
+          text: "visible user prompt",
+        }),
+      })
+
+      const cutoff = yield* EventV2.latestSequence(db, sessionID)
+      const promoted = yield* SessionInput.promoteLane(
+        db,
+        events,
+        sessionID,
+        { admissionClass: "user", delivery: "steer" },
+        cutoff,
+      )
+      expect(promoted.promoted).toBe(1)
+      expect(yield* db.select().from(SessionInputTable).where(eq(SessionInputTable.id, id)).get()).toMatchObject({
+        prompt: { text: "visible user prompt" },
+        input: { type: "user", prompt: { text: "visible user prompt" } },
+      })
+      expect(yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, id)).get()).toMatchObject({
+        type: "user",
+        data: { text: "visible user prompt" },
+      })
     }),
   )
 

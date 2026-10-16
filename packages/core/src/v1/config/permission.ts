@@ -31,14 +31,39 @@ const InputObject = Schema.StructWithRest(
     lsp: Schema.optional(Rule),
     doom_loop: Schema.optional(Action),
     skill: Schema.optional(Rule),
+    code: Schema.optional(Rule),
   }),
   [Schema.Record(Schema.String, Rule)],
 )
 
 const InputSchema = Schema.Union([Action, InputObject])
 
-const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> =>
-  typeof input === "string" ? { "*": input } : input
+/**
+ * Migrate the deprecated provider-visible `execute` permission key to `code`.
+ *
+ * An explicit current `code` rule always wins, regardless of object order.
+ * This is intentionally stricter than ordinary permission precedence because
+ * `execute` is a compatibility alias, not an independent current action.
+ */
+export const normalizeLegacyKeys = <T>(
+  input: Readonly<Record<string, T>>,
+): Record<string, T> => {
+  const hasCode = globalThis.Object.prototype.hasOwnProperty.call(input, "code")
+  const migrated: Record<string, T> = {}
+  for (const [key, value] of globalThis.Object.entries(input)) {
+    if (key === "execute") {
+      if (!hasCode) migrated.code = value
+      continue
+    }
+    migrated[key] = value
+  }
+  return migrated
+}
+
+const normalizeInput = (input: Schema.Schema.Type<typeof InputSchema>): Schema.Schema.Type<typeof InputObject> => {
+  if (typeof input === "string") return { "*": input }
+  return normalizeLegacyKeys(input as Readonly<Record<string, Rule>>)
+}
 
 export const Info = InputSchema.pipe(
   Schema.decodeTo(InputObject, {

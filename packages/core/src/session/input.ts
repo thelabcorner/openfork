@@ -25,7 +25,7 @@ import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { Prompt } from "./prompt"
 import { SessionSchema } from "./schema"
-import { SessionInputTable, SessionMessageTable } from "./sql"
+import { MessageTable, PartTable, SessionInputTable, SessionMessageTable } from "./sql"
 import { SessionTurnProvenance } from "./turn-provenance"
 
 type DatabaseService = Database.Interface["db"]
@@ -608,7 +608,10 @@ export type SyntheticAdmission = {
       readonly userPreemptible?: true
       readonly expectedLatestUserSeq: number | undefined
     }
-)
+) & {
+  /** Fail if this durable identity already exists instead of adopting another caller's row. */
+  readonly rejectExisting?: boolean
+}
 
 export const admitSynthetic = Effect.fn("SessionInput.admitSynthetic")(function* (
   db: DatabaseService,
@@ -641,6 +644,7 @@ export const admitSynthetic = Effect.fn("SessionInput.admitSynthetic")(function*
 
   const existing = yield* findEntry(db, input.id)
   if (existing) {
+    if (input.rejectExisting) return yield* Effect.die(new LifecycleConflict({ id: input.id }))
     if (!equivalentEntry(existing, expected)) return yield* Effect.die(new LifecycleConflict({ id: input.id }))
     return existing
   }
@@ -690,11 +694,13 @@ export const admitSynthetic = Effect.fn("SessionInput.admitSynthetic")(function*
             ),
       ),
       Effect.catchDefect((defect) =>
-        findEntry(db, input.id).pipe(
-          Effect.flatMap((stored) =>
-            stored && equivalentEntry(stored, expected) ? Effect.succeed(stored) : Effect.die(defect),
-          ),
-        ),
+        input.rejectExisting
+          ? Effect.die(defect)
+          : findEntry(db, input.id).pipe(
+              Effect.flatMap((stored) =>
+                stored && equivalentEntry(stored, expected) ? Effect.succeed(stored) : Effect.die(defect),
+              ),
+            ),
       ),
     )
 })
@@ -1308,6 +1314,73 @@ const combinePromoteResult = (left: PromoteResult, right: PromoteResult): Promot
   staleRevoked: left.staleRevoked + right.staleRevoked,
 })
 
+/**
+ * V1 stores the user message shell and its parts as separate events. Resolve
+ * that compatibility input once, at promotion, after its parts are durable.
+ * This keeps the canonical Prompt complete without rescanning the message's
+ * parts for every V1 part update.
+ */
+const resolveLegacyPrompt = Effect.fnUntraced(function* (db: DatabaseService, row: Row, item: UserItem) {
+  if (item.prompt.text || item.prompt.files?.length || item.prompt.agents?.length) return item
+  const messageID = SessionV1.MessageID.ascending(row.id)
+  const legacy = yield* db
+    .select({ id: MessageTable.id })
+    .from(MessageTable)
+    .where(and(eq(MessageTable.id, messageID), eq(MessageTable.session_id, row.session_id)))
+    .get()
+    .pipe(Effect.orDie)
+  if (!legacy) return item
+
+  const rows = yield* db
+    .select({ data: PartTable.data })
+    .from(PartTable)
+    .where(and(eq(PartTable.message_id, messageID), eq(PartTable.session_id, row.session_id)))
+    .orderBy(asc(PartTable.id))
+    .all()
+    .pipe(Effect.orDie)
+  const parts = rows.map((part) => part.data as SessionV1.Part)
+  const text = parts
+    .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.synthetic && !part.ignored)
+    .map((part) => part.text)
+    .join("")
+  const files = parts.flatMap((part) =>
+    part.type === "file"
+      ? [{
+          uri: part.url,
+          mime: part.mime,
+          ...(part.filename ? { name: part.filename } : {}),
+          ...(part.source
+            ? { source: { start: part.source.text.start, end: part.source.text.end, text: part.source.text.value } }
+            : {}),
+        }]
+      : [],
+  )
+  const agents = parts.flatMap((part) =>
+    part.type === "agent"
+      ? [{
+          name: part.name,
+          ...(part.source ? { source: { start: part.source.start, end: part.source.end, text: part.source.value } } : {}),
+        }]
+      : [],
+  )
+  const prompt = Prompt.make({ text, ...(files.length ? { files } : {}), ...(agents.length ? { agents } : {}) })
+  const resolved = UserItem.make({ type: "user", prompt })
+  yield* db
+    .update(SessionInputTable)
+    .set({ prompt: encodePrompt(prompt), input: resolved })
+    .where(
+      and(
+        eq(SessionInputTable.id, row.id),
+        eq(SessionInputTable.session_id, row.session_id),
+        isNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+      ),
+    )
+    .run()
+    .pipe(Effect.orDie)
+  return resolved
+})
+
 const publishRows = Effect.fn("SessionInput.publishRows")(function* (
   db: DatabaseService,
   events: EventV2.Interface,
@@ -1317,7 +1390,8 @@ const publishRows = Effect.fn("SessionInput.publishRows")(function* (
   const result = { selected: rows.length, promoted: 0, staleRevoked: 0 }
   for (const row of rows) {
     const id = SessionMessage.ID.make(row.id)
-    const item = itemFromRow(row)
+    const storedItem = itemFromRow(row)
+    const item = storedItem.type === "user" ? yield* resolveLegacyPrompt(db, row, storedItem) : storedItem
     const publish =
       item.type === "user"
         ? events
@@ -1371,6 +1445,52 @@ const publishRows = Effect.fn("SessionInput.publishRows")(function* (
     if (outcome === "stale-revoked") result.staleRevoked++
   }
   return result satisfies PromoteResult
+})
+
+/**
+ * Promote one exact pending Synthetic input.
+ *
+ * Most runners should use promoteLane(), which owns normal SessionInput
+ * priority. Durable domain cursors sometimes provide a stronger ordering fence
+ * (for example, resuming an interrupted provider turn before work that was
+ * already queued when the interruption occurred). Those owners still must not
+ * bypass SessionInput admission/projection, so they use this exact-id CAS-like
+ * promotion and supply the expected lane.
+ *
+ * A concurrent genuine User admission can revoke a user-preemptible Synthetic
+ * row between selection and publication; publishRows() classifies that as
+ * staleRevoked instead of resurrecting it.
+ */
+export const promoteSyntheticByID = Effect.fn("SessionInput.promoteSyntheticByID")(function* (
+  db: DatabaseService,
+  events: EventV2.Interface,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly id: SessionMessage.ID
+    readonly admissionClass: SyntheticAdmissionClass
+    readonly delivery: Delivery
+  },
+) {
+  if (input.admissionClass === "automatic" && input.delivery !== "queue")
+    return yield* Effect.die(new InvalidAdmissionPolicy("Automatic Session input is queue-only"))
+
+  const row = yield* db
+    .select()
+    .from(SessionInputTable)
+    .where(
+      and(
+        eq(SessionInputTable.id, input.id),
+        eq(SessionInputTable.session_id, input.sessionID),
+        eq(SessionInputTable.kind, "synthetic"),
+        eq(SessionInputTable.admission_class, input.admissionClass),
+        eq(SessionInputTable.delivery, input.delivery),
+        isNull(SessionInputTable.promoted_seq),
+        isNull(SessionInputTable.revoked_seq),
+      ),
+    )
+    .get()
+    .pipe(Effect.orDie)
+  return row ? yield* publishRows(db, events, input.sessionID, [row]) : emptyPromoteResult()
 })
 
 function pendingWhere(sessionID: SessionSchema.ID, lane: PendingLane) {

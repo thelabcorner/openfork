@@ -150,9 +150,7 @@ export function normalizeWorkerDelegationModel(value: unknown): WorkerDelegation
   let routeIntent: ProviderRouteIntent.Info
 
   if (rawRouteIntent === undefined) {
-    routeIntent = accountID
-      ? { kind: "account", accountID, pin: "hard" }
-      : { kind: "auto" }
+    routeIntent = accountID ? { kind: "account", accountID, pin: "hard" } : { kind: "auto" }
   } else {
     if (!Schema.is(ProviderRouteIntent.Info)(rawRouteIntent)) return
     routeIntent = rawRouteIntent
@@ -203,14 +201,8 @@ export function workerDelegation(value: Metadata | undefined): WorkerDelegationO
   const invocationRef = stringField(row, "invocationRef")
   const rootRef = stringField(row, "rootRef")
   const agent = stringField(row, "agent")
-  if (
-    !producer ||
-    !principalRef ||
-    !invocationRef ||
-    !rootRef ||
-    !agent ||
-    typeof row.nestedDelegation !== "boolean"
-  ) return
+  if (!producer || !principalRef || !invocationRef || !rootRef || !agent || typeof row.nestedDelegation !== "boolean")
+    return
   const parentWorkerID = stringField(row, "parentWorkerID")
   return {
     producer,
@@ -227,6 +219,12 @@ export function workerDelegation(value: Metadata | undefined): WorkerDelegationO
 /** Any Session whose aggregate lifecycle belongs to a first-party producer. */
 export function isProducerOwned(value: Metadata | undefined) {
   return isSpecialAgent(value) || hasScheduledTaskOrigin(value) || hasWorkerDelegationOrigin(value)
+}
+
+/** Conversational/control authority is independent of producer-owned configuration. */
+export function isHumanControllableWorker(value: Metadata | undefined) {
+  // Mixed/corrupt origins must not bypass a special-agent or scheduler fence.
+  return !isSpecialAgent(value) && !hasScheduledTaskOrigin(value) && workerDelegation(value) !== undefined
 }
 
 /**
@@ -249,10 +247,7 @@ export function forPublicCreate(value: Metadata | undefined): Record<string, unk
  * producer-owned origin fields from the current Session. Incoming origin fields
  * cannot introduce or overwrite producer identity.
  */
-export function replaceCallerOwned(
-  current: Metadata | undefined,
-  replacement: Metadata,
-): Record<string, unknown> {
+export function replaceCallerOwned(current: Metadata | undefined, replacement: Metadata): Record<string, unknown> {
   const next = clone(replacement)
 
   for (const key of immutableOriginKeys) {
@@ -309,7 +304,9 @@ export function specialAgent(input: {
  * Compose one protected worker-delegation aggregate identity. Producer-owned
  * identity wins over caller metadata by construction.
  */
-export function delegatedWorker(input: WorkerDelegationOrigin & { readonly metadata?: Metadata }): Record<string, unknown> {
+export function delegatedWorker(
+  input: WorkerDelegationOrigin & { readonly metadata?: Metadata },
+): Record<string, unknown> {
   const { metadata, ...origin } = input
   return {
     ...metadata,

@@ -25,6 +25,7 @@ import { ProviderRouteIntentRuntime } from "../../provider-route-intent"
 import { OpencodeAccountModel } from "../../plugin/provider/opencode-account-model"
 import { projectCredential as projectOpencodeCredential } from "../../plugin/provider/opencode-provider-account"
 import { OpencodeProviderRoute } from "../../plugin/provider/opencode-provider-route"
+import type { ExecutionMaterialization } from "../../plugin/provider/opencode-route-candidates"
 import { currentHostedCatalog, isHostedPublicModel, refreshHostedCatalog } from "../../plugin/provider/opencode-hosted"
 import { isTrustedPublicCost } from "../../plugin/provider/opencode"
 import { SessionSchema } from "../schema"
@@ -112,6 +113,17 @@ export interface ResolvedInfo {
   readonly lease?: ProviderRouteResolution.ProviderRouteLease
 }
 
+export interface MaintenanceOptions {
+  /**
+   * Explicit caller/config selection (a requested model, an agent-configured
+   * model, a configured small_model). Explicit overrides always resolve a
+   * transient route in the ref's own provider domain and never inherit the
+   * parent Session's durable binding. Automatic same-provider fallbacks pass
+   * false (or omit) so the existing exact route generation is inherited.
+   */
+  readonly explicitOverride?: boolean
+}
+
 export interface Interface {
   readonly resolve: (
     session: SessionSchema.Info,
@@ -122,21 +134,64 @@ export interface Interface {
     session: SessionSchema.Info,
     routeIntent?: ProviderRouteIntent.Info,
   ) => Effect.Effect<ResolvedInfo, Error>
+  /**
+   * Host-owned maintenance/special-agent resolution. Never selects, binds,
+   * rebinds, or fails over the parent Session's durable ProviderRoute:
+   *
+   * - same-provider, existing binding, non-explicit: inherit the exact route
+   *   generation via compileExisting (fail closed on staleness);
+   * - no binding, explicit override, or no session: resolve one
+   *   transient/non-persistent route;
+   * - the route owner returning undefined positively means outside its routing
+   *   domain, and only then is direct provider lookup allowed.
+   *
+   * An undefined ref inherits the session's current worker selection (its
+   * model, else the catalog default/first supported model), always as
+   * non-explicit maintenance. Missing session and ref fails closed.
+   *
+   * Preserves the ref's accountID/variant and returns secret-free route
+   * attribution where applicable. The transient attribution carries
+   * routeRevision 0 to mark "no durable generation".
+   */
+  readonly resolveMaintenanceWithInfo: (
+    session: SessionSchema.Info | undefined,
+    ref: ModelV2.Ref | undefined,
+    options?: MaintenanceOptions,
+  ) => Effect.Effect<ResolvedInfo, Error>
+  readonly resolveMaintenanceRef: (
+    session: SessionSchema.Info | undefined,
+    ref: ModelV2.Ref | undefined,
+    options?: MaintenanceOptions,
+  ) => Effect.Effect<Model, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunnerModel") {}
 
 /** Test or embedding seam for supplying model resolvers directly. */
-export const layerWith = (resolve: Interface["resolve"], resolveRef?: Interface["resolveRef"]) =>
-  Layer.succeed(
+export const layerWith = (resolve: Interface["resolve"], resolveRef?: Interface["resolveRef"]) => {
+  const refResolver =
+    resolveRef ?? (() => Effect.die("SessionRunnerModel.resolveRef is unavailable in this test layer"))
+  const maintenanceWithInfo: Interface["resolveMaintenanceWithInfo"] = (session, ref) =>
+    (
+      session
+        ? resolve(ref ? { ...session, model: ref } : session)
+        : ref
+          ? refResolver(ref)
+          : Effect.die("SessionRunnerModel.resolveMaintenance requires a session or model ref")
+    ).pipe(Effect.map((model) => ({ model, name: model.id })))
+  return Layer.succeed(
     Service,
     Service.of({
       resolve,
-      resolveRef: resolveRef ?? (() => Effect.die("SessionRunnerModel.resolveRef is unavailable in this test layer")),
+      resolveRef: refResolver,
       resolveWithInfo: (session, routeIntent) =>
         resolve(session, routeIntent).pipe(Effect.map((model) => ({ model, name: model.id }))),
+      resolveMaintenanceWithInfo: maintenanceWithInfo,
+      resolveMaintenanceRef: (session, ref, options) =>
+        maintenanceWithInfo(session, ref, options).pipe(Effect.map((value) => value.model)),
     }),
   )
+}
 
 const apiKey = (model: ModelV2.Info, credential?: Credential.Value) => {
   if (credential?.type === "key") return Auth.value(credential.key)
@@ -227,8 +282,15 @@ export const fromCatalogModel = (
   )
 }
 
+export const resolveWithVariant = (
+  variant: ModelV2.VariantID | undefined,
+  model: ModelV2.Info,
+  credential?: Credential.Value,
+): Effect.Effect<Model, UnsupportedApiError | VariantUnavailableError> =>
+  withVariant(model, variant).pipe(Effect.flatMap((model) => fromCatalogModel(model, credential)))
+
 export const resolve = (session: SessionSchema.Info, model: ModelV2.Info, credential?: Credential.Value) =>
-  withVariant(model, session.model?.variant).pipe(Effect.flatMap((model) => fromCatalogModel(model, credential)))
+  resolveWithVariant(session.model?.variant, model, credential)
 
 export const supported = (model: ModelV2.Info) =>
   ModelV2.isLanguageModel(model.providerID, model) &&
@@ -365,7 +427,7 @@ export const locationLayer = Layer.effect(
           })
         }
         const routeIntent = yield* ProviderRouteIntentRuntime.normalize({
-          routeIntent: requestedRouteIntent,
+          routeIntent: requestedRouteIntent ?? session.model?.routeIntent,
           ...(legacyAccountID ? { legacyAccountID } : {}),
         }).pipe(
           Effect.mapError(
@@ -387,8 +449,8 @@ export const locationLayer = Layer.effect(
             modelID: selected.id,
             affinityDomain,
             routeIntent,
-            mode: "concentrate",
-            freeRoutePreference: "public-first-for-free",
+            mode: OpencodeProviderRoute.routingMode(selected.providerID, routeIntent),
+            freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(selected.providerID, routeIntent),
             allowPublic,
             publicEligible,
           })
@@ -523,22 +585,271 @@ export const locationLayer = Layer.effect(
           } satisfies ResolvedInfo
         }
 
-        const provider = yield* catalog.provider.get(selected.providerID)
-        const connection = yield* integrations.connection.active(
-          provider?.integrationID ?? Integration.ID.make(selected.providerID),
-        )
         const model = yield* resolve(
           session,
           selected,
-          connection ? yield* integrations.connection.resolve(connection) : undefined,
+          yield* directCredential(selected.providerID),
         )
         return { model, name: selected.name } satisfies ResolvedInfo
       })
+    const directCredential = Effect.fnUntraced(function* (providerID: ProviderV2.ID) {
+      const provider = yield* catalog.provider.get(providerID)
+      const connection = yield* integrations.connection.active(
+        provider?.integrationID ?? Integration.ID.make(providerID),
+      )
+      return connection ? yield* integrations.connection.resolve(connection) : undefined
+    })
+
+    /**
+     * Non-durable session identity for transient maintenance attribution when
+     * no parent Session exists. Never persisted: settlement only reads
+     * routeKind/accountID, and revision 0 marks "no durable generation".
+     */
+    const TRANSIENT_MAINTENANCE_SESSION_ID = SessionSchema.ID.make("ses_maintenance_transient")
+
+    // Names the session's current worker selection for model-less maintenance:
+    // catalog default, then first supported model. Mirrors worker selection so
+    // the authority stays in one place; always non-explicit maintenance.
+    const inheritWorkerSelection = Effect.fnUntraced(function* (session: SessionSchema.Info | undefined) {
+      if (session === undefined)
+        return yield* Effect.die("SessionRunnerModel.resolveMaintenance requires a session or model ref")
+      const catalogDefault = yield* catalog.model.default()
+      const usable = (model: ModelV2.Info | undefined) =>
+        model !== undefined && supported(model) ? model : undefined
+      const fallback =
+        (usable(catalogDefault) ? catalogDefault : undefined) ??
+        (yield* catalog.model.available()).find((model) => usable(model))
+      if (!fallback) return yield* new ModelNotSelectedError({ sessionID: session.id })
+      return ModelV2.Ref.make({ providerID: fallback.providerID, id: fallback.id })
+    })
+
+    const resolveMaintenanceWithInfo = Effect.fn("SessionRunnerModel.resolveMaintenanceWithInfo")(function* (
+      session: SessionSchema.Info | undefined,
+      ref: ModelV2.Ref | undefined,
+      options?: MaintenanceOptions,
+    ) {
+        const explicitOverride = ref !== undefined && (options?.explicitOverride ?? false)
+        // A missing ref inherits the session's current worker selection,
+        // always as non-explicit maintenance.
+        ref = ref ?? session?.model ?? (yield* inheritWorkerSelection(session))
+        const selected = (yield* catalog.model.available()).find(
+          (model) => model.providerID === ref.providerID && model.id === ref.id,
+        )
+        if (!selected)
+          return yield* new ModelUnavailableError({
+            providerID: ref.providerID,
+            modelID: ref.id,
+          })
+
+        const failRoute = (reason: string) =>
+          new RouteUnavailableError({
+            providerID: selected.providerID,
+            modelID: selected.id,
+            reason,
+          })
+        const legacyAccountID = yield* canonicalLegacyAccountID(ref.accountID)
+        if (ref.accountID?.startsWith("cred_") && legacyAccountID === undefined) {
+          return yield* failRoute(
+            "Selected OpenCode credential cannot be projected to a stable ProviderAccount identity",
+          )
+        }
+        const routeIntent = yield* ProviderRouteIntentRuntime.normalize({
+          ...(legacyAccountID ? { legacyAccountID } : {}),
+        }).pipe(Effect.mapError((cause) => failRoute(routeReason(cause))))
+        const affinityDomain = OpencodeProviderRoute.affinityDomain(selected.providerID)
+        // Unlike worker turns, host-owned maintenance cannot use the upstream
+        // OpenCode-only Public/free tier. Preserve all account-backed routes.
+        const allowPublic = false
+        const publicEligible = allowPublic ? yield* publicEligibility(selected) : false
+
+        // Exact transport materialization for an already-resolved account
+        // lease. Returns undefined when the lease no longer materializes so
+        // the caller can refresh once from the same binding; never binds,
+        // rebinds, or fails over.
+        const resolveAccountExecution = (input: {
+          readonly providerID: string
+          readonly accountID: string
+          readonly credentialHandle: string
+          readonly credentialRevision: number
+        }) =>
+          providerRoutes
+            .resolveExecution({
+              providerID: input.providerID,
+              accountID: input.accountID,
+              credentialHandle: input.credentialHandle,
+              modelID: selected.id,
+              expectedCredentialRevision: input.credentialRevision,
+            })
+            .pipe(Effect.mapError((cause) => failRoute(routeReason(cause))))
+        const compileAccountModel = (execution: ExecutionMaterialization) => {
+          const capability = execution.capabilities.providers[selected.providerID]
+          return capability ? OpencodeAccountModel.compile(selected, capability, selected.id) : undefined
+        }
+
+        // Host-owned maintenance inherits the parent Session's existing exact
+        // route generation. The committed attribution is the authority: this
+        // path never re-enters account/public selection or failover.
+        if (session && !explicitOverride) {
+          const current = yield* routes.get(session.id, affinityDomain)
+          if (current !== undefined &&
+              !(selected.providerID === ProviderV2.ID.opencode && current.routeKind === "public")) {
+            const pinnedAccountID = legacyAccountID ?? ref.accountID
+            if (
+              pinnedAccountID !== undefined &&
+              (current.routeKind !== "account" || current.accountID !== pinnedAccountID)
+            ) {
+              return yield* failRoute("Maintenance model account pin does not match the committed session route")
+            }
+            const expected = {
+              sessionID: session.id,
+              affinityDomain,
+              providerID: selected.providerID,
+              routeRevision: current.routeRevision,
+              routeKind: current.routeKind,
+              ...(current.routeKind === "account" ? { accountID: current.accountID } : {}),
+            } satisfies ProviderRouteResolution.RouteAttribution
+            const compileArgs = {
+              sessionID: session.id,
+              providerID: selected.providerID,
+              modelID: selected.id,
+              affinityDomain,
+              // The committed attribution is now the authority. This inherit
+              // is not allowed to re-enter account/public selection or
+              // failover.
+              routeIntent: { kind: "auto" },
+              mode: "concentrate",
+              freeRoutePreference: "public-first-for-free",
+              allowPublic,
+              publicEligible,
+            } as const
+            const inherited = yield* providerRoutes
+              .compileExisting({ ...compileArgs, expected })
+              .pipe(Effect.mapError((cause) => failRoute(routeReason(cause))))
+
+            if (inherited.lease.route.kind === "public") {
+              if (selected.providerID === ProviderV2.ID.opencode)
+                return yield* failRoute("Hosted Public free tier cannot execute OpenFork special agents")
+              if (!publicEligible) {
+                return yield* failRoute("Committed Public route is not eligible for this hosted model")
+              }
+              const model = yield* resolveWithVariant(ref.variant, publicModel(selected), undefined)
+              return {
+                model,
+                name: selected.name,
+                route: inherited.attribution,
+                lease: inherited.lease,
+              } satisfies ResolvedInfo
+            }
+
+            const inheritAccount = inherited.lease.route
+            if (inheritAccount.kind !== "account") {
+              return yield* failRoute("Committed account route changed kind during exact transport materialization")
+            }
+            let attribution = inherited.attribution
+            let lease = inherited.lease
+            let execution = yield* resolveAccountExecution(inheritAccount)
+            if (!execution) {
+              // Refresh may advance credential revision without changing the
+              // durable ProviderRoute. Recompile that same binding once from
+              // the inherited attribution, then materialize the new exact
+              // generation. Existing route stickiness means this does not
+              // perform a second account choice.
+              const refreshed = yield* providerRoutes
+                .compileExisting({ ...compileArgs, expected: inherited.attribution })
+                .pipe(Effect.mapError((cause) => failRoute(routeReason(cause))))
+              const refreshAccount = refreshed.lease.route
+              if (refreshAccount.kind !== "account") {
+                return yield* failRoute("Committed account route changed kind during exact transport materialization")
+              }
+              attribution = refreshed.attribution
+              lease = refreshed.lease
+              execution = yield* resolveAccountExecution(refreshAccount)
+            }
+            if (!execution) {
+              return yield* failRoute("Committed account lease changed before exact transport materialization")
+            }
+            const exact = compileAccountModel(execution)
+            if (!exact) {
+              return yield* failRoute("Committed account no longer serves the selected model")
+            }
+            const model = yield* resolveWithVariant(ref.variant, exact, execution.credential)
+            return {
+              model,
+              name: selected.name,
+              route: attribution,
+              lease,
+            } satisfies ResolvedInfo
+          }
+        }
+
+        // No binding to inherit (or an explicit override, or no session): one
+        // non-persistent route in the ref's own provider domain. This creates
+        // no durable row, revision, cursor, or sticky affinity.
+        const transient = yield* providerRoutes
+          .resolveTransient({
+            providerID: selected.providerID,
+            modelID: selected.id,
+            routeIntent,
+            mode: "concentrate",
+            freeRoutePreference: "public-first-for-free",
+            allowPublic,
+            publicEligible,
+          })
+          .pipe(Effect.mapError((cause) => failRoute(routeReason(cause))))
+
+        if (transient === undefined) {
+          if (selected.providerID === ProviderV2.ID.opencode || selected.providerID === ProviderV2.ID.make("opencode-go"))
+            return yield* failRoute("No account-backed hosted route is available for this OpenFork special agent")
+          // The route owner positively declines this provider/model: it is
+          // outside the routing domain. Only then may maintenance use direct
+          // provider lookup; hosted models never fall back to ambient auth.
+          const model = yield* resolveWithVariant(
+            ref.variant,
+            selected,
+            yield* directCredential(selected.providerID),
+          )
+          return { model, name: selected.name } satisfies ResolvedInfo
+        }
+
+        const transientAttribution = {
+          sessionID: session?.id ?? TRANSIENT_MAINTENANCE_SESSION_ID,
+          affinityDomain,
+          providerID: selected.providerID,
+          routeRevision: 0,
+          routeKind: transient.route.kind,
+          ...(transient.route.kind === "account" ? { accountID: transient.route.accountID } : {}),
+        } satisfies ProviderRouteResolution.RouteAttribution
+
+        if (transient.route.kind === "public") {
+          if (selected.providerID === ProviderV2.ID.opencode)
+            return yield* failRoute("Hosted Public free tier cannot execute OpenFork special agents")
+          const model = yield* resolveWithVariant(ref.variant, publicModel(selected), undefined)
+          return { model, name: selected.name, route: transientAttribution } satisfies ResolvedInfo
+        }
+        const transientAccount = transient.route
+        if (transientAccount.kind !== "account") {
+          return yield* failRoute("Transient route changed kind during exact transport materialization")
+        }
+        const execution = yield* resolveAccountExecution(transientAccount)
+        if (!execution) {
+          return yield* failRoute("Transient account lease changed before exact transport materialization")
+        }
+        const exact = compileAccountModel(execution)
+        if (!exact) {
+          return yield* failRoute("Transient account no longer serves the maintenance model")
+        }
+        const model = yield* resolveWithVariant(ref.variant, exact, execution.credential)
+        return { model, name: selected.name, route: transientAttribution } satisfies ResolvedInfo
+      })
+    const resolveMaintenanceRef: Interface["resolveMaintenanceRef"] = (session, ref, options) =>
+      resolveMaintenanceWithInfo(session, ref, options).pipe(Effect.map((value) => value.model))
     return Service.of({
       resolve: (session, routeIntent) =>
         resolveWithInfo(session, routeIntent).pipe(Effect.map((value) => value.model)),
       resolveWithInfo,
       resolveRef,
+      resolveMaintenanceWithInfo,
+      resolveMaintenanceRef,
     })
   }),
 )
