@@ -29,9 +29,22 @@ function finiteReset(value: number | null | undefined, from: number, to: number)
   return typeof value === "number" && Number.isFinite(value) && value >= from && value <= to
 }
 
+/** Rolling Go usage is a capacity observation, not a fixed reset deadline.
+ * Include official rolling utilization even when its moving resetAt lies
+ * outside the requested fixed-deadline agenda interval. */
+function includeGoWindow(window: { label: string; source: "api" | "local"; resetsAt: number }, from: number, to: number) {
+  return finiteReset(window.resetsAt, from, to) ||
+    (window.label === "5h" && window.source === "api" && Number.isFinite(window.resetsAt))
+}
+
 function windowSource(providerId: string): ResetSource {
   if (providerId === "opencode-zen") return "inferred"
   if (providerId === "nvidia") return "local"
+  // WorkBuddy package expiry fields come from an undocumented billing surface.
+  // They are useful reset observations, but package expiry is not sufficient
+  // proof that request capacity will replenish at that instant. Keep them
+  // display-grade; a failure-local Retry-After remains execution-authoritative.
+  if (providerId === "workbuddy") return "observed"
   return "provider"
 }
 
@@ -235,13 +248,13 @@ function addGoSnapshot(
   const providerName = "OpenCode Go"
 
   for (const window of snapshot.result.aggregate) {
-    if (!finiteReset(window.resetsAt, from, to)) continue
+    if (!includeGoWindow(window, from, to)) continue
     const representedByAccount =
       window.source === "api" &&
       snapshot.result.byCredential.some((account) =>
         account.windows.some(
           (accountWindow) =>
-            accountWindow.label === window.label && finiteReset(accountWindow.resetsAt, from, to),
+            accountWindow.label === window.label && includeGoWindow(accountWindow, from, to),
         ),
       )
     if (representedByAccount) continue
@@ -266,7 +279,7 @@ function addGoSnapshot(
     const accountId = account.accountID ?? account.credentialID
     const accountLabel = snapshot.accountLabels.get(accountId) ?? snapshot.accountLabels.get(account.credentialID) ?? accountId
     for (const window of account.windows) {
-      if (!finiteReset(window.resetsAt, from, to)) continue
+      if (!includeGoWindow(window, from, to)) continue
       addOccurrence(map, {
         providerId,
         providerName,

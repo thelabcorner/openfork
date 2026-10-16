@@ -10,6 +10,53 @@ import { createAmazonBedrock, type AmazonBedrockLanguageModelOptions } from "@ai
 import { createAnthropic } from "@ai-sdk/anthropic"
 import { createVertexAnthropic } from "@ai-sdk/google-vertex/anthropic"
 
+describe("ProviderTransform.schema - Muse Spark wire compatibility", () => {
+  const muse = { providerID: "opencode-go", api: { id: "muse-spark-1.3-contributor", npm: "@ai-sdk/openai" } } as any
+  const nonMuse = { providerID: "opencode-go", api: { id: "deepseek-v4.1-flash" } } as any
+
+  function depth(node: any): number {
+    if (!node || typeof node !== "object") return 0
+    const children = Object.entries(node).flatMap(([key, value]) => {
+      if (["properties", "patternProperties"].includes(key)) return Object.values(value as object)
+      if (["items", "additionalProperties", "not"].includes(key)) return [value]
+      if (["anyOf", "oneOf", "allOf", "prefixItems"].includes(key)) return Array.isArray(value) ? value : []
+      return []
+    })
+    return 1 + Math.max(0, ...children.map(depth))
+  }
+
+  test("bounds deeply nested tool parameters to 10 levels and leaves source unchanged", () => {
+    let child: any = { type: "string" }
+    for (let index = 0; index < 14; index++) child = { type: "object", required: ["child"], properties: { child } }
+    const original = structuredClone(child)
+    const lowered = ProviderTransform.schema(muse, child) as any
+    expect(depth(lowered)).toBeLessThanOrEqual(10)
+    expect(lowered.properties.child).toBeDefined()
+    expect(child).toEqual(original)
+    expect(depth(ProviderTransform.schema(nonMuse, child))).toBeGreaterThan(10)
+  })
+
+  test("inlines recursive local refs, bounds recursion and preserves top-level required fields", () => {
+    const original: any = {
+      type: "object", required: ["root"],
+      properties: { root: { $ref: "#/$defs/node" } },
+      $defs: { node: { type: "object", properties: { next: { $ref: "#/$defs/node" } } } },
+    }
+    const lowered = ProviderTransform.schema(muse, original) as any
+    expect(lowered.required).toEqual(["root"])
+    expect(lowered.properties.root.type).toBe("object")
+    expect(JSON.stringify(lowered)).not.toContain('"$ref"')
+    expect(JSON.stringify(lowered)).not.toContain('"$defs"')
+    expect(depth(lowered)).toBeLessThanOrEqual(10)
+  })
+
+  test("leaves already supported schema shapes and unrelated providers unchanged", () => {
+    const schema: any = { type: "object", required: ["count"], properties: { count: { type: "integer" } } }
+    expect(ProviderTransform.schema(muse, schema)).toEqual(schema)
+    expect(ProviderTransform.schema(nonMuse, schema)).toBe(schema)
+  })
+})
+
 describe("ProviderTransform.options - setCacheKey", () => {
   const sessionID = "test-session-123"
 
@@ -884,6 +931,59 @@ describe("ProviderTransform.providerOptions", () => {
     expect(ProviderTransform.providerOptions(model, { cachePoint: { type: "default" } })).toEqual({
       bedrock: { cachePoint: { type: "default" } },
     })
+  })
+
+  test("downgrades only hosted Muse Spark max effort to upstream-supported xhigh", () => {
+    const candidate = createModel({
+      providerID: "opencode-go",
+      id: "muse-spark-1.3-contributor",
+      api: {
+        id: "muse-spark-1.3-contributor",
+        url: "https://opencode.ai/zen/go/v1",
+        npm: "@ai-sdk/openai",
+      },
+    })
+    const original = { reasoningEffort: "max", reasoningSummary: "auto" }
+    for (const providerID of ["opencode-go", "opencode"]) {
+      const model = { ...candidate, providerID }
+      expect(ProviderTransform.providerOptions(model, original)).toEqual({
+        openai: { reasoningEffort: "xhigh", reasoningSummary: "auto", forceReasoning: true },
+      })
+    }
+    expect(original.reasoningEffort).toBe("max")
+    const defaultInclude = { include: ["reasoning.encrypted_content"], reasoningEffort: "high" }
+    expect(ProviderTransform.providerOptions(candidate, defaultInclude)).toEqual({
+      openai: { reasoningEffort: "high", forceReasoning: true },
+    })
+    expect(defaultInclude.include).toEqual(["reasoning.encrypted_content"])
+    const multiInclude = { include: ["reasoning.encrypted_content", "other"], reasoningEffort: "max" }
+    expect(ProviderTransform.providerOptions(candidate, multiInclude)).toEqual({
+      openai: { include: ["other"], reasoningEffort: "xhigh", forceReasoning: true },
+    })
+    expect(ProviderTransform.providerOptions(candidate, { ...defaultInclude, store: true }).openai.include)
+      .toEqual(["reasoning.encrypted_content"])
+    expect(ProviderTransform.providerOptions({
+      ...candidate, providerID: "meta",
+    }, defaultInclude).openai.include).toEqual(["reasoning.encrypted_content"])
+    expect(ProviderTransform.providerOptions(candidate, { reasoningEffort: "high" }).openai.reasoningEffort).toBe("high")
+    expect(ProviderTransform.providerOptions({
+      ...candidate,
+      api: { ...candidate.api, id: "muse-glimmer-30b" },
+    }, original).openai.reasoningEffort).toBe("max")
+    // Standard-tier Muse Spark 1.3 supports max; only contributor/free
+    // endpoints have demonstrated the upstream max->400 incompatibility.
+    expect(ProviderTransform.providerOptions({
+      ...candidate,
+      api: { ...candidate.api, id: "muse-spark-1.3" },
+    }, original).openai.reasoningEffort).toBe("max")
+    expect(ProviderTransform.providerOptions({
+      ...candidate,
+      api: { ...candidate.api, id: "gpt-5.6" },
+    }, original).openai.reasoningEffort).toBe("max")
+    expect(ProviderTransform.providerOptions({
+      ...candidate,
+      providerID: "meta",
+    }, original).openai.reasoningEffort).toBe("max")
   })
 
   test("forces reasoning for custom OpenAI package models with explicit effort", () => {

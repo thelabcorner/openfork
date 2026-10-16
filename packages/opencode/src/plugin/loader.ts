@@ -3,7 +3,9 @@ import {
   createPluginEntry,
   isClaudeExternalPlugin,
   isDeprecatedPlugin,
+  isTypeScriptPluginEntry,
   pluginSource,
+  resolveCompiledPluginEntry,
   resolvePluginTarget,
   type PluginKind,
   type PluginPackage,
@@ -147,16 +149,36 @@ export namespace PluginLoader {
     return { ok: true, value: { ...plan, source: base.source, target: base.target, entry: base.entry, pkg: base.pkg } }
   }
 
+  export async function runtimeEntry(row: Resolved, nodeLike = typeof Bun === "undefined") {
+    // The Electron sidecar runs on Node, which intentionally refuses built-in
+    // TypeScript stripping for files beneath node_modules. A few npm plugins
+    // nevertheless publish src/*.ts as main while also shipping dist/*.js.
+    // Bun should honor the declared source; Node uses only the narrow,
+    // package-contained compiled projection resolved below.
+    if (!nodeLike || row.source !== "npm" || !row.pkg || !isTypeScriptPluginEntry(row.entry)) {
+      return row.entry
+    }
+
+    const compiled = await resolveCompiledPluginEntry(row.entry, row.pkg)
+    if (compiled) return compiled
+
+    throw new Error(
+      `Plugin ${row.spec} publishes a TypeScript entry inside node_modules (${row.entry}), but the Node runtime cannot execute TypeScript dependencies and no compiled JavaScript sibling was found. The plugin package must publish a JavaScript server entry or a matching dist artifact.`,
+    )
+  }
+
   // Import the resolved module only after all earlier validation has succeeded.
   export async function load(row: Resolved): Promise<{ ok: true; value: Loaded } | { ok: false; error: unknown }> {
+    let entry: string
     let mod
     try {
-      mod = await import(row.entry)
+      entry = await runtimeEntry(row)
+      mod = await import(entry)
     } catch (error) {
       return { ok: false, error }
     }
     if (!mod) return { ok: false, error: new Error(`Plugin ${row.spec} module is empty`) }
-    return { ok: true, value: { ...row, mod } }
+    return { ok: true, value: { ...row, entry, mod } }
   }
 
   // Run one candidate through the full pipeline: resolve, optionally surface a missing entry,

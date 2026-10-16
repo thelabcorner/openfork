@@ -204,6 +204,47 @@ describe("ProviderCatalog T3 account projection", () => {
   )
 
   it.effect(
+    "bootstrap-free catalog and V1 agree on proven neutral identities from hosted qualified-only models",
+    Effect.gen(function* () {
+      const catalog = yield* ProviderCatalog.Service
+      const config = {
+        provider: {
+          "opencode-go": {
+            api: "https://opencode.ai/zen/go/v1",
+            models: {
+              "catalog-neutral-probe@zen-one": { id: "catalog-neutral-probe" },
+              "catalog-neutral-probe@zen-two": { id: "catalog-neutral-probe" },
+            },
+          },
+        },
+      }
+      const result = yield* catalog.list({ directory: "/catalog-qualified-only", config })
+      const hosted = result.all.find((entry) => entry.id === "opencode-go")
+      expect(hosted?.models["catalog-neutral-probe"]).toMatchObject({
+        id: "catalog-neutral-probe",
+        api: { id: "catalog-neutral-probe" },
+      })
+      expect(hosted?.models["catalog-neutral-probe@zen-one"]).toBeDefined()
+      expect(hosted?.models["catalog-neutral-probe@zen-two"]).toBeDefined()
+
+      const restricted = yield* catalog.list({
+        directory: "/catalog-qualified-only-restricted",
+        config: {
+          provider: {
+            "opencode-go": {
+              ...config.provider["opencode-go"],
+              whitelist: ["catalog-neutral-probe@zen-one", "catalog-neutral-probe@zen-two"],
+            },
+          },
+        },
+      })
+      const restrictedHosted = restricted.all.find((entry) => entry.id === "opencode-go")
+      expect(restrictedHosted?.models["catalog-neutral-probe"]).toBeUndefined()
+      expect(restrictedHosted?.models["catalog-neutral-probe@zen-one"]).toBeDefined()
+    }),
+  )
+
+  it.effect(
     "materializes filtered account aliases asynchronously and invalidates on credential changes",
     Effect.gen(function* () {
       fetchCount = 0

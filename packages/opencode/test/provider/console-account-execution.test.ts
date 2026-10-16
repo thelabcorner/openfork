@@ -809,18 +809,19 @@ it.instance(
       yield* routes.get(sessionID, OpencodeProviderRoute.affinityDomain(publicProviderID)),
     ).toMatchObject({ routeKind: "public" })
 
-    const inherited = yield* provider.resolveInheritedRoutedModel({
+    const deniedMaintenanceInheritance = yield* provider.resolveInheritedRoutedModel({
       sessionID,
       providerID: publicProviderID,
       modelID: publicModelID,
       route: routed.route.attribution,
-    })
-    expect(inherited.route.attribution).toEqual(routed.route.attribution)
-    expect(inherited.route.lease.route.kind).toBe("public")
-    expect("accountID" in inherited.route.lease.route).toBe(false)
+    }).pipe(Effect.flip)
+    expect(deniedMaintenanceInheritance._tag).toBe("ProviderRouteResolutionError")
+    expect(String(deniedMaintenanceInheritance.cause)).toContain("special agents")
+    // The ordinary worker may still use its own original committed Public
+    // route; rejecting a maintenance inherit never mutates that route.
     expect((yield* routes.get(sessionID, OpencodeProviderRoute.affinityDomain(publicProviderID)))?.routeRevision).toBe(1)
 
-    const language = yield* provider.getLanguage(inherited.model)
+    const language = yield* provider.getLanguage(routed.model)
     const result = yield* Effect.promise(() =>
       generateText({
         model: language,
@@ -967,6 +968,97 @@ it.instance(
     expect(persisted?.routeKind === "account" ? persisted.accountID : undefined).toBe(accountB)
   }),
   { timeout: 30_000 },
+)
+
+it.instance(
+  "qualified-only Zen compatibility catalog keeps an exact authorized account route through the wire",
+  Effect.gen(function* () {
+    const secret = "qualified-only-compat-key"
+    const modelName = "qualified-only-compat-probe"
+    const requests: Array<{ authorization: string | null; model: unknown }> = []
+    const saved = ZEN_ENV_KEYS.map((name) => [name, process.env[name]] as const)
+    for (const name of ZEN_ENV_KEYS) delete process.env[name]
+    resetZenPoolForTest()
+    setTestZenVaultCredentials([{ apiKey: secret, label: "Qualified test", isDefault: true }])
+    setTestZenFetch(async (input, init) => {
+      if (String(input).endsWith("/models")) {
+        return new Response(JSON.stringify({
+          object: "list",
+          data: [{ id: modelName, object: "model", owned_by: "opencode" }],
+        }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      const request = new Request(input, init)
+      const body = await request.json() as { model: unknown }
+      requests.push({ authorization: request.headers.get("authorization"), model: body.model })
+      return new Response(JSON.stringify({
+        id: "chatcmpl-qualified",
+        object: "chat.completion",
+        created: 0,
+        model: modelName,
+        choices: [{ index: 0, message: { role: "assistant", content: "QUALIFIED_OK" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }), { status: 200, headers: { "content-type": "application/json" } })
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(() => {
+      setTestZenFetch(undefined)
+      setTestZenVaultCredentials(undefined)
+      resetZenPoolForTest()
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }))
+    const provider = yield* Provider.Service
+    const providerID = ProviderV2.ID.make("opencode")
+    const modelID = ModelV2.ID.make(modelName)
+    const model = yield* provider.getModel(providerID, modelID)
+    expect(model.id).toBe(modelID)
+    const deniedPublic = yield* provider.resolveTransientRoutedModel({
+      providerID,
+      modelID,
+      executionPurpose: "system-one",
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "public" }),
+      allowPublic: true,
+    }).pipe(Effect.flip)
+    expect(deniedPublic._tag).toBe("ProviderRouteResolutionError")
+    const sessionID = SessionSchema.ID.make("ses_qualified_only_zen_compat")
+    yield* seedRouteSession(sessionID)
+    const accountID = stableZenIdentity(secret)
+    const routed = yield* provider.resolveRoutedModel({
+      sessionID,
+      providerID,
+      modelID,
+      routeIntent: ProviderRouteIntent.Info.make({ kind: "account", accountID, pin: "hard" }),
+    })
+    if (!routed) throw new Error("expected authorized compatibility route")
+    expect(routed.route.lease.route).toMatchObject({ kind: "account", accountID })
+    expect(JSON.stringify(routed.route)).not.toContain(secret)
+    expect(routed.model.api.url).toBe("https://opencode.ai/zen/v1")
+    const providerInfo = yield* provider.getProvider(providerID, routed.model)
+    expect(providerInfo.key).toBeUndefined()
+    expect(providerInfo.options.apiKey).toBeUndefined()
+    expect(JSON.stringify(providerInfo)).not.toContain(secret)
+    const language = yield* provider.getLanguage(routed.model)
+    const result = yield* Effect.promise(() =>
+      generateText({ model: language, prompt: "Reply QUALIFIED_OK", maxRetries: 0 }),
+    )
+    expect(result.text).toBe("QUALIFIED_OK")
+    expect(requests).toEqual([{ authorization: `Bearer ${secret}`, model: modelName }])
+  }),
+  {
+    config: {
+      provider: {
+        opencode: {
+          api: "https://opencode.ai/zen/v1",
+          models: {
+            "qualified-only-compat-probe@zen-first": { id: "qualified-only-compat-probe" },
+            "qualified-only-compat-probe@zen-second": { id: "qualified-only-compat-probe" },
+          },
+        },
+      },
+    },
+    timeout: 30_000,
+  },
 )
 
 const hostedWireStub = (

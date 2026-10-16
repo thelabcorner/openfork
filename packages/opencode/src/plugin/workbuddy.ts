@@ -23,6 +23,7 @@ import {
   pollWorkBuddyOAuth,
   startWorkBuddyOAuth,
   type Credential,
+  type AccountRouteGenerationOptions,
   type AccountRouteGenerationResult,
   type WorkBuddyAccount,
   type WorkBuddyOAuthRealm,
@@ -137,7 +138,31 @@ const NPM = "@ai-sdk/openai-compatible"
  */
 const USER_AGENT = workBuddyUserAgent()
 const REQUEST_TIMEOUT_MS = 5 * 60_000
+// Timeout for first HTTP response headers, not for a long-running SSE stream.
+// A dead upstream connection must not masquerade as five minutes of model
+// initialization. The separate existing overall request bound remains intact.
+const RESPONSE_HEADERS_TIMEOUT_MS = 30_000
 const DISCOVERY_TTL_MS = 5 * 60_000
+
+export async function fetchWithWorkBuddyHeaderTimeout(
+  url: string,
+  init: RequestInit,
+  headerTimeoutMs = RESPONSE_HEADERS_TIMEOUT_MS,
+  fetchImpl: (input: string, init: RequestInit) => Promise<Response> = globalThis.fetch.bind(globalThis),
+): Promise<Response> {
+  const headersDeadline = new AbortController()
+  const timer = setTimeout(() => headersDeadline.abort(), headerTimeoutMs)
+  try {
+    return await fetchImpl(url, {
+      ...init,
+      signal: init.signal ? AbortSignal.any([init.signal, headersDeadline.signal]) : headersDeadline.signal,
+    })
+  } finally {
+    // The fetch promise settles when headers arrive. Clearing only this
+    // deadline preserves the upstream stream for lengthy reasoning responses.
+    clearTimeout(timer)
+  }
+}
 
 /**
  * Preferred loopback port for the local proxy hop.
@@ -299,11 +324,20 @@ const CN_CATALOG: CatalogEntry[] = [
 /** All discovered accounts and a session-affine router live for this provider. */
 let accountRegistry = new AccountRegistry()
 let accountRouter = new AccountRouter({ registry: accountRegistry })
+let creditRecoveryInflight: Promise<boolean> | undefined
+let creditRecoveryRetryAt = 0
+const CREDIT_RECOVERY_BACKOFF_MS = 60_000
 
 /** Test-only: isolate the account vault from the user's real WorkBuddy store. */
 export function setTestAccountStore(root: string | undefined) {
   if (!root) return
-  accountRegistry = new AccountRegistry({ vault: new AccountVault(root), persistenceDir: `${root}/state` })
+  creditRecoveryInflight = undefined
+  creditRecoveryRetryAt = 0
+  accountRegistry = new AccountRegistry({
+    authFiles: [],
+    vault: new AccountVault(root),
+    persistenceDir: `${root}/state`,
+  })
   accountRouter = new AccountRouter({ registry: accountRegistry })
 }
 
@@ -895,6 +929,9 @@ async function listen(server: Server, host: string, port = 0): Promise<number> {
 // --- live model discovery (issue #3), cache + fallback ------------------------
 
 const discoveryCache = new Map<string, { at: number; catalog: CatalogEntry[] }>()
+const discoveryInflight = new Map<string, Promise<CatalogEntry[]>>()
+const discoveryRetryAfter = new Map<string, number>()
+const DISCOVERY_FAILURE_BACKOFF_MS = 30_000
 
 /**
  * Live catalog from the product-configuration endpoint. Best-effort; returns
@@ -1343,7 +1380,7 @@ function catalogForLocal(account: WorkBuddyAccount | undefined): CatalogEntry[] 
   return [...account.catalog.ids].map((id) => staticByID.get(id) ?? unknownCatalogEntry(id))
 }
 
-/** live -> cached -> static fallback. Selected-provider demand only. */
+/** live -> cached -> static fallback. Startup opt-in or selected-provider demand. */
 async function catalogFor(account: WorkBuddyAccount | undefined): Promise<CatalogEntry[]> {
   const _catStart = WB_PROFILE ? performance.now() : 0
   const cred = account?.credential
@@ -1352,32 +1389,48 @@ async function catalogFor(account: WorkBuddyAccount | undefined): Promise<Catalo
   const cached = discoveryCache.get(key)
   const now = Date.now()
   if (cached && now - cached.at < DISCOVERY_TTL_MS) { if (WB_PROFILE) wbMark("catalogFor:cacheHit", _catStart); return cached.catalog }
-  if (cred) {
-    const probed = await discoverCatalogDetailed(cred)
-    if (probed.entries && probed.entries.length) {
-      const merged = mergeCatalog(staticCatalog, probed.entries)
-      discoveryCache.set(key, { at: now, catalog: merged })
-      if (account) account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: now }
-      return merged
-    }
-    if (account && probed.unauthorized) {
-      // Demand-driven auth validation on the existing catalog traffic: no new
-      // timers, no extra requests on the happy path, no generation
-      // entitlement burned. A healed credential (refresh inside validation)
-      // gets one immediate discovery retry so the picker heals in the same
-      // pass instead of serving stale static data for 5 more minutes.
-      if ((await validateAccountAuth(account)) === "valid") {
-        const retry = await discoverCatalog(cred)
-        if (retry && retry.length) {
-          const merged = mergeCatalog(staticCatalog, retry)
-          discoveryCache.set(key, { at: now, catalog: merged })
-          account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: now }
-          return merged
+  if (!cred) return catalogForLocal(account)
+
+  const pending = discoveryInflight.get(key)
+  if (pending) return pending
+  if (Date.now() < (discoveryRetryAfter.get(key) ?? 0)) return catalogForLocal(account)
+
+  const run = (async () => {
+    try {
+      const probed = await discoverCatalogDetailed(cred)
+      if (probed.entries && probed.entries.length) {
+        const merged = mergeCatalog(staticCatalog, probed.entries)
+        discoveryCache.set(key, { at: Date.now(), catalog: merged })
+        discoveryRetryAfter.delete(key)
+        if (account) account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: Date.now() }
+        return merged
+      }
+      if (account && probed.unauthorized) {
+        // A healed credential gets one immediate discovery retry so the picker
+        // heals in the same pass instead of serving stale static data.
+        if ((await validateAccountAuth(account)) === "valid") {
+          const retry = await discoverCatalog(cred)
+          if (retry && retry.length) {
+            const merged = mergeCatalog(staticCatalog, retry)
+            discoveryCache.set(key, { at: Date.now(), catalog: merged })
+            discoveryRetryAfter.delete(key)
+            account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: Date.now() }
+            return merged
+          }
         }
       }
+    } catch {
+      // Best effort: preserve the last-known-good or static catalog.
     }
+    discoveryRetryAfter.set(key, Date.now() + DISCOVERY_FAILURE_BACKOFF_MS)
+    return catalogForLocal(account)
+  })()
+  discoveryInflight.set(key, run)
+  try {
+    return await run
+  } finally {
+    if (discoveryInflight.get(key) === run) discoveryInflight.delete(key)
   }
-  return catalogForLocal(account)
 }
 
 // --- priority (issue #9: tool-continuation jumps titles) ----------------------
@@ -1403,6 +1456,98 @@ function decodeAccountModel(requestedModel: string): { model: string; accountId?
     model: context.model,
     ...(split.accountID ? { accountId: split.accountID } : {}),
     ...(context.contextWindowTokens !== undefined ? { contextWindowTokens: context.contextWindowTokens } : {}),
+  }
+}
+
+/**
+ * A depleted/restricted pool is NOT a transient rate-limit. Returning 429 for
+ * every permanent routing failure makes SDK retry policies turn an immediate
+ * account-state error into the appearance of endless provider initialization.
+ * Derive the terminal HTTP category from the entire model-eligible pool, not
+ * only the accounts that happened to be tried by this request.
+ */
+export function classifyUnavailableWorkBuddy(
+  accounts: WorkBuddyAccount[],
+  model: string,
+  attempts: number,
+): { status: number; type: string; message: string } {
+  if (accounts.length === 0) {
+    return {
+      status: 401,
+      type: "authentication_error",
+      message: "No WorkBuddy accounts are enrolled. Sign in or add a WorkBuddy account.",
+    }
+  }
+  const eligible = accounts.filter((account) => !account.catalog || account.catalog.ids.has(model))
+  if (!eligible.length) {
+    return {
+      status: 404,
+      type: "model_not_found",
+      message: `No enrolled WorkBuddy account advertises model ${model}.`,
+    }
+  }
+
+  let forbidden = 0
+  let quota = 0
+  let auth = 0
+  let window = 0
+  for (const account of eligible) {
+    const state = account.governor.metrics().state
+    if (state === "ACCOUNT_FORBIDDEN") forbidden++
+    else if (state === "QUOTA_EXHAUSTED") quota++
+    else if (state === "AUTH_INVALID") auth++
+    else if (!account.governor.canAdmitModel(model)) window++
+  }
+  const permanent = forbidden + quota + auth
+  const summary = `WorkBuddy cannot run ${model}: ${forbidden} restricted, ${quota} out of credits, ${auth} requiring re-authentication, ${window} frequency-limited across ${eligible.length} model-eligible account(s).`
+  const attempted = attempts > 0 ? ` The request tried ${attempts} account(s).` : ""
+
+  // At least one account may recover after a short cooldown/window reset.
+  // Only treat the pool as terminal when EVERY candidate has a durable block.
+  if (permanent === eligible.length) {
+    if (forbidden) return { status: 403, type: "account_forbidden", message: summary + attempted }
+    if (auth) return { status: 401, type: "authentication_error", message: summary + attempted }
+    return { status: 402, type: "quota_exhausted", message: summary + attempted }
+  }
+  return {
+    status: 429,
+    type: "account_temporarily_unavailable",
+    message: summary + attempted + " Check account eligibility or retry after the applicable cooldown.",
+  }
+}
+
+/**
+ * A persisted 402 is evidence of exhaustion at the time it occurred, not a
+ * permanent entitlement. On an actual failed generation route, perform one
+ * bounded billing-only probe before reporting the pool as unavailable.
+ * Singleflight and failure backoff prevent concurrent sessions from creating
+ * a new billing-request storm. No provider-list or picker read enters here.
+ */
+async function recoverFundedWorkBuddyAccounts(): Promise<boolean> {
+  if (creditRecoveryInflight) return creditRecoveryInflight
+  if (Date.now() < creditRecoveryRetryAt) return false
+  const depleted = accountRegistry.all().filter((account) => account.governor.metrics().state === "QUOTA_EXHAUSTED")
+  if (depleted.length === 0) return false
+  creditRecoveryRetryAt = Date.now() + CREDIT_RECOVERY_BACKOFF_MS
+  const run = (async () => {
+    const { probeWorkBuddyCreditRecovery } = await import("../quota/providers/workbuddy")
+    const balances = await probeWorkBuddyCreditRecovery(depleted.map((account) => account.credential), {
+      ...(injectedBackend ? { backendOverride: injectedBackend } : {}),
+    })
+    let recovered = false
+    for (const balance of balances) {
+      const account = accountRegistry.get(balance.accountId)
+      if (!account || account.governor.metrics().state !== "QUOTA_EXHAUSTED") continue
+      account.governor.setPackageCredits(balance.remaining)
+      if (balance.remaining > 0 && account.governor.metrics().state === "READY") recovered = true
+    }
+    return recovered
+  })().catch(() => false)
+  creditRecoveryInflight = run
+  try {
+    return await run
+  } finally {
+    if (creditRecoveryInflight === run) creditRecoveryInflight = undefined
   }
 }
 
@@ -1453,7 +1598,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   let _govStart2 = WB_PROFILE ? performance.now() : 0
   let routed: AccountRouteGenerationResult
   try {
-    routed = await accountRouter.runGeneration({
+    const generationOptions: AccountRouteGenerationOptions = {
       priority: priorityFor(payload, messages),
       requestId,
       requestedModel,
@@ -1464,14 +1609,25 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       refresh: (account) => singleflightRefresh(account).then(toRefreshResult),
       transport: (account) => {
         const cred = account.credential
-        return fetch(`${backendFor(cred)}/v2/chat/completions`, {
+        return fetchWithWorkBuddyHeaderTimeout(`${backendFor(cred)}/v2/chat/completions`, {
           method: "POST",
           headers: upstreamHeaders(cred, upstreamConversationHeaders(account.id, session)),
           body: JSON.stringify(body),
           signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
         })
       },
-    })
+    }
+    routed = await accountRouter.runGeneration(generationOptions)
+    if (
+      !cancellation.signal.aborted &&
+      (routed.kind === "unavailable" || (routed.kind === "admission" && routed.error.kind === "quota")) &&
+      await recoverFundedWorkBuddyAccounts()
+    ) {
+      // The prior attempt is terminal (no live lease). A confirmed positive
+      // balance changed routing eligibility: retry the logical request ONCE.
+      // Explicit account selection remains pinned by generationOptions.
+      routed = await accountRouter.runGeneration(generationOptions)
+    }
   } catch {
     cleanupCancellation()
     return sendJson(res, 502, {
@@ -1483,26 +1639,9 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   if (routed.kind === "unavailable") {
     cleanupCancellation()
     if (res.writableEnded || res.destroyed) return
-    const accounts = accountRegistry.all()
-    const modelAccounts = accounts.filter((account) => !account.catalog || account.catalog.ids.has(requestedModel))
-    const allForbidden = modelAccounts.length > 0 && modelAccounts.every((account) => account.governor.isAccountForbidden())
-    const attempted = routed.attemptedAccountIds.length
-    const status = accounts.length === 0 ? 401 : allForbidden ? 403 : 429
-    const message =
-      accounts.length === 0
-        ? "No signed-in WorkBuddy desktop session found. Sign in to the WorkBuddy desktop app, then retry."
-        : allForbidden
-          ? attempted > 0
-            ? `Every WorkBuddy account eligible for ${requestedModel} is currently restricted by WorkBuddy (auth_forbidden, code 11140). The logical request tried ${attempted} account${attempted === 1 ? "" : "s"} and no healthy eligible account remains.`
-            : `Every WorkBuddy account eligible for ${requestedModel} is currently restricted by WorkBuddy (auth_forbidden, code 11140); no healthy eligible account remains.`
-          : attempted > 0
-            ? `No healthy eligible WorkBuddy account remains for ${requestedModel} after ${attempted} bounded account attempt${attempted === 1 ? "" : "s"}.`
-            : `No eligible WorkBuddy account currently supports ${requestedModel}; choose an account or wait for its entitlement window.`
-    return sendJson(res, status, {
-      error: {
-        message,
-        type: accounts.length === 0 ? "authentication_error" : allForbidden ? "account_forbidden" : "account_unavailable",
-      },
+    const failure = classifyUnavailableWorkBuddy(accountRegistry.all(), requestedModel, routed.attemptedAccountIds.length)
+    return sendJson(res, failure.status, {
+      error: { message: failure.message, type: failure.type },
     })
   }
 

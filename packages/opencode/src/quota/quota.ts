@@ -56,6 +56,13 @@ export interface Interface {
   readonly providers: () => Effect.Effect<ProvidersResult>
   /** Fetches one provider's account quota; same-ID calls single-flight. */
   readonly get: (input: { readonly providerID: string }) => Effect.Effect<ProviderResult, QuotaProviderNotFoundError>
+  /** One provider's reset projection, including OpenCode Go's canonical shared usage snapshot path. */
+  readonly resetsForProvider: (input: {
+    readonly providerID: string
+    readonly from: number
+    readonly to: number
+    readonly generatedAt?: number
+  }) => Effect.Effect<ResetAgendaResult, QuotaProviderNotFoundError>
   /** Bounded calendar projection of currently-known provider/account reset deadlines. */
   readonly resets: (input: { readonly from: number; readonly to: number }) => Effect.Effect<ResetAgendaResult>
 }
@@ -122,6 +129,33 @@ const layer: Layer.Layer<
       return yield* singleFlight(adapter.id, adapter.fetch())
     })
 
+    const resetsForProvider = Effect.fn("Quota.resetsForProvider")(function* (input: {
+      readonly providerID: string
+      readonly from: number
+      readonly to: number
+      readonly generatedAt?: number
+    }) {
+      const adapter = resolveAdapter(adapters, input.providerID)
+      if (!adapter) return yield* Effect.fail(new QuotaProviderNotFoundError({ providerID: input.providerID }))
+      if (adapter.id === "opencode-go") {
+        const goSnapshot = yield* forkUsageSnapshot({ credentials, usage: sessionUsage, auth }).pipe(Effect.option)
+        return buildResetAgenda({
+          from: input.from,
+          to: input.to,
+          generatedAt: input.generatedAt,
+          providerResults: [],
+          ...(goSnapshot._tag === "Some" ? { goSnapshot: goSnapshot.value } : {}),
+        })
+      }
+      const result = yield* get({ providerID: adapter.id })
+      return buildResetAgenda({
+        from: input.from,
+        to: input.to,
+        generatedAt: input.generatedAt,
+        providerResults: [result],
+      })
+    })
+
     const resets = Effect.fn("Quota.resets")(function* (input: { readonly from: number; readonly to: number }) {
       const configured = (yield* providers()).providers.filter((provider) => provider.configured)
       const providerResults = yield* Effect.forEach(
@@ -168,7 +202,7 @@ const layer: Layer.Layer<
       }
     })
 
-    return Service.of({ providers, get, resets })
+    return Service.of({ providers, get, resetsForProvider, resets })
   }),
 )
 

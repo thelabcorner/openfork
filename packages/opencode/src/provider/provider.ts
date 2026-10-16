@@ -19,7 +19,7 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types, Semaphore } from "effect"
+import { Cause, Effect, Layer, Context, Schema, Types, Semaphore } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
@@ -52,6 +52,12 @@ import {
   ZEN_PUBLIC_API_KEY,
 } from "@/plugin/zen"
 import { stableZenIdentity } from "@/plugin/zen-accounts"
+import {
+  OFFICIAL_TTL_MS,
+  officialUsageCache,
+  type OfficialUsage,
+  type OfficialWindow,
+} from "@/fork/usage-cache"
 import {
   MODEL_IDS,
   MODEL_METADATA,
@@ -97,6 +103,7 @@ import {
   type ConsoleClientIdentity,
 } from "./console-account-execution"
 import { providerModelID, splitModelIDForProvider } from "@opencode-ai/schema/model-select/account-identity"
+import { projectHostedNeutralModels } from "./hosted-neutral-model"
 
 import {
   resolveProviderAccountSelector,
@@ -129,43 +136,103 @@ async function readGensparkKeyFromFallbackConfig(): Promise<string | undefined> 
   return undefined
 }
 
-function wrapSSE(res: Response, ms: number, ctl: AbortController) {
-  if (typeof ms !== "number" || ms <= 0) return res
+const OPENAI_SSE_DONE = new TextEncoder().encode("data: [DONE]")
+
+function wrapSSE(
+  res: Response,
+  ms: number | undefined,
+  ctl: AbortController | undefined,
+  signal: AbortSignal,
+  requireOpenAIDone: boolean,
+) {
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
 
   const reader = res.body.getReader()
+  let doneCursor = 0
+  let sawOpenAIDone = false
+  const witnessOpenAIDone = (bytes: Uint8Array) => {
+    if (!requireOpenAIDone || sawOpenAIDone) return
+    for (const byte of bytes) {
+      if (byte === OPENAI_SSE_DONE[doneCursor]) doneCursor++
+      else doneCursor = byte === OPENAI_SSE_DONE[0] ? 1 : 0
+      if (doneCursor === OPENAI_SSE_DONE.length) {
+        sawOpenAIDone = true
+        break
+      }
+    }
+  }
+  let terminated = false
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+  const detachAbort = () => signal.removeEventListener("abort", onAbort)
+  // Fetch-body cancellation is not guaranteed to reject the AI SDK's
+  // downstream stream. Explicitly error our response body on abort, including
+  // session cancellation and idle/overall timeouts, so the SDK does not wait
+  // forever for a finish chunk after the socket is gone.
+  function onAbort() {
+    if (terminated) return
+    terminated = true
+    detachAbort()
+    const reason = signal.reason ?? new DOMException("Provider request aborted", "AbortError")
+    streamController?.error(reason)
+    void reader.cancel(reason).catch(() => {})
+  }
   const body = new ReadableStream<Uint8Array>({
+    start(ctrl) {
+      streamController = ctrl
+      if (signal.aborted) onAbort()
+      else signal.addEventListener("abort", onAbort, { once: true })
+    },
     async pull(ctrl) {
-      const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
-        const id = setTimeout(() => {
-          const err = new ProviderError.ResponseStreamError("SSE read timed out")
-          ctl.abort(err)
-          reader.cancel(err).catch(() => {})
-          reject(err)
-        }, ms)
-
-        reader.read().then(
-          (part) => {
-            clearTimeout(id)
-            resolve(part)
-          },
-          (err) => {
-            clearTimeout(id)
-            reject(err)
-          },
-        )
-      })
+      if (terminated) return
+      let part: Awaited<ReturnType<typeof reader.read>>
+      try {
+        part = ms === undefined
+          ? await reader.read()
+          : await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+              const id = setTimeout(() => {
+                const err = new ProviderError.ResponseStreamError("SSE read timed out")
+                ctl?.abort(err)
+                void reader.cancel(err).catch(() => {})
+                reject(err)
+              }, ms)
+              reader.read().then(
+                (part) => {
+                  clearTimeout(id)
+                  resolve(part)
+                },
+                (err) => {
+                  clearTimeout(id)
+                  reject(err)
+                },
+              )
+            })
+      } catch (error) {
+        if (terminated) return
+        terminated = true
+        detachAbort()
+        throw error
+      }
+      if (terminated) return
 
       if (part.done) {
+        terminated = true
+        detachAbort()
+        if (requireOpenAIDone && !sawOpenAIDone) {
+          throw new ProviderError.ResponseStreamError("OpenAI-compatible SSE ended before [DONE]")
+        }
         ctrl.close()
         return
       }
 
+      witnessOpenAIDone(part.value)
       ctrl.enqueue(part.value)
     },
     async cancel(reason) {
-      ctl.abort(reason)
+      if (terminated) return
+      terminated = true
+      detachAbort()
+      ctl?.abort(reason)
       await reader.cancel(reason)
     },
   })
@@ -188,7 +255,7 @@ function timeoutController(ms: number) {
 
 // Applies the `headerTimeout`, `chunkTimeout` (SSE idle) and `timeout` provider options at the
 // fetch layer, on top of `options.fetch` when a custom fetch is configured.
-function timeoutFetch(options: Record<string, any>) {
+function timeoutFetch(options: Record<string, any>, requireOpenAIDone = false) {
   const customFetch = options["fetch"]
   const chunkTimeout = options["chunkTimeout"] ?? 300_000
   const headerTimeout = options["headerTimeout"] ?? 300_000
@@ -216,8 +283,12 @@ function timeoutFetch(options: Record<string, any>) {
       timeout: false,
     }).finally(() => headerTimeoutCtl?.clear())
 
-    if (!chunkAbortCtl) return res
-    return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+    // Abort propagation and idle timeouts are independent. Even when an
+    // installation opts out of chunkTimeout, SDK cancellation must surface as
+    // an errored SSE body rather than silently closing a pending step.
+    const streamSignal = combined ?? chunkAbortCtl?.signal
+    if (!streamSignal) return res
+    return wrapSSE(res, chunkAbortCtl ? chunkTimeout : undefined, chunkAbortCtl, streamSignal, requireOpenAIDone)
   }
 }
 
@@ -1643,6 +1714,13 @@ export class AccountResolutionError extends Schema.TaggedErrorClass<AccountResol
   }
 }
 
+class SpecialAgentPublicRouteError extends globalThis.Error {
+  constructor() {
+    super("OpenCode Public/free tier is unavailable for OpenFork special agents. Select an eligible account-backed model.")
+    this.name = "SpecialAgentPublicRouteError"
+  }
+}
+
 export class RouteResolutionError extends Schema.TaggedErrorClass<RouteResolutionError>()(
   "ProviderRouteResolutionError",
   {
@@ -1652,7 +1730,17 @@ export class RouteResolutionError extends Schema.TaggedErrorClass<RouteResolutio
   },
 ) {
   override get message() {
-    return `Provider route unavailable: ${this.providerID}/${this.modelID}`
+    const hint =
+      this.cause instanceof SpecialAgentPublicRouteError
+        ? this.cause.message
+        : this.cause instanceof ProviderRouteResolution.NoEligibleRouteError
+        ? "No eligible subscription account can serve this model. Check connected credentials, model access, and quota."
+        : this.cause instanceof ProviderRouteResolution.BoundRouteUnavailableError
+          ? this.cause.hardPin
+            ? "The selected account is pinned and unavailable."
+            : "The bound account is unavailable and no automatic failover account is ready."
+          : undefined
+    return `Provider route unavailable: ${this.providerID}/${this.modelID}${hint ? `. ${hint}` : ""}`
   }
 }
 
@@ -1719,14 +1807,38 @@ export function isHostedZenProvider(providerID: string): boolean {
   return HOSTED_ZEN_PROVIDERS.has(providerID)
 }
 
+const GO_USAGE_ROUTING_MAX_ACCOUNTS = 10
+
+/**
+ * Greedy quota-use heuristic for the next account assignment: rank by the
+ * highest remaining fraction per hour until reset across all current windows.
+ * This makes an imminent hourly reset visible even when a longer window is
+ * more heavily used. The shared Core policy compares this only when every
+ * eligible Go key has usable fresh data; otherwise it falls back to round-robin.
+ */
+function quotaExpiryUrgency(usage: OfficialUsage | undefined, now: number) {
+  const windows = Object.values(usage ?? {}).filter(
+    (window): window is OfficialWindow =>
+      window !== undefined &&
+      Number.isFinite(window.percent) &&
+      Number.isFinite(window.resetsAt) &&
+      window.resetsAt > now,
+  )
+  if (windows.length === 0) return undefined
+  const urgency = windows.map((window) => {
+    const remainingFraction = Math.max(0, Math.min(100, 100 - window.percent)) / 100
+    const hoursUntilReset = Math.max(1 / 60, (window.resetsAt - now) / (60 * 60 * 1000))
+    return remainingFraction / hoursUntilReset
+  })
+  return urgency.length ? Math.max(...urgency) : undefined
+}
+
 const noHostedRouteError = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
   Effect.fail(
     new RouteResolutionError({
       providerID,
       modelID,
-      cause: new Error(
-        "No authoritative OpenCode route resolved for this hosted provider; refusing ambient credential fallback",
-      ),
+      cause: new ProviderRouteResolution.NoEligibleRouteError({ providerID }),
     }),
   )
 
@@ -1772,6 +1884,14 @@ const zenCompatSourceName = (source: string): ProviderAccount.Source =>
 
 
 
+/**
+ * Public eligibility is opt-in for detached one-call inference (System One).
+ * Session resolution remains worker-owned by default. Inherited route
+ * resolution is maintenance-owned by default. A legacy allowPublic hint
+ * cannot override that restriction.
+ */
+export type RoutedExecutionPurpose = "special-agent" | "system-one"
+
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly listAccountModelProjections: () => Effect.Effect<readonly AccountModelProjection[]>
@@ -1806,6 +1926,7 @@ export interface Interface {
     readonly accountID?: string
     readonly routeIntent?: ProviderRouteIntent.Info
     readonly allowPublic?: boolean
+    readonly executionPurpose?: RoutedExecutionPurpose
   }) => Effect.Effect<RoutedModel | undefined, ModelNotFoundError | RouteResolutionError>
   /**
    * Materialize a maintenance/special-agent model from the exact parent route
@@ -1817,6 +1938,7 @@ export interface Interface {
     readonly modelID: ModelV2.ID
     readonly route: ProviderRouteResolution.RouteAttribution
     readonly allowPublic?: boolean
+    readonly executionPurpose?: RoutedExecutionPurpose
   }) => Effect.Effect<RoutedModel, ModelNotFoundError | RouteResolutionError>
   /**
    * Resolve one non-persistent provider route for a standalone primitive.
@@ -1828,6 +1950,7 @@ export interface Interface {
     readonly accountID?: string
     readonly routeIntent?: ProviderRouteIntent.Info
     readonly allowPublic?: boolean
+    readonly executionPurpose?: RoutedExecutionPurpose
   }) => Effect.Effect<TransientRoutedModel | undefined, ModelNotFoundError | RouteResolutionError>
   readonly getLanguage: (
     model: Model,
@@ -2537,8 +2660,43 @@ const layer = Layer.effect(
           const core = yield* coreRouteSource.list(input)
           if (!isHostedZenProvider(input.providerID)) return core
 
+          const compatInventory = yield* zenCompatInventory(input.providerID)
+          const expiringCapacityByAccount = new Map<string, number>()
+          const usageAccounts = compatInventory.filter((entry) => entry.state === "READY")
+          // The Go usage endpoint is account-key scoped. Compare quotas only
+          // when the eligible pool is the bounded compatibility-key pool; an
+          // eligible OAuth/API-key mix has no comparable usage data and falls
+          // back to round-robin. Core accounts that cannot serve this model or
+          // are already unhealthy do not compete for this assignment.
+          if (
+            input.providerID === ProviderV2.ID.make("opencode-go") &&
+            input.mode === "session-round-robin" &&
+            !core.candidates.some((entry) => entry.candidate.admissible) &&
+            usageAccounts.length <= GO_USAGE_ROUTING_MAX_ACCOUNTS
+          ) {
+            const observedAt = Date.now()
+            const snapshots = yield* Effect.all(
+              usageAccounts.map((entry) =>
+                officialUsageCache
+                  .get(entry.accountID, entry.apiKey)
+                  .pipe(
+                    Effect.map((snapshot) => ({ accountID: entry.accountID, snapshot })),
+                    Effect.catchCause(() =>
+                      Effect.succeed({ accountID: entry.accountID, snapshot: undefined }),
+                    ),
+                  ),
+              ),
+              { concurrency: GO_USAGE_ROUTING_MAX_ACCOUNTS },
+            )
+            for (const entry of snapshots) {
+              if (entry.snapshot?.status !== "ok" || entry.snapshot.ageMs > OFFICIAL_TTL_MS) continue
+              const urgency = quotaExpiryUrgency(entry.snapshot.snapshot, observedAt)
+              if (urgency !== undefined) expiringCapacityByAccount.set(entry.accountID, urgency)
+            }
+          }
+
           const seen = new Set(core.candidates.map((entry) => entry.candidate.accountID))
-          const compat = (yield* zenCompatInventory(input.providerID))
+          const compat = compatInventory
             .filter((entry) => !seen.has(entry.accountID))
             .map((entry) => {
               const accountID = ProviderAccount.ID.make(entry.accountID)
@@ -2566,6 +2724,9 @@ const layer = Layer.effect(
                   ...(cooling ? { ineligibleReason: "cooldown" as const } : {}),
                   ...(!ready && !cooling ? { ineligibleReason: "quota-exhausted" as const } : {}),
                   ...(entry.resetAt === undefined ? {} : { resetAt: entry.resetAt }),
+                  ...(expiringCapacityByAccount.has(entry.accountID)
+                    ? { quotaExpiryUrgency: expiringCapacityByAccount.get(entry.accountID)! }
+                    : {}),
                 } satisfies ProviderAccountPolicy.Candidate,
               } satisfies OpencodeRouteCandidates.CandidateSnapshot
             })
@@ -2824,6 +2985,11 @@ const layer = Layer.effect(
 
         // load plugins first so config() hook runs before reading cfg.provider
         const plugins = yield* plugin.list()
+        // Provider hooks need an auth projection, and the final provider map
+        // needs the same projection below. Snapshot it once here instead of
+        // calling Auth.get (which rereads and decodes the complete auth file)
+        // once for every plugin provider.
+        const auths = yield* auth.all().pipe(Effect.orDie)
 
         // now read config providers - includes any modifications from plugin config() hook
         const configProviders = Object.entries(cfg.provider ?? {})
@@ -2842,7 +3008,7 @@ const layer = Layer.effect(
 
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
-          const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
+          const pluginAuth = auths[providerID]
 
           if (p.accounts) {
             // Keep the loader live rather than snapshotting labels at provider
@@ -2920,7 +3086,6 @@ const layer = Layer.effect(
         }
 
         // load apikeys
-        const auths = yield* auth.all().pipe(Effect.orDie)
         for (const [id, provider] of Object.entries(auths)) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
@@ -2962,7 +3127,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(plugin.auth.provider)
           if (disabled.has(providerID)) continue
 
-          const stored = yield* auth.get(providerID).pipe(Effect.orDie)
+          const stored = auths[providerID]
           if (!stored) continue
           if (!plugin.auth.loader) continue
 
@@ -3059,6 +3224,12 @@ const layer = Layer.effect(
           // Providers whose model set is supplied by a discoverModels hook
           // remain selectable by identity; that hook is awaited only if this
           // provider is actually selected for execution.
+          const projected = projectHostedNeutralModels(provider, (base) =>
+            !(configProvider?.blacklist?.includes(base)) &&
+            (!configProvider?.whitelist || configProvider.whitelist.includes(base)),
+          )
+          if (projected !== provider) provider.models = projected.models
+
           if (Object.keys(provider.models).length === 0 && !discoveryLoaders[providerID]) {
             delete providers[providerID]
             return
@@ -3266,6 +3437,11 @@ const layer = Layer.effect(
             } else {
               Object.assign(provider.models, next)
             }
+            const projected = projectHostedNeutralModels(provider, (base) =>
+              !(configured?.blacklist?.includes(base)) &&
+              (!configured?.whitelist || configured.whitelist.includes(base)),
+            )
+            if (projected !== provider) provider.models = projected.models
           })
           .catch(() => {})
         current.discoveryPromises.set(providerID, pending)
@@ -3457,7 +3633,7 @@ const layer = Layer.effect(
         const existing = !activation || activation.cacheable ? s.sdk.get(key) : undefined
         if (existing) return existing
 
-        const fetchWithTimeouts = timeoutFetch(options)
+        const fetchWithTimeouts = timeoutFetch(options, model.api.npm === "@ai-sdk/openai-compatible")
         options["fetch"] =
           model.providerID === "nvidia"
             ? async (input: any, init?: BunFetchRequestInit) => {
@@ -3658,8 +3834,14 @@ const layer = Layer.effect(
       readonly providerID: ProviderV2.ID
       readonly modelID: ModelV2.ID
       readonly allowPublic?: boolean
+      readonly executionPurpose?: RoutedExecutionPurpose
     }) {
-      const allowPublic = input.allowPublic !== false && input.providerID === ProviderV2.ID.make("opencode")
+      // This service owns upstream hosted eligibility. Callers declare
+      // execution purpose; the transport eligibility cannot be opted back in.
+      const allowPublic =
+        input.executionPurpose !== "special-agent" &&
+        input.allowPublic !== false &&
+        input.providerID === ProviderV2.ID.make("opencode")
       let publicEligible = false
       if (allowPublic) {
         const base = input.state.catalog[input.providerID]?.models[input.modelID]
@@ -3803,8 +3985,8 @@ const layer = Layer.effect(
             modelID: input.modelID,
             affinityDomain: input.affinityDomain,
             routeIntent: { kind: "auto" },
-            mode: "concentrate",
-            freeRoutePreference: "public-first-for-free",
+            mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "auto" }),
+            freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "auto" }),
             allowPublic: input.allowPublic,
             publicEligible: input.publicEligible,
             expected: resolution.attribution,
@@ -3906,16 +4088,45 @@ const layer = Layer.effect(
       readonly execution: ZenCompatExecution
     }) {
       const baseProvider = input.state.catalog[input.providerID]
-      const base = baseProvider?.models[input.modelID]
+      const trusted = baseProvider?.models[input.modelID]
+      // Only for an authenticated, already-committed compatibility account:
+      // when models.dev lacks the neutral row, independently reconstruct its
+      // metadata from qualified aliases that EXPLICITLY advertise the same
+      // underlying hosted API id/URL. Never turn this into a Public witness,
+      // a generic direct-provider route, or an ambient key lookup.
+      const liveProvider = input.state.providers[input.providerID]
+      const witnessed = !trusted && liveProvider
+        ? projectHostedNeutralModels({
+            ...liveProvider,
+            models: Object.fromEntries(
+              Object.entries(liveProvider.models).filter(([id]) => id !== input.modelID),
+            ),
+          }).models[input.modelID]
+        : undefined
+      const base = trusted ?? witnessed
       if (!base) return undefined
       if (base.status === "deprecated") return undefined
       if (base.status === "alpha" && !runtimeFlags.enableExperimentalModels) return undefined
 
-      const providerInfo = toPublicInfo(baseProvider)
+      // Do not reuse the live provider's options (which may include ambient
+      // auth, a configurable base URL, or a pool-selecting fetch). A witnessed
+      // alias is merely metadata; construct a minimal provider and install
+      // ONLY the committed account's transport in the following lines.
+      const materializationSource: Info = trusted
+        ? baseProvider!
+        : {
+            id: input.providerID,
+            name: baseProvider?.name ?? liveProvider?.name ?? input.providerID,
+            source: "custom",
+            env: [],
+            options: {},
+            models: { [input.modelID]: base },
+          }
+      const providerInfo = toPublicInfo(materializationSource)
       providerInfo.env = []
       delete providerInfo.key
       delete providerInfo.options.apiKey
-      providerInfo.options.fetch = committedZenProviderFetch(input.execution.accountID)
+      providerInfo.options.fetch = committedZenProviderFetch(input.execution.accountID, input.execution.apiKey)
       const model = providerInfo.models[input.modelID]
       if (!model) return undefined
       return { model, providerInfo }
@@ -4078,8 +4289,17 @@ const layer = Layer.effect(
         readonly modelID: ModelV2.ID
         readonly route: ProviderRouteResolution.RouteAttribution
         readonly allowPublic?: boolean
+        readonly executionPurpose?: RoutedExecutionPurpose
       },
     ) {
+      // Inheritance is maintenance-only; an omitted purpose is not an escape.
+      if (isHostedZenProvider(input.providerID) && input.route.routeKind === "public") {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: input.modelID,
+          cause: new SpecialAgentPublicRouteError(),
+        })
+      }
       const s = yield* currentState(input.providerID)
       const accountModelID = ModelV2.ID.make(
         splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
@@ -4090,6 +4310,7 @@ const layer = Layer.effect(
         providerID: input.providerID,
         modelID: accountModelID,
         allowPublic: input.allowPublic,
+        executionPurpose: "special-agent",
       })
 
       // The parent attribution is the authority here. compileExisting validates
@@ -4103,8 +4324,8 @@ const layer = Layer.effect(
           modelID: accountModelID,
           affinityDomain,
           routeIntent: { kind: "auto" },
-          mode: "concentrate",
-          freeRoutePreference: "public-first-for-free",
+          mode: OpencodeProviderRoute.routingMode(input.providerID, { kind: "auto" }),
+          freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, { kind: "auto" }),
           allowPublic,
           publicEligible,
           expected: input.route,
@@ -4140,19 +4361,26 @@ const layer = Layer.effect(
         readonly accountID?: string
         readonly routeIntent?: ProviderRouteIntent.Info
         readonly allowPublic?: boolean
+        readonly executionPurpose?: RoutedExecutionPurpose
       },
     ) {
       const s = yield* currentState(input.providerID)
-      const accountModelID = ModelV2.ID.make(
-        splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
-      )
+      const modelParts = splitModelIDForProvider(input.modelID, input.providerID)
+      const accountModelID = ModelV2.ID.make(modelParts.baseModelID)
       const affinityDomain = OpencodeProviderRoute.affinityDomain(input.providerID)
 
       // Migration-window V1 selections used Credential.ID as model.accountID for
       // Console accounts. Translate that local handle into the stable remote
       // ProviderAccount identity before route intent normalization. Never let the
       // opaque credential handle become the durable account identity.
-      let legacyAccountID = input.accountID
+      if (input.accountID && modelParts.accountID && input.accountID !== modelParts.accountID) {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: accountModelID,
+          cause: new Error("Selected model account suffix conflicts with model.accountID"),
+        })
+      }
+      let legacyAccountID = input.accountID ?? modelParts.accountID
       if (legacyAccountID?.startsWith("cred_")) {
         const stored = yield* credentials.get(Credential.ID.make(legacyAccountID))
         const projected = stored ? projectOpencodeCredential(stored) : undefined
@@ -4180,6 +4408,13 @@ const layer = Layer.effect(
         ),
       )
 
+      if (input.executionPurpose === "special-agent" && isHostedZenProvider(input.providerID) && routeIntent.kind === "public") {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: accountModelID,
+          cause: new SpecialAgentPublicRouteError(),
+        })
+      }
       // Public is only an OpenCode-hosted route. Its eligibility requires both
       // the live hosted-model witness and trusted all-zero pricing metadata.
       const { allowPublic, publicEligible } = yield* routedAvailability({
@@ -4187,6 +4422,7 @@ const layer = Layer.effect(
         providerID: input.providerID,
         modelID: accountModelID,
         allowPublic: input.allowPublic,
+        executionPurpose: input.executionPurpose,
       })
 
       let resolution = yield* providerRoutes
@@ -4196,8 +4432,8 @@ const layer = Layer.effect(
           modelID: accountModelID,
           affinityDomain,
           routeIntent,
-          mode: "concentrate",
-          freeRoutePreference: "public-first-for-free",
+          mode: OpencodeProviderRoute.routingMode(input.providerID, routeIntent),
+          freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, routeIntent),
           allowPublic,
           publicEligible,
         })
@@ -4241,14 +4477,22 @@ const layer = Layer.effect(
         readonly accountID?: string
         readonly routeIntent?: ProviderRouteIntent.Info
         readonly allowPublic?: boolean
+        readonly executionPurpose?: RoutedExecutionPurpose
       },
     ) {
       const s = yield* currentState(input.providerID)
-      const accountModelID = ModelV2.ID.make(
-        splitModelIDForProvider(input.modelID, input.providerID).baseModelID,
-      )
+      const modelParts = splitModelIDForProvider(input.modelID, input.providerID)
+      const accountModelID = ModelV2.ID.make(modelParts.baseModelID)
 
-      let legacyAccountID = input.accountID
+      if (input.accountID && modelParts.accountID && input.accountID !== modelParts.accountID) {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: accountModelID,
+          cause: new Error("Selected model account suffix conflicts with model.accountID"),
+        })
+      }
+
+      let legacyAccountID = input.accountID ?? modelParts.accountID
       if (legacyAccountID?.startsWith("cred_")) {
         const stored = yield* credentials.get(Credential.ID.make(legacyAccountID))
         const projected = stored ? projectOpencodeCredential(stored) : undefined
@@ -4276,11 +4520,19 @@ const layer = Layer.effect(
         ),
       )
 
+      if (input.executionPurpose !== "system-one" && isHostedZenProvider(input.providerID) && routeIntent.kind === "public") {
+        return yield* new RouteResolutionError({
+          providerID: input.providerID,
+          modelID: accountModelID,
+          cause: new SpecialAgentPublicRouteError(),
+        })
+      }
       const { allowPublic, publicEligible } = yield* routedAvailability({
         state: s,
         providerID: input.providerID,
         modelID: accountModelID,
         allowPublic: input.allowPublic,
+        executionPurpose: input.executionPurpose ?? "special-agent",
       })
 
       const resolution = yield* providerRoutes
@@ -4288,8 +4540,8 @@ const layer = Layer.effect(
           providerID: input.providerID,
           modelID: accountModelID,
           routeIntent,
-          mode: "concentrate",
-          freeRoutePreference: "public-first-for-free",
+          mode: OpencodeProviderRoute.routingMode(input.providerID, routeIntent),
+          freeRoutePreference: OpencodeProviderRoute.freeRoutePreference(input.providerID, routeIntent),
           allowPublic,
           publicEligible,
         })

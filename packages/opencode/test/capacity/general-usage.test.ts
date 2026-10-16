@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { observeYieldStatistic, type YieldStatisticState } from "@opencode-ai/core/usage/yield-statistics"
+import {
+  effectiveSamples,
+  observeYieldStatistic,
+  sessionMomentsFor,
+  snapshotYieldStatistic,
+  type YieldStatisticState,
+} from "@opencode-ai/core/usage/yield-statistics"
 import type { UsageYield } from "@opencode-ai/core/usage/yield"
 import * as GeneralUsage from "../../src/capacity/general-usage"
 
@@ -308,5 +314,91 @@ describe("GeneralUsage", () => {
     expect(shuffled.corpus).toEqual(result.corpus)
     expect(shuffled.observedRequestBand).toEqual(result.observedRequestBand)
     expect(shuffled.fingerprint).toBe(result.fingerprint)
+  })
+
+  test("session ESS matches full moment finalization for an open block without mutating the state", () => {
+    const state = stateFor(
+      Array.from({ length: 32 }, (_, index) => ({
+        sessionID: `session-${Math.floor(index / 2)}`,
+        completedAt: 100 + index,
+        input: 12_000 + index * 11,
+        cacheRead: index * 15,
+        output: 500 + index,
+      })),
+    )
+    const before = JSON.stringify(state)
+    const reference = effectiveSamples(sessionMomentsFor(snapshotYieldStatistic(state), 8)!)
+    const estimate = GeneralUsage.build([entry("provider-a", "model-a", state)]).models[0]
+    expect(estimate?.evidence.sessionEffectiveSamples).toBe(reference)
+    expect(JSON.stringify(state)).toBe(before)
+
+    const finalized = snapshotYieldStatistic(state)
+    const finalEstimate = GeneralUsage.build([entry("provider-a", "model-a", finalized)]).models[0]
+    expect(finalEstimate?.evidence.sessionEffectiveSamples).toBe(reference)
+  })
+
+  test("bounded direct-model selection agrees with full-sort reference under timestamp ties", () => {
+    const entries = Array.from({ length: 170 }, (_, index) => {
+      const record = entry(
+        `provider-${index % 7}`,
+        `model-${String(index).padStart(3, "0")}`,
+        stateFor(
+          Array.from({ length: 12 }, (_, i) => ({
+            sessionID: `independent-${index}-${i}`,
+            completedAt: 1000 + i,
+            input: 40_000 + index + i,
+            output: 300,
+          })),
+        ),
+      )
+      return { ...record, updatedAt: 1000 + (index % 11) }
+    })
+    const expected = [...entries]
+      .sort(
+        (a, b) =>
+          b.updatedAt - a.updatedAt ||
+          a.key.providerID.localeCompare(b.key.providerID) ||
+          a.key.baseModelID.localeCompare(b.key.baseModelID),
+      )
+      .slice(0, 128)
+      .map((value) => `${value.key.providerID}/${value.key.baseModelID}`)
+      .sort()
+    const actual = (values: typeof entries) =>
+      GeneralUsage.build(values).models.map((model) => `${model.providerID}/${model.modelID}`).sort()
+    expect(actual(entries)).toEqual(expected)
+    expect(actual([...entries].reverse())).toEqual(expected)
+  })
+
+  test("recency pruning preserves exact evidence with out-of-order and future zero-token observations", () => {
+    const historical = Array.from({ length: 20 }, (_, scope) => {
+      // Ingest newest first, with late-arriving older observations afterward.
+      const rows = Array.from({ length: 16 }, (_, index) => ({
+        sessionID: `scope-${scope}-session-${index}`,
+        completedAt: 10_000 + index * 20 + scope,
+        input: 1_000 + index * 100 + scope,
+        output: 300 + index,
+      })).reverse()
+      return { scope, rows }
+    })
+    const make = (withZero: boolean) =>
+      historical.map(({ scope, rows }) =>
+        entry(
+          `provider-${scope % 3}`,
+          `model-${scope}`,
+          stateFor(
+            scope === 0 && withZero
+              ? [...rows, { sessionID: "future-zero", completedAt: 1_000_000, input: 0, output: 0 }]
+              : rows,
+          ),
+        ),
+      )
+    const expected = GeneralUsage.build(make(false))
+    const actual = GeneralUsage.build(make(true).reverse())
+    expect(expected.evidence.observations).toBe(128)
+    expect(actual.evidence).toEqual(expected.evidence)
+    expect(actual.corpus).toEqual(expected.corpus)
+    expect(actual.typical).toEqual(expected.typical)
+    expect(actual.observedRequestBand).toEqual(expected.observedRequestBand)
+    expect(actual.fingerprint).toBe(expected.fingerprint)
   })
 })

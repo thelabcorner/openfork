@@ -2,7 +2,7 @@ import { APICallError } from "ai"
 import { STATUS_CODES } from "http"
 import { iife } from "@/util/iife"
 import type { ProviderV2 } from "@opencode-ai/core/provider"
-import { isContextOverflow } from "@opencode-ai/llm"
+import { isContextOverflow, isStaleReasoning } from "@opencode-ai/llm"
 
 export class HeaderTimeoutError extends Error {
   public override readonly name = "ProviderHeaderTimeoutError"
@@ -32,6 +32,21 @@ function isOpenAiErrorRetryable(e: APICallError) {
 function message(providerID: ProviderV2.ID, e: APICallError) {
   return iife(() => {
     const msg = e.message
+    // Upstream Go/Zen sometimes wraps a useful provider validation error
+    // behind a generic "invalid parameters" SDK message. Prefer a structured
+    // nested detail when present; never expose the entire request/response
+    // payload (which can include user prompts and credentials).
+    if (providerID === "opencode" || providerID === "opencode-go") {
+      const parsed = json(e.responseBody)
+      const detail = typeof parsed?.error?.message === "string" ? parsed.error.message : undefined
+      if (detail && detail !== msg && /invalid parameters|invalid request|bad request/i.test(msg)) {
+        const parameter =
+          typeof parsed?.error?.param === "string" && /^[a-zA-Z0-9_.\[\]-]{1,96}$/.test(parsed.error.param)
+            ? parsed.error.param
+            : undefined
+        return parameter ? `${msg} (${parameter}): ${detail}` : `${msg}: ${detail}`
+      }
+    }
     if (msg === "") {
       if (e.responseBody) return e.responseBody
       if (e.statusCode) {
@@ -48,7 +63,7 @@ function message(providerID: ProviderV2.ID, e: APICallError) {
     try {
       const body = JSON.parse(e.responseBody)
       // try to extract common error message fields
-      const errMsg = body.message || body.error || body.error?.message
+      const errMsg = body.message || body.error?.message || body.error
       if (errMsg && typeof errMsg === "string") {
         return `${msg}: ${errMsg}`
       }
@@ -86,9 +101,29 @@ function json(input: unknown) {
   return undefined
 }
 
+// Hosted Go/Zen can reject a request at its model-specific prompt compiler,
+// sometimes through a gateway 5xx. That is a deterministic request/model
+// incompatibility, not an overloaded provider or a reason to replay the same
+// transcript. Inspect only the structured error code or the gateway's own
+// bracketed failure code; never scan user prompt/request-body content.
+function isPromptRenderingFailure(message: unknown, response: unknown) {
+  if (typeof message === "string" && /\[prompt_rendering_failed\]/i.test(message)) return true
+  const body = json(response)
+  return body?.error?.code === "prompt_rendering_failed" || body?.code === "prompt_rendering_failed"
+}
+
+const promptRenderingGuidance =
+  "This model could not render the conversation in its supported prompt format. " +
+  "Choose another model to continue with the existing history; repeating the same request will not fix this model's prompt renderer."
+
 export type ParsedStreamError =
   | {
       type: "context_overflow"
+      message: string
+      responseBody: string
+    }
+  | {
+      type: "stale_reasoning"
       message: string
       responseBody: string
     }
@@ -112,6 +147,12 @@ export function parseStreamError(input: unknown): ParsedStreamError | undefined 
       return {
         type: "context_overflow",
         message: "Input exceeds context window of this model",
+        responseBody,
+      }
+    case "invalid_encrypted_content":
+      return {
+        type: "stale_reasoning",
+        message: typeof body?.error?.message === "string" ? body.error.message : "Encrypted reasoning is no longer valid",
         responseBody,
       }
     case "insufficient_quota":
@@ -145,10 +186,27 @@ export function parseStreamError(input: unknown): ParsedStreamError | undefined 
       }
   }
 
+  if (isPromptRenderingFailure(body?.error?.message, body)) {
+    return {
+      type: "api_error",
+      message: `Prompt rendering failed [prompt_rendering_failed]. ${promptRenderingGuidance}`,
+      isRetryable: false,
+      responseBody,
+    }
+  }
+
+  // Hosted Responses streams may report validation failures over SSE without
+  // an HTTP status. Recognize these only AFTER special context/reasoning/quota
+  // codes above, so stale encrypted state still takes its recovery path.
+  const errorType = body?.error?.type
+  const errorCode = body?.error?.code
+  const invalid =
+    ["invalid_request_error", "invalid_parameters", "validation_error"].includes(errorType) ||
+    ["invalid_request_error", "invalid_parameters", "invalid_tool_schema", "unsupported_parameter"].includes(errorCode)
   return {
     type: "api_error",
     message: typeof body?.error?.message === "string" ? body.error.message : "Server error.",
-    isRetryable: true,
+    isRetryable: !invalid,
     responseBody,
   }
 }
@@ -156,6 +214,11 @@ export function parseStreamError(input: unknown): ParsedStreamError | undefined 
 export type ParsedAPICallError =
   | {
       type: "context_overflow"
+      message: string
+      responseBody?: string
+    }
+  | {
+      type: "stale_reasoning"
       message: string
       responseBody?: string
     }
@@ -170,11 +233,31 @@ export type ParsedAPICallError =
     }
 
 export function parseAPICallError(input: { providerID: ProviderV2.ID; error: APICallError }): ParsedAPICallError {
-  const m = message(input.providerID, input.error)
   const body = json(input.error.responseBody)
+  if (isPromptRenderingFailure(input.error.message, body)) {
+    return {
+      type: "api_error",
+      // A gateway response body is not trusted display text: it may contain
+      // request fragments. The stable error code is sufficient for guidance.
+      message: `Prompt rendering failed [prompt_rendering_failed]. ${promptRenderingGuidance}`,
+      statusCode: input.error.statusCode,
+      isRetryable: false,
+      responseHeaders: input.error.responseHeaders,
+      responseBody: input.error.responseBody,
+      ...(input.error.url ? { metadata: { url: input.error.url } } : {}),
+    }
+  }
+  const m = message(input.providerID, input.error)
   if (isContextOverflow(m) || input.error.statusCode === 413 || body?.error?.code === "context_length_exceeded") {
     return {
       type: "context_overflow",
+      message: m,
+      responseBody: input.error.responseBody,
+    }
+  }
+  if (isStaleReasoning(m) || body?.error?.code === "invalid_encrypted_content") {
+    return {
+      type: "stale_reasoning",
       message: m,
       responseBody: input.error.responseBody,
     }

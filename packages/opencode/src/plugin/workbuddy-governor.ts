@@ -233,6 +233,12 @@ const DEFAULT_MAX_CONCURRENT = Number(process.env.WORKBUDDY_MAX_CONCURRENT) || 4
 const DEFAULT_LAUNCH_BURST = Number(process.env.WORKBUDDY_LAUNCH_BURST) || 4
 const DEFAULT_LAUNCH_PER_SEC = Number(process.env.WORKBUDDY_LAUNCH_PER_SEC) || 4
 const MAX_INFLIGHT = 24
+/** Deficit-aware token refill wakeup; avoid a full interval of idle oversleep. */
+export function launchPumpDelayMs(tokens: number, launchesPerSecond: number): number {
+  const rate = Number.isFinite(launchesPerSecond) && launchesPerSecond > 0 ? launchesPerSecond : 0.5
+  const deficit = Number.isFinite(tokens) ? Math.max(0, 1 - tokens) : 1
+  return Math.max(20, Math.ceil((deficit / rate) * 1000))
+}
 const TRANSIENT_CAP_MS = 60_000
 /**
  * How long a forbidden account is quarantined before OpenFork lets it try one
@@ -357,10 +363,12 @@ type Pending = {
   priority: number
   session: string
   seq: number
+  enqueuedAt: number
   resolve: () => void
   reject: (e: any) => void
   signal?: AbortSignal
   onAbort?: () => void
+  timeout?: ReturnType<typeof setTimeout>
 }
 
 export type GovernorOptions = {
@@ -369,6 +377,8 @@ export type GovernorOptions = {
   maxConcurrent?: number
   launchBurst?: number
   launchPerSec?: number
+  /** Maximum queued admission age before an explicit retryable failure, not a generation replay. */
+  maxQueueWaitMs?: number
   /** Test override for the auth_forbidden quarantine window. */
   forbiddenCooldownMs?: number
 }
@@ -385,13 +395,19 @@ export class WorkBuddyEntitlementGovernor {
   private readonly launchCapacity: number
   private launchPerSec: number
   private launchTokens: number
-  private launchLast = Date.now()
+  // In-process rate budgets must never follow a mutable wall clock.
+  private launchLast = performance.now()
   private launchTimer: ReturnType<typeof setTimeout> | undefined
 
   // fair queue
   private pending: Pending[] = []
   private seq = 0
-  private vt: Record<string, number> = {}
+  private readonly maxQueueWaitMs: number
+  private queueTimeouts = 0
+  // A prior plain-object virtual clock retained every Session ever admitted,
+  // indefinitely. Map avoids prototype-key collisions and insertion order
+  // supports bounded pruning without scanning unrelated account state.
+  private readonly vt = new Map<string, number>()
 
   // 3. entitlement state
   private state: EntitlementState = "READY"
@@ -454,6 +470,10 @@ export class WorkBuddyEntitlementGovernor {
     this.launchPerSec = this.defaultLaunchPerSec
     this.launchCapacity = Math.max(1, options.launchBurst ?? DEFAULT_LAUNCH_BURST)
     this.launchTokens = this.launchCapacity
+    const configuredQueueWait = options.maxQueueWaitMs
+    this.maxQueueWaitMs = configuredQueueWait !== undefined && Number.isFinite(configuredQueueWait)
+      ? Math.max(1, Math.min(900_000, Math.floor(configuredQueueWait)))
+      : 180_000
     this.forbiddenCooldownMs = Math.max(1_000, options.forbiddenCooldownMs ?? DEFAULT_FORBIDDEN_COOLDOWN_MS)
 
     // Learn-once: restore a persisted hard/window limit so a fresh OpenFork
@@ -737,15 +757,19 @@ export class WorkBuddyEntitlementGovernor {
 
   // --- launch-rate token bucket -------------------------------------------------
   private refillLaunch() {
-    const now = Date.now()
-    const elapsed = (now - this.launchLast) / 1000
+    const now = performance.now()
+    const elapsed = Math.max(0, (now - this.launchLast) / 1000)
     this.launchTokens = Math.min(this.launchCapacity, this.launchTokens + elapsed * this.launchPerSec)
     this.launchLast = now
   }
 
   private scheduleLaunchPump() {
     if (this.launchTimer) return
-    const delay = Math.max(20, 1000 / this.launchPerSec)
+    // The pump has already refilled tokens. A full 1/rate interval wastes
+    // nearly an entire permit when 0 < tokens < 1 (common after idle gaps).
+    // Wake when the *remaining* fraction reaches one permit, preserving the
+    // upstream rate ceiling and existing bounded queue/backpressure logic.
+    const delay = launchPumpDelayMs(this.launchTokens, this.launchPerSec)
     this.launchTimer = setTimeout(() => {
       this.launchTimer = undefined
       this.pump()
@@ -755,12 +779,15 @@ export class WorkBuddyEntitlementGovernor {
   // --- fair queue selection (weighted fair queueing by session) ---------------
   private selectNext(): Pending | undefined {
     if (!this.pending.length) return undefined
-    const now = Date.now()
+    // Fair-session virtual time is an in-process scheduling clock, not an
+    // entitlement epoch. Wall-clock NTP/DST adjustments must not reorder or
+    // stall already-queued generations.
+    const now = performance.now()
     let best: Pending | undefined
     let bestTag = Infinity
     let bestSeq = Infinity
     for (const p of this.pending) {
-      const base = Math.max(this.vt[p.session] ?? 0, now)
+      const base = Math.max(this.vt.get(p.session) ?? 0, now)
       const tag = base + (WEIGHT[p.priority] ?? 3)
       if (tag < bestTag - 1e-9 || (Math.abs(tag - bestTag) < 1e-9 && p.seq < bestSeq)) {
         best = p
@@ -769,14 +796,35 @@ export class WorkBuddyEntitlementGovernor {
       }
     }
     if (best) {
-      this.vt[best.session] = Math.max(this.vt[best.session] ?? 0, now) + (WEIGHT[best.priority] ?? 3)
+      const finish = Math.max(this.vt.get(best.session) ?? 0, now) + (WEIGHT[best.priority] ?? 3)
+      this.vt.delete(best.session)
+      this.vt.set(best.session, finish)
       const index = this.pending.indexOf(best)
       if (index >= 0) this.pending.splice(index, 1)
+      // The queue is bounded to 24 logical generations, but the virtual-clock
+      // ledger previously grew with every historical Session. Only dormant
+      // Sessions can be pruned; retain every still-queued competitor to prevent
+      // a late cancellation/retry from resetting its fair-share debt.
+      if (this.vt.size > 256) {
+        const queued = new Set(this.pending.map((entry) => entry.session))
+        for (const session of this.vt.keys()) {
+          if (this.vt.size <= 128) break
+          if (session !== best.session && !queued.has(session)) this.vt.delete(session)
+        }
+      }
     }
     return best
   }
 
   // --- admission ---------------------------------------------------------------
+  private clearPending(pending: Pending) {
+    if (pending.onAbort) pending.signal?.removeEventListener("abort", pending.onAbort)
+    if (pending.timeout !== undefined) {
+      clearTimeout(pending.timeout)
+      pending.timeout = undefined
+    }
+  }
+
   private admit(priority: number, session: string, model: string, signal?: AbortSignal): Promise<void> {
     const now = Date.now()
     if (signal?.aborted) return Promise.reject(new AdmissionError(499, 0, "generation canceled before admission", "cancel"))
@@ -814,18 +862,34 @@ export class WorkBuddyEntitlementGovernor {
       return Promise.reject(new AdmissionError(503, 1, "admission queue full", "queue"))
     }
     return new Promise<void>((resolve, reject) => {
-      const pending: Pending = { model, priority, session, seq: this.seq++, resolve, reject, signal }
+      const pending: Pending = {
+        model, priority, session, seq: this.seq++, enqueuedAt: performance.now(), resolve, reject, signal,
+      }
       const cancel = () => {
         const index = this.pending.indexOf(pending)
         if (index < 0) return
         this.pending.splice(index, 1)
-        if (pending.onAbort) signal?.removeEventListener("abort", pending.onAbort)
+        this.clearPending(pending)
         reject(new AdmissionError(499, 0, "generation canceled while queued", "cancel"))
       }
       pending.onAbort = cancel
       signal?.addEventListener("abort", cancel, { once: true })
       this.pending.push(pending)
       this.pump()
+      if (!this.pending.includes(pending)) return
+      // An admitted stream may legitimately run for a long time, but it can
+      // also fail to release its lease. Never leave other requests waiting
+      // indefinitely with no provider attempt or actionable error. This timer
+      // exists ONLY while waiting; it is cleared before granting a lease.
+      pending.timeout = setTimeout(() => {
+        const index = this.pending.indexOf(pending)
+        if (index < 0) return
+        this.pending.splice(index, 1)
+        this.clearPending(pending)
+        this.queueTimeouts++
+        reject(new AdmissionError(503, 1, `WorkBuddy admission queue wait exceeded ${this.maxQueueWaitMs}ms`, "queue"))
+        this.pump()
+      }, this.maxQueueWaitMs)
     })
   }
 
@@ -838,6 +902,7 @@ export class WorkBuddyEntitlementGovernor {
       }
       const next = this.selectNext()
       if (!next) break
+      this.clearPending(next)
       if (!this.canAdmitModel(next.model)) {
         const runtime = this.runtimeFor(next.model)
         const retryAfter = runtime.resetAt ? Math.max(1, Math.ceil((runtime.resetAt - Date.now()) / 1000)) : 3600
@@ -848,7 +913,6 @@ export class WorkBuddyEntitlementGovernor {
         next.reject(new AdmissionError(499, 0, "generation canceled while queued", "cancel"))
         continue
       }
-      if (next.onAbort) next.signal?.removeEventListener("abort", next.onAbort)
       this.launchTokens -= 1
       this.active++
       next.resolve()
@@ -1096,6 +1160,15 @@ export class WorkBuddyEntitlementGovernor {
   /** Called by the quota adapter after a fresh package-balance read. */
   setPackageCredits(remaining: number) {
     this.packageCreditsRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : null
+    // QUOTA_EXHAUSTED is learned from an earlier 402 and persisted across
+    // restarts. Tencent's *fresh* billing balance is the authority on whether
+    // credits have since renewed or been topped up. Without this transition a
+    // funded account remains unusable indefinitely until manual re-enrollment.
+    // Never clear AUTH_INVALID, ACCOUNT_FORBIDDEN or per-model frequency limits:
+    // positive package credits say nothing about those separate restrictions.
+    if (this.state === "QUOTA_EXHAUSTED" && this.packageCreditsRemaining !== null && this.packageCreditsRemaining > 0) {
+      this.clearHardLimit()
+    }
   }
 
   /**
@@ -1185,6 +1258,11 @@ export class WorkBuddyEntitlementGovernor {
       launchPerSec: Number(this.launchPerSec.toFixed(2)),
       active: this.active,
       queued: this.pending.length,
+      oldestQueuedMs: this.pending.length
+        ? Math.max(0, Math.round(performance.now() - this.pending[0]!.enqueuedAt))
+        : 0,
+      queueTimeouts: this.queueTimeouts,
+      fairnessSessions: this.vt.size,
       pressure: this.pressure,
       generations: this.generations,
       attempts: this.attempts,

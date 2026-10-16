@@ -78,6 +78,80 @@ afterEach(() => {
 })
 
 describe("hosted provider route authority", () => {
+  it.instance("Provider service rejects special-agent Public intent before account selection even if allowPublic is requested", () =>
+    Effect.gen(function* () {
+      setTestZenVaultCredentials([])
+      const provider = yield* Provider.Service
+      const transient = yield* provider.resolveTransientRoutedModel({
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        routeIntent: { kind: "public" },
+        executionPurpose: "special-agent",
+        allowPublic: true,
+      }).pipe(Effect.flip)
+      expect(transient._tag).toBe("ProviderRouteResolutionError")
+      expect(String(transient.cause)).toContain("special agents")
+
+      // A new internal caller that forgets the purpose must not resurrect
+      // hosted Public via legacy allowPublic=true on a detached operation.
+      const implicit = yield* provider.resolveTransientRoutedModel({
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        routeIntent: { kind: "public" },
+        allowPublic: true,
+      }).pipe(Effect.flip)
+      expect(implicit._tag).toBe("ProviderRouteResolutionError")
+      expect(String(implicit.cause)).toContain("special agents")
+
+      const durable = yield* provider.resolveRoutedModel({
+        sessionID: "ses_specialagent_public_rejection" as never,
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        routeIntent: { kind: "public" },
+        executionPurpose: "special-agent",
+        allowPublic: true,
+      }).pipe(Effect.flip)
+      expect(durable._tag).toBe("ProviderRouteResolutionError")
+      expect(String(durable.cause)).toContain("special agents")
+    }), 30000)
+
+  it.instance("Provider service rejects inheritance of hosted Public for a special agent without mutating the parent", () =>
+    Effect.gen(function* () {
+      const provider = yield* Provider.Service
+      const failure = yield* provider.resolveInheritedRoutedModel({
+        sessionID: "ses_specialagent_public_parent" as never,
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        route: {
+          sessionID: "ses_specialagent_public_parent" as never,
+          affinityDomain: "opencode-provider/opencode",
+          providerID: hostedProviderID,
+          routeRevision: 17,
+          routeKind: "public",
+        },
+        executionPurpose: "special-agent",
+        allowPublic: true,
+      }).pipe(Effect.flip)
+      expect(failure._tag).toBe("ProviderRouteResolutionError")
+      expect(String(failure.cause)).toContain("special agent")
+
+      const omittedPurpose = yield* provider.resolveInheritedRoutedModel({
+        sessionID: "ses_specialagent_public_parent" as never,
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        route: {
+          sessionID: "ses_specialagent_public_parent" as never,
+          affinityDomain: "opencode-provider/opencode",
+          providerID: hostedProviderID,
+          routeRevision: 17,
+          routeKind: "public",
+        },
+        allowPublic: true,
+      }).pipe(Effect.flip)
+      expect(omittedPurpose._tag).toBe("ProviderRouteResolutionError")
+      expect(String(omittedPurpose.cause)).toContain("special agents")
+    }), 30000)
+
   it.instance(
     "refuses a hosted model when no credential is projectable at all",
     () =>
@@ -97,7 +171,7 @@ describe("hosted provider route authority", () => {
         .pipe(Effect.flip)
 
       expect(transient._tag).toBe("ProviderRouteResolutionError")
-      expect(String((transient.cause as Error)?.message ?? "")).toContain("refusing ambient credential fallback")
+      expect((transient.cause as { _tag?: string })?._tag).toBe("ProviderRouteResolution.NoEligibleRoute")
 
       const durable = yield* provider
         .resolveRoutedModel({
@@ -109,7 +183,7 @@ describe("hosted provider route authority", () => {
         .pipe(Effect.flip)
 
       expect(durable._tag).toBe("ProviderRouteResolutionError")
-      expect(String((durable.cause as Error)?.message ?? "")).toContain("refusing ambient credential fallback")
+      expect((durable.cause as { _tag?: string })?._tag).toBe("ProviderRouteResolution.NoEligibleRoute")
     }),
     30000,
   )
@@ -168,6 +242,55 @@ describe("hosted provider route authority", () => {
 
       expect(conflict._tag).toBe("ProviderRouteResolutionError")
       expect((conflict.cause as { _tag?: string })?._tag).toBe("ProviderRouteIntent.Conflict")
+    }),
+    30000,
+  )
+
+  it.instance("central provider service rejects special-agent Public on transient, session, and inherited routes", () =>
+    Effect.gen(function* () {
+      setTestZenVaultCredentials([])
+      const provider = yield* Provider.Service
+      const sessionID = "ses_hosted_special_route" as never
+      const chosen = {
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        routeIntent: { kind: "public" as const },
+        // Purpose must override even a legacy caller explicitly opting in.
+        allowPublic: true,
+        executionPurpose: "special-agent" as const,
+      }
+
+      const transient = yield* provider.resolveTransientRoutedModel(chosen).pipe(Effect.flip)
+      const session = yield* provider.resolveRoutedModel({ ...chosen, sessionID }).pipe(Effect.flip)
+      const inherited = yield* provider.resolveInheritedRoutedModel({
+        sessionID,
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        allowPublic: true,
+        executionPurpose: "special-agent",
+        route: {
+          sessionID,
+          providerID: hostedProviderID,
+          affinityDomain: "opencode-provider/opencode",
+          routeRevision: 8,
+          routeKind: "public",
+        },
+      }).pipe(Effect.flip)
+      for (const error of [transient, session, inherited]) {
+        expect(error._tag).toBe("ProviderRouteResolutionError")
+        expect(String((error.cause as Error).message)).toContain("Public")
+        expect(error.message).toContain("Select an eligible account-backed model")
+      }
+      // A maintenance request with Auto intent reaches account candidate
+      // resolution instead of a Public route, and cannot spend ambient auth.
+      const noAccount = yield* provider.resolveTransientRoutedModel({
+        providerID: hostedProviderID,
+        modelID: hostedModelID,
+        routeIntent: { kind: "auto" },
+        executionPurpose: "special-agent",
+      }).pipe(Effect.flip)
+      expect(noAccount._tag).toBe("ProviderRouteResolutionError")
+      expect((noAccount.cause as { _tag?: string })?._tag).toBe("ProviderRouteResolution.NoEligibleRoute")
     }),
     30000,
   )

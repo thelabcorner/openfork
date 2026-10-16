@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { createAnthropic } from "@ai-sdk/anthropic"
+import { generateText } from "ai"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -402,6 +404,40 @@ describe("zen provider fetch wrapper", () => {
     }
   })
 
+  test("legacy Anthropic Zen routes by x-api-key and does not inject Bearer", async () => {
+    const dispose = configure(["anthropic-default", "anthropic-selected"])
+    try {
+      stubFetch([new Response("{}", { status: 200 })])
+      const target = stableZenIdentity("anthropic-selected")
+      await zenProviderFetch("https://opencode.ai/zen/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": "stale-key" },
+        body: JSON.stringify({ model: `qwen3.6-plus@${target}`, messages: [] }),
+      })
+      expect(lastCall().headers.get("x-api-key")).toBe("anthropic-selected")
+      expect(lastCall().headers.get("authorization")).toBeNull()
+      expect(lastCall().body.model).toBe("qwen3.6-plus")
+    } finally {
+      dispose()
+    }
+  })
+
+  test("legacy Anthropic Go preserves the selected direct x-api-key instead of the pool default", async () => {
+    const dispose = configure(["anthropic-default"])
+    try {
+      stubFetch([new Response("{}", { status: 200 })])
+      await zenGoProviderFetch("https://opencode.ai/zen/go/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": "go-selected-key" },
+        body: JSON.stringify({ model: "qwen3.6-plus", messages: [] }),
+      })
+      expect(lastCall().headers.get("x-api-key")).toBe("go-selected-key")
+      expect(lastCall().headers.get("authorization")).toBeNull()
+    } finally {
+      dispose()
+    }
+  })
+
   test("public bootstrap sentinel stays public even when the pool has a default", async () => {
     const dispose = configure(["pool-default-key"])
     try {
@@ -564,7 +600,7 @@ describe("committed hosted route transport", () => {
         return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
       })
 
-      const response = await committedZenProviderFetch(accountB)("https://opencode.ai/zen/v1/chat/completions", {
+      const response = await committedZenProviderFetch(accountB, KEY_B)("https://opencode.ai/zen/v1/chat/completions", {
         method: "POST",
         headers: { Authorization: `Bearer ${KEY_B}` },
         body: JSON.stringify({ model: `grok-code@${accountB}`, messages: [] }),
@@ -593,7 +629,7 @@ describe("committed hosted route transport", () => {
       })
 
       await expect(
-        committedZenProviderFetch(accountB)("https://opencode.ai/zen/v1/chat/completions", {
+        committedZenProviderFetch(accountB, KEY_B)("https://opencode.ai/zen/v1/chat/completions", {
           method: "POST",
           headers: { Authorization: `Bearer ${KEY_B}` },
           body: JSON.stringify({ model: `grok-code@${accountA}`, messages: [] }),
@@ -616,11 +652,85 @@ describe("committed hosted route transport", () => {
       })
 
       await expect(
-        committedZenProviderFetch(accountA)("https://opencode.ai/zen/v1/chat/completions", {
+        committedZenProviderFetch(accountA, KEY_A)("https://opencode.ai/zen/v1/chat/completions", {
           method: "POST",
           body: JSON.stringify({ model: "grok-code", messages: [] }),
         }),
       ).rejects.toThrow("missing its selected credential")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("Anthropic SDK Qwen requests use the exact committed x-api-key and remove account suffix", async () => {
+    const dispose = configure([KEY_A, KEY_B])
+    const accountB = stableZenIdentity(KEY_B)
+    const observed: Array<{ key: string | null; bearer: string | null; model: string }> = []
+    try {
+      setTestZenFetch(async (input, init) => {
+        const request = new Request(input, init)
+        const payload = await request.json() as { model: string }
+        observed.push({
+          key: request.headers.get("x-api-key"),
+          bearer: request.headers.get("authorization"),
+          model: payload.model,
+        })
+        return new Response(JSON.stringify({
+          id: "msg_test",
+          type: "message",
+          role: "assistant",
+          model: "qwen3.6-plus",
+          content: [{ type: "text", text: "ROUTE_OK" }],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 2, output_tokens: 2 },
+        }), { status: 200, headers: { "content-type": "application/json" } })
+      })
+      const sdk = createAnthropic({
+        apiKey: KEY_B,
+        baseURL: "https://opencode.ai/zen/v1",
+        fetch: committedZenProviderFetch(accountB, KEY_B) as typeof fetch,
+      })
+      const result = await generateText({ model: sdk("qwen3.6-plus@" + accountB), prompt: "test", maxRetries: 0 })
+      expect(result.text).toBe("ROUTE_OK")
+      expect(observed).toEqual([{ key: KEY_B, bearer: null, model: "qwen3.6-plus" }])
+    } finally {
+      dispose()
+    }
+  })
+
+  test("a committed account rejects a different Anthropic x-api-key before network", async () => {
+    const dispose = configure([KEY_A, KEY_B])
+    let called = false
+    try {
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}")
+      })
+      await expect(committedZenProviderFetch(stableZenIdentity(KEY_B), KEY_B)("https://opencode.ai/zen/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": KEY_A },
+        body: JSON.stringify({ model: "qwen3.6-plus" }),
+      })).rejects.toThrow("does not match the selected credential")
+      expect(called).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+  test("a committed account rejects a foreign Bearer even if another auth channel is correct", async () => {
+    const dispose = configure([KEY_A, KEY_B])
+    let called = false
+    try {
+      setTestZenFetch(async () => {
+        called = true
+        return new Response("{}")
+      })
+      await expect(committedZenProviderFetch(stableZenIdentity(KEY_B), KEY_B)("https://opencode.ai/zen/v1/messages", {
+        method: "POST",
+        headers: { authorization: `Bearer ${KEY_A}`, "x-api-key": KEY_B },
+        body: JSON.stringify({ model: "qwen3.6-plus" }),
+      })).rejects.toThrow("does not match the selected credential")
       expect(called).toBe(false)
     } finally {
       dispose()
@@ -703,6 +813,31 @@ describe("committed Public route transport", () => {
       dispose()
     }
   })
+  test("accepts Anthropic x-api-key public sentinel but rejects foreign public credentials", async () => {
+    const dispose = configure(["default-must-not-leak"])
+    const seen: Array<{ key: string | null; bearer: string | null }> = []
+    try {
+      setTestZenFetch(async (_url, init) => {
+        const headers = new Headers(init?.headers)
+        seen.push({ key: headers.get("x-api-key"), bearer: headers.get("authorization") })
+        return new Response("{}")
+      })
+      await committedPublicZenProviderFetch("https://opencode.ai/zen/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": ZEN_PUBLIC_API_KEY },
+        body: JSON.stringify({ model: "qwen3.6-plus-free" }),
+      })
+      expect(seen).toEqual([{ key: "public", bearer: null }])
+      expect(() => committedPublicZenProviderFetch("https://opencode.ai/zen/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": "default-must-not-leak" },
+        body: JSON.stringify({ model: "qwen3.6-plus-free" }),
+      })).toThrow("missing its public credential")
+      expect(seen).toHaveLength(1)
+    } finally {
+      dispose()
+    }
+  })
 })
 
 describe("committed Public transport wiring", () => {
@@ -712,7 +847,7 @@ describe("committed Public transport wiring", () => {
     const dispose = configure(["public-regression-key"])
     try {
       expect(committedPublicZenProviderFetch).not.toBe(zenProviderFetch)
-      expect(committedZenProviderFetch(stableZenIdentity("public-regression-key"))).not.toBe(zenProviderFetch)
+      expect(committedZenProviderFetch(stableZenIdentity("public-regression-key"), "public-regression-key")).not.toBe(zenProviderFetch)
       expect(committedPublicZenProviderFetch).not.toBe(zenGoProviderFetch)
     } finally {
       dispose()
