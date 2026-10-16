@@ -114,6 +114,52 @@ const policyState = (databasePath: string) =>
   )
 
 describe("ProviderRoute atomic account policy", () => {
+  for (const mode of ["session-round-robin", "round-robin"] as const) {
+    for (const count of [1, 3, 6]) {
+      test(`${mode}: ${count} simultaneous independent sessions honor account caps and one durable cursor`, async () => {
+        await using tmp = await tmpdir()
+        const databasePath = join(tmp.path, `strategy-${mode}-${count}.sqlite`)
+        const sessions = Array.from({ length: count }, (_, i) =>
+          SessionSchema.ID.make(`ses_routing_stress_${mode.replace(/-/g, "_")}_${count}_${i}`),
+        )
+        const accounts = ["cred-a", "cred-b", "cred-c"].map((handle) =>
+          candidate(handle, { maxSessionBindings: 2 }),
+        )
+        await run(databasePath, seedSessions(sessions))
+
+        const outcomes = await Promise.all(sessions.map((sessionID, index) =>
+          run(databasePath, Effect.gen(function* () {
+            const routes = yield* ProviderRoute.Service
+            return yield* routes.commitAccountSelection(initial(
+              sessionID,
+              index % 2 ? [...accounts].reverse() : accounts,
+              { mode, now: 100 + index },
+            ))
+          })),
+        ))
+
+        expect(outcomes.every((result) => result.state === "committed")).toBe(true)
+        const durable = await policyState(databasePath)
+        expect(durable.routes).toHaveLength(count)
+        expect(new Set(durable.routes.map((entry) => entry.session_id)).size).toBe(count)
+        expect(durable.cursors).toHaveLength(1)
+        expect(durable.cursors[0]?.epoch).toBe(count)
+        expect(durable.stats.reduce((total, entry) => total + entry.assignment_count, 0)).toBe(count)
+        // Active bindings are derived from the binding rows inside the policy
+        // transaction; they are not a cached column on the stats table.
+        const active = new Map<string, number>()
+        for (const binding of durable.routes) {
+          if (binding.route_kind !== "account" || !binding.credential_handle)
+            throw new Error("expected an account binding for each concurrent session")
+          active.set(binding.account_id!, (active.get(binding.account_id!) ?? 0) + 1)
+        }
+        expect([...active.values()].reduce((total, value) => total + value, 0)).toBe(count)
+        expect([...active.values()].every((value) => value <= 2)).toBe(true)
+        expect(durable.stats.every((entry) => entry.assignment_count === active.get(entry.account_id))).toBe(true)
+      }, 15000)
+    }
+  }
+
   test("two independent connections racing initial Auto bind commit one route and one policy transition", async () => {
     await using tmp = await tmpdir()
     const databasePath = join(tmp.path, "atomic-initial.sqlite")

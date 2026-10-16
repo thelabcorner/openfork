@@ -16,7 +16,7 @@ import {
 export const RouteKind = Schema.Literals(["public", "account"])
 export type RouteKind = typeof RouteKind.Type
 
-export const RoutingMode = Schema.Literals(["concentrate", "session-round-robin"])
+export const RoutingMode = Schema.Literals(["concentrate", "session-round-robin", "round-robin"])
 export type RoutingMode = typeof RoutingMode.Type
 
 export const Pin = Schema.Literals(["hard", "soft"])
@@ -92,7 +92,7 @@ export type AccountCommitInput =
     })
   | (AccountCommitBaseInput & {
       readonly reason: "failover"
-      readonly current: AccountBinding
+      readonly current: Binding
     })
 
 export type AccountCommitResult =
@@ -258,13 +258,19 @@ function insertValues(prepared: Prepared) {
   } satisfies typeof ProviderRouteBindingTable.$inferInsert
 }
 
-function sameAccountOwner(binding: Binding, current: AccountBinding) {
+function sameBindingOwner(binding: Binding, current: Binding) {
+  if (
+    binding.routeKind !== current.routeKind ||
+    binding.sessionID !== current.sessionID ||
+    binding.affinityDomain !== current.affinityDomain ||
+    binding.providerID !== current.providerID ||
+    binding.routeRevision !== current.routeRevision
+  ) {
+    return false
+  }
+  if (binding.routeKind === "public" && current.routeKind === "public") return true
+  if (binding.routeKind !== "account" || current.routeKind !== "account") return false
   return (
-    binding.routeKind === "account" &&
-    binding.sessionID === current.sessionID &&
-    binding.affinityDomain === current.affinityDomain &&
-    binding.providerID === current.providerID &&
-    binding.routeRevision === current.routeRevision &&
     binding.accountID === current.accountID &&
     binding.credentialHandle === current.credentialHandle &&
     binding.mode === current.mode &&
@@ -383,7 +389,7 @@ const layer = Layer.effect(
       if (affinityDomain !== input.affinityDomain) {
         return yield* invalid("affinityDomain", "must already be canonical")
       }
-      if (input.mode !== "concentrate" && input.mode !== "session-round-robin") {
+      if (input.mode !== "concentrate" && input.mode !== "session-round-robin" && input.mode !== "round-robin") {
         return yield* invalid("mode", "must be a supported routing mode")
       }
       const now = input.now ?? Date.now()
@@ -422,19 +428,16 @@ const layer = Layer.effect(
 
               let failoverCurrent: AccountBinding | undefined
               if (input.reason === "failover") {
-                if (!persistedCurrent || !sameAccountOwner(persistedCurrent, input.current)) {
+                if (!persistedCurrent || !sameBindingOwner(persistedCurrent, input.current)) {
                   return { state: "stale" } as const
                 }
-                if (persistedCurrent.routeKind !== "account") {
-                  return { state: "stale" } as const
-                }
-                if (persistedCurrent.pin === "hard") {
+                if (persistedCurrent.routeKind === "account" && persistedCurrent.pin === "hard") {
                   return yield* invalid("current.pin", "hard-pinned account routes cannot fail over")
                 }
                 if (persistedCurrent.providerID !== providerID) {
                   return { state: "stale" } as const
                 }
-                failoverCurrent = persistedCurrent
+                if (persistedCurrent.routeKind === "account") failoverCurrent = persistedCurrent
               }
 
               const cursorRow = yield* tx
@@ -572,7 +575,7 @@ const layer = Layer.effect(
                   providerID,
                   accountID: account.accountID,
                   credentialHandle: account.credentialHandle,
-                  mode: failoverCurrent?.mode ?? input.mode,
+                  mode: input.mode,
                   ...(failoverCurrent?.pin ? { pin: failoverCurrent.pin } : {}),
                 },
                 assignmentEpoch,
@@ -609,6 +612,13 @@ const layer = Layer.effect(
                   return { state: "winner", binding: binding(winner) } as const
                 }
               } else {
+                const currentRouteCondition = input.current.routeKind === "account"
+                  ? and(
+                      eq(ProviderRouteBindingTable.route_kind, "account"),
+                      eq(ProviderRouteBindingTable.account_id, input.current.accountID),
+                      eq(ProviderRouteBindingTable.credential_handle, input.current.credentialHandle),
+                    )
+                  : eq(ProviderRouteBindingTable.route_kind, "public")
                 committedRow = yield* tx
                   .update(ProviderRouteBindingTable)
                   .set({
@@ -620,10 +630,8 @@ const layer = Layer.effect(
                       eq(ProviderRouteBindingTable.session_id, input.sessionID),
                       eq(ProviderRouteBindingTable.affinity_domain, affinityDomain),
                       eq(ProviderRouteBindingTable.route_revision, input.current.routeRevision),
-                      eq(ProviderRouteBindingTable.route_kind, "account"),
                       eq(ProviderRouteBindingTable.provider_id, providerID),
-                      eq(ProviderRouteBindingTable.account_id, input.current.accountID),
-                      eq(ProviderRouteBindingTable.credential_handle, input.current.credentialHandle),
+                      currentRouteCondition,
                     ),
                   )
                   .returning()

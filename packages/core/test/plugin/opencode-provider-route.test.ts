@@ -127,6 +127,21 @@ function resolveInput(
 }
 
 describe("OpenCode production provider-route composition", () => {
+  it.effect("maps exactly two hosted account-routing strategies, including legacy unqualified intent", () =>
+    Effect.sync(() => {
+      for (const hosted of ["opencode", "opencode-go"]) {
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto" })).toBe("session-round-robin")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto", strategy: "adaptive" })).toBe("session-round-robin")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "auto", strategy: "round-robin" })).toBe("round-robin")
+        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "auto", strategy: "adaptive" })).toBe("account-first")
+        expect(OpencodeProviderRoute.freeRoutePreference(hosted, { kind: "auto", strategy: "round-robin" })).toBe("account-first")
+        expect(OpencodeProviderRoute.routingMode(hosted, { kind: "account", accountID: "acct-a" })).toBe("concentrate")
+      }
+      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "auto" })).toBe("concentrate")
+      expect(OpencodeProviderRoute.routingMode("anthropic", { kind: "auto", strategy: "round-robin" })).toBe("concentrate")
+      expect(OpencodeProviderRoute.routingMode("openai", { kind: "auto", strategy: "adaptive" })).toBe("concentrate")
+    }),
+  )
   it.effect("uses one stable provider-scoped affinity namespace across runtimes", () =>
     Effect.sync(() => {
       expect(OpencodeProviderRoute.affinityDomain("opencode")).toBe("opencode-provider/opencode")
@@ -234,6 +249,56 @@ describe("OpenCode production provider-route composition", () => {
       expect(again.lease.routeRevision).toBe(initial.lease.routeRevision)
       expect(fake.calls.list).toBe(0)
       expect(fake.calls.revision).toBe(0)
+    }),
+  )
+
+  it.effect("a concurrent account selection cannot be overwritten by sticky Public Auto", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionSchema.ID.make("ses_opencode_public_account_race")
+      yield* seedSession(sessionID)
+      const routes = yield* ProviderRoute.Service
+      const fake = fakeSource()
+      const first = yield* compose({ routes, source: fake.source }).resolve(
+        resolveInput(sessionID, { freeRoutePreference: "public-first-for-free" }),
+      )
+      expect(first.lease.route.kind).toBe("public")
+
+      let reads = 0
+      const racingRoutes: ProviderRoute.Interface = {
+        ...routes,
+        get: (id, domain) => Effect.gen(function* () {
+          const observed = yield* routes.get(id, domain)
+          reads++
+          if (reads === 2 && observed?.routeKind === "public") {
+            const winner = yield* routes.compareAndSwap({
+              sessionID: id,
+              affinityDomain: domain,
+              expectedRevision: observed.routeRevision,
+              route: {
+                kind: "account",
+                providerID,
+                accountID: fake.account.accountID,
+                credentialHandle: fake.credentialID,
+                mode: "session-round-robin",
+              },
+              assignmentEpoch: observed.assignmentEpoch + 1,
+              reason: "explicit",
+              assignedAt: 250,
+            }).pipe(Effect.orDie)
+            expect(winner?.routeKind).toBe("account")
+            return yield* routes.get(id, domain)
+          }
+          return observed
+        }),
+      }
+      const resolved = yield* compose({ routes: racingRoutes, source: fake.source }).resolve(
+        resolveInput(sessionID, { freeRoutePreference: "account-first", now: 300 }),
+      )
+      expect(resolved.lease.route).toMatchObject({ kind: "account", accountID: fake.account.accountID })
+      expect(resolved.lease.routeRevision).toBe(first.lease.routeRevision + 1)
+      expect((yield* routes.get(sessionID, affinityDomain))?.routeKind).toBe("account")
+      expect(fake.calls.list).toBe(1)
+      expect(reads).toBeGreaterThanOrEqual(3)
     }),
   )
 

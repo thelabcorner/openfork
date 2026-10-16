@@ -26,7 +26,7 @@ const left = (input: ProviderRouteIntentRuntime.NormalizeInput) => {
 }
 
 describe("ProviderRouteIntentRuntime.normalize", () => {
-  test("maps an entirely legacy-empty selection to Auto", () => {
+  test("maps an empty legacy account selection to the unpinned Adaptive default wire intent", () => {
     expect(right({})).toEqual({ kind: "auto" })
   })
 
@@ -38,7 +38,7 @@ describe("ProviderRouteIntentRuntime.normalize", () => {
     })
   })
 
-  test("preserves explicit Auto and Public when no legacy account is present", () => {
+  test("preserves the unpinned strategy wire intent and Public transport intent", () => {
     expect(right({ routeIntent: ProviderRouteIntent.Info.make({ kind: "auto" }) })).toEqual({ kind: "auto" })
     expect(right({ routeIntent: ProviderRouteIntent.Info.make({ kind: "public" }) })).toEqual({ kind: "public" })
   })

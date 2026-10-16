@@ -1,7 +1,7 @@
 export * as OpencodeProviderRoute from "./opencode-provider-route"
 
 import { Effect } from "effect"
-import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import type { Credential } from "../../credential"
 import { ProviderRoute } from "../../provider-route"
 import { ProviderRouteResolution } from "../../provider-route-resolution"
@@ -16,6 +16,7 @@ export interface CandidateSource<CredentialError = unknown> {
   readonly list: (input: {
     readonly providerID: string
     readonly modelID: string
+    readonly mode: ProviderRoute.RoutingMode
   }) => Effect.Effect<OpencodeRouteCandidates.ListResult>
   readonly resolveCredentialRevision: (
     input: OpencodeRouteCandidates.RevisionInput,
@@ -92,6 +93,27 @@ export interface Options<HealthError = never> extends OpencodeRouteCandidates.Op
  */
 export const affinityDomain = (providerID: string) => `opencode-provider/${providerID}`
 
+/** Shared mode mapping for both V1 and current Session route resolution. */
+export function routingMode(providerID: string, intent: ProviderRouteIntent.Info): ProviderRoute.RoutingMode {
+  // Hosted account strategies must never change an unrelated provider's
+  // account-routing semantics just because a stale/forged intent carried a
+  // strategy field across a provider switch.
+  if (intent.kind !== "auto" || (providerID !== "opencode" && providerID !== "opencode-go"))
+    return "concentrate"
+  if (ProviderRouteIntent.effectiveStrategy(intent) === "round-robin") return "round-robin"
+  return "session-round-robin"
+}
+
+/** Unpinned hosted strategies prefer subscription accounts, then consider eligible Public. */
+export function freeRoutePreference(
+  providerID: string,
+  intent: ProviderRouteIntent.Info,
+): ProviderRouteResolution.FreeRoutePreference {
+  return intent.kind === "auto" && (providerID === "opencode" || providerID === "opencode-go")
+    ? "account-first"
+    : "public-first-for-free"
+}
+
 function resolutionInput(
   input: ResolveInput,
   candidates: readonly ProviderRouteResolution.AccountCandidate[],
@@ -148,6 +170,7 @@ export function compose<CredentialError = unknown>(
     options.source.list({
       providerID: input.providerID,
       modelID: input.modelID,
+      mode: input.mode,
     })
 
   const withCandidates = (input: ResolveInput) =>
@@ -176,8 +199,32 @@ export function compose<CredentialError = unknown>(
       }
 
       const current = yield* options.routes.get(input.sessionID, input.affinityDomain)
-      if (input.routeIntent.kind === "auto" && current?.routeKind === "public") {
-        return yield* withoutCandidates(input)
+      if (
+        input.routeIntent.kind === "auto" &&
+        current?.routeKind === "public" &&
+        input.allowPublic &&
+        input.publicEligible
+      ) {
+        // Compile only the exact Public generation we observed, without
+        // account enumeration or ANY route mutation. Running the full Auto
+        // resolver with an empty candidate snapshot here could undo a
+        // concurrent account rebinding by erroneously falling back to Public.
+        return yield* compileExisting({
+          ...input,
+          expected: {
+            sessionID: input.sessionID,
+            affinityDomain: input.affinityDomain,
+            providerID: input.providerID,
+            routeRevision: current.routeRevision,
+            routeKind: "public",
+          },
+        }).pipe(
+          Effect.catch((error) =>
+            error instanceof ProviderRouteResolution.StaleRouteError
+              ? withCandidates(input)
+              : Effect.fail(error),
+          ),
+        )
       }
 
       if (
@@ -223,7 +270,13 @@ export function compose<CredentialError = unknown>(
       const current = yield* options.routes.get(input.sessionID, input.affinityDomain)
       if (current !== undefined) return yield* resolve(input)
 
-      if (input.allowPublic && input.publicEligible) return yield* resolve(input)
+      if (
+        input.freeRoutePreference === "public-first-for-free" &&
+        input.allowPublic &&
+        input.publicEligible
+      ) {
+        return yield* resolve(input)
+      }
 
       const prepared = yield* prepare(input)
       const ownsModel = prepared.candidates.some(
@@ -235,7 +288,7 @@ export function compose<CredentialError = unknown>(
       // No credential/config ambiguity and every known account positively says
       // this model is unsupported: this provider/model belongs to the legacy
       // direct-provider path, not the OpenCode account router.
-      if (!ownsModel && prepared.issues.length === 0) return undefined
+      if (!ownsModel && prepared.issues.length === 0 && !input.publicEligible) return undefined
 
       return yield* withPreparedCandidates(input, prepared)
     })

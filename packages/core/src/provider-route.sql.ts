@@ -24,7 +24,7 @@ export const ProviderRouteBindingTable = sqliteTable(
     // Account-route identity. Public routes must keep these NULL.
     account_id: text(),
     credential_handle: text(),
-    mode: text().$type<"concentrate" | "session-round-robin">(),
+    mode: text().$type<"concentrate" | "session-round-robin" | "round-robin">(),
     pin: text().$type<"hard" | "soft">(),
 
     // Optimistic-CAS fence. Every successful rebind increments by exactly one.
@@ -43,7 +43,7 @@ export const ProviderRouteBindingTable = sqliteTable(
     check("provider_route_binding_route_kind_check", sql`${table.route_kind} in ('public', 'account')`),
     check(
       "provider_route_binding_mode_check",
-      sql`${table.mode} is null or ${table.mode} in ('concentrate', 'session-round-robin')`,
+      sql`${table.mode} is null or ${table.mode} in ('concentrate', 'session-round-robin', 'round-robin')`,
     ),
     check("provider_route_binding_pin_check", sql`${table.pin} is null or ${table.pin} in ('hard', 'soft')`),
     check(

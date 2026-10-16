@@ -223,6 +223,10 @@ export function observeYieldStatistic(
  * session are aggregated into one cluster-level observation.
  */
 export function snapshotYieldStatistic(state: YieldStatisticState): YieldStatisticState {
+  // Repeated consumers (the materialized list, provider capacity, and general
+  // profile) can snapshot the same state. Finalization is idempotent: avoid
+  // allocating another wrapper when no open block remains.
+  if (state.sessions.activeCount <= 0) return state
   return {
     ...state,
     sessions: finalizeSessionBlock(state.sessions),

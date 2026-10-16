@@ -4,6 +4,7 @@ import { afterAll, describe, expect } from "bun:test"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Global } from "@opencode-ai/core/global"
+import { Flock } from "@opencode-ai/core/util/flock"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Flag } from "@opencode-ai/core/flag/flag"
@@ -13,6 +14,7 @@ import { testEffect } from "./lib/effect"
 
 const source = `https://models-dev-owner-${crypto.randomUUID()}.example`
 const cachePath = path.join(Global.Path.cache, `models-${Hash.fast(source)}.json`)
+const lockKey = `models-dev:${cachePath}`
 const previous = {
   source: Flag.OPENCODE_MODELS_URL,
   path: Flag.OPENCODE_MODELS_PATH,
@@ -25,6 +27,7 @@ Flag.OPENCODE_DISABLE_MODELS_FETCH = false
 let fetchCount = 0
 let requestGate: Effect.Effect<void> | undefined
 let requestStarted: Deferred.Deferred<void> | undefined
+let requestRelease: Deferred.Deferred<void> | undefined
 const client = HttpClient.make((request) =>
   Effect.gen(function* () {
     fetchCount++
@@ -60,7 +63,8 @@ describe("ModelsDev selected-provider ownership", () => {
       yield* Effect.promise(() => rm(cachePath, { force: true }))
       const modelsDev = yield* ModelsDev.Service
       requestStarted = yield* Deferred.make<void>()
-      requestGate = Effect.never
+      requestRelease = yield* Deferred.make<void>()
+      requestGate = Deferred.await(requestRelease)
       yield* Effect.gen(function* () {
         const first = yield* modelsDev.getForSelectedProvider("acme").pipe(Effect.forkScoped)
         yield* Deferred.await(requestStarted!)
@@ -102,6 +106,43 @@ describe("ModelsDev selected-provider ownership", () => {
       expect(Object.hasOwn(typo, "acme-typo")).toBe(false)
       expect(fetchCount).toBe(1)
     }),
+    30000,
+  )
+
+  it.effect("does not hold the cross-process catalog lock while the network is stalled", () =>
+    Effect.gen(function* () {
+      fetchCount = 0
+      yield* Effect.promise(() => rm(cachePath, { force: true }))
+      const modelsDev = yield* ModelsDev.Service
+      requestStarted = yield* Deferred.make<void>()
+      requestRelease = yield* Deferred.make<void>()
+      requestGate = Deferred.await(requestRelease)
+
+      const fetch = yield* modelsDev.getForSelectedProvider("acme").pipe(Effect.forkScoped)
+      yield* Deferred.await(requestStarted).pipe(Effect.timeout("3 seconds"))
+
+      // This is the same cross-process lock key another server/bootstrap
+      // would need. It must remain available while HTTP is awaiting bytes.
+      const lease = yield* Effect.promise(() => Flock.tryAcquire(lockKey))
+      expect(lease).toBeDefined()
+      if (lease) yield* Effect.promise(() => lease.release())
+
+      yield* Deferred.succeed(requestRelease, undefined)
+      requestGate = undefined
+      requestStarted = undefined
+      requestRelease = undefined
+      expect(Object.keys(yield* Fiber.join(fetch).pipe(Effect.timeout("3 seconds")))).toEqual(["acme"])
+      expect(fetchCount).toBe(1)
+    }).pipe(
+      Effect.ensuring(
+        Effect.gen(function* () {
+          requestGate = undefined
+          requestStarted = undefined
+          if (requestRelease) yield* Deferred.succeed(requestRelease, undefined)
+          requestRelease = undefined
+        }),
+      ),
+    ),
     30000,
   )
 })

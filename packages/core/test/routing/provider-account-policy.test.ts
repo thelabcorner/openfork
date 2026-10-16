@@ -151,6 +151,26 @@ describe("ProviderAccountPolicy concentrate", () => {
 })
 
 describe("ProviderAccountPolicy session-round-robin", () => {
+  test("Adaptive prioritizes comparable expiring Go allowance; Round Robin follows the rotation cursor", () => {
+    const candidates = [
+      candidate("cred-a", { quotaExpiryUrgency: 0.1 }),
+      candidate("cred-b", { quotaExpiryUrgency: 0.9 }),
+    ]
+    const cursor = { epoch: 5, lastAssignedHandle: "cred-b" }
+    const adaptive = select({ mode: "session-round-robin", candidates, cursor })
+    const roundRobin = select({ mode: "round-robin", candidates, cursor })
+    expect(selectedHandle(adaptive)).toBe("cred-b")
+    expect(selectedHandle(roundRobin)).toBe("cred-a")
+
+    // Without complete comparable quota observations, Adaptive falls back
+    // to fair rotation; it never guesses urgency for an unknown account.
+    const incomplete = select({
+      mode: "session-round-robin",
+      candidates: [candidate("cred-a"), candidate("cred-b", { quotaExpiryUrgency: 0.9 })],
+      cursor,
+    })
+    expect(selectedHandle(incomplete)).toBe("cred-a")
+  })
   test("uses stable handle ordering and advances after the durable cursor", () => {
     const result = select({
       mode: "session-round-robin",
