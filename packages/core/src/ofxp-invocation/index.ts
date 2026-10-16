@@ -48,6 +48,11 @@ export interface PrepareInput {
   readonly now?: number
 }
 
+export interface ClaimStartResult {
+  readonly fresh: boolean
+  readonly receipt: Ofxp.InvocationReceipt
+}
+
 export interface RecentInput {
   readonly sourcePeerID?: Ofxp.PeerID
   readonly limit?: number
@@ -88,6 +93,22 @@ export interface Interface {
     input: PrepareInput,
   ) => Effect.Effect<
     Ofxp.InvocationReceipt,
+    | OfxpInvocationSchema.NotFoundError
+    | OfxpInvocationSchema.InvalidTransitionError
+    | OfxpInvocationSchema.CollisionError
+      | OfxpInvocationSchema.ValidationError
+  >
+  /**
+   * Atomically claims the admitted -> started execution boundary.
+   *
+   * Unlike prepare(), a duplicate caller never receives permission to cross the
+   * boundary again. A matching already-started receipt is returned with
+   * fresh=false so callers can fail closed or reconcile without re-execution.
+   */
+  readonly claimStart: (
+    input: PrepareInput,
+  ) => Effect.Effect<
+    ClaimStartResult,
     | OfxpInvocationSchema.NotFoundError
     | OfxpInvocationSchema.InvalidTransitionError
     | OfxpInvocationSchema.CollisionError
@@ -362,7 +383,59 @@ const layer = Layer.effect(
       return receipt(updated!)
     })
 
-    return Service.of({ admit, get, recent, recentByPeer, prepare, settle })
+    const claimStart = Effect.fn("OfxpInvocation.claimStart")(function* (input: PrepareInput) {
+      const now = input.now ?? Date.now()
+      if (!input.targetRef || input.targetRef.length > 4096) {
+        return yield* new OfxpInvocationSchema.ValidationError({ reason: "target reference is invalid" })
+      }
+      if (!validDigest(input.resultDigest)) {
+        return yield* new OfxpInvocationSchema.ValidationError({ reason: "result digest is invalid" })
+      }
+
+      const updated = yield* db
+        .update(OfxpInvocationReceiptTable)
+        .set({
+          state: "started",
+          target_ref: input.targetRef,
+          result_digest: input.resultDigest,
+          time_updated: now,
+        })
+        .where(
+          and(
+            eq(OfxpInvocationReceiptTable.invocation_id, input.invocationID),
+            eq(OfxpInvocationReceiptTable.state, "admitted"),
+          ),
+        )
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      if (updated) return { fresh: true, receipt: receipt(updated) }
+
+      const existing = yield* readDb
+        .select()
+        .from(OfxpInvocationReceiptTable)
+        .where(eq(OfxpInvocationReceiptTable.invocation_id, input.invocationID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!existing) return yield* new OfxpInvocationSchema.NotFoundError({ invocationID: input.invocationID })
+      if (
+        (existing.target_ref !== null && existing.target_ref !== input.targetRef) ||
+        (existing.result_digest !== null && existing.result_digest !== (input.resultDigest ?? existing.result_digest))
+      ) {
+        return yield* new OfxpInvocationSchema.CollisionError({
+          invocationID: input.invocationID,
+          reason: "claimed execution target or result digest changed",
+        })
+      }
+      if (existing.state === "started") return { fresh: false, receipt: receipt(existing) }
+      return yield* new OfxpInvocationSchema.InvalidTransitionError({
+        invocationID: input.invocationID,
+        from: existing.state,
+        to: "started",
+      })
+    })
+
+    return Service.of({ admit, get, recent, recentByPeer, prepare, claimStart, settle })
   }),
 )
 

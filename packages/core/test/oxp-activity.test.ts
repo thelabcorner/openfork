@@ -6,6 +6,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
+import { OxpInvocationLinkTable, OxpInvocationTable } from "@opencode-ai/core/oxp-activity/sql"
 import { OxpActivity as OxpActivityContract } from "@opencode-ai/schema/oxp-activity"
 import { Effect, Layer } from "effect"
 import { testEffect } from "./lib/effect"
@@ -411,6 +412,174 @@ describe("OxpActivity", () => {
       yield* activity.link(link)
       yield* unsubscribe
       expect(linkEvents).toBe(1)
+    }),
+  )
+
+  it.live(
+    "inserts causal links idempotently in one batch with one invalidation",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const events = yield* EventV2.Service
+      const started = yield* activity.begin({
+        correlation: { scheme: "mcp-session-id", digest: "batch-links", scope: "unknown" },
+        hostRunID: "host-batch-links",
+        plane: "delegation",
+        tool: "openfork_worker",
+      })
+      let publishes = 0
+      const unsubscribe = yield* events.listenType(OxpActivityContract.Event.LinkAdded,
+        () => Effect.sync(() => { publishes++ }))
+      const links = [
+        { invocationID: started.invocationID, kind: "root" as const, ref: "root_batched", relation: "target" },
+        { invocationID: started.invocationID, kind: "worker_session" as const, ref: "ses_batched_1", relation: "created" },
+        { invocationID: started.invocationID, kind: "worker_session" as const, ref: "ses_batched_2", relation: "created" },
+      ]
+      yield* activity.linkMany(links)
+      yield* activity.linkMany(links)
+      yield* unsubscribe
+      const page = yield* inspection.invocations({ activityID: started.activityID })
+      expect(page.links.map((link) => link.ref).toSorted()).toEqual(["root_batched", "ses_batched_1", "ses_batched_2"])
+      expect(publishes).toBe(1)
+      const oversized = yield* Effect.exit(activity.linkMany(Array.from({ length: 65 }, () => links[0]!)))
+      expect(oversized._tag).toBe("Failure")
+      expect((yield* inspection.invocations({ activityID: started.activityID })).links).toHaveLength(3)
+    }),
+  )
+
+  it.live(
+    "atomically admits initial links with the invocation and publishes one invalidation",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const inspection = yield* OxpActivityInspection.Service
+      const events = yield* EventV2.Service
+      let added = 0
+      const unsubscribe = yield* events.listenType(OxpActivityContract.Event.LinkAdded,
+        () => Effect.sync(() => { added++ }))
+      const started = yield* activity.beginWithLinks({
+        correlation: { scheme: "mcp-session-id", digest: "inline-begin", scope: "unknown" },
+        hostRunID: "host-inline",
+        plane: "delegation",
+        tool: "openfork_worker",
+        initialLinks: [
+          { kind: "root", ref: "root-inline", relation: "target" },
+          { kind: "worker_group", ref: "batch-inline", relation: "target" },
+        ],
+      })
+      const page = yield* inspection.invocations({ activityID: started.activityID })
+      expect(page.links.map((link) => link.ref).toSorted()).toEqual(["batch-inline", "root-inline"])
+      expect(page.items[0]?.status).toBe("running")
+      expect(added).toBe(1)
+      const bad = yield* Effect.exit(activity.beginWithLinks({
+        correlation: { scheme: "mcp-session-id", digest: "inline-bad", scope: "unknown" },
+        hostRunID: "host-inline",
+        plane: "augmentation",
+        tool: "read",
+        initialLinks: [{ kind: "root", ref: "x".repeat(1024), relation: "target" }],
+      }))
+      expect(bad._tag).toBe("Failure")
+      expect(yield* inspection.list()).toHaveLength(1)
+      yield* unsubscribe
+    }),
+  )
+
+  it.live(
+    "preserves invocation and link cardinality at 1/5/10/25/50/100 concurrent admissions",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const { db } = yield* Database.Service
+      let completed = 0
+      const observations: Array<{ concurrency: number; admissionsMs: number; settledMs: number }> = []
+      for (const concurrency of [1, 5, 10, 25, 50, 100]) {
+        const startedAt = performance.now()
+        const started = yield* Effect.forEach(
+          Array.from({ length: concurrency }, (_, index) => index),
+          (index) => activity.beginWithLinks({
+            correlation: { scheme: "mcp-session-id", digest: "concurrent-admission-cohort", scope: "unknown" },
+            hostRunID: "host-concurrent-cohort",
+            plane: "delegation",
+            tool: "openfork_worker",
+            initialLinks: [
+              { kind: "root", ref: "root-concurrent", relation: "target" },
+              { kind: "worker_session", ref: `worker-${completed + index}`, relation: "created" },
+            ],
+          }),
+          { concurrency },
+        )
+        const admissionElapsed = performance.now() - startedAt
+        expect(new Set(started.map((item) => item.invocationID)).size).toBe(concurrency)
+        const settlingAt = performance.now()
+        const settled = yield* Effect.forEach(
+          started,
+          (item) => activity.settle({
+            invocationID: item.invocationID,
+            status: "committed",
+            mutationAttempted: true,
+            mutationCommitted: true,
+          }),
+          { concurrency },
+        )
+        expect(settled.every(Boolean)).toBe(true)
+        completed += concurrency
+        const invocationCount = yield* db.select({ count: sql<number>`count(*)` }).from(OxpInvocationTable).get()
+        const linkCount = yield* db.select({ count: sql<number>`count(*)` }).from(OxpInvocationLinkTable).get()
+        expect(invocationCount?.count).toBe(completed)
+        expect(linkCount?.count).toBe(completed * 2)
+        observations.push({
+          concurrency,
+          admissionsMs: Math.round(admissionElapsed * 100) / 100,
+          settledMs: Math.round((performance.now() - settlingAt) * 100) / 100,
+        })
+      }
+      console.info("OXP 1/5/10/25/50/100 in-memory writer-lane evidence", JSON.stringify(observations))
+    }),
+  )
+
+  it.live(
+    "measures atomic-versus-separate OXP link admission without timing-based assertions",
+    Effect.gen(function* () {
+      const activity = yield* OxpActivity.Service
+      const elapsed: { atomic: number[]; separate: number[] } = { atomic: [], separate: [] }
+      for (let round = 0; round < 4; round++) {
+        // Alternate order to mitigate temperature and cache warmup bias.
+        for (const mode of (round % 2 === 0 ? ["atomic", "separate"] : ["separate", "atomic"]) as Array<"atomic" | "separate">) {
+          const start = performance.now()
+          yield* Effect.forEach(
+            Array.from({ length: 100 }, (_, index) => index),
+            (index) => Effect.gen(function* () {
+              const links = [
+                { kind: "root" as const, ref: "root-measured", relation: "target" },
+                { kind: "worker_session" as const, ref: `worker-${round}-${mode}-${index}`, relation: "created" },
+              ]
+              const common = {
+                correlation: { scheme: "mcp-session-id", digest: `benchmark-${round}-${mode}`, scope: "unknown" as const },
+                hostRunID: "host-atomic-measurement",
+                plane: "delegation" as const,
+                tool: "openfork_worker",
+              }
+              if (mode === "atomic") {
+                yield* activity.beginWithLinks({ ...common, initialLinks: links })
+              } else {
+                const admitted = yield* activity.begin(common)
+                yield* activity.linkMany(links.map((link) => ({ invocationID: admitted.invocationID, ...link })))
+              }
+            }),
+            { concurrency: 100, discard: true },
+          )
+          elapsed[mode].push(Math.round((performance.now() - start) * 100) / 100)
+        }
+      }
+      const median = (times: number[]) => {
+        const values = [...times].toSorted((a, b) => a - b)
+        return (values[1]! + values[2]!) / 2
+      }
+      console.info("OXP 100-way atomic vs separate admission (in-memory, milliseconds)", JSON.stringify({
+        ...elapsed,
+        atomicMedianMs: median(elapsed.atomic),
+        separateMedianMs: median(elapsed.separate),
+      }))
+      expect(elapsed.atomic).toHaveLength(4)
+      expect(elapsed.separate).toHaveLength(4)
     }),
   )
 

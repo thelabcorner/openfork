@@ -1,6 +1,6 @@
 export * as OxpActivity from "./activity"
 
-import { and, eq, sql } from "drizzle-orm"
+import { and, desc, eq, sql } from "drizzle-orm"
 import { Context, Effect, Layer } from "effect"
 import { OxpActivity as OxpActivityContract } from "@opencode-ai/schema/oxp-activity"
 import { Database } from "../database/database"
@@ -9,6 +9,7 @@ import { EventV2 } from "../event"
 import { OxpAttributionRevision } from "../oxp-attribution/revision"
 import { runHistoricalContextBackfillLoop } from "../oxp-attribution/backfill"
 import { OxpActivitySchema } from "./schema"
+import { generateOxpActivityTitle } from "./title"
 import { runInvocationDetailRetentionLoop } from "./retention"
 import {
   OxpCorrelationRefTable,
@@ -87,6 +88,8 @@ export interface BeginInput {
   readonly detail?: OxpActivitySchema.InvocationDetail
   readonly contextRequest?: ContextMeasurement
   readonly startedAt?: number
+  /** Initial structural links persisted in the SAME writer transaction as admission. */
+  readonly initialLinks?: readonly Omit<LinkInput, "invocationID">[]
 }
 
 export interface BeginResult {
@@ -115,17 +118,47 @@ export interface LinkInput {
   readonly label?: string
 }
 
+export interface RegisterSessionInput {
+  readonly correlation: {
+    readonly scheme: string
+    readonly digest: string
+    readonly scope: OxpActivitySchema.CorrelationScope
+  }
+  readonly title?: string
+}
+
+export interface RegisterSessionResult {
+  readonly activityID: OxpActivitySchema.ActivityID
+  readonly created: boolean
+  readonly title: string | undefined
+}
+
 export interface Interface {
   readonly begin: (input: BeginInput) => Effect.Effect<BeginResult>
+  /** Feature-detectable optimization for callers that require atomic link admission. */
+  readonly beginWithLinks: (input: BeginInput & { readonly initialLinks: readonly Omit<LinkInput, "invocationID">[] }) => Effect.Effect<BeginResult>
+  /** Only the real atomic Core implementation advertises this capability. */
+  readonly atomicInitialLinks?: true
   readonly settle: (input: SettleInput) => Effect.Effect<boolean>
   readonly link: (input: LinkInput) => Effect.Effect<void>
+  /** Atomically insert one invocation's bounded causal links with one SQLite writer acquisition. */
+  readonly linkMany: (inputs: readonly LinkInput[]) => Effect.Effect<void>
   /** Distinct host generations that still own running historical spans. */
   readonly runningHostRuns: () => Effect.Effect<readonly string[]>
   /** Settle only still-running spans owned by one proven-dead/gracefully-stopping host generation. */
   readonly interruptHostRun: (hostRunID: string, completedAt?: number) => Effect.Effect<number>
   readonly rename: (id: OxpActivitySchema.ActivityID, title: string | undefined) => Effect.Effect<boolean>
+  /** Generate and persist a title from bounded OXP tool-call evidence. */
+  readonly regenerateTitle: (id: OxpActivitySchema.ActivityID) => Effect.Effect<boolean>
   readonly archive: (id: OxpActivitySchema.ActivityID, archived: boolean) => Effect.Effect<boolean>
   readonly deleteHistory: (id: OxpActivitySchema.ActivityID) => Effect.Effect<boolean>
+  /**
+   * Find-or-create the parent activity row keyed by one pseudonymized
+   * correlation, and (re)stamp its display title. Idempotent: a repeated
+   * registration only advances recency and, when the title changed, emits one
+   * Updated event. Cheap: one indexed read plus at most two writes.
+   */
+  readonly registerSession: (input: RegisterSessionInput) => Effect.Effect<RegisterSessionResult>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/core/OxpActivity") {}
@@ -177,6 +210,15 @@ const layer = Layer.effect(
       const summary = safeSummary(input.summary)
       const detail = invocationDetail(input.detail, "request detail")
       const contextRequest = contextMeasurement(input.contextRequest, "request context")
+      if ((input.initialLinks?.length ?? 0) > 64) {
+        throw new Error("OXP initial activity link batch exceeds 64 links")
+      }
+      const initialLinks = input.initialLinks?.map((link) => ({
+        kind: link.kind,
+        ref: bounded(link.ref, MAX_LINK_REF_BYTES, "link ref")!,
+        relation: bounded(link.relation, MAX_RELATION_BYTES, "link relation")!,
+        label: bounded(link.label, MAX_LINK_LABEL_BYTES, "link label"),
+      })) ?? []
       bounded(input.correlation.scheme, 128, "correlation scheme")
       bounded(input.correlation.digest, 256, "correlation digest")
       bounded(input.hostRunID, 128, "host run ID")
@@ -281,16 +323,24 @@ const layer = Layer.effect(
                 .run()
                 .pipe(Effect.orDie)
 
-              if (detail !== undefined) {
-                yield* tx
-                  .insert(OxpInvocationDetailTable)
-                  .values({
-                    invocation_id: invocationID,
-                    request: detail,
-                  })
-                  .run()
-                  .pipe(Effect.orDie)
-              }
+                if (detail !== undefined) {
+                  yield* tx
+                    .insert(OxpInvocationDetailTable)
+                    .values({
+                      invocation_id: invocationID,
+                      request: detail,
+                    })
+                    .run()
+                    .pipe(Effect.orDie)
+                }
+
+                if (initialLinks.length > 0) {
+                  yield* tx.insert(OxpInvocationLinkTable)
+                    .values(initialLinks.map((link) => ({ invocation_id: invocationID, ...link })))
+                    .onConflictDoNothing()
+                    .run()
+                    .pipe(Effect.orDie)
+                }
 
               yield* tx
                 .update(OxpParentActivityTable)
@@ -330,7 +380,7 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       // Every inserted invocation changes attribution call counts/clustering,
       // even when the boundary measurement is unavailable.
-      OxpAttributionRevision.advance()
+      OxpAttributionRevision.advance(result.activityID)
       if (input.observedEpoch !== undefined) {
         rememberEpochSegment(epochSegmentKey(result.activityID, input.hostRunID, input.observedEpoch))
       }
@@ -356,6 +406,12 @@ const layer = Layer.effect(
           invocationID: result.invocationID,
         }),
       )
+      if (initialLinks.length > 0) {
+        yield* emit("link.added", events.publish(OxpActivityContract.Event.LinkAdded, {
+          activityID: result.activityID,
+          invocationID: result.invocationID,
+        }))
+      }
       return result
     })
 
@@ -433,7 +489,7 @@ const layer = Layer.effect(
       if (!settled) return false
       // Settlement always changes status/completion geometry read by the
       // attribution projection, regardless of whether result text was measured.
-      OxpAttributionRevision.advance()
+      OxpAttributionRevision.advance(settled)
       yield* emit(
         "updated",
         events.publish(OxpActivityContract.Event.Updated, {
@@ -479,6 +535,40 @@ const layer = Layer.effect(
             invocationID: input.invocationID,
           }),
         )
+      }
+    })
+
+    const linkMany = Effect.fn("OxpActivity.linkMany")(function* (inputs: readonly LinkInput[]) {
+      if (inputs.length === 0) return
+      if (inputs.length > 64) throw new Error("OXP activity link batch exceeds 64 links")
+      const values = inputs.map((input) => ({
+        invocation_id: input.invocationID,
+        kind: input.kind,
+        ref: bounded(input.ref, MAX_LINK_REF_BYTES, "link ref")!,
+        relation: bounded(input.relation, MAX_RELATION_BYTES, "link relation")!,
+        label: bounded(input.label, MAX_LINK_LABEL_BYTES, "link label"),
+      }))
+      // A single multi-row INSERT avoids one writer acquisition per causal
+      // link. ON CONFLICT preserves idempotency across replayed invocations.
+      const inserted = yield* db.insert(OxpInvocationLinkTable)
+        .values(values)
+        .onConflictDoNothing()
+        .returning({ invocationID: OxpInvocationLinkTable.invocation_id })
+        .all()
+        .pipe(Effect.orDie)
+      if (inserted.length === 0) return
+      // Invalidate after the whole batch is durable, once per invocation.
+      for (const invocationID of new Set(inserted.map((row) => row.invocationID))) {
+        const row = yield* db.select({ activityID: OxpInvocationTable.activity_id })
+          .from(OxpInvocationTable)
+          .where(eq(OxpInvocationTable.id, invocationID))
+          .get()
+          .pipe(Effect.orDie)
+        if (!row) continue
+        yield* emit("link.added", events.publish(OxpActivityContract.Event.LinkAdded, {
+          activityID: row.activityID,
+          invocationID,
+        }))
       }
     })
 
@@ -541,7 +631,7 @@ const layer = Layer.effect(
           { behavior: "immediate" },
         )
         .pipe(Effect.orDie)
-      if (interrupted.length > 0) OxpAttributionRevision.advance()
+      if (interrupted.length > 0) OxpAttributionRevision.advance([...new Set(interrupted.map((row) => row.activityID))])
 
       const activities = new Set<OxpActivitySchema.ActivityID>()
       for (const row of interrupted) {
@@ -570,15 +660,20 @@ const layer = Layer.effect(
           (tx) =>
             Effect.gen(function* () {
               const row = yield* tx
-                .select({ id: OxpParentActivityTable.id })
+                .select({
+                  id: OxpParentActivityTable.id,
+                  title: OxpParentActivityTable.title,
+                  userSet: OxpParentActivityTable.title_user_set,
+                })
                 .from(OxpParentActivityTable)
                 .where(eq(OxpParentActivityTable.id, id))
                 .get()
                 .pipe(Effect.orDie)
               if (!row) return false
+              if (row.title === next && row.userSet === (title !== undefined)) return false
               yield* tx
                 .update(OxpParentActivityTable)
-                .set({ title: next })
+                .set({ title: next, title_user_set: title !== undefined })
                 .where(eq(OxpParentActivityTable.id, id))
                 .run()
                 .pipe(Effect.orDie)
@@ -591,6 +686,176 @@ const layer = Layer.effect(
         yield* emit("renamed", events.publish(OxpActivityContract.Event.Updated, { activityID: id }))
       }
       return changed
+    })
+
+    const regenerateTitle = Effect.fn("OxpActivity.regenerateTitle")(function* (
+      id: OxpActivitySchema.ActivityID,
+    ) {
+      const baseline = yield* db
+        .select({ title: OxpParentActivityTable.title, userSet: OxpParentActivityTable.title_user_set })
+        .from(OxpParentActivityTable)
+        .where(eq(OxpParentActivityTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      if (!baseline) return false
+      const rows = yield* db
+        .select({
+          tool: OxpInvocationTable.tool,
+          action: OxpInvocationTable.action,
+          safeSummary: OxpInvocationTable.safe_summary,
+          request: OxpInvocationDetailTable.request,
+        })
+        .from(OxpInvocationTable)
+        .leftJoin(
+          OxpInvocationDetailTable,
+          eq(OxpInvocationDetailTable.invocation_id, OxpInvocationTable.id),
+        )
+        .where(eq(OxpInvocationTable.activity_id, id))
+        .orderBy(desc(OxpInvocationTable.time_started), desc(OxpInvocationTable.id))
+        .limit(100)
+        .all()
+        .pipe(Effect.orDie)
+      const title = generateOxpActivityTitle(rows)
+      if (!title) return false
+      const changed = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const current = yield* tx
+                .select({ title: OxpParentActivityTable.title, userSet: OxpParentActivityTable.title_user_set })
+                .from(OxpParentActivityTable)
+                .where(eq(OxpParentActivityTable.id, id))
+                .get()
+                .pipe(Effect.orDie)
+              // Do the bounded evidence read before acquiring SQLite's write
+              // lock. If a manual rename or handshake changes the title while
+              // that read is in flight, leave the newer title untouched.
+              if (!current || current.title !== baseline.title || current.userSet !== baseline.userSet) return false
+              if (current.title === title && current.userSet) return false
+              yield* tx
+                .update(OxpParentActivityTable)
+                .set({ title, title_user_set: true })
+                .where(eq(OxpParentActivityTable.id, id))
+                .run()
+                .pipe(Effect.orDie)
+              return true
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      if (changed) {
+        yield* emit("title.regenerated", events.publish(OxpActivityContract.Event.Updated, { activityID: id }))
+      }
+      return changed
+    })
+
+    const registerSession = Effect.fn("OxpActivity.registerSession")(function* (
+      input: RegisterSessionInput,
+    ) {
+      const now = Date.now()
+      bounded(input.correlation.scheme, 128, "correlation scheme")
+      bounded(input.correlation.digest, 256, "correlation digest")
+      const title = input.title === undefined ? undefined : (bounded(input.title.trim(), 256, "title") ?? undefined)
+      const changed = yield* db
+        .transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const existing = yield* tx
+                .select({ activityID: OxpCorrelationRefTable.activity_id })
+                .from(OxpCorrelationRefTable)
+                .where(
+                  and(
+                    eq(OxpCorrelationRefTable.scheme, input.correlation.scheme),
+                    eq(OxpCorrelationRefTable.digest, input.correlation.digest),
+                  ),
+                )
+                .get()
+                .pipe(Effect.orDie)
+
+              if (!existing) {
+                const activityID = OxpActivitySchema.nextActivityID()
+                yield* tx
+                  .insert(OxpParentActivityTable)
+                  .values({
+                    id: activityID,
+                    title: title ?? null,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                  })
+                  .run()
+                  .pipe(Effect.orDie)
+                yield* tx
+                  .insert(OxpCorrelationRefTable)
+                  .values({
+                    scheme: input.correlation.scheme,
+                    digest: input.correlation.digest,
+                    activity_id: activityID,
+                    scope: input.correlation.scope,
+                    first_seen_at: now,
+                    last_seen_at: now,
+                  })
+                  .onConflictDoNothing()
+                  .run()
+                  .pipe(Effect.orDie)
+                return { activityID, created: true, titleChanged: title !== undefined }
+              }
+
+              const parent = yield* tx
+                .select({
+                  title: OxpParentActivityTable.title,
+                  userSet: OxpParentActivityTable.title_user_set,
+                })
+                .from(OxpParentActivityTable)
+                .where(eq(OxpParentActivityTable.id, existing.activityID))
+                .get()
+                .pipe(Effect.orDie)
+              // Session titles refresh: a later handshake wins when it differs,
+              // which is how conversation renames propagate without a
+              // synchronization subsystem.
+              const titleChanged =
+                !parent?.userSet && title !== undefined && title !== (parent?.title ?? undefined)
+              yield* tx
+                .update(OxpParentActivityTable)
+                .set({
+                  ...(titleChanged ? { title: title! } : {}),
+                  last_seen_at: now,
+                })
+                .where(eq(OxpParentActivityTable.id, existing.activityID))
+                .run()
+                .pipe(Effect.orDie)
+              yield* tx
+                .update(OxpCorrelationRefTable)
+                .set({ last_seen_at: now })
+                .where(
+                  and(
+                    eq(OxpCorrelationRefTable.scheme, input.correlation.scheme),
+                    eq(OxpCorrelationRefTable.digest, input.correlation.digest),
+                  ),
+                )
+                .run()
+                .pipe(Effect.orDie)
+              return { activityID: existing.activityID, created: false, titleChanged }
+            }),
+          { behavior: "immediate" },
+        )
+        .pipe(Effect.orDie)
+      OxpAttributionRevision.advance(changed.activityID)
+      if (changed.created) {
+        yield* emit(
+          "created",
+          events.publish(OxpActivityContract.Event.Created, { activityID: changed.activityID }),
+        )
+      } else if (changed.titleChanged) {
+        yield* emit(
+          "updated",
+          events.publish(OxpActivityContract.Event.Updated, { activityID: changed.activityID }),
+        )
+      }
+      return {
+        activityID: changed.activityID,
+        created: changed.created,
+        title,
+      } satisfies RegisterSessionResult
     })
 
     const archive = Effect.fn("OxpActivity.archive")(function* (id: OxpActivitySchema.ActivityID, archived: boolean) {
@@ -641,7 +906,7 @@ const layer = Layer.effect(
         )
         .pipe(Effect.orDie)
       if (deleted) {
-        OxpAttributionRevision.advance()
+        OxpAttributionRevision.advance(id)
         yield* emit("removed", events.publish(OxpActivityContract.Event.Removed, { activityID: id }))
       }
       return deleted
@@ -649,14 +914,20 @@ const layer = Layer.effect(
 
     return Service.of({
       begin,
+      beginWithLinks: begin,
+      atomicInitialLinks: true,
       settle,
       link,
+      linkMany,
       runningHostRuns,
       interruptHostRun,
       rename,
+      regenerateTitle,
       archive,
       deleteHistory,
+      registerSession,
     })
+
   }),
 )
 

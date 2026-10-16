@@ -75,6 +75,7 @@ export const projectHistoricalContext = Effect.fnUntraced(function* (db: Databas
   const rows = yield* db
     .select({
       id: OxpInvocationTable.id,
+      activityID: OxpInvocationTable.activity_id,
       currentRequest: OxpInvocationTable.context_request_chars,
       currentResult: OxpInvocationTable.context_result_chars,
       requestChars: legacyRequestChars,
@@ -137,7 +138,7 @@ export const projectHistoricalContext = Effect.fnUntraced(function* (db: Databas
       { behavior: "immediate" },
     )
     .pipe(Effect.orDie)
-  if (written > 0) OxpAttributionRevision.advance()
+  if (written > 0) OxpAttributionRevision.advance([...new Set(selected.map((row) => row.activityID))])
 
   return {
     projected: written,
@@ -151,6 +152,7 @@ const runPass = (filename: string) =>
       Flock.tryAcquire(`oxp-context-backfill:${filename}`, {
         dir: join(dirname(filename), RUNTIME_LOCK_DIRNAME),
         staleMs: 60_000,
+        protectLiveProcess: true,
         signal,
       }),
     )

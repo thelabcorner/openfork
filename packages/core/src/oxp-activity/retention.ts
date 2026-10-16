@@ -133,6 +133,7 @@ const runRetentionPass = (filename: string) =>
       yield* Flock.effect(`oxp-detail-retention:${filename}`, {
         dir: join(dirname(filename), RUNTIME_LOCK_DIRNAME),
         staleMs: 60_000,
+        protectLiveProcess: true,
         timeoutMs: 100,
         baseDelayMs: 20,
         maxDelayMs: 50,

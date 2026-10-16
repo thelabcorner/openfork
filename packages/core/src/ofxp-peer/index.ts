@@ -986,7 +986,7 @@ const layer = Layer.effect(
     // independently grantable; individual operations may still impose a root
     // (for example browser visual artifacts) at their adapter boundary.
     const rootRequired = (capability: Ofxp.CapabilityClass) =>
-      capability !== "messaging" && capability !== "integrations" && capability !== "browser"
+      capability !== "messaging" && capability !== "integrations" && capability !== "browser" && capability !== "code"
 
     const allowed = (grant: Ofxp.Grant, capability: Ofxp.CapabilityClass) => {
       switch (capability) {
@@ -1003,6 +1003,8 @@ const layer = Layer.effect(
         case "requestSupervision":
         case "nestedDelegation":
           return grant[capability]
+        case "code":
+          return grant.code ?? false
         case "sessionSupervision":
           return grant.sessionSupervision === "approved-roots"
         case "delegation":

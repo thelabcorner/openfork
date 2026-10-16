@@ -1,0 +1,71 @@
+{
+  "version": 2,
+  "calibratedAt": "2026-10-06T22:09:10.821Z",
+  "source": {
+    "pairedMessages": 110495,
+    "sessions": 2137,
+    "usageRows": 118438,
+    "toolRows": 165221,
+    "target": "input+cacheRead+cacheWrite+output+reasoning",
+    "validation": "five folds partitioned by session ID"
+  },
+  "tokenizer": {
+    "encoding": "o200k_base",
+    "requestCharsPerToken": 3.325470347614613,
+    "resultCharsPerToken": 3.5742728255165748,
+    "sampledInvocations": 6174
+  },
+  "upstream": {
+    "kind": "log-split-cumulative",
+    "turnGapThresholdMs": 1500,
+    "features": [
+      "intercept",
+      "log1p(requestTokens)",
+      "log1p(resultTokens)",
+      "log1p(callCount)",
+      "log1p(cumulativeTokens)",
+      "log1p(cumulativeCalls)",
+      "log1p(turnIndex)",
+      "log1p(spanSeconds)"
+    ],
+    "coefficients": [
+      11.828164371490132,
+      0.0461454785813488,
+      -0.06094837487008761,
+      -0.04900740063514039,
+      0.3934721706976123,
+      0.0661013096371571,
+      0.1307740552307132,
+      0.030216072317984656
+    ],
+    "means": [
+      0,
+      4.77479444782225,
+      5.6426954871994734,
+      0.849023977342229,
+      11.368757881233602,
+      4.149521180920394,
+      3.738838574090005,
+      0.7112910889900048
+    ],
+    "stds": [
+      1,
+      1.1887346061331485,
+      2.1801590945653806,
+      0.27857562753458404,
+      1.2979825126863767,
+      1.2580414113181857,
+      1.3589150407387565,
+      1.1153800950319988
+    ],
+    "validation": {
+      "cvSessionWAPE": 0.2598536952610424,
+      "cvSessionMedianAPE": 0.1796777022505744,
+      "cvSessionP90APE": 0.5576172533627782,
+      "maxAbsFoldBias": 0.23429296318974302,
+      "labeledGaps": 163003,
+      "boundaryRawError": 0.011232922093458402,
+      "boundaryBalancedError": 0.01617879030853122
+    }
+  }
+}

@@ -1,4 +1,4 @@
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core"
 import type { OxpActivitySchema } from "./schema"
 
 export const OxpParentActivityTable = sqliteTable(
@@ -6,6 +6,7 @@ export const OxpParentActivityTable = sqliteTable(
   {
     id: text().$type<OxpActivitySchema.ActivityID>().primaryKey(),
     title: text(),
+    title_user_set: integer({ mode: "boolean" }).notNull().default(false),
     first_seen_at: integer().notNull(),
     last_seen_at: integer().notNull(),
     call_count: integer().notNull().default(0),
@@ -103,11 +104,5 @@ export const OxpInvocationLinkTable = sqliteTable(
       columns: [table.invocation_id, table.kind, table.ref, table.relation],
     }),
     index("oxp_invocation_link_ref_idx").on(table.kind, table.ref),
-    uniqueIndex("oxp_invocation_link_invocation_ref_idx").on(
-      table.invocation_id,
-      table.kind,
-      table.ref,
-      table.relation,
-    ),
   ],
 )
