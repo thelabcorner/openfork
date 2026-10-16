@@ -61,6 +61,9 @@ export class ComputedValue {
 
 export class PromiseNamespace {}
 
+/** Opaque callable reference for the host-mediated Code composition bridge. */
+export class HostCallReference {}
+
 export type PromiseMethodName = "all" | "allSettled" | "race" | "resolve" | "reject"
 
 export class PromiseMethodReference {
@@ -114,6 +117,7 @@ export type DiagnosticKind =
   | "InvalidToolInput"
   | "InvalidToolOutput"
   | "InvalidDataValue"
+  | "LimitExceeded"
   | "ToolCallLimitExceeded"
   | "TimeoutExceeded"
   | "ToolFailure"

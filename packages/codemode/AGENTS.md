@@ -5,6 +5,20 @@
 - Keep Code Mode unaware of host session, channel, and conversation models. The hosting application supplies trusted execution scope around it.
 - Tool schemas are the model-facing Interface. Keep arguments minimal and natural to the operation; never add unrelated IDs as ambient capability tokens.
 
+## Host-level tool-surface parity
+
+Code Mode is an **invocation entry point**, not a competing tool registry,
+domain owner, or automatic bridge into foreign Sessions. Read
+`../../docs/architecture/tool-surface-parity.md` and the root `AGENTS.md`
+before adding Code-hosted tools or changing search/describe/run semantics.
+Where a tool is supported in native Sessions, Code Mode, OXP, OFXP, ACP or
+MCP, parity requires actual authorized leaf execution with equivalent
+action contracts; displaying its schema in Code's search catalog is not
+enough. The host owns lazy activation, dispatch, grants, root/Session
+admission, cancellation, result projection, and regression tests.
+Never expand caller authority or re-export a dynamic MCP/plugin tool
+merely because Code Mode can describe or call it locally.
+
 ## OpenAPI
 
 - Generate an operation only when its transport semantics are supported; otherwise return a precise `skipped` reason.
