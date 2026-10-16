@@ -140,10 +140,10 @@ test("foreign-directory Scheduled root converges through the project Session cen
   await expect(sidebar).toBeVisible()
   const ordinaryRow = sidebar.locator(`[data-chat-tooltip-session="${ordinarySessionID}"]`)
   const scheduledRow = sidebar.locator(`[data-chat-tooltip-session="${scheduledSessionID}"]`)
-  // The sidebar intentionally projects each visible root once in Recent and
-  // once in its project group. Two is therefore the exact non-duplicate
-  // baseline; a third copy would be a real project/sandbox aggregation bug.
-  await expect(ordinaryRow).toHaveCount(2)
+  // The sidebar renders exactly one view (Recent, Projects, or Status), so each
+  // visible root appears once. A second copy would be a real project/sandbox
+  // aggregation bug or a regression to the old duplicated Recent + project tree.
+  await expect(ordinaryRow).toHaveCount(1)
   await expect(scheduledRow).toHaveCount(0)
 
   expect(projectCatalogRequests).toBeGreaterThan(0)

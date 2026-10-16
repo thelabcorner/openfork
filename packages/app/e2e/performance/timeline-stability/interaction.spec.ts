@@ -208,6 +208,8 @@ test("expands and collapses a long completed shell without overlap", async ({ pa
   })
   const trigger = page.locator(`[data-timeline-part-id="${shellID}"] [data-slot="collapsible-trigger"]`)
   await waitForVisualSettle(page, [`[data-timeline-part-id="${shellID}"]`, `[data-timeline-part-id="${followingID}"]`])
+  await trigger.scrollIntoViewIfNeeded()
+  await waitForVisualSettle(page, [`[data-timeline-part-id="${shellID}"]`, `[data-timeline-part-id="${followingID}"]`], 8)
   const regions = defineVisualRegions({
     shell: { selector: `[data-timeline-part-id="${shellID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
     following: { selector: `[data-timeline-part-id="${followingID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
@@ -216,22 +218,22 @@ test("expands and collapses a long completed shell without overlap", async ({ pa
     { type: "required", regions: ["shell", "following"] },
     { type: "unique", regions: ["shell", "following"] },
     { type: "stable", regions: ["shell", "following"] },
+    { type: "fixed", regions: ["shell"], tolerance: 1 },
     { type: "opacity", regions: "all" },
     { type: "continuity", regions: "all" },
     { type: "motion", regions: "all", maxPositionReversals: 0 },
     { type: "label-stability", regions: "all" },
-    { type: "preserve-bottom-anchor" },
     { type: "flow", regions: ["shell", "following"] },
   ])
   await startVisualProbe(page, regions)
-  await trigger.click()
+  await trigger.evaluate((element: HTMLElement) => element.click())
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await page.waitForTimeout(500)
   const expanded = await stopVisualProbe<keyof typeof regions>(page)
   await reportVisualStability(testInfo, "shell-expand", expanded, plan)
 
   await startVisualProbe(page, regions)
-  await trigger.click()
+  await trigger.evaluate((element: HTMLElement) => element.click())
   await expect(trigger).toHaveAttribute("aria-expanded", "false")
   await page.waitForTimeout(500)
   const collapsed = await stopVisualProbe<keyof typeof regions>(page)
@@ -263,6 +265,8 @@ test("expands and collapses a completed context group without overlap", async ({
   })
   const trigger = page.locator(`${group} [data-slot="collapsible-trigger"]`)
   await waitForVisualSettle(page, [group, `[data-timeline-part-id="${followingID}"]`])
+  await trigger.scrollIntoViewIfNeeded()
+  await waitForVisualSettle(page, [group, `[data-timeline-part-id="${followingID}"]`], 8)
   for (const [name, expanded] of [
     ["context-expand", true],
     ["context-collapse", false],
@@ -276,7 +280,9 @@ test("expands and collapses a completed context group without overlap", async ({
       },
     })
     await startVisualProbe(page, regions)
-    await trigger.click()
+    // This oracle measures the accordion's motion, not Playwright's own
+    // scroll-into-view behavior. Stage the trigger above and click in place.
+    await trigger.evaluate((element: HTMLElement) => element.click())
     await expect(trigger).toHaveAttribute("aria-expanded", String(expanded))
     await page.waitForTimeout(500)
     const trace = await stopVisualProbe<keyof typeof regions>(page)
@@ -288,11 +294,13 @@ test("expands and collapses a completed context group without overlap", async ({
         { type: "required", regions: ["context", "following"] },
         { type: "unique", regions: ["context", "following"] },
         { type: "stable", regions: ["context", "following"] },
+        // An explicit inspection gesture pauses follow-latest and keeps the
+        // clicked heading at its screen coordinate as the body changes size.
+        { type: "fixed", regions: ["context"], tolerance: 1 },
         { type: "opacity", regions: "all" },
         { type: "continuity", regions: "all" },
         { type: "motion", regions: "all", maxPositionReversals: 0 },
         { type: "label-stability", regions: "all" },
-        { type: "preserve-bottom-anchor" },
         { type: "flow", regions: ["context", "following"] },
       ]),
     )
@@ -329,15 +337,20 @@ test("expands and collapses an edit diff without moving twice", async ({ page },
     settings: { editToolPartsExpanded: false },
     cpuRate: 4,
     seedHistory: true,
+    // Completed/static diff: no SSE event is consumed. The visual regression
+    // must not fail setup waiting for a transport connection it never uses.
+    waitForConnection: false,
   })
   const trigger = page.locator(`[data-timeline-part-id="${editID}"] [data-slot="collapsible-trigger"]`).first()
   await waitForVisualSettle(page, [`[data-timeline-part-id="${editID}"]`, `[data-timeline-part-id="${followingID}"]`])
+  await trigger.scrollIntoViewIfNeeded()
+  await waitForVisualSettle(page, [`[data-timeline-part-id="${editID}"]`, `[data-timeline-part-id="${followingID}"]`], 8)
   const regions = defineVisualRegions({
     edit: { selector: `[data-timeline-part-id="${editID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
     following: { selector: `[data-timeline-part-id="${followingID}"]`, closest: '[data-timeline-row="AssistantPart"]' },
   })
   await startVisualProbe(page, regions)
-  await trigger.click()
+  await trigger.evaluate((element: HTMLElement) => element.click())
   await expect(trigger).toHaveAttribute("aria-expanded", "true")
   await page.waitForTimeout(900)
   const trace = await stopVisualProbe<keyof typeof regions>(page)
@@ -349,11 +362,13 @@ test("expands and collapses an edit diff without moving twice", async ({ page },
       { type: "required", regions: ["edit", "following"] },
       { type: "unique", regions: ["edit", "following"] },
       { type: "stable", regions: ["edit", "following"] },
+      { type: "fixed", regions: ["edit"], tolerance: 1 },
       { type: "opacity", regions: "all" },
       { type: "continuity", regions: "all" },
       { type: "motion", regions: "all", maxPositionReversals: 0, maxReversals: 1 },
       { type: "label-stability", regions: "all" },
-      { type: "preserve-bottom-anchor" },
+      // Opening a tool is intentional inspection, not live-tail following.
+      // The clicked diff heading must stay stable instead of forcing bottom.
       { type: "flow", regions: ["edit", "following"] },
     ]),
   )

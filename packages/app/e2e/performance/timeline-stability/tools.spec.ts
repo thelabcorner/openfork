@@ -107,7 +107,7 @@ test.describe("timeline tool state stability", () => {
     await expect(page.locator(`[data-timeline-part-id="${questionID}"]`)).toContainText("Keep it stable")
     await expect(page.locator(`[data-timeline-part-id="${todoID}"]`)).toHaveCount(0)
     await expect(
-      page.locator(`a[href$="/session/${childID}"]`, { has: page.locator('[data-component="task-tool-card"]') }),
+      page.locator(`a[data-slot="collapsible-trigger"][href$="/session/${childID}"]`),
     ).toBeVisible()
     await expect(page.getByRole("button", { name: /Exa Web Search/ })).toBeVisible()
   })

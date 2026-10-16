@@ -70,6 +70,7 @@ async function runTimelineStreamBenchmark(page: Page, options: TimelineStreamOpt
 
   const profile = await startTimelineProfile(page, { cpuThrottle, profileCPU })
   await installTimelineStreamProbe(page, { textPartID, finalIndex: deltaCount, profileVisual, minimal })
+  const projectionScansBeforeStream = await collectProjectionScans(page)
   const deltas = buildStreamDeltaEvents(deltaCount)
   await startTimelineStreamProbe(page)
   fixture.transport.enqueue(deltas)
@@ -99,7 +100,16 @@ async function runTimelineStreamBenchmark(page: Page, options: TimelineStreamOpt
     finalIndex: deltaCount,
     navigations: benchmarkDiagnostics(page).navigations,
   })
+  const projectionScansAfterStream = await collectProjectionScans(page)
   const phaseTrace = await collectPhaseTraceSummary(page)
+  const contentOnlyProjectionScanRows = projectionScansAfterStream.totalRows - projectionScansBeforeStream.totalRows
+  const contentOnlySessionStructureRows =
+    projectionScansAfterStream.byPass["session-structure"] -
+    projectionScansBeforeStream.byPass["session-structure"]
+  expect(
+    contentOnlySessionStructureRows,
+    "content-only deltas must not traverse the complete structural session history",
+  ).toBe(0)
   const delivered = deltas.length - fixture.transport.pendingCount()
   await profile.stop()
 
@@ -110,6 +120,8 @@ async function runTimelineStreamBenchmark(page: Page, options: TimelineStreamOpt
       endToEndInitialContentObservedMs: initialContentObservedMs,
       ...metrics,
       phaseTrace,
+      contentOnlyProjectionScanRows,
+      contentOnlySessionStructureRows,
       deliveredDeltas: delivered,
       pendingDeltas: fixture.transport.pendingCount(),
     },
@@ -128,6 +140,30 @@ async function runTimelineStreamBenchmark(page: Page, options: TimelineStreamOpt
 
   await profile.reset()
   return result
+}
+
+async function collectProjectionScans(page: Page) {
+  return page.evaluate(() => {
+    type Pass = "messages" | "assistant-parents" | "session-structure" | "context-structure" | "group-turns"
+    type Window = { projectionScanRows: number; projectionScanRowsByPass: Partial<Record<Pass, number>> }
+    type Snapshot = { windows: Window[]; current: Window }
+    const snapshot = (window as Window & { __opencodePhaseTrace?: () => Snapshot }).__opencodePhaseTrace?.()
+    if (!snapshot) throw new Error("phase trace is unavailable for projection scan accounting")
+    const windows = [...snapshot.windows, snapshot.current]
+    const byPass: Record<Pass, number> = {
+      messages: 0,
+      "assistant-parents": 0,
+      "session-structure": 0,
+      "context-structure": 0,
+      "group-turns": 0,
+    }
+    let totalRows = 0
+    for (const value of windows) {
+      totalRows += value.projectionScanRows
+      for (const pass of Object.keys(byPass) as Pass[]) byPass[pass] += value.projectionScanRowsByPass[pass] ?? 0
+    }
+    return { totalRows, byPass }
+  })
 }
 
 async function collectPhaseTraceSummary(page: Page) {
@@ -170,6 +206,8 @@ async function collectPhaseTraceSummary(page: Page) {
       projectionMs: number
       projectionRuns: number
       projectionTurns: number
+      projectionScanRows: number
+      projectionScanRowsByPass: Record<string, number>
       rowsBuilt: number
       rowsMs: number
       slowRows: number
@@ -198,6 +236,15 @@ async function collectPhaseTraceSummary(page: Page) {
       projectionMs: sum((value) => value.projectionMs),
       projectionRuns: sum((value) => value.projectionRuns),
       projectionTurnsMax: max((value) => value.projectionTurns),
+      projectionScanRows: sum((value) => value.projectionScanRows),
+      projectionScanRowsByPass: Object.fromEntries(
+        windows.reduce((total, value) => {
+          for (const [pass, rows] of Object.entries(value.projectionScanRowsByPass)) {
+            total.set(pass, (total.get(pass) ?? 0) + rows)
+          }
+          return total
+        }, new Map<string, number>()),
+      ),
       rowsBuilt: sum((value) => value.rowsBuilt),
       rowsMs: sum((value) => value.rowsMs),
       slowRows: sum((value) => value.slowRows),
