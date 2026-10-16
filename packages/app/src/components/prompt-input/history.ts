@@ -4,6 +4,13 @@ import type { SelectedLineRange } from "@/context/file"
 const DEFAULT_PROMPT: Prompt = [{ type: "text", content: "", start: 0, end: 0 }]
 
 export const MAX_HISTORY = 100
+// Prompt history is persisted into a shared user-data store. A count-only cap
+// still permits a few enormous pasted prompts to make every later store write
+// serialize megabytes of unrelated state. Keep both one entry and the full
+// retained history bounded; the units are UTF-16 code units, which is a cheap
+// conservative proxy for the JSON payload size.
+export const MAX_HISTORY_ENTRY_CHARS = 256_000
+export const MAX_HISTORY_TOTAL_CHARS = 1_000_000
 
 export type PromptHistoryComment = {
   id: string
@@ -97,9 +104,43 @@ export function prependHistoryEntry(
     prompt: clonePromptParts(prompt),
     comments: clonePromptHistoryComments(comments),
   } satisfies PromptHistoryEntry
+  if (historyEntrySize(entry) > MAX_HISTORY_ENTRY_CHARS) return entries
   const last = entries[0]
   if (last && isPromptEqual(last, entry)) return entries
-  return [entry, ...entries].slice(0, max)
+  return boundPromptHistory([entry, ...entries], max)
+}
+
+function historyEntrySize(entry: PromptHistoryStoredEntry) {
+  try {
+    return JSON.stringify(entry).length
+  } catch {
+    return MAX_HISTORY_ENTRY_CHARS + 1
+  }
+}
+
+/** Keep newest entries while bounding their serialized footprint. */
+export function boundPromptHistory(entries: PromptHistoryStoredEntry[], max = MAX_HISTORY) {
+  if (max <= 0) return []
+  const result: PromptHistoryStoredEntry[] = []
+  let size = 0
+  for (const entry of entries) {
+    const entrySize = historyEntrySize(entry)
+    if (entrySize > MAX_HISTORY_ENTRY_CHARS || size + entrySize > MAX_HISTORY_TOTAL_CHARS) continue
+    result.push(entry)
+    size += entrySize
+    if (result.length >= max) break
+  }
+  return result
+}
+
+/** Migration hook for older count-only histories, including oversized legacy stores. */
+export function migratePromptHistory(value: unknown): unknown {
+  if (!value || typeof value !== "object" || !("entries" in value)) return value
+  const entries = (value as { entries?: unknown }).entries
+  if (!Array.isArray(entries)) return value
+  const bounded = boundPromptHistory(entries as PromptHistoryStoredEntry[])
+  if (bounded.length === entries.length && bounded.every((entry, index) => entry === entries[index])) return value
+  return { ...(value as Record<string, unknown>), entries: bounded }
 }
 
 function isCommentEqual(commentA: PromptHistoryComment, commentB: PromptHistoryComment) {

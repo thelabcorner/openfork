@@ -26,8 +26,10 @@ import {
   AgentPart,
   ExternalPathPart,
   FileAttachmentPart,
+  ToolPart,
 } from "@/context/prompt"
 import { useLayout } from "@/context/layout"
+import { useSettings } from "@/context/settings"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { isSubagentMentionableAgent } from "@/context/local-agent"
@@ -51,6 +53,7 @@ import { ModelSelectorPopover, ModelSelectorPopoverV2 } from "@/components/dialo
 import { DialogSelectModelUnpaid } from "@/components/dialog-select-model-unpaid"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 import { useCommand } from "@/context/command"
+import { getFilename } from "@opencode-ai/core/util/path"
 import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
@@ -58,6 +61,7 @@ import { createSessionTabs } from "@/pages/session/helpers"
 import { createTextFragment, getCursorPosition, setCursorPosition, setRangeEdge } from "./prompt-input/editor-dom"
 import { createPromptAttachments } from "./prompt-input/attachments"
 import { createAtMentionSearch, toMentionOptions } from "./prompt-input/at-mention-search"
+import { toToolOptions } from "./prompt-input/tool-mentions"
 import { resolveAtToken } from "./prompt-input/at-token"
 import {
   createExternalPathFetch,
@@ -86,6 +90,7 @@ import {
   type PromptInputSubmission,
 } from "./prompt-input/contracts"
 import { createPromptSubmit } from "./prompt-input/submit"
+import { useServerSync } from "@/context/server-sync"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
 import { PromptContextItems } from "./prompt-input/context-items"
 import { PromptImageAttachments } from "./prompt-input/image-attachments"
@@ -93,6 +98,7 @@ import { PromptDragOverlay } from "./prompt-input/drag-overlay"
 import { promptPlaceholder } from "./prompt-input/placeholder"
 import { createPromptInputTransientState } from "./prompt-input/transient-state"
 import { showToast } from "@/utils/toast"
+import { formatServerError } from "@/utils/server-errors"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 
@@ -129,6 +135,8 @@ const EXAMPLES = [
 
 export const PromptInput: Component<PromptInputProps> = (props) => {
   const sdk = useSDK()
+  const settings = useSettings()
+  const serverSync = useServerSync()
 
   const sync = useSync()
   const files = useFile()
@@ -613,6 +621,19 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       addPart({ type: "agent", name: option.name, content: "@" + option.name, start: 0, end: 0 })
       return
     }
+    if (option.type === "tool") {
+      addPart({
+        type: "tool",
+        name: option.name,
+        content: "@" + option.name,
+        start: 0,
+        end: 0,
+        ...(option.description ? { description: option.description } : {}),
+        ...(option.exposure ? { exposure: option.exposure } : {}),
+        ...(option.source ? { source: option.source } : {}),
+      })
+      return
+    }
     if (option.type === "reference") {
       addPart({
         type: "file",
@@ -687,6 +708,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const atKey = (x: AtOption | undefined) => {
     if (!x) return ""
     if (x.type === "agent") return `agent:${x.name}`
+    if (x.type === "tool") return `tool:${x.name}`
     if (x.type === "reference") return `reference:${x.name}`
     if (x.type === "resource") return `resource:${x.client}:${x.uri}`
     if (x.type === "symbol") return `symbol:${x.path}:${x.line}:${x.name}`
@@ -710,6 +732,29 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   }
   const externalSearch = createExternalPathMentionSearch(externalFetch)
 
+  // Tool mentions resolve dynamically from the server tool catalog (default +
+  // lazy tools, permission-filtered) so the popover never hardcodes tool ids.
+  // Fetched once per provider/model/session; failure closes over an empty list.
+  const [toolOptions, setToolOptions] = createSignal<AtOption[]>([])
+  let toolCatalogKey: string | undefined
+  const ensureToolOptions = () => {
+    const selection = props.controls.model.selection.current()
+    const provider = selection?.provider?.id
+    const model = selection?.id
+    if (!provider || !model) return
+    const sessionID = props.controls.session.id
+    const key = `${provider}|${model}|${sessionID ?? ""}`
+    if (toolCatalogKey === key) return
+    toolCatalogKey = key
+    void sdk()
+      .client.tool.catalog(
+        { directory: sdk().directory, provider, model, ...(sessionID ? { sessionID } : {}) },
+        { throwOnError: false },
+      )
+      .then((response) => setToolOptions(toToolOptions(response.data ?? [])))
+      .catch(() => setToolOptions([]))
+  }
+
   const routeAtSearch = (token: string) => {
     if (splitExternalToken(token)) {
       atSearch.onInput("")
@@ -732,10 +777,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     items: (query) => {
       const references = referenceList()
       const agents = agentList()
+      const tools = toolOptions()
       const mcpResources = mcpResourceList()
       const open = recent()
       const pinned: AtOption[] = open.map((path) => ({ type: "file", path, display: path, recent: true }))
-      if (!query.trim()) return [...references, ...agents, ...mcpResources, ...pinned]
+      if (!query.trim()) return [...references, ...agents, ...tools, ...mcpResources, ...pinned]
       if (splitExternalToken(query)) {
         return [
           ...references,
@@ -756,7 +802,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       // Server results arrive pre-ranked (files, folders, symbols interleaved);
       // skipFilter keeps them in server order instead of re-running fuzzysort.
       const remote = toMentionOptions(atSearch.results(), open)
-      return [...references, ...agents, ...mcpResources, ...pinned, ...remote]
+      return [...references, ...agents, ...tools, ...mcpResources, ...pinned, ...remote]
     },
     key: atKey,
     filterKeys: ["display"],
@@ -765,6 +811,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     groupBy: (item) => {
       if (item.type === "reference") return "reference"
       if (item.type === "agent") return "agent"
+      if (item.type === "tool") return "tool"
       if (item.type === "resource") return "resource"
       if (item.type === "symbol") return "symbol"
       if (item.type === "external") return "external"
@@ -775,11 +822,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const rank = (category: string) => {
         if (category === "reference") return 0
         if (category === "agent") return 1
-        if (category === "resource") return 2
-        if (category === "recent") return 3
-        if (category === "file") return 4
-        if (category === "symbol") return 5
-        return 6
+        if (category === "tool") return 2
+        if (category === "resource") return 3
+        if (category === "recent") return 4
+        if (category === "file") return 5
+        if (category === "symbol") return 6
+        return 7
       }
       return rank(a.category) - rank(b.category)
     },
@@ -856,7 +904,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onSelect: handleSlashSelect,
   })
 
-  const createPill = (part: FileAttachmentPart | AgentPart | ExternalPathPart) => {
+  const createPill = (part: FileAttachmentPart | AgentPart | ToolPart | ExternalPathPart) => {
     const pill = document.createElement("span")
     pill.textContent = part.content
     pill.setAttribute("data-type", part.type)
@@ -878,6 +926,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (part.status) pill.setAttribute("data-status", part.status)
     }
     if (part.type === "agent") pill.setAttribute("data-name", part.name)
+    if (part.type === "tool") pill.setAttribute("data-name", part.name)
     pill.setAttribute("contenteditable", "false")
     pill.style.userSelect = "text"
     pill.style.cursor = "default"
@@ -900,6 +949,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const el = node as HTMLElement
       if (el.dataset.type === "file") return true
       if (el.dataset.type === "agent") return true
+      if (el.dataset.type === "tool") return true
       if (el.dataset.type === "external-path") return true
       return el.tagName === "BR"
     })
@@ -911,7 +961,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         editorRef.appendChild(createTextFragment(part.content))
         continue
       }
-      if (part.type === "file" || part.type === "agent" || part.type === "external-path") {
+      if (part.type === "file" || part.type === "agent" || part.type === "tool" || part.type === "external-path") {
         editorRef.appendChild(createPill(part))
       }
     }
@@ -1071,6 +1121,18 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       position += content.length
     }
 
+    const pushTool = (pill: HTMLElement) => {
+      const content = pill.textContent ?? ""
+      parts.push({
+        type: "tool",
+        name: pill.dataset.name!,
+        content,
+        start: position,
+        end: position + content.length,
+      })
+      position += content.length
+    }
+
     const pushExternalPath = (pill: HTMLElement) => {
       const content = pill.textContent ?? ""
       parts.push({
@@ -1101,6 +1163,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (el.dataset.type === "agent") {
         flushText()
         pushAgent(el)
+        return
+      }
+      if (el.dataset.type === "tool") {
+        flushText()
+        pushTool(el)
         return
       }
       if (el.dataset.type === "external-path") {
@@ -1166,8 +1233,22 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (atToken) {
         atOnInput(atToken.token)
         routeAtSearch(atToken.token)
+        ensureToolOptions()
         setStore({ popover: "at", slashMenu: false, slashMenuQuery: "" })
       } else if (slashMatch) {
+        const directory = sdk().directory
+        const sessionID = props.controls.session.id
+        void serverSync().commands
+          .ensure(directory, {
+            isCurrent: () => sdk().directory === directory && (!sessionID || props.controls.session.id === sessionID),
+          })
+          .catch((err) => {
+            showToast({
+              variant: "error",
+              title: language.t("toast.project.reloadFailed.title", { project: getFilename(directory) }),
+              description: formatServerError(err, language.t),
+            })
+          })
         slashOnInput(slashMatch[1])
         setStore({ popover: "slash", slashMenu: false, slashMenuQuery: "" })
       } else {
@@ -1200,7 +1281,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const range = selection.getRangeAt(0)
     if (!editorRef.contains(range.startContainer)) return false
 
-    if (part.type === "file" || part.type === "agent" || part.type === "external-path") {
+    if (part.type === "file" || part.type === "agent" || part.type === "tool" || part.type === "external-path") {
       const cursorPosition = getCursorPosition(editorRef)
       const rawText = prompt
         .current()
@@ -1383,10 +1464,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     createPromptSubmit({
       prompt,
       info,
-      imageAttachments,
       commentCount,
-      autoAccept: () => accepting(),
-      mode: () => store.mode,
+       autoAccept: () => accepting(),
+       correctBeforeSubmit: () => settings.general.promptAutocorrection() && !settings.general.promptRevision()?.autoBeforeSend,
+       correctionIgnoredWords: () => settings.general.promptAutocorrectionIgnore(),
+       correctionUserReplacements: () => settings.general.promptAutocorrectionCustom(),
+       mode: () => store.mode,
       working,
       editor: () => editorRef,
       queueScroll,

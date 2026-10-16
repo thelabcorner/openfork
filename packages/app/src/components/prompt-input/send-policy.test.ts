@@ -98,6 +98,32 @@ describe("Prompt Input V2 send policy", () => {
     ).toBe("stop")
   })
 
+  test("interrupted sessions require explicit stop recovery before any prompt or question action", () => {
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: false,
+        canSubmit: true,
+        hasRevisableText: true,
+        autoReviseBeforeSending: true,
+        revisionBusy: false,
+        recoveryRequired: true,
+      }),
+    ).toBe("stop")
+    expect(
+      resolvePromptPrimaryAction({
+        mode: "normal",
+        working: false,
+        canSubmit: true,
+        hasRevisableText: true,
+        autoReviseBeforeSending: false,
+        revisionBusy: false,
+        recoveryRequired: true,
+        questionActive: true,
+      }),
+    ).toBe("stop")
+  })
+
   test("drafts typed during a generation remain sendable while stop moves to the menu", () => {
     expect(
       resolvePromptPrimaryAction({

@@ -1,4 +1,5 @@
 import { checksum } from "@opencode-ai/core/util/encode"
+import { snapshotPrompt } from "./prompt-snapshot"
 import type { FilePartSource } from "@opencode-ai/sdk/v2/client"
 import { batch, createMemo, type Accessor } from "solid-js"
 import { createStore, type SetStoreFunction } from "solid-js/store"
@@ -7,6 +8,7 @@ import { Persist, persisted } from "@/utils/persist"
 import type { ServerScope } from "@/utils/server-scope"
 import type { BlobReference } from "@/utils/draft-store"
 import type { Platform } from "@/context/platform"
+import type { Info as ProviderRouteIntentInfo } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 interface PartBase {
   content: string
@@ -78,6 +80,7 @@ export type PromptModel = {
   providerID: string
   modelID: string
   variant?: string | null
+  routeIntent?: ProviderRouteIntentInfo
 }
 
 export type FileContextItem = {
@@ -150,27 +153,7 @@ export function isPromptEqual(promptA: Prompt, promptB: Prompt): boolean {
   return true
 }
 
-function cloneSelection(selection?: FileSelection) {
-  if (!selection) return undefined
-  return { ...selection }
-}
-
-function clonePart(part: ContentPart): ContentPart {
-  if (part.type === "text") return { ...part }
-  if (part.type === "image") return { ...part }
-  if (part.type === "agent") return { ...part }
-  if (part.type === "skill") return { ...part }
-  if (part.type === "tool") return { ...part }
-  if (part.type === "external-path") return { ...part }
-  return {
-    ...part,
-    selection: cloneSelection(part.selection),
-  }
-}
-
-function clonePrompt(prompt: Prompt): Prompt {
-  return prompt.map(clonePart)
-}
+const clonePrompt = snapshotPrompt
 
 function contextItemKey(item: ContextItem) {
   if (item.type !== "file") return item.type

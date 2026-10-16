@@ -3,6 +3,9 @@ import type { Prompt } from "@/context/prompt"
 import {
   canNavigateHistoryAtCursor,
   clonePromptParts,
+  MAX_HISTORY_ENTRY_CHARS,
+  MAX_HISTORY_TOTAL_CHARS,
+  migratePromptHistory,
   normalizePromptHistoryEntry,
   navigatePromptHistory,
   prependHistoryEntry,
@@ -39,6 +42,28 @@ describe("prompt-input history", () => {
 
     const dedupedComments = prependHistoryEntry(commentsOnly, DEFAULT_PROMPT, [comment("c1")])
     expect(dedupedComments).toBe(commentsOnly)
+  })
+
+  test("prompt history stays within entry and aggregate persistence budgets", () => {
+    const tooLarge = prependHistoryEntry([], text("x".repeat(MAX_HISTORY_ENTRY_CHARS + 1)))
+    expect(tooLarge).toEqual([])
+
+    const oversizedLegacy = {
+      entries: [text("newest"), text("x".repeat(MAX_HISTORY_TOTAL_CHARS)), text("older")],
+      retained: true,
+    }
+    const migrated = migratePromptHistory(oversizedLegacy) as { entries: Prompt[]; retained: boolean }
+    expect(migrated.retained).toBe(true)
+    expect(migrated.entries).toHaveLength(2)
+    expect(migrated.entries[0]).toEqual(text("newest"))
+    expect(migrated.entries[1]).toEqual(text("older"))
+
+    const many = Array.from({ length: 100 }, (_, index) => text(`${index}:` + "x".repeat(20_000)))
+    const bounded = migratePromptHistory({ entries: many }) as { entries: Prompt[] }
+    const serializedSize = bounded.entries.reduce((total, entry) => total + JSON.stringify(entry).length, 0)
+    expect(serializedSize).toBeLessThanOrEqual(MAX_HISTORY_TOTAL_CHARS)
+    expect(bounded.entries.length).toBeLessThan(many.length)
+    expect(migratePromptHistory({ entries: [text("small")] })).toEqual({ entries: [text("small")] })
   })
 
   test("navigatePromptHistory restores saved prompt when moving down from newest", () => {

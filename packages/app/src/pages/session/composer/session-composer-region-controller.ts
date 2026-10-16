@@ -7,6 +7,7 @@ import { useSync } from "@/context/sync"
 import { getSessionHandoff, setSessionHandoff } from "@/pages/session/handoff"
 import { createSessionQuestionController } from "./question-controller"
 import type { SessionComposerController } from "./session-composer-state"
+import { isReadOnlyChild, showsSessionComposer } from "./human-interjection"
 
 export type SessionComposerFollowupDock = {
   items: { id: string; text: string }[]
@@ -108,10 +109,11 @@ export function createSessionComposerRegionController(input: {
 
   onCleanup(clear)
 
-  const parentID = createMemo(() => {
+  const session = createMemo(() => {
     const id = input.sessionID()
-    return id ? sync().session.get(id)?.parentID : undefined
+    return id ? sync().session.get(id) : undefined
   })
+  const parentID = () => session()?.parentID
   const open = createMemo(() => store.ready && input.state.dock() && !input.state.closing())
   const progress = useSpring(
     () => (open() ? 1 : 0),
@@ -133,8 +135,8 @@ export function createSessionComposerRegionController(input: {
     setPromptRef: input.setPromptRef,
     setDockRef: input.setDockRef,
     parentID,
-    child: () => !!parentID(),
-    showComposer: () => !input.state.permissionRequest() || !!parentID(),
+    child: () => isReadOnlyChild(session()),
+    showComposer: () => showsSessionComposer(session(), !!input.state.permissionRequest()),
     handoffPrompt: () => getSessionHandoff(input.sessionKey())?.prompt,
     promptReady: input.prompt.ready,
     dock: () => (store.ready && input.state.dock()) || value() > 0.001,

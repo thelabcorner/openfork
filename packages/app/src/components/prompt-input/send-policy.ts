@@ -18,8 +18,12 @@ export function resolvePromptPrimaryAction(input: {
   autoReviseBeforeSending: boolean
   revisionBusy: boolean
   revisionReadyForSend?: boolean
+  recoveryRequired?: boolean
   questionActive?: boolean
 }): PromptPrimaryAction {
+  // A crashed execution can leave its durable generation fenced. Recovery must
+  // happen before answering a stale question or admitting another prompt.
+  if (input.recoveryRequired) return "stop"
   // A pending question temporarily owns the composer. Its answer path is
   // intentionally direct: no prompt-revision, queue, or stop semantics are
   // allowed to steal the primary from the question controller.

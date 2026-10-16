@@ -13,6 +13,7 @@ const sessionCreateInputs: Array<{
   location?: { directory: string }
 }> = []
 const enabledAutoAccept: Array<{ server: string; sessionID: string; directory: string }> = []
+const synchronizedAutoAccept: Array<{ server: string; sessionID: string; directory: string }> = []
 const optimistic: Array<{
   directory?: string
   sessionID?: string
@@ -32,15 +33,27 @@ const sentPrompts: string[] = []
 const promptInputs: unknown[] = []
 const sentCommands: unknown[] = []
 const commands: Array<{ name: string }> = []
+const commandCatalogLoads: string[] = []
 let serverSessionSyncs = 0
+let delegatedWorker:
+  | {
+      humanInterjection: boolean
+      parentID: string
+      agent: string
+      model: { id: string; providerID: string; variant: string }
+    }
+  | undefined
 
 let params: { id?: string } = {}
 let search: { draftId?: string } = {}
 let selected = "/repo/worktree-a"
 let variant: string | undefined
 let permissionServer = "server-a"
+let synchronizeAutoAcceptResult = true
 let createSessionGate: Promise<void> | undefined
 let createSessionDirectory: ((requested: string) => string) | undefined
+let resolvedSessionInfo: { id: string; title?: string; directory?: string } | undefined
+const resolvedSessions: Array<{ sessionID: string; priority?: string }> = []
 
 let promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 const [promptStore, setPromptStore] = createStore<PromptStore>({
@@ -138,6 +151,7 @@ beforeAll(async () => {
   mock.module("@opencode-ai/ui/toast", () => ({
     Toast: { Region: () => null },
     showToast: () => 0,
+    toaster: { show: () => 0, dismiss: () => undefined, promise: () => 0 },
   }))
 
   mock.module("@opencode-ai/core/util/encode", () => ({
@@ -163,8 +177,15 @@ beforeAll(async () => {
 
   mock.module("@/context/permission", () => {
     const state = (server: string) => ({
+      initializeAutoAccept(sessionID: string, directory: string, enabled: boolean) {
+        if (enabled) enabledAutoAccept.push({ server, sessionID, directory })
+      },
       enableAutoAccept(sessionID: string, directory: string) {
         enabledAutoAccept.push({ server, sessionID, directory })
+      },
+      async synchronizeAutoAccept(sessionID: string, directory: string) {
+        synchronizedAutoAccept.push({ server, sessionID, directory })
+        return synchronizeAutoAcceptResult
       },
     })
     return { usePermission: () => ({ currentServerState: () => state(permissionServer) }) }
@@ -215,6 +236,7 @@ beforeAll(async () => {
     useSync: () => () => ({
       data: { command: commands },
       session: {
+        get: (sessionID: string) => ({ id: sessionID, projectID: "project", ...delegatedWorker }),
         optimistic: {
           add: (value: {
             directory?: string
@@ -237,8 +259,24 @@ beforeAll(async () => {
 
   mock.module("@/context/server-sync", () => ({
     useServerSync: () => () => ({
+      commands: {
+        ensure: async (directory: string) => {
+          commandCatalogLoads.push(directory)
+          return commands
+        },
+      },
       session: {
-        remember: () => undefined,
+        resolve: async (sessionID: string, options?: { priority?: string }) => {
+          resolvedSessions.push({ sessionID, priority: options?.priority })
+          if (!resolvedSessionInfo) throw new Error(`Session not found: ${sessionID}`)
+          return { projectID: "project", ...resolvedSessionInfo }
+        },
+        remember: (info: { id: string; title?: string; directory?: string }) => {
+          if (!info.directory) return
+          storedSessions[info.directory] ??= []
+          if (!storedSessions[info.directory].some((item) => item.id === info.id))
+            storedSessions[info.directory].push({ id: info.id, title: info.title })
+        },
         set: () => undefined,
         sync: async () => {
           serverSessionSyncs++
@@ -286,6 +324,7 @@ beforeEach(() => {
   createdSessions.length = 0
   sessionCreateInputs.length = 0
   enabledAutoAccept.length = 0
+  synchronizedAutoAccept.length = 0
   optimistic.length = 0
   optimisticSeeded.length = 0
   promoted.length = 0
@@ -293,6 +332,7 @@ beforeEach(() => {
   sentPrompts.length = 0
   promptInputs.length = 0
   sentCommands.length = 0
+  commandCatalogLoads.length = 0
   commands.length = 0
   promptValue = [{ type: "text", content: "ls", start: 0, end: 2 }]
   params = {}
@@ -302,19 +342,98 @@ beforeEach(() => {
   selected = "/repo/worktree-a"
   variant = undefined
   permissionServer = "server-a"
+  synchronizeAutoAcceptResult = true
   createSessionGate = undefined
   createSessionDirectory = undefined
+  resolvedSessionInfo = undefined
+  resolvedSessions.length = 0
   serverSessionSyncs = 0
+  delegatedWorker = undefined
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
 describe("prompt submit worktree selection", () => {
+  test("resolves an explicitly addressed session cache miss before sending without creating a replacement", async () => {
+    params = { id: "session-from-oxp" }
+    resolvedSessionInfo = { id: "session-from-oxp", title: "OXP session", directory: "/repo/main" }
+
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => undefined,
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(resolvedSessions).toEqual([{ sessionID: "session-from-oxp", priority: "control" }])
+    expect(sessionCreateInputs).toEqual([])
+    expect(sentPrompts).toEqual(["/repo/main"])
+    expect(storedSessions["/repo/main"]?.[0]).toMatchObject({ id: "session-from-oxp", title: "OXP session" })
+  })
+
+  test("nested worker human input sends the selected model without changing worker permissions", async () => {
+    params = { id: "ses_worker" }
+    delegatedWorker = {
+      humanInterjection: true,
+      parentID: "ses_parent",
+      agent: "build",
+      model: { id: "assigned", providerID: "assigned-provider", variant: "max" },
+    }
+    synchronizeAutoAcceptResult = false
+    promptValue = [{ type: "text", content: "/check human steering", start: 0, end: 21 }]
+    commands.push({ name: "check" })
+    const submit = createPromptSubmit({
+      prompt,
+      model: {
+        current: () => ({ id: "longcat", provider: { id: "longcat-provider" } }),
+        variant: { current: () => "high" },
+        subProvider: { current: () => undefined },
+      } as unknown as ModelSelection,
+      info: () => ({ id: "ses_worker", projectID: "project", directory: "/repo/main", ...delegatedWorker }) as never,
+      commentCount: () => 0,
+      autoAccept: () => true,
+      mode: () => "normal",
+      working: () => true,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: () => 21,
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+    })
+    expect(await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)).toBe(true)
+    expect(synchronizedAutoAccept).toEqual([])
+    expect(commandCatalogLoads).toEqual([])
+    expect(sentCommands).toEqual([])
+    expect(promptInputs).toHaveLength(1)
+    expect(promptInputs[0]).toMatchObject({
+      sessionID: "ses_worker",
+      agent: undefined,
+      model: { providerID: "longcat-provider", modelID: "longcat" },
+      variant: "high",
+      subProvider: undefined,
+    })
+    expect(optimistic[0]?.message).toMatchObject({
+      agent: "build",
+      model: { modelID: "longcat", providerID: "longcat-provider", variant: "high" },
+    })
+  })
   test("retargets a new session to the authoritative directory returned by the server", async () => {
     createSessionDirectory = () => "/server-owned/chats/session-1"
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "shell",
@@ -346,7 +465,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "shell",
@@ -400,7 +518,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => true,
       mode: () => "shell",
@@ -422,6 +539,9 @@ describe("prompt submit worktree selection", () => {
     await submit.handleSubmit(event)
 
     expect(enabledAutoAccept).toEqual([{ server: "server-a", sessionID: "session-1", directory: "/repo/worktree-a" }])
+    expect(synchronizedAutoAccept).toEqual([
+      { server: "server-a", sessionID: "session-1", directory: "/repo/worktree-a" },
+    ])
   })
 
   test("keeps auto-accept bound to the submission server", async () => {
@@ -432,7 +552,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => true,
       mode: () => "shell",
@@ -455,6 +574,39 @@ describe("prompt submit worktree selection", () => {
     await result
 
     expect(enabledAutoAccept).toEqual([{ server: "server-a", sessionID: "session-1", directory: "/repo/worktree-a" }])
+    expect(synchronizedAutoAccept).toEqual([
+      { server: "server-a", sessionID: "session-1", directory: "/repo/worktree-a" },
+    ])
+  })
+
+  test("blocks prompt admission when permission policy synchronization fails", async () => {
+    synchronizeAutoAcceptResult = false
+    params = { id: "session-1" }
+
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => ({ id: "session-1" }),
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "normal",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      onSubmit: () => undefined,
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(synchronizedAutoAccept).toEqual([{ server: "server-a", sessionID: "session-1", directory: "/repo/main" }])
+    expect(sentPrompts).toEqual([])
+    expect(sentCommands).toEqual([])
+    expect(sentShell).toEqual([])
+    expect(optimistic).toEqual([])
   })
 
   test("promotes drafts using the selected project's server", async () => {
@@ -462,7 +614,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
@@ -491,7 +642,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => ({ id: "session-1" }),
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
@@ -519,6 +669,7 @@ describe("prompt submit worktree selection", () => {
       },
     })
     expect(sentPrompts).toEqual(["/repo/main"])
+    expect(commandCatalogLoads).toEqual([])
     expect(promptInputs[0]).toMatchObject({
       sessionID: "session-1",
       text: "ls",
@@ -540,7 +691,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => ({ id: "session-1" }),
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
@@ -567,6 +717,7 @@ describe("prompt submit worktree selection", () => {
         files: [],
       },
     ])
+    expect(commandCatalogLoads).toEqual(["/repo/main"])
     expect(serverSessionSyncs).toBe(0)
   })
 
@@ -579,7 +730,6 @@ describe("prompt submit worktree selection", () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => ({ id: "session-1" }),
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",
@@ -601,13 +751,16 @@ describe("prompt submit worktree selection", () => {
         model: { providerID: "draft-provider", modelID: "draft-model", variant: "draft-variant" },
       },
     })
+    expect(promptInputs[0]).toMatchObject({
+      model: { providerID: "draft-provider", modelID: "draft-model" },
+      variant: "draft-variant",
+    })
   })
 
   test("seeds new sessions before optimistic prompts are added", async () => {
     const submit = createPromptSubmit({
       prompt,
       info: () => undefined,
-      imageAttachments: () => [],
       commentCount: () => 0,
       autoAccept: () => false,
       mode: () => "normal",

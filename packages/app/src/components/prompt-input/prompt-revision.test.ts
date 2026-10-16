@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import type { PromptInputV2Prompt } from "@opencode-ai/session-ui/v2/prompt-input/types"
 import {
+  pollRevisionProgress,
+  pollRevisionRun,
+  cancelRevisionRun,
+  resumeRevisionRun,
   promptRevisionDraftContext,
   promptRevisionFingerprint,
   promptRevisionArtifactIsApplied,
@@ -327,5 +331,264 @@ describe("prompt revision helpers", () => {
       },
     ]
     expect(promptRevisionRevealBoundaries(long, 40).length).toBeLessThanOrEqual(41)
+  })
+
+  test("polls revision progress at a bounded cadence and applies only current snapshots", async () => {
+    const controller = new AbortController()
+    const waits: number[] = []
+    const seen: number[] = []
+    let reads = 0
+
+    await pollRevisionProgress({
+      operationID: "op",
+      intervalMs: 5,
+      wait: (ms) => {
+        waits.push(ms)
+        return Promise.resolve()
+      },
+      read: () => {
+        reads += 1
+        if (reads === 1) return Promise.resolve(null)
+        if (reads === 2) return Promise.resolve({ operationID: "op", percent: 40, updatedAt: 1 })
+        controller.abort()
+        return Promise.resolve({ operationID: "op", percent: 90, updatedAt: 2 })
+      },
+      isCurrent: () => true,
+      onUpdate: (next) => seen.push(next.percent),
+      signal: controller.signal,
+    })
+
+    expect(waits).toEqual([5, 5, 5])
+    expect(reads).toBe(3)
+    // A snapshot that arrives after the operation settled is discarded.
+    expect(seen).toEqual([40])
+  })
+
+  test("stops applying revision progress once the flow is superseded", async () => {
+    const controller = new AbortController()
+    const seen: number[] = []
+    let current = true
+
+    await pollRevisionProgress({
+      operationID: "op",
+      wait: () => Promise.resolve(),
+      read: () => Promise.resolve({ operationID: "op", percent: 10, updatedAt: 1 }),
+      isCurrent: () => current,
+      onUpdate: (next) => {
+        seen.push(next.percent)
+        // A newer revision claims the composer; the stale flow must stop here.
+        current = false
+      },
+      signal: controller.signal,
+    })
+
+    // The superseded flow never even reads again.
+    const readsAfterSupersede = {
+      count: 0,
+    }
+    await pollRevisionProgress({
+      operationID: "op",
+      wait: () => Promise.resolve(),
+      read: () => {
+        readsAfterSupersede.count += 1
+        return Promise.resolve({ operationID: "op", percent: 20, updatedAt: 2 })
+      },
+      isCurrent: () => current,
+      onUpdate: (next) => seen.push(next.percent),
+      signal: controller.signal,
+    })
+
+    expect(seen).toEqual([10])
+    expect(readsAfterSupersede.count).toBe(0)
+  })
+
+  test("keeps polling through read failures and aborts as soon as the flow settles", async () => {
+    const controller = new AbortController()
+    const seen: number[] = []
+    let reads = 0
+
+    await pollRevisionProgress({
+      operationID: "op",
+      wait: () => Promise.resolve(),
+      read: () => {
+        reads += 1
+        if (reads === 1) return Promise.reject(new Error("flaky"))
+        return Promise.resolve({ operationID: "op", percent: 30, updatedAt: 1 })
+      },
+      isCurrent: () => true,
+      onUpdate: (next) => {
+        seen.push(next.percent)
+        controller.abort()
+      },
+      signal: controller.signal,
+    })
+
+    expect(reads).toBe(2)
+    expect(seen).toEqual([30])
+    expect(controller.signal.aborted).toBe(true)
+  })
+})
+
+describe("resumed revision run supervision", () => {
+  const running = (operationID?: string) => ({
+    state: "running" as const,
+    sourceFingerprint: "fp",
+    ...(operationID === undefined ? {} : { operationID }),
+    startedAt: 1,
+  })
+  const failed = { state: "failed" as const, sourceFingerprint: "fp", message: "provider exploded", at: 9 }
+
+  test("tracks a running run through progress and recovers the artifact once it settles", async () => {
+    const controller = new AbortController()
+    const statuses: Array<ReturnType<typeof running> | null> = [running("op-1"), running("op-1"), null]
+    const waits: number[] = []
+    const progress: number[] = []
+    const runningSeen: string[] = []
+    let recovered = 0
+
+    await pollRevisionRun({
+      readStatus: () => Promise.resolve(statuses.shift() ?? null),
+      readProgress: (operationID) => Promise.resolve({ operationID, percent: 42, updatedAt: 1 }),
+      recover: () => {
+        recovered += 1
+        return Promise.resolve(true)
+      },
+      onRunning: (status) => runningSeen.push(status.operationID ?? "none"),
+      onProgress: (next) => progress.push(next.percent),
+      onFailed: () => {
+        throw new Error("unexpected failure")
+      },
+      isCurrent: () => true,
+      signal: controller.signal,
+      intervalMs: 5,
+      wait: (ms) => {
+        waits.push(ms)
+        return Promise.resolve()
+      },
+    })
+
+    expect(runningSeen).toEqual(["op-1", "op-1"])
+    expect(progress).toEqual([42, 42])
+    expect(recovered).toBe(1)
+    expect(waits).toEqual([5, 5])
+  })
+
+  test("surfaces a retained failure and stops supervising", async () => {
+    const controller = new AbortController()
+    const statuses: unknown[] = [running("op-1"), failed]
+    const failures: string[] = []
+    let recovered = 0
+
+    await pollRevisionRun({
+      readStatus: () => Promise.resolve(statuses.shift() as never),
+      recover: () => {
+        recovered += 1
+        return Promise.resolve(false)
+      },
+      onRunning: () => {},
+      onFailed: (status) => failures.push(status.message),
+      isCurrent: () => true,
+      signal: controller.signal,
+      wait: () => Promise.resolve(),
+    })
+
+    expect(failures).toEqual(["provider exploded"])
+    expect(recovered).toBe(0)
+  })
+
+  test("checks the mailbox once when no run is tracked, and never loops", async () => {
+    const controller = new AbortController()
+    let statusReads = 0
+    let recovered = 0
+
+    await pollRevisionRun({
+      readStatus: () => {
+        statusReads += 1
+        return Promise.resolve(null)
+      },
+      recover: () => {
+        recovered += 1
+        return Promise.resolve(false)
+      },
+      onRunning: () => {},
+      onFailed: () => {},
+      isCurrent: () => true,
+      signal: controller.signal,
+      wait: () => Promise.resolve(),
+    })
+
+    expect(statusReads).toBe(1)
+    expect(recovered).toBe(1)
+  })
+
+  test("a transient status read failure does not settle a running run", async () => {
+    const controller = new AbortController()
+    const statuses: Array<unknown> = [new Error("flaky"), running("op-1"), null]
+    let recovered = 0
+
+    await pollRevisionRun({
+      readStatus: () => {
+        const next = statuses.shift()
+        return next instanceof Error ? Promise.reject(next) : Promise.resolve(next as never)
+      },
+      recover: () => {
+        recovered += 1
+        return Promise.resolve(true)
+      },
+      onRunning: () => {},
+      onFailed: () => {
+        throw new Error("unexpected failure")
+      },
+      isCurrent: () => true,
+      signal: controller.signal,
+      wait: () => Promise.resolve(),
+    })
+
+    expect(recovered).toBe(1)
+  })
+
+  test("aborting a resumed run tears down only the local polls", async () => {
+    let statusReads = 0
+    const run = resumeRevisionRun({
+      readStatus: () => {
+        statusReads += 1
+        return Promise.resolve(running("op-1"))
+      },
+      recover: () => Promise.resolve(false),
+      onRunning: () => {},
+      onFailed: () => {},
+      isCurrent: () => true,
+      wait: (_ms, signal) =>
+        new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })),
+    })
+    await Promise.resolve()
+    run.abort()
+    await run.done
+    const readsAtAbort = statusReads
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(statusReads).toBe(readsAtAbort)
+  })
+
+  test("explicit cancellation calls the server endpoint with the locator", async () => {
+    const calls: Array<{ kind: string; key: string; operationID?: string }> = []
+    const cancelled = await cancelRevisionRun({
+      kind: "prompt",
+      key: "session:ses_1",
+      operationID: "op-1",
+      cancel: (input) => {
+        calls.push(input)
+        return Promise.resolve(true)
+      },
+    })
+    expect(cancelled).toBe(true)
+    expect(calls).toEqual([{ kind: "prompt", key: "session:ses_1", operationID: "op-1" }])
+
+    const tolerated = await cancelRevisionRun({
+      kind: "prompt",
+      key: "session:ses_1",
+      cancel: () => Promise.reject(new Error("404")),
+    })
+    expect(tolerated).toBe(false)
   })
 })

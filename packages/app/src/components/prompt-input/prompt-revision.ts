@@ -1,4 +1,9 @@
 import type { PromptInputV2Prompt } from "@opencode-ai/session-ui/v2/prompt-input/types"
+import type {
+  CompatibleRevisionDraftArtifact,
+  CompatibleRevisionProgress,
+  CompatibleRevisionRunStatus,
+} from "@/utils/server-compat"
 
 export type PromptRevisionReference =
   | {
@@ -311,4 +316,163 @@ export function promptRevisionArtifactIsApplied(
   if (promptRevisionText(current) !== text) return false
   const candidate = revisedPromptParts(text, current, references)
   return promptRevisionFingerprint(candidate) === promptRevisionFingerprint(current)
+}
+
+/** One bounded-cadence poll for one in-flight revision. Stops on settle/abort. */
+export const REVISION_PROGRESS_POLL_MS = 800
+
+const waitForProgressPoll = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+
+/**
+ * The Prompt Revisor POST is synchronous, so the composer correlates live
+ * progress with its own client-generated operation id instead of trying to
+ * thread a request identity through a server-side event bus. Exactly one
+ * bounded-cadence poller runs per revision: it starts with the request, keeps
+ * only well-formed snapshots for the still-current flow, and stops as soon as
+ * the flow settles or is superseded. `read` returning null (no update yet,
+ * settled projection, legacy server without the route) never fails the poll.
+ */
+export async function pollRevisionProgress(input: {
+  operationID: string
+  read: (operationID: string, signal: AbortSignal) => Promise<CompatibleRevisionProgress | null>
+  isCurrent: () => boolean
+  onUpdate: (progress: CompatibleRevisionProgress) => void
+  signal: AbortSignal
+  intervalMs?: number
+  wait?: (ms: number, signal: AbortSignal) => Promise<void>
+}): Promise<void> {
+  const wait = input.wait ?? waitForProgressPoll
+  while (!input.signal.aborted) {
+    await wait(input.intervalMs ?? REVISION_PROGRESS_POLL_MS, input.signal)
+    if (input.signal.aborted || !input.isCurrent()) return
+    let next: CompatibleRevisionProgress | null = null
+    try {
+      next = await input.read(input.operationID, input.signal)
+    } catch {
+      if (input.signal.aborted) return
+      continue
+    }
+    if (input.signal.aborted || !input.isCurrent()) return
+    if (next) input.onUpdate(next)
+  }
+}
+
+export type RevisionRunningStatus = Extract<CompatibleRevisionRunStatus, { state: "running" }>
+export type RevisionFailedStatus = Extract<CompatibleRevisionRunStatus, { state: "failed" }>
+
+/**
+ * Supervisor for one revision run this component did not itself start, for
+ * example after a tab switch disposed the original composer.
+ *
+ * A returning client needs three facts without duplicating the progress poll:
+ * the run is still in flight (keep showing busy + latest progress under the
+ * correlation id reported by the server), it failed (surface the retained
+ * message), or it left the registry (re-check the durable mailbox and apply a
+ * committed artifact). Status is read first and then on the same bounded
+ * cadence as progress, so a run is never reconstructed from rendered text.
+ */
+export async function pollRevisionRun(input: {
+  readStatus: (signal: AbortSignal) => Promise<CompatibleRevisionRunStatus | null>
+  readProgress?: (operationID: string, signal: AbortSignal) => Promise<CompatibleRevisionProgress | null>
+  /** True when a durable artifact was handled (applied, consumed, or offered). */
+  recover: (signal: AbortSignal) => Promise<boolean>
+  onRunning: (status: RevisionRunningStatus) => void
+  onProgress?: (progress: CompatibleRevisionProgress) => void
+  onFailed: (status: RevisionFailedStatus) => void
+  isCurrent: () => boolean
+  signal: AbortSignal
+  intervalMs?: number
+  wait?: (ms: number, signal: AbortSignal) => Promise<void>
+}): Promise<void> {
+  const wait = input.wait ?? waitForProgressPoll
+  let operationID: string | undefined
+  while (!input.signal.aborted && input.isCurrent()) {
+    let status: CompatibleRevisionRunStatus | null = null
+    let readFailed = false
+    try {
+      status = await input.readStatus(input.signal)
+    } catch {
+      readFailed = true
+    }
+    if (input.signal.aborted || !input.isCurrent()) return
+    if (!readFailed) {
+      if (status?.state === "failed") {
+        input.onFailed(status)
+        return
+      }
+      if (status?.state === "running") {
+        if (status.operationID !== undefined) operationID = status.operationID
+        input.onRunning(status)
+        if (operationID !== undefined && input.readProgress) {
+          try {
+            const progress = await input.readProgress(operationID, input.signal)
+            if (!input.signal.aborted && input.isCurrent() && progress) input.onProgress?.(progress)
+          } catch {
+            // Advisory only; the next bounded tick retries.
+          }
+        }
+      } else {
+        // Untracked: the run settled, was consumed elsewhere, was explicitly
+        // cancelled, or never existed. A committed artifact is the only
+        // authoritative completion signal left.
+        if (await input.recover(input.signal)) return
+        return
+      }
+    }
+    await wait(input.intervalMs ?? REVISION_PROGRESS_POLL_MS, input.signal)
+  }
+}
+
+/**
+ * Local controls for one resumed run. `abort` tears down these polls only:
+ * the run is owned by the server registry, so unmounting a composer must never
+ * be treated as cancellation. Only an explicit cancel endpoint call ends it.
+ */
+export function resumeRevisionRun(input: Omit<Parameters<typeof pollRevisionRun>[0], "signal">): {
+  abort: () => void
+  done: Promise<void>
+} {
+  const controller = new AbortController()
+  return { abort: () => controller.abort(), done: pollRevisionRun({ ...input, signal: controller.signal }) }
+}
+
+/**
+ * Explicit user cancellation. Calls the server-owned cancel endpoint and never
+ * throws: `false` means "nothing to cancel", which is also what an older server
+ * without the route reports, so callers keep their local-abort fallback there.
+ */
+export async function cancelRevisionRun(input: {
+  kind: CompatibleRevisionDraftArtifact["kind"]
+  key: string
+  operationID?: string
+  cancel: (input: {
+    kind: CompatibleRevisionDraftArtifact["kind"]
+    key: string
+    operationID?: string
+  }) => Promise<boolean>
+}): Promise<boolean> {
+  try {
+    return await input.cancel({
+      kind: input.kind,
+      key: input.key,
+      ...(input.operationID === undefined ? {} : { operationID: input.operationID }),
+    })
+  } catch {
+    return false
+  }
 }
