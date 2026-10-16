@@ -574,8 +574,7 @@ export function aggregateSessionContextByModel(
  * Unlike aggregateSessionContextByModel(), this never inspects client message
  * or part stores: virtualization/pagination cannot change the result.
  */
-export function projectSessionContextSnapshot(snapshot: UsageSessionContextResponse): SessionModelBreakdown {
-  const history = snapshot.history
+export function projectSessionContextHistory(history: UsageSessionContextResponse["history"]): SessionModelBreakdown {
   const models: ModelContextMetrics[] = history.models.map((model) => {
     const generatedSeconds = model.generatedMs / 1000
     const total =
@@ -625,12 +624,8 @@ export function projectSessionContextSnapshot(snapshot: UsageSessionContextRespo
   const availableBreakdowns = models.flatMap((model) => (model.costBreakdown ? [model.costBreakdown] : []))
   const availableSavings = models.flatMap((model) => (model.cacheSavings !== undefined ? [model.cacheSavings] : []))
   const tokens = history.totals.tokens
-  const telemetry = snapshot.telemetry as typeof snapshot.telemetry | null
-  const historicalGenerated = history.totals.generatedMs / 1000
-  const historicalTool = history.totals.toolMs / 1000
-  const generatedSeconds =
-    telemetry && telemetry.generatedMs > 0 ? telemetry.generatedMs / 1000 : historicalGenerated
-  const toolSeconds = telemetry && telemetry.toolMs > 0 ? telemetry.toolMs / 1000 : historicalTool
+  const generatedSeconds = history.totals.generatedMs / 1000
+  const toolSeconds = history.totals.toolMs / 1000
 
   return {
     models,
@@ -658,4 +653,33 @@ export function projectSessionContextSnapshot(snapshot: UsageSessionContextRespo
       cacheSavings: availableSavings.length > 0 ? availableSavings.reduce((sum, value) => sum + value, 0) : undefined,
     },
   }
+}
+
+/**
+ * Only generation timing is affected by live telemetry. Keep the historical
+ * per-model array and rate-card valuation stable across telemetry updates:
+ * recreating it once per stream tick invalidates every model row needlessly.
+ */
+export function applySessionContextTelemetry(
+  base: SessionModelBreakdown,
+  telemetry: UsageSessionContextResponse["telemetry"] | null | undefined,
+): SessionModelBreakdown {
+  if (!telemetry) return base
+  const generatedSeconds = telemetry.generatedMs > 0 ? telemetry.generatedMs / 1000 : base.session.generatedSeconds
+  const toolSeconds = telemetry.toolMs > 0 ? telemetry.toolMs / 1000 : base.session.toolSeconds
+  if (generatedSeconds === base.session.generatedSeconds && toolSeconds === base.session.toolSeconds) return base
+  return {
+    models: base.models,
+    session: {
+      ...base.session,
+      generatedSeconds,
+      toolSeconds,
+      tokensPerSecond: tokensPerSecond(base.session.output + base.session.reasoning, generatedSeconds),
+    },
+  }
+}
+
+/** Preserve the public projection contract for non-reactive consumers. */
+export function projectSessionContextSnapshot(snapshot: UsageSessionContextResponse): SessionModelBreakdown {
+  return applySessionContextTelemetry(projectSessionContextHistory(snapshot.history), snapshot.telemetry)
 }

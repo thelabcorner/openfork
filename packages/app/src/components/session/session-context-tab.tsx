@@ -41,7 +41,8 @@ import { subsidyShare, type SubsidyUsageRow } from "@/utils/usage-subsidy"
 import { projectSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import {
   aggregateSessionContextByModel,
-  projectSessionContextSnapshot,
+  applySessionContextTelemetry,
+  projectSessionContextHistory,
   type CostBreakdown,
   type LiveGenerationProgress,
   type ModelContextMetrics,
@@ -49,12 +50,19 @@ import {
 } from "./session-context-model-metrics"
 import { createSessionContextFormatter } from "./session-context-format"
 import {
+  boundedMessagePreview,
   boundedPartsText,
   newestRawMessages,
   RAW_MESSAGE_PAGE_SIZE,
 } from "./session-context-raw"
 import { MetricCell, Section } from "./insights-primitives"
 import { shouldRefreshSessionContext, type SessionContextRefreshState } from "./session-context-refresh"
+import { createSessionContextLedgerRequest } from "./session-context-ledger-request"
+import {
+  createSessionContextLedgerPager,
+  type ContextLedgerPageState,
+} from "./session-context-ledger-pager"
+import { ContextLedgerVirtualRows } from "./session-context-virtual-ledger"
 import {
   newestSessionContextTelemetry,
   normalizeSessionContextResponse,
@@ -130,8 +138,8 @@ function RatioBar(props: { percent: number | null; color: string }) {
 }
 
 function CategoryBar(props: { segments: CategorySegment[] }) {
-  const visible = () => props.segments.filter((segment) => segment.amount > 0)
-  const total = () => props.segments.reduce((sum, segment) => sum + segment.amount, 0)
+  const visible = createMemo(() => props.segments.filter((segment) => segment.amount > 0))
+  const total = createMemo(() => props.segments.reduce((sum, segment) => sum + segment.amount, 0))
   return (
     <div class="flex flex-col gap-1.5">
       <div class="flex h-2 w-full overflow-hidden rounded-full bg-v2-background-bg-layer-03">
@@ -196,8 +204,8 @@ function messagePreviewText(parts: Part[]): string | undefined {
     for (const part of parts) {
       const text = predicate(part)
       if (text === undefined) continue
-      const trimmed = text.trim()
-      if (trimmed) return trimmed
+      const preview = boundedMessagePreview(text, PREVIEW_LENGTH)
+      if (preview) return preview
     }
     return undefined
   }
@@ -205,12 +213,13 @@ function messagePreviewText(parts: Part[]): string | undefined {
   const text =
     firstNonEmpty((part) => (part.type === "text" && !part.synthetic && !part.ignored ? part.text : undefined)) ??
     firstNonEmpty((part) => (part.type === "reasoning" ? part.text : undefined))
-  if (!text) return undefined
-  return text.length > PREVIEW_LENGTH ? `${text.slice(0, PREVIEW_LENGTH)}…` : text
+  return text
 }
 
 function partSummaryText(part: Part): string | undefined {
-  if (part.type === "text" || part.type === "reasoning") return part.text.trim() || undefined
+  // Structured-part rows are previews, not a second full transcript renderer.
+  // Keep giant synthetic/ignored text in the explicitly opened Raw JSON view.
+  if (part.type === "text" || part.type === "reasoning") return boundedMessagePreview(part.text, 512)
   if (part.type === "subtask") return part.description || part.prompt
   if (part.type === "tool") return part.tool
   if (part.type === "file") return part.filename || part.mime
@@ -239,6 +248,8 @@ type ContextLedgerEntry = {
 
 type ContextLedger = {
   entries: ContextLedgerEntry[]
+  complete?: boolean
+  hasMore?: boolean
   totals: {
     messageCount: number
     excludedCount: number
@@ -283,7 +294,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     },
   }))
   const streamedContextTelemetry = createMemo(() =>
-    params.id ? serverSync().telemetry.get(params.id) : undefined,
+    active() && params.id ? serverSync().telemetry.get(params.id) : undefined,
   )
   const contextTelemetry = createMemo(() =>
     newestSessionContextTelemetry(contextQuery.data?.telemetry, streamedContextTelemetry()),
@@ -301,7 +312,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     snapshotTelemetryReceivedAt.set(key, receivedAt)
     return receivedAt
   }
-  const contextSnapshot = createMemo(() => {
+  const historySnapshot = createMemo(() => {
     if (contextQuery.isPending) return undefined
     const raw = contextQuery.data
     if (!raw) return undefined
@@ -309,7 +320,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     // Solid Query survives renderer HMR and can still hold the previous
     // bare-history payload under this query key. Normalize at consumption as
     // well as fetch time so cached pre-migration data can never reach the pane.
-    const snapshot = normalizeSessionContextResponse(raw)
+    return normalizeSessionContextResponse(raw)
+  })
+  const contextSnapshot = createMemo(() => {
+    const snapshot = historySnapshot()
+    if (!snapshot) return undefined
     const telemetry = contextTelemetry()
     if (!telemetry || telemetry === snapshot.telemetry) return snapshot
     return { ...snapshot, telemetry }
@@ -342,53 +357,36 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   })
 
   const ctx = createMemo(() => projectSessionContextOccupancy(contextSnapshot()))
-  const [oxpOrigins, setOxpOrigins] = createSignal<OxpResourceProvenanceInfo[]>([])
-  let oxpOriginRequest = 0
-
-  createEffect(
-    on(
-      () => [active(), params.id] as const,
-      ([isActive, sessionID]) => {
-        const request = ++oxpOriginRequest
-        if (!isActive || !sessionID) {
-          setOxpOrigins([])
-          return
-        }
-        const global = serverSDK().client.global
-        void Promise.all([
-          global.oxpResource(
-            { kind: "session", ref: sessionID, limit: "5" },
-            { throwOnError: true },
-          ),
-          global.oxpResource(
-            { kind: "worker_session", ref: sessionID, limit: "5" },
-            { throwOnError: true },
-          ),
-        ])
-          .then(([session, worker]) => {
-            if (request !== oxpOriginRequest) return
-            const rows = [...(session.data ?? []), ...(worker.data ?? [])]
-            const unique = new Map(
-              rows.map((row) => [
-                row.activityID + ":" + row.invocationID,
-                row,
-              ]),
-            )
-            setOxpOrigins(
-              [...unique.values()]
-                .sort(
-                  (left, right) =>
-                    Number(right.startedAt) - Number(left.startedAt),
-                )
-                .slice(0, 5),
-            )
-          })
-          .catch(() => {
-            if (request === oxpOriginRequest) setOxpOrigins([])
-          })
-      },
-    ),
-  )
+  // Provenance changes far less often than telemetry. Cache this pair of
+  // network reads by scoped session rather than refetching on every Context /
+  // Limits tab switch. The query key also rejects stale cross-session results.
+  const oxpOriginQuery = useQuery(() => ({
+    queryKey: [serverSDK().scope, "oxp", "resource-provenance", params.id] as const,
+    enabled: active() && !!params.id,
+    staleTime: 30_000,
+    gcTime: 5 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 0,
+    queryFn: async (): Promise<OxpResourceProvenanceInfo[]> => {
+      const sessionID = params.id
+      if (!sessionID) return []
+      const global = serverSDK().client.global
+      const [session, worker] = await Promise.all([
+        global.oxpResource({ kind: "session", ref: sessionID, limit: "5" }, { throwOnError: true }),
+        global.oxpResource({ kind: "worker_session", ref: sessionID, limit: "5" }, { throwOnError: true }),
+      ])
+      const unique = new Map<string, OxpResourceProvenanceInfo>()
+      for (const row of [...(session.data ?? []), ...(worker.data ?? [])]) {
+        unique.set(row.activityID + ":" + row.invocationID, row)
+      }
+      return [...unique.values()]
+        .sort((left, right) => Number(right.startedAt) - Number(left.startedAt))
+        .slice(0, 5)
+    },
+  }))
+  const oxpOrigins = () => (active() ? oxpOriginQuery.data ?? [] : [])
 
   const messages = createMemo<Message[]>(
     (previous) => {
@@ -406,7 +404,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   // presentation aggregator, but its provider metadata comes from the compact
   // server projection rather than hydrating workspace provider state.
   const providerList = createMemo<SessionProviderList>(() => {
-    const snapshot = contextSnapshot()
+    const snapshot = historySnapshot()
     if (!snapshot) return emptyProviderList
     const byProvider = new Map<string, SessionProviderList[number]>()
     for (const model of snapshot.history.models) {
@@ -428,6 +426,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   })
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
   const [rawOpen, setRawOpen] = createSignal<string[]>([])
+  // Up to thousands of loaded rows check their open status. Avoid a linear
+  // rawOpen.includes() scan for every row on each expand/collapse operation.
+  const rawOpenSet = createMemo(() => new Set(rawOpen()))
   const [rawLimit, setRawLimit] = createSignal(RAW_MESSAGE_PAGE_SIZE)
   const rawMessages = createMemo(() => newestRawMessages(messages(), rawLimit()))
   const hiddenRawCount = createMemo(() => Math.max(0, messages().length - rawMessages().length))
@@ -460,7 +461,8 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   })
   const liveTelemetryTickKey = createMemo(() => {
     const telemetry = contextTelemetry()
-    if (!telemetry || telemetry.phase === "idle") return undefined
+    if (!telemetry || telemetry.phase === "idle" || !params.id ||
+      !serverSync().session.data.session_working(params.id)) return undefined
     return `${telemetry.step?.assistantMessageID ?? ""}:${telemetry.phase}`
   })
   createEffect(() => {
@@ -548,7 +550,8 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
     const telemetry = contextTelemetry()
-    if (!params.id || !telemetry?.step || telemetry.phase === "idle") return emptyLiveProgress
+    if (!params.id || !telemetry?.step || telemetry.phase === "idle" ||
+      !serverSync().session.data.session_working(params.id)) return emptyLiveProgress
     // Keep the existing 1s reactive tick, but measure the open phase across
     // producer/client clock domains explicitly.
     now()
@@ -575,11 +578,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   }
 
   const counts = createMemo(
-    () => contextSnapshot()?.history.counts ?? { all: 0, user: 0, assistant: 0 },
+    () => historySnapshot()?.history.counts ?? { all: 0, user: 0, assistant: 0 },
   )
 
   const systemPrompt = createMemo(() => {
-    const prompt = contextSnapshot()?.history.systemPrompt
+    const prompt = historySnapshot()?.history.systemPrompt
     if (!prompt) return undefined
     const trimmed = prompt.trim()
     return trimmed || undefined
@@ -626,11 +629,18 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const usagePercent = createMemo(() => ctx()?.usage ?? null)
 
-  const aggregate = createMemo(() => {
-    const snapshot = contextSnapshot()
-    return snapshot ? projectSessionContextSnapshot(snapshot) : emptyAggregate
+  // The history projection is O(models), while the telemetry overlay is O(1).
+  // A live step/timer update must never rebuild settled model rows, reset their
+  // accordion identity, or recompute free-token valuation.
+  const historicalAggregate = createMemo(() => {
+    const snapshot = historySnapshot()
+    return snapshot ? projectSessionContextHistory(snapshot.history) : emptyAggregate
   })
+  const aggregate = createMemo(() =>
+    applySessionContextTelemetry(historicalAggregate(), contextSnapshot()?.telemetry),
+  )
 
+  const settledSession = createMemo(() => historicalAggregate().session)
   const session = createMemo(() => aggregate().session)
   const models = createMemo(() => aggregate().models)
 
@@ -696,10 +706,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       : language.t("context.metric.unavailable")
 
   const sessionTotalsStats = [
-    { label: "context.stats.totalTokens", value: () => formatter().number(session().total) },
+    { label: "context.stats.totalTokens", value: () => formatter().number(settledSession().total) },
     { label: "context.stats.userMessages", value: () => counts().user.toLocaleString(language.intl()) },
     { label: "context.stats.assistantMessages", value: () => counts().assistant.toLocaleString(language.intl()) },
-    { label: "context.metric.toolCalls", value: () => session().toolCallCount.toLocaleString(language.intl()) },
+    { label: "context.metric.toolCalls", value: () => settledSession().toolCallCount.toLocaleString(language.intl()) },
   ] satisfies { label: string; value: () => JSX.Element }[]
 
   const modelMetricStats = (metrics: ModelContextMetrics, live: LiveGenerationProgress) =>
@@ -824,36 +834,98 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const [scrollElement, setScrollElement] = createSignal<HTMLDivElement>()
   const [ledgerElement, setLedgerElement] = createSignal<HTMLElement>()
   const [ledgerVisible, setLedgerVisible] = createSignal(false)
-  const [ledger, setLedger] = createSignal<ContextLedger | null>(null)
+  const [fullLedger, setFullLedger] = createSignal<ContextLedger | null>(null)
+  const [pagedLedger, setPagedLedger] = createSignal<ContextLedgerPageState<ContextLedgerEntry> | null>(null)
   const [ledgerBusy, setLedgerBusy] = createSignal<string | null>(null)
   const [ledgerError, setLedgerError] = createSignal<string | null>(null)
+  const [pageLoading, setPageLoading] = createSignal(false)
+  const [rawInspectorOpen, setRawInspectorOpen] = createSignal(false)
 
-  const fetchLedger = async (sessionID = params.id) => {
-    if (!sessionID) return
-    try {
+  const ledgerRequests = createSessionContextLedgerRequest<ContextLedger>({
+    load: async (sessionID) => {
       const res = await (
         sdk().client as unknown as {
           sessionContext: { ledger: (p: Record<string, unknown>) => Promise<{ data: unknown }> }
         }
       ).sessionContext.ledger({ sessionID })
-      const data = (res as unknown as { data?: unknown }).data ?? res
-      if (params.id === sessionID) {
-        setLedger(data as ContextLedger)
-        setLedgerError(null)
-      }
-    } catch (e) {
-      if (params.id === sessionID) setLedgerError(e instanceof Error ? e.message : String(e))
+      return ((res as unknown as { data?: unknown }).data ?? res) as ContextLedger
+    },
+    currentSession: () => params.id,
+    receive: (data) => {
+      setFullLedger(data)
+      setLedgerError(null)
+    },
+    error: (reason) => setLedgerError(reason instanceof Error ? reason.message : String(reason)),
+  })
+  const ledgerPager = createSessionContextLedgerPager<ContextLedgerEntry>({
+    load: async (sessionID, cursor) => {
+      const result = await sdk().client.sessionContext.ledgerPage({ sessionID, limit: 50, cursor })
+      if (result.error) throw result.error
+      if (!result.data) throw new Error("Context ledger page returned no data")
+      return result.data
+    },
+    loadTotals: async (sessionID) => {
+      const result = await sdk().client.sessionContext.ledgerTotals({ sessionID })
+      if (result.error) throw result.error
+      if (!result.data) throw new Error("Context ledger totals returned no data")
+      return result.data
+    },
+    currentSession: () => params.id,
+    classify: (entry) => ({
+      excluded: entry.excluded,
+      pinned: entry.pinned,
+      edited: entry.edited,
+      tokenEstimate: entry.tokenEstimate,
+    }),
+    receive: (state) => {
+      setPagedLedger(state)
+      if (state) setLedgerError(null)
+    },
+    error: (reason) => setLedgerError(reason instanceof Error ? reason.message : String(reason)),
+  })
+  const fetchLedger = (sessionID = params.id, fresh = false) =>
+    specialAgentReadOnly() ? ledgerRequests.read(sessionID, fresh) : ledgerPager.read(sessionID, fresh)
+  const fetchMoreLedger = async () => {
+    if (pageLoading()) return
+    setPageLoading(true)
+    try {
+      await ledgerPager.more()
+    } finally {
+      setPageLoading(false)
     }
   }
+  onCleanup(() => {
+    ledgerRequests.invalidate()
+    ledgerPager.invalidate()
+  })
+
+  const ledger = createMemo<ContextLedger | null>(() => {
+    if (specialAgentReadOnly()) return fullLedger()
+    const page = pagedLedger()
+    if (!page) return null
+    // Loaded-only counts accumulate per page. Never flatten all loaded rows
+    // merely to refresh one header or append another 50 message summaries.
+    return {
+      entries: [],
+      totals: page.authoritativeTotals ?? page.totals,
+      // Here complete means authoritative *totals*, not that every inspection
+      // page is mounted. The independent hasMore/loadedCount control paging.
+      complete: page.complete || page.authoritativeTotals !== undefined,
+      hasMore: page.hasMore,
+    }
+  })
 
   createEffect(
     on(
-      () => [active(), params.id] as const,
-      ([isActive, sessionID]) => {
-        setLedger(null)
+      () => params.id,
+      () => {
+        ledgerRequests.invalidate()
+        ledgerPager.invalidate()
+        setFullLedger(null)
         setLedgerError(null)
+        setPageLoading(false)
+        setRawInspectorOpen(false)
         setLedgerVisible(false)
-        if (!isActive || !sessionID) return
       },
     ),
   )
@@ -908,15 +980,17 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   createEffect(
     on(
       () => {
-        const telemetry = params.id ? serverSync().telemetry.get(params.id) : undefined
-        return [active(), params.id, telemetry?.phase, telemetry?.updatedAt] as SessionContextRefreshState
+        const isActive = active()
+        const sessionID = params.id
+        const telemetry = isActive && sessionID ? serverSync().telemetry.get(sessionID) : undefined
+        return [isActive, sessionID, telemetry?.phase, telemetry?.updatedAt] as SessionContextRefreshState
       },
       (next, previous) => {
         if (!shouldRefreshSessionContext(next, previous)) return
         const sessionID = next[1]
         if (!sessionID) return
         if (!contextQuery.isFetching) void contextQuery.refetch()
-        if (ledgerVisible() || ledger()) void fetchLedger(sessionID)
+        if (ledgerVisible() || ledger()) void fetchLedger(sessionID, true)
       },
       { defer: true },
     ),
@@ -936,7 +1010,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       // Context operations mutate the prospective effective ledger only.
       // Historical usage and provider-reported occupancy do not change until a
       // later generation settles, so do not force an O(history) projection scan.
-      await fetchLedger(sessionID)
+      await fetchLedger(sessionID, true)
       showToast({ variant: "success", title: language.t("context.ledger.applied") })
     } catch (e) {
       showToast({
@@ -951,13 +1025,21 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const ledgerUsagePercent = createMemo(() => {
     const limit = ctx()?.limit
-    const tokens = ledger()?.totals.estimatedTokens
+    const selected = ledger()
+    const tokens = selected?.complete === false ? undefined : selected?.totals.estimatedTokens
     if (!limit || tokens === undefined) return null
     return (tokens / limit) * 100
   })
-  const ledgerByMessage = createMemo(
-    () => new Map((ledger()?.entries ?? []).map((entry) => [entry.messageID, entry] as const)),
-  )
+  const ledgerByMessage = createMemo(() => {
+    if (specialAgentReadOnly())
+      return new Map((fullLedger()?.entries ?? []).map((entry) => [entry.messageID, entry] as const))
+    // Summary rows have exact entry props. Build the lookup only when the raw
+    // inspector is explicitly open, never on each paginated fetch by default.
+    if (!rawInspectorOpen()) return new Map<string, ContextLedgerEntry>()
+    return new Map((pagedLedger()?.pages ?? []).flatMap((page) =>
+      page.map((entry) => [entry.messageID, entry] as const),
+    ))
+  })
 
   const restoreScroll = () => {
     const el = scroll
@@ -1296,7 +1378,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     }, [] as Part[])
     const preview = createMemo(() => messagePreviewText(parts()))
     const entry = createMemo(() => ledgerByMessage().get(props.message.id))
-    const isOpen = () => rawOpen().includes(props.message.id)
+    const isOpen = () => rawOpenSet().has(props.message.id)
 
     return (
       <Accordion.Item value={props.message.id}>
@@ -1429,6 +1511,53 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     )
   }
 
+  const LedgerSummaryRow = (props: { entry: ContextLedgerEntry }) => (
+    <div class="group flex min-h-11 items-center justify-between gap-2 border-b border-v2-border-border-muted px-2.5 py-1.5 last:border-b-0">
+      <div class="min-w-0 flex-1">
+        <div class="flex min-w-0 items-center gap-1.5">
+          <span class="size-1.5 shrink-0 rounded-full bg-v2-text-text-faint"
+            classList={{
+              "bg-v2-state-fg-danger": props.entry.excluded,
+              "bg-v2-state-fg-warning": props.entry.pinned && !props.entry.excluded,
+            }} />
+          <Tag>{props.entry.role}</Tag>
+          <span class="min-w-0 truncate text-[10px] text-v2-text-text-muted"
+            classList={{ "line-through opacity-60": props.entry.excluded }}>
+            {props.entry.preview}
+          </span>
+        </div>
+        <div class="mt-0.5 flex items-center gap-1.5 text-[9px] tabular-nums text-v2-text-text-faint">
+          <span class="min-w-0 truncate font-mono">{props.entry.messageID}</span>
+          <span>·</span>
+          <span class="shrink-0">{formatter().number(props.entry.tokenEstimate)} tok</span>
+          <Show when={props.entry.edited}><span>{language.t("context.ledger.edited")}</span></Show>
+          <Show when={props.entry.pinned}><span>{language.t("context.ledger.pinned")}</span></Show>
+          <Show when={props.entry.hasSignedReasoning}><span>{language.t("context.ledger.locked")}</span></Show>
+        </div>
+      </div>
+      <div class="flex shrink-0 items-center gap-0.5">
+        <ButtonV2 variant="ghost-muted" size="small" class="!h-5 !px-1.5 !text-[10px]"
+          disabled={ledgerBusy() !== null || props.entry.hasSignedReasoning && !props.entry.excluded}
+          onClick={() => void applyLedgerOperation({
+            type: props.entry.excluded ? "message.include" : "message.exclude",
+            messageID: props.entry.messageID,
+          })}>
+          {language.t(props.entry.excluded ? "context.ledger.restore" : "context.ledger.remove")}
+        </ButtonV2>
+        <ButtonV2 variant={props.entry.pinned ? "warning" : "ghost-muted"} size="small"
+          class="!h-5 !w-5 !min-w-5 !px-0"
+          icon={props.entry.pinned ? "pin-filled" : "pin"}
+          disabled={ledgerBusy() !== null}
+          title={language.t(props.entry.pinned ? "context.ledger.unpin" : "context.ledger.pin")}
+          aria-label={language.t(props.entry.pinned ? "context.ledger.unpin" : "context.ledger.pin")}
+          onClick={() => void applyLedgerOperation({
+            type: props.entry.pinned ? "message.unpin" : "message.pin",
+            messageID: props.entry.messageID,
+          })} />
+      </div>
+    </div>
+  )
+
   return (
     <div class="flex h-full min-h-0 flex-col">
       <div class="flex shrink-0 items-center justify-between gap-2 border-b border-v2-border-border-muted px-3 py-1.5">
@@ -1484,15 +1613,15 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
             <MetricCell
               label={language.t("context.metric.cacheHit")}
               tooltip={language.t("context.tooltip.cacheHit")}
-              value={percentLabel(session().cacheHitPercent)}
+              value={percentLabel(settledSession().cacheHitPercent)}
             />
             <MetricCell
               label={language.t("context.metric.tokensPerSecond")}
               tooltip={language.t("context.tooltip.tokensPerSecond")}
               value={tokensPerSecondLabel(session().tokensPerSecond)}
             />
-            <MetricCell label={language.t("context.stats.totalCost")} value={formatter().currency(session().cost)} />
-            <MetricCell label={language.t("context.stats.totalTokens")} value={formatter().number(session().total)} />
+            <MetricCell label={language.t("context.stats.totalCost")} value={formatter().currency(settledSession().cost)} />
+            <MetricCell label={language.t("context.stats.totalTokens")} value={formatter().number(settledSession().total)} />
             <MetricCell
               label={language.t("context.metric.freeValue")}
               tooltip={language.t("context.tooltip.freeValue")}
@@ -1573,7 +1702,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
               <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
                 {language.t("context.tokens.title")}
               </div>
-              <CategoryBar segments={buildTokenSegments(session())} />
+              <CategoryBar segments={buildTokenSegments(settledSession())} />
             </div>
           </Section>
 
@@ -1594,12 +1723,12 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
               <MetricCell
                 label={language.t("context.metric.ttft")}
                 tooltip={language.t("context.tooltip.ttft")}
-                value={durationLabel(session().ttftSeconds)}
+                value={durationLabel(settledSession().ttftSeconds)}
               />
               <MetricCell
                 label={language.t("context.metric.upstreamTTFT")}
                 tooltip={language.t("context.tooltip.upstreamTTFT")}
-                value={durationLabel(session().upstreamTTFTSeconds)}
+                value={durationLabel(settledSession().upstreamTTFTSeconds)}
               />
             </div>
           </Section>
@@ -1607,7 +1736,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           <Section title={language.t("context.cost.title")} tooltip={language.t("context.tooltip.costBreakdown")}>
             <div class="flex flex-col gap-2">
               <Show
-                when={session().costBreakdown}
+                when={settledSession().costBreakdown}
                 fallback={
                   <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
                     {language.t("context.cost.unavailable")}
@@ -1617,7 +1746,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                 {(breakdown) => <CategoryBar segments={buildCostSegments(breakdown())} />}
               </Show>
               <InfoCard>
-                <Show when={session().costBreakdown}>
+                <Show when={settledSession().costBreakdown}>
                   {(breakdown) => (
                     <InfoRow
                       label={language.t("context.cost.estimatedTotal")}
@@ -1625,7 +1754,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                     />
                   )}
                 </Show>
-                <InfoRow label={language.t("context.cost.billedTotal")} value={formatter().currency(session().cost)} />
+                <InfoRow label={language.t("context.cost.billedTotal")} value={formatter().currency(settledSession().cost)} />
                 <InfoRow
                   label={language.t("context.cost.freeValue")}
                   value={
@@ -1634,7 +1763,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                     </span>
                   }
                 />
-                <Show when={session().cacheSavings !== undefined}>
+                <Show when={settledSession().cacheSavings !== undefined}>
                   <InfoRow
                     label={
                       <span class="inline-flex items-center gap-1">
@@ -1650,7 +1779,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                         </TooltipV2>
                       </span>
                     }
-                    value={formatter().currency(session().cacheSavings)}
+                    value={formatter().currency(settledSession().cacheSavings)}
                   />
                 </Show>
               </InfoCard>
@@ -1667,7 +1796,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                   })}
                 </div>
               </Show>
-              <Show when={!session().costBreakdownComplete}>
+              <Show when={!settledSession().costBreakdownComplete}>
                 <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
                   {language.t("context.cost.partial", {
                     available: models().filter((m) => m.costBreakdown).length,
@@ -1780,11 +1909,30 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                 fallback={
                   <div class="border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2 text-[10px] leading-3 text-v2-text-text-faint">
                     {language.t(ledgerError() ? "context.ledger.error" : "context.ledger.loading")}
+                    <Show when={ledgerError()}>
+                      <button type="button" class="ml-2 underline"
+                        onClick={() => {
+                          setLedgerError(null)
+                          void fetchLedger(params.id, true)
+                        }}>Retry</button>
+                    </Show>
                   </div>
                 }
               >
                 {(l) => (
                   <div class="flex flex-col gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
+                    <Show when={pagedLedger()?.hasMore}>
+                      <div class="text-[10px] leading-3 text-v2-text-text-muted">
+                        {formatter().number(pagedLedger()?.loadedCount ?? 0)} messages loaded
+                        <Show when={pagedLedger()?.authoritativeTotals}>
+                          {" "}of {formatter().number(l().totals.messageCount)} total.
+                        </Show>
+                        <Show when={!pagedLedger()?.authoritativeTotals}>
+                          . Full-history totals are unavailable until all pages are loaded.
+                        </Show>
+                      </div>
+                    </Show>
+                    <Show when={l().complete !== false}>
                     <div class="flex items-center justify-between gap-2">
                       <div class="flex min-w-0 items-center gap-1.5">
                         <ProgressCircleV2 percentage={ledgerUsagePercent() ?? 0} size={16} strokeWidth={2} />
@@ -1824,6 +1972,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                         <span>{language.t("context.ledger.editedCount", { count: l().totals.editedCount })}</span>
                       </Show>
                     </div>
+                    </Show>
                   </div>
                 )}
               </Show>
@@ -1857,33 +2006,73 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                 </Show>
               </div>
 
-              <Show
-                when={messages().length > 0}
-                fallback={
-                  <div class="px-2.5 py-3 text-[10px] leading-3 text-v2-text-text-faint">
-                    {language.t("context.ledger.empty")}
+              {/* Each server request is bounded to one page. Stable chunks
+                  accumulate only when explicitly requested; no full-transcript
+                  hydration, per-page history flattening, or stale row remount. */}
+              <Show when={ledgerVisible() && !specialAgentReadOnly()}>
+                <Show when={ledgerError()}>
+                  <div class="border-b border-v2-border-border-muted px-2.5 py-2 text-[10px] text-v2-text-text-muted">
+                    {language.t("context.ledger.error")}: {ledgerError()}
+                    <button type="button" class="ml-2 underline"
+                      onClick={() => {
+                        setLedgerError(null)
+                        void fetchLedger(params.id, true)
+                      }}>Retry</button>
                   </div>
-                }
-              >
-                <Show when={hiddenRawCount() > 0}>
-                  <button
-                    type="button"
-                    class="flex w-full items-center justify-center border-b border-v2-border-border-muted px-2.5 py-1.5 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
-                    onClick={() => setRawLimit((value) => value + RAW_MESSAGE_PAGE_SIZE)}
-                  >
-                    {language.t("common.loadMore")} ({Math.min(RAW_MESSAGE_PAGE_SIZE, hiddenRawCount())})
+                </Show>
+                <ContextLedgerVirtualRows
+                  pages={() => pagedLedger()?.pages ?? []}
+                  count={() => pagedLedger()?.loadedCount ?? 0}
+                  renderRow={(item) => <LedgerSummaryRow entry={item} />}
+                />
+                <Show when={pagedLedger()?.hasMore}>
+                  <button type="button"
+                    class="flex w-full items-center justify-center border-t border-v2-border-border-muted px-2.5 py-2 text-[10px] font-[520] text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base disabled:opacity-40"
+                    disabled={pageLoading()}
+                    onClick={() => void fetchMoreLedger()}>
+                    {language.t("common.loadMore")} ({formatter().number(pagedLedger()?.loadedCount ?? 0)} loaded)
                   </button>
                 </Show>
-                <Accordion
-                  multiple
-                  value={rawOpen()}
-                  onChange={(value) => setRawOpen(Array.isArray(value) ? value : value ? [value] : [])}
+                <Show when={messages().length > 0}>
+                  <button type="button"
+                    class="flex w-full justify-center border-t border-v2-border-border-muted px-2.5 py-1.5 text-[9px] font-[520] text-v2-text-text-faint hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                    onClick={() => setRawInspectorOpen((open) => !open)}>
+                    {rawInspectorOpen() ? "Hide raw transcript" : "Inspect raw transcript"}
+                  </button>
+                </Show>
+              </Show>
+              {/* The special-agent ledger is read-only; its authoritative V2
+                  transcript is not exposed through the V1 paging endpoint.
+                  Raw details remain an explicit, independently mounted view. */}
+              <Show when={ledgerVisible() && (specialAgentReadOnly() || rawInspectorOpen())}>
+                <Show
+                  when={messages().length > 0}
+                  fallback={
+                    <div class="px-2.5 py-3 text-[10px] leading-3 text-v2-text-text-faint">
+                      {language.t("context.ledger.empty")}
+                    </div>
+                  }
                 >
-                  <For each={rawMessages()}>{(message) => <RawMessage message={message} />}</For>
-                </Accordion>
+                  <Show when={hiddenRawCount() > 0}>
+                    <button
+                      type="button"
+                      class="flex w-full items-center justify-center border-b border-v2-border-border-muted px-2.5 py-1.5 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                      onClick={() => setRawLimit((value) => value + RAW_MESSAGE_PAGE_SIZE)}
+                    >
+                      {language.t("common.loadMore")} ({Math.min(RAW_MESSAGE_PAGE_SIZE, hiddenRawCount())})
+                    </button>
+                  </Show>
+                  <Accordion
+                    multiple
+                    value={rawOpen()}
+                    onChange={(value) => setRawOpen(Array.isArray(value) ? value : value ? [value] : [])}
+                  >
+                    <For each={rawMessages()}>{(message) => <RawMessage message={message} />}</For>
+                  </Accordion>
+                </Show>
               </Show>
 
-              <Show when={ledger()?.totals.excludedCount || ledger()?.totals.editedCount}>
+              <Show when={ledger()?.complete !== false && (ledger()?.totals.excludedCount || ledger()?.totals.editedCount)}>
                 <div class="border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-1.5 text-[9px] leading-3 text-v2-text-text-faint">
                   {language.t("context.ledger.spendNote")}
                 </div>

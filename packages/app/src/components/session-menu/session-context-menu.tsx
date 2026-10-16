@@ -6,19 +6,19 @@ import { useTabs, tabKey } from "@/context/tabs"
 import { useGlobal } from "@/context/global"
 import { ServerConnection } from "@/context/server"
 import type { Session } from "@opencode-ai/sdk/v2"
-import { useSessionGroups } from "@/context/session-groups"
+import { sessionGroupMemberSession, useSessionGroups } from "@/context/session-groups"
 import { useProviders } from "@/hooks/use-providers"
 import { useForkUsage } from "@/context/fork-usage"
 import { accountShortLabel, splitMultiAccountModelID } from "@/utils/model-account-identity"
 import { showToast } from "@/utils/toast"
+import { stopSession } from "@/utils/session-stop"
 import { tabSessionState } from "../titlebar-tab-state"
 import {
   isTitleRegenerationPending,
   sessionApiOf,
-  beginTitleRegeneration,
-  endTitleRegeneration,
 } from "../titlebar-tab-actions"
 import { createSessionMenuModel, type SessionMenuWhere } from "./session-menu-model"
+import { createSessionTitleRegeneration } from "../session-title-regeneration"
 import type { MenuSectionDef } from "./menu-model"
 import { MenuSectionsRenderer } from "./menu-renderer"
 import { usePermission } from "@/context/permission"
@@ -34,6 +34,7 @@ import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
 import { isSessionPinned, toggleSessionPin } from "@/utils/pinned-sessions"
 import type { SessionModelPickerRequest } from "./session-model-picker-runtime"
+import { generateSessionGroupTitle } from "./session-group-title"
 import { ContextMenuCursorTrigger } from "@/components/context-menu-cursor-trigger"
 
 const SessionModelPicker = lazy(() =>
@@ -54,6 +55,29 @@ const promptFromSession = (sess: Session | undefined): PromptModel | undefined =
   const model = sess?.model
   if (!model) return undefined
   return { providerID: model.providerID, modelID: model.id, variant: model.variant }
+}
+
+type GroupMenuMember = { id: string; directory?: string; session?: Session }
+
+async function runGroupAction<T>(items: T[], action: (item: T) => Promise<unknown>, concurrency = 4) {
+  let next = 0
+  let succeeded = 0
+  let failed = 0
+  const workers = Math.min(concurrency, items.length)
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      while (next < items.length) {
+        const item = items[next++]
+        try {
+          await action(item)
+          succeeded++
+        } catch {
+          failed++
+        }
+      }
+    }),
+  )
+  return { total: items.length, succeeded, failed }
 }
 
 // Tracks the last real pointer position so the model popover (which has no
@@ -134,6 +158,24 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     return global.ensureServerCtx(conn)
   })
 
+  const groupEntry = createMemo(() => (props.isGroup && props.groupId ? sessionGroups.byID(props.groupId) : undefined))
+  const [groupTitlePending, setGroupTitlePending] = createSignal(false)
+  createEffect(() => {
+    const groupId = props.isGroup ? props.groupId : undefined
+    if (groupId) sessionGroups.fetchDetail(groupId)
+  })
+  const groupMembers = createMemo<GroupMenuMember[]>(() => {
+    const ctx = serverCtx()
+    const seen = new Set<string>()
+    return (groupEntry()?.sessions ?? []).flatMap((member) => {
+      if (member.time?.archived != null || seen.has(member.id)) return []
+      seen.add(member.id)
+      const cached = ctx?.sync.session.peek(member.id)
+      const session = cached ?? sessionGroupMemberSession(member) ?? (props.session?.id === member.id ? props.session : undefined)
+      return [{ id: member.id, directory: member.directory ?? session?.directory, session }]
+    })
+  })
+
   const state = createMemo(() => tabSessionState(serverCtx(), sessionID()))
   const pendingRegenerate = createMemo(() => isTitleRegenerationPending(sessionID()))
 
@@ -170,7 +212,11 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const id = sessionID()
     const a = api()
     if (!id || !a) return
-    void (a as unknown as { interrupt: (p: { sessionID: string }) => Promise<unknown> }).interrupt({ sessionID: id })
+    void stopSession(a, id).catch((error) => showToast({
+      variant: "error",
+      title: language.t("common.requestFailed"),
+      description: error instanceof Error ? error.message : String(error),
+    }))
   }
   const pause = () => {
     const id = sessionID()
@@ -184,23 +230,13 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     if (!id || !a) return
     void a.resume({ sessionID: id })
   }
-  const regenerateTitle = () => {
-    const id = sessionID()
-    const a = api()
-    if (!id || !a || pendingRegenerate()) return
-    beginTitleRegeneration(id)
-    void a
-      .regenerateTitle({ sessionID: id })
-      .then(() => showToast({ title: language.t("toast.title.regenerated"), variant: "success" }))
-      .catch((err) =>
-        showToast({
-          title: language.t("toast.title.failed"),
-          description: err instanceof Error ? err.message : undefined,
-          variant: "error",
-        }),
-      )
-      .finally(() => endTitleRegeneration(id))
-  }
+  const titleRegeneration = createSessionTitleRegeneration({
+    sessionID,
+    session: () => props.session,
+    api,
+    server: () => props.server,
+  })
+  const regenerateTitle = () => titleRegeneration.run()
 
   const [pinVersion, setPinVersion] = createSignal(0)
   const isPinned = createMemo(() => {
@@ -522,6 +558,38 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     return permission.isAutoAccepting(sid, sess.directory)
   })
 
+  const groupMenuState = createMemo(() => {
+    const ctx = serverCtx()
+    const members = groupMembers()
+    const permissionState = props.server && permission ? permission.ensureServerState(props.server) : undefined
+    const permissionMembers = members.filter((member) => !!member.directory)
+    const permissionReady = permissionState?.ready() ?? false
+    const working = members.filter((member) => tabSessionState(ctx, member.id) === "working").length
+    const stopEligible = members.filter((member) => {
+      const state = tabSessionState(ctx, member.id)
+      return state === "working" || state === "interrupted"
+    }).length
+    const paused = members.filter((member) => tabSessionState(ctx, member.id) === "paused").length
+    const pokeable = members.filter((member) => {
+      const status = tabSessionState(ctx, member.id)
+      return !!member.directory && status === "idle"
+    }).length
+    return {
+      members: members.length,
+      permissionMembers: permissionMembers.length,
+      permissionReady,
+      working,
+      stopEligible,
+      paused,
+      pokeable,
+      allAutoAccepting:
+        permissionReady &&
+        permissionMembers.length > 0 &&
+        permissionMembers.every((member) => permissionState?.isAutoAccepting(member.id, member.directory)),
+      titlePending: groupTitlePending(),
+    }
+  })
+
   const currentVariant = createMemo(() => props.session?.model?.variant ?? undefined)
   // The session stores an account-qualified id ("deepseek-v4.1-flash@zen-889db3308123").
   // Show the catalog name plus the human account/key label instead of the raw internal
@@ -562,21 +630,39 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   }
 
   const changeModel = () => {
-    const sid = sessionID()
-    const sess = props.session
+    const group = props.isGroup ? groupMembers() : []
+    const sess = props.isGroup ? group.find((member) => !!member.session?.directory)?.session : props.session
+    const sid = sess?.id
     if (!sid || !sess) return
     // Capture synchronously — this is the pointerdown that selected "Change
     // model" itself, so the popover spawns right there, like a submenu flyout.
     const anchor = { top: lastPointerPosition.y, left: lastPointerPosition.x }
-    if (props.onChangeModel) {
-      const ctx = serverCtx()
-      if (!ctx) return
-      props.onChangeModel({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
-      return
-    }
     const ctx = serverCtx()
     if (!ctx) return
-    setModelPicker({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
+    const modelMembers = group
+      .filter((member) => member.id !== sid && !!member.directory)
+      .map((member) => ({ id: member.id, directory: member.directory! }))
+    const unavailableMembers = props.isGroup ? Math.max(0, group.length - modelMembers.length - 1) : 0
+    const request: SessionModelPickerRequest = {
+      session: sess,
+      server: props.server,
+      serverScope: ctx.sdk.scope,
+      anchor,
+      applyModelTo: props.isGroup ? modelMembers : undefined,
+      onBulkModelApplied: props.isGroup
+        ? (result) =>
+            showGroupActionResult("sessionGroup.changeModelAll", {
+              total: result.total + unavailableMembers + 1,
+              succeeded: result.succeeded + 1,
+              failed: result.failed + unavailableMembers,
+            })
+        : undefined,
+    }
+    if (props.onChangeModel) {
+      props.onChangeModel(request)
+      return
+    }
+    setModelPicker(request)
   }
 
   const selectVariant = (variant: string | undefined) => {
@@ -605,6 +691,119 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       description: active
         ? language.t("toast.permissions.autoaccept.on.description")
         : language.t("toast.permissions.autoaccept.off.description"),
+    })
+  }
+
+  const showGroupActionResult = (
+    titleKey: string,
+    result: { total: number; succeeded: number; failed: number },
+  ) =>
+    showToast({
+      title: language.t(titleKey),
+      description: language.t(
+        result.failed > 0 ? "sessionGroup.action.partial" : "sessionGroup.action.success",
+        result.failed > 0
+          ? { succeeded: result.succeeded, count: result.total, failed: result.failed }
+          : { count: result.succeeded },
+      ),
+      variant: result.failed > 0 ? "error" : "success",
+    })
+
+  const runGroupMenuAction = <T,>(
+    titleKey: string,
+    targets: T[],
+    action: (target: T) => Promise<unknown>,
+    concurrency = 4,
+  ) => {
+    if (targets.length === 0) return
+    void holdSurface(async () => {
+      const result = await runGroupAction(targets, action, concurrency)
+      showGroupActionResult(titleKey, result)
+    })
+  }
+
+  const stopAll = () => {
+    const ctx = serverCtx()
+    const current = api()
+    if (!ctx || !current) return
+    const targets = groupMembers().filter((member) => {
+      const state = tabSessionState(ctx, member.id)
+      return state === "working" || state === "interrupted"
+    })
+    runGroupMenuAction("sessionGroup.stopAll.done", targets, (member) => stopSession(current, member.id))
+  }
+
+  const pauseAll = () => {
+    const ctx = serverCtx()
+    const current = api()
+    if (!ctx || !current) return
+    const targets = groupMembers().filter((member) => tabSessionState(ctx, member.id) === "working")
+    runGroupMenuAction("sessionGroup.pauseAll.done", targets, (member) => current.pause({ sessionID: member.id }))
+  }
+
+  const resumeAll = () => {
+    const current = api()
+    if (!current) return
+    const targets = groupMembers().filter((member) => tabSessionState(serverCtx(), member.id) === "paused")
+    runGroupMenuAction("sessionGroup.resumeAll.done", targets, (member) => current.resume({ sessionID: member.id }))
+  }
+
+  const regenerateGroupTitle = () => {
+    const group = groupEntry()
+    if (!group || group.kind === "swarm" || groupTitlePending()) return
+    const title = generateSessionGroupTitle(
+      group.sessions
+        .filter((member) => member.time?.archived == null)
+        .map((member) => member.title),
+    )
+    if (!title) {
+      showToast({
+        title: language.t("sessionGroup.regenerateGroupTitle.unavailable"),
+        variant: "error",
+      })
+      return
+    }
+    if (title === group.name) {
+      showToast({ title: language.t("sessionGroup.regenerateGroupTitle.current"), variant: "success" })
+      return
+    }
+    setGroupTitlePending(true)
+    void sessionGroups
+      .renameGroup({ id: group.id, name: title })
+      .then(() =>
+        showToast({
+          title: language.t("sessionGroup.regenerateGroupTitle.done"),
+          description: title,
+          variant: "success",
+        }),
+      )
+      .catch((error: unknown) =>
+        showToast({
+          title: language.t("sessionGroup.regenerateGroupTitle.failed"),
+          description: error instanceof Error ? error.message : undefined,
+          variant: "error",
+        }),
+      )
+      .finally(() => setGroupTitlePending(false))
+  }
+
+  const toggleAutoAcceptAll = () => {
+    if (!props.server || !permission) return
+    const permissionState = permission.ensureServerState(props.server)
+    if (!permissionState.ready()) return
+    const targets = groupMembers().filter((member) => !!member.directory)
+    if (targets.length === 0) return
+    const enable = !groupMenuState().allAutoAccepting
+    for (const member of targets) {
+      if (enable) permissionState.enableAutoAccept(member.id, member.directory!)
+      else permissionState.disableAutoAccept(member.id, member.directory)
+    }
+    showToast({
+      title: language.t(
+        enable ? "toast.permissions.autoaccept.on.title" : "toast.permissions.autoaccept.off.title",
+      ),
+      description: language.t("sessionGroup.action.success", { count: targets.length }),
+      variant: "success",
     })
   }
 
@@ -648,6 +847,40 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
         variant: "error",
       })
     }
+  }
+
+  const pokeAll = () => {
+    const ctx = serverCtx()
+    if (!ctx) return
+    const targets = groupMembers().filter(
+      (member) => !!member.directory && tabSessionState(ctx, member.id) === "idle",
+    )
+    const sessionAPI = ctx.sdk.api.session as unknown as { prompt: (input: PokePromptInput) => Promise<unknown> }
+    runGroupMenuAction(
+      "sessionGroup.pokeAll.done",
+      targets,
+      async (member) => {
+        const { createPromptSession } = await loadPromptRuntime()
+        if (!owner || !member.directory) throw new Error("Session prompt is unavailable")
+        const prompt = runWithOwner(owner, () =>
+          createPromptSession(ctx.sdk.scope, { dir: base64Encode(member.directory!), id: member.id }),
+        )
+        if (!prompt) throw new Error("Session prompt is unavailable")
+        await prompt.ready.promise
+        const model = prompt.model.current() ?? promptFromSession(member.session)
+        const messageID = Identifier.ascending("message")
+        await sessionAPI.prompt({
+          sessionID: member.id,
+          id: messageID,
+          agent: "build",
+          model: model
+            ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined }
+            : undefined,
+          text: "continue",
+          legacyParts: [{ id: `prt_${messageID}`, type: "text", text: "continue" }],
+        })
+      },
+    )
   }
 
   const compact = async () => {
@@ -727,6 +960,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       currentVariant: currentVariant(),
       currentModelLabel: currentModelLabel(),
       availableVariants: [...DEFAULT_VARIANTS],
+      groupState: props.isGroup ? groupMenuState() : undefined,
       onCreateGroupDialog,
       actions: {
         open: props.onOpen ? () => props.onOpen?.({ background: false }) : undefined,
@@ -735,8 +969,17 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
         pause,
         resume,
         regenerateTitle,
-        renameGroup: props.isGroup ? renameGroup : undefined,
-        addSessions: props.isGroup ? addSessions : undefined,
+        stopAll: props.isGroup && api() ? stopAll : undefined,
+        pauseAll: props.isGroup && api() ? pauseAll : undefined,
+        resumeAll: props.isGroup && api() ? resumeAll : undefined,
+        regenerateGroupTitle:
+          props.isGroup && groupEntry()?.kind !== "swarm" && groupEntry() ? regenerateGroupTitle : undefined,
+        changeModelAll: props.isGroup && groupMembers().some((member) => !!member.session?.directory) ? changeModel : undefined,
+        toggleAutoAcceptAll: props.isGroup && permission ? toggleAutoAcceptAll : undefined,
+        pokeAll: props.isGroup && serverCtx() ? pokeAll : undefined,
+        renameGroup:
+          props.isGroup && groupEntry()?.kind !== "swarm" && groupEntry() ? renameGroup : undefined,
+        addSessions: props.isGroup && props.where === "group-tab" ? addSessions : undefined,
         addToGroup: (groupId) => {
           if (props.onAddToGroup) {
             props.onAddToGroup(groupId)

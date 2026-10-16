@@ -5,14 +5,17 @@ import { UserTurnSource } from "@opencode-ai/schema/session-v1"
 import { isSemanticUserMessage, normalizeSessionMessages } from "@/utils/session-message"
 import type { TimelineRow as TimelineRowNS } from "./rows"
 
+let groupPartRefVisits = 0
+
 mock.module("@opencode-ai/session-ui/message-part", () => ({
   renderable: () => true,
   groupParts: (refs: Array<{ messageID: string; part: { id: string } }>) =>
+    (groupPartRefVisits += refs.length,
     refs.map((ref) => ({
       type: "part" as const,
       key: ref.part.id,
       ref: { messageID: ref.messageID, partID: ref.part.id },
-    })),
+    }))),
 }))
 
 // rows.ts now imports the markdown-height predictor, which imports the shared
@@ -29,6 +32,112 @@ mock.module("@/lib/text-layout", () => ({
 const { Timeline, TimelineRow, sessionMessageTimelineDisposition } = await import("./rows")
 
 describe("current session timeline rows", () => {
+  test("records full-page part projection cost independently of virtualized DOM", () => {
+    const perAssistant = 512
+    const source: SessionMessageInfo[] = []
+    for (let turn = 0; turn < 20; turn++) {
+      const userID = `msg_user_${turn}`
+      source.push({ id: userID, type: "user", text: `prompt ${turn}`, time: { created: turn * 2 + 1 } })
+      source.push({
+        id: `msg_assistant_${turn}`,
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: Array.from({ length: perAssistant }, (_, part) => ({
+          type: "text" as const,
+          text: `part ${part}`,
+        })),
+        time: { created: turn * 2 + 2, completed: turn * 2 + 3 },
+      })
+    }
+    const normalized = normalizeSessionMessages("ses_large_page", source)
+    groupPartRefVisits = 0
+
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (messageID) => normalized.messages.find((message) => message.id === messageID) as UserMessage | AssistantMessage,
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      false,
+      "idle",
+      false,
+      [],
+    )
+
+    expect(result.rows.length).toBeGreaterThan(20)
+    expect(groupPartRefVisits).toBe(20 * perAssistant)
+  })
+
+  test("measures renderer projection for an 80k-part assistant message", () => {
+    const partCount = 80_000
+    const source: SessionMessageInfo[] = [
+      { id: "msg_user_large", type: "user", text: "inspect the full output", time: { created: 1 } },
+      {
+        id: "msg_assistant_large",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: Array.from({ length: partCount }, (_, part) => ({
+          type: "text" as const,
+          text: `part ${part}`,
+        })),
+        time: { created: 2, completed: 3 },
+      },
+    ]
+    const normalized = normalizeSessionMessages("ses_large_message", source)
+    groupPartRefVisits = 0
+    const startedAt = performance.now()
+
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (messageID) => normalized.messages.find((message) => message.id === messageID) as UserMessage | AssistantMessage,
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      true,
+      false,
+      "idle",
+      false,
+      [],
+    )
+
+    const elapsedMs = performance.now() - startedAt
+    const assistantRows = result.rows.filter((row) => row._tag === "AssistantPart")
+    console.info("80k-part timeline projection baseline", { elapsedMs, rows: assistantRows.length })
+    expect(groupPartRefVisits).toBe(partCount)
+    expect(assistantRows).toHaveLength(partCount)
+  })
+
+  test("does not inject per-message content-recovery rows into the transcript", () => {
+    const source: SessionMessageInfo[] = [
+      { id: "msg_user_window", type: "user", text: "question", time: { created: 1 } },
+      {
+        id: "msg_assistant_window",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "preview…" }],
+        time: { created: 2, completed: 3 },
+      },
+    ]
+    const normalized = normalizeSessionMessages("ses_windowed", source)
+    const user = normalized.messages.find((message) => message.id === "msg_user_window") as UserMessage
+    const assistant = normalized.messages.find((message) => message.id === "msg_assistant_window") as AssistantMessage
+    const rows = Timeline.constructMessageRows(
+      user,
+      (messageID) => normalized.parts.get(messageID) ?? [],
+      [assistant],
+      0,
+      true,
+      false,
+      "idle",
+      false,
+      false,
+      undefined,
+    )
+
+    const rowTags: string[] = rows.map((row) => row._tag)
+    expect(rowTags).not.toContain("ContentWindow")
+  })
+
   test("classifies every current SessionMessageInfo variant into an explicit timeline disposition", () => {
     const messages = [
       { id: "agent", type: "agent-switched", agent: "build", time: { created: 1 } },
@@ -840,6 +949,44 @@ describe("current session timeline rows", () => {
       // stays stable across part deltas — no markdown remount mid-stream
       // (the pretext-timeline benchmark regression this gate fixes).
       expect(parts[1]?.heightHint).toBeUndefined()
+    } finally {
+      textLayoutModeValue = "off"
+    }
+  })
+
+  test("does not project interrupted turns as live timeline work", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "continue later", time: { created: 1 } },
+      {
+        id: "msg_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "partial answer" }],
+        time: { created: 2 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    textLayoutModeValue = "pretext"
+    try {
+      const result = Timeline.constructSessionMessageRows(
+        source,
+        (messageID) => messages.get(messageID),
+        (messageID) => normalized.parts.get(messageID) ?? [],
+        true,
+        false,
+        "interrupted",
+        true,
+        normalized.messages.filter((message) => message.role === "user"),
+      )
+      const assistant = result.rows.find(
+        (row): row is Extract<TimelineRowNS.TimelineRow, { _tag: "AssistantPart" }> => row._tag === "AssistantPart",
+      )
+
+      expect(assistant?.heightHint).toBeTypeOf("number")
+      expect(result.rows.some((row) => row._tag === "Thinking" || row._tag === "Retry")).toBe(false)
     } finally {
       textLayoutModeValue = "off"
     }

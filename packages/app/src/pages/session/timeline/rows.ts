@@ -6,6 +6,7 @@ import { estimateMarkdownHeight, MARKDOWN_WIDTH_FALLBACK } from "@/pages/session
 import { TimelineRow, type SummaryDiff } from "./timeline-row"
 import { uniqueSummaryDiffs } from "./summary-diffs"
 import { systemInjectionSignature } from "./system-injection"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 import {
   compareMessages,
   isStateProjectionMessage,
@@ -299,7 +300,9 @@ export namespace Timeline {
     // object means "do not inspect live reasoning text here", including when
     // the current derived heading is undefined.
     live?: { reasoningHeading?: string },
-    presentation?: { showUserMessage?: boolean },
+    presentation?: {
+      showUserMessage?: boolean
+    },
   ) {
     const rows: TimelineRow.TimelineRow[] = []
 
@@ -353,6 +356,7 @@ export namespace Timeline {
         }),
       )
 
+
     // Sits directly under the prompt it was appended to, because that is what
     // the model actually received for this turn. Gated first so the scan is not
     // even attempted while the setting is off.
@@ -382,8 +386,8 @@ export namespace Timeline {
     // every delta; attaching the changing hint to its rows would break row
     // equality (the hint is the only text-derived field) and replace/remount
     // the markdown element mid-stream. Same workingTurn predicate as
-    // message-timeline: skip the hint while the active turn is not idle.
-    const workingTurn = isActive && status !== "idle"
+    // message-timeline: skip the hint while the active turn is busy or retrying.
+    const workingTurn = isActive && sessionStatusIsWorking(status)
     assistantItems.forEach((item) => {
       if (item.type === "interrupted") {
         rows.push(
@@ -428,7 +432,7 @@ export namespace Timeline {
     if (isActive && status === "retry") rows.push(new TimelineRow.Retry({ userMessageID: userMessage.id }))
 
     const diffs = uniqueSummaryDiffs(userMessage.summary?.diffs)
-    if (diffs.length > 0 && (status === "idle" || !isActive)) {
+    if (diffs.length > 0 && (!sessionStatusIsWorking(status) || !isActive)) {
       rows.push(
         new TimelineRow.DiffSummary({
           userMessageID: userMessage.id,
