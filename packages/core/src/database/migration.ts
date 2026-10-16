@@ -2,6 +2,7 @@ export * as DatabaseMigration from "./migration"
 
 import { sql } from "drizzle-orm"
 import { Effect, Semaphore } from "effect"
+import { retrySqliteBusyCause } from "./sqlite-busy"
 import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { migrations } from "./migration.gen"
 import schema from "./schema.gen"
@@ -177,6 +178,40 @@ const checksumCorrections = new Map<string, ReadonlyMap<string, string>>([
       ],
     ]),
   ],
+  [
+    "20261007192518_session_tool_recall_projection",
+    new Map([
+      // Same-day pre-release projection work journaled two earlier source
+      // fingerprints while the migration/reconcile contract was still settling.
+      // The canonical reconcile upgrades either persisted FTS representation
+      // transactionally after the journal repair. Only these exact observed
+      // stale fingerprints are accepted; every unknown mutation still fails.
+      [
+        "b442d660a2909ee4badde34d64b896bab0c76643c3a44d28908e01f2d8b1c518",
+        "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
+      ],
+      [
+        "2e62c3bea8013b7da27e049261260deb7f26cfde395ac4973909eeabff9aa38b",
+        "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
+      ],
+      [
+        "7a82489c079254d44fc812a61a87f64c18a24b2a98167d15d2dd998439176528",
+        "c67021d3eaf77afa7ea120985fa42705f84a4257f42ced65c58e4fa1dd7821fe",
+      ],
+    ]),
+  ],
+  [
+    "20261007195036_session_tool_recall_scope_indexes",
+    new Map([
+      // The original pre-release migration tried to recreate the already-
+      // generated session directory index. Only this exact previously
+      // journaled fingerprint may converge to the idempotent migration.
+      [
+        "b2a8ffed579b16e92f2cb570f22436ad1653c63c6f08225c65d67116711307a7",
+        "15f2dda95905e8f2769a993c0143198ca8984c064e182f1a451c4552117a2340",
+      ],
+    ]),
+  ],
 ])
 
 export type Migration = {
@@ -199,10 +234,18 @@ export type Migration = {
 }
 
 export function apply(db: Database) {
+  // Source-level bootstrap already owns the DB-local schema Flock and the
+  // native adapter retries failed BEGIN admission. Never rerun an entire
+  // migration chain after an arbitrary BUSY: DDL, journal writes or COMMIT
+  // may already have executed and their outcome is not always replayable.
   return lock.withPermit(
     Effect.gen(function* () {
-      const tables = yield* db.all<{ name: string }>(
-        sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+      // Only this stand-alone read may be retried without rerunning DDL or
+      // switching the schema branch after a partially completed transaction.
+      const tables = yield* retrySqliteBusyCause(
+        () => db.all<{ name: string }>(
+          sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+        ),
       )
       if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations)
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
@@ -213,12 +256,13 @@ export function apply(db: Database) {
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL, checksum TEXT)`,
           )
-          yield* Effect.forEach(migrations, (migration) =>
-            tx.run(
-              sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum) VALUES (${migration.id}, ${Date.now()}, ${migration.checksum ?? null})`,
-            ),
-          )
-        }),
+            yield* Effect.forEach(migrations, (migration) =>
+              tx.run(
+                sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum) VALUES (${migration.id}, ${Date.now()}, ${migration.checksum ?? null})`,
+              ),
+            )
+          }),
+        { behavior: "immediate" },
       )
     }),
   )
@@ -338,6 +382,7 @@ export function applyOnly(db: Database, input: Migration[]) {
                 VALUES (${directoryGuardTarget.id}, ${Date.now()}, ${directoryGuardTarget.checksum})`,
           )
         }),
+        { behavior: "immediate" },
       )
       completed.add(DIRECTORY_GUARD_MIGRATION)
     }
@@ -351,6 +396,7 @@ export function applyOnly(db: Database, input: Migration[]) {
             sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum) VALUES (${migration.id}, ${Date.now()}, ${migration.checksum ?? null})`,
           )
         }),
+        { behavior: "immediate" },
       )
     }
 
@@ -359,7 +405,7 @@ export function applyOnly(db: Database, input: Migration[]) {
     // get their supplements created here. All statements are IF NOT EXISTS, so
     // this is a cheap no-op for healthy databases.
     if (input.some(hasReconcile)) {
-      yield* db.transaction((tx) => reconcileSupplements(tx, input))
+      yield* db.transaction((tx) => reconcileSupplements(tx, input), { behavior: "immediate" })
     }
   })
 }

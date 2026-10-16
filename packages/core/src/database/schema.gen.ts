@@ -5,6 +5,19 @@ export default {
   up(tx) {
     return Effect.gen(function* () {
       yield* tx.run(`
+        CREATE TABLE \`saved_code_admission\` (
+          \`scope_kind\` text NOT NULL,
+          \`scope_key\` text NOT NULL,
+          \`saved_id\` text NOT NULL,
+          \`revision\` text NOT NULL,
+          \`source_hash\` text NOT NULL,
+          \`origin\` text NOT NULL,
+          \`origin_run_id\` text,
+          \`time_admitted\` integer NOT NULL,
+          CONSTRAINT \`saved_code_admission_pk\` PRIMARY KEY(\`scope_kind\`, \`scope_key\`, \`saved_id\`, \`revision\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`workspace\` (
           \`id\` text PRIMARY KEY,
           \`type\` text NOT NULL,
@@ -173,7 +186,7 @@ export default {
           CONSTRAINT "provider_route_binding_affinity_domain_check" CHECK(length("affinity_domain") > 0),
           CONSTRAINT "provider_route_binding_provider_id_check" CHECK(length("provider_id") > 0),
           CONSTRAINT "provider_route_binding_route_kind_check" CHECK("route_kind" in ('public', 'account')),
-          CONSTRAINT "provider_route_binding_mode_check" CHECK("mode" is null or "mode" in ('concentrate', 'session-round-robin')),
+          CONSTRAINT "provider_route_binding_mode_check" CHECK("mode" is null or "mode" in ('concentrate', 'session-round-robin', 'round-robin')),
           CONSTRAINT "provider_route_binding_pin_check" CHECK("pin" is null or "pin" in ('hard', 'soft')),
           CONSTRAINT "provider_route_binding_reason_check" CHECK("reason" in ('explicit', 'initial', 'failover', 'model-selection')),
           CONSTRAINT "provider_route_binding_revision_check" CHECK("route_revision" > 0),
@@ -240,6 +253,75 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_attachment_blob\` (
+          \`id\` text PRIMARY KEY,
+          \`content_hash\` text NOT NULL,
+          \`mime\` text NOT NULL,
+          \`byte_length\` integer NOT NULL,
+          \`bytes\` text NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_attachment_grant\` (
+          \`id\` text PRIMARY KEY,
+          \`attachment_id\` text NOT NULL,
+          \`source_session_id\` text NOT NULL,
+          \`source_message_id\` text NOT NULL,
+          \`source_part_id\` text NOT NULL,
+          \`target_kind\` text NOT NULL,
+          \`target_child_session_id\` text,
+          \`target_tool_call_id\` text,
+          \`target_tool_part_id\` text,
+          \`target_assistant_message_id\` text,
+          \`target_task_id\` text,
+          \`target_run_id\` text,
+          \`target_session_input_id\` text,
+          \`target_member_session_id\` text,
+          \`state\` text DEFAULT 'active' NOT NULL,
+          \`reason\` text,
+          \`idempotency_key\` text NOT NULL,
+          \`parent_grant_id\` text,
+          \`revoked_at\` integer,
+          \`expires_at\` integer,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`fk_session_attachment_grant_attachment_id_session_attachment_id_fk\` FOREIGN KEY (\`attachment_id\`) REFERENCES \`session_attachment\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_attachment_status\` (
+          \`grant_id\` text PRIMARY KEY,
+          \`selected\` integer DEFAULT false NOT NULL,
+          \`authorized\` integer DEFAULT false NOT NULL,
+          \`resolved\` integer DEFAULT false NOT NULL,
+          \`included_in_provider_request\` integer DEFAULT false NOT NULL,
+          \`recipient_provider_id\` text,
+          \`recipient_model_id\` text,
+          \`recipient_account_id\` text,
+          \`reason\` text,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_session_attachment_status_grant_id_session_attachment_grant_id_fk\` FOREIGN KEY (\`grant_id\`) REFERENCES \`session_attachment_grant\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_attachment\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`part_id\` text NOT NULL,
+          \`blob_id\` text NOT NULL,
+          \`origin\` text NOT NULL,
+          \`filename\` text,
+          \`mime\` text NOT NULL,
+          \`byte_length\` integer NOT NULL,
+          \`handle\` text NOT NULL,
+          \`tombstoned_at\` integer,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`fk_session_attachment_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_attachment_blob_id_session_attachment_blob_id_fk\` FOREIGN KEY (\`blob_id\`) REFERENCES \`session_attachment_blob\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_execution_boundary\` (
           \`session_id\` text PRIMARY KEY,
           \`boundary\` text NOT NULL,
@@ -261,6 +343,53 @@ export default {
           CONSTRAINT \`fk_session_execution_owner_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
           CONSTRAINT \`fk_session_execution_owner_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`owner_id\`) REFERENCES \`runtime_owner\`(\`id\`),
           CONSTRAINT \`fk_session_execution_owner_recovery_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`recovery_owner_id\`) REFERENCES \`runtime_owner\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_limit_recovery_epoch\` (
+          \`session_id\` text PRIMARY KEY,
+          \`generation\` integer DEFAULT 0 NOT NULL,
+          CONSTRAINT \`fk_session_limit_recovery_epoch_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_limit_recovery\` (
+          \`session_id\` text PRIMARY KEY,
+          \`source_assistant_message_id\` text NOT NULL,
+          \`source_user_message_id\` text,
+          \`provider_id\` text NOT NULL,
+          \`account_id\` text,
+          \`model_id\` text NOT NULL,
+          \`failure_class\` text NOT NULL,
+          \`failure_code\` text,
+          \`reset_at\` integer,
+          \`reset_source\` text,
+          \`reset_observed_at\` integer,
+          \`expected_latest_user_seq\` integer,
+          \`generation\` integer NOT NULL,
+          \`auto_resume\` integer DEFAULT false NOT NULL,
+          \`manual_resume\` integer DEFAULT false NOT NULL,
+          \`snooze_until\` integer,
+          \`continuation_id\` text NOT NULL,
+          \`claim_owner\` text,
+          \`claim_expires_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_session_limit_recovery_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`native_tool_settlement\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`project_id\` text NOT NULL,
+          \`provider_id\` text NOT NULL,
+          \`model_id\` text NOT NULL,
+          \`tool\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`started_at\` integer NOT NULL,
+          \`completed_at\` integer NOT NULL,
+          \`duration_ms\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -384,6 +513,7 @@ export default {
           \`session_id\` text PRIMARY KEY,
           \`goal_id\` text NOT NULL,
           \`audit_requested_at\` integer,
+          \`audit_retry_count\` integer DEFAULT 0 NOT NULL,
           \`auditing_at\` integer,
           \`auditor_session_id\` text,
           \`runtime_error\` text,
@@ -699,6 +829,7 @@ export default {
         CREATE TABLE \`oxp_parent_activity\` (
           \`id\` text PRIMARY KEY,
           \`title\` text,
+          \`title_user_set\` integer DEFAULT false NOT NULL,
           \`first_seen_at\` integer NOT NULL,
           \`last_seen_at\` integer NOT NULL,
           \`call_count\` integer DEFAULT 0 NOT NULL,
@@ -858,6 +989,8 @@ export default {
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
+          \`context_summary\` integer DEFAULT false NOT NULL,
+          \`context_opaque\` integer DEFAULT false NOT NULL,
           CONSTRAINT \`fk_message_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -876,6 +1009,17 @@ export default {
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
+          \`context_compaction\` integer DEFAULT false NOT NULL,
+          \`context_opaque\` integer DEFAULT false NOT NULL,
+          \`context_projection_version\` integer DEFAULT 0 NOT NULL,
+          \`context_kind\` text,
+          \`context_tokens\` integer DEFAULT 0 NOT NULL,
+          \`context_preview\` text,
+          \`context_signed\` integer DEFAULT false NOT NULL,
+          \`context_status\` text,
+          \`context_synthetic\` integer DEFAULT false NOT NULL,
+          \`context_ignored\` integer DEFAULT false NOT NULL,
+          \`tool_identity_version\` integer DEFAULT 0 NOT NULL,
           \`search_text\` text DEFAULT '' NOT NULL,
           CONSTRAINT \`fk_part_message_id_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`message\`(\`id\`) ON DELETE CASCADE
         );
@@ -1107,6 +1251,84 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_tool_output\` (
+          \`session_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`tool_call_id\` text NOT NULL,
+          \`chunk_index\` integer NOT NULL,
+          \`start_offset\` integer DEFAULT 0 NOT NULL,
+          \`text\` text,
+          \`total_chars\` integer,
+          \`total_lines\` integer,
+          \`complete\` integer DEFAULT false NOT NULL,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`session_tool_output_pk\` PRIMARY KEY(\`session_id\`, \`message_id\`, \`tool_call_id\`, \`chunk_index\`),
+          CONSTRAINT \`fk_session_tool_output_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_tool_output_message_id_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`message\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_tool_recall_backfill\` (
+          \`source\` text PRIMARY KEY,
+          \`watermark_rowid\` integer DEFAULT -1 NOT NULL,
+          \`done\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_tool_recall\` (
+          \`id\` integer PRIMARY KEY AUTOINCREMENT,
+          \`source\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`part_id\` text NOT NULL,
+          \`tool\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`search_text\` text NOT NULL,
+          CONSTRAINT \`fk_session_tool_recall_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_v1_shadow_cursor\` (
+          \`session_id\` text PRIMARY KEY,
+          \`source_event_seq\` integer NOT NULL,
+          \`watermark_rowid\` integer DEFAULT 0 NOT NULL,
+          \`complete\` integer DEFAULT false NOT NULL,
+          CONSTRAINT \`fk_session_v1_shadow_cursor_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_v1_shadow\` (
+          \`message_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`source_event_seq\` integer NOT NULL,
+          \`source_hash\` text NOT NULL,
+          \`source_snapshot_hash\` text NOT NULL,
+          \`wire_hash\` text NOT NULL,
+          \`wire\` text NOT NULL,
+          \`time_written\` integer NOT NULL,
+          CONSTRAINT \`fk_session_v1_shadow_message_id_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`message\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_v1_shadow_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_v1_tool_call_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`watermark_rowid\` integer DEFAULT 0 NOT NULL,
+          \`done\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_v1_tool_call\` (
+          \`part_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`call_id\` text NOT NULL,
+          \`status\` text NOT NULL,
+          CONSTRAINT \`fk_session_v1_tool_call_part_id_part_id_fk\` FOREIGN KEY (\`part_id\`) REFERENCES \`part\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_v1_tool_call_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`todo\` (
           \`session_id\` text NOT NULL,
           \`content\` text NOT NULL,
@@ -1125,9 +1347,29 @@ export default {
           \`id\` text NOT NULL,
           \`secret\` text NOT NULL,
           \`url\` text NOT NULL,
+          \`delete_base_url\` text,
+          \`delete_api_family\` text,
+          \`delete_account_id\` text,
+          \`delete_org_id\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`share_cleanup\` (
+          \`share_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`secret\` text NOT NULL,
+          \`base_url\` text,
+          \`api_family\` text,
+          \`account_id\` text,
+          \`org_id\` text,
+          \`ready\` integer DEFAULT 0 NOT NULL,
+          \`attempts\` integer DEFAULT 0 NOT NULL,
+          \`last_error\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -1415,6 +1657,9 @@ export default {
         );
       `)
       yield* tx.run(
+        `CREATE INDEX \`saved_code_admission_saved_idx\` ON \`saved_code_admission\` (\`scope_kind\`,\`scope_key\`,\`saved_id\`);`,
+      )
+      yield* tx.run(
         `CREATE INDEX \`directory_activity_lease_directory_idx\` ON \`directory_activity_lease\` (\`directory\`,\`state\`);`,
       )
       yield* tx.run(
@@ -1459,9 +1704,63 @@ export default {
       yield* tx.run(
         `CREATE UNIQUE INDEX \`revision_draft_target_idx\` ON \`revision_draft\` (\`target_kind\`,\`target_key\`);`,
       )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_attachment_blob_hash_idx\` ON \`session_attachment_blob\` (\`content_hash\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_attachment_grant_idempotency_idx\` ON \`session_attachment_grant\` (\`idempotency_key\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_grant_attachment_idx\` ON \`session_attachment_grant\` (\`attachment_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_grant_target_child_idx\` ON \`session_attachment_grant\` (\`target_child_session_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_grant_target_run_idx\` ON \`session_attachment_grant\` (\`target_run_id\`,\`state\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_grant_parent_idx\` ON \`session_attachment_grant\` (\`parent_grant_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_status_included_idx\` ON \`session_attachment_status\` (\`included_in_provider_request\`,\`time_updated\`) WHERE "session_attachment_status"."included_in_provider_request" = 1;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_status_recipient_idx\` ON \`session_attachment_status\` (\`recipient_provider_id\`,\`recipient_model_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_attachment_handle_idx\` ON \`session_attachment\` (\`session_id\`,\`handle\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_attachment_source_part_idx\` ON \`session_attachment\` (\`session_id\`,\`message_id\`,\`part_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_attachment_session_index_idx\` ON \`session_attachment\` (\`session_id\`,\`time_created\`,\`id\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_execution_owner_owner_idx\` ON \`session_execution_owner\` (\`owner_id\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_execution_owner_recovery_owner_idx\` ON \`session_execution_owner\` (\`recovery_owner_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_limit_recovery_due_idx\` ON \`session_limit_recovery\` (\`auto_resume\`,\`reset_at\`,\`session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_limit_recovery_manual_idx\` ON \`session_limit_recovery\` (\`manual_resume\`,\`claim_expires_at\`,\`session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_limit_recovery_claim_idx\` ON \`session_limit_recovery\` (\`auto_resume\`,\`claim_expires_at\`,\`session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`native_tool_settlement_started_idx\` ON \`native_tool_settlement\` (\`started_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`native_tool_settlement_completed_idx\` ON \`native_tool_settlement\` (\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`native_tool_settlement_provider_model_started_idx\` ON \`native_tool_settlement\` (\`provider_id\`,\`model_id\`,\`started_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`native_tool_settlement_provider_model_completed_idx\` ON \`native_tool_settlement\` (\`provider_id\`,\`model_id\`,\`completed_at\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`event_payload_chunk_time_created_idx\` ON \`event_payload_chunk\` (\`time_created\`);`,
@@ -1541,9 +1840,6 @@ export default {
       yield* tx.run(`CREATE INDEX \`oxp_correlation_ref_activity_idx\` ON \`oxp_correlation_ref\` (\`activity_id\`);`)
       yield* tx.run(`CREATE INDEX \`oxp_invocation_link_ref_idx\` ON \`oxp_invocation_link\` (\`kind\`,\`ref\`);`)
       yield* tx.run(
-        `CREATE UNIQUE INDEX \`oxp_invocation_link_invocation_ref_idx\` ON \`oxp_invocation_link\` (\`invocation_id\`,\`kind\`,\`ref\`,\`relation\`);`,
-      )
-      yield* tx.run(
         `CREATE INDEX \`oxp_invocation_activity_started_idx\` ON \`oxp_invocation\` (\`activity_id\`,\`time_started\`,\`id\`);`,
       )
       yield* tx.run(
@@ -1571,6 +1867,9 @@ export default {
       )
       yield* tx.run(`CREATE UNIQUE INDEX \`scheduled_task_run_goal_idx\` ON \`scheduled_task_run\` (\`goal_id\`);`)
       yield* tx.run(
+        `CREATE INDEX \`scheduled_task_run_status_started_idx\` ON \`scheduled_task_run\` (\`status\`,\`started_at\`,\`id\`);`,
+      )
+      yield* tx.run(
         `CREATE INDEX \`scheduled_task_run_task_started_idx\` ON \`scheduled_task_run\` (\`task_id\`,\`started_at\`);`,
       )
       yield* tx.run(
@@ -1588,8 +1887,17 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_summary_probe_idx\` ON \`message\` (\`session_id\`) WHERE "message"."context_summary" = 1;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_opaque_probe_idx\` ON \`message\` (\`session_id\`) WHERE "message"."context_opaque" = 1;`,
+      )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`part_session_opaque_context_probe_idx\` ON \`part\` (\`session_id\`) WHERE "part"."context_opaque" = 1;`,
+      )
       yield* tx.run(`CREATE INDEX \`session_checkpoint_session_id_idx\` ON \`session_checkpoint\` (\`session_id\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
@@ -1650,6 +1958,7 @@ export default {
         `CREATE INDEX \`session_message_tool_overlay_unsettled_idx\` ON \`session_message_tool_overlay\` (\`message_id\`,\`call_id\`) WHERE ("session_message_tool_overlay"."settlement_event_id" is null);`,
       )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_directory_idx\` ON \`session\` (\`directory\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_project_directory_root_updated_idx\` ON \`session\` (\`project_id\`,\`directory\`,\`time_updated\`) WHERE ("session"."parent_id" is null);`,
       )
@@ -1668,6 +1977,27 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_tool_output_page_idx\` ON \`session_tool_output\` (\`session_id\`,\`message_id\`,\`tool_call_id\`,\`start_offset\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_tool_recall_identity_idx\` ON \`session_tool_recall\` (\`source\`,\`message_id\`,\`part_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_tool_recall_tool_time_idx\` ON \`session_tool_recall\` (\`tool\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_tool_recall_session_tool_time_idx\` ON \`session_tool_recall\` (\`session_id\`,\`tool\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_v1_shadow_session_message_idx\` ON \`session_v1_shadow\` (\`session_id\`,\`message_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_v1_tool_call_session_call_idx\` ON \`session_v1_tool_call\` (\`session_id\`,\`call_id\`,\`status\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_v1_tool_call_session_status_idx\` ON \`session_v1_tool_call\` (\`session_id\`,\`status\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
       yield* tx.run(`CREATE INDEX \`swarm_blackboard_task_idx\` ON \`swarm_blackboard\` (\`swarm_id\`,\`task_id\`);`)
       yield* tx.run(

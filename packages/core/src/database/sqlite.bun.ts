@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite"
 import { drizzle } from "drizzle-orm/bun-sqlite"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -15,6 +16,10 @@ import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
 import { Sqlite } from "./sqlite"
 import { sqliteExecutionFailureMessage, sqliteFailureLogFields } from "./sqlite-diagnostics"
+import { makeSqlitePermitTracker } from "./sqlite-permit-tracker"
+import { sqliteQueryOrigin } from "./sqlite-query-origin"
+import { isSqliteBusy, retrySqliteBusyCause, sqliteBeginRetryElapsedMs, sqliteRetryableBegin } from "./sqlite-busy"
+import { layer as asyncWorkerLayer } from "./sqlite.bun-worker"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 
@@ -31,12 +36,17 @@ interface SqliteClient extends Client.SqlClient {
 
 interface Config {
   readonly filename: string
+  /** Select the existing worker-backed driver for this connection only. */
+  readonly asyncWorker?: boolean
   readonly readonly?: boolean
   readonly create?: boolean
   readonly readwrite?: boolean
   readonly disableWAL?: boolean
   /** Skip the best-effort TRUNCATE checkpoint performed when this handle closes. */
   readonly checkpointOnClose?: boolean
+  /** Maximum wait for this process's SQLite connection permit. Not SQLite busy_timeout. */
+  readonly acquireTimeoutMs?: number
+  readonly permitLane?: string
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
@@ -58,6 +68,8 @@ interface SqliteConnection extends Connection {
 const make = (options: Config) =>
   Effect.gen(function* () {
     const native = (yield* Sqlite.Native) as Database
+    const semaphore = yield* Semaphore.make(1)
+    const permit = makeSqlitePermitTracker(semaphore, options.acquireTimeoutMs, options.permitLane)
 
     const compiler = Statement.makeCompilerSqlite(options.transformQueryNames)
     const transformRows = options.transformResultNames
@@ -70,13 +82,40 @@ const make = (options: Config) =>
           operation: "execute",
         }),
       })
-      return Effect.logError("SQLite statement execution failed", sqliteFailureLogFields(cause, query)).pipe(
+      const log = isSqliteBusy(cause) ? Effect.logDebug : Effect.logError
+      return log("SQLite statement execution failed", sqliteFailureLogFields(cause, query)).pipe(
         Effect.andThen(Effect.fail(error)),
       )
     }
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
+        const endStatement = permit.statement(query, sqliteQueryOrigin(fiber.context))
+        // BEGIN is the only SQL operation that can be retried here without
+        // replaying user-visible work. If a peer WAL writer owns the SQLite
+        // writer slot, a 75-ms native busy_timeout alone turns concurrent
+        // Session starts into failures. Keep the same acquired connection
+        // permit throughout bounded, Effect-scheduled attempts and never
+        // retry statements inside a transaction (especially side effects).
+        if (sqliteRetryableBegin(query)) {
+          const begin = () => Effect.try({
+            try: () => {
+              const statement = native.query(query)
+              // @ts-ignore bun-types missing safeIntegers method
+              statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+              return (statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>
+            },
+            catch: (cause) => cause,
+          })
+          return retrySqliteBusyCause(begin, {
+             maxElapsedMs: sqliteBeginRetryElapsedMs(options.permitLane),
+            delayMs: 30,
+            maxDelayMs: 160,
+          }).pipe(
+            Effect.catchCause((cause) => failStatement(Cause.squash(cause), query)),
+            Effect.ensuring(Effect.sync(endStatement)),
+          )
+        }
         try {
           const statement = native.query(query)
           // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
@@ -84,11 +123,14 @@ const make = (options: Config) =>
           return Effect.succeed((statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>)
         } catch (cause) {
           return failStatement(cause, query)
+        } finally {
+          endStatement()
         }
       })
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<unknown[]>, SqlError>((fiber) => {
+        const endStatement = permit.statement(query, sqliteQueryOrigin(fiber.context))
         try {
           const statement = native.query(query)
           // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
@@ -96,6 +138,8 @@ const make = (options: Config) =>
           return Effect.succeed((statement.values(...(params as any)) ?? []) as Array<unknown[]>)
         } catch (cause) {
           return failStatement(cause, query)
+        } finally {
+          endStatement()
         }
       })
 
@@ -132,16 +176,29 @@ const make = (options: Config) =>
         }),
     })
 
-    const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
+      // An Effect semaphore wait happens BEFORE SQLite sees the statement, so
+      // native busy_timeout cannot interrupt a reentrant/cyclic acquisition.
+      // Bound that wait independently. Cancellation removes the pending taker;
+      // a timeout must never register a release finalizer for a permit it did
+      // not acquire.
+      // Restore interruptibility around the ENTIRE wait+deadline, not merely
+      // semaphore.take(). Otherwise Fiber.interrupt of a queued Session parks
+      // until the timeout while the uninterruptible timeout wrapper runs.
+      const acquire = restore(permit.take)
       return Effect.as(
-        Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
+        Effect.tap(acquire, () => Scope.addFinalizer(scope, permit.release)),
         connection,
       )
     })
+    // Connection admission must own the permit for the entire Effect SQL
+    // statement scope. withPermits(1)(Effect.succeed(connection)) releases
+    // BEFORE execute() and allows a second Session's query to run inside
+    // another fiber's open BEGIN IMMEDIATE transaction on this same handle.
+    // Align the synchronous Bun driver with the worker/Node scoped contract.
+    const acquirer = transactionAcquirer
 
     const client = Object.assign(
       (yield* Client.make({
@@ -157,8 +214,8 @@ const make = (options: Config) =>
       {
         [TypeId]: TypeId,
         config: options,
-        export: Effect.flatMap(acquirer, (_) => _.export),
-        loadExtension: (path: string) => Effect.flatMap(acquirer, (_) => _.loadExtension(path)),
+        export: Effect.scoped(Effect.flatMap(acquirer, (_) => _.export)),
+        loadExtension: (path: string) => Effect.scoped(Effect.flatMap(acquirer, (_) => _.loadExtension(path))),
       },
     )
 
@@ -228,9 +285,18 @@ const drizzleLayer = Layer.effect(
   }),
 )
 
-export const layer = (config: Config) => {
+export const synchronousLayer = (config: Config) => {
   const native = nativeLayer(config)
   return Layer.merge(native, Layer.merge(sqliteLayer(config), drizzleLayer).pipe(Layer.provide(native))).pipe(
     Layer.provide(Reactivity.layer),
   )
 }
+
+// Explicit migration gate: validate source-mode and the packaged single-file
+// worker entrypoint before selecting the asynchronous storage driver in release
+// builds. The existing synchronous driver remains the safe default for now.
+// Both implement the same Effect SqlClient and transaction-lifetime contract.
+export const layer = (config: Config) =>
+  config.asyncWorker === true || process.env.OPENFORK_SQLITE_ASYNC_WORKER === "1"
+    ? asyncWorkerLayer(config)
+    : synchronousLayer(config)

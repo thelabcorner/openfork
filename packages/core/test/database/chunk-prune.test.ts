@@ -128,6 +128,22 @@ describe("ChunkDB semantic prune", () => {
     expect(exit._tag).toBe("Failure")
     expect(fatalAttempts).toBe(1)
 
+    let contentionAttempts = 0
+    const started = Date.now()
+    const bounded = await Effect.runPromise(Effect.exit(retrySqliteBusy(
+      () => {
+        contentionAttempts++
+        return Effect.fail(new Error("SQLITE_BUSY: database is locked"))
+      },
+      3,
+      undefined,
+      { maxElapsedMs: 18 },
+    )))
+    expect(bounded._tag).toBe("Failure")
+    expect(contentionAttempts).toBeGreaterThan(1)
+    expect(contentionAttempts).toBeLessThan(15)
+    expect(Date.now() - started).toBeLessThan(1_000)
+
     const defect = await Effect.runPromise(
       Effect.exit(Effect.die(new Error("SQLITE_BUSY: database is locked inside migration defect"))),
     )
@@ -565,6 +581,7 @@ describe("ChunkDB semantic prune", () => {
           const db = yield* makeDatabase
           yield* DatabaseMigration.apply(db)
           yield* ensureChunkDB(db)
+          const beforeSchema = yield* db.get<{ schema_version: number }>("PRAGMA main.schema_version")
           const sessionID = "ses_legacy_checkpoint"
           yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (${sessionID}, 5, NULL)`).pipe(Effect.orDie)
           yield* db.run(sql`
@@ -595,6 +612,14 @@ describe("ChunkDB semantic prune", () => {
           const second = yield* runSemanticPrunePass(db, { limit: 8, now: Date.now() })
           expect(second.checkpointRowsMigrated).toBe(0)
           expect((yield* loadCompaction(db, sessionID))?.count).toBe(1)
+          // Scanning an already-drained legacy migration must not create and
+          // drop a transient event-table index, changing the main schema and
+          // blocking other WAL writers.
+          const afterSchema = yield* db.get<{ schema_version: number }>("PRAGMA main.schema_version")
+          expect(afterSchema?.schema_version).toBe(beforeSchema?.schema_version)
+          expect(yield* db.get<{ name: string }>(
+            "SELECT name FROM sqlite_master WHERE name='ocdb_checkpoint_migrate_idx'",
+          )).toBeUndefined()
         }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
       )
     } finally {

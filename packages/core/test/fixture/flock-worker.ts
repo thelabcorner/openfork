@@ -9,6 +9,8 @@ type Msg = {
   baseDelayMs?: number
   maxDelayMs?: number
   holdMs?: number
+  protectLiveProcess?: boolean
+  blockHeartbeatMs?: number
   ready?: string
   active?: string
   done?: string
@@ -39,6 +41,12 @@ async function job(input: Msg) {
   }
 
   try {
+    if (input.blockHeartbeatMs) {
+      // Deliberately stall the fixture's event loop: the process continues
+      // executing even though its filesystem heartbeat cannot be refreshed.
+      const end = performance.now() + input.blockHeartbeatMs
+      while (performance.now() < end) {}
+    }
     if (input.holdMs && input.holdMs > 0) {
       await sleep(input.holdMs)
     }
@@ -62,6 +70,7 @@ async function main() {
     timeoutMs: msg.timeoutMs,
     baseDelayMs: msg.baseDelayMs,
     maxDelayMs: msg.maxDelayMs,
+    protectLiveProcess: msg.protectLiveProcess,
   })
 }
 

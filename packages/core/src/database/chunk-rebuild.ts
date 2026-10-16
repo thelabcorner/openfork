@@ -250,6 +250,16 @@ export function rebuildDatabase(filename: string): Effect.Effect<RebuildResult, 
           let collapsedEvent = 0
           let collapsedProjection = 0
           let deduped = 0
+          // The optional rebuild tool also supports older databases that have
+          // not yet run the Context-projection migration. Never assume the
+          // scalar marker exists when operating on a legacy VACUUM copy.
+          const contextOpaqueAvailable = new Map(
+            (["message", "part"] as const).map((table) => [
+              table,
+              (db.prepareAll(`PRAGMA table_info("${table}")`, []) as Array<{ name: string }>)
+                .some((column) => column.name === "context_opaque"),
+            ]),
+          )
 
           // Verify the event_value FK (aggregate_id -> event_sequence) holds before
           // injecting a ref (spec note 2). If the aggregate has no event_sequence
@@ -324,7 +334,14 @@ export function rebuildDatabase(filename: string): Effect.Effect<RebuildResult, 
               if (!canInject(row.agg)) continue
               const ref = collapseValue(row.agg, row.seq, row.v)
               if (!ref) continue
-              db.prepareRun(`UPDATE ${table} SET ${column} = ? WHERE id = ?`, [ref, row.rid])
+               // Preserve producer-computed semantic flags while marking
+               // externalized V1 payloads opaque. Context admission must not
+               // interpret a reference lacking inline type/signature as proof
+               // of an ordinary, editable part.
+               const opaque = (table === "message" || table === "part") && contextOpaqueAvailable.get(table)
+                 ? ", context_opaque = 1"
+                 : ""
+               db.prepareRun(`UPDATE ${table} SET ${column} = ?${opaque} WHERE id = ?`, [ref, row.rid])
               collapsedProjection += 1
             }
           }

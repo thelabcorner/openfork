@@ -28,4 +28,34 @@ describe("SQLite maintenance quiet gate", () => {
     await Effect.runPromise(gate.wait())
     expect(reads - beforeExternal).toBeGreaterThan(1)
   })
+
+  test.serial("wall-clock jumps never bypass or strand a monotonic quiet interval", async () => {
+    let version = 1
+    const original = Date.now
+    let wallNow = original()
+    Date.now = () => wallNow
+    try {
+      const db = {
+        get: () => Effect.succeed({ data_version: version }),
+      } as unknown as DatabaseShape
+      const gate = makeSqliteMaintenanceQuietGate(db, { quietMs: 45, pollMs: 4 })
+      await Effect.runPromise(gate.wait())
+
+      wallNow += 3_600_000 // OS clock sync jumped forward an hour
+      version++
+      let started = performance.now()
+      await Effect.runPromise(gate.wait().pipe(Effect.timeout(500)))
+      expect(performance.now() - started).toBeGreaterThanOrEqual(35)
+
+      wallNow -= 7_200_000 // OS clock sync jumped backward two hours
+      version++
+      started = performance.now()
+      await Effect.runPromise(gate.wait().pipe(Effect.timeout(500)))
+      const elapsed = performance.now() - started
+      expect(elapsed).toBeGreaterThanOrEqual(35)
+      expect(elapsed).toBeLessThan(400)
+    } finally {
+      Date.now = original
+    }
+  })
 })

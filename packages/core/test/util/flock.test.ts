@@ -14,6 +14,8 @@ type Msg = {
   baseDelayMs?: number
   maxDelayMs?: number
   holdMs?: number
+  protectLiveProcess?: boolean
+  blockHeartbeatMs?: number
   ready?: string
   active?: string
   done?: string
@@ -114,6 +116,46 @@ async function readJson<T>(p: string): Promise<T> {
 }
 
 describe("util.flock", () => {
+  test("stale owner with a reused but currently live PID can be reclaimed using process birth proof", async () => {
+    await using tmp = await tmpdir()
+    const dir = path.join(tmp.path, "locks")
+    const key = "reused-pid-crash-owner"
+    const lockDir = lock(dir, key)
+    await fs.mkdir(lockDir, { recursive: true })
+    await fs.writeFile(path.join(lockDir, "meta.json"), JSON.stringify({
+      token: "dead-process-token",
+      pid: process.pid,
+      hostname: os.hostname(),
+      createdAt: "2020-01-01T00:00:00.000Z",
+    }))
+    const heartbeat = path.join(lockDir, "heartbeat")
+    await fs.writeFile(heartbeat, "")
+    const old = new Date(Date.now() - 60_000)
+    await fs.utimes(heartbeat, old, old)
+    const lease = await Flock.tryAcquire(key, {
+      dir,
+      staleMs: 100,
+      protectLiveProcess: true,
+    })
+    expect(lease).toBeDefined()
+    try {
+      const meta = await readJson<{ token: string }>(path.join(lockDir, "meta.json"))
+      expect(meta.token).not.toBe("dead-process-token")
+    } finally {
+      await lease?.release()
+    }
+  }, 15_000)
+
+  test("PID reuse requires a proved newer process birth, not guessed liveness", () => {
+    const createdAt = "2026-10-15T10:00:00.000Z"
+    const timestamp = Date.parse(createdAt)
+    expect(Flock.provablyReusedPID(createdAt, timestamp - 120_000)).toBe(false)
+    expect(Flock.provablyReusedPID(createdAt, timestamp + 1_000)).toBe(false)
+    expect(Flock.provablyReusedPID(createdAt, timestamp + 60_000)).toBe(true)
+    expect(Flock.provablyReusedPID(createdAt, undefined)).toBe(false)
+    expect(Flock.provablyReusedPID("invalid", timestamp + 60_000)).toBe(false)
+  })
+
   test("enforces mutual exclusion under process contention", async () => {
     await using tmp = await tmpdir()
     const dir = path.join(tmp.path, "locks")
@@ -376,6 +418,44 @@ describe("util.flock", () => {
     expect(next).toBeDefined()
     await next!.release()
   })
+
+  test("protected process slot never reclaims a live owner's expired heartbeat", async () => {
+    await using tmp = await tmpdir()
+    const dir = path.join(tmp.path, "locks")
+    const key = "flock:live-protection"
+    const lockDir = lock(dir, key)
+    const original = await Flock.tryAcquire(key, { dir, staleMs: 200, protectLiveProcess: true })
+    expect(original).toBeDefined()
+    try {
+      const old = new Date(Date.now() - 3_000)
+      await fs.utimes(path.join(lockDir, "heartbeat"), old, old)
+      expect(await Flock.tryAcquire(key, { dir, staleMs: 200, protectLiveProcess: true })).toBeUndefined()
+    } finally {
+      await original!.release()
+    }
+    const next = await Flock.tryAcquire(key, { dir, staleMs: 200, protectLiveProcess: true })
+    expect(next).toBeDefined()
+    await next!.release()
+  })
+
+  test("protected slot survives a stalled heartbeat in a separate owner process", async () => {
+    await using tmp = await tmpdir()
+    const dir = path.join(tmp.path, "locks")
+    const key = "flock:blocked-owner"
+    const ready = path.join(tmp.path, "ready")
+    const proc = spawnWorker({ key, dir, ready, protectLiveProcess: true, blockHeartbeatMs: 1_000, staleMs: 300 })
+    try {
+      await wait(ready, 5_000)
+      await sleep(450)
+      expect(await Flock.tryAcquire(key, { dir, staleMs: 300, protectLiveProcess: true })).toBeUndefined()
+    } finally {
+      await stopWorker(proc)
+    }
+    // This also verifies stale recovery for a genuinely terminated process.
+    const replacement = await Flock.tryAcquire(key, { dir, staleMs: 300, protectLiveProcess: true })
+    expect(replacement).toBeDefined()
+    await replacement!.release()
+  }, 15_000)
 
   test("refuses token mismatch release and recovers from stale", async () => {
     await using tmp = await tmpdir()

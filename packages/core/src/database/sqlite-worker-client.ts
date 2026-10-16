@@ -1,8 +1,18 @@
 import { Worker } from "node:worker_threads"
+import * as Effect from "effect/Effect"
+import { sqliteStatementClass } from "./sqlite-diagnostics"
+import type { SqlitePlanDiagnostic } from "./sqlite-query-forensics"
 
 export interface SqliteWorkerOptions {
   readonly filename: string
+  readonly permitLane?: string
+  /** Hard deadline for disposable read-only scan subprocesses. */
+  readonly queryTimeoutMs?: number
+  /** Maximum in-process semaphore wait; independent of native SQLite busy_timeout. */
+  readonly acquireTimeoutMs?: number
   readonly readonly?: boolean
+  readonly create?: boolean
+  readonly readwrite?: boolean
   readonly timeout?: number
   readonly allowExtension?: boolean
   readonly disableWAL?: boolean
@@ -16,8 +26,36 @@ export interface SqliteWorkerOptions {
 const source = String.raw`
 const { parentPort, workerData: config } = require('node:worker_threads');
 const { DatabaseSync } = require('node:sqlite');
+const activity = new Int32Array(config.activity);
 let db;
 const statements = new Map();
+const diagnosed = new Set();
+function capturePlan(request) {
+  const hash = request.diagnosePlan;
+  if (!hash || diagnosed.has(hash)) return;
+  diagnosed.add(hash);
+  const plan = {
+    hash, steps: 0, scans: 0, searches: 0, tempSorts: 0,
+    covering: 0, automaticIndexes: 0, status: 'unavailable',
+  };
+  try {
+    // EXPLAIN QUERY PLAN prepares a statement but never executes its SELECT.
+    // Bound parameters stay inside the worker; details (identifiers and
+    // literals) are discarded before anything crosses the IPC boundary.
+    const rows = db.prepare('EXPLAIN QUERY PLAN ' + request.query).all(...request.params);
+    plan.steps = rows.length;
+    for (const row of rows) {
+      const detail = typeof row.detail === 'string' ? row.detail.toUpperCase() : '';
+      if (/^SCAN\b/.test(detail)) plan.scans++;
+      if (/^SEARCH\b/.test(detail)) plan.searches++;
+      if (detail.includes('USE TEMP B-TREE')) plan.tempSorts++;
+      if (detail.includes('COVERING INDEX')) plan.covering++;
+      if (detail.includes('AUTOMATIC INDEX')) plan.automaticIndexes++;
+    }
+    plan.status = 'ok';
+  } catch {}
+  parentPort.postMessage({ planDiagnostic: plan });
+}
 const error = (cause) => ({
   name: cause?.name, message: cause?.message,
   code: cause?.code, errno: cause?.errno, errcode: cause?.errcode,
@@ -44,6 +82,10 @@ try {
   parentPort.close();
 }
 parentPort.on('message', (request) => {
+  // Shared activity is observable while the native SQLite worker is blocked.
+  // No per-query stage messages cross the structured-clone boundary.
+  Atomics.store(activity, 0, request.id);
+  Atomics.store(activity, 1, 1);
   try {
     let value;
     if (request.kind === 'close') {
@@ -55,6 +97,7 @@ parentPort.on('message', (request) => {
     } else if (request.kind === 'extension') {
       db.loadExtension(request.path);
     } else {
+      if (request.diagnosePlan) capturePlan(request);
       const key = (request.arrays ? 'a:' : 'o:') + request.query;
       let statement = statements.get(key);
       if (statement) { statements.delete(key); statements.set(key, statement); }
@@ -69,16 +112,21 @@ parentPort.on('message', (request) => {
       statement.setReadBigInts(request.safeIntegers);
       value = statement.all(...request.params);
     }
+    Atomics.store(activity, 1, 2);
     parentPort.postMessage({ id: request.id, value });
     if (request.kind === 'close') parentPort.close();
   } catch (cause) {
+    Atomics.store(activity, 1, 2);
     parentPort.postMessage({ id: request.id, error: error(cause) });
+  } finally {
+    Atomics.store(activity, 1, 0);
+    Atomics.store(activity, 0, 0);
   }
 });
 `
 
 type Request =
-  | { kind: "query"; query: string; params: ReadonlyArray<unknown>; arrays: boolean; safeIntegers: boolean }
+  | { kind: "query"; query: string; params: ReadonlyArray<unknown>; arrays: boolean; safeIntegers: boolean; diagnosePlan?: string }
   | { kind: "extension"; path: string }
   | { kind: "close" }
 
@@ -88,20 +136,27 @@ function restoreError(value: Record<string, unknown>) {
 
 export class SqliteWorkerClient {
   private readonly worker: Worker
-  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: unknown) => void }>()
+  private readonly activity = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2))
+  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: unknown) => void; kind: string }>()
   private nextID = 0
   private failed: Error | undefined
   private closing = false
   private closePromise: Promise<void> | undefined
   readonly ready: Promise<void>
 
-  constructor(options: SqliteWorkerOptions) {
-    this.worker = new Worker(source, { eval: true, workerData: options })
+  constructor(options: SqliteWorkerOptions, private readonly onPlanDiagnostic?: (entry: SqlitePlanDiagnostic) => void) {
+    this.worker = new Worker(source, { eval: true, workerData: { ...options, activity: this.activity.buffer } })
     this.ready = new Promise((resolve, reject) => {
       this.worker.on("message", (message) => {
         if ("ready" in message) {
           if (message.ready) resolve()
           else { const error = restoreError(message.error); reject(error); this.fail(error) }
+          return
+        }
+        if ("planDiagnostic" in message) {
+          const entry = message.planDiagnostic as SqlitePlanDiagnostic
+          if (this.onPlanDiagnostic) this.onPlanDiagnostic(entry)
+          else void Effect.runFork(Effect.logWarning("SQLite runaway query plan", entry))
           return
         }
         const job = this.pending.get(message.id)
@@ -120,6 +175,14 @@ export class SqliteWorkerClient {
     })
   }
 
+  /** O(1), privacy-safe native activity snapshot while the worker is blocked. */
+  activitySnapshot() {
+    const phase = Atomics.load(this.activity, 1)
+    const id = Atomics.load(this.activity, 0)
+    const kind = this.pending.get(id)?.kind ?? "unknown"
+    return `workerStage=${phase === 1 ? "executing" : phase === 2 ? "replying" : "idle"} workerSql=${phase ? kind : "none"} workerPending=${this.pending.size}`
+  }
+
   private fail(error: Error) {
     this.failed ??= error
     for (const job of this.pending.values()) job.reject(error)
@@ -135,7 +198,10 @@ export class SqliteWorkerClient {
     if (request.kind !== "close" && this.pending.size >= 64) throw new Error("SQLite worker admission capacity exceeded")
     const id = ++this.nextID
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      this.pending.set(id, {
+        resolve, reject,
+        kind: request.kind === "query" ? sqliteStatementClass(request.query) : request.kind,
+      })
       try { this.worker.postMessage({ ...request, id }) }
       catch (error) { this.pending.delete(id); reject(error) }
     })

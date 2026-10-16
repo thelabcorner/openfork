@@ -2,6 +2,8 @@ import path from "path"
 import os from "os"
 import { randomBytes, randomUUID } from "crypto"
 import { mkdir, readFile, rm, stat, utimes, writeFile } from "fs/promises"
+import { execFile as execFileCallback } from "node:child_process"
+import { promisify } from "node:util"
 import { Hash } from "./hash"
 import { Effect } from "effect"
 
@@ -46,6 +48,9 @@ export namespace Flock {
     baseDelayMs?: number
     maxDelayMs?: number
     onWait?: Wait
+    /** For process slots only: an expired heartbeat must not evict a live
+     * same-host process. Other locks retain their existing recovery policy. */
+    protectLiveProcess?: boolean
   }
 
   type Opts = {
@@ -53,6 +58,7 @@ export namespace Flock {
     timeoutMs: number
     baseDelayMs: number
     maxDelayMs: number
+    protectLiveProcess: boolean
   }
 
   type Owned = {
@@ -134,25 +140,98 @@ export namespace Flock {
     }
   }
 
-  async function stale(lockDir: string, heartbeatPath: string, metaPath: string, staleMs: number) {
+  function locallyAlive(pid: number): boolean {
+    // Signal 0 probes liveness; it does not terminate or interrupt the owner.
+    // Permission denial and unknown OS errors are not proof of death.
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return code(error) !== "ESRCH"
+    }
+  }
+
+  const execFile = promisify(execFileCallback)
+  const processBirthCache = new Map<number, { observedAt: number; startedAt?: number }>()
+  async function processBornAt(pid: number): Promise<number | undefined> {
+    const now = mono()
+    const cached = processBirthCache.get(pid)
+    if (cached && now - cached.observedAt < 5_000) return cached.startedAt
+    let startedAt: number | undefined
+    try {
+      // Only an already-stale lease with a LIVE PID pays this probe cost.
+      // A liveness signal alone cannot distinguish PID reuse after a crash.
+      const command = process.platform === "win32"
+        ? {
+            executable: "powershell.exe",
+            args: [
+              "-NoProfile", "-NonInteractive", "-Command",
+              `[DateTimeOffset]::new((Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()`,
+            ],
+          }
+        : { executable: "ps", args: ["-p", String(pid), "-o", "lstart="] }
+      const { stdout } = await execFile(command.executable, command.args, {
+        timeout: 3_000,
+        windowsHide: true,
+        maxBuffer: 4_096,
+      })
+      const timestamp = process.platform === "win32"
+        ? Number(stdout.trim())
+        : Date.parse(stdout.trim())
+      if (Number.isFinite(timestamp) && timestamp > 0) startedAt = timestamp
+    } catch {
+      // Unprovable PID reuse must not authorize stale-lock eviction.
+    }
+    processBirthCache.set(pid, { observedAt: now, startedAt })
+    if (processBirthCache.size > 64) processBirthCache.clear()
+    return startedAt
+  }
+
+  /** A newer process with the same recycled PID cannot own a lease which
+   * predates its birth. Ambiguous times conservatively protect the lock. */
+  export function provablyReusedPID(lockCreatedAt: unknown, processStartedAt: unknown): boolean {
+    if (typeof lockCreatedAt !== "string" || typeof processStartedAt !== "number") return false
+    const acquiredAt = Date.parse(lockCreatedAt)
+    return Number.isFinite(acquiredAt) && Number.isFinite(processStartedAt) &&
+      processStartedAt > acquiredAt + 3_000
+  }
+
+  async function stale(lockDir: string, heartbeatPath: string, metaPath: string, opts: Opts) {
     // Stale detection allows automatic recovery after crashed owners.
     const now = wall()
     const heartbeat = await stats(heartbeatPath)
     if (heartbeat) {
-      return now - heartbeat.mtimeMs > staleMs
+      if (now - heartbeat.mtimeMs <= opts.staleMs) return false
+    } else {
+      const meta = await stats(metaPath)
+      if (meta) {
+        if (now - meta.mtimeMs <= opts.staleMs) return false
+      } else {
+        const dir = await stats(lockDir)
+        if (!dir || now - dir.mtimeMs <= opts.staleMs) return false
+      }
     }
 
-    const meta = await stats(metaPath)
-    if (meta) {
-      return now - meta.mtimeMs > staleMs
+    if (opts.protectLiveProcess) {
+      const owner = await readFile(metaPath, "utf8").then((raw) => JSON.parse(raw) as {
+        pid?: unknown
+        hostname?: unknown
+        createdAt?: unknown
+      }).catch(() => undefined)
+      // Even when heartbeat renewal is delayed by synchronous workload, its
+      // owner can still be executing. Fail closed if that PID remains live.
+      if (
+        owner?.hostname === os.hostname() &&
+        typeof owner.pid === "number" &&
+        Number.isSafeInteger(owner.pid) &&
+        owner.pid > 0 &&
+        locallyAlive(owner.pid)
+      ) {
+        const startedAt = await processBornAt(owner.pid)
+        if (!provablyReusedPID(owner.createdAt, startedAt)) return false
+      }
     }
-
-    const dir = await stats(lockDir)
-    if (!dir) {
-      return false
-    }
-
-    return now - dir.mtimeMs > staleMs
+    return true
   }
 
   async function tryAcquireLockDir(lockDir: string, opts: Opts): Promise<Owned | { acquired: false }> {
@@ -167,7 +246,7 @@ export namespace Flock {
         throw err
       }
 
-      if (!(await stale(lockDir, heartbeatPath, metaPath, opts.staleMs))) {
+      if (!(await stale(lockDir, heartbeatPath, metaPath, opts))) {
         return { acquired: false }
       }
 
@@ -193,7 +272,7 @@ export namespace Flock {
 
       try {
         // Breaker ownership ensures only one contender performs stale cleanup.
-        if (!(await stale(lockDir, heartbeatPath, metaPath, opts.staleMs))) {
+        if (!(await stale(lockDir, heartbeatPath, metaPath, opts))) {
           return { acquired: false }
         }
 
@@ -324,6 +403,7 @@ export namespace Flock {
       timeoutMs: input.timeoutMs ?? defaultOpts.timeoutMs,
       baseDelayMs: input.baseDelayMs ?? defaultOpts.baseDelayMs,
       maxDelayMs: input.maxDelayMs ?? defaultOpts.maxDelayMs,
+      protectLiveProcess: input.protectLiveProcess ?? false,
     }
     const dir = input.dir ?? root()
 
@@ -354,6 +434,7 @@ export namespace Flock {
       timeoutMs: input.timeoutMs ?? defaultOpts.timeoutMs,
       baseDelayMs: input.baseDelayMs ?? defaultOpts.baseDelayMs,
       maxDelayMs: input.maxDelayMs ?? defaultOpts.maxDelayMs,
+      protectLiveProcess: input.protectLiveProcess ?? false,
     }
     const dir = input.dir ?? root()
     await mkdir(dir, { recursive: true })
