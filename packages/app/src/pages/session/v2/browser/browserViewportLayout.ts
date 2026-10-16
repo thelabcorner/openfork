@@ -2,9 +2,8 @@
 //
 // MODEL: the guest page always renders at its LOGICAL CSS viewport
 // (`data-preview-css-width/height`, never changed by the presentation layer).
-// The webview DOM element is sized to `logical * zoomFactor / scale` and
-// scaled down by `scale` when the logical size does not fit the panel — so
-// scaling is a pure visual fit and never changes the page's CSS breakpoint.
+// The webview DOM element is sized to logical * pageZoom; the presentation
+// scale (automatic fit or a manual preview value) never changes CSS breakpoints.
 //
 // The centered-viewport resize math below (resizeFromEndRail/StartRail,
 // resizeBrowserViewportFromRail) ports T3Code's `browserViewportLayout.ts`
@@ -35,7 +34,7 @@ export interface ViewportLayout {
   /** Screen-px size of the PRESENTED (scaled) viewport. */
   viewportWidth: number
   viewportHeight: number
-  /** Visual fit factor (<= 1). Never part of the guest CSS viewport. */
+  /** Presentation factor; manual preview scale may exceed 1 without changing CSS viewport. */
   viewportScale: number
   /** Size of the scrollable canvas backing the wrapper. */
   canvasWidth: number
@@ -98,6 +97,7 @@ export function resolveViewportLayout(
   panel: PanelRect,
   viewport: ViewportSetting,
   zoomFactor: number,
+  previewZoom: "fit" | number = "fit",
 ): ViewportLayout {
   if (viewport.mode === "fill") {
     return {
@@ -115,7 +115,11 @@ export function resolveViewportLayout(
   const area = resolveBrowserDeviceViewportArea(panel)
   const logicalWidth = Math.max(1, viewport.width ?? VIEWPORT_MIN_SIZE)
   const logicalHeight = Math.max(1, viewport.height ?? VIEWPORT_MIN_SIZE)
-  const scale = fitScale(area, logicalWidth, logicalHeight, zoomFactor)
+  // Unlike automatic fit, manual zoom may overflow into the scrollable stage.
+  const scale =
+    previewZoom === "fit" || !Number.isFinite(previewZoom) || previewZoom <= 0
+      ? fitScale(area, logicalWidth, logicalHeight, zoomFactor)
+      : Math.min(3, Math.max(0.1, previewZoom))
   const presentedWidth = Math.max(1, logicalWidth * zoomFactor * scale)
   const presentedHeight = Math.max(1, logicalHeight * zoomFactor * scale)
   const origin = centeredIn(area, presentedWidth, presentedHeight)
@@ -137,6 +141,19 @@ export function resolveViewportLayout(
  * Sizes the webview DOM element: logical CSS px (× guest zoom) divided by the
  * fit scale, with `scale()` applied in CSS. Inverse of the presented rect.
  */
+export function resolveBrowserCanvasCenterScroll(
+  panel: { width: number; height: number },
+  layout: ViewportLayout,
+): { left: number; top: number } {
+  // Oversized manual previews must begin centered in their virtual canvas,
+  // not anchored to the top-left. This affects only the outer host scroller,
+  // never the guest page's CSS viewport or internal scroll position.
+  return {
+    left: Math.max(0, (layout.canvasWidth - Math.max(0, panel.width)) / 2),
+    top: Math.max(0, (layout.canvasHeight - Math.max(0, panel.height)) / 2),
+  }
+}
+
 export function resolveWebviewElementSize(layout: ViewportLayout): { width: number; height: number } {
   return {
     width: layout.viewportWidth / layout.viewportScale,

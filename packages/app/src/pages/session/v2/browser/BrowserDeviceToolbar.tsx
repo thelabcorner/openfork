@@ -6,6 +6,7 @@
 
 import { Show, createEffect, createMemo, createSignal, For } from "solid-js"
 import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
+import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
 import { BROWSER_DEVICE_PRESETS, resolveBrowserDevicePreset, type BrowserDeviceNameKey } from "./browserPresets"
 import { aspectRatioOf, resizeAtAspectRatio } from "./browserViewportLayout"
@@ -20,6 +21,7 @@ import {
 } from "./types"
 
 const MODES: readonly ViewportMode[] = ["fill", "freeform", "preset"]
+const PREVIEW_ZOOMS = [0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2] as const
 
 function modeLabel(mode: ViewportMode): "browser.mode.fill" | "browser.mode.freeform" | "browser.mode.preset" {
   switch (mode) {
@@ -37,6 +39,9 @@ export function BrowserDeviceToolbar(props: {
   fillSize: { width: number; height: number }
   aspectRatioLocked: boolean
   badgesVisible: boolean
+  previewZoom: "fit" | number
+  fittedScale: number
+  onPreviewZoomChange: (scale: "fit" | number) => void
   onChange: (setting: ViewportSetting) => void
   onAspectRatioChange: (locked: boolean) => void
   onBadgesToggle: () => void
@@ -155,9 +160,10 @@ export function BrowserDeviceToolbar(props: {
   return (
     <div
       data-browser-device-toolbar
-      class="flex h-7 shrink-0 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base px-1.5"
+      class="flex h-8 shrink-0 items-center gap-1.5 border-b border-v2-border-border-base bg-v2-background-bg-base px-2"
     >
-      <div class="flex items-center gap-0.5 rounded-[5px] bg-v2-background-bg-layer-01 p-0.5" role="group" aria-label={language.t("browser.viewportMode")}>
+      <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto whitespace-nowrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div class="flex shrink-0 items-center gap-0.5 rounded-[5px] border border-v2-border-border-base bg-v2-background-bg-layer-01 p-0.5" role="group" aria-label={language.t("browser.viewportMode")}>
         <For each={MODES}>{(mode) => segButton(mode)}</For>
       </div>
 
@@ -175,7 +181,7 @@ export function BrowserDeviceToolbar(props: {
           </div>
         }
       >
-        <form class="flex h-6 items-center gap-1" onSubmit={submitDimensions} data-browser-dimension-form>
+        <form class="flex h-6 shrink-0 items-center gap-1" onSubmit={submitDimensions} data-browser-dimension-form>
           <span class="text-[10px] text-v2-text-text-muted" aria-hidden="true">
             W
           </span>
@@ -245,23 +251,58 @@ export function BrowserDeviceToolbar(props: {
         </button>
       </Show>
 
-      <div class="flex-1" />
+      </div>
+
+      <div class="flex shrink-0 items-center gap-1 border-l border-v2-border-border-base pl-1.5">
+        <MenuV2>
+          <MenuV2.Trigger
+            as="button"
+            type="button"
+            disabled={props.setting.mode === "fill"}
+            class="flex h-6 min-w-[78px] items-center justify-between gap-1 rounded-[4px] px-1.5 text-[11px] tabular-nums text-v2-text-text-base hover:bg-v2-background-bg-layer-02 disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label={language.t("browser.previewZoom")}
+            title={props.setting.mode === "fill" ? language.t("browser.previewZoom.fillHint") : language.t("browser.previewZoom.hint")}
+            data-testid="browser-preview-zoom"
+          >
+            <span class="text-v2-text-text-muted">{language.t("browser.previewZoom.short")}</span>
+            <span>{props.setting.mode === "fill" || props.previewZoom === "fit" ? language.t("browser.previewZoom.fit") : `${Math.round(props.previewZoom * 100)}%`}</span>
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </MenuV2.Trigger>
+          <MenuV2.Portal>
+            <MenuV2.Content>
+              <MenuV2.CheckboxItem checked={props.previewZoom === "fit"} onSelect={() => props.onPreviewZoomChange("fit")}>
+                {language.t("browser.previewZoom.fit")} ({Math.round(props.fittedScale * 100)}%)
+              </MenuV2.CheckboxItem>
+              <MenuV2.Separator />
+              <For each={PREVIEW_ZOOMS}>
+                {(scale) => (
+                  <MenuV2.CheckboxItem checked={props.previewZoom === scale} onSelect={() => props.onPreviewZoomChange(scale)}>
+                    {Math.round(scale * 100)}%
+                  </MenuV2.CheckboxItem>
+                )}
+              </For>
+            </MenuV2.Content>
+          </MenuV2.Portal>
+        </MenuV2>
 
       <button
         type="button"
         data-active={props.badgesVisible || undefined}
-        class={`flex h-6 items-center gap-1 rounded-[4px] px-1.5 text-[11px] leading-none transition-colors duration-100 ${
+        class={`flex size-6 items-center justify-center rounded-[4px] text-[11px] leading-none transition-colors duration-100 ${
           props.badgesVisible
             ? "bg-v2-background-bg-layer-03 text-v2-text-text-base"
             : "text-v2-text-text-muted hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base"
         }`}
         title={language.t("browser.badges.toggle")}
+        aria-label={language.t("browser.badges.toggle")}
         aria-pressed={props.badgesVisible}
         onClick={props.onBadgesToggle}
       >
         <BadgeIcon />
-        <span>{language.t("browser.badges")}</span>
       </button>
+      </div>
 
       <span class="sr-only">{browserViewportSettingKey(props.setting)}</span>
     </div>

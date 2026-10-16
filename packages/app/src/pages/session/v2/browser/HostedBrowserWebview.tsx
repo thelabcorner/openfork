@@ -31,12 +31,14 @@ import { sendFollowupDraft, type FollowupDraft } from "@/components/prompt-input
 import { createBlobReference } from "@/utils/draft-store"
 import { uuid } from "@/utils/uuid"
 import { showToast } from "@/utils/toast"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { browserHostClient, type BrowserAnnotationResult } from "./browserHostClient"
 import { buildBrowserAnnotationPrompt } from "./browserAnnotationPrompt"
 import { BrowserChromeMenu } from "./BrowserChromeMenu"
 import { browserSurfaceStore } from "./browserSurfaceStore"
 import {
   resolveBrowserDeviceViewportArea,
+  resolveBrowserCanvasCenterScroll,
   resolveResponsiveBrowserViewportSize,
   resolveViewportLayout,
   resolveWebviewElementSize,
@@ -104,7 +106,6 @@ export function HostedBrowserWebview(props: {
   const language = useLanguage()
   const platform = usePlatform()
   const serverSync = useServerSync()
-  const canAnnotate = () => !!browserHostClient.annotationTarget()
   const [webviewEl, setWebviewEl] = createSignal<WebviewElement>()
   const [annotating, setAnnotating] = createSignal(false)
   const [preloadPath, setPreloadPath] = createSignal("")
@@ -164,7 +165,13 @@ export function HostedBrowserWebview(props: {
     return { ...authoritative, width: drag.width, height: drag.height }
   })
 
-  const layout = createMemo(() => resolveViewportLayout(panelRect(), effectiveViewport(), zoomFactor()))
+  const previewZoom = createMemo(() => surface()?.previewZoom ?? "fit")
+  const fittedLayout = createMemo(() => resolveViewportLayout(panelRect(), effectiveViewport(), zoomFactor()))
+  const layout = createMemo(() =>
+    previewZoom() === "fit"
+      ? fittedLayout()
+      : resolveViewportLayout(panelRect(), effectiveViewport(), zoomFactor(), previewZoom()),
+  )
   const elementSize = createMemo(() => resolveWebviewElementSize(layout()))
   const fillSize = createMemo(() => resolveResponsiveBrowserViewportSize(panelRect(), zoomFactor()))
 
@@ -370,13 +377,17 @@ export function HostedBrowserWebview(props: {
   // display:none → visible transition when a tab becomes active), so use it
   // instead of relying on the render-reactive graph for this.
   let panelResizeObserver: ResizeObserver | undefined
+  function observeCanvasViewport() {
+    const wrapper = wrapperRef
+    if (!wrapper || !props.active) return
+    // ScrollView supplies viewportRef during its own onMount, which can run
+    // after this parent component's onMount. Support either ordering.
+    if (!panelResizeObserver) panelResizeObserver = new ResizeObserver(() => presentPanelRect())
+    panelResizeObserver.observe(wrapper)
+    presentPanelRect()
+  }
   onMount(() => {
-    if (!wrapperRef) return
-    panelResizeObserver = new ResizeObserver(() => presentPanelRect())
-    if (props.active) {
-      panelResizeObserver.observe(wrapperRef)
-      presentPanelRect()
-    }
+    observeCanvasViewport()
   })
   onCleanup(() => panelResizeObserver?.disconnect())
 
@@ -403,6 +414,30 @@ export function HostedBrowserWebview(props: {
     layout()
     scheduleMeasure()
   })
+
+  // A preset/freeform resize or preview zoom is a deliberate reframe; center
+  // the virtual device even when it overflows its available canvas. Ordinary
+  // scrolling does NOT re-run this effect, so the user can pan freely.
+  let lastCenteredKey = ""
+  let centerFrame = 0
+  createEffect(() => {
+    if (!props.active || activeDirection()) return
+    const panel = panelRect()
+    const target = resolveBrowserCanvasCenterScroll(panel, layout())
+    const key = `${browserViewportSettingKey(effectiveViewport())}:${previewZoom()}:${zoomFactor()}:${panel.width}x${panel.height}`
+    if (key === lastCenteredKey) return
+    lastCenteredKey = key
+    if (centerFrame) cancelAnimationFrame(centerFrame)
+    centerFrame = requestAnimationFrame(() => {
+      centerFrame = 0
+      const wrapper = wrapperRef
+      if (!wrapper || !props.active) return
+      wrapper.scrollLeft = target.left
+      wrapper.scrollTop = target.top
+      scheduleMeasure()
+    })
+  })
+  onCleanup(() => { if (centerFrame) cancelAnimationFrame(centerFrame) })
 
   // ── resize drags ───────────────────────────────────────────────────────────
   //
@@ -642,20 +677,29 @@ export function HostedBrowserWebview(props: {
       void browserHostClient.cancelAnnotation(props.tabId)
       return
     }
-    if (!canAnnotate()) {
-      showToast({ title: language.t("browser.annotate.toast.unavailable") })
-      return
-    }
     setAnnotating(true)
-    const result = await browserHostClient.startAnnotation(props.tabId)
-    setAnnotating(false)
-    if (!result) return
-    if (result.submission === "send") {
-      await sendAnnotation(result)
-      return
+    try {
+      const result = await browserHostClient.startAnnotation(props.tabId)
+      if (!result) return
+      // Browser can be open without a selected chat. Keep annotation usable
+      // instead of hiding its entry point: copy structured DOM/mark context
+      // without claiming that a screenshot was attached to a prompt.
+      if (!browserHostClient.annotationTarget()) {
+        await navigator.clipboard.writeText(buildBrowserAnnotationPrompt({ ...result, screenshot: null }))
+        showToast({ title: language.t("browser.annotate.toast.copied") })
+        return
+      }
+      if (result.submission === "send") {
+        await sendAnnotation(result)
+        return
+      }
+      await attachAnnotation(result)
+      showToast({ title: language.t("browser.annotate.toast.attached.title") })
+    } catch {
+      showToast({ title: language.t("browser.annotate.toast.failed") })
+    } finally {
+      setAnnotating(false)
     }
-    await attachAnnotation(result)
-    showToast({ title: language.t("browser.annotate.toast.attached.title") })
   }
 
   const submitAddress = (event: SubmitEvent) => {
@@ -768,34 +812,20 @@ export function HostedBrowserWebview(props: {
           />
         </form>
 
-        <Show when={canAnnotate()}>
-          <IconButton
-            label={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
-            onClick={() => void toggleAnnotate()}
-            title={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
-            active={annotating()}
-            data-testid="browser-annotate"
-          >
-            <AnnotateIcon />
-          </IconButton>
-        </Show>
-        <IconButton
-          label={language.t("browser.nav.newTab")}
-          onClick={props.onNewTab}
-          title={language.t("browser.nav.newTab")}
-          data-testid="browser-new-tab"
+        <button
+          type="button"
+          class="inline-flex h-6 shrink-0 items-center justify-center gap-1.5 rounded-[4px] border border-v2-border-border-base bg-v2-background-bg-layer-01 px-2 text-[11px] font-medium leading-none text-v2-text-text-base transition-colors duration-100 hover:bg-v2-background-bg-layer-02 data-[active=true]:border-v2-border-border-strong data-[active=true]:bg-v2-background-bg-layer-03"
+          onClick={() => void toggleAnnotate()}
+          title={language.t("browser.annotate.hint")}
+          aria-label={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
+          aria-pressed={annotating()}
+          data-active={annotating() || undefined}
+          data-testid="browser-annotate"
         >
-          <NavIcon d="M8 3.5V12.5M3.5 8H12.5" />
-        </IconButton>
-        <IconButton
-          label={language.t("common.close")}
-          onClick={props.onClose}
-          title={language.t("common.close")}
-          data-testid="browser-close-tab"
-        >
-          <NavIcon d="M5 5L11 11M11 5L5 11" />
-        </IconButton>
-        <BrowserChromeMenu tabId={props.tabId} />
+          <AnnotateIcon />
+          <span>{annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}</span>
+        </button>
+        <BrowserChromeMenu tabId={props.tabId} onAnnotate={() => void toggleAnnotate()} />
       </div>
 
       {/* ── device/viewport toolbar: part of the chrome flow (not an overlay),
@@ -807,6 +837,9 @@ export function HostedBrowserWebview(props: {
           fillSize={fillSize()}
           aspectRatioLocked={aspectLocked()}
           badgesVisible={badgesVisible()}
+          previewZoom={previewZoom()}
+          fittedScale={fittedLayout().viewportScale}
+          onPreviewZoomChange={(value) => browserSurfaceStore.setPreviewZoom(props.tabId, value)}
           onChange={(setting) => browserSurfaceStore.setViewport(props.tabId, setting)}
           onAspectRatioChange={setAspectLocked}
           onBadgesToggle={() => setBadgesVisible(!badgesVisible())}
@@ -839,10 +872,16 @@ export function HostedBrowserWebview(props: {
               </div>
             }
           >
-            <div
-              ref={wrapperRef}
-              class="absolute inset-0 overflow-auto"
-              data-browser-canvas-scroll
+            <ScrollView
+              class="[&_.scroll-view__viewport]:overflow-x-auto [&_.scroll-view__viewport]:overscroll-contain"
+              style={{ position: "absolute", inset: "0" }}
+              viewportRef={(element) => {
+                // PresentedContent and ResizeObserver read the REAL scrolling
+                // viewport, never the decorative ScrollView root or thumb.
+                wrapperRef = element
+                element.setAttribute("data-browser-canvas-scroll", "")
+                observeCanvasViewport()
+              }}
               onScroll={scheduleMeasure}
             >
               <div
@@ -918,7 +957,7 @@ export function HostedBrowserWebview(props: {
                   <ViewportDimensionBadge layout={layout()} width={effectiveViewport().width!} height={effectiveViewport().height!} />
                 </Show>
               </div>
-            </div>
+            </ScrollView>
 
             <Show when={loading()}>
               <div class="pointer-events-none absolute inset-x-0 top-0 z-30 h-0.5 overflow-hidden">

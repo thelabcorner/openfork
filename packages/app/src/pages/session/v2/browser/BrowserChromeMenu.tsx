@@ -9,7 +9,7 @@ import { browserHostClient, type BrowserAppearance } from "./browserHostClient"
  * Extensions submenu (MV3 extensions loaded into the browser partition, e.g. a
  * bundled uBlock Origin) with enable/disable toggles. All actions are host-level.
  */
-export function BrowserChromeMenu(props: { tabId: string }) {
+export function BrowserChromeMenu(props: { tabId: string; onAnnotate: () => void }) {
   const language = useLanguage()
   const [extensions, { refetch }] = createResource(
     () => props.tabId,
@@ -38,6 +38,9 @@ export function BrowserChromeMenu(props: { tabId: string }) {
       </MenuV2.Trigger>
       <MenuV2.Portal>
         <MenuV2.Content>
+          <MenuV2.Item onSelect={props.onAnnotate}>
+            {language.t("browser.nav.annotate")}
+          </MenuV2.Item>
           <MenuV2.Item onSelect={() => void browserHostClient.openDevtools(props.tabId)}>
             {language.t("browser.chrome.devtools")}
           </MenuV2.Item>
