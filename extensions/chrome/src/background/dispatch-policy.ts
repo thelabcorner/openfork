@@ -6,6 +6,9 @@ const ALWAYS_DEBUGGER_OPERATIONS = new Set([
   "press",
   "scroll",
   "evaluate",
+  "react_inspect",
+  "profiler_start",
+  "profiler_stop",
   "resize",
   "set_appearance",
 ])
@@ -24,4 +27,3 @@ export function operationNeedsDebugger(name: string, input: unknown): boolean {
   const target = (input as { target?: unknown }).target
   return !!target && typeof target === "object" && (target as { kind?: unknown }).kind === "element"
 }
-

@@ -191,7 +191,7 @@
     return ctx.getImageData(0, 0, w, h).data;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/protocol.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/protocol.js
   var SCHEMA_VERSION = 1;
   var PROTOCOL_VERSION = 1;
   var OPERATIONS = ["capture", "diff", "record"];
@@ -267,7 +267,7 @@
     background: "#ffffff"
   };
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/ids.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/ids.js
   var RUN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
   var NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
   function isValidRunId(value) {
@@ -311,7 +311,7 @@
     return value;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/result.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/result.js
   var KNOWN_CODES = new Set(Object.values(ERROR_CODES));
   var KNOWN_OPERATIONS = new Set([...OPERATIONS, "unknown"]);
   function buildResult(input) {
@@ -368,7 +368,7 @@
     return out;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/metrics.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/metrics.js
   function computeScale({ pixelWidth, cssWidth, pixelHeight, cssHeight }) {
     const byWidth = positiveRatio(pixelWidth, cssWidth);
     const byHeight = positiveRatio(pixelHeight, cssHeight);
@@ -503,7 +503,7 @@
     return Math.round(Number(value) * 100) / 100;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/regions.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/regions.js
   function maskFromDiffBuffer(rgba, diffColor = [255, 0, 0]) {
     const [r, g, b] = diffColor;
     const mask = new Uint8Array(rgba.length / 4);
@@ -658,7 +658,7 @@
     return boxes;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/errors.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/errors.js
   var KNOWN_ERROR_CODES = new Set(Object.values(ERROR_CODES));
 
   class SnapEyeError extends Error {
@@ -691,7 +691,7 @@
     return "SnapEye could not capture the target";
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/envelope.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/envelope.js
   var HEADER_BYTES = 4;
   var MAX_METADATA_BYTES = 1024 * 1024;
   async function encodeBaselineEnvelope({ image, meta }) {
@@ -748,7 +748,7 @@
     return error;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/client/http-store.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/client/http-store.js
   var BASELINE_TYPE = "application/vnd.snapeye.baseline";
   function createHttpArtifactStore({
     endpoint = "/__snapeye",
@@ -875,7 +875,7 @@
     return String(value);
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/client/legacy-store.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/client/legacy-store.js
   function createLegacyArtifactStore({
     endpoint = "/__snapeye__",
     fetch: fetchImpl = globalThis.fetch
@@ -918,11 +918,11 @@
   // ../../packages/browser-visual/src/gifenc-safe.ts
   var exports_gifenc_safe = {};
   __export(exports_gifenc_safe, {
-    quantize: () => quantize,
-    encodeGifFrames: () => encodeGifFrames,
-    default: () => gifenc_safe_default,
+    GIFEncoder: () => GIFEncoder,
     applyPalette: () => applyPalette,
-    GIFEncoder: () => GIFEncoder
+    default: () => gifenc_safe_default,
+    encodeGifFrames: () => encodeGifFrames,
+    quantize: () => quantize
   });
 
   // ../../node_modules/.bun/gifenc@1.0.3/node_modules/gifenc/src/stream.js
@@ -1557,7 +1557,7 @@
   }
   var sq = (value) => value * value;
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/core/filmstrip.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/core/filmstrip.js
   function selectKeyFrames(timestampsMs, maxCells = FILMSTRIP_DEFAULTS.maxCells) {
     const n = Array.isArray(timestampsMs) ? timestampsMs.length : 0;
     if (n === 0)
@@ -1673,7 +1673,7 @@
     };
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/client/encoders.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/client/encoders.js
   var gifenc = typeof GIFEncoder === "function" ? exports_gifenc_safe : gifenc_safe_default ?? exports_gifenc_safe;
   var GIFEncoder2 = gifenc.GIFEncoder || gifenc.default;
   var { quantize: quantize2, applyPalette: applyPalette2 } = gifenc;
@@ -1824,13 +1824,13 @@
     return NaN;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/client/stability.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/client/stability.js
   var FREEZE_ATTRIBUTE = "data-snapeye-freeze";
   var FREEZE_CSS = `*, *::before, *::after {
   animation-play-state: paused !important;
   transition-property: none !important;
 }`;
-  async function freezeMotion(documentImpl, { window: windowImpl, wait: wait2 } = {}) {
+  async function freezeMotion(documentImpl, { window: windowImpl, wait } = {}) {
     const original = new Map(listAnimations(documentImpl).map((animation) => [animation, {
       animation,
       currentTime: readCurrentTime(animation),
@@ -1839,7 +1839,7 @@
     const style = injectFreezeStyle(documentImpl);
     const entries = [];
     try {
-      await nextFrames(windowImpl, wait2, 2);
+      await nextFrames(windowImpl, wait, 2);
       for (const animation of listAnimations(documentImpl)) {
         const entry = original.get(animation) || {
           animation,
@@ -1878,7 +1878,7 @@
       entries.length = 0;
     }
   }
-  async function waitForSettled({ document: document2, window: windowImpl, element, budgetMs = 2500, wait: wait2 }) {
+  async function waitForSettled({ document: document2, window: windowImpl, element, budgetMs = 2500, wait }) {
     if (!document2 || !(budgetMs > 0))
       return;
     const now = () => windowImpl?.performance?.now?.() ?? Date.now();
@@ -1886,7 +1886,7 @@
     let previous = null;
     let stable = 0;
     while (stable < 3) {
-      await nextFrames(windowImpl, wait2, 1);
+      await nextFrames(windowImpl, wait, 1);
       const signature = pageSignature(document2, element);
       if (signature === previous)
         stable++;
@@ -1913,13 +1913,13 @@
     }
     return parts.join("x");
   }
-  async function waitForReady(spec, { document: document2, wait: wait2, now, timeoutMs = 5000 }) {
+  async function waitForReady(spec, { document: document2, wait, now, timeoutMs = 5000 }) {
     if (spec == null || spec === "")
       return;
     const milliseconds = asMilliseconds(spec);
     if (milliseconds != null) {
       if (milliseconds > 0)
-        await wait2(milliseconds);
+        await wait(milliseconds);
       return;
     }
     const selector = String(spec);
@@ -1936,7 +1936,7 @@
       if (now() >= deadline) {
         throw waitError(`SnapEye waited ${timeoutMs}ms for ${selector} and it never appeared`);
       }
-      await wait2(50);
+      await wait(50);
     }
   }
   function asMilliseconds(spec) {
@@ -1946,12 +1946,12 @@
       return Number(spec);
     return null;
   }
-  async function nextFrames(windowImpl, wait2, count) {
+  async function nextFrames(windowImpl, wait, count) {
     for (let i = 0;i < count; i++) {
       if (typeof windowImpl?.requestAnimationFrame === "function") {
         await nextFrame(windowImpl);
-      } else if (typeof wait2 === "function") {
-        await wait2(16);
+      } else if (typeof wait === "function") {
+        await wait(16);
       } else {
         return;
       }
@@ -2028,7 +2028,7 @@
     return error;
   }
 
-  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+d2c423ec9f7d8080/node_modules/@zumer/snapeye/src/client/runtime.js
+  // ../../node_modules/.bun/@zumer+snapeye@0.4.0+ad47507e1afd666e/node_modules/@zumer/snapeye/src/client/runtime.js
   var RUNTIME_STATE = Symbol.for("@zumer/snapeye/runtime");
   var KNOWN_OPERATIONS2 = new Set(OPERATIONS);
   var DEFAULTS2 = {
@@ -2295,8 +2295,8 @@
           throw new SnapEyeError(ERROR_CODES.DIFF_FAILED, "SnapEye could not compare the current capture");
         }
       }
-      const diffPixels2 = changed ? regionCanvas.getContext("2d").getImageData(0, 0, comparison.width, comparison.height).data : null;
-      const regions = extractRegions(changed ? maskFromDiffBuffer(diffPixels2, diffOptions.diffColor) : new Uint8Array(0), changed ? comparison.width : 0, changed ? comparison.height : 0, { scale: captured.image.scale, ...operationOptions.regionOptions });
+      const diffPixels = changed ? regionCanvas.getContext("2d").getImageData(0, 0, comparison.width, comparison.height).data : null;
+      const regions = extractRegions(changed ? maskFromDiffBuffer(diffPixels, diffOptions.diffColor) : new Uint8Array(0), changed ? comparison.width : 0, changed ? comparison.height : 0, { scale: captured.image.scale, ...operationOptions.regionOptions });
       const artifacts = {
         baseline: `../../baselines/${name}.png`,
         current: ARTIFACTS.current,
@@ -7319,7 +7319,7 @@ ${g}
           e.replaceChild(pn, Et), e.insertBefore(It, pn), fe && e.insertBefore(document.createTextNode(fe), It);
           continue;
         }
-        let d = u.content ?? "", m = d === "" || d === "none" || d === "normal", { text: g, incs: y } = Xl(t, f, s, n.__siblingCounters), b = u.backgroundImage, w = u.backgroundColor, C = u.fontFamily, x = parseInt(u.fontSize) || 32, S = parseInt(u.fontWeight) || false, A = u.fontStyle || "normal", v = u.color || "#000", M = u.transform, k = At(C, r?.__iconMatchers), R = !m && g !== "", E = b && b !== "none", T = w && w !== "transparent" && w !== "rgba(0, 0, 0, 0)", N = fs(u), O = M && M !== "none", H = d !== "none" && d !== "normal", _ = /^inline-/.test(u.display || ""), L = H && ((parseFloat(u.width) || 0) > 0 || (parseFloat(u.height) || 0) > 0 || _), $ = H && u.boxShadow && u.boxShadow !== "none", F = H && u.outlineStyle && u.outlineStyle !== "none" && (parseFloat(u.outlineWidth) || 0) > 0;
+        let d = u.content ?? "", m = d === "" || d === "none" || d === "normal", { text: g, incs: y } = Xl(t, f, s, n.__siblingCounters), { backgroundImage: b, backgroundColor: w, fontFamily: C } = u, x = parseInt(u.fontSize) || 32, S = parseInt(u.fontWeight) || false, A = u.fontStyle || "normal", v = u.color || "#000", M = u.transform, k = At(C, r?.__iconMatchers), R = !m && g !== "", E = b && b !== "none", T = w && w !== "transparent" && w !== "rgba(0, 0, 0, 0)", N = fs(u), O = M && M !== "none", H = d !== "none" && d !== "normal", _ = /^inline-/.test(u.display || ""), L = H && ((parseFloat(u.width) || 0) > 0 || (parseFloat(u.height) || 0) > 0 || _), $ = H && u.boxShadow && u.boxShadow !== "none", F = H && u.outlineStyle && u.outlineStyle !== "none" && (parseFloat(u.outlineWidth) || 0) > 0;
         if (!(R || E || T || N || O || L || $ || F)) {
           if (y && y.length && t.parentElement) {
             let U = n.__siblingCounters.get(t.parentElement) || new Map;
@@ -7572,7 +7572,7 @@ ${g}
   function hs(t) {
     if (Zr.has(t))
       return In(t, [], Zr);
-    let e = getComputedStyle(t), n = e.outlineStyle, r = e.outlineWidth, i = n !== "none" && parseFloat(r) > 0, o = parseFloat(e.borderTopWidth) === 0 && parseFloat(e.borderRightWidth) === 0 && parseFloat(e.borderBottomWidth) === 0 && parseFloat(e.borderLeftWidth) === 0;
+    let e = getComputedStyle(t), { outlineStyle: n, outlineWidth: r } = e, i = n !== "none" && parseFloat(r) > 0, o = parseFloat(e.borderTopWidth) === 0 && parseFloat(e.borderRightWidth) === 0 && parseFloat(e.borderBottomWidth) === 0 && parseFloat(e.borderLeftWidth) === 0;
     if (i && o) {
       let s = [];
       for (let a of ["top", "right", "bottom", "left"])
@@ -7971,7 +7971,7 @@ ${g}
       if (!(u.width > 0 && u.height > 0))
         continue;
       ks.add(a);
-      let p = f.transform && f.transform !== "none" ? f.transform : "", h = se(c), d = !!(p || h.rotate !== "0deg" || h.scale || h.translate), m = d ? lo(p, h) : null, g = !m || !m.is2D || m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1, y = u.width, b = u.height;
+      let p = f.transform && f.transform !== "none" ? f.transform : "", h = se(c), d = !!(p || h.rotate !== "0deg" || h.scale || h.translate), m = d ? lo(p, h) : null, g = !m || !m.is2D || m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1, { width: y, height: b } = u;
       g || (y = c.offsetWidth || u.width, b = c.offsetHeight || u.height);
       let w = c.getRootNode && ue(c.getRootNode()), C = o, x = t.clientLeft || 0, S = t.clientTop || 0;
       if (w) {
@@ -8247,7 +8247,7 @@ ${g}
           if (O?.nodeType === 1 && vt(T) && T.style && O.isConnected) {
             let _ = O.getBoundingClientRect();
             if (_.width > 0 && _.height > 0) {
-              let L = N.getBoundingClientRect(), $ = _.width / c, F = _.height / f, V = L.width, z = L.height, q = O.offsetWidth || $, B = O.offsetHeight || F, Z = N.offsetWidth || V, Mt = N.offsetHeight || z, Lt = Math.abs($ - q) > Fe || Math.abs(F - B) > Fe || Math.abs(V - Z) > Fe || Math.abs(z - Mt) > Fe;
+              let L = N.getBoundingClientRect(), $ = _.width / c, F = _.height / f, { width: V, height: z } = L, q = O.offsetWidth || $, B = O.offsetHeight || F, Z = N.offsetWidth || V, Mt = N.offsetHeight || z, Lt = Math.abs($ - q) > Fe || Math.abs(F - B) > Fe || Math.abs(V - Z) > Fe || Math.abs(z - Mt) > Fe;
               if (H) {
                 let at = m(N, Z, Mt);
                 $ = V > 0 ? $ * w * at.width / V : $, F = z > 0 ? F * C * at.height / z : F, V = at.width, z = at.height;
@@ -8494,7 +8494,7 @@ ${g}
       let a = i.get(s);
       if (!(!a || a === e || a.parentNode == null)) {
         try {
-          let c = getComputedStyle(s, "::backdrop"), f = c.backgroundColor, l = c.backgroundImage;
+          let c = getComputedStyle(s, "::backdrop"), { backgroundColor: f, backgroundImage: l } = c;
           if (f && f !== "rgba(0, 0, 0, 0)" && f !== "transparent" || l && l !== "none") {
             let p = document.createElement("div");
             p.setAttribute("data-sd-backdrop", ""), p.style.cssText = `position:fixed;inset:0;z-index:${o};background-color:${f};` + (l && l !== "none" && l.includes("data:") ? `background-image:${l};` : ""), e.appendChild(p);
@@ -8687,7 +8687,7 @@ ${g}
       e.style.setProperty("background-attachment", r.map(() => "scroll").join(", "));
       return;
     }
-    let o = t.getBoundingClientRect(), s = t.ownerDocument?.defaultView || window, a = s.innerWidth, c = s.innerHeight, f = Ht(e.style.backgroundImage || n.getPropertyValue("background-image") || ""), l = (e.style.backgroundSize || n.getPropertyValue("background-size") || "auto").split(",").map((d) => d.trim()), u = (e.style.backgroundPosition || n.getPropertyValue("background-position") || "0% 0%").split(",").map((d) => d.trim()), p = [], h = [];
+    let o = t.getBoundingClientRect(), s = t.ownerDocument?.defaultView || window, { innerWidth: a, innerHeight: c } = s, f = Ht(e.style.backgroundImage || n.getPropertyValue("background-image") || ""), l = (e.style.backgroundSize || n.getPropertyValue("background-size") || "auto").split(",").map((d) => d.trim()), u = (e.style.backgroundPosition || n.getPropertyValue("background-position") || "0% 0%").split(",").map((d) => d.trim()), p = [], h = [];
     for (let d = 0;d < f.length; d++) {
       let m = r[d % r.length] || "scroll", g = l[d % l.length], y = u[d % u.length];
       if (m !== "fixed") {
@@ -9663,7 +9663,7 @@ ${g}
     e.__session = Ls(e.cache), delete e.__compressedAssets, delete e.__compressedSnapshot, delete e.__compressionDensity, e.__resolveNodeHooks = lu(e);
     let n = e;
     n.element = t, Object.defineProperty(n, "options", { value: n, configurable: true });
-    let r, i, o, s, a, c, f, l = "", u = null, p = e.needs || ft, h = n.format, d = n.type;
+    let r, i, o, s, a, c, f, l = "", u = null, p = e.needs || ft, { format: h, type: d } = n;
     await Nt("beforeSnap", n);
     let m = n.format !== h && /^(?:png|jpe?g|webp|svg)$/i.test(n.format), g = n.type !== d && /^(?:png|jpe?g|webp|svg)$/i.test(n.type);
     if (m || g) {
@@ -10738,7 +10738,7 @@ ${g}
         let z = R[_];
         if (!z)
           throw new Error(`[snapdom] Unknown export type: ${_}`);
-        let q = E(_, $), B = A({ artifacts: e.__artifacts || null, export: C({ type: _, options: q, requestedOptions: $ }) }), Z = q.format, Mt = q.type;
+        let q = E(_, $), B = A({ artifacts: e.__artifacts || null, export: C({ type: _, options: q, requestedOptions: $ }) }), { format: Z, type: Mt } = q;
         await Gn("beforeExport", B, { format: _, options: q });
         let Lt = q.format !== Z ? q.format : q.type !== Mt ? q.type : "", gt = typeof Lt == "string" ? Lt.toLowerCase() : "";
         La.has(gt) && (q.format = gt === "jpg" ? "jpeg" : gt, q.type = q.format, q.__explicitFormat = q.format, /^(?:jpeg|webp)$/.test(q.format) && (q.backgroundColor == null || q.backgroundColor === "transparent") && (q.backgroundColor = "#ffffff"));
@@ -10930,7 +10930,7 @@ ${g}
       return response;
     };
     const store = new RemoteVisualArtifactStore(input.capability, input.maxChunkBytes, rpc);
-    const wait2 = (milliseconds) => input.wait ? abortable(input.wait(Math.max(0, milliseconds)), input.signal) : abortableWait(milliseconds, input.signal);
+    const wait = (milliseconds) => input.wait ? abortable(input.wait(Math.max(0, milliseconds)), input.signal) : abortableWait(milliseconds, input.signal);
     const timingWindow = input.preferWaitForFrames ? waitDrivenWindow() : undefined;
     const api = attachSnapEye({
       snapdom: X,
@@ -10941,7 +10941,7 @@ ${g}
       forwardConsole: false,
       errorOverlay: false,
       hotkey: false,
-      wait: wait2,
+      wait,
       encodeGif: encodeGifFrames,
       stabilize: true,
       settle: true,
@@ -11002,12 +11002,12 @@ ${g}
     throwIfAborted(signal);
     return new Promise((resolve, reject) => {
       let settled = false;
-      const finish = (fn2) => {
+      const finish = (fn) => {
         if (settled)
           return;
         settled = true;
         signal.removeEventListener("abort", onAbort);
-        fn2();
+        fn();
       };
       const onAbort = () => finish(() => reject(abortError()));
       signal.addEventListener("abort", onAbort, { once: true });
@@ -11021,13 +11021,13 @@ ${g}
     return new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => finish(resolve), Math.max(0, milliseconds));
-      const finish = (fn2) => {
+      const finish = (fn) => {
         if (settled)
           return;
         settled = true;
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
-        fn2();
+        fn();
       };
       const onAbort = () => finish(() => reject(abortError()));
       signal.addEventListener("abort", onAbort, { once: true });

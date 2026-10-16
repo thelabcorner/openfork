@@ -40,12 +40,12 @@
   // src/background/sw.ts
   var exports_sw = {};
   __export(exports_sw, {
-    toBrokerErrorBody: () => toBrokerErrorBody,
-    handleBrokerRequest: () => handleBrokerRequest,
-    getNativePort: () => getNativePort,
-    getDebuggerManager: () => getDebuggerManager,
+    dispatchOperation: () => dispatchOperation,
     getActiveTabIconController: () => getActiveTabIconController,
-    dispatchOperation: () => dispatchOperation
+    getDebuggerManager: () => getDebuggerManager,
+    getNativePort: () => getNativePort,
+    handleBrokerRequest: () => handleBrokerRequest,
+    toBrokerErrorBody: () => toBrokerErrorBody
   });
 
   // src/shared/protocol.ts
@@ -581,6 +581,9 @@
     "press",
     "scroll",
     "evaluate",
+    "react_inspect",
+    "profiler_start",
+    "profiler_stop",
     "resize",
     "set_appearance"
   ]);
@@ -599,6 +602,10 @@
   var MAX_INTERACTIVE_ELEMENTS = 200;
   var RECORDING_FRAME_INTERVAL_MS = Math.ceil(1000 / 12);
   var RECORDING_DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
+  var PROFILER_MAX_COMPONENTS = 100;
+  var PROFILER_MAX_FIBERS_PER_COMMIT = 2000;
+  var PROFILER_MAX_COMMITS = 200;
+  var PROFILER_MAX_PROPS = 5;
   // ../../packages/desktop/src/main/browser/scripts-resolve.ts
   function synthesizeSelectorScript() {
     return String.raw`
@@ -816,6 +823,234 @@
       readyState: document.readyState,
       url: location.href,
     };
+  })()`;
+  }
+  function reactInspectScript(resolveExpr) {
+    return `(() => {
+    const find = ${resolveExpr};
+    let el;
+    try { el = find(); } catch (e) { return { error: e.message }; }
+    if (!el) return null;
+
+    const MAX_DEPTH = 3;
+    const safe = (value, depth) => {
+      if (depth > MAX_DEPTH) return '[Truncated]';
+      if (value === null || value === undefined) return value === undefined ? null : value;
+      if (typeof value === 'function') return '[Function ' + (value.name || 'anonymous') + ']';
+      if (typeof value === 'string') return value.length > 500 ? value.slice(0, 500) + '…' : value;
+      if (typeof value === 'number' || typeof value === 'boolean') return value;
+      if (typeof Element !== 'undefined' && value instanceof Element) return '[Element <' + value.tagName.toLowerCase() + '>]';
+      if (Array.isArray(value)) return value.slice(0, 20).map((v) => safe(v, depth + 1));
+      if (typeof value === 'object') {
+        const out = {};
+        let count = 0;
+        for (const key in value) {
+          if (key === 'children' || key.charAt(0) === '_') continue;
+          if (count++ >= 20) { out['…'] = 'truncated'; break; }
+          try { out[key] = safe(value[key], depth + 1); } catch { out[key] = '[Unserializable]'; }
+        }
+        return out;
+      }
+      return String(value);
+    };
+
+    const fiberKey = Object.keys(el).find((k) => k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0);
+    if (!fiberKey) return { hasReact: false, ancestors: [] };
+
+    const componentNameOfType = (type) => {
+      if (typeof type === 'string') return null;
+      if (typeof type === 'function') return type.displayName || type.name || null;
+      if (type && typeof type === 'object') return type.displayName || type.name || (type.render && (type.render.displayName || type.render.name)) || null;
+      return null;
+    };
+
+    const sourceOf = (fiber) => {
+      const s = fiber._debugSource;
+      if (!s) return undefined;
+      return { file: s.fileName, line: s.lineNumber, column: s.columnNumber };
+    };
+
+    const readHooks = (fiber) => {
+      const hooks = [];
+      let hook = fiber.memoizedState;
+      let guard = 0;
+      while (hook && guard++ < 25 && hooks.length < 15) {
+        if ('memoizedState' in hook) hooks.push(safe(hook.memoizedState, 0));
+        hook = hook.next;
+      }
+      return hooks;
+    };
+
+    let fiber = el[fiberKey];
+    let component;
+    const ancestors = [];
+    let guard = 0;
+    while (fiber && guard++ < 60) {
+      const name = componentNameOfType(fiber.type);
+      if (name) {
+        const entry = { name, source: sourceOf(fiber) };
+        if (!component) {
+          component = { name, source: entry.source, props: fiber.memoizedProps ? safe(fiber.memoizedProps, 0) : undefined, hooks: fiber.memoizedState ? readHooks(fiber) : undefined };
+        } else if (ancestors.length < 12) {
+          ancestors.push(entry);
+        }
+      }
+      fiber = fiber.return;
+    }
+
+    return { hasReact: true, component, ancestors };
+  })()`;
+  }
+
+  // ../../packages/desktop/src/main/browser/scripts-profiler.ts
+  var PROFILER_STATE_KEY = "__opencode_browser_profiler__";
+  function reactDevtoolsStatusScript() {
+    return `(() => {
+    const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    const renderers = hook && hook.renderers;
+    const rendererCount = renderers && typeof renderers.size === 'number' ? renderers.size : 0;
+    const listenerApi = !!hook && typeof hook.on === 'function' && typeof hook.off === 'function';
+    return {
+      hookPresent: !!hook,
+      supportsFiber: !!hook && hook.supportsFiber === true,
+      rendererCount,
+      listenerApi,
+      connected: !!hook && hook.supportsFiber === true && rendererCount > 0 && listenerApi,
+    };
+  })()`;
+  }
+  function profilerStartScript(component) {
+    const target = component ? JSON.stringify(component) : "null";
+    return `(() => {
+    const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    if (!hook || !hook.supportsFiber) return { noDevtools: true };
+    if (!hook.renderers || typeof hook.renderers.size !== 'number' || hook.renderers.size === 0 || typeof hook.on !== 'function' || typeof hook.off !== 'function') return { noDevtools: true };
+    if (window[${JSON.stringify(PROFILER_STATE_KEY)}]) return { already: true };
+    const state = {
+      commits: [],
+      startedAt: performance.now(),
+      renderCounts: new Map(),
+      component: ${target},
+      truncated: false,
+    };
+    const walk = (root) => {
+      let visited = 0;
+      const stack = [root];
+      while (stack.length > 0 && visited < ${PROFILER_MAX_FIBERS_PER_COMMIT}) {
+        const fiber = stack.pop();
+        if (!fiber) continue;
+        visited++;
+        const type = fiber.elementType || fiber.type;
+        let name = null;
+        if (typeof type === 'function') name = type.displayName || type.name || null;
+        else if (typeof type === 'string') name = type;
+        else if (type && typeof type === 'object' && typeof type.render === 'function') name = type.displayName || null;
+        if (name) {
+          const count = state.renderCounts.get(name) || 0;
+          // alternate !== null means the fiber re-rendered in this commit
+          state.renderCounts.set(name, count + (fiber.alternate ? 1 : 0));
+        }
+        if (fiber.child) stack.push(fiber.child);
+        if (fiber.sibling) stack.push(fiber.sibling);
+      }
+      if (visited >= ${PROFILER_MAX_FIBERS_PER_COMMIT}) state.truncated = true;
+    };
+    state.onCommit = (rendererIDOrEvent, rootArg) => {
+      if (state.commits.length >= ${PROFILER_MAX_COMMITS}) { state.truncated = true; return; }
+      // React DevTools versions have emitted either positional arguments or a
+      // single event payload through the hook event bus. Normalize both forms.
+      const root = rootArg || rendererIDOrEvent?.root || rendererIDOrEvent?.fiberRoot || rendererIDOrEvent;
+      if (!root || !root.current) return;
+      state.commits.push({ at: performance.now(), root });
+      try { walk(root.current); } catch (e) { /* fiber walk is best-effort */ }
+    };
+    hook.on('commitFiberRoot', state.onCommit);
+    state.unsubscribe = () => hook.off('commitFiberRoot', state.onCommit);
+    window[${JSON.stringify(PROFILER_STATE_KEY)}] = state;
+    return { started: true };
+  })()`;
+  }
+  function profilerStopScript() {
+    return `(() => {
+    const state = window[${JSON.stringify(PROFILER_STATE_KEY)}];
+    if (!state) return { noReact: true };
+    state.unsubscribe();
+    delete window[${JSON.stringify(PROFILER_STATE_KEY)}];
+    const windowMs = Math.max(0, performance.now() - state.startedAt);
+    const sorted = Array.from(state.renderCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, ${PROFILER_MAX_COMPONENTS});
+    const topRenders = sorted.map(([name, count]) => ({ name, count }));
+    let propsDiff = null;
+    if (state.component) {
+      const wanted = state.component;
+      const lastCommit = state.commits[state.commits.length - 1];
+      if (lastCommit && lastCommit.root) {
+        const stack = [lastCommit.root.current];
+        let visited = 0;
+        while (stack.length > 0 && visited < ${PROFILER_MAX_FIBERS_PER_COMMIT}) {
+          const fiber = stack.pop();
+          if (!fiber) continue;
+          visited++;
+          const type = fiber.elementType || fiber.type;
+          let name = null;
+          if (typeof type === 'function') name = type.displayName || type.name || null;
+          if (name === wanted && fiber.memoizedProps && fiber.alternate && fiber.alternate.memoizedProps) {
+            const keys = Object.keys(fiber.alternate.memoizedProps);
+            const props = [];
+            for (const key of keys) {
+              if (props.length >= ${PROFILER_MAX_PROPS}) break;
+              const before = fiber.alternate.memoizedProps[key];
+              const after = fiber.memoizedProps[key];
+              if (before !== after) {
+                props.push({ key, before: before === undefined ? null : before, after: after === undefined ? null : after });
+              }
+            }
+            if (props.length > 0) propsDiff = { component: wanted, props };
+            break;
+          }
+          if (fiber.child) stack.push(fiber.child);
+          if (fiber.sibling) stack.push(fiber.sibling);
+        }
+      }
+    }
+    const truncate = (v) => {
+      const s = JSON.stringify(v);
+      if (!s) return v;
+      return s.length > 400 ? s.slice(0, 400) : v;
+    };
+    return {
+      commits: state.commits.length,
+      windowMs: Math.round(windowMs),
+      topRenders,
+      propsDiff: propsDiff ? { component: propsDiff.component, props: propsDiff.props.map((p) => ({ key: p.key, before: truncate(p.before), after: truncate(p.after) })) } : undefined,
+      truncated: state.truncated,
+    };
+  })()`;
+  }
+  function reactPresentScript() {
+    return `(() => {
+    const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    if (hook && hook.supportsFiber && hook.renderers && hook.renderers.size > 0) return true;
+    // Fall back to a fiber-root DOM scan (React attaches __reactFiber$* to roots).
+    const keys = Object.keys(window);
+    if (keys.some((k) => k.startsWith('__reactContainer$') || k.startsWith('__REACT_DEVTOOLS'))) return true;
+    if (document.body) {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+      let node = walker.nextNode();
+      let found = false;
+      let scanned = 0;
+      while (node && scanned < 500) {
+        scanned++;
+        for (const key of Object.keys(node)) {
+          if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) { found = true; break; }
+        }
+        if (found) break;
+        node = walker.nextNode();
+      }
+      return found;
+    }
+    return false;
   })()`;
   }
 
@@ -1065,8 +1300,8 @@
     let requestId = "";
     try {
       if (!isBrokerRequest(raw)) {
-        const resp2 = { ok: false, requestId: "", elapsedMs: Date.now() - startedAt, error: toError("BrowserOperationFailed", "Invalid BrokerRequest envelope", true) };
-        reply(source, resp2);
+        const resp = { ok: false, requestId: "", elapsedMs: Date.now() - startedAt, error: toError("BrowserOperationFailed", "Invalid BrokerRequest envelope", true) };
+        reply(source, resp);
         return;
       }
       const req = raw;
@@ -1350,10 +1585,10 @@
         return { typed: { value: text, caret: { selectionStart: text.length, selectionEnd: text.length }, submitted: !!input.submit } };
       }
       case "press": {
-        const key2 = input.key;
-        await dm.sendCommand(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key: key2, code: key2 });
-        await dm.sendCommand(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key: key2, code: key2 });
-        return { pressed: { key: key2, repeat: false, modifiers: [] } };
+        const key = input.key;
+        await dm.sendCommand(tabId, "Input.dispatchKeyEvent", { type: "keyDown", key, code: key });
+        await dm.sendCommand(tabId, "Input.dispatchKeyEvent", { type: "keyUp", key, code: key });
+        return { pressed: { key, repeat: false, modifiers: [] } };
       }
       case "scroll": {
         if (input.delta) {
@@ -1370,6 +1605,59 @@
         const result = res.result?.value ?? res.result ?? null;
         const type = typeof result;
         return { evaluated: { result, type, truncated: false } };
+      }
+      case "react_inspect": {
+        const coords = await resolveTargetToCoords(dm, tabId, input.target);
+        const find = `() => document.elementFromPoint(${JSON.stringify(coords.x)}, ${JSON.stringify(coords.y)})`;
+        const result = await evaluatePage(dm, tabId, reactInspectScript(find));
+        if (result && typeof result === "object" && typeof result.error === "string") {
+          throw Object.assign(new Error(result.error), { tag: "BrowserTargetNotFound", retryable: true });
+        }
+        if (!result)
+          throw browserTargetNotFound();
+        return {
+          inspected: {
+            tabId: String(tabId),
+            hasReact: !!result.hasReact,
+            component: result.component,
+            ancestors: Array.isArray(result.ancestors) ? result.ancestors : []
+          }
+        };
+      }
+      case "profiler_start": {
+        const present = await evaluatePage(dm, tabId, reactPresentScript());
+        if (!present) {
+          throw Object.assign(new Error("The page is not a React application"), { tag: "BrowserNotAReactAppError", retryable: false });
+        }
+        const devtools = await evaluatePage(dm, tabId, reactDevtoolsStatusScript());
+        if (!devtools?.connected) {
+          throw Object.assign(new Error("No React DevTools renderer is connected to this page. Enable the React Developer Tools extension for this site and reload the page before profiling."), { tag: "BrowserOperationFailed", retryable: false, details: { reactDevtools: devtools } });
+        }
+        const started = await evaluatePage(dm, tabId, profilerStartScript(input.component));
+        if (started?.noDevtools) {
+          throw Object.assign(new Error("React DevTools disconnected before profiling could start. Reload the page and retry."), { tag: "BrowserOperationFailed", retryable: false });
+        }
+        const snapshot = await snapshotRefs.get(tabId);
+        return { started: { snapshotVersion: snapshot?.version ?? 0 } };
+      }
+      case "profiler_stop": {
+        const result = await evaluatePage(dm, tabId, profilerStopScript());
+        if (result?.noReact) {
+          const present = await evaluatePage(dm, tabId, reactPresentScript()).catch(() => false);
+          if (!present)
+            throw Object.assign(new Error("The page is not a React application"), { tag: "BrowserNotAReactAppError", retryable: false });
+          return { profiled: { commits: 0, windowMs: 0, topRenders: [], truncated: false } };
+        }
+        const topRenders = Array.isArray(result?.topRenders) ? result.topRenders.slice(0, 100) : [];
+        return {
+          profiled: {
+            commits: Number.isFinite(result?.commits) ? result.commits : 0,
+            windowMs: Number.isFinite(result?.windowMs) ? result.windowMs : 0,
+            topRenders,
+            propsDiff: result?.propsDiff,
+            truncated: result?.truncated === true
+          }
+        };
       }
       case "wait_for": {
         const timeout = input.timeoutMs ?? 5000;
