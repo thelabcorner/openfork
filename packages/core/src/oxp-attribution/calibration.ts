@@ -1,22 +1,14 @@
 export * as OxpAttributionCalibration from "./calibration"
 
 import { createHash } from "node:crypto"
-import profile from "./calibration-v1.json" with { type: "json" }
+import payload from "./payload-calibration-v1.json" with { type: "json" }
+import upstreamProfile from "./calibration-v2.json" with { type: "json" }
 
 type Donor = {
   readonly reqArgsMean: number
   readonly reqArgsCount: number
   readonly canonicalResultMean: number
   readonly canonicalResultCount: number
-}
-
-type ToolValidation = {
-  readonly tool: string
-  readonly observations: number
-  readonly exposureAggregateBiasRMSE: number | null
-  readonly exposureMaxAbsFoldBias: number | null
-  readonly exposureWAPE: number | null
-  readonly foldsWithExposureEvidence: number
 }
 
 function canonical(value: unknown): unknown {
@@ -30,44 +22,52 @@ function canonical(value: unknown): unknown {
 }
 
 function digest(value: unknown) {
-  return createHash("sha256")
-    .update(JSON.stringify(canonical(value)))
-    .digest("hex")
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex")
 }
 
-function assertProfile() {
-  if (profile.version !== 1) throw new Error(`Unsupported OXP attribution calibration v${profile.version}`)
+function assertPayload() {
+  if (payload.version !== 1) throw new Error(`Unsupported OXP payload calibration v${payload.version}`)
+  if (!(payload.tokenizer.canonicalRequestCharsPerToken > 0) || !(payload.tokenizer.canonicalResultCharsPerToken > 0))
+    throw new Error("OXP payload calibration has invalid tokenizer ratios")
+  if (!Number.isFinite(payload.corpus.maxStartedAt)) throw new Error("OXP payload calibration has invalid corpus window")
+}
+
+function assertUpstream() {
+  if (upstreamProfile.version !== 2) throw new Error(`Unsupported OXP usage calibration v${upstreamProfile.version}`)
   if (
-    profile.units.rawLength !== "sqlite-text-unicode-codepoints" ||
-    profile.units.canonicalLength !== "sqlite-text-unicode-codepoints"
+    !(upstreamProfile.tokenizer.requestCharsPerToken > 0) ||
+    !(upstreamProfile.tokenizer.resultCharsPerToken > 0)
+  )
+    throw new Error("OXP usage calibration has invalid tokenizer ratios")
+  if (!(upstreamProfile.upstream.turnGapThresholdMs >= 0))
+    throw new Error("OXP usage calibration has invalid turn threshold")
+  const width = upstreamProfile.upstream.features.length
+  if (
+    upstreamProfile.upstream.coefficients.length !== width ||
+    upstreamProfile.upstream.means.length !== width ||
+    upstreamProfile.upstream.stds.length !== width
   ) {
-    throw new Error("OXP attribution calibration uses incompatible length units")
+    throw new Error("OXP usage calibration feature dimensions do not match")
   }
-  if (!(profile.rho >= 0 && profile.rho <= 1)) throw new Error("OXP attribution calibration rho is outside [0,1]")
-  if (!(profile.gapThresholdMs >= 0)) throw new Error("OXP attribution calibration gap threshold is invalid")
-  const { integrity, ...body } = profile
-  const actual = digest(body)
-  if (integrity.algorithm !== "sha256" || actual !== integrity.digest)
-    throw new Error("OXP attribution calibration integrity check failed")
+  if (upstreamProfile.upstream.stds.some((value) => !(value > 0)))
+    throw new Error("OXP usage calibration has invalid scaling")
 }
 
-assertProfile()
+assertPayload()
+assertUpstream()
 
-const donors = profile.donors.groups as Record<string, Donor>
-const globalDonor = profile.donors.global as Donor
-const temporal = profile.validation.temporal.byTool as Record<
-  string,
-  { readonly observations: number; readonly exposureRelativeError: number | null }
->
-const validation = new Map((profile.validation.byTool as readonly ToolValidation[]).map((row) => [row.tool, row]))
+const donors = payload.donors.groups as unknown as Record<string, Donor>
 
-export const artifact = profile
-export const id = profile.integrity.digest
-export const rho = profile.rho
-export const gapThresholdMs = profile.gapThresholdMs
-
-export const requestCharsPerToken = profile.tokenizer.canonicalRequestCharsPerToken
-export const resultCharsPerToken = profile.tokenizer.canonicalResultCharsPerToken
+// The payload artifact's `canonicalSchema` names the historical detail shape the
+// tokenizer ratios were measured against; live boundary scalars reuse the same
+// ratios because both are Unicode-code-point text at the boundary. `payload` only
+// supplies donor statistics and the legacy corpus window now -- it no longer
+// carries `rho`/geometric residency semantics.
+export const canonicalSchema = payload.canonicalSchema
+export const requestCharsPerToken = upstreamProfile.tokenizer.requestCharsPerToken
+export const resultCharsPerToken = upstreamProfile.tokenizer.resultCharsPerToken
+export const turnGapThresholdMs = upstreamProfile.upstream.turnGapThresholdMs
+export const upstream = upstreamProfile.upstream
 
 export const donor = (tool: string, status: string) => donors[`${tool}\0${status}`]
 
@@ -83,29 +83,25 @@ export const resultDonorChars = (tool: string, status: string) => {
   return undefined
 }
 
-export const globalDonorReference = globalDonor
-
-/**
- * The research surrogate is eligible only when both activity-disjoint folds
- * and the strict future holdout support it. Core does not need this for exact
- * persisted scalars, but exposes the gate for cold historical fallback/audit.
- */
-export const surrogateEligible = (tool: string) => {
-  const row = validation.get(tool)
-  const future = temporal[tool]
-  if (!row || !future) return false
-  if (row.foldsWithExposureEvidence < 3 || future.observations < 20) return false
-  const rmse = row.exposureAggregateBiasRMSE
-  const futureError = future.exposureRelativeError
-  if (rmse === null || futureError === null) return false
-  return Math.max(Math.abs(rmse), Math.abs(futureError)) <= 0.05
-}
+export const id = digest(upstreamProfile)
+export const artifact = upstreamProfile
 
 export const status = {
-  productionDigest: profile.integrity.digest,
-  sourceDigest: profile.sourceArtifact.digest,
-  calibratedAt: profile.calibratedAt,
-  observations: profile.observations,
-  corpus: profile.corpus,
-  validation: profile.validation.best,
+  productionDigest: id,
+  payloadDigest: digest(payload),
+  sourceDigest: payload.sourceArtifact.digest,
+  calibratedAt: upstreamProfile.calibratedAt,
+  observations: upstreamProfile.source.pairedMessages,
+  corpus: {
+    pairedMessages: upstreamProfile.source.pairedMessages,
+    sessions: upstreamProfile.source.sessions,
+    usageRows: upstreamProfile.source.usageRows,
+    toolRows: upstreamProfile.source.toolRows,
+    maxStartedAt: payload.corpus.maxStartedAt,
+  },
+  tokenizer: {
+    encoding: upstreamProfile.tokenizer.encoding,
+    sampledInvocations: upstreamProfile.tokenizer.sampledInvocations,
+  },
+  validation: upstreamProfile.upstream.validation,
 } as const

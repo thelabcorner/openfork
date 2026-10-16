@@ -3,10 +3,12 @@ import { Context, Effect, Layer } from "effect"
 import fs from "node:fs/promises"
 import os from "node:os"
 import { join } from "node:path"
+import { eq } from "drizzle-orm"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { OfxpPeer } from "@opencode-ai/core/ofxp-peer"
+import { OfxpPeerGrantTable } from "@opencode-ai/core/ofxp-peer/sql"
 import { OfxpIdentity } from "@opencode-ai/core/ofxp-peer/identity"
 import { Ofxp } from "@opencode-ai/schema/ofxp"
 import { tmpdir } from "./fixture/tmpdir"
@@ -52,6 +54,26 @@ function tempRoot(prefix: string) {
 }
 
 describe("OFXP peer trust domain", () => {
+  it.effect("normalizes legacy persisted grants without Code authority to code=false", () =>
+    Effect.gen(function* () {
+      const peers = yield* OfxpPeer.Service
+      const { db } = yield* Database.Service
+      const generated = identity("Legacy Grant")
+      yield* peers.trust({ identity: generated.identity })
+      const { code: _code, ...legacyGrant } = Ofxp.DENY_GRANT
+      yield* db
+        .update(OfxpPeerGrantTable)
+        .set({ grant: legacyGrant as Ofxp.Grant })
+        .where(eq(OfxpPeerGrantTable.peer_id, generated.key.peerID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const record = yield* peers.get(generated.key.peerID)
+      expect(record.grant.code).toBe(false)
+      expect(record.grant).toEqual(Ofxp.DENY_GRANT)
+    }),
+  )
+
   test("propagates durable authority generations between independent services sharing one SQLite file", async () => {
     await using tmp = await tmpdir()
     const filename = join(tmp.path, "shared-ofxp-authority.db")

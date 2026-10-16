@@ -133,6 +133,38 @@ describe("OFXP invocation receipts", () => {
     }),
   )
 
+  it.effect("atomically claims the execution boundary exactly once", () =>
+    Effect.gen(function* () {
+      const peers = yield* OfxpPeer.Service
+      const receipts = yield* OfxpInvocation.Service
+      const peer = identity()
+      yield* peers.trust({ identity: peer.identity })
+      const invocationID = Ofxp.InvocationID.create()
+      yield* receipts.admit({
+        invocationID,
+        sourcePeerID: peer.key.peerID,
+        operation: "code.run",
+        commitClass: "non_idempotent_mutation",
+        requestDigest: `sha256:${"5".repeat(64)}`,
+      })
+
+      const claims = yield* Effect.all(
+        [
+          receipts.claimStart({ invocationID, targetRef: "code:global" }),
+          receipts.claimStart({ invocationID, targetRef: "code:global" }),
+        ],
+        { concurrency: "unbounded" },
+      )
+      expect(claims.filter((item) => item.fresh)).toHaveLength(1)
+      expect(claims.filter((item) => !item.fresh)).toHaveLength(1)
+      expect(claims.every((item) => item.receipt.state === "started")).toBe(true)
+
+      const duplicate = yield* receipts.claimStart({ invocationID, targetRef: "code:global" })
+      expect(duplicate.fresh).toBe(false)
+      expect(duplicate.receipt.state).toBe("started")
+    }),
+  )
+
   it.effect("scopes receipt lookup to the authenticated source peer", () =>
     Effect.gen(function* () {
       const peers = yield* OfxpPeer.Service
