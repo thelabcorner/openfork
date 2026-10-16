@@ -46,6 +46,40 @@ originate in OpenCode. Their APIs are not required to remain compatible with
 upstream. The strict external boundary is any upstream-operated remote service
 OpenFork elects to consume.
 
+### Dreamer background historical investigation
+
+The lazy V1 `dream` tool launches `dreamer` as a host-owned special agent
+(shared built-in contract: `special: true`, hidden primary) through
+`special-agent/dreamer-runtime.ts` and `SubagentDelegation.executeSpecialAgent`,
+which reuses the process-local Core `BackgroundJob`/child Session lifecycle
+owner to run a detached worker Session. Generic Task delegation refuses the
+special-agent class by built-in id; Dreamer is excluded from the
+`subagent_type` catalog. Dreamer does not create a second scheduler, storage
+format, or coding worker. Session and Memory
+remain the only inspection capabilities available to that agent, with host-side
+leaf fences against mutation, live status, waiting and index repair. The Dreamer
+Session discovery window is capped at 20 results; transcript inspection is
+limited to 12 messages / 200 scanned rows with a serialized-text ceiling of
+6 KiB per message and 24 KiB per response. Inspectable excerpts retain source
+IDs and explicit omissions. This bounds projection/row demand but does not yet
+bound the source bytes decoded for each selected historical message.
+
+The child Session is durable but running job state is process-local. A missing
+job after process restart means **outcome unknown**, not finished; read-only
+`dream.status` exposes producer-owned Session timestamps without initializing
+another workspace's live status runtime. Automatic memory promotion, durable
+consolidation checkpoints, global Dreamer concurrency budgets, and multi-host
+worker recovery are not implemented. See
+`docs/architecture/dreamer-background-agent.md` for per-surface certification
+and the still-open release gates.
+
+Dreamer and Summary also use the ordinary V1 Session provider resolver. Their
+host-owned class is checked against the canonical built-in topology before
+hosted route selection, with `allowPublic: false`; the Session LLM provides
+a second pre-dispatch fence. This prevents OpenFork from accidentally selecting
+OpenCode's official-client-only hosted free tier for special agents. See
+`docs/architecture/compatibility-boundary.md`.
+
 ### Process-global coding activity telemetry
 
 WakaTime is a deliberate cross-generation first-party integration. Producers in the
@@ -202,6 +236,36 @@ routes can remain until a V1-oriented simplification is deliberate and proven sa
 
 ## 4. Session execution
 
+### 4.0 Executable tool parity across all supported surfaces
+
+A built-in, lazy or Code-hosted OpenFork tool is not complete when it merely
+appears in the native registry, OXP/OFXP catalog, ACP list, MCP discovery or
+Code search output. Every supported tool-calling entry point must actually
+dispatch equivalent actions to one authoritative domain owner, subject to
+its *own* legitimate Session/peer/root grants. Native chat and workers,
+Code Mode, OXP, OFXP, ACP, MCP and future tool-capable gateways are in scope.
+Unsupported transports and deliberately narrower operations must be
+identified as such rather than advertised as passing parity.
+
+```text
+Normal chat / worker + lazy @tool --(real Session)--------+
+Code tool / confined Code Mode ----(host invocation)-----+
+OXP ---------------------------(approved root/principal)-+
+OFXP ----------------------------(verified peer/grants)--+--> shared domain owner
+ACP -----------------------------(real agent Session)---+
+MCP import / authorized export ----(directional grants)--+
+other supported tool entry points -----------------------+
+```
+
+The V1 production `ToolRegistry` remains the authoritative built-in inventory;
+`packages/opencode/src/exchange/tool-coverage.ts` records external semantic
+dispositions, while **actual per-surface dispatchers and integration tests**
+prove execution. Preserve progressive discovery, Code gateway confinement,
+explicit Session supervision, authorization/revocation, bounded results,
+and independent external principals. See the
+[universal tool-surface parity contract](../architecture/tool-surface-parity.md)
+and the [OXP-specific evidence ledger](../architecture/oxp-native-tool-parity.md).
+
 Two execution generations coexist.
 
 ### Legacy/V1 path
@@ -217,9 +281,11 @@ The V1 production stack and its internal backward-bridge seams are centered in:
 This path remains important because much of the mature local OpenFork execution
 behavior and fork tooling still runs through it. It is not “dead code”.
 
-OpenFork also backports upstream Code Mode into this V1 production path. Code Mode
-is the default MCP exposure strategy: native OpenFork tools stay direct while MCP
-tools are orchestrated through the confined `execute` tool. See
+OpenFork also hosts the provider-visible Code orchestration surface in this V1
+production path. The static `code` tool owns broad discovery/exact describe,
+confined run/replay, saved-tool promotion, and saved-tool invocation. Eligible
+native/lazy/MCP/MCP-resource/saved capabilities execute through one host invocation
+gateway rather than expanding the provider manifest. See
 [`docs/architecture/code-mode.md`](../architecture/code-mode.md).
 
 ### Current/V2 path
@@ -372,7 +438,86 @@ producer/storage
 and architectural review should trace the reverse demand path back to the authoritative
 producer before adding a fetch or frontend derivation.
 
+An explicitly opened transcript consumes complete durable parts. The V1 history
+page is a bounded bootstrap, followed by one session-owned recovery drain through
+`/session/:sessionID/timeline-parts`. The server pages `PartTable` with current-part
+overlays; the client batches message owners and fences snapshots against newer live
+changes. Virtual rows bound mounted presentation, not which stored parts exist.
+There is no per-message recovery transport or content-omission presentation policy.
+
+Session UI owns Markdown parsing and DOM work. Visible streaming tails have a
+reserved worker lane; oversized rich bodies use a separate lazy worker and bounded
+DOM continuations. First paint publishes formatted Markdown, with the previous
+formatted prefix retained during parsing. Accessibility `aria-hidden` is not visual
+visibility. The app owns scroll gestures; its shared scroll hook and virtualizer
+consume that intent rather than reconstructing it from layout-induced scroll deltas.
+
+Cold Markdown mounts publish the first ready rich block, then bounded batches;
+they do not wait for the entire message or expose raw Markdown while parsing.
+After a complete render, updates prepare a complete replacement projection.
+The render producer retains its last proven prefix independently of pending
+resource reloads and copies every reused block, including prefix recovery after
+viewport re-entry. Reuse compares parsed source as well as raw bytes so changed
+Markdown semantics cannot inherit stale HTML. The shared sanitizer owner admits
+up to eight tasks / 256 KiB actual input / four milliseconds per frame, retaining
+tail priority and bounded reservations; tiny paragraphs do not each consume a
+separate paint interval.
+
+Draft presentation imports only its shared composer controls. Existing-session
+composer region/state/controllers belong to the opened-session surface; importing
+their barrel from the draft eagerly loads that unrelated graph in development.
+The real Electron startup gate enforces that those modules stay unloaded on a
+cold draft, while verifying that full draft loading starts on route entry.
+
 ## 8. Generated API paths
+
+Ordinary V1 `session.prompt` / `prompt_async` conversation admission uses
+`SessionPrompt.interactivePrompt` (an alias of canonical `prompt`). Well-formed
+root and nested delegated workers accept
+human follow-ups while their durable agent/provider/model/account/variant and
+producer identity remain protected. The admission service binds omitted selection
+fields, checks explicit overrides, stamps the nested-delegation policy snapshot,
+and rechecks the protected selection before persistence. User turns retain user
+provenance; they do not impersonate an OXP invocation. Command/shell preflight
+and trusted `hostPrompt` keep their separate ownership/authentication fences.
+Generic aggregate mutation, opaque child/special-agent prompting and malformed
+delegation origins remain fenced. This is execution Tier 3 work, not a new
+history-derived projection or a per-message transport.
+
+Human conversation/control authority is independent of producer configuration
+ownership. `SessionMetadataOwnership.isHumanControllableWorker` owns that policy;
+mixed special-agent/scheduler origins and malformed delegation remain fenced.
+V1 session reads and created/updated events expose its O(1) `humanInterjection`
+projection. The GUI consumes that capability through the V1 adapter and session
+cache: delegated children retain a composer, including during permission waits.
+Human worker submission inherits the owner's selection and does not synchronize
+auto-accept or expand a slash-prefixed conversational turn into a command.
+Permission/question replies remain explicit independent decisions.
+
+Stop uses the process-global execution owner and exact-generation interrupt,
+without `InstanceStore.load`. Stop/Pause/Resume accept valid delegated workers
+without granting generic aggregate mutation. A successful Stop cancels the
+observed limit-recovery generation so a scheduled retry cannot resurrect it;
+a stale interrupt returns false before revoking recovery or automation.
+Pending blocker replies settle through the shared active-response registry,
+matching ambiguous raw/encoded directory-header spellings against the registered
+owner. Explicit query/workspace locations retain their fence; no candidate
+initializes an execution instance.
+
+Working-session status is projected from the durable owner and exact process
+activation, not merely from a non-null owner row. The activation registry is
+shared across independently compiled runtime modules in the same Node process,
+so backend refresh cannot make a still-running generation look orphaned. A
+foreign owner whose process is proven dead, or a same-process generation with
+no matching activation, is reported as `interrupted`; a live or uncertain owner remains `busy`. Interrupted
+generations with unresolved tool effects stay fenced until explicit Stop/Resume
+recovery seals the unknown effects and exact-releases that generation. Telemetry
+snapshots mask stale phase and turn clocks for interrupted sessions while
+retaining settled usage and context.
+
+The public prompt routes return a typed `InvalidRequestError` for admission
+rejection rather than discarding the reason in an empty 400. Admission remains
+durable before acknowledgement and execution wake remains independently owned.
 
 OpenFork has two generated-client families:
 

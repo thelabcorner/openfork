@@ -1,6 +1,9 @@
 # OpenFork Hosted Multi-Tenant Serve Architecture
 
-> Status: architecture draft, implementation not started  
+> **Status: ON HOLD — 2026-10-14 user decision. Do not implement or merge cloud multi-tenancy until necessity is proven and the user explicitly reactivates this work.**  
+> Historical architecture and engineering evidence below are preserved for future evaluation, **not** an active implementation mandate.  
+> Decision: cloud-hosted tenant-multiplexed execution is deferred; local ACP, local runtime supervision, native bridges, and desktop/editor work remain in scope.  
+> Cold source snapshots and worktree disposition: `C:\\Users\\slooshied\\WebstormProjects\\scripts\\worktree-consolidation\\MULTITENANT-CLOUD-HOLD-20261014.md`.  
 > Scope: OpenFork server runtime + PresGen hosted integration  
 > Initial deployment target: one shared OpenFork process inside one PresGen agent sandbox  
 > Long-term target: bounded multi-tenant cells with deterministic tenant placement  

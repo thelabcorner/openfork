@@ -1,0 +1,452 @@
+﻿1d96902911	OF-DIFF-025	1	test(core): align hosted identity header expectation
+75303d5b75	OF-DIFF-021,OF-DIFF-025	3	fix: close upstream v1.18.34 sync verification
+62b53deaeb	HISTORY-NO-NET-DIFF	0	merge: sync upstream v1.18.34
+545fc0eb98	OF-DIFF-010	1	docs(swarm): record post-flatten verification results
+b897a18ce9	NONPRODUCT-DOCS-EVIDENCE	1	chore(coordination): record implementation ledger
+5452242c83	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-009,OF-DIFF-010,OF-DIFF-011,OF-DIFF-012,OF-DIFF-014	58	docs: refresh architecture, plans, handoffs, and performance ledgers
+220ce756d2	OF-DIFF-023	1	test(app): add OXP activity lab entrypoint
+94f4569a1a	NONPRODUCT-DOCS-EVIDENCE	1	perf(capacity): add bounded provider projection benchmark
+6a46779cc8	OF-DIFF-015	1	test(runtime): preserve semantic executor denial typing
+7d00885f8a	OF-DIFF-006,OF-DIFF-025	6	chore(sdk): regenerate clients for expanded runtime APIs
+9cd63e8822	OF-DIFF-003,OF-DIFF-010,OF-DIFF-011,OF-DIFF-013,OF-DIFF-017,OF-DIFF-019,OF-DIFF-020,OF-DIFF-023,OF-DIFF-034	202	feat(app): integrate provider capacity, session sync, agents, and OXP surfaces
+e9bccf5fb9	OF-DIFF-003,OF-DIFF-034	30	perf(ui): harden markdown streaming and projection lifecycle
+1befb5a69a	OF-DIFF-008,OF-DIFF-016,OF-DIFF-018,OF-DIFF-034	81	feat(desktop): harden sidecar control and Electron lifecycle
+3f0f425293	OF-DIFF-006,OF-DIFF-008,OF-DIFF-009,OF-DIFF-010,OF-DIFF-011,OF-DIFF-012,OF-DIFF-013,OF-DIFF-014,OF-DIFF-015,OF-DIFF-017,OF-DIFF-019,OF-DIFF-021,OF-DIFF-022,OF-DIFF-023,OF-DIFF-024,OF-DIFF-025	414	feat(runtime): integrate routing, OXP control, swarm, and session supervision
+9dd9ceac86	OF-DIFF-010,OF-DIFF-011,OF-DIFF-012,OF-DIFF-013,OF-DIFF-017,OF-DIFF-018,OF-DIFF-020,OF-DIFF-021,OF-DIFF-022,OF-DIFF-023,OF-DIFF-024,OF-DIFF-025	283	feat(core): add durable routing, autonomy, execution, and swarm state
+5c5491faf7	OF-DIFF-001,OF-DIFF-013,OF-DIFF-018,OF-DIFF-025	25	chore(build): align OpenFork packaging and hosted compatibility
+d49ff96b70	OF-DIFF-014	1	fix(codemode): preserve host cancellation semantics
+b7930a2920	OF-DIFF-007	1	docs: refresh T3 compatibility audit
+fcf0e660e5	OF-DIFF-007	2	test: preserve T3 session status compatibility
+8157e62f1f	OF-DIFF-007,OF-DIFF-025	2	fix: mark OpenFork launchers executable
+60d29f98fb	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-006,OF-DIFF-007,OF-DIFF-017,OF-DIFF-025	22	feat: add T3 Code compatibility facade
+e2bbf2bfd8	OF-DIFF-003,OF-DIFF-023	8	fix(wakatime): prepare CLI when enabling
+b812cf5d94	OF-DIFF-006,OF-DIFF-025	2	fix(wakatime): fail closed on stale v1 backend
+b73812e002	OF-DIFF-018	3	fix(desktop): retry stale sidecar builds
+c064f22057	OF-DIFF-003,OF-DIFF-023	5	fix(wakatime): handle stale desktop backend
+61d86c8ae5	OF-DIFF-003,OF-DIFF-006,OF-DIFF-008,OF-DIFF-009,OF-DIFF-011,OF-DIFF-013,OF-DIFF-015,OF-DIFF-022,OF-DIFF-023,OF-DIFF-025,OF-DIFF-034	56	feat(wakatime): add first-party process-global telemetry
+ac08136011	OF-DIFF-013,OF-DIFF-021,OF-DIFF-025	4	fix(snapshot): bound capture and paginate checkpoint retention
+8420ac3335	OF-DIFF-025	2	feat(codemode): default MCP orchestration to Code Mode
+4fb4799281	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-018,OF-DIFF-025	24	feat(desktop): package worktree-store sidecar with fail-closed pinning
+03fa9b037a	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-014	5	docs: adopt Code Mode and supersede Custom Runtime
+058f728b33	OF-DIFF-001,OF-DIFF-006,OF-DIFF-008,OF-DIFF-011,OF-DIFF-012,OF-DIFF-013	11	fix(goal): recover continuation across compaction and restart
+3d8ed51fe8	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-006,OF-DIFF-009,OF-DIFF-019,OF-DIFF-025	15	chore: refresh generated SDK, dependency lock, and fork planning docs
+cb7505ae1c	OF-DIFF-006,OF-DIFF-009,OF-DIFF-011,OF-DIFF-013,OF-DIFF-015,OF-DIFF-017,OF-DIFF-021,OF-DIFF-022,OF-DIFF-024,OF-DIFF-025	82	feat(core): add session telemetry ownership, storage reset, and goal reconciliation
+55f1b45c9d	OF-DIFF-008,OF-DIFF-016,OF-DIFF-018	14	feat(desktop): add transactional OXP runtime refresh and node sidecar watch
+7f0fa68158	OF-DIFF-009,OF-DIFF-011,OF-DIFF-012,OF-DIFF-017,OF-DIFF-020,OF-DIFF-023,OF-DIFF-034	54	feat(app): integrate quota agenda, OXP activity, and shared presentation surfaces
+41321312c7	OF-DIFF-003,OF-DIFF-017,OF-DIFF-023,OF-DIFF-034	36	feat(app): add model catalog scope, OXP activity detail, and split i18n modules
+9e8cf06688	OF-DIFF-019	110	refactor(mobile): rebuild mobile client as a thin PWA shell over the app
+a02fbfbe74	OF-DIFF-019,OF-DIFF-034	24	feat(app): add installable PWA runtime with bounded event streaming
+dc6baaa046	OF-DIFF-008,OF-DIFF-012,OF-DIFF-013,OF-DIFF-021,OF-DIFF-023	55	feat(oxp): add invocation detail, runtime refresh, and delegated worker control
+82ae65e983	OF-DIFF-013,OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	19	feat(provider): add authoritative account resolution and routing metadata
+de8c435f63	OF-DIFF-013,OF-DIFF-017,OF-DIFF-021,OF-DIFF-025	39	feat(usage): add quota reset agenda, capacity priors, and yield statistics
+46c94739cd	OF-DIFF-017,OF-DIFF-034	2	fix: residual branding and language-model eligibility comment fixes
+cc9ebd724d	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-010,OF-DIFF-024	17	docs: add architecture contracts, handoff notes, and research ledgers
+3f8068d62b	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-010,OF-DIFF-025,OF-DIFF-034	35	docs: refresh architecture, map, and plan documents for OpenFork
+39cae16f9c	OF-DIFF-022,OF-DIFF-025	20	chore: refresh publish scripts, tooling, and root config
+be128a399e	OF-DIFF-006,OF-DIFF-018,OF-DIFF-034	26	feat(app/desktop): add send-control lab harness and refresh SDK v2 types
+1474b2ecfd	OF-DIFF-003,OF-DIFF-011,OF-DIFF-013,OF-DIFF-034	66	refactor(app): apply OpenFork branding across settings, dialogs, and pages
+2a04d94cc2	OF-DIFF-013,OF-DIFF-017,OF-DIFF-020,OF-DIFF-034	43	refactor(app): modernize global-sync, server-session, and context layer
+ce8a6e7e14	OF-DIFF-011,OF-DIFF-034	23	feat(app): add revision-draft durability and refine goal/prompt composer
+a653d39aff	OF-DIFF-020,OF-DIFF-034	12	feat(app): align timeline projection with V1 provenance taxonomy
+f582377322	OF-DIFF-016,OF-DIFF-018	37	refactor(desktop): apply OpenFork branding and harden browser/extension bridge
+3601ee21d2	OF-DIFF-019	14	refactor(mobile): apply OpenFork branding to mobile client
+5b0c38ec2d	OF-DIFF-020,OF-DIFF-034	15	feat(session-ui): surface provenance presentation and tool visual media
+3038ce8251	OF-DIFF-025	20	refactor(tui): apply OpenFork branding and refine session-message utilities
+e08a45706f	OF-DIFF-003,OF-DIFF-034	10	refactor(ui): apply OpenFork branding to shared UI assets and theme
+ec88097070	OF-DIFF-011,OF-DIFF-017,OF-DIFF-025	4	feat(schema): extend goal/model schema and event manifest
+a8cb6ca06d	OF-DIFF-025	1	build(core): add luxon dependency for OXP activity timestamps
+e4285cce19	OF-DIFF-025	2	feat(core): harden browser host broker contract
+a159e97a50	OF-DIFF-013,OF-DIFF-025	5	refactor(core): expose language-model primitive and catalog helpers
+8f57bb57d6	OF-DIFF-025	1	build(opencode): add MCP client/server, asn1js, and bson dev/runtime dependencies
+c5c3d4ace5	OF-DIFF-006,OF-DIFF-008,OF-DIFF-013,OF-DIFF-022	6	test(oxp/session): cover OXP session control, ingress gate, and V1 title/reminder provenance
+8857e3e48b	OF-DIFF-025	3	feat(effect): compose runtime with coalesced drain and single-owned timers
+9976d01ba7	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-025	13	chore: add migration/diagnostic scripts, specs, and agent documentation
+33e9ace9b7	OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	15	refactor(plugin): apply OpenFork branding to plugins and refine quota/genspark
+c9a0dac6bd	OF-DIFF-022,OF-DIFF-025	41	refactor(cli/config): migrate storage namespace to OpenFork and modernize CLI/config
+3ad033da0a	OF-DIFF-021,OF-DIFF-025	6	feat(snapshot/share): harden snapshot capture and next-gen share flow
+407b196073	OF-DIFF-022,OF-DIFF-025	8	feat(mcp/skill): refine catalog lifecycle, OAuth discovery, and skill indexing
+433cf4e10e	OF-DIFF-006,OF-DIFF-011,OF-DIFF-013,OF-DIFF-022,OF-DIFF-025	34	feat(session): apply V1 provenance taxonomy across session, import, and tools
+49ef7ef174	OF-DIFF-012	2	fix(scheduled-task): do not inject Goal continuation limits into scheduled goals
+6b848044e3	OF-DIFF-025	3	fix(auth): serialize auth.json writes with atomic temp-file rename
+7e88254ce5	OF-DIFF-013,OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	18	feat(provider): expand account models, add agent catalog, and refine ACP directory snapshot
+ec74f59404	OF-DIFF-025	1	feat(provider): expand account models, add agent catalog, and refine ACP directory snapshot
+904b491d24	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-006,OF-DIFF-008,OF-DIFF-020,OF-DIFF-023,OF-DIFF-034	25	feat(oxp): record OXP parent activity with privacy-preserving projection
+dd3973d839	OF-DIFF-008,OF-DIFF-013,OF-DIFF-025,OF-DIFF-034	19	feat(oxp): harden OXP caller boundaries, remove delegation gate, and record external actor in questions
+f7def5b750	OF-DIFF-009,OF-DIFF-025,OF-DIFF-034	16	feat(oxp/ofxp): add OFXP network discovery, runtime reconciliation, and settings bridge
+e75237555f	OF-DIFF-021,OF-DIFF-025	4	test(core): align residual fixtures with committed decision-fetch and typed-path contracts
+30c02fcae6	OF-DIFF-022,OF-DIFF-025	25	chore(core): complete OpenFork branding on user-visible surfaces and provider attribution
+57840f691c	OF-DIFF-022,OF-DIFF-025	4	refactor(core): move reference/skill guidance onto the render-only SystemContext contract
+130b017b35	OF-DIFF-025	8	feat(core): harden shell source transport, lock admission, and ripgrep parsing limits
+b9a219206b	OF-DIFF-021,OF-DIFF-025	6	feat(db): fence reference-capable ChunkDB at v5 and retire the delta_ref writer
+0fb97e805a	OF-DIFF-013,OF-DIFF-020,OF-DIFF-025	17	feat(session): generalize V2 input admission with typed provenance and host Synthetic turns
+7c96e42b15	OF-DIFF-011	8	feat(goal): add user-turn reactivation, idempotent bookkeeping, and auditor-owned verification policy
+14a3b8f1bd	OF-DIFF-017	20	feat(llm): add OpenAI explicit prompt-cache controls and a compile-once transport seam
+10d1c48f1d	OF-DIFF-006,OF-DIFF-025	9	feat(sdk): harden generator portability, fork branding, and provenance contract
+024a1a8ade	OF-DIFF-021,OF-DIFF-025	15	feat(db): harden chunkdb framing, migration checksums, and busy retry
+0a83bc9dbe	OF-DIFF-006,OF-DIFF-025	7	chore(sdk): regenerate unified SDK and OpenAPI for fork route groups
+84e6a532a6	OF-DIFF-006,OF-DIFF-009,OF-DIFF-013,OF-DIFF-022,OF-DIFF-025	54	feat(server): compose fork API groups and publish service identity
+42332d524e	OF-DIFF-015,OF-DIFF-016,OF-DIFF-021,OF-DIFF-025	66	refactor(tool): route capability tools through the shared exchange layer
+9121794dae	OF-DIFF-012,OF-DIFF-015,OF-DIFF-025	27	feat(tool): harden shell, background, and process execution boundaries
+42c2b1071f	OF-DIFF-006,OF-DIFF-025	10	feat(revisor): add prompt revisor runtime and durable revision drafts
+cc491bf744	OF-DIFF-006,OF-DIFF-011,OF-DIFF-025	18	feat(goal): add durable Goal projection, auditor, and creation policy
+62bb43fbe6	OF-DIFF-011,OF-DIFF-013	29	feat(session): harden V1 prompt execution, run state, and session grouping
+34019df192	OF-DIFF-015,OF-DIFF-025	6	feat(core): add bounded tool-output projection and retention storage
+f4e89602bb	OF-DIFF-025	8	feat(session): add checkpoint read projection, snapshot retention, and permission boundary
+fe8443deef	OF-DIFF-013,OF-DIFF-017,OF-DIFF-022,OF-DIFF-024,OF-DIFF-025	32	feat(system-one): add Jev semantic-inference primitive and provider system capability
+e1c0695859	OF-DIFF-013,OF-DIFF-025	35	feat(session): establish durable turn provenance and semantic message kinds
+2a5974d05c	OF-DIFF-010	57	feat(swarm): add native first-party swarm collaboration runtime
+e55357bb75	OF-DIFF-008,OF-DIFF-009,OF-DIFF-015,OF-DIFF-025	172	feat(oxp): add OXP/OFXP external-agent adapters and capability broker
+b090343f68	OF-DIFF-025	30	feat(exchange): add shared capability implementation layer
+89b373bb50	OF-DIFF-009,OF-DIFF-021,OF-DIFF-025	30	feat(ofxp): add durable OFXP peer identity, trust, and invocation receipts
+c04390d930	OF-DIFF-003,OF-DIFF-008,OF-DIFF-018	40	feat(desktop): add OXP native tunnel, credentials, and sidecar protocol
+1e407aa5df	OF-DIFF-012,OF-DIFF-034	67	feat(scheduled-task): add durable cross-process scheduled tasks
+c37e2855b4	OF-DIFF-006,OF-DIFF-025	10	feat(installation): restrict self-update to fork-owned direct installs
+fc67ed41bc	OF-DIFF-021,OF-DIFF-022,OF-DIFF-025	16	feat(core): add fork-owned storage identity and brand contracts
+63fa5cccb9	OF-DIFF-001,OF-DIFF-025	92	chore(fork): migrate fork-owned config namespace to .openfork and pin OpenFork distribution boundaries
+9ac758441a	OF-DIFF-025	3	feat(reviser): add durable revision draft mailbox
+fa9832d5ef	OF-DIFF-025	1	fix(tui): ignore transport control frames in domain event subscriptions
+bbb9e049fe	OF-DIFF-021,OF-DIFF-025	2	test(chunkdb): cover rebuild compatibility after read-connection split
+1460b20690	OF-DIFF-013,OF-DIFF-025	17	feat(session): add durable provenance and execution ownership
+8dca2ee09f	OF-DIFF-013,OF-DIFF-025	6	feat(system): formalize semantic system-surface projection
+8e1133560f	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-021,OF-DIFF-025	11	perf(chunkdb): harden event payload storage and background sealing
+5489cd7531	OF-DIFF-010,OF-DIFF-011,OF-DIFF-012,OF-DIFF-013,OF-DIFF-017,OF-DIFF-021,OF-DIFF-023,OF-DIFF-025	62	feat(database): harden migrations and converge orchestration storage
+903d6314ab	OF-DIFF-010,OF-DIFF-011,OF-DIFF-012,OF-DIFF-013,OF-DIFF-017,OF-DIFF-023,OF-DIFF-024,OF-DIFF-025	20	feat(schema): add durable orchestration and provenance contracts
+5f714f63dd	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-025	14	docs: define OpenFork product and compatibility boundaries
+0cddae1397	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-015,OF-DIFF-021,OF-DIFF-025	20	fix(git): make repository line endings deterministic
+4a24b33b41	NONPRODUCT-DOCS-EVIDENCE	1	docs: add OXP architecture ledger
+973489724d	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-025,OF-DIFF-034	12	docs: make OpenFork V1-first across local APIs
+f2691d7943	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-025	9	docs: define OpenFork V1 backport policy
+058bd679c0	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-010,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	51	docs: map OpenFork architecture
+e24a303979	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-034	7	fix(app): resolve abbreviated markdown paths
+73db635b22	OF-DIFF-018,OF-DIFF-025	3	fix(desktop): configure fork publish feed and repository so installers package
+cb55954f7b	OF-DIFF-018,OF-DIFF-025	2	ci(release): cross-build all CLI platforms and bundle fork CLI in desktop dev builds
+db75ce946a	HISTORY-NO-NET-DIFF	1	docs(audit): record work-tree audit and commit slicing
+d2dbaf0495	OF-DIFF-019,OF-DIFF-025	7	chore(release): add GitHub-hosted dev pre-release workflow and build/fork-sync updates
+2a1212c129	OF-DIFF-006,OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-017,OF-DIFF-021,OF-DIFF-025	43	feat(opencode): add Tier-0 provider-settings/usage API and bound snapshot/inventory work
+98d9499d55	OF-DIFF-013,OF-DIFF-025	28	refactor(opencode): finish Claude bridge ownership and abort proven reasoning runaways
+b03f85a3fe	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	14	fix(workbuddy): present first-party identity and classify account-forbidden auth
+b6c44405a8	OF-DIFF-003,OF-DIFF-013,OF-DIFF-034	17	perf(app): trim sidebar, menu, tooltip, and markdown-target reactive work
+ea60dd53d8	OF-DIFF-011,OF-DIFF-034	11	feat(app): rebuild Goal Mode as an inline composer shelf
+3b5950ad07	OF-DIFF-017,OF-DIFF-034	25	feat(app): project model sections and add provider/auto-accept settings
+c64e8aff8b	OF-DIFF-013,OF-DIFF-017,OF-DIFF-020,OF-DIFF-034	23	feat(app): consume server telemetry and usage projections instead of message history
+b1d422d9cb	OF-DIFF-011	17	feat(goal): authorize creation from turn provenance and host auditor sessions
+8dd23c4dc3	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-015,OF-DIFF-021,OF-DIFF-025	29	feat(core): own event/location scope, project inventory, and special-agent sessions
+8458e95ead	OF-DIFF-006,OF-DIFF-013,OF-DIFF-017,OF-DIFF-021,OF-DIFF-025	20	feat(core): add SessionTelemetry projection and UsageRecord ledger
+ba1ea2fb8d	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-012	21	docs(plans): add scheduled-tasks, macroturn-mode, and snapeye planning docs
+9ced217a22	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-006,OF-DIFF-013,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	16	docs(governance): add root ownership contract, playbook, and AGENTS enforcement
+4200678786	OF-DIFF-025	1	chore(repo): ignore root-level SPAD scratch analysis scripts
+68ad438c36	OF-DIFF-003,OF-DIFF-017,OF-DIFF-034	6	feat(app): manage provider credential accounts
+72a159f5c9	OF-DIFF-003,OF-DIFF-034	13	refactor(app): route settings as full-screen surface
+1f4757f5a4	OF-DIFF-025	1	fix(browser-visual): include gifenc in lockfile
+8638b4aa5a	NONPRODUCT-DOCS-EVIDENCE	44	docs(startup): record sidebar optimization evidence
+0e5a58ba4c	OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	10	perf(desktop): prebuild renderer shell and cache Tailwind CSS
+e3634cf4cc	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-018,OF-DIFF-034	17	perf(markdown): resolve path targets with bounded probes
+b792805aa9	OF-DIFF-034	3	refactor(settings): share server management state
+e91d46e024	OF-DIFF-017,OF-DIFF-034	13	perf(models): defer usage and model selector work
+53aefa8002	OF-DIFF-013,OF-DIFF-034	27	perf(app): split shell and context menu startup work
+e3e54b6a39	OF-DIFF-034	12	perf(project-explorer): cache visible file-tree startup state
+d8e3e4a47e	OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	37	perf(app): coordinate startup session hydration
+0a4e1c56c5	OF-DIFF-006,OF-DIFF-013,OF-DIFF-021,OF-DIFF-025	18	perf(startup): add backend session root fast paths
+4f2aba496c	OF-DIFF-006,OF-DIFF-020,OF-DIFF-025,OF-DIFF-034	26	perf(transport): add interest-aware event streams
+3364b5ae1c	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-003,OF-DIFF-006,OF-DIFF-012,OF-DIFF-013,OF-DIFF-016,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	92	feat(browser): add first-party SnapEye visual observation
+b140857e56	NONPRODUCT-DOCS-EVIDENCE	24	docs: add hosted multitenant serve implementation plan
+01830d4644	NONPRODUCT-DOCS-EVIDENCE	1	fix(readme): rebalance OpenFork hero mark
+8aaf61d15d	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001	3	fix(readme): inset OpenFork hero mark
+9bdcb91c41	HISTORY-NO-NET-DIFF	1	fix(readme): pad OpenFork wordmark
+5b269ad5d9	OF-DIFF-001	2	docs(readme): overhaul OpenFork project overview
+0d1add3fed	OF-DIFF-034	1	perf(models): keep selector ranking off first paint
+ad7ac317fb	OF-DIFF-034	1	test(app): narrow session source assertions
+95974664cc	OF-DIFF-017	1	test(models): make selector benchmark exercise the real open path
+90e3a62aaf	OF-DIFF-017	3	perf(limits): reuse fresh quota snapshots and bound pane admission
+74203e0fad	OF-DIFF-014	1	docs(desktop): update custom runtime architecture review
+d7a8788778	OF-DIFF-034	2	fix(usage): refresh fork quotas only on repair reconnect
+602036e9fc	OF-DIFF-034	3	perf(session-ui): tighten message parts and question output
+1e5ce73301	OF-DIFF-034	1	feat(settings): expose safe local-data reset
+fe515cc4f3	OF-DIFF-017	2	test(models): harden limits and selector browser fixtures
+e8db43e2bc	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-006,OF-DIFF-018,OF-DIFF-034	21	feat(markdown): add path-aware target actions
+cf75cdaeb1	OF-DIFF-003	1	chore(i18n): add target-action and reset copy
+5d4530ff59	OF-DIFF-006	2	chore(sdk): sync generated v2 surfaces
+f1ba7ea7a8	OF-DIFF-017,OF-DIFF-034	2	fix(limits): route usage arc to the mounted pane
+f354effda1	OF-DIFF-019	30	perf(mobile): isolate PWA transport and rendering work
+69b1abec97	OF-DIFF-013,OF-DIFF-017,OF-DIFF-034	20	perf(models): optimize usage limits and selector paths
+fa12e9377a	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	68	perf(app): isolate concurrent renderer workloads
+34ea2a2787	OF-DIFF-034	17	perf(markdown): make streaming projection incremental
+53e51f82da	OF-DIFF-006,OF-DIFF-017,OF-DIFF-021,OF-DIFF-025	5	feat(storage): add safe local reset and bound global replay
+499246953b	OF-DIFF-006,OF-DIFF-011,OF-DIFF-013,OF-DIFF-020,OF-DIFF-021,OF-DIFF-025	86	perf(concurrency): isolate persistence and event hot paths
+85d6a99a1b	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-016,OF-DIFF-018,OF-DIFF-034	24	fix(browser): harden webview lifecycle ownership
+d6fd778dfb	OF-DIFF-016	5	perf(browser): reduce desktop extension bridge contention
+538051f754	OF-DIFF-012,OF-DIFF-016	18	perf(chrome): reduce extension bridge overhead
+5e064bf224	OF-DIFF-015	3	perf(shell): separate I/O and heavy admission
+162701e31a	OF-DIFF-015,OF-DIFF-025	22	fix(tools): preserve surrounding line endings
+82f1dac094	HISTORY-NO-NET-DIFF	0	Merge v1.18.30 into main
+bba6980d03	OF-DIFF-021,OF-DIFF-025	4	fix(chunkdb): gate semantic writes behind sealer
+6e286e58f6	OF-DIFF-015,OF-DIFF-016	6	fix(tools): harden coalesced broker arguments
+c8af8f0ca4	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-025	6	fix(tools): preserve find auto-healing at provider boundary
+cd639edaa9	OF-DIFF-013,OF-DIFF-025	4	fix(tools): harden healed find payload correlation
+84b9e02905	OF-DIFF-013,OF-DIFF-025,OF-DIFF-034	11	fix(tools): harden legacy find call healing
+3a7420b1ec	OF-DIFF-003,OF-DIFF-034	12	feat(composer): integrate questions with the main prompt
+d3ba7e3290	OF-DIFF-034	4	feat(composer): complete reusable question response primitives
+22205aaae0	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-025	10	fix(tools): auto-heal legacy glob and grep calls
+870b3e6adf	OF-DIFF-034	2	refactor(composer): add reusable question response primitives
+a9231382a9	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-003,OF-DIFF-013,OF-DIFF-014,OF-DIFF-015,OF-DIFF-016,OF-DIFF-025,OF-DIFF-034	51	refactor(tools): collapse provider capabilities into compact gateways
+d43f888645	OF-DIFF-015	4	refactor(tools): route apply_patch through the hardened patch engine
+a0bcf1ff76	OF-DIFF-006,OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-025	15	feat(background): unify task and monitor lifecycle
+00c9e4ce71	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-034	5	perf(session): suspend prefetched background stream projection
+c1538c2c80	OF-DIFF-003,OF-DIFF-013,OF-DIFF-022,OF-DIFF-025,OF-DIFF-034	58	feat(spad): harden supervision and enable the bounded auditor
+8582f3e98a	OF-DIFF-025	1	chore(repo): ignore local analysis artifacts
+efbf56ef77	OF-DIFF-034	2	fix(session-ui): freeze markdown blocks before fast append
+88d1cdaaa0	OF-DIFF-034	2	fix(session-ui): stabilize nested streamed lists
+f9cfe7f909	OF-DIFF-025	1	chore(sync): recognize lazy tool broker
+fa43dadf3d	OF-DIFF-006	3	chore(sdk): refresh generated clients
+b0f6e698c2	OF-DIFF-034	10	feat(session-ui): standardize tool output scrollbars
+642430cfbd	OF-DIFF-034	3	feat(usage): surface maintenance overhead
+da0746a51c	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-003,OF-DIFF-011,OF-DIFF-034	28	feat(composer): integrate goals, revision send, and tool mentions
+11ebcbcbe6	OF-DIFF-006,OF-DIFF-013,OF-DIFF-017,OF-DIFF-021,OF-DIFF-025	12	feat(usage): track maintenance agent costs
+898e83b50f	OF-DIFF-011,OF-DIFF-013,OF-DIFF-025	14	fix(agents): harden terminal completion protocols
+451df2ffdc	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015	15	feat(tools): broker low-frequency tools lazily
+3e673e26f0	OF-DIFF-015	13	feat(tools): batch reads and track session file freshness
+84a397dbbd	OF-DIFF-015,OF-DIFF-018,OF-DIFF-025	3	fix(desktop): preserve live sidecar parser assets
+0af38f5bad	OF-DIFF-006	3	feat(session): persist agent and model selection
+14d59cda83	OF-DIFF-034	2	fix(app): surface structured server errors
+21c981f6f8	OF-DIFF-006,OF-DIFF-012,OF-DIFF-016,OF-DIFF-018,OF-DIFF-025	40	feat(browser): add existing Chrome control lane
+4969d23c2b	NONPRODUCT-DOCS-EVIDENCE	2	docs(browser): capture Chrome attach architecture research
+07a7a5a35f	OF-DIFF-025,OF-DIFF-034	12	feat(markdown): add interactive Mermaid diagrams
+0c80a61b7e	OF-DIFF-021,OF-DIFF-034	7	fix(search): preserve directory metadata semantics
+8188132ff5	OF-DIFF-020,OF-DIFF-034	3	fix(session): resume cached streams on activation
+3104c1428e	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.30
+e576031b4f	OF-DIFF-006,OF-DIFF-021,OF-DIFF-025	10	chore(sdk): regenerate clients and database artifacts
+096ed59107	OF-DIFF-001,OF-DIFF-006,OF-DIFF-013,OF-DIFF-014,OF-DIFF-015,OF-DIFF-022,OF-DIFF-025	23	chore(sync): curate fork rules and custom runtime docs
+4389281f59	OF-DIFF-003,OF-DIFF-013,OF-DIFF-018,OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	37	feat(app): integrate chat project, endpoints and settings
+33e79a7a65	OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-021,OF-DIFF-025	42	feat(exec): harden process and shell concurrency
+209afde155	OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	19	feat(search): improve mention ranking and composer mentions
+5d8230fe40	OF-DIFF-013,OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	24	feat(session): add grouping with tab previews and tree
+6ca5ac866e	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-025,OF-DIFF-034	45	feat(revisor): add prompt revisor with shared completion
+b8ab26b145	OF-DIFF-011,OF-DIFF-034	16	feat(goal): add auditor semantic gate for continuations
+2a01b3e967	OF-DIFF-021	2	fix(core): keep semantic prune backfill draining
+7369474e22	OF-DIFF-006,OF-DIFF-013,OF-DIFF-018,OF-DIFF-021,OF-DIFF-025	21	feat(core): add semantic ChunkDB compaction
+7cd1b421b3	OF-DIFF-021	4	fix(core): harden ChunkDB delta and space reclaim
+41fc49ab62	OF-DIFF-003,OF-DIFF-034	6	refactor(ui): prompt input v2 wiring, goal strings and popover fix
+4307b1e9d4	OF-DIFF-006	3	chore(sdk): regenerate v2 client from updated openapi including goal routes
+a0a1d3eb0b	OF-DIFF-001,OF-DIFF-006,OF-DIFF-013,OF-DIFF-014,OF-DIFF-025	12	fix(sync): workspace curation, fork:sync pipeline and custom runtime docs
+9a10224b14	OF-DIFF-011,OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	27	feat(goal): goal mode with automation recovery, composer shelf and HTTP API
+337520184d	OF-DIFF-013,OF-DIFF-015,OF-DIFF-025	11	refactor(session): prompt grouping, local execution and event manifest wiring
+09e154fc65	OF-DIFF-015,OF-DIFF-025	29	refactor(tool): split edit/patch with resolve/rollback and file locking
+8008c6bb72	OF-DIFF-021	7	refactor(core): harden chunkdb sealing with cooling and hot-tail gates
+4975f2a55d	OF-DIFF-001,OF-DIFF-025	3	fix(sync): harden fork:sync verify + mandate pipeline in skill/FORK.md
+bc26fb41ee	OF-DIFF-025	4	fix(sync): curated workspaces, fork:sync pipeline, rebuilt lock after v1.18.29
+1ded086eea	OF-DIFF-025	1	fix(sync): restore fork ./memory export lost in v1.18.29 package.json union
+8a55c41e7b	HISTORY-NO-NET-DIFF	0	Merge v1.18.29 into main
+6e4c0846f7	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-025	9	docs(bench): event-loop concurrency audit, handoff, workbuddy repro harness
+77e785c7a8	OF-DIFF-006	16	fix(sdk): tolerate prettier-wrapped SSE reader shape in codegen patch
+400632d615	OF-DIFF-034	8	refactor(session-ui): harden markdown worker stream with trace hooks
+1a059a2dbb	OF-DIFF-020,OF-DIFF-034	14	refactor(app): stale-drain file tree, phase tracing, session-cache gating
+93525276f0	OF-DIFF-006,OF-DIFF-025	13	fix(server,opencode): gate legacy bridge on connected subscribers, cache wire projection
+da1010dff9	OF-DIFF-020,OF-DIFF-021,OF-DIFF-025	10	refactor(core): instrument event queue/replay/coalescer with EventTrace budgets
+4dbb8b69be	OF-DIFF-025	2	test(core): cover EventV2 byte-bounded queue and concurrent-session saturation
+06a73a88ef	OF-DIFF-001,OF-DIFF-025	4	chore: CI, lint and FORK ownership doc updates
+74360ef13f	OF-DIFF-019,OF-DIFF-025	8	chore(schema,httpapi-codegen,mobile): event manifest, codegen and PWA build config
+db5fd95665	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-017,OF-DIFF-021,OF-DIFF-022,OF-DIFF-025	28	refactor(opencode): session/quota/tools and server-route hardening
+a1392111ec	OF-DIFF-013,OF-DIFF-021,OF-DIFF-025	19	refactor(core): bound internal concurrency and regenerate schema
+f279639809	OF-DIFF-006,OF-DIFF-022	20	chore: regenerate client/SDK/generated types from schema
+400e7b4258	OF-DIFF-003,OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	23	refactor(app): session/global-sync context, tabs, usage and server-sdk updates
+b56ff80e8f	OF-DIFF-034	6	test(app): persistent event-stream server and performance harness updates
+946ff1b274	OF-DIFF-034	9	feat(app): hosted-browser annotation persistence and v2 pane polish
+d93ebde745	OF-DIFF-034	2	perf(app): indexed v2 session reducer for O(1) streaming-delta lookup
+310e4e4988	OF-DIFF-002	7	feat(console): zen usage graphs, training-consent and workspace migration
+7a5e11cac7	OF-DIFF-034	10	perf(app): file-tree avoids full DFS on every mutation; tree-store generation API
+0e923639ec	OF-DIFF-034	10	perf(session-ui): markdown worker queueing, transport and caching
+5c5bc022f5	OF-DIFF-013,OF-DIFF-015,OF-DIFF-025	11	feat(opencode): concurrency-bounded shell tool and PowerShell heredoc handling
+6a526712b5	OF-DIFF-006,OF-DIFF-025	20	feat(server): event serialization, instance pinning and SSE transport
+2f7059b912	OF-DIFF-020,OF-DIFF-025	5	refactor(core): event bus coalescing and replay support
+b4add93b41	OF-DIFF-016,OF-DIFF-018	27	feat(desktop): browser annotation geometry/trust plus server health and log throttling
+8d02f19b43	OF-DIFF-013,OF-DIFF-015,OF-DIFF-021,OF-DIFF-022,OF-DIFF-034	17	feat(session): locked session-group memberships and subagent auto-grouping
+bc26e6c19b	OF-DIFF-003,OF-DIFF-013,OF-DIFF-020,OF-DIFF-025,OF-DIFF-034	15	feat(session): measure assistant-message throughput at the stream boundary
+d69640b58e	OF-DIFF-019,OF-DIFF-025	42	feat(mobile): bind PWA to verified instance, shared model selector, tool UI
+4f68724d1d	OF-DIFF-006,OF-DIFF-017,OF-DIFF-025,OF-DIFF-034	18	refactor(app,opencode): re-export model-selector logic from shared schema
+2536a75085	OF-DIFF-017,OF-DIFF-025	16	feat(schema): extract shared model-select logic for desktop and PWA
+16747470f9	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.29
+1db8f7163e	OF-DIFF-034	1	chore(ui): match genspark/workbuddy icons to sprite conventions
+36a3dbf8c2	OF-DIFF-006,OF-DIFF-017,OF-DIFF-025	3	chore: remaining manifest, formatting and Effect type casts
+ca097c24db	OF-DIFF-003	1	chore(i18n): credential default-key and notification copy strings
+65306c0566	OF-DIFF-025	1	test(workbuddy): namespace the injected request id by agent purpose
+6a4c4e3142	OF-DIFF-019	3	chore(mobile): add the PWA icon assets referenced by the webmanifest
+4330c6072e	OF-DIFF-006,OF-DIFF-034	3	chore(ui): add workbuddy and genspark provider icons
+8b2c699e8d	OF-DIFF-018	1	fix(desktop): alias the app workspace for the renderer build
+a250e790f5	HISTORY-NO-NET-DIFF	2	feat(mobile): bind to a verified instance and clear state on rebind
+a081bd6733	OF-DIFF-025	3	fix(tui): empty prompt hint, Dynamic import source, pinned diff queries
+462542aa43	OF-DIFF-006,OF-DIFF-013,OF-DIFF-025	12	test: provide filesystem layers and adapt fixtures to the new server auth config
+ebb4a012bd	HISTORY-NO-NET-DIFF	5	refactor(providers): trim the azure plugin and drop verdent env-token support
+c096c51acd	OF-DIFF-017,OF-DIFF-022	3	fix(workbuddy): bind the local proxy to a stable port and make it self-healing
+e73e90c8ee	OF-DIFF-017,OF-DIFF-020,OF-DIFF-034	4	feat(usage): provider and model time series in the usage summary
+fd138280fd	OF-DIFF-013	1	feat(session): attribute zen spend per routed key and log dropped thinking blocks
+1c2ab54d4f	OF-DIFF-012,OF-DIFF-013,OF-DIFF-025	11	fix(opencode): effect boundary hardening and session error translation
+911bd8ad75	OF-DIFF-012,OF-DIFF-015	10	fix(tools): project summary action, skill path recovery, job kind and BSON buffer
+9c240897dd	OF-DIFF-006,OF-DIFF-018,OF-DIFF-019,OF-DIFF-025,OF-DIFF-034	20	feat(mobile): verify the dev proxy target's identity before forwarding
+0ed4afcc4e	OF-DIFF-019,OF-DIFF-025,OF-DIFF-034	7	feat(push): session-aware notification copy and an SVG icon default
+2bee1c814b	OF-DIFF-003,OF-DIFF-034	7	feat(session-ui): bounded output, skill notices and renderers for lsp and refactor
+defd825a0d	OF-DIFF-034	14	feat(session-ui): render tool output as text instead of pushing it through markdown
+6b222de157	OF-DIFF-006,OF-DIFF-017,OF-DIFF-034	12	feat(fork): rename credential select to setDefault, expose the routed default
+c2e725ad40	OF-DIFF-017,OF-DIFF-022	12	refactor(zen): replace the per-key governor with a unified account pool
+c5b676d656	OF-DIFF-017,OF-DIFF-025	6	feat(provider): send anthropic thinking block binding controls
+15d013854d	OF-DIFF-013,OF-DIFF-025	7	feat(claude): expose OpenCode tools to the Agent SDK over an in-process MCP server
+f306603714	OF-DIFF-001,OF-DIFF-025	3	chore(cli): drop the --conditions=browser export condition from dev entrypoints
+561a4451e9	OF-DIFF-017,OF-DIFF-025,OF-DIFF-034	17	chore(deps): bump ai-sdk anthropic/bedrock, pin patches, drop fff-bun patch
+72d437d198	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-003,OF-DIFF-006,OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-016,OF-DIFF-017,OF-DIFF-018,OF-DIFF-020,OF-DIFF-021,OF-DIFF-022,OF-DIFF-025,OF-DIFF-034	239	chore: checkpoint in-progress fork work before upstream v1.18.27 sync
+1d0c0877e1	OF-DIFF-012	2	cleanup: remove unused InstanceState imports from shell-job, monitor-delivery
+9e3f6a2ee0	OF-DIFF-017	3	feat(quota): workbuddy limit snapshot, limits-format, schema updates
+6b5eda7516	OF-DIFF-022	2	fix(workbuddy): account router model admission, live quota snapshot
+ec39458ffc	OF-DIFF-022	1	fix(workbuddy): governor model entitlement updates (missed from group B)
+3cda3ebecd	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	19	chore(docs/scripts): workbuddy scripts, docs, test cache, lockfile
+b50c7eca75	OF-DIFF-006	1	chore(sdk): regenerate v2 SDK types
+a6559be483	OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-025	8	feat(background): shell-job service with Truncate layer, background/monitor registry updates
+88afc245b5	OF-DIFF-012,OF-DIFF-013,OF-DIFF-017,OF-DIFF-022,OF-DIFF-034	14	feat(workbuddy): plugin, monitor delivery, ingress, quota provider
+833009037b	OF-DIFF-003,OF-DIFF-017,OF-DIFF-034	21	feat(quota): provider quotas, limits UI, format updates
+1dbfc47683	OF-DIFF-017,OF-DIFF-034	3	fix(limits): always show OpenCode Zen free quota
+c8257aa91b	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-003,OF-DIFF-025	8	chore: docs, handoffs and lockfile
+4a81d99cfb	OF-DIFF-034	5	feat(ui): improve auto-scroll and filtered list
+1d851c23a2	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-017,OF-DIFF-025	34	feat(opencode): quota, provider and server hardening
+59a8b8b747	OF-DIFF-019	11	feat(mobile): refresh PWA shell and app
+d0cfe8bcea	OF-DIFF-016,OF-DIFF-018	21	feat(desktop): trim main process and browser surface
+3a0ffc0b38	OF-DIFF-021,OF-DIFF-025	9	feat(core): harden filesystem index and device handling
+90998fbd9d	OF-DIFF-034	12	feat(app): improve prompt input and command palette
+7d7242379a	OF-DIFF-003,OF-DIFF-013,OF-DIFF-017,OF-DIFF-020,OF-DIFF-034	33	feat(app): unify context, usage and limits into context panel
+1a57843a63	HISTORY-NO-NET-DIFF	0	Merge remote-tracking branch 'origin/feat/zen-free-usage-limits-v2'
+48742bfde4	HISTORY-NO-NET-DIFF	0	Merge remote-tracking branch 'origin/main'
+fe398f4605	OF-DIFF-017	1	Update HANDOFF-zen-free-usage-limits.md
+1a0cea54da	OF-DIFF-017	1	docs(handoff): document Zen free quota implementation
+f2dce08fbc	OF-DIFF-025	1	test(usage): count Zen provider requests from step-finish parts
+abaa4226cf	OF-DIFF-017	1	test(quota): cover Zen free limit learning
+21fea9ee4b	OF-DIFF-017	1	fix(quota): import Zen usage service namespace
+316bb0969a	OF-DIFF-017	1	feat(quota): register first-party Zen usage source
+7a17528de2	OF-DIFF-017	1	feat(quota): add OpenCode Zen quota adapter
+434dcd5ec9	OF-DIFF-017	1	feat(usage): scan persisted Zen free request history
+f16fdd776e	OF-DIFF-025	1	ci: route OpenFork validation through homelab
+72650860ad	HISTORY-NO-NET-DIFF	0	chore: merge upstream v1.18.24 into openfork
+9c8c558d25	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-002,OF-DIFF-025	5	chore: remove stale STATS doc, add cleanup script and HANDOFF
+1441f56bda	OF-DIFF-025	2	fix(opencode): prevent ScopedCache poisoning from aborted requests
+fa4fe7e42e	OF-DIFF-006	2	chore(sdk): regenerate v2 SDK client and types
+33bd67ee08	OF-DIFF-017	5	feat(opencode): widen Google schema transform and update quota adapters
+d2c7d272de	OF-DIFF-003,OF-DIFF-018	11	feat(desktop): update main process, renderer, and onboarding
+c3b4b25966	OF-DIFF-034	5	feat(ui): update provider icon, spinner, and tooltip styles
+dd2cd4c4a3	OF-DIFF-034	6	feat(session-ui): rework prompt-input machine and store
+02fec8adb9	OF-DIFF-034	6	feat(app): add model cost and usage analytics utilities
+7e0dd26752	OF-DIFF-013,OF-DIFF-017,OF-DIFF-034	15	feat(app): rework session UI, composer, and limits panel
+9070611b48	OF-DIFF-003,OF-DIFF-034	11	feat(app): extend settings v2 (devices, pairing, local scope)
+227704f3a3	OF-DIFF-034	13	feat(app): rework model selection and provider dialogs
+807e824a02	OF-DIFF-006,OF-DIFF-025	3	feat(opencode): improve device pairing handler
+7bd15ff72e	OF-DIFF-013,OF-DIFF-025	5	feat(opencode): update session compaction and message handling
+d15b6a3993	OF-DIFF-013,OF-DIFF-022,OF-DIFF-025	6	feat(core): extend config, compaction, and project APIs
+1cd45834b5	OF-DIFF-022	1	feat(opencode): rework skill system registry
+ee3e0f6564	OF-DIFF-013	7	feat(opencode): harden SPAD supervisor loop
+5d9c7974fc	OF-DIFF-013,OF-DIFF-015,OF-DIFF-020,OF-DIFF-025	18	feat(opencode): rewrite read/skill/json/checkpoint tools
+52db58e410	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-013,OF-DIFF-017,OF-DIFF-022,OF-DIFF-025	44	feat(opencode): add first-party Claude provider
+d69d3b0f7e	OF-DIFF-019,OF-DIFF-034	63	feat(mobile): add PWA mobile client package
+83cc5f0765	OF-DIFF-006,OF-DIFF-021,OF-DIFF-025	13	feat(core): add push notification infrastructure
+57e8055697	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.24
+9b41ac25a3	HISTORY-NO-NET-DIFF	1	Delete backup-graphic-design.ps1
+b7a1286243	HISTORY-NO-NET-DIFF	1	Delete backup-graphic-design-remote.ps1
+ef182507d4	HISTORY-NO-NET-DIFF	0	Merge remote-tracking branch 'origin/main'
+98dd5e5ffc	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-001,OF-DIFF-007,OF-DIFF-010,OF-DIFF-013,OF-DIFF-017,OF-DIFF-019,OF-DIFF-025	338	chore: reorganize docs
+b988a43de5	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-025	20	Delete artifacts/glm52-rise-video directory
+ba87335ea5	OF-DIFF-017	1	test(opencode): cover nvidia manual rate tracking
+2366ab7ccb	OF-DIFF-017	4	feat(opencode): track nvidia requests against 40 rpm window
+bb4e23058c	HISTORY-NO-NET-DIFF	4	bench: export pipeline harness and baseline results
+dcabecfda2	OF-DIFF-003	1	chore(i18n): sync en strings for sidebar, menus and dialogs
+41563d4e68	OF-DIFF-018	9	feat(desktop): store, ipc and background-cli updates
+2b0749cc41	OF-DIFF-034	2	fix(app): session export edge cases
+f9a2cc53f4	OF-DIFF-020,OF-DIFF-034	26	perf(app): timeline virtualization and shell tab persistence
+f10a50dd12	OF-DIFF-034	13	refactor(app): rework model and provider dialogs
+9a56ce1e3c	OF-DIFF-013,OF-DIFF-034	15	feat(app): text selection toolbar and session menu system
+c976bc3c4d	OF-DIFF-006	1	feat(protocol): browser open-devtools and extensions-list schemas
+eb75c20c63	OF-DIFF-017	2	feat(opencode): nvidia quota provider with manual rate tracking
+93b9707c98	OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	13	feat(app): sidebar pinning and home session rework
+10dd1bd0ea	OF-DIFF-017,OF-DIFF-034	7	feat(app): refresh limits panel and usage hooks
+71b3bbf23a	OF-DIFF-015,OF-DIFF-025	10	chore(opencode): sqlite worker, swarm tool and probe script touch-ups
+23d0b3b7c9	OF-DIFF-001,OF-DIFF-013,OF-DIFF-015,OF-DIFF-022,OF-DIFF-025	13	chore(core): search/sql/tool/config touch-ups and compaction shape guard
+088ae8299f	OF-DIFF-006,OF-DIFF-034	5	feat: session unarchive contract via nullable archived timestamp
+bef5dc6ee2	OF-DIFF-013	1	perf(opencode): cache session-group listings behind backfill connection
+0c622bebe5	OF-DIFF-006,OF-DIFF-025	2	fix(events): scope SSE to instance directory and batch listener dispatch
+10b4cdd3d5	OF-DIFF-015	1	chore(opencode): register checkpoint and browser devtools tools
+93db4eb5ac	OF-DIFF-016,OF-DIFF-025	8	feat(opencode): browser devtools and extensions-list tools
+5b62247090	OF-DIFF-006,OF-DIFF-017,OF-DIFF-025	14	feat(opencode): harden quota providers and openrouter free usage
+6b49bea3a7	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-025	9	feat(opencode): session checkpoint tool with turn/baseline capture
+cbab772244	OF-DIFF-013,OF-DIFF-025	10	feat(core): durable session pause/resume and title regeneration
+8bf3195fb8	HISTORY-NO-NET-DIFF	0	Merge remote-tracking branch 'origin/main'
+8bf35c98c0	OF-DIFF-006	1	fix(opencode): register project init listener before INIT dispatch
+55e75d5ad0	OF-DIFF-006,OF-DIFF-021,OF-DIFF-025	3	fix(opencode): interrupt instance warmup on disposal; steady flaky instance tests
+834fc9b3dc	OF-DIFF-006,OF-DIFF-013	3	feat(app): batch session-group detail fetches behind one request
+bdd5d01e95	OF-DIFF-020	1	perf(app): paint timeline from cache before session.sync resolves
+6252efcf99	OF-DIFF-013	3	feat(opencode): batched session-group details endpoint
+dbcf69a473	OF-DIFF-006,OF-DIFF-013,OF-DIFF-021,OF-DIFF-022,OF-DIFF-025	13	perf(opencode): unblock instance loads before eager service warmup
+2eb39b47cf	OF-DIFF-020,OF-DIFF-021,OF-DIFF-034	3	feat(app): honest route-loading diagnostics and sync perf marks
+dd80e99cab	OF-DIFF-017	1	fix(opencode): close unclosed paren in xai quota adapter
+16f64acab3	OF-DIFF-006,OF-DIFF-021	2	chore(opencode): log per-init bootstrap timings and instance-load waits
+b9ca71ead7	OF-DIFF-003,OF-DIFF-034	3	feat(app): add show-fewer-chats control to sidebar
+f71fd3b756	OF-DIFF-025	1	chore: ignore cpuprofile summaries
+c7ba96f88c	OF-DIFF-034	1	feat(app): add show-less-recent action to chat sidebar state
+3b9c0d8a3f	OF-DIFF-025	1	chore: ignore local run artifacts and probe logs
+c4abf69dab	HISTORY-NO-NET-DIFF	2	docs: add pane resizing handoff and SPAD live research notes
+6ba1cdb8b2	HISTORY-NO-NET-DIFF	19	docs(perf): add startup investigation notes and profiling harness
+63c41c612f	HISTORY-NO-NET-DIFF	4	docs: add swarm port plan
+0637d27b3c	HISTORY-NO-NET-DIFF	13	docs(limits): add plan-limits specs, provider matrix and tasks
+a413ea567d	HISTORY-NO-NET-DIFF	25	docs(fork): add openfork isolation plan and tasks
+2d60567e59	OF-DIFF-017	1	test(app): cover limits formatting
+3130583ecc	OF-DIFF-017	1	fix(opencode): annotate xai quota fetch effect type
+26fb2af7b4	OF-DIFF-034	1	perf(app): isolate working-state reads and dedupe sidebar grouping passes
+cf6d7aa2e9	OF-DIFF-025,OF-DIFF-034	16	chore(tooling): update deps, e2e and bench harnesses
+5a67d1646c	OF-DIFF-018,OF-DIFF-034	21	feat(ui): pane geometry, resize handle and sheet components
+372f627989	OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	64	feat(app): refresh desktop chrome and session workspace
+46a76de5b3	OF-DIFF-017,OF-DIFF-019,OF-DIFF-034	36	feat(app): add PWA mobile shell and device pairing
+ff66aa87c6	OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-017,OF-DIFF-025	51	feat(opencode): pairing/device API, quota providers and SPAD expansion
+bccc238438	OF-DIFF-021,OF-DIFF-025	11	feat(core): add session search FTS and device registry
+18d96710c7	OF-DIFF-001,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	4	docs(fork): clarify protocol vs unified SDK and workspace boundaries
+cf20e52955	OF-DIFF-003,OF-DIFF-034	213	chore(i18n): prune non-English translations, keep en-only
+73b863d2d7	OF-DIFF-034	2	perf(app): stabilize chat sidebar row identity and scope reactive updates
+087966ae04	HISTORY-NO-NET-DIFF	1	Delete dedupe-graphic-design.ps1
+99bed6e723	OF-DIFF-025	28	chore: remove anomalyco SaaS and publish workflows
+9e937cfa12	OF-DIFF-001,OF-DIFF-002,OF-DIFF-025	1573	chore: prune SaaS trees; allowlist desktop workspace
+3cbf187bd7	HISTORY-NO-NET-DIFF	1	docs: list case-by-case class in upstream-sync skill
+eab5c9d715	OF-DIFF-001	1	docs: record v1.18.21 case-by-case conflict paths in FORK.md
+3540a81170	OF-DIFF-018,OF-DIFF-025	6	chore(desktop): disable official updater on OpenFork
+9a04164c0f	OF-DIFF-001	4	docs: add OpenFork AGENTS, ownership map, and upstream-sync skill
+d24ef852bb	OF-DIFF-003,OF-DIFF-006,OF-DIFF-013,OF-DIFF-017,OF-DIFF-018,OF-DIFF-020,OF-DIFF-021,OF-DIFF-022,OF-DIFF-025,OF-DIFF-034	110	chore: checkpoint fork work before isolating thelabcorner/openfork
+a747d51764	HISTORY-NO-NET-DIFF	0	chore: merge upstream v1.18.21 into openfork
+fccc8b3385	OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	10	chore: checkpoint search/matcher perf probes before merge window
+5374a0963b	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-002,OF-DIFF-003,OF-DIFF-006,OF-DIFF-012,OF-DIFF-013,OF-DIFF-015,OF-DIFF-018,OF-DIFF-020,OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	223	chore: checkpoint in-progress fork work before upstream v1.18.21 sync
+826d9ad46a	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.21
+4667437f74	NONPRODUCT-DOCS-EVIDENCE,OF-DIFF-016,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	19	docs: add design docs, agent handoffs, live generation rate, desktop storage, and firecrawl
+da8ef3217a	OF-DIFF-021,OF-DIFF-022,OF-DIFF-025,OF-DIFF-034	8	chore: update package deps, bootstrap, plugin, and CLI session
+d4a0e8772c	OF-DIFF-021,OF-DIFF-025	11	chore(core): update database, filesystem search, file-mutation, and config
+f45c9301e8	OF-DIFF-003,OF-DIFF-025,OF-DIFF-034	30	feat(session-ui): add tool output components, message part styling, and TUI updates
+4a5fa7fc17	OF-DIFF-004,OF-DIFF-013,OF-DIFF-020,OF-DIFF-034	116	feat(app): polish tabs, titlebar, prompt input, context tabs, layout, and session commands
+ca012c08b7	OF-DIFF-003	63	i18n: add project explorer, browser chrome, session groups, and usage keys to all locales
+fdbd5d865b	OF-DIFF-006,OF-DIFF-013,OF-DIFF-025	29	chore: regenerate client/SDK types, update schema and protocol, and add file/tool/session API routes
+1f07bd3608	OF-DIFF-012,OF-DIFF-013,OF-DIFF-017	22	feat(session): add SPAD supervisor, session processor improvements, and background shell jobs
+fbf7534841	OF-DIFF-006,OF-DIFF-016,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	32	feat(browser): overhaul hosted browser with broker, chrome menu, IPC, and element annotation
+9e8e2cd59c	OF-DIFF-006,OF-DIFF-013,OF-DIFF-017,OF-DIFF-025,OF-DIFF-034	27	feat(app): add context panel, models panel, usage tracking, and model pricing
+81fbbdd576	OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	33	feat(app): add project explorer with file tree, viewers, editor, and git status
+41b3b2bcbc	OF-DIFF-013,OF-DIFF-021,OF-DIFF-034	11	feat(session): add session groups with schema, core, API, and app support
+b9fb1b0640	OF-DIFF-015,OF-DIFF-016	27	feat(tool): improve edit, shell, skill, websearch, read, write tools and refactor registry
+7a5085cb48	OF-DIFF-012,OF-DIFF-015,OF-DIFF-016	68	feat(tool): add json, background, sqlite, git, typecheck, project, symbols, test, refactor, sympy, patch, and custom tool support
+93e423f1d2	OF-DIFF-013,OF-DIFF-025	2	feat(search): tune backfill chunk size and add env gate
+dc75db6959	OF-DIFF-001,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-022,OF-DIFF-025,OF-DIFF-034	12	chore: update account/config/plugin, sdk clients, and dev guidance
+751a39ddaa	OF-DIFF-034	7	feat(app): server-compat session actions and search controller polish
+6f3ed5fcf3	OF-DIFF-034	10	feat(session-ui): tool output display and error card polish
+f3879466bd	OF-DIFF-006,OF-DIFF-021	7	chore: regenerate client and sdk-next generated types
+5ba6f7a561	OF-DIFF-013,OF-DIFF-021,OF-DIFF-025	4	feat(core): add session title regeneration with paused_at migration
+764479682e	OF-DIFF-015,OF-DIFF-025	11	feat(tool): add archive tool with zip/tar/decompress support
+6a2bdfc9f8	OF-DIFF-006,OF-DIFF-015,OF-DIFF-016,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	32	feat(browser): hosted browser panel with element annotation overlay
+379cb4d993	OF-DIFF-003	65	i18n: add tab session-state and regenerate-title keys to locales
+b3ab0b5e54	OF-DIFF-020,OF-DIFF-034	21	feat(app): tab session controls with pause/resume/regenerate actions
+6410cd3995	OF-DIFF-006,OF-DIFF-013,OF-DIFF-025	12	feat(session): add V1 pause/resume/regenerate-title API
+05e969fc9d	HISTORY-NO-NET-DIFF	6	docs: add swarm design handoffs and cross-doc reviews
+6b6bdb93a0	HISTORY-NO-NET-DIFF	23	docs: add ChunkDB storage architecture research and plan
+fc19430c2c	OF-DIFF-013,OF-DIFF-021,OF-DIFF-025	5	fix: align openfork with upstream sdk updates
+108709d816	HISTORY-NO-NET-DIFF	0	Merge tag 'v1.18.18' into openfork
+9c360d0583	OF-DIFF-003,OF-DIFF-006,OF-DIFF-013,OF-DIFF-015,OF-DIFF-016,OF-DIFF-017,OF-DIFF-018,OF-DIFF-020,OF-DIFF-021,OF-DIFF-025,OF-DIFF-034	219	feat: checkpoint openfork changes
+31406ccc51	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.18
+daa6086511	OF-DIFF-003,OF-DIFF-034	8	feat(app): shared realtime OpenCode Go usage controller
+951fb780a8	OF-DIFF-006,OF-DIFF-017,OF-DIFF-025	9	feat(opencode): two-layer usage cache with 5m official gate
+4570504eec	OF-DIFF-003	61	feat(app): add tab context menu i18n keys to locales
+26917b333c	OF-DIFF-003,OF-DIFF-034	5	feat(app): add tab context menu close actions
+a3647eb025	OF-DIFF-002,OF-DIFF-006,OF-DIFF-017,OF-DIFF-018,OF-DIFF-025,OF-DIFF-034	30	release: v1.18.16

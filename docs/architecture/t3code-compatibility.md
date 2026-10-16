@@ -20,6 +20,26 @@ stock T3 Code
 T3 Code itself is not patched, forked, or asked to understand OpenFork-specific
 HTTP, event, session, or provider concepts.
 
+### Native Windows executable and external-server recovery
+
+Use the native `openfork-t3code.exe` alias as `binaryPath` on Windows rather
+than the legacy .cmd batch wrapper. The executable basename activates only the
+opt-in T3 compatibility profile and avoids intermediate cmd.exe spawning; the
+canonical OpenFork executable retains its own identity.
+
+If stock T3's local binary probe still times out, use its existing external
+server mode. Launch `openfork-t3code.exe serve --hostname=127.0.0.1` on a
+dedicated port under a supervised task and enter its loopback HTTP URL in T3's
+`serverUrl` field. Unlike local-process mode, T3 then performs the HTTP
+health/version probe and consumes the 1.x SDK inventory without launching a
+child CLI on each probe. The installed Windows supervision script
+`packages/opencode/script/openfork-t3code-service.ps1` checks the configured
+loopback health endpoint before attempting to launch a new service. Never
+disable or bypass authentication to make availability checks succeed; when
+exposing the server beyond loopback, configure matching credentials on both
+OpenFork and T3. Verify HTTP health, provider inventory, SDK calls and T3
+status after changes.
+
 ## Audited consumer snapshot
 
 The current contract was audited on **2026-09-29** against
@@ -37,6 +57,61 @@ At that snapshot:
 
 The OpenFork façade therefore reports **1.15.13**. That number is a consumer
 contract version, not the OpenFork product version.
+
+### Both generations must stay reachable at once
+
+Stock T3 Code has since gained a second OpenCode integration generation
+without removing the 1.x one, so the reported compatibility version is now
+bounded by **two** consumer manifests rather than one. Audited on
+**2026-10-03** against `pingdotgg/t3code` `origin/main`
+`a21702d0e58ad20263dc965d84472bb6d7eb38c8`,
+`apps/server/src/provider/model-manifest.json` carries two `opencode` driver
+entries:
+
+| T3 Code itself | OpenCode `supported` | OpenCode `graceful` | OpenCode `unsupported` / `broken` |
+| --- | --- | --- | --- |
+| `>=0.0.42 <0.0.46` (audited baseline) | `>=1.14.19 <2.0.0` | — | `>=2.0.0`, `<1.14.19` |
+| `>=0.0.46` (current stock) | `>=2.0.18` | `>=1.14.19 <2.0.0` | `>=2.0.0 <2.0.18`, `<1.14.19` |
+
+The intersection that keeps **both** generations alive is therefore exactly
+`[1.14.19, 2.0.0)`. `1.15.13` sits inside it: the audited baseline calls it
+supported and current stock calls it graceful.
+
+**The reported compatibility version must never be raised out of
+`[1.14.19, 2.0.0)`.** This is the most easily-broken invariant on this
+boundary, and raising the number would look like an improvement:
+
+- `>=2.0.0` is *broken* for the audited baseline and *unsupported* for current
+  stock, so it regresses both directions at once.
+- OpenFork's façade implements the OpenCode 1.x wire. It deliberately does not
+  implement the 2.x `/api/*` protocol, so advertising 2.x would be a claim the
+  runtime cannot honour.
+- This number must never be derived from the OpenFork release version.
+
+#### What "graceful" actually means for current stock T3
+
+Current stock T3 resolves the band through
+`apps/server/src/provider/providerCompatibility.ts`, which attaches a
+`compatibilityAdvisory` to the provider snapshot and does nothing else with it.
+Driver selection is keyed only on the probed *generation*
+(`Drivers/OpenCodeDriver.ts`, `byOpenCodeRuntime`: `generation === "v2" ? v2 :
+v1`); the word `graceful` never appears in dispatch. So against a `1.15.13`
+façade, current stock T3 runs the retained 1.x path at full function — session
+creation, event streaming, tools, permissions, questions and model resolution
+are all exercised through `@opencode-ai/sdk` 1.x. `graceful` is a
+**presentational** downgrade, rendered as a "Limited support" banner
+(`apps/web/src/components/settings/providerStatus.ts`).
+
+Two consequences are load-bearing:
+
+- The banner reads "This provider version has limited compatibility with this T3
+  Code release. Use `>=2.0.18`." That recommendation is addressed to stock
+  OpenCode and is not actionable for OpenFork. It is cosmetic; it must not be
+  "fixed" by raising the reported version.
+- A reported version that matches no range, or that is not a stable
+  `MAJOR.MINOR.PATCH` string, resolves to `unknown` with **no** advisory at all —
+  not an error and not a block. The façade must keep reporting a bare stable
+  three-part semver or it silently loses even the banner.
 
 ## Activation and identity isolation
 
@@ -66,6 +141,58 @@ T3 Code relies on three process-level observations.
 | server startup | stdout containing `server listening on <url>` | `opencode server listening on <url>` |
 | health probe | `GET /global/health` with `healthy: true` and semantic `version` | minimal legacy shape with version `1.15.13` |
 
+### Generation follows the version, not the path
+
+Current stock T3 negotiates the generation server-side in
+`apps/server/src/provider/opencodeVersionProbe.ts`. The mechanics matter because
+they determine which OpenFork-side changes are actually dangerous:
+
+- `probeOpenCodeRuntime` is **mutually exclusive**. A non-empty `serverUrl`
+  selects the server probe; otherwise the local `binaryPath --version` probe
+  runs. The two are independent configurations, and proving one proves nothing
+  about the other.
+- `probeOpenCodeServer` tries `/api/info` **first**, then `/global/health`, and
+  the **path selects only the decoder**. Generation comes from the decoded value:
+  `probed()` returns `{ generation: major >= 2 ? "v2" : "v1", version }`. A
+  decodable `/api/info` body reporting `1.15.13` therefore classifies as **v1**.
+- A candidate only advances to the next one on `404`, a non-`200`, a
+  non-`application/json` media type, or an undecodable body. Media type is
+  normalized with `contentType.split(";")[0].trim().toLowerCase()`.
+- The decoders are stricter than status plus content type. `/api/info` requires
+  **both** `version: string` and `pid: int`; `/global/health` requires `healthy`
+  as the literal boolean `true` plus a `version` string. The extra canonical
+  `path` object is ignored, but a string `"true"` is not.
+- A `401` is a **hard error on either path**, not a fall-through. Both generations
+  answer a wrong password with `401` on either path, so it carries no version
+  information and the probe raises immediately.
+- The probe **appends** to the configured URL and preserves its query, so
+  `/base/?x=1` becomes `/base/api/info?x=1`. Sub-path and reverse-proxy mounts
+  are in scope.
+
+#### The invariant that actually matters
+
+The forbidden thing is a **decoded version whose major is `>= 2`**, on either
+path — not the presence of a route. OpenFork's `404` on `/api/info` is correct
+and current, but it is not what keeps this integration on v1; the reported
+version is.
+
+Two consequences:
+
+- Under the T3 profile this is safe by construction, because only the profile
+  pins the report to `1.15.13`.
+- The forward hazard is **canonical OpenFork**. `localClientReportedVersion`
+  serves both probe paths, and without the profile it reports OpenFork's real
+  version. So the day OpenFork's own version reaches `2.0.0`, a `serverUrl`
+  deployment pointed at a canonical OpenFork server negotiates **v2** with no
+  route added, no configuration change, and no error naming the cause. That is a
+  much more likely trigger than any `/api/*` work, and it should be tracked as a
+  canonical-version-numbering concern rather than a T3-profile one.
+
+The negotiation decision is pinned by
+`packages/opencode/test/server/t3code-process-version-auth.test.ts`, and the
+profile-pinned version's `major < 2` by
+`packages/opencode/test/compat/t3code-version-window.test.ts`.
+
 Canonical `openfork` invocations continue to print the OpenFork startup
 identity and real OpenFork version. Historical `opencode` does the same; only
 `openfork-t3code` projects the audited OpenCode 1.x identity.
@@ -76,6 +203,39 @@ T3's SDK client authenticates password-protected OpenCode servers with HTTP
 Basic credentials using username `opencode`. OpenFork's server-auth contract
 uses the same default username and `OPENCODE_SERVER_PASSWORD`, so the adapter
 does not translate credentials or weaken normal server authentication.
+
+### Password auth interoperates only where T3 actually forwards the credential
+
+The sentence above is a statement about OpenFork, not a promise of end-to-end
+interoperation. T3 forwards the password on the **session** client only when the
+connection is external, so the working and broken configurations are the
+opposite of the intuitive ones:
+
+- `OpenCodeAdapterV2.ts:963-969` passes `serverPassword` only when
+  `connection.external` is true. Per `opencodeRuntime.ts`, `external: true`
+  means an externally-managed server (a `serverUrl` was configured) and
+  `external: false` means a locally spawned managed process.
+- Therefore **external `serverUrl` + password works**, and a
+  **locally spawned password-protected server returns `401`** to the session
+  client.
+
+The asymmetry that makes this look like an OpenFork fault: the version probe
+authenticates in **both** modes, while the session client's credential is
+subject to the external guard. A green probe proves negotiation and generation
+classification, and proves nothing about whether the session path can
+authenticate.
+
+In the local case T3 provisions the credential and then omits it:
+`opencodeRuntime.ts:691-693` resolves the server password and `:707` places it
+in the spawned child environment as `OPENCODE_SERVER_PASSWORD`, so OpenFork
+enforces authentication correctly and the adapter simply declines to send that
+same password back.
+
+> **Do not relax authentication on `/global/health`, `/api/info`, or any other
+> route to clear a `401` observed here.** OpenFork's auth behavior is correct;
+> the credential is withheld by the consumer. Trading a canonical security
+> boundary for a consumer-side omission is a canonical-behavior regression and
+> must be treated as upstream's defect, not as work for this façade.
 
 T3 also passes `OPENCODE_CONFIG_CONTENT` to locally spawned OpenCode
 processes. OpenFork continues to consume that compatibility environment
@@ -195,6 +355,17 @@ The recognized session-status family remains `idle | busy | retry`. T3 is
 tolerant of extra fields on those status objects but depends on those type
 names and on the ordinary message/session/request identifiers in the events.
 
+The legacy `/event` SSE route gives replayable frames an epoch-scoped
+`Last-Event-ID`. Its bridge retains at most 4096 events / 8 MiB and keeps
+capturing for 30 seconds after the last subscriber disconnects, covering the
+pinned SDK 1.15.13 retry window without retaining an unbounded history while
+idle. Reconnects within that grace replay from the supplied cursor. After expiry,
+the cursor receives `server.stream.gap` and requires snapshot hydration. The
+pinned T3 provider adapter currently ignores that gap event; therefore bounded
+short-disconnect replay is supported, while recovery after the grace window is
+not a production-ready guarantee. The SDK retries thrown transport errors but
+ends its event stream on a clean EOF without retrying.
+
 OpenFork may emit additional fork-specific events. They are not part of this
 exception and do not need to be hidden merely because T3 ignores them.
 
@@ -291,6 +462,15 @@ is an executable shell launcher using `exec`. The historical `opencode`
 launcher remains a separate transparent OpenFork forwarding surface and must
 not be repurposed as the T3 adapter.
 
+The packaged-distribution promise above covers released archives. Running the
+façade **from a source checkout** is a development harness concern: the
+`bin/openfork-t3code` wrapper resolves the OpenFork binary through the normal
+resolver, so the harness must supply `OPENFORK_BIN_PATH` pointing at a freshly
+built native executable. A stale `dist/` binary predating the current checkout
+can prove the shipped handshake while proving nothing about current source, so
+harness evidence must always name the binary it used. Do not change the resolver
+or the launcher to accommodate a source checkout.
+
 ## Non-goals
 
 This exception does **not** mean:
@@ -326,3 +506,9 @@ The regression owners are:
 
 - `packages/opencode/test/compat/t3code.test.ts`
 - `packages/opencode/test/server/t3code-compat-contract.test.ts`
+- `packages/opencode/test/compat/t3code-version-window.test.ts` — the
+  dual-generation version window from §Both generations must stay reachable at
+  once, including the negative cases proving that guard has teeth.
+- `packages/opencode/test/server/t3code-process-version-auth.test.ts` — the
+  v1-vs-v2 negotiation decision from §Generation follows the version, not the
+  path.
