@@ -98,18 +98,22 @@ const fuzzyExcerpt = (content: string, needleLines: readonly string[]): string |
   return renderRegion(content, region)
 }
 
-// Hint for edit-tool conflicts: exact multi-match → occurrence lines + first
-// site; otherwise the closest fuzzy region. undefined = nothing worth showing.
+// Hint for edit-tool conflicts: exact multi-match → bounded locations and
+// compact distinguishing contexts; otherwise the closest fuzzy region.
 export function replaceConflictHint(input: { content: string; needle: string }): string | undefined {
   const occurrences = occurrenceLineNumbers(input.content, input.needle)
   if (occurrences.length > 1) {
     const listed = occurrences.slice(0, MAX_OCCURRENCES_LISTED)
     const suffix = occurrences.length > listed.length ? `, … (+${occurrences.length - listed.length} more)` : ""
-    const first = { start: listed[0]! - 1, end: listed[0]! - 1 }
+    const contexts = candidateConflictHint({
+      content: input.content,
+      candidates: listed,
+      matchedLines: input.needle.split(/\r\n|\n|\r/).length,
+      maxContextChars: 24,
+    })
     return [
-      `The target text currently appears at line(s): ${listed.join(", ")}${suffix}. Include more surrounding lines to disambiguate.`,
-      "",
-      renderRegion(input.content, first),
+      `The target text currently appears at line(s): ${listed.join(", ")}${suffix}. Include more surrounding lines to disambiguate, or select a verified match line.`,
+      ...(contexts ? ["", contexts] : []),
     ].join("\n")
   }
   const excerpt = fuzzyExcerpt(input.content, input.needle.split("\n"))
@@ -117,10 +121,10 @@ export function replaceConflictHint(input: { content: string; needle: string }):
   return ["Current file content closest to your target:", "", excerpt].join("\n")
 }
 
-const compactCandidateLine = (value: string) => {
+const compactCandidateLine = (value: string, maxChars = MAX_CANDIDATE_CONTEXT_CHARS) => {
   const line = displayLine(value).trim()
-  if (line.length <= MAX_CANDIDATE_CONTEXT_CHARS) return line
-  return `${line.slice(0, MAX_CANDIDATE_CONTEXT_CHARS)}…`
+  if (line.length <= maxChars) return line
+  return `${line.slice(0, maxChars)}…`
 }
 
 /**
@@ -132,14 +136,15 @@ export function candidateConflictHint(input: {
   content: string
   candidates: readonly number[]
   matchedLines: number
+  maxContextChars?: number
 }): string | undefined {
   if (input.candidates.length === 0) return undefined
   const lines = input.content.split("\n")
   const rows = input.candidates.slice(0, MAX_CANDIDATE_CONTEXTS).map((line) => {
     const start = Math.max(0, line - 1)
     const end = Math.min(lines.length - 1, start + Math.max(1, input.matchedLines) - 1)
-    const before = start > 0 ? `${start}: ${compactCandidateLine(lines[start - 1]!)}` : "BOF"
-    const after = end + 1 < lines.length ? `${end + 2}: ${compactCandidateLine(lines[end + 1]!)}` : "EOF"
+    const before = start > 0 ? `${start}: ${compactCandidateLine(lines[start - 1]!, input.maxContextChars)}` : "BOF"
+    const after = end + 1 < lines.length ? `${end + 2}: ${compactCandidateLine(lines[end + 1]!, input.maxContextChars)}` : "EOF"
     return `  match ${line}-${end + 1}: before [${before}] · after [${after}]`
   })
   const omitted = input.candidates.length - rows.length

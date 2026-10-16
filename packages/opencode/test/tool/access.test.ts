@@ -97,6 +97,28 @@ describe("optional tool access", () => {
     }),
   )
 
+  it.instance("guides when the broker action is missing instead of leaking a raw SchemaError", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
+      const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)
+      expect(broker).toBeDefined()
+
+      // The common miss: omitting the broker's own dispatch key entirely.
+      const exit = yield* Effect.exit(broker!.execute({} as never, ctx))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = Cause.pretty(exit.cause)
+        // Raw Effect error would be `Missing key at ["action"]` with no guidance.
+        expect(message).not.toContain("Missing key")
+        expect(message).toContain("required top-level field")
+        expect(message).toContain('action: "describe"')
+        expect(message).toContain('action: "call"')
+        expect(message).toContain("never at the broker level")
+      }
+    }),
+  )
+
   it.instance("describe returns the hidden schema as result content without changing the manifest", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

@@ -209,7 +209,7 @@ export type Resolution = {
   match: Match
   /** All matches in the winning tier (length 1 on success). */
   tier: Match[]
-  /** Every distinct match found, for diagnostics. */
+  /** Distinct matches at the earliest nonempty risk tier; later tiers are not executed. */
   all: Match[]
   warnings: string[]
 }
@@ -228,18 +228,19 @@ export class MatchError extends Error {
 function collect(content: string, find: string, lines: readonly Line[], opts: ResolveOptions): Match[] {
   const from = opts.from ?? 0
   const maxFuzz = opts.maxFuzz ?? Number.POSITIVE_INFINITY
-  const seen = new Map<string, Match>()
+  // MATCHERS is ordered by increasing FUZZ. Once one tier produces an eligible
+  // candidate, lower-priority matchers cannot change arbitration. Stop there:
+  // scanning the full ladder after an exact hit wastes CPU on every common edit.
   for (const matcher of MATCHERS) {
+    const seen = new Map<string, Match>()
     for (const m of matcher(content, find, lines)) {
-      if (m.start < from) continue
-      if (m.fuzz > maxFuzz) continue
+      if (m.start < from || m.fuzz > maxFuzz) continue
       const key = `${m.start}:${m.end}`
-      const prior = seen.get(key)
-      // Same span found by several tiers: keep the safest attribution.
-      if (!prior || m.fuzz < prior.fuzz) seen.set(key, m)
+      if (!seen.has(key)) seen.set(key, m)
     }
+    if (seen.size > 0) return [...seen.values()].sort((a, b) => a.start - b.start)
   }
-  return [...seen.values()].sort((a, b) => a.fuzz - b.fuzz || a.start - b.start)
+  return []
 }
 
 /**
@@ -380,17 +381,40 @@ function notFoundMessage(content: string, find: string, lines: readonly Line[], 
  * approximation of oldString and replaceAll would then rewrite every
  * occurrence of that approximation.
  */
+export type ExactSelection =
+  | { readonly mode: "one"; readonly atLine: number }
+  | { readonly mode: "selected"; readonly atLines: readonly number[] }
+  | { readonly mode: "all"; readonly expectedMatches?: number }
+
+/**
+ * Optional target intent: a verified exact source line, or an asserted count
+ * for a deliberate all-occurrences edit. Omitted selection preserves the
+ * existing zero-argument fast path and unique/fuzzy arbitration.
+ */
 export function resolveReplacement(
   content: string,
   oldString: string,
   newString: string,
   replaceAll = false,
+  selection?: ExactSelection,
 ): { spans: Span[]; warnings: string[]; via: string; applied: number } {
   if (oldString === newString) {
     throw new MatchError("not-found", "No changes to apply: oldString and newString are identical.")
   }
 
-  if (replaceAll) {
+  if (selection !== undefined && selection.mode !== "all" && replaceAll) {
+    throw new MatchError("ambiguous", "selection.mode one/selected cannot be combined with replaceAll:true.")
+  }
+  if (selection?.mode === "all" && selection.expectedMatches !== undefined &&
+      (!Number.isSafeInteger(selection.expectedMatches) || selection.expectedMatches < 1)) {
+    throw new MatchError("ambiguous", "expectedMatches must be a positive safe integer.")
+  }
+  if (selection?.mode === "one" &&
+      (!Number.isSafeInteger(selection.atLine) || selection.atLine < 1)) {
+    throw new MatchError("ambiguous", "selection.atLine must be a positive safe integer.")
+  }
+
+  if (replaceAll || selection?.mode === "all") {
     // Uniqueness arbitration is skipped deliberately: renaming every
     // occurrence is the documented intent. Exact-only by policy (D8) — a
     // fuzzy tier must never decide the rewrite set.
@@ -408,6 +432,66 @@ export function resolveReplacement(
         "not-found",
         "replaceAll requires an exact logical match; oldString was not found (line-ending encoding is auto-healed).",
       )
+    }
+    if (selection?.mode === "all" && selection.expectedMatches !== undefined &&
+        spans.length !== selection.expectedMatches) {
+      throw new MatchError(
+        "ambiguous",
+        "Refusing all-occurrences edit: expected " + selection.expectedMatches +
+          " exact matches but found " + spans.length + ". No changes applied. " +
+          "Re-read the current file or update expectedMatches deliberately.",
+        spans.map((span) => lineNumberAt(lines, span.start)),
+      )
+    }
+    return { spans, warnings: [], via: "exact", applied: spans.length }
+  }
+
+  if (selection?.mode === "one" || selection?.mode === "selected") {
+    // Verify every requested line against the same snapshot, then commit all
+    // selected spans together. No fuzzy recovery, nearest-line guess or
+    // positional "best effort" is permitted for explicit targets.
+    const wanted = selection.mode === "one" ? [selection.atLine] : selection.atLines
+    if (wanted.length === 0 || wanted.length > 128 ||
+        wanted.some((line) => !Number.isSafeInteger(line) || line < 1) ||
+        new Set(wanted).size !== wanted.length) {
+      throw new MatchError("ambiguous", "Selected source lines must be 1-128 distinct positive safe integers.")
+    }
+    const lines = buildLineIndex(content)
+    const requested = new Set(wanted)
+    // Streaming scan: memory scales with requested targets, not with how many
+    // times the needle occurs in the file. Diagnostics retain bounded sites.
+    const byLine = new Map<number, { match: Match; count: number }>()
+    const sites: number[] = []
+    let totalCandidates = 0
+    for (const candidate of ExactMatcher(content, oldString, lines)) {
+      const line = lineNumberAt(lines, candidate.start)
+      totalCandidates++
+      if (sites.length < MAX_CANDIDATES_LISTED) sites.push(line)
+      if (!requested.has(line)) continue
+      const existing = byLine.get(line)
+      if (existing) existing.count++
+      else byLine.set(line, { match: candidate, count: 1 })
+    }
+    const spans: Span[] = []
+    for (const line of wanted) {
+      const entry = byLine.get(line)
+      if (entry?.count !== 1) {
+        const suffix = totalCandidates > sites.length ? `, … (+${totalCandidates - sites.length} more)` : ""
+        throw new MatchError(
+          "ambiguous",
+          "Cannot resolve oldString uniquely at line " + line + ": " +
+            (entry?.count ?? 0) + " exact candidate(s) start there. " +
+            "Exact matches start at lines " + (sites.join(", ") || "(none)") +
+            suffix + ". Verify current source lines; no changes applied.",
+          sites,
+        )
+      }
+      const match = entry.match
+      spans.push({
+        start: match.start,
+        end: match.end,
+        replacement: adaptReplacementTerminators(content, match.start, match.end, newString),
+      })
     }
     return { spans, warnings: [], via: "exact", applied: spans.length }
   }

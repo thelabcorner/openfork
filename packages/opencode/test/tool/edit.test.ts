@@ -91,6 +91,56 @@ const onceBus = Effect.fn("EditToolTest.onceBus")(function* (def: typeof Watcher
 })
 
 describe("tool.edit", () => {
+  it.instance("selects one of repeated exact matches and guards deliberate all replacement", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "repeated-ax.txt")
+      yield* put(filepath, "head\nvalue\nvalue\n")
+
+      expect((yield* fail({ filePath: filepath, oldString: "value", newString: "next" })).message).toContain(
+        "multiple matches",
+      )
+      expect(yield* load(filepath)).toBe("head\nvalue\nvalue\n")
+
+      const selected = yield* run({
+        filePath: filepath,
+        oldString: "value",
+        newString: "next",
+        selection: { mode: "one", atLine: 3 },
+      })
+      expect(selected.metadata.applied).toBe(1)
+      expect(yield* load(filepath)).toBe("head\nvalue\nnext\n")
+
+      expect((yield* fail({
+        filePath: filepath,
+        oldString: "v",
+        newString: "V",
+        selection: { mode: "all", expectedMatches: 2 },
+      })).message).toContain("expected 2 exact matches")
+      expect(yield* load(filepath)).toBe("head\nvalue\nnext\n")
+
+      const all = yield* run({
+        filePath: filepath,
+        oldString: "e",
+        newString: "E",
+        selection: { mode: "all", expectedMatches: 3 },
+      })
+      expect(all.metadata.applied).toBe(3)
+      expect(yield* load(filepath)).toBe("hEad\nvaluE\nnExt\n")
+
+      const subsetFilepath = path.join(test.directory, "selected-ax.txt")
+      yield* put(subsetFilepath, "value\nvalue\nvalue\n")
+      const subset = yield* run({
+        filePath: subsetFilepath,
+        oldString: "value",
+        newString: "selected",
+        selection: { mode: "selected", atLines: [3, 1] },
+      })
+      expect(subset.metadata.applied).toBe(2)
+      expect(yield* load(subsetFilepath)).toBe("selected\nvalue\nselected\n")
+    }),
+  )
+
   describe("creating new files", () => {
     it.instance("creates new file when oldString is empty", () =>
       Effect.gen(function* () {

@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmSchema } from "@opencode-ai/core/swarm/schema"
 import { SwarmMemberTool, Parameters } from "../../src/tool/swarm-member"
@@ -71,6 +71,7 @@ const swarmLayer = (input: {
   readonly details?: Record<string, any>
   readonly authority?: any
   readonly inbox?: ReadonlyArray<any>
+  readonly pageInbox?: any
   readonly page?: any
 }) =>
   Layer.mock(SwarmV2.Service, {
@@ -124,6 +125,11 @@ const swarmLayer = (input: {
         calls.push({ op: "memberInbox", args: request })
         return (input.inbox ?? []) as any
       }),
+    memberInboxPage: (request: any) =>
+      Effect.sync(() => {
+        calls.push({ op: "memberInboxPage", args: request })
+        return (input.pageInbox ?? { items: input.inbox ?? [], more: false }) as any
+      }),
     enqueueMessage: (request: any) =>
       Effect.sync(() => {
         calls.push({ op: "enqueueMessage", args: request })
@@ -174,8 +180,10 @@ const truncate = Layer.succeed(
         write: () => Effect.void,
         close: Effect.void,
         healthy: () => true,
+        timelineHealthy: () => false,
       }),
     output: (text) => Effect.succeed({ content: text, truncated: false as const }),
+    retainTimeline: () => Effect.succeed(false),
     limits: () => Effect.succeed({ maxLines: 2_000, maxBytes: 50 * 1024 }),
   }),
 )
@@ -228,6 +236,32 @@ const ACTIVE_ONE = () =>
   })
 
 describe("tool.swarm_member", () => {
+  it.effect("prevents malformed worker actions at schema decode instead of after permission or domain reads", () =>
+    Effect.gen(function* () {
+      for (const [input, missing] of [
+        [{ action: "send", to: "peer" }, "body"],
+        [{ action: "send", body: "Hi" }, "to"],
+        [{ action: "fail" }, "failureKind"],
+        [{ action: "shared.put", key: "notes" }, "value"],
+        [{ action: "shared.put", value: null }, "key"],
+        [{ action: "publish" }, "summary"],
+      ] as const) {
+        const rejected = yield* Schema.decodeUnknownEffect(Parameters)(input).pipe(Effect.flip)
+        expect(String(rejected)).toContain(missing)
+      }
+      expect(yield* Schema.decodeUnknownEffect(Parameters)({
+        action: "shared.put", key: "notes", value: null,
+      })).toMatchObject({ action: "shared.put", key: "notes", value: null })
+      const badCursor = yield* Schema.decodeUnknownEffect(Parameters)({
+        action: "shared.get", key: "notes", afterKey: "first",
+      }).pipe(Effect.flip)
+      expect(String(badCursor)).toContain("afterKey")
+      const badInboxCursor = yield* Schema.decodeUnknownEffect(Parameters)({
+        action: "status", inboxCursor: { createdAt: 100, id: "swd_foo" },
+      }).pipe(Effect.flip)
+      expect(String(badInboxCursor)).toContain("inboxCursor")
+    }),
+  )
   it.effect("settles a task from caller Session identity with no opaque ids", () =>
     Effect.gen(function* () {
       calls.length = 0
@@ -295,7 +329,7 @@ describe("tool.swarm_member", () => {
     Effect.gen(function* () {
       calls.length = 0
       const message = yield* refusal(run({ action: "fail" }, ACTIVE_ONE()))
-      expect(message).toContain("failureKind is required")
+      expect(message).toContain("missing required input(s): failureKind")
       expect(calls.some((call) => call.op === "settleTask")).toBe(false)
     }),
   )
@@ -411,8 +445,16 @@ describe("tool.swarm_member", () => {
       // A keyless read must never degrade into a whole-board read.
       expect(calls.some((call) => call.op === "blackboard")).toBe(false)
       expect(paged.metadata).toMatchObject({ count: 1 })
-      expect(paged.output).toContain('"truncated": true')
+      expect(paged.output).toContain('"hasMore": true')
+      expect(paged.output).toContain('"nextKey": "findings"')
       expect(paged.output).toContain("findings")
+
+      calls.length = 0
+      const continued = yield* run({ action: "shared.get", afterKey: "findings", limit: 10 }, layer)
+      expect(calls.find((call) => call.op === "blackboardPage")?.args).toMatchObject({
+        swarmID: "swr_1", limit: 10, afterKey: "findings",
+      })
+      expect(continued.output).toContain('"hasMore": true')
 
       calls.length = 0
       const exact = yield* run({ action: "shared.get", key: "findings" }, layer)
@@ -498,13 +540,41 @@ describe("tool.swarm_member", () => {
         ],
       })
       const out = yield* run({ action: "inbox", limit: 5 }, layer)
-      expect(calls.find((call) => call.op === "memberInbox")?.args).toMatchObject({
+      expect(calls.find((call) => call.op === "memberInboxPage")?.args).toMatchObject({
         swarmID: "swr_1",
         memberID: "mbr_alpha",
         limit: 5,
       })
       expect(out.metadata).toMatchObject({ count: 1 })
       expect(out.output).toContain("attempts=1")
+      expect(out.output).toContain('"complete": true')
+    }),
+  )
+
+  it.effect("exposes honest inbox completeness and passes the returned keyset cursor to Core", () =>
+    Effect.gen(function* () {
+      calls.length = 0
+      const layer = swarmLayer({
+        bound: [member("mbr_alpha", "alpha", "swr_1")],
+        infos: { swr_1: swarmInfo("swr_1", "verify-swarm") },
+        pageInbox: {
+          items: [],
+          more: true,
+          next: { createdAt: 123456, id: "swd_benchmark" },
+        },
+      })
+      const first = yield* run({ action: "inbox", limit: 5 }, layer)
+      expect(first.output).toContain('"hasMore": true')
+      expect(first.output).toContain('"id": "swd_benchmark"')
+      expect(first.metadata.status).toBe("more")
+      calls.length = 0
+      yield* run({
+        action: "inbox", limit: 5, inboxCursor: { createdAt: 123456, id: "swd_benchmark" },
+      }, layer)
+      expect(calls.find((call) => call.op === "memberInboxPage")?.args).toMatchObject({
+        memberID: "mbr_alpha", limit: 5,
+        before: { createdAt: 123456, id: "swd_benchmark" },
+      })
     }),
   )
 })

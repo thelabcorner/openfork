@@ -2,6 +2,12 @@ Delegate work to a subagent: an independent agent session with its own context, 
 permissions, and conversation history. The subagent works autonomously and returns a
 final result to you.
 
+Subagents use the model currently running the parent turn unless `model` explicitly
+selects another provider/model. For providers with multiple connected accounts, set
+`model.accountID` to select the account. Model IDs are resolved from the active
+workspace provider catalog; unavailable models, accounts, and variants fail before
+the child session is created.
+
 ## PARALLEL DISPATCH IS THE DEFAULT FOR INDEPENDENT WORK
 
 If a task contains two or more independent questions, files, investigations, or test
@@ -143,4 +149,3 @@ without restarting it: `task_id` with `mode: "supervisor"` adopts a running work
 | Peer messaging | no | no | no | yes |
 | Shared blackboard / DAG | no | no | no | yes |
 | Runtime | Task | Task | Task | Swarm |
-

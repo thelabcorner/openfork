@@ -38,16 +38,35 @@ type Metadata = {
 
 const hasText = (value: string | undefined) => typeof value === "string" && value.trim().length > 0
 
+const PATTERN_NOTE =
+  "`pattern` is not a find parameter; pass `grep` for content search or `glob` for path matching."
+
+function usageError(detail: string, note = false): Error {
+  return new Error(
+    [
+      detail,
+      "Accepted fields: glob | grep (exactly one), plus optional path and grep-only include.",
+      '  glob — find files by path/name, e.g. {"glob":"**/*.ts","path":"packages/opencode/src"}',
+      '  grep — search file contents with a regex, e.g. {"grep":"someRegex","include":"*.ts","path":"packages"}',
+      ...(note ? [PATTERN_NOTE] : []),
+    ].join("\n"),
+  )
+}
+
 function resolveAction(params: Params): Action {
   const hasGlob = hasText(params.glob)
   const hasGrep = hasText(params.grep)
   const hasInclude = hasText(params.include)
   if (hasGlob && hasGrep) {
     if (hasInclude) return "grep"
-    throw new Error("find requires exactly one non-empty field: glob or grep")
+    throw usageError("find received both glob and grep; pass exactly one search mode per call.")
   }
-  if (!hasGlob && !hasGrep) throw new Error("find requires exactly one non-empty field: glob or grep")
-  if (hasGlob && hasInclude) throw new Error("include is only valid with find grep")
+  if (!hasGlob && !hasGrep) {
+    throw usageError("find received neither glob nor grep; one search mode is required.", true)
+  }
+  if (hasGlob && hasInclude) {
+    throw usageError('"include" only filters grep results; it cannot be combined with glob.')
+  }
   return hasGlob ? "glob" : "grep"
 }
 

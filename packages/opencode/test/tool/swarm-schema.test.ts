@@ -31,16 +31,19 @@ describe("tool.swarm action schema", () => {
         "swarmId; full Swarm detail only; use task.runs for TaskRun/result audit",
       ],
       ["summary", "swarmId"],
-      ["delegate", "swarmName"],
+       ["delegate", "swarmName; optional requestKey makes creation at-most-once for this coordinator principal; a repeat returns a conflict with the existing swarmId for reconciliation"],
+       ["creation.lookup", "requestKey; read-only lookup after a lost creation result; returns durable state and whether bootstrap is incomplete, never assumes workers ran"],
       [
         "set_status",
         "swarmId, status; mutating Swarm lifecycle action; `state` is the deprecated alias of this action",
       ],
       ["state", "swarmId, status; deprecated alias of set_status"],
       ["member.add", "swarmId, memberName, memberRole, desiredProfile, workspacePolicy"],
+      ["member.batch", "swarmId, members; 1-8 workers; choose a small batch when model/authority failure risk is unknown; independent created/satisfied/failed receipts; retry only failed keys"],
       ["member.stop", "swarmId, memberId"],
       ["member.resume", "swarmId, memberId"],
       ["task.create", "swarmId, title"],
+      ["task.batch", "swarmId, tasks; 1-8 stable keyed DAG tasks; size by dependency and failure risk; created/satisfied/failed receipts preserve committed siblings; retry only failures"],
       ["task.dependencies", "swarmId, taskId"],
       [
         "task.runs",
@@ -51,7 +54,7 @@ describe("tool.swarm action schema", () => {
         "swarmId, settlement; when settlement=failed also require failureKind; omit taskId and member identity; completed settlement may include resultSummary for durable successor handoff",
       ],
       ["message.list", "swarmId"],
-      ["message.send", "swarmId, body, and either targetMemberId or broadcast=true"],
+      ["message.send", "swarmId, body, and either targetMemberId or broadcast=true; when force=true also require sourceSwarmId"],
       ["blackboard.get", "swarmId"],
       ["blackboard.put", "swarmId, key, value; expectedVersion is required when overwriting"],
       ["claim.list", "swarmId"],
@@ -67,11 +70,42 @@ describe("tool.swarm action schema", () => {
         "recover.contain",
         "swarmId, taskId, leaseGeneration; explicit containment acknowledgement; requires a recover.effects entry for this Swarm",
       ],
+      ["recover.session", "swarmId, memberId; operator containment acknowledgement for a proven-dead bound Session; preserves binding and pending input; task-owned effects require recover.contain"],
       [
         "task.review",
         "swarmId, taskId, decision, expectedLeaseGeneration; expectedLeaseGeneration is the task's current leaseGeneration as last observed; a stale value fails closed",
       ],
+      [
+        "admin.overview",
+        "none; read-only operator recovery overview for the current project; optional swarmId scope and limit; lists fenced task effects, the review backlog, and proven-dead bound member Sessions when scoped to one Swarm",
+      ],
+      [
+        "admin.contain",
+        "swarmId, taskId, leaseGeneration; operator containment without coordinator membership; requires a listed admin.overview/recover.effects entry; requires the swarm.admin permission",
+      ],
+      [
+        "admin.session",
+        "swarmId, memberId; operator containment for a proven-dead bound Session without coordinator membership; requires the swarm.admin permission",
+      ],
+      [
+        "admin.review",
+        "swarmId, taskId, decision, expectedLeaseGeneration; operator review recorded against the Swarm's durable coordinator member without coordinator membership; requires the swarm.admin permission; a stale generation fails closed",
+      ],
     ])
+  })
+
+  it("validates retry-safe Swarm request keys at the provider schema boundary", async () => {
+    expect(await accept({ action: "delegate", swarmName: "test", requestKey: "ax.research-2026:phase_1" })).toBe(true)
+    for (const requestKey of ["", "has whitespace", "bad/segment", "a".repeat(129), "☃"]) {
+      expect(await accept({ action: "delegate", swarmName: "test", requestKey })).toBe(false)
+    }
+    const json = ToolJsonSchema.fromSchema(Parameters) as {
+      properties: { requestKey: { minLength?: number; maxLength?: number; pattern?: string } }
+    }
+    expect(json.properties.requestKey).toMatchObject({
+      minLength: 1, maxLength: 128,
+    })
+    expect(json.properties.requestKey.pattern).toContain("[A-Za-z0-9]")
   })
 
   it("exposes set_status as the canonical mutating lifecycle action and keeps state as a deprecated alias", async () => {
@@ -93,6 +127,7 @@ describe("tool.swarm action schema", () => {
       { input: { action: "get" }, action: "get", missing: ["swarmId"] },
       { input: { action: "summary" }, action: "summary", missing: ["swarmId"] },
       { input: { action: "delegate" }, action: "delegate", missing: ["swarmName"] },
+      { input: { action: "creation.lookup" }, action: "creation.lookup", missing: ["requestKey"] },
       { input: { action: "recover.members" }, action: "recover.members", missing: ["swarmId"] },
       { input: { action: "message.list" }, action: "message.list", missing: ["swarmId"] },
       { input: { action: "blackboard.get" }, action: "blackboard.get", missing: ["swarmId"] },
@@ -106,6 +141,7 @@ describe("tool.swarm action schema", () => {
         missing: ["desiredProfile", "workspacePolicy"],
       },
       { input: { action: "task.create", swarmId: "swr_1" }, action: "task.create", missing: ["title"] },
+      { input: { action: "task.batch", swarmId: "swr_1" }, action: "task.batch", missing: ["tasks"] },
       { input: { action: "task.dependencies", swarmId: "swr_1" }, action: "task.dependencies", missing: ["taskId"] },
       { input: { action: "task.runs" }, action: "task.runs", missing: ["swarmId"] },
       { input: { action: "claim.acquire", swarmId: "swr_1" }, action: "claim.acquire", missing: ["scope"] },
@@ -115,6 +151,17 @@ describe("tool.swarm action schema", () => {
         input: { action: "deliverable.publish", swarmId: "swr_1" },
         action: "deliverable.publish",
         missing: ["deliverableSummary"],
+      },
+      {
+        input: { action: "admin.contain", swarmId: "swr_1", taskId: "swt_1" },
+        action: "admin.contain",
+        missing: ["leaseGeneration"],
+      },
+      { input: { action: "admin.session", swarmId: "swr_1" }, action: "admin.session", missing: ["memberId"] },
+      {
+        input: { action: "admin.review", swarmId: "swr_1", taskId: "swt_1", decision: "accept" },
+        action: "admin.review",
+        missing: ["expectedLeaseGeneration"],
       },
       {
         input: { action: "deliverable.review", swarmId: "swr_1", deliverableId: "swdlv_1" },
@@ -139,6 +186,16 @@ describe("tool.swarm action schema", () => {
     )
     expect(await accept({ action: "message.send", swarmId: "swr_1", body: "hi", targetMemberId: "swm_1" })).toBe(true)
     expect(await accept({ action: "message.send", swarmId: "swr_1", body: "hi", broadcast: true })).toBe(true)
+    expect(await accept({ action: "admin.overview" })).toBe(true)
+  })
+
+  it("rejects empty or oversized task batches at the schema boundary without effects", async () => {
+    const base = { action: "task.batch", swarmId: "swr_1" }
+    const task = { key: "key", title: "Task" }
+    expect(await accept({ ...base, tasks: [task] })).toBe(true)
+    expect(await decodeFailure({ ...base, tasks: [] })).toContain("task.batch requires 1-8 tasks")
+    expect(await decodeFailure({ ...base, tasks: Array.from({ length: 9 }, (_, index) => ({ ...task, key: "key-" + index })) }))
+      .toContain("task.batch requires 1-8 tasks")
   })
 
   it("treats a blank string as a missing action input", async () => {

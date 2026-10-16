@@ -3,6 +3,8 @@ import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer, Stream } from "effect"
 import path from "path"
+import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
 import { Agent } from "../../src/agent/agent"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -520,6 +522,149 @@ describe("tool.read truncation", () => {
     }),
   )
 
+  it.live("attaches MP4 bytes as video input even with a non-video extension", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const mp4 = Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0])
+      const filename = path.join(dir, "capture.bin")
+      yield* put(filename, mp4)
+      const result = yield* exec(dir, { filePath: filename })
+      expect(result.output).toContain("Video read successfully")
+      expect(result.metadata.truncated).toBe(false)
+      expect(result.attachments).toEqual([
+        { type: "file", mime: "video/mp4", url: `data:video/mp4;base64,${mp4.toString("base64")}` },
+      ])
+    }),
+  )
+
+  it.live("reads TypeScript .ts and .mts as source despite video/mp2t extension metadata", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      for (const filename of ["schema.ts", "module.mts"]) {
+        const filePath = path.join(dir, filename)
+        yield* put(filePath, "export interface Frame { time: number }\nexport const frame: Frame = { time: 3 }\n")
+        const result = yield* exec(dir, { filePath })
+        expect(result.attachments).toBeUndefined()
+        expect(result.output).toContain("TypeScript source candidate")
+        expect(result.output).toContain("export interface Frame")
+        expect(result.metadata).toMatchObject({
+          detectedFileKind: "typescript-candidate", detection: "verified-text-not-video",
+        })
+      }
+    }),
+  )
+
+  it.live("recognizes Qt Linguist translation .ts as XML rather than TypeScript or video", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const filePath = path.join(dir, "en_US.ts")
+      yield* put(filePath, '<?xml version="1.0"?><TS version="2.1"><context/></TS>')
+      const result = yield* exec(dir, { filePath })
+      expect(result.attachments).toBeUndefined()
+      expect(result.metadata).toMatchObject({ detectedFileKind: "qt-translation", detection: "xml-content-header" })
+      expect(result.output).toContain("Qt Linguist XML translation catalog")
+    }),
+  )
+
+  it.live("identifies MPEG-TS .ts video but refuses unsupported direct model ingestion", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const bytes = Buffer.alloc(188 * 8)
+      for (let index = 0; index < 8; index++) {
+        const at = index * 188
+        bytes[at] = 0x47
+        bytes[at + 1] = 0x40
+        bytes[at + 3] = 0x10 | index
+        bytes.fill(0xff, at + 4, at + 188)
+      }
+      const filePath = path.join(dir, "clip.ts")
+      yield* put(filePath, bytes)
+      const error = yield* fail(dir, { filePath })
+      expect(error.message).toContain("MPEG transport stream detected")
+      expect(error.message).toContain("Remux with ffmpeg")
+      expect(error.message).not.toContain("Cannot read binary file")
+    }),
+  )
+
+  it.live("losslessly remuxes real MPEG-TS H264 video before model attachment", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const exe = process.env.OPENFORK_FFMPEG_PATH ??
+        (process.env.LOCALAPPDATA
+          ? path.join(process.env.LOCALAPPDATA, "Microsoft", "WinGet", "Links", "ffmpeg.exe")
+          : "ffmpeg")
+      if (exe !== "ffmpeg" && !existsSync(exe)) return
+      const generated = spawnSync(exe, [
+        "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+        "-i", "testsrc2=size=160x90:rate=10", "-t", "1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts", "pipe:1",
+      ], { timeout: 15_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true })
+      if (generated.error && (generated.error as NodeJS.ErrnoException).code === "ENOENT") return
+      expect(generated.status).toBe(0)
+      const filePath = path.join(dir, "h264.ts")
+      yield* put(filePath, generated.stdout)
+      const result = yield* exec(dir, { filePath })
+      expect(result.metadata).toMatchObject({
+        detectedFileKind: "mpeg-transport-stream",
+        originalMime: "video/mp2t",
+        deliveredMime: "video/mp4",
+        remux: "lossless-container-copy",
+      })
+      const url = result.attachments?.[0]?.url ?? ""
+      expect(result.attachments?.[0]?.mime).toBe("video/mp4")
+      expect(url.startsWith("data:video/mp4;base64,")).toBe(true)
+      expect(Buffer.from(url.slice(url.indexOf(",") + 1), "base64").toString("ascii", 4, 8)).toBe("ftyp")
+      expect(result.output).toContain("losslessly remuxed")
+    }),
+  )
+
+  it.live("refuses inconclusive .ts binary instead of reporting TypeScript or video", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const filePath = path.join(dir, "uncertain.ts")
+      yield* put(filePath, Buffer.from([0x47, 0x00, 0xff, 0x10]))
+      const error = yield* fail(dir, { filePath })
+      expect(error.message).toContain("Ambiguous .ts/.mts file")
+    }),
+  )
+
+  it.live("rejects oversized videos before allocating a base64 payload", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const filename = path.join(dir, "large.mp4")
+      yield* put(filename, Buffer.concat([
+        Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]),
+        Buffer.alloc(20 * 1024 * 1024),
+      ]))
+      const error = yield* fail(dir, { filePath: filename })
+      expect(error.message).toContain("20 MiB direct-input limit")
+    }),
+  )
+
+  it.live("attaches audio with signature-based MIME even when renamed", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const wav = Buffer.from([0x52, 0x49, 0x46, 0x46, 0x24, 0, 0, 0, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74, 0x20])
+      const filename = path.join(dir, "sound.bin")
+      yield* put(filename, wav)
+      const result = yield* exec(dir, { filePath: filename })
+      expect(result.output).toContain("Audio read successfully")
+      expect(result.attachments?.[0].mime).toBe("audio/wav")
+      expect(result.attachments?.[0].url).toBe(`data:audio/wav;base64,${wav.toString("base64")}`)
+    }),
+  )
+
+  it.live("does not deliver a fake video purely because its filename ends in .mp4", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const filename = path.join(dir, "spoofed.mp4")
+      yield* put(filename, "not video: this is a normal plain-text fixture\n")
+      const result = yield* exec(dir, { filePath: filename })
+      expect(result.attachments).toBeUndefined()
+      expect(result.output).toContain("not video: this is a normal plain-text fixture")
+    }),
+  )
+
   it.live("large image files are properly attached without error", () =>
     Effect.gen(function* () {
       const result = yield* exec(FIXTURES_DIR, { filePath: path.join(FIXTURES_DIR, "large-image.png") })
@@ -642,6 +787,34 @@ describe("tool.read subtools", () => {
         symbol: "",
       })
       expect(result.output).toContain("payload survived")
+    }),
+  )
+
+  it.live("does not decode MPEG-TS as TypeScript when it appears in a mixed batch Read", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const code = path.join(dir, "component.ts")
+      const media = path.join(dir, "recording.ts")
+      const uncertain = path.join(dir, "unknown.ts")
+      yield* put(code, "export const visual = true;\n")
+      const bytes = Buffer.alloc(188 * 8)
+      for (let index = 0; index < 8; index++) {
+        const at = index * 188
+        bytes[at] = 0x47
+        bytes[at + 1] = 0x40
+        bytes[at + 3] = 0x10 | index
+        bytes.fill(0xff, at + 4, at + 188)
+      }
+      yield* put(media, bytes)
+      yield* put(uncertain, Buffer.from([0x47, 0, 0xff, 0x10]))
+      const result = yield* exec(dir, { filePaths: [code, media, uncertain] })
+      expect(result.attachments).toBeUndefined()
+      expect(result.output).toContain("export const visual")
+      expect(result.output).toContain('kind="mpeg-transport-stream"')
+      expect(result.output).toContain('kind="unclassified-ts-binary"')
+      expect(result.output).toContain("TypeScript source candidate")
+      expect(result.output).not.toContain("\ufffd")
+      expect(result.metadata.truncated).toBe(false)
     }),
   )
 

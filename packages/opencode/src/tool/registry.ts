@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { createHash } from "node:crypto"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -21,8 +22,13 @@ import { ArchiveTool } from "./archive"
 import { JsonTool } from "./json"
 import { BackgroundTool } from "./background"
 import { MemoryTool } from "./memory"
+import { DreamTool } from "./dream"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
+import { GithubTool } from "./github"
+import { QuotaTool } from "./quota"
+import { UsageTool } from "./usage"
+import { ModelsTool } from "./models"
 import { Git } from "@/git"
 import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { CheckpointTool } from "./checkpoint"
@@ -43,6 +49,8 @@ import { RefactorTool } from "./refactor"
 import { SympyTool } from "./sympy"
 import { createToolAccessTool, isLazyTool, TOOL_ACCESS_ID } from "./access"
 import * as Tool from "./tool"
+import * as Capability from "./capability"
+import { ToolJsonSchema } from "./json-schema"
 import { buildCustomTools } from "./custom"
 import { Config } from "@/config/config"
 import { SessionStatus } from "@/session/status"
@@ -56,6 +64,8 @@ import { ApplyPatchTool } from "./apply_patch"
 import { PatchTool } from "./patch"
 import { BrowserTool } from "./browser"
 import { OfxpTool } from "./ofxp"
+import { CodeTool } from "./code"
+import { RuntimeRefreshTool } from "./runtime-refresh"
 import { BrokerClient } from "@/browser/broker-client"
 import { OfxpRuntime } from "@/ofxp/runtime"
 import { ExternalToolCoverage } from "@/exchange/tool-coverage"
@@ -80,11 +90,14 @@ import { SessionIngress } from "@/session/ingress"
 import { ShellJob } from "@/background/shell-job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import type { JSONSchema7 } from "@ai-sdk/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
+import { ToolInterrupt } from "@/tool/interrupt"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppProcess } from "@opencode-ai/core/process"
 import { McpCatalog } from "@/mcp/catalog"
+import * as McpResourceTools from "@/mcp/resource-capabilities"
 import { Memory } from "@opencode-ai/core/memory"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import { ScheduledTaskAgent } from "@opencode-ai/core/scheduled-task/agent"
@@ -92,6 +105,12 @@ import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
 import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
 import { SwarmContainment } from "@/swarm/containment"
+import { SavedCodeCatalog } from "@/code/saved"
+import * as SavedCapability from "@/code/saved-capability"
+import type { SessionID } from "@/session/schema"
+import { Quota } from "@/quota/quota"
+import { Usage } from "@/usage/usage"
+import { ModelsDev } from "@opencode-ai/core/models-dev"
 
 export function webSearchEnabled(
   providerID: ProviderV2.ID,
@@ -113,6 +132,7 @@ export function webSearchEnabled(
 type ReadDef = Tool.InferDef<typeof ReadTool>
 
 type State = {
+  generation: number
   custom: Tool.Def[]
   builtin: Tool.Def[]
   read: ReadDef
@@ -127,6 +147,9 @@ const snapshotReadOnlyTools = new Set([
   "todo",
   "skill",
   "memory",
+  "github",
+  "quota",
+  "usage",
   "project",
   "symbols",
   "sympy",
@@ -160,6 +183,12 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
   const args = inputRecord(input)
 
   switch (toolID) {
+    case "code":
+      // Discovery and exact contract inspection cannot mutate the project tree.
+      // run/call may dispatch mutating leaves, while save publishes a durable
+      // filesystem-authoritative artifact, so every other Code action remains
+      // conservatively mutating.
+      return args.action !== "search" && args.action !== "describe"
     case "archive":
       return args.action !== "list" && args.action !== "read"
     case "json": {
@@ -179,6 +208,8 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
       return !["list", "status", "read", "wait"].includes(String(args.action))
     case "swarm":
       return args.action === "recover.members"
+    case "dream":
+      return false
     case "swarm_member":
       // Session-derived Swarm collaboration is durable-domain state only. It
       // never reads or writes workspace files: `files` in publish records a path
@@ -191,6 +222,29 @@ export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean 
 
 const delegatedPermissionTools = new Set([FindTool.id, WebTool.id, BrowserTool.id])
 
+// Host-owned Dreamer is a historical read-only role, not an ordinary
+// configurable coding agent. An inherited Session allow or a custom/MCP
+// registration must never extend these two inspection leaves.
+const dreamerAllows = (toolID: string) => toolID === "memory" || toolID === "session"
+
+const nonCodeCallableTools = new Set(["invalid", TOOL_ACCESS_ID, "code"])
+
+const durableCapabilityTools = new Set([
+  "background",
+  "dream",
+  "goal",
+  "scheduled_task",
+  "task",
+  "session",
+  "swarm",
+  "swarm_create",
+  "ofxp",
+])
+
+function capabilityLifetime(toolID: string): Capability.Lifetime {
+  return durableCapabilityTools.has(toolID) ? "durable" : "inline"
+}
+
 /**
  * Provider-visible aliases must never widen an older permission boundary.
  *
@@ -200,6 +254,55 @@ const delegatedPermissionTools = new Set([FindTool.id, WebTool.id, BrowserTool.i
  */
 const providerPermissionOwners: Readonly<Record<string, string>> = {
   swarm_create: "swarm",
+  dream: "task",
+}
+
+type ModelSelectionInput = {
+  providerID: ProviderV2.ID
+  modelID: ModelV2.ID
+}
+
+function selectModelTools(tools: readonly Tool.Def[], input: ModelSelectionInput, includeLazy: boolean) {
+  const usePatch =
+    input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
+
+  return tools.filter((tool) => {
+    if (!includeLazy && isLazyTool(tool)) return false
+    if (tool.id === ApplyPatchTool.id) return usePatch
+    if (tool.id === PatchTool.id) return !usePatch
+    if (tool.id === EditTool.id || tool.id === WriteTool.id) return !usePatch
+    return true
+  })
+}
+
+function fingerprint(parts: readonly string[]) {
+  let hash = 0x811c9dc5
+  for (const part of parts) {
+    for (let index = 0; index < part.length; index++) {
+      hash ^= part.charCodeAt(index)
+      hash = Math.imul(hash, 0x01000193)
+    }
+    hash ^= 0xff
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0")
+}
+
+function searchGeneration(entries: readonly Capability.Registration[]) {
+  const hash = createHash("sha256")
+  for (const entry of [...entries].sort((a, b) => a.identity.ref.localeCompare(b.identity.ref))) {
+    hash.update(entry.identity.ref)
+    hash.update("\0")
+    hash.update(entry.identity.segments.join("\0"))
+    hash.update("\0")
+    hash.update(entry.kind)
+    hash.update("\0")
+    hash.update(entry.description)
+    hash.update("\0")
+    hash.update(entry.codeCallable ? "1" : "0")
+    hash.update("\xff")
+  }
+  return `search:${hash.digest("hex")}`
 }
 
 function providerPolicy(toolID: string, ruleset: PermissionV1.Ruleset): PermissionV1.Rule {
@@ -229,6 +332,14 @@ export interface Interface {
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
   }) => Effect.Effect<Tool.Def[]>
+  readonly capabilities: (model: {
+    providerID: ProviderV2.ID
+    modelID: ModelV2.ID
+    agent: Agent.Info
+    permission?: PermissionV1.Ruleset
+    /** Real provider-root session; required for physical-scope saved overlays. */
+    sessionID?: SessionID
+  }) => Effect.Effect<Capability.Inventory>
   readonly refreshCustom: (custom: Tool.Def[]) => Effect.Effect<{
     added: string[]
     updated: string[]
@@ -248,6 +359,8 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
     const snapshot = yield* Snapshot.Service
+    const session = yield* Session.Service
+    const savedCatalog = yield* SavedCodeCatalog.Service
 
     const guardSnapshot = <T extends Tool.Def>(tool: T): T => {
       const execute = tool.execute
@@ -278,8 +391,13 @@ const layer = Layer.effect(
     const jsontool = yield* JsonTool
     const backgroundtool = yield* BackgroundTool
     const memorytool = yield* MemoryTool
+    const dreamtool = yield* DreamTool
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
+    const githubtool = yield* GithubTool
+    const quotaTool = yield* QuotaTool
+    const usageTool = yield* UsageTool
+    const modelsTool = yield* ModelsTool
     const checkpointtool = yield* CheckpointTool
     const goaltool = yield* GoalTool
     const scheduledtasktool = yield* ScheduledTaskTool
@@ -296,8 +414,8 @@ const layer = Layer.effect(
     const patchTool = yield* PatchTool
     const browsertool = yield* BrowserTool
     const ofxptool = yield* OfxpTool
-    const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
-    const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
+    const codeTool = yield* CodeTool
+    const runtimeRefreshTool = yield* RuntimeRefreshTool
 
     const state = yield* InstanceState.make<Ref.Ref<State>>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
@@ -330,8 +448,13 @@ const layer = Layer.effect(
           json: Tool.init(jsontool),
           background: Tool.init(backgroundtool),
           memory: Tool.init(memorytool),
+          dream: Tool.init(dreamtool),
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
+          github: Tool.init(githubtool),
+          quota: Tool.init(quotaTool),
+          usage: Tool.init(usageTool),
+          models: Tool.init(modelsTool),
           checkpoint: Tool.init(checkpointtool),
           goal: Tool.init(goaltool),
           scheduledTask: Tool.init(scheduledtasktool),
@@ -352,7 +475,8 @@ const layer = Layer.effect(
           plan: Tool.init(plan),
           browser: Tool.init(browsertool),
           ofxp: Tool.init(ofxptool),
-          ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
+          code: Tool.init(codeTool),
+          runtimeRefresh: Tool.init(runtimeRefreshTool),
         })
 
         const tool = Object.fromEntries(
@@ -372,6 +496,7 @@ const layer = Layer.effect(
         ])
 
         return yield* Ref.make<State>({
+          generation: 1,
           custom,
           builtin: [
             tool.invalid,
@@ -389,8 +514,13 @@ const layer = Layer.effect(
             tool.json,
             tool.background,
             tool.memory,
+            tool.dream,
             tool.sqlite,
             tool.git,
+            tool.github,
+            tool.quota,
+            tool.usage,
+            tool.models,
             tool.checkpoint,
             tool.goal,
             tool.scheduledTask,
@@ -409,7 +539,8 @@ const layer = Layer.effect(
             tool.patch,
             tool.browser,
             tool.ofxp,
-            ...(tool.execute ? [tool.execute] : []),
+            tool.code,
+            tool.runtimeRefresh,
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
           ],
@@ -441,7 +572,7 @@ const layer = Layer.effect(
       const builtin = current.builtin.map((tool) =>
         tool.id === TOOL_ACCESS_ID ? createToolAccessTool(lazy, plugin) : tool,
       )
-      yield* Ref.set(stateRef, { ...current, builtin, custom: guarded })
+      yield* Ref.set(stateRef, { ...current, generation: current.generation + 1, builtin, custom: guarded })
       const currentIds = new Set(current.custom.map((tool) => tool.id))
       const nextIds = new Set(guarded.map((tool) => tool.id))
       return {
@@ -470,30 +601,228 @@ const layer = Layer.effect(
       return ["Available agent types and the tools they have access to:", description].join("\n")
     })
 
-    const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (input: {
-      agent: Agent.Info
-      permission?: PermissionV1.Ruleset
-    }) {
-      if (!codeMode) return
-      const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
-      const tools = Permission.visibleTools(yield* mcp.tools(), ruleset)
-      if (Object.keys(tools).length === 0) return
-      return codeMode.describeCatalog(tools, Object.keys(yield* mcp.clients()).map(McpCatalog.sanitize))
+    const shapeDefinition = Effect.fn("ToolRegistry.shapeDefinition")(function* (
+      tool: Tool.Def,
+      input: { agent: Agent.Info },
+    ) {
+      const output = {
+        description: tool.description,
+        parameters: tool.parameters,
+        jsonSchema: tool.jsonSchema,
+      }
+      yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
+      const jsonSchema =
+        output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
+          ? output.jsonSchema
+          : undefined
+      return {
+        description: [
+          output.description,
+          tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        parameters: output.parameters,
+        jsonSchema,
+      }
+    })
+
+    const capabilities: Interface["capabilities"] = Effect.fn("ToolRegistry.capabilities")(function* (input) {
+      const current = yield* readState()
+      const dreamer = input.agent.name === "dreamer"
+      const candidates = selectModelTools([...current.builtin, ...current.custom], input, true)
+        .filter((tool) => !dreamer || dreamerAllows(tool.id))
+      const nativeEntries = yield* Effect.forEach(
+        candidates,
+        Effect.fnUntraced(function* (tool: Tool.Def) {
+          const shaped = yield* shapeDefinition(tool, input)
+          const shapedTool = {
+            ...tool,
+            description: shaped.description,
+            parameters: shaped.parameters,
+            jsonSchema: shaped.jsonSchema,
+          } as Tool.Def
+          const inputSchema = ToolJsonSchema.fromTool(shapedTool)
+          const initialized = Tool.hasSemantic(tool)
+          const identity = Capability.nativeIdentity(tool.id)
+          const owner = providerPermissionOwners[tool.id]
+
+          return {
+            identity,
+            kind: isLazyTool(tool) ? "lazy" : "native",
+            description: shaped.description,
+            inputSchema,
+            permissionKey: tool.id,
+            ...(owner ? { delegatesTo: [owner] } : {}),
+            invokeSemantic: initialized
+              ? (args, ctx) => tool.semantic(args as never, ctx)
+              : (args, ctx) => tool.execute(args as never, ctx),
+            authorize: ({ authority }) => {
+              const policy = providerPolicy(tool.id, authority.ruleset)
+              return policy.action === "deny"
+                ? Effect.fail(new PermissionV1.DeniedError({ ruleset: [policy] }))
+                : Effect.void
+            },
+            authorityBinding: `native:${tool.id}`,
+            classifyWorkspaceMutation: (args) => toolMayMutateWorkspace(tool.id, args),
+            codeCallable: initialized && !nonCodeCallableTools.has(tool.id),
+            lifetime: capabilityLifetime(tool.id),
+          } satisfies Capability.Registration
+        }),
+        { concurrency: 8 },
+      )
+
+      const exactMcp = yield* mcp.exactTools()
+      const mcpClients = yield* mcp.clients()
+      const resourceServers = Object.entries(mcpClients)
+        .filter(([, client]) => !!client.getServerCapabilities()?.resources)
+        .map(([name]) => name)
+        .sort((a, b) => a.localeCompare(b))
+      const permissionKeyCounts = new Map<string, number>()
+      for (const entry of exactMcp) {
+        const permissionKey = McpCatalog.toolName(entry.server, entry.def.name)
+        permissionKeyCounts.set(permissionKey, (permissionKeyCounts.get(permissionKey) ?? 0) + 1)
+      }
+
+      const mcpEntries: Capability.Registration[] = (dreamer ? [] : exactMcp).map((entry) => {
+        const permissionKey = McpCatalog.toolName(entry.server, entry.def.name)
+        const collision = (permissionKeyCounts.get(permissionKey) ?? 0) > 1
+        const inputSchema = ToolJsonSchema.fromJsonSchema({
+          ...(entry.def.inputSchema as JSONSchema7),
+          type: "object",
+          properties: (entry.def.inputSchema.properties ?? {}) as JSONSchema7["properties"],
+          additionalProperties: false,
+        })
+        const outputSchema = entry.def.outputSchema
+          ? ToolJsonSchema.fromJsonSchema(entry.def.outputSchema as JSONSchema7)
+          : undefined
+        const identity = Capability.mcpIdentity(entry.server, entry.def.name)
+
+        return {
+          identity,
+          kind: "mcp",
+          description: entry.def.description ?? "",
+          inputSchema,
+          ...(outputSchema ? { outputSchema } : {}),
+          permissionKey,
+          invokeSemantic: (args, ctx) =>
+            Effect.gen(function* () {
+              yield* ctx.ask({
+                permission: permissionKey,
+                metadata: { server: entry.server, tool: entry.def.name },
+                patterns: ["*"],
+                always: ["*"],
+              })
+              const result = yield* mcp.invokeTool({
+                server: entry.server,
+                tool: entry.def.name,
+                args,
+                signal: ctx.abort,
+              })
+              const projected = McpCatalog.projectToolResult(result)
+              return {
+                title: "",
+                metadata: projected.metadata,
+                output: projected.output,
+                ...(projected.data === undefined ? {} : { data: projected.data }),
+                ...(projected.attachments ? { attachments: projected.attachments } : {}),
+              }
+            }),
+          authorize: ({ authority }) => {
+            const policy = Permission.evaluate(permissionKey, "*", authority.ruleset)
+            return policy.action === "deny"
+              ? Effect.fail(new PermissionV1.DeniedError({ ruleset: [policy] }))
+              : Effect.void
+          },
+          authorityBinding: `mcp:${Capability.encodeSegment(entry.server)}`,
+          classifyWorkspaceMutation: () => true,
+          codeCallable: !collision,
+          lifetime: "inline",
+          ...(collision
+            ? {
+                diagnostic: {
+                  kind: "AmbiguousPermissionIdentity",
+                  message: `MCP capability ${identity.ref} collides on legacy permission key ${permissionKey}`,
+                },
+              }
+            : {}),
+        } satisfies Capability.Registration
+      })
+
+      const resourceEntries: Capability.Registration[] =
+        dreamer || resourceServers.length === 0
+          ? []
+          : McpResourceTools.definitions.map((definition) => ({
+              identity: Capability.mcpResourceIdentity(definition.id),
+              kind: "mcp-resource",
+              description: definition.description,
+              inputSchema: definition.inputSchema,
+              permissionKey: "read",
+              invokeSemantic: (args, ctx) => definition.invoke(mcp, args, ctx),
+              authorize: ({ authority, args }) =>
+                McpResourceTools.authorize(mcp, definition.id, args, authority.ruleset),
+              authorityBinding: `mcp-resource:${resourceServers
+                .map((server) => Capability.encodeSegment(server))
+                .join(",")}`,
+              classifyWorkspaceMutation: () => false,
+              codeCallable: true,
+              lifetime: "inline",
+            }))
+
+      const baseEntries = [...nativeEntries, ...mcpEntries, ...resourceEntries]
+      let savedItems: readonly SavedCodeCatalog.LoadedRevision[] = []
+      let savedContext: SavedCodeCatalog.ScopeContext | undefined
+      if (!dreamer && input.sessionID) {
+        const physical = yield* session
+          .physicalScope(input.sessionID)
+          .pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (physical) {
+          savedContext = {
+            project: {
+              root: physical.root,
+              key: physical.key,
+            },
+          }
+          savedItems = yield* savedCatalog
+            .list(savedContext)
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning(
+                  `Saved Code catalog discovery failed closed: ${cause instanceof Error ? cause.message : String(cause)}`,
+                ).pipe(Effect.as([] as readonly SavedCodeCatalog.LoadedRevision[])),
+              ),
+            )
+        }
+      }
+      const savedEntries = SavedCapability.registrations(
+        savedItems,
+        baseEntries,
+        savedContext
+          ? { resolveExact: (selector) => savedCatalog.resolve(savedContext!, selector) }
+          : {},
+      )
+      const entries = [...baseEntries, ...savedEntries]
+      const refs = new Set<string>()
+      for (const entry of entries) {
+        if (refs.has(entry.identity.ref)) {
+          return yield* Effect.die(new Error(`Duplicate capability ref: ${entry.identity.ref}`))
+        }
+        refs.add(entry.identity.ref)
+      }
+
+      return {
+        generation: `registry:${current.generation}:${input.providerID}:${input.modelID}:mcp:${fingerprint([...exactMcp.flatMap((entry) => [entry.server, entry.def.name, entry.def.description ?? "", JSON.stringify(entry.def.inputSchema), JSON.stringify(entry.def.outputSchema ?? null)]), ...resourceServers.map((server) => `resource:${server}`)])}:saved:${fingerprint(savedItems.flatMap((item) => [item.handle, item.manifest?.descriptorFingerprint ?? "", item.admitted ? "1" : "0", item.diagnostic?.kind ?? "", item.diagnostic?.message ?? ""]))}`,
+        searchGeneration: searchGeneration(entries),
+        entries: Object.freeze(entries),
+        byRef: new Map(entries.map((entry) => [entry.identity.ref, entry] as const)),
+      } satisfies Capability.Inventory
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
       const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
-      const candidates = (yield* all()).filter((tool) => {
-        if (isLazyTool(tool)) return false
-
-        const usePatch =
-          input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
-        if (tool.id === ApplyPatchTool.id) return usePatch
-        if (tool.id === PatchTool.id) return !usePatch
-        if (tool.id === EditTool.id || tool.id === WriteTool.id) return !usePatch
-
-        return true
-      })
+      const current = yield* readState()
+      const candidates = selectModelTools([...current.builtin, ...current.custom], input, false)
+        .filter((tool) => input.agent.name !== "dreamer" || dreamerAllows(tool.id))
       // IMPORTANT: do not filter provider-visible tools by session permission here.
       // The tool prefix is cache-sensitive. A local/session policy such as
       // `swarm_* = deny` must not mutate the manifest and destroy prompt-cache
@@ -501,39 +830,19 @@ const layer = Layer.effect(
       // returned execute closure before the underlying tool can run.
       const filtered = candidates
 
-      const codeModeDescription = filtered.some((tool) => tool.id === "execute")
-        ? yield* describeCodeMode(input)
-        : undefined
-      const visible = filtered.filter((tool) => tool.id !== "execute" || codeModeDescription)
-
       return yield* Effect.forEach(
-        visible,
+        filtered,
         Effect.fnUntraced(function* (tool: Tool.Def) {
           // Composite provider tools defer action-specific authorization to
           // their delegated leaf tools. This preserves legacy rules such as
           // `*=deny, grep=allow, glob=allow` after the provider-facing merge.
           const policy = providerPolicy(tool.id, ruleset)
-          const output = {
-            description: tool.description,
-            parameters: tool.parameters,
-            jsonSchema: tool.jsonSchema,
-          }
-          yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
-          const jsonSchema =
-            output.parameters === tool.parameters || output.jsonSchema !== tool.jsonSchema
-              ? output.jsonSchema
-              : undefined
+          const shaped = yield* shapeDefinition(tool, input)
           return {
             id: tool.id,
-            description: [
-              output.description,
-              tool.id === TaskTool.id ? yield* describeTask(input.agent) : undefined,
-              tool.id === "execute" ? codeModeDescription : undefined,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-            parameters: output.parameters,
-            jsonSchema,
+            description: shaped.description,
+            parameters: shaped.parameters,
+            jsonSchema: shaped.jsonSchema,
             execute:
               policy.action === "deny"
                 ? () => Effect.die(new PermissionV1.DeniedError({ ruleset: [policy] }))
@@ -550,7 +859,7 @@ const layer = Layer.effect(
       return { read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools, refreshCustom })
+    return Service.of({ ids, all, named, tools, capabilities, refreshCustom })
   }),
 )
 
@@ -583,6 +892,7 @@ export const node = LayerNode.make({
     SessionIngress.node,
     ShellJob.node,
     Provider.node,
+    Permission.node,
     LSP.node,
     Instruction.node,
     FSUtil.node,
@@ -593,8 +903,15 @@ export const node = LayerNode.make({
     Format.node,
     Truncate.node,
     RuntimeFlags.node,
+    // CodeTool executes through the shared invocation gateway and acquires
+    // ToolInterrupt while ToolRegistry is being built. LayerNode dependencies
+    // are locally scoped, so the process-level group registration is not enough.
+    ToolInterrupt.node,
     MCP.node,
     Database.node,
+    Quota.node,
+    Usage.node,
+    ModelsDev.node,
     Checkpoint.readNode,
     Snapshot.node,
     TurnCheckpoint.node,
@@ -611,6 +928,7 @@ export const node = LayerNode.make({
     BrokerClient.node,
     OfxpRuntime.node,
     Memory.node,
+    SavedCodeCatalog.node,
     locationServiceMapNode,
   ],
 })

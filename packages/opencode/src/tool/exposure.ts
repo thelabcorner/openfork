@@ -7,12 +7,17 @@
 export const BUILTIN_LAZY_TOOL_IDS = Object.freeze([
   "archive",
   "checkpoint",
+  "dream",
+  "github",
   "json",
+  "models",
+  "quota",
   "refactor",
   "sqlite",
   "swarm",
   "sympy",
   "test",
+  "usage",
 ] as const)
 
 const lazy = new Set<string>(BUILTIN_LAZY_TOOL_IDS)

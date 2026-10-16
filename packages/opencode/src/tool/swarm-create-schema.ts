@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { Agent } from "@opencode-ai/schema/agent"
+import { SwarmCreationKey } from "@/swarm/creation-key"
 import { Model } from "@opencode-ai/schema/model"
 import { Permission } from "@opencode-ai/schema/permission"
 import { Provider } from "@opencode-ai/schema/provider"
@@ -25,7 +25,7 @@ export const DelegateMemberInput = Schema.Struct({
   role: Schema.String.annotate({ description: "Concise worker role." }),
   desiredProfile: SwarmModel.MemberExecutionProfile.annotate({
     description:
-      "Explicit managed-worker execution profile: agent, provider/model, hard permissionBoundary, and optional model requirements.",
+      "Explicit managed-worker execution profile: agent must be swarm-m, provider/model is selected independently, with hard permissionBoundary and optional model requirements.",
   }),
   workspacePolicy: SwarmModel.WorkspacePolicy.annotate({
     description: "Worker workspace policy: shared-read, shared-write, or isolated worktree.",
@@ -46,7 +46,6 @@ export const DelegateMemberInput = Schema.Struct({
 export const CreateMemberInput = Schema.Struct({
   name: Schema.String.annotate({ description: "Unique worker roster name." }),
   role: Schema.String.annotate({ description: "Concise worker role." }),
-  agent: Agent.ID.annotate({ description: "Managed worker agent id." }),
   providerID: Provider.ID.annotate({ description: "Managed worker model provider id." }),
   modelID: Model.ID.annotate({ description: "Managed worker model id." }),
   accountID: Schema.optional(Schema.String).annotate({ description: "Optional provider account id." }),
@@ -89,6 +88,10 @@ export const TaskInput = Schema.Struct({
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Json)).annotate({
     description: "Structured low-authority task metadata.",
   }),
+  attachments: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Optional symbolic handles for user uploads to deliver to the assigned member's initial model request. Only handles shown in the coordinator's attachment manifest, returned by an explicit session-index lookup, or already granted are accepted; omitted or empty means no attachments.",
+  }),
   dependsOn: Schema.optional(Schema.Array(DependencyInput)).annotate({
     description: "Prerequisite task keys. Dependencies may reference tasks declared later in the same request.",
   }),
@@ -103,6 +106,9 @@ export const TaskInput = Schema.Struct({
  * delegates to the exact same SwarmCommand workflow used by lazy delegate.
  */
 export const Parameters = Schema.Struct({
+  requestKey: Schema.optional(SwarmCreationKey.Input).annotate({
+    description: "Optional retry-safe creation key (1-128 ASCII letters/digits/._:-). Reusing the same key from this coordinator Session never creates another Swarm; on conflict inspect the reported swarmId rather than assuming completion.",
+  }),
   name: Schema.String.annotate({
     description: "Name for the new native Swarm.",
   }),
@@ -114,10 +120,10 @@ export const Parameters = Schema.Struct({
   }),
   members: Schema.optional(Schema.Array(CreateMemberInput)).annotate({
     description:
-      "Managed workers using flat execution fields. permissionBoundary is explicit; workspace safely defaults to shared-read.",
+      "Managed workers always run in the dedicated swarm-m agent mode. Choose provider/model separately. permissionBoundary is explicit; workspace safely defaults to shared-read.",
   }),
   tasks: Schema.optional(Schema.Array(TaskInput)).annotate({
-    description: "Initial task DAG. dependsOn references request-local task keys.",
+    description: "Initial task DAG. dependsOn references initial task keys. Keys remain addressable by later lazy swarm task.batch calls; stage large requests based on measured failure risk.",
   }),
 })
 

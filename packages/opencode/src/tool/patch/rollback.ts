@@ -1,6 +1,7 @@
 import { Effect } from "effect"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
+import { atomicWrite } from "../edit/commit"
 
 export type Restorable = {
   filePath: string
@@ -86,7 +87,7 @@ export const withRollback = Effect.fn("PatchRollback.with")(function* <A, E, R>(
           }
           const restored = yield* (
             entry.existedBefore
-              ? afs.writeWithDirs(entry.filePath, Bom.join(entry.contentBefore, entry.bom))
+              ? atomicWrite(afs, entry.filePath, Bom.join(entry.contentBefore, entry.bom))
               : afs.remove(entry.filePath)
           ).pipe(
             Effect.as(true),

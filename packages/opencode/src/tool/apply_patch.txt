@@ -3,11 +3,11 @@ Use `apply_patch` for file mutations. This is the GPT-facing name for OpenFork's
 The tool accepts either the native OpenFork patch format below or a git-style unified diff. `format:"auto"` is the default and detects which one you supplied.
 
 QoL/safety controls:
-- `apply:true` is the `apply_patch` default: validate the entire change set, ask once, atomically apply it, and fail without writes if any conflict exists.
-- `apply:"if-clean"`: validate first; if there are zero conflicts, ask once and atomically apply it. If conflicts exist, return a compact plan without writing.
+- `apply:true` is the `apply_patch` default: validate the entire change set, ask once, apply it, and fail without writes if any conflict exists. If a write fails partway through, the engine attempts to restore files it can still verify it owns.
+- `apply:"if-clean"`: validate first; if there are zero conflicts, ask once and apply it. If conflicts exist, return a compact plan without writing.
 - `apply:false`: dry-run only. Validate and return the plan without writing or asking permission.
 - `showDiff:true`: include per-file diffs in plan output. Default false keeps plans token-lean.
-- The engine checks stale prior reads, merges repeated update sections safely, supports add/update/delete/move, serializes overlapping writes with file locks, and rolls back captured preimages if commit fails.
+- The engine checks stale prior reads and post-approval file state, merges repeated update sections safely, supports add/update/delete/move, serializes overlapping writes with file locks, and uses a guarded rollback journal if commit fails.
 
 Native OpenFork patch format:
 

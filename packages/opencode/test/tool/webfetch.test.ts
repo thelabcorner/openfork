@@ -1,11 +1,11 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
-import { WebFetchTool } from "../../src/tool/webfetch"
+import { WebFetchTool, applyGitHubNudge, isGitHubUrl } from "../../src/tool/webfetch"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Tool } from "@/tool/tool"
 import { testEffect } from "../lib/effect"
@@ -116,4 +116,61 @@ describe("tool.webfetch", () => {
         }),
     ),
   )
+
+  it.instance("bounds chunked response bodies before buffering past the 5MB limit", () =>
+    withFetch(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(3 * 1024 * 1024))
+              controller.enqueue(new Uint8Array(3 * 1024 * 1024))
+              controller.close()
+            },
+          }),
+          { headers: { "content-type": "text/plain" } },
+        ),
+      (url) =>
+        Effect.gen(function* () {
+          const exit = yield* Effect.exit(exec({ url: new URL("/chunked.txt", url).toString(), format: "text" }))
+          expect(Exit.isFailure(exit)).toBe(true)
+        }),
+    ),
+  )
+})
+
+describe("tool.webfetch github routing", () => {
+  test("recognizes GitHub content hosts", () => {
+    for (const url of [
+      "https://github.com/owner/repo/pull/123.diff",
+      "https://www.github.com/owner/repo",
+      "https://api.github.com/repos/owner/repo",
+      "https://raw.githubusercontent.com/owner/repo/main/file.ts",
+      "https://patch-diff.githubusercontent.com/raw/owner/repo/pull/123.diff",
+      "https://codeload.github.com/owner/repo/tar.gz/main",
+      "https://GITHUB.COM/owner/repo",
+    ]) {
+      expect(isGitHubUrl(url)).toBe(true)
+    }
+  })
+
+  test("leaves non-GitHub and unsupported hosts alone", () => {
+    for (const url of [
+      "https://example.com/page",
+      "https://gist.github.com/user/abc",
+      "https://github.example.com/owner/repo",
+      "not a url",
+      "",
+    ]) {
+      expect(isGitHubUrl(url)).toBe(false)
+    }
+  })
+
+  test("nudges toward the github tool only for GitHub hosts", () => {
+    const nudged = applyGitHubNudge("diff content", "https://github.com/owner/repo/pull/123.diff")
+    expect(nudged.startsWith("diff content")).toBe(true)
+    expect(nudged).toContain("github tool")
+    expect(nudged).toContain('argv:["pr","diff","123"]')
+    expect(applyGitHubNudge("hello", "https://example.com/page")).toBe("hello")
+  })
 })

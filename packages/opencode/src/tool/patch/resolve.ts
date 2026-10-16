@@ -5,6 +5,7 @@ import { adaptReplacementTerminators } from "@opencode-ai/core/line-ending"
 import { FUZZ } from "../edit/span"
 import { orderSpans, type Span } from "../edit/span"
 import { candidateConflictHint } from "../conflict"
+import { absorbDeletionNewline } from "../edit/heal"
 import type { UpdateFileChunk } from "../../patch"
 
 export type ResolvedChunk = {
@@ -269,10 +270,22 @@ export function deriveContent(
   filePath: string,
 ): { content: string; spans: Span[]; warnings: string[] } {
   const resolvedChunks = resolveChunks(content, chunks, filePath)
-  const spans = resolvedChunks.map((r) => ({
-    ...r.span,
-    replacement: adaptReplacementTerminators(content, r.span.start, r.span.end, r.span.replacement),
-  }))
+  const spans = resolvedChunks.map((r) => {
+    const span = {
+      ...r.span,
+      replacement: adaptReplacementTerminators(content, r.span.start, r.span.end, r.span.replacement),
+    }
+    // A unified-diff hunk that removes complete lines and adds no lines must
+    // consume the following line terminator too. Otherwise `a\nb\nc` with
+    // `-b` becomes `a\n\nc`, silently turning a deletion into a blank line.
+    return r.chunk.new_lines.length === 0 ? absorbDeletionNewline(content, span).value : span
+  })
+  try {
+    orderSpans(spans, `${filePath}: patch`)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`overlapping chunks in ${filePath}: ${detail}`)
+  }
   const warnings = resolvedChunks
     .filter((r) => r.fuzz !== 0)
     .map(

@@ -9,28 +9,28 @@ ROUTING — decide this before mutating:
 - A single brand-new file with no other changes -> `write`.
 
 SINGLE-EDIT PATHWAY (filePath, plus exactly one of):
-- oldString/newString: exact replacement; safest for small blocks. replaceAll:true renames every occurrence (exact matches only).
+- oldString with newString or newText: exact replacement of single- or multi-line text; both replacement names are accepted and must agree if both are supplied. Empty oldString creates a file or initializes an existing empty file, but cannot replace text in a non-empty file. replaceAll:true renames every occurrence (exact matches only) and requires a non-empty oldString. For a duplicated target, use selection:{mode:"one",atLine:N} after checking the target line, or selection:{mode:"selected",atLines:[N,M]} for a verified subset in one atomic edit. For deliberate multi-replacement, selection:{mode:"all",expectedMatches:N} asserts the exact match count before writing. Do not combine contradictory selection modes with replaceAll.
 - line + oldText + newText: replace line N. oldText is REQUIRED and must be text currently on that line.
 - startLine + endLine + newText (+ oldText): replace a range. Ranges over 5 lines require oldText whose first and last lines match the range's endpoints. Add delete:true (no newText) to REMOVE the range.
 - insertAt + newText: insert after line N. insertAt:0 prepends. Any N>0 requires oldText confirming line N.
 - appendFile:true + newText: append at EOF.
 - nearText + oldText + newText (+ occurrence): replace oldText within ±5 lines of a unique anchor.
-- edits:[...]: single-file atomic batch of the above shapes. Every op is validated against the file as read, overlaps are rejected, and ops apply against original coordinates so earlier edits never shift later targets.
+- edits:[...]: single-file atomic batch of the above shapes. An exact op accepts {oldString,newString} or {oldString,newText}; conflicting replacement aliases are refused. Select one strategy per op. Every op is validated against the file as read, overlaps are rejected, and ops apply against original coordinates so earlier edits never shift later targets.
 
 RULES
-- Read establishes this session's file grounding. Successful edit/write/patch changes made by THIS SAME SESSION advance that grounding automatically. Do NOT spend another tool call re-reading merely because your own previous mutation changed the file; that is redundant context churn and token waste.
+- A plain text read or tail establishes this session's line grounding. Outline, grep, and around are navigation/excerpt views: they record freshness but do not count as a full text read for line-targeted edits. Successful edit/write/patch changes made by THIS SAME SESSION advance freshness automatically, but a write does not create line grounding. Do NOT re-read merely because your own previous mutation changed the file; that is redundant context churn and token waste.
 - A stale-file refusal specifically means the path changed OUTSIDE this session after it was last observed. Re-read once on that signal, then continue. Line-targeted edits without an actual read still carry a grounding warning.
 - Preserve exact indentation as it appears AFTER the `N: ` read prefix; never include the prefix (it is stripped with a warning if detected).
-- Ambiguous targets are REFUSED, never guessed: if text matches more than one location the error lists every candidate line number. Add context, or use replaceAll for a deliberate rename.
+- Ambiguous targets are REFUSED, never guessed: if text matches more than one location the error lists candidate lines and their distinguishing adjacent context. Use selection:{mode:"one",atLine:N} for one verified occurrence, selection:{mode:"selected",atLines:[N,M]} for a verified subset, add context, or use selection:{mode:"all",expectedMatches:N} for a deliberate bounded rename. A selected line must match EXACTLY (no fuzzy fallback); an expected-count mismatch writes nothing.
 - If a match is resolved by anything other than exact text, the result says so — send exact text next time.
 - A no-op returns applied=0 without writing. applied reflects the TRUE number of changes.
 - If the formatter explicitly reports that it reshaped the file, re-read before further line-number-targeted edits because line coordinates may have shifted.
 - runTypecheck:true runs a scoped tsgo/tsc check (single-edit pathway only).
 - AVOID emojis unless explicitly requested.
 
-BULK PATHWAY (patchText + optional apply/format/showDiff)
+BULK PATHWAY (patchText + optional apply mode, patch-format hint, and showDiff)
 - apply defaults to "if-clean": validate everything, then apply in the same call if there are zero conflicts, or return a plan and write nothing if there are any. apply:false forces a plan; apply:true forces application.
-- EVERY hunk is validated BEFORE ANY write, hunks are positioned by unique content match (an ambiguous hunk is refused with candidate line numbers, not applied to the first match), and the write loop unwinds completely on failure — never a half-applied refactor.
+- EVERY hunk is validated BEFORE ANY write, hunks are positioned by unique content match (an ambiguous hunk is refused with candidate line numbers, not applied to the first match), and files are rechecked after approval. If a write fails partway through, the tool attempts to restore files it can still verify it owns.
 - Repeated `*** Update File:` sections for one path are merged; contradictory operations on one path are reported as conflicts, never silently dropped.
 - Two formats, auto-detected (pass format to force): the opencode format (*** Begin Patch / *** Add File: / *** Update File: + @@ hunks / *** Move to: / *** Delete File: / *** End Patch), or a git-style unified diff pasted directly.
 - Every hunk needs at least one context or removed line; a hunk of pure additions has no determinable position and is refused (use insertAt/appendFile instead).

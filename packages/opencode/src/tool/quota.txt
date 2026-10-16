@@ -1,0 +1,11 @@
+Inspect provider quota, balance, and reset state from OpenFork's canonical Limits/Quota owner without exposing credentials.
+
+Actions:
+- providers: cheap configured-provider discovery only; never calls provider quota endpoints.
+- get: inspect one provider. detail defaults to summary; use windows/accounts/models/full only when the extra rows matter.
+- overview: explicit bounded fan-out across configured providers (or providerIDs). Use only when a cross-provider snapshot is actually needed.
+- resets: known reset deadlines for one provider or all configured providers. Defaults to the next 7 days; maximum 32 days.
+
+Quota is advisory provider-account display state. It does not gate inference. Provider adapters own TTLs, stale-last-good behavior, single-flight and rate-limit cooldowns; this tool never bypasses those policies and has no force-refresh mode.
+
+Prefer get over overview for a named provider. Prefer summary over full. Account labels are omitted from normal summaries and only returned by explicit accounts/full detail. No bearer tokens, API keys, credential handles, or authorization headers cross this surface.

@@ -5,6 +5,7 @@ import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, FileSystem, Layer } from "effect"
 import { Truncate } from "@/tool/truncate"
+import { MessageID, SessionID } from "@/session/schema"
 import { Config } from "@/config/config"
 import { Identifier } from "../../src/id/id"
 import { Process } from "@/util/process"
@@ -138,6 +139,7 @@ describe("Truncate", () => {
         const projected = yield* svc.output("HEAD-" + "x".repeat(10_000) + "-TAIL", { maxBytes: 512 })
         expect(projected.truncated).toBe(true)
         if (!projected.truncated) throw new Error("expected provider projection")
+        expect("timelineOutput" in projected).toBe(false)
 
         const producerPath = "/producer/full-output"
         const metadata = Truncate.mergeMetadata(
@@ -151,6 +153,24 @@ describe("Truncate", () => {
         expect(metadata.providerOutputPath).toBe(projected.outputPath)
         expect(metadata.outputProjection?.originalBytes).toBe(projected.originalBytes)
         expect(metadata.outputProjection?.segments).toEqual(projected.segments)
+        expect("timelineOutput" in metadata).toBe(false)
+      }),
+    )
+
+    it.live("preserves producer-owned durable timeline authority during provider projection", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const projected = yield* svc.output(
+          "HEAD-" + "x".repeat(10_000) + "-TAIL",
+          { maxBytes: 512, timelineRetained: true },
+        )
+
+        expect(projected.truncated).toBe(true)
+        if (!projected.truncated) throw new Error("expected provider projection")
+        expect(projected.timelineOutput).toBe(true)
+        expect(projected.content).toContain("HEAD-")
+        expect(projected.content).toContain("-TAIL")
+        expect(Buffer.byteLength(projected.content, "utf-8")).toBeLessThanOrEqual(512)
       }),
     )
 
@@ -167,7 +187,7 @@ describe("Truncate", () => {
       expect("outputProjection" in metadata).toBe(false)
     })
 
-    test("metadata composition represents lossy provider projection when retention is unavailable", () => {
+    test("metadata composition does not invent durable timeline recovery when retention is unavailable", () => {
       const projected: Truncate.Result = {
         content: "HEAD\n[retention unavailable]\nTAIL",
         truncated: true,
@@ -186,7 +206,27 @@ describe("Truncate", () => {
       expect(metadata.providerTruncated).toBe(true)
       expect("outputPath" in metadata).toBe(false)
       expect("providerOutputPath" in metadata).toBe(false)
+      expect("timelineOutput" in metadata).toBe(false)
       expect(metadata.outputProjection?.omittedBytes).toBe(9_992)
+    })
+
+    test("metadata composition propagates a verified durable timeline marker", () => {
+      const projected: Truncate.Result = {
+        content: "HEAD\n[durable timeline]\nTAIL",
+        truncated: true,
+        timelineOutput: true,
+        originalLines: 100,
+        originalBytes: 10_000,
+        retainedBytes: 8,
+        omittedBytes: 9_992,
+        strategy: "balanced",
+        segments: [
+          { startByte: 0, endByte: 4 },
+          { startByte: 9_996, endByte: 10_000 },
+        ],
+      }
+      const metadata = Truncate.mergeMetadata({}, projected)
+      expect(metadata.timelineOutput).toBe(true)
     })
 
     it.live("limits() falls back to MAX_LINES/MAX_BYTES when Config is not provided", () =>
@@ -323,12 +363,23 @@ describe("Truncate", () => {
     failingWriterIt.live("streaming retention initialization failure degrades to a disabled writer", () =>
       Effect.gen(function* () {
         const svc = yield* Truncate.Service
-        const writer = yield* svc.writer("initial output")
+        const writer = yield* svc.writer("initial output", { sessionID: SessionID.make("ses_test"), messageID: MessageID.make("msg_test"), toolCallID: "call_test" })
         expect(writer.healthy()).toBe(false)
         expect(writer.outputPath).toBeUndefined()
         yield* writer.write("later output")
         yield* writer.close
         expect(writer.healthy()).toBe(false)
+      }),
+    )
+
+    it.live("ownerless streaming writer never claims timeline retention", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const writer = yield* svc.writer("initial output")
+        expect(writer.timelineHealthy()).toBe(false)
+        yield* writer.write("later output")
+        yield* writer.close
+        expect(writer.timelineHealthy()).toBe(false)
       }),
     )
 

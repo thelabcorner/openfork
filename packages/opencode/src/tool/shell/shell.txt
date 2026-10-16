@@ -13,6 +13,8 @@ Runtime shell profile:
 - For quote-dense or multiline data (Markdown, JSON, source code, regexes), prefer a dedicated tool, a temporary file, or the target program's `--file`/stdin interface instead of embedding the data through nested shell quoting.
 - Repository text bytes are governed by repository attributes and the dedicated mutation tools. OpenFork-owned child processes enforce deterministic Git defaults (`core.autocrlf=false`, `core.eol=lf`), but intentional target-file CRLF/mixed terminators are preserved by Write/Edit/Patch. Do not use shell newline conversion or Git config changes to "fix" a file's line endings.
 
+${interpreterSection}
+
 ${workdirSection}
 
 Use `${tmp}` for temporary work outside the workspace. This directory has already been created, already exists, and is pre-approved for external directory access.

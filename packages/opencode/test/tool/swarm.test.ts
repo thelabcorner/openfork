@@ -84,6 +84,33 @@ function sessionRow(id: SessionID, projectID: ProjectV2.ID, directory: string): 
 }
 
 describe("tool.swarm", () => {
+  it.instance("reconciles creation by a caller-scoped key using swarm.read without recreating a worker", () =>
+    Effect.gen(function* () {
+      const { createTool, tool, swarms, db, instance } = yield* toolAndServices
+      const coordinator = SessionID.make("ses_native_creation_reconcile")
+      yield* db.insert(SessionTable).values(sessionRow(coordinator, instance.project.id, instance.directory))
+        .run().pipe(Effect.orDie)
+      const requestKey = "native-recovery-1"
+      const missing = yield* tool.execute({ action: "creation.lookup", requestKey }, context(coordinator, []))
+      expect(missing.metadata).toMatchObject({ status: "not_found", permission: "swarm.read" })
+      const created = yield* createTool.execute({
+        name: "Recover me", requestKey, tasks: [{ key: "foundation", title: "Foundation" }],
+      }, context(coordinator, []))
+      const asks: string[] = []
+      const read = yield* tool.execute({ action: "creation.lookup", requestKey }, context(coordinator, asks))
+      expect(asks).toEqual(["swarm.read"])
+      expect(read.metadata).toMatchObject({
+        action: "creation.lookup", status: "active", swarmId: created.metadata.swarmId,
+      })
+      expect(read.output).toContain("NOT verified")
+      const other = yield* tool.execute({
+        action: "creation.lookup", requestKey,
+      }, context(SessionID.make("ses_different_creation_principal"), []))
+      expect(other.metadata.status).toBe("not_found")
+      expect((yield* swarms.list({ projectID: instance.project.id })).length).toBe(1)
+    }),
+  )
+
   it.instance("is lazy and enforces the swarm.read leaf on project-scoped inspection", () =>
     Effect.gen(function* () {
       const { tool } = yield* toolAndServices
@@ -140,6 +167,125 @@ describe("tool.swarm", () => {
         ["First", "ready"],
         ["Second", "blocked"],
       ])
+      const parsed = JSON.parse(created.output.split("\n")
+        .filter((line) => line.startsWith("> ")).map((line) => line.slice(2)).join("\n")) as {
+          outcome: string
+          durableSwarm: { id: string; status: string }
+          tasks: Array<{ key: string; taskId: string; status: string }>
+          execution: string
+          verification: { tool: string; action: string; swarmId: string; note: string }
+        }
+      expect(parsed.outcome).toBe("applied")
+      expect(parsed.durableSwarm).toMatchObject({ id: created.metadata.swarmId, status: "active" })
+      expect(parsed.tasks.map((task) => [task.key, task.taskId])).toEqual([
+        ["a", detail.tasks[0]!.id], ["b", detail.tasks[1]!.id],
+      ])
+      expect(parsed.execution).toContain("NOT been verified as running")
+      expect(parsed.verification).toEqual({ tool: "swarm", action: "get", swarmId: created.metadata.swarmId,
+        note: "Use summary for a bounded overview, get for member bindings/tasks, and task.runs to verify actual execution." })
+      expect(created.output).not.toContain('"bindingGeneration"')
+    }),
+  )
+
+  it.instance("keeps eager and lazy initial creation at-most-once under the same Session requestKey", () =>
+    Effect.gen(function* () {
+      const { createTool, tool, swarms, db, instance } = yield* toolAndServices
+      const coordinator = SessionID.make("ses_swarm_creation_key_native")
+      yield* db.insert(SessionTable).values(sessionRow(coordinator, instance.project.id, instance.directory))
+        .run().pipe(Effect.orDie)
+      const requestKey = "retry-safe-2026"
+      const first = yield* createTool.execute({
+        name: "native original", requestKey,
+        tasks: [{ key: "initial", title: "Initial" }],
+      }, context(coordinator, []))
+      expect(first.metadata.swarmId.startsWith("swr_k_")).toBe(true)
+      const eagerRetry = yield* Effect.exit(createTool.execute({
+        name: "native changed intent", requestKey,
+      }, context(coordinator, [])))
+      expect(Exit.isFailure(eagerRetry)).toBe(true)
+      if (Exit.isFailure(eagerRetry)) expect(Cause.pretty(eagerRetry.cause)).toContain(first.metadata.swarmId)
+      const lazyRetry = yield* Effect.exit(tool.execute({
+        action: "delegate", swarmName: "lazy changed intent", requestKey,
+      }, context(coordinator, [])))
+      expect(Exit.isFailure(lazyRetry)).toBe(true)
+      if (Exit.isFailure(lazyRetry)) expect(Cause.pretty(lazyRetry.cause)).toContain(first.metadata.swarmId)
+      expect((yield* swarms.list({ projectID: instance.project.id })).map((row) => row.id))
+        .toEqual([SwarmV2.ID.make(first.metadata.swarmId)])
+      expect((yield* swarms.get(SwarmV2.ID.make(first.metadata.swarmId))).tasks).toHaveLength(1)
+    }),
+  )
+
+  it.instance("dispatches keyed task.batch through the actual native lazy tool with scoped coordinator authority", () =>
+    Effect.gen(function* () {
+      const { createTool, tool, swarms, db, instance } = yield* toolAndServices
+      const coordinator = SessionID.make("ses_swarm_batch_native")
+      yield* db.insert(SessionTable).values(sessionRow(coordinator, instance.project.id, instance.directory))
+        .run().pipe(Effect.orDie)
+      const created = yield* createTool.execute({
+        name: "native staged task dispatch", tasks: [{ key: "foundation", title: "Foundation" }],
+      }, context(coordinator, []))
+      const asks: string[] = []
+      const staged = yield* tool.execute({
+        action: "task.batch", swarmId: created.metadata.swarmId,
+        tasks: [
+          { key: "followup", title: "Follow-up", dependsOn: [{ key: "foundation" }] },
+          { key: "broken", title: "Broken", dependsOn: [{ key: "missing" }] },
+        ],
+      }, context(coordinator, asks))
+      expect(asks).toEqual(["swarm.task"])
+      expect(staged.metadata).toMatchObject({
+        action: "task.batch", permission: "swarm.task", count: 1, status: "partial",
+      })
+      const detail = yield* swarms.get(SwarmV2.ID.make(created.metadata.swarmId))
+      expect(detail.tasks.map((task) => [task.title, task.status])).toEqual([
+        ["Foundation", "ready"], ["Follow-up", "blocked"],
+      ])
+      const repeated = yield* tool.execute({
+        action: "task.batch", swarmId: created.metadata.swarmId,
+        tasks: [{ key: "followup", title: "Follow-up", dependsOn: [{ key: "foundation" }] }],
+      }, context(coordinator, []))
+      expect(repeated.metadata).toMatchObject({ count: 0, status: "complete" })
+      expect((yield* swarms.get(SwarmV2.ID.make(created.metadata.swarmId))).tasks).toHaveLength(2)
+    }),
+  )
+
+  it.instance("preserves original worker indexes when flat creation normalization and model preflight fail", () =>
+    Effect.gen(function* () {
+      const { createTool, db, swarms, instance } = yield* toolAndServices
+      const coordinator = SessionID.make("ses_swarm_create_partial")
+      yield* db.insert(SessionTable)
+        .values(sessionRow(coordinator, instance.project.id, instance.directory))
+        .run().pipe(Effect.orDie)
+      const base = { role: "research", permissionBoundary: [] }
+      const created = yield* createTool.execute({
+        name: "partial flat creation",
+        members: [
+          { ...base, name: "wrong-workspace", providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model"), workspace: "shared-read", worktreeBaseRef: "main" },
+          { ...base, name: "missing-model", providerID: Provider.ID.make("no-such-provider"), modelID: Model.ID.make("no-such-model") },
+          { ...base, name: " ", providerID: Provider.ID.make("test"), modelID: Model.ID.make("test-model") },
+        ],
+        tasks: [
+          { key: "independent", title: "Still works" },
+          { key: "reserved", title: "Unavailable", reservedMemberName: "missing-model" },
+        ],
+      }, context(coordinator, []))
+
+      expect(created.metadata).toMatchObject({
+        status: "partial", complete: false, failedCount: 4, managedMemberCount: 0, taskCount: 1,
+      })
+      const payload = JSON.parse(created.output.split("\n")
+        .filter((line) => line.startsWith("> ")).map((line) => line.slice(2)).join("\n")) as {
+          admission: { failures: Array<{ kind: string; key: string; index: number }> }
+        }
+      expect(payload.admission.failures.map((failure) => [failure.kind, failure.key, failure.index])).toEqual([
+        ["member", "wrong-workspace", 0],
+        ["member", "missing-model", 1],
+        ["member", " ", 2],
+        ["task", "reserved", 1],
+      ])
+      const detail = yield* swarms.get(SwarmV2.ID.make(created.metadata.swarmId))
+      expect(detail.tasks.map((task) => task.title)).toEqual(["Still works"])
+      expect(detail.members).toHaveLength(1)
     }),
   )
 
@@ -160,6 +306,40 @@ describe("tool.swarm", () => {
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("producer-owned")
       expect(yield* swarms.list({ projectID: instance.project.id })).toEqual([])
+    }),
+  )
+
+  it.instance("dispatches member.batch with per-member refusal receipts and coordinator-only authority", () =>
+    Effect.gen(function* () {
+      const { tool, swarms, db, instance } = yield* toolAndServices
+      const coordinator = SessionID.make("ses_swarm_batch_coordinator")
+      const outsider = SessionID.make("ses_swarm_batch_outsider")
+      yield* db.insert(SessionTable).values([
+        sessionRow(coordinator, instance.project.id, instance.directory),
+        sessionRow(outsider, instance.project.id, instance.directory),
+      ]).run().pipe(Effect.orDie)
+      const created = yield* tool.execute({ action: "delegate", swarmName: "staged native" }, context(coordinator, []))
+      const id = SwarmV2.ID.make(created.metadata.swarmId!)
+      const invalid = {
+        name: "missing-model",
+        role: "research",
+        desiredProfile: {
+          agent: Agent.ID.make("invalid-agent"),
+          model: { providerID: Provider.ID.make("missing"), id: Model.ID.make("missing") },
+          permissionBoundary: [],
+        },
+        workspacePolicy: { mode: "shared-read" as const },
+      }
+      const inputs = { action: "member.batch" as const, swarmId: id, members: [invalid] }
+      const rejected = yield* tool.execute(inputs, context(outsider, [])).pipe(Effect.exit)
+      expect(Exit.isFailure(rejected)).toBe(true)
+      const asks: string[] = []
+      const admitted = yield* tool.execute(inputs, context(coordinator, asks))
+      expect(asks).toEqual(["swarm.member"])
+      expect(admitted.metadata).toMatchObject({ action: "member.batch", count: 0, status: "partial" })
+      expect(admitted.output).toContain("invalid-agent")
+      expect(admitted.output).toContain('"status": "failed"')
+      expect((yield* swarms.get(id)).members.map((member) => member.name)).toEqual(["coordinator"])
     }),
   )
 
@@ -670,6 +850,74 @@ describe("tool.swarm", () => {
       expect(containAsks).toEqual(["swarm.review"])
       expect(Exit.isFailure(refused)).toBe(true)
       if (Exit.isFailure(refused)) expect(Cause.pretty(refused.cause)).toContain("recover.effects")
+    }),
+  )
+
+  it.instance("admin.overview is a project read with no coordinator requirement", () =>
+    Effect.gen(function* () {
+      const { tool, peerSession, info } = yield* reviewFixture
+      const asks: string[] = []
+      const overview = yield* tool.execute({ action: "admin.overview" }, context(peerSession, asks))
+      expect(asks).toEqual(["swarm.read"])
+      expect(overview.output).toContain("[SWARM ADMIN]")
+      expect(overview.metadata).toMatchObject({ count: 0, status: "clear" })
+
+      const scopedAsks: string[] = []
+      const scoped = yield* tool.execute(
+        { action: "admin.overview", swarmId: info.id },
+        context(peerSession, scopedAsks),
+      )
+      expect(scopedAsks).toEqual(["swarm.read"])
+      expect(scoped.metadata).toMatchObject({ swarmId: info.id })
+      expect(scoped.output).toContain('"reviewBacklog"')
+    }),
+  )
+
+  it.instance("admin.review resolves an unsettled task under swarm.admin without coordinator membership", () =>
+    Effect.gen(function* () {
+      const { tool, swarms, peerSession, info, task, claim, runID } = yield* reviewFixture
+
+      yield* swarms.requestTaskRetirement({ token: claim.token, reason: "lease_owner_lost", now: 30 })
+      yield* swarms.settleTask({
+        token: claim.token,
+        runID,
+        settlement: { type: "contained_unknown", detail: "contained by operator" },
+        now: 31,
+      })
+      const parked = (yield* swarms.get(info.id)).tasks.find((item) => item.id === task.id)!
+      expect(parked.status).toBe("review_pending")
+
+      const asks: string[] = []
+      const resolved = yield* tool.execute(
+        {
+          action: "admin.review",
+          swarmId: info.id,
+          taskId: task.id,
+          decision: "retry",
+          expectedLeaseGeneration: parked.leaseGeneration,
+          detail: "operator authorized a fresh execution after containment",
+        },
+        context(peerSession, asks),
+      )
+      expect(asks).toEqual(["swarm.admin"])
+      expect(resolved.metadata).toMatchObject({ taskId: task.id, status: "ready" })
+      expect((yield* swarms.get(info.id)).tasks.find((item) => item.id === task.id)?.status).toBe("ready")
+    }),
+  )
+
+  it.instance("admin.contain fails closed without a listed fence and never asks for coordinator authority", () =>
+    Effect.gen(function* () {
+      const { tool, peerSession, info, task, claim } = yield* reviewFixture
+      const asks: string[] = []
+      const refused = yield* tool
+        .execute(
+          { action: "admin.contain", swarmId: info.id, taskId: task.id, leaseGeneration: claim.token.generation },
+          context(peerSession, asks),
+        )
+        .pipe(Effect.exit)
+      expect(asks).toEqual(["swarm.admin"])
+      expect(Exit.isFailure(refused)).toBe(true)
+      if (Exit.isFailure(refused)) expect(Cause.pretty(refused.cause)).toContain("admin.overview")
     }),
   )
 })

@@ -21,7 +21,7 @@ import { TypecheckScope } from "./typecheck-scope"
 import { runPatchEffect } from "./patch"
 import { assertTextContent, trimDiff } from "./patch/core"
 import { resolveReplacement } from "./edit/match"
-import { applyEditStrategy, type BatchOpType as StrategyBatchOp } from "./edit/strategy"
+import { applyEditStrategy, validateStrategyShape, type BatchOpType as StrategyBatchOp } from "./edit/strategy"
 import { buildPlan, type EditPlan } from "./edit/plan"
 import { absorbDeletionNewline, healInput } from "./edit/heal"
 import * as Fingerprint from "./edit/fingerprint"
@@ -31,56 +31,109 @@ import { enforce as enforcePriorReadEffect, globalReadCache } from "./edit/prior
 // trimDiff is re-exported below (next to its original definition site) so
 // existing `from "./edit"` importers keep working.
 
-// Batch edit op. Three shapes (union — the JSON-schema "anyOf" equivalent):
-// a line-targeted op, a range op (optionally deleting), or an exact replace op.
+// Preserve excess keys for strategy validation: silently stripping an extra
+// selector can turn an ambiguous mutation into a different valid edit.
+const BatchExtras = [Schema.Record(Schema.String, Schema.Unknown)] as const
+const ExactSelection = Schema.Union([
+  Schema.Struct({ mode: Schema.Literal("one"), atLine: PositiveInt }),
+  Schema.Struct({ mode: Schema.Literal("selected"), atLines: Schema.Array(PositiveInt).check(Schema.isMinLength(1), Schema.isMaxLength(128)) }),
+  Schema.Struct({ mode: Schema.Literal("all"), expectedMatches: optional(PositiveInt) }),
+])
+
 const BatchOp = Schema.Union([
-  Schema.Struct({
-    line: PositiveInt.annotate({
-      description: "1-based line to replace",
+  Schema.StructWithRest(
+    Schema.Struct({
+      line: PositiveInt.annotate({
+        description: "1-based line to replace",
+      }),
+      newText: Schema.String.annotate({ description: "Replacement text for the line" }),
+      oldText: optional(Schema.String).annotate({
+        description:
+          "Verification: line must contain this text (required by the tool although optional in the wire shape)",
+      }),
     }),
-    newText: Schema.String.annotate({ description: "Replacement text for the line" }),
-    oldText: optional(Schema.String).annotate({
-      description: "Verification: line must contain this text (required by the tool although optional in the wire shape)",
+    BatchExtras,
+  ),
+  Schema.StructWithRest(
+    Schema.Struct({
+      startLine: PositiveInt.annotate({ description: "Range replace start (1-based, inclusive)" }),
+      endLine: PositiveInt.annotate({ description: "Range replace end (1-based, inclusive)" }),
+      newText: optional(Schema.String).annotate({
+        description: "Replacement text for the range (omit with delete:true)",
+      }),
+      oldText: optional(Schema.String).annotate({
+        description: "Verification: must span the range's endpoints for ranges over 5 lines",
+      }),
+      delete: optional(Schema.Boolean).annotate({ description: "Remove the range instead of replacing it" }),
     }),
-  }),
-  Schema.Struct({
-    startLine: PositiveInt.annotate({ description: "Range replace start (1-based, inclusive)" }),
-    endLine: PositiveInt.annotate({ description: "Range replace end (1-based, inclusive)" }),
-    newText: optional(Schema.String).annotate({ description: "Replacement text for the range (omit with delete:true)" }),
-    oldText: optional(Schema.String).annotate({
-      description: "Verification: must span the range's endpoints for ranges over 5 lines",
+    BatchExtras,
+  ),
+  Schema.StructWithRest(
+    Schema.Struct({
+      oldString: Schema.String.annotate({ description: "The exact text to replace (must be unique)" }),
+      newString: Schema.String.annotate({ description: "The replacement text" }),
+      newText: optional(Schema.String).annotate({
+        description: "Alias for newString; if both are supplied they must agree",
+      }),
     }),
-    delete: optional(Schema.Boolean).annotate({ description: "Remove the range instead of replacing it" }),
-  }),
-  Schema.Struct({
-    oldString: Schema.String.annotate({ description: "The exact text to replace (must be unique)" }),
-    newString: Schema.String.annotate({ description: "The replacement text" }),
-  }),
+    BatchExtras,
+  ),
+  Schema.StructWithRest(
+    Schema.Struct({ oldString: Schema.String, newText: Schema.String, newString: optional(Schema.String) }),
+    BatchExtras,
+  ),
+  Schema.StructWithRest(
+    Schema.Struct({ insertAt: NonNegativeInt, newText: Schema.String, oldText: optional(Schema.String) }),
+    BatchExtras,
+  ),
+  Schema.StructWithRest(
+    Schema.Struct({ insertAfter: PositiveInt, newText: Schema.String, oldText: optional(Schema.String) }),
+    BatchExtras,
+  ),
+  Schema.StructWithRest(Schema.Struct({ appendFile: Schema.Literal(true), newText: Schema.String }), BatchExtras),
+  Schema.StructWithRest(
+    Schema.Struct({
+      nearText: Schema.String,
+      oldText: Schema.String,
+      newText: Schema.String,
+      occurrence: optional(PositiveInt),
+    }),
+    BatchExtras,
+  ),
 ])
 
 export const Parameters = Schema.Struct({
-  filePath: Schema.optional(Schema.String).annotate({ description: "The absolute path to the file to modify (alias: file_path)" }),
+  filePath: Schema.optional(Schema.String).annotate({
+    description: "The absolute path to the file to modify (alias: file_path)",
+  }),
   file_path: Schema.optional(Schema.String).annotate({ description: "Alias for filePath" }),
   oldString: Schema.optional(Schema.String).annotate({
-    description: "The text to replace. Single-hunk only — for 2+ locations/files use the patchText bulk pathway instead of looping this tool.",
+    description:
+      "The exact text to replace (single or multi-line). Pair with newString or its newText alias. Empty text can create a file or initialize an existing empty file; it cannot replace text in a non-empty file. For 2+ locations/files use edits or patchText.",
   }),
   newString: Schema.optional(Schema.String).annotate({
-    description: "The text to replace it with (must be different from oldString)",
+    description: "Exact replacement for oldString (alias: newText). Must differ from oldString.",
   }),
   newText: Schema.optional(Schema.String).annotate({
-    description: "Replacement text for the line/range/insertAt/appendFile/nearText strategies",
+    description:
+      "Replacement text for line/range/insertAt/appendFile/nearText strategies; with oldString, this is an alias for newString. If both aliases are supplied they must agree.",
   }),
   replaceAll: Schema.optional(Schema.Boolean).annotate({
     description: "Replace all occurrences of oldString (default false)",
   }),
+  selection: Schema.optional(ExactSelection).annotate({
+    description: "Optional exact-only arbitration: {mode:'one',atLine:187} selects one verified line; {mode:'selected',atLines:[78,187]} selects a subset atomically; {mode:'all',expectedMatches:2} replaces all only when the count matches.",
+  }),
   line: Schema.optional(PositiveInt).annotate({
-    description: "1-based line to replace with newText (line strategy; oldText with the line's current text is required)",
+    description:
+      "1-based line to replace with newText (line strategy; oldText with the line's current text is required)",
   }),
   oldText: Schema.optional(Schema.String).annotate({
     description: "Verification for line/range/insertAt/nearText strategies: target must contain this text",
   }),
   startLine: Schema.optional(PositiveInt).annotate({
-    description: "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText spanning the endpoints.",
+    description:
+      "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText spanning the endpoints.",
   }),
   endLine: Schema.optional(PositiveInt).annotate({
     description: "Range replace end (1-based, inclusive)",
@@ -105,7 +158,7 @@ export const Parameters = Schema.Struct({
   }),
   edits: Schema.optional(Schema.Array(BatchOp)).annotate({
     description:
-      "PREFERRED when 2+ non-overlapping changes in ONE file are already known. Apply them atomically in ONE call instead of sequential edit calls: [{line,newText,oldText?}], [{startLine,endLine,newText?,oldText?,delete?}], or [{oldString,newString}]. Every op is validated against original coordinates; overlaps are rejected. For multi-file/create/delete/move work use patch/patchText.",
+      "Atomic non-overlapping changes in ONE file: {oldString,newString} (newText is a replacement alias), {line,oldText,newText}, {startLine,endLine,newText?,oldText?,delete?}, {insertAt,newText,oldText?}, {appendFile:true,newText}, or {nearText,oldText,newText,occurrence?}. Select one strategy per op. Original coordinates, all-or-nothing validation, overlaps rejected. For multiple files use patch/patchText.",
   }),
   runTypecheck: Schema.optional(Schema.Boolean).annotate({
     description:
@@ -113,7 +166,7 @@ export const Parameters = Schema.Struct({
   }),
   patchText: Schema.optional(Schema.String).annotate({
     description:
-      "Bulk pathway for 2+ files, arbitrary multi-hunk changes, or structural create/delete/move work (the dedicated patch tool is also appropriate). Batch ALL known edits into ONE mutation call instead of looping edit. One context processing, one permission prompt, atomic all-or-nothing apply. Validates every hunk first ('if-clean' default: asks once and applies when zero conflicts, else returns the plan; apply:false = plan only; apply:true = fail on conflicts). Cannot be combined with filePath/oldString/line-style params.",
+      "Bulk pathway for 2+ files, arbitrary multi-hunk changes, or structural create/delete/move work (the dedicated patch tool is also appropriate). Batch ALL known edits into ONE mutation call instead of looping edit. Validates every hunk before one permission prompt, rechecks files after approval, and attempts rollback if a write fails. 'if-clean' default: applies when zero conflicts, else returns the plan; apply:false = plan only; apply:true = fail on conflicts. Cannot be combined with filePath/oldString/line-style params.",
   }),
   apply: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("if-clean")])).annotate({
     description:
@@ -123,11 +176,77 @@ export const Parameters = Schema.Struct({
     description: "Bulk pathway only: patch format hint. 'auto' detects from the patch text (default).",
   }),
   showDiff: Schema.optional(Schema.Boolean).annotate({
-    description: "Bulk pathway only: include the per-file diffs in the dry-run plan (default false — the plan is intentionally token-lean).",
+    description:
+      "Bulk pathway only: include the per-file diffs in the dry-run plan (default false — the plan is intentionally token-lean).",
   }),
 })
 
 export type BatchOpType = Schema.Schema.Type<typeof BatchOp>
+
+function validateMutationShape(params: Schema.Schema.Type<typeof Parameters>) {
+  if (params.oldString !== undefined) {
+    const mixed = [
+      "line",
+      "oldText",
+      "startLine",
+      "endLine",
+      "insertAt",
+      "insertAfter",
+      "appendFile",
+      "nearText",
+      "occurrence",
+      "delete",
+      "edits",
+    ].filter((key) => params[key as keyof typeof params] !== undefined)
+    if (mixed.length > 0) {
+      throw new Error(
+        `Exact oldString editing cannot be combined with other edit strategies (${mixed.join(", ")}). Choose one strategy for this call.`,
+      )
+    }
+    if (params.newString !== undefined && params.newText !== undefined && params.newString !== params.newText) {
+      throw new Error("Conflicting replacements: newString and newText must match when both are provided.")
+    }
+    if (params.newString === undefined && params.newText === undefined) {
+      throw new Error("Provide the replacement as newString or newText when oldString is provided.")
+    }
+    if (params.selection !== undefined && params.selection.mode !== "all" && params.replaceAll === true) {
+      throw new Error("selection.mode one cannot be combined with replaceAll:true.")
+    }
+    if (params.selection?.mode === "all" && params.replaceAll === false) {
+      throw new Error("selection.mode all cannot be combined with replaceAll:false.")
+    }
+    if (params.oldString === "" && params.selection !== undefined) {
+      throw new Error("selection cannot be used with an empty oldString.")
+    }
+    if (params.oldString === "" && params.replaceAll === true) {
+      throw new Error("replaceAll cannot be used with an empty oldString; provide the exact non-empty text to replace.")
+    }
+    return
+  }
+  if (params.newString !== undefined) {
+    throw new Error("newString requires oldString. Use newText for line, range, insertion, append, or nearText edits.")
+  }
+  if (params.selection !== undefined) {
+    throw new Error("selection requires oldString and a non-empty exact target.")
+  }
+  if (params.replaceAll !== undefined) {
+    throw new Error("replaceAll requires oldString and an exact replacement (newString or newText).")
+  }
+  validateStrategyShape({
+    edits: params.edits as StrategyBatchOp[] | undefined,
+    line: params.line,
+    startLine: params.startLine,
+    endLine: params.endLine,
+    insertAt: params.insertAt,
+    insertAfter: params.insertAfter,
+    appendFile: params.appendFile,
+    nearText: params.nearText,
+    occurrence: params.occurrence,
+    oldText: params.oldText,
+    newText: params.newText,
+    delete: params.delete,
+  })
+}
 
 export type EditMetadata = {
   diagnostics: Record<string, LSPClient.Diagnostic[]>
@@ -181,6 +300,7 @@ export const EditTool = Tool.define<
             if (params.newString !== undefined) mixed.push("newString")
             if (params.newText !== undefined) mixed.push("newText")
             if (params.replaceAll !== undefined) mixed.push("replaceAll")
+            if (params.selection !== undefined) mixed.push("selection")
             if (params.line !== undefined) mixed.push("line")
             if (params.oldText !== undefined) mixed.push("oldText")
             if (params.startLine !== undefined) mixed.push("startLine")
@@ -216,6 +336,9 @@ export const EditTool = Tool.define<
               "apply/format/showDiff require patchText (bulk pathway). Single-edit params apply immediately — there is no dry-run for one precise edit. Either add patchText with all changes, or drop these flags.",
             )
           }
+          // Reject incomplete or mixed argument shapes before path resolution,
+          // external-directory prompts, reads, and permission requests.
+          validateMutationShape(params)
           if (params.filePath !== undefined && params.file_path !== undefined && params.filePath !== params.file_path) {
             throw new Error(
               `Conflicting paths: filePath (${params.filePath}) differs from file_path (${params.file_path}). Provide exactly one.`,
@@ -234,29 +357,65 @@ export const EditTool = Tool.define<
           yield* assertExternalDirectoryEffect(ctx, within.inside ? within.resolved : within.real)
 
           const runTypecheckBlock =
-            params.runTypecheck === true
-              ? () => runTypecheckAfterEdit(filePath, instance, ctx)
-              : undefined
+            params.runTypecheck === true ? () => runTypecheckAfterEdit(filePath, instance, ctx) : undefined
 
           // Exact path has priority (back-compat). Strategies run only when
           // oldString is absent; ambiguity between groups is refused, never guessed.
           if (params.oldString !== undefined) {
-            if (params.newString === undefined) {
-              throw new Error("newString is required when oldString is provided.")
+            const mixed = [
+              "line",
+              "oldText",
+              "startLine",
+              "endLine",
+              "insertAt",
+              "insertAfter",
+              "appendFile",
+              "nearText",
+              "occurrence",
+              "delete",
+              "edits",
+            ].filter((key) => params[key as keyof typeof params] !== undefined)
+            if (mixed.length > 0) {
+              throw new Error(
+                `Exact oldString editing cannot be combined with other edit strategies (${mixed.join(", ")}). Choose one strategy for this call.`,
+              )
             }
-            const built = yield* buildExactPlan({ services, params, ctx, filePath, instance }).pipe(Effect.orDie)
+            if (params.newString !== undefined && params.newText !== undefined && params.newString !== params.newText) {
+              throw new Error("Conflicting replacements: newString and newText must match when both are provided.")
+            }
+            const replacement = params.newString ?? params.newText
+            if (replacement === undefined) {
+              throw new Error("Provide the replacement as newString or newText when oldString is provided.")
+            }
+            const exactParams = { ...params, newString: replacement }
+            const built = yield* buildExactPlan({ services, params: exactParams, ctx, filePath, instance }).pipe(Effect.orDie)
             const result = yield* commitPlan(services, built.plan, ctx, instance, {
               fingerprint: built.fingerprint,
-              rebuild: () => buildExactPlan({ services, params, ctx, filePath, instance }).pipe(Effect.orDie, Effect.map((b) => b.plan)),
+              rebuild: () =>
+                buildExactPlan({ services, params: exactParams, ctx, filePath, instance }).pipe(
+                  Effect.orDie,
+                  Effect.map((b) => b.plan),
+                ),
               runTypecheckBlock,
             }).pipe(Effect.orDie)
             return result as unknown as Tool.ExecuteResult<EditMetadata>
           }
 
+          if (params.newString !== undefined) {
+            throw new Error("newString requires oldString. Use newText for line, range, insertion, append, or nearText edits.")
+          }
+          if (params.replaceAll !== undefined) {
+            throw new Error("replaceAll requires oldString and an exact replacement (newString or newText).")
+          }
+
           const built = yield* buildStrategyPlan({ services, params, ctx, filePath, instance }).pipe(Effect.orDie)
           const result = yield* commitPlan(services, built.plan, ctx, instance, {
             fingerprint: built.fingerprint,
-            rebuild: () => buildStrategyPlan({ services, params, ctx, filePath, instance }).pipe(Effect.orDie, Effect.map((b) => b.plan)),
+            rebuild: () =>
+              buildStrategyPlan({ services, params, ctx, filePath, instance }).pipe(
+                Effect.orDie,
+                Effect.map((b) => b.plan),
+              ),
             runTypecheckBlock,
           }).pipe(Effect.orDie)
           return result as unknown as Tool.ExecuteResult<EditMetadata>
@@ -294,21 +453,37 @@ const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInp
   if (oldString === "") {
     const existed = yield* afs.existsSafe(filePath)
     if (existed) {
-      throw new Error(
-        "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
-      )
+      const source = yield* readExisting(afs, filePath)
+      assertTextContent(source.text, filePath)
+      if (source.text !== "") {
+        throw new Error(
+          "oldString cannot be empty for a non-empty file. Provide exact text to replace, or use write for a full-file replacement.",
+        )
+      }
+      const next = Bom.split(healedNewTop.value)
+      const bom = source.bom || next.bom
+      const plan = buildPlan({
+        filePath,
+        contentOld: source.text,
+        bom,
+        spans: [{ start: 0, end: 0, replacement: next.text }],
+        strategy: "exact",
+        applied: next.text === "" && bom === source.bom ? 0 : 1,
+        warnings: [...warnings, ...healedNewTop.warnings],
+        isNew: false,
+      })
+      const fingerprint = yield* Fingerprint.capture(afs, filePath, Bom.join(source.text, source.bom))
+      return { plan, fingerprint }
     }
-    const healedNew = healInput(newString, "newString")
-    warnings.push(...healedNew.warnings)
-    const next = Bom.split(healedNew.value)
+    const next = Bom.split(healedNewTop.value)
     const plan = buildPlan({
       filePath,
       contentOld: "",
       bom: next.bom,
       spans: [{ start: 0, end: 0, replacement: next.text }],
       strategy: "exact",
-      applied: next.text === "" ? 0 : 1,
-      warnings,
+      applied: next.text === "" && next.bom === false ? 0 : 1,
+      warnings: [...warnings, ...healedNewTop.warnings],
       isNew: true,
     })
     return { plan, fingerprint: undefined }
@@ -329,7 +504,7 @@ const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInp
   // This is intentionally local: a mixed-ending file is never normalized by a
   // whole-file "dominant EOL" guess.
   const replacement = healedNew.value
-  const resolved = resolveReplacement(source.text, healedOld.value, replacement, params.replaceAll)
+  const resolved = resolveReplacement(source.text, healedOld.value, replacement, params.replaceAll, params.selection)
   warnings.push(...resolved.warnings)
 
   let spans = resolved.spans
@@ -349,7 +524,7 @@ const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInp
     warnings,
     isNew: false,
   })
-  const fingerprint = yield* Fingerprint.capture(afs, filePath, source.text)
+  const fingerprint = yield* Fingerprint.capture(afs, filePath, Bom.join(source.text, source.bom))
   return { plan, fingerprint }
 })
 
@@ -363,7 +538,11 @@ const buildStrategyPlan = Effect.fn("EditTool.strategyPlan")(function* (input: P
   const healedNew = params.newText === undefined ? undefined : healInput(params.newText, "newText")
   const healedOld = params.oldText === undefined ? undefined : healInput(params.oldText, "oldText")
   const healedNear = params.nearText === undefined ? undefined : healInput(params.nearText, "nearText")
-  const warnings: string[] = [...(healedNew?.warnings ?? []), ...(healedOld?.warnings ?? []), ...(healedNear?.warnings ?? [])]
+  const warnings: string[] = [
+    ...(healedNew?.warnings ?? []),
+    ...(healedOld?.warnings ?? []),
+    ...(healedNear?.warnings ?? []),
+  ]
 
   const result = applyEditStrategy(source.text, {
     edits: params.edits as StrategyBatchOp[] | undefined,
@@ -395,7 +574,7 @@ const buildStrategyPlan = Effect.fn("EditTool.strategyPlan")(function* (input: P
     oldPreview: result.oldPreview,
     isNew: false,
   })
-  const fingerprint = yield* Fingerprint.capture(afs, filePath, source.text)
+  const fingerprint = yield* Fingerprint.capture(afs, filePath, Bom.join(source.text, source.bom))
   return { plan, fingerprint }
 })
 

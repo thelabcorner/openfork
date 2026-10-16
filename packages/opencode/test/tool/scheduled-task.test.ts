@@ -55,8 +55,10 @@ const truncate = Layer.succeed(
         write: () => Effect.void,
         close: Effect.void,
         healthy: () => true,
+        timelineHealthy: () => false,
       }),
     output: (text) => Effect.succeed({ content: text, truncated: false as const }),
+    retainTimeline: () => Effect.succeed(false),
     limits: () => Effect.succeed({ maxLines: 2_000, maxBytes: 50 * 1024 }),
   }),
 )

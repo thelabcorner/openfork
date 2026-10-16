@@ -56,6 +56,26 @@ function shellDisplayName(name: string) {
   return name
 }
 
+export function interpreterSection(name: string) {
+  if (name === "pwsh" || name === "powershell") {
+    return `## This interpreter is PowerShell — not Bash
+- Unix/Bash commands are NOT installed. \`grep\`, \`rg\`, \`sed\`, \`awk\`, \`head\`, \`tail\`, \`xargs\`, \`wc\`, \`touch\`, and POSIX \`find\` do not exist here; invoking them fails with "not recognized", and a Bash-style pipeline (\`... | head\`) fails the same way.
+- Content search: use the Find tool with the \`grep\` parameter, not the \`grep\` executable. Inside a PowerShell pipeline the native alternative is \`Select-String\`.
+- File search: use the Find tool with the \`glob\` parameter.
+- Partial file reads: use the Read tool with \`offset\`/\`limit\`; surgical text changes use the Edit tool.
+- Discard output with \`$null\` (for example \`2>$null\`); \`/dev/null\` does not exist on Windows.
+- Do not use Bash idioms: no \`VAR=value command\` prefixes (set \`$env:VAR = "value"\`), no heredocs, no \`source\`, \`chmod\`, or \`chown\`.`
+  }
+  if (name === "cmd") {
+    return `## This interpreter is cmd.exe — not Bash
+- \`grep\`, \`rg\`, \`sed\`, \`awk\`, \`head\`, \`tail\`, \`xargs\`, and POSIX \`find\` are NOT installed; invoking them fails with "not recognized".
+- Content search: use the Find tool with the \`grep\` parameter; file search: use Find with \`glob\`.
+- Partial reads: use Read with \`offset\`/\`limit\`; text changes: use the Edit tool.
+- \`/dev/null\` does not exist; use \`NUL\` if a redirect is truly required.`
+  }
+  return ""
+}
+
 function powershellNotes(name: string) {
   if (name === "pwsh") {
     return `# PowerShell (7+) shell notes
@@ -261,6 +281,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   const isPowerShell = PS.has(name)
   const chain = chainGuidance(name)
   const dialect = ShellLaunch.profile(name, platform).dialect
+  const interpreter = interpreterSection(name)
   if (dialect === "unknown") {
     return {
       intro: `Executes a command through the configured shell wrapper \`${name}\`. Its command-language dialect is unknown.`,
@@ -271,6 +292,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
 - Keep commands to the wrapper's documented syntax. If its dialect is not known from the task/repository, avoid shell-specific operators, substitutions, heredocs, quoting recipes, and path rewrites rather than guessing.
 - This wrapper is entered through the host shell adapter, not a guessed direct-argv contract. Compatible wrappers must implement the host shell protocol (a \`-c\` command-string entrypoint on POSIX; cmd-compatible \`/d /s /c\` parsing on Windows). If the configured executable does not implement that protocol, execution fails rather than inventing another adapter.
 - The runtime still treats \`command\` as a shell SCRIPT STRING and starts a fresh process for every call.`,
+      interpreterSection: interpreter,
       gitCommands: "commands",
       gitCommandRestriction: "git commands",
       createPrInstruction:
@@ -280,10 +302,11 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
   if (CMD.has(name)) {
     return {
-      intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures.`,
+      intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures. This runtime is cmd.exe, not Bash: Unix/Bash commands such as grep, sed, awk, head, and tail are not installed.`,
       workdirSection:
         "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead.",
       commandSection: cmdCommandSection(chain, limits, defaultTimeoutMs),
+      interpreterSection: interpreter,
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
       createPrInstruction:
@@ -293,7 +316,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
   if (isPowerShell) {
     return {
-      intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures.`,
+      intro: `Executes a given ${shellDisplayName(name)} command with optional timeout, ensuring proper handling and security measures. This runtime is PowerShell, not Bash: Unix/Bash commands such as grep, sed, awk, head, and tail are not installed.`,
       workdirSection:
         "All commands run in the current working directory by default. Use the `workdir` parameter if you need to run a command in a different directory. AVOID changing directories inside the command - use `workdir` instead.",
       commandSection: powershellCommandSection(
@@ -303,6 +326,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
         limits,
         defaultTimeoutMs,
       ),
+      interpreterSection: interpreter,
       gitCommands: "git commands",
       gitCommandRestriction: "git commands",
       createPrInstruction:
@@ -317,6 +341,7 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
     commandSection: [gitBashNotes(name, platform), bashCommandSection(chain, limits, defaultTimeoutMs)]
       .filter(Boolean)
       .join("\n\n"),
+    interpreterSection: interpreter,
     gitCommands: "shell commands",
     gitCommandRestriction: "git commands",
     createPrInstruction:
@@ -351,6 +376,7 @@ export function render(shell: string, platform: NodeJS.Platform, limits: Limits,
       tmp: Global.Path.tmp,
       workdirSection: selected.workdirSection,
       commandSection: selected.commandSection,
+      interpreterSection: selected.interpreterSection,
       backgroundSection: BACKGROUND_SECTION,
       gitCommands: selected.gitCommands,
       toolName: ShellID.ToolID,

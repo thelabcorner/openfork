@@ -11,6 +11,10 @@ import { TRUNCATION_DIR } from "./truncation-dir"
 import { heldJobStems } from "@/background/shell-jobs"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
 import { ToolOutputRetention } from "@opencode-ai/core/tool-output-retention"
+import * as SessionToolOutput from "@opencode-ai/core/session/tool-output"
+import { Database } from "@opencode-ai/core/database/database"
+import type { SessionSchema } from "@opencode-ai/core/session/schema"
+import type { MessageID } from "@opencode-ai/core/v1/session"
 
 const RETENTION = Duration.days(7)
 
@@ -24,6 +28,8 @@ export type Result =
   | {
       content: string
       truncated: true
+      /** True only when the complete result was durably retained in the session timeline. */
+      timelineOutput?: true
       outputPath?: string
       originalLines: number
       originalBytes: number
@@ -37,6 +43,19 @@ export interface Options {
   maxLines?: number
   maxBytes?: number
   direction?: ToolOutputProjection.Strategy
+  /**
+   * The producer already durably retained its complete semantic output under
+   * this tool call. Provider projection must preserve that authority instead of
+   * replacing it with a second, smaller retention of the projected producer
+   * result.
+   */
+  timelineRetained?: boolean
+}
+
+export type TimelineOwner = {
+  sessionID: SessionSchema.ID
+  messageID: MessageID
+  toolCallID: string
 }
 
 const JOB_PREFIX = "job_"
@@ -57,12 +76,18 @@ function hasTaskTool(agent?: Agent.Info) {
 export interface Interface {
   readonly cleanup: () => Effect.Effect<void>
   readonly write: (text: string) => Effect.Effect<string>
-  readonly writer: (initial?: string) => Effect.Effect<Writer>
+  readonly writer: (initial: string | undefined, owner?: TimelineOwner) => Effect.Effect<Writer>
   /**
    * Returns output unchanged when it fits within the limits, otherwise writes the full text
    * to the truncation directory and returns a preview plus a hint to inspect the saved file.
    */
-  readonly output: (text: string, options?: Options, agent?: Agent.Info) => Effect.Effect<Result>
+  readonly output: (text: string, options?: Options, agent?: Agent.Info, owner?: TimelineOwner) => Effect.Effect<Result>
+  /**
+   * Best-effort durable timeline retention, independent of provider projections
+   * and archive TTL. False means the provider result must remain usable but the
+   * timeline must not advertise full-output recovery.
+   */
+  readonly retainTimeline: (owner: TimelineOwner, text: string) => Effect.Effect<boolean>
   /**
    * Resolved truncation limits: values from `tool_output` in opencode config, or MAX_LINES / MAX_BYTES if unset.
    */
@@ -73,7 +98,10 @@ export interface Writer {
   readonly outputPath?: string
   readonly write: (text: string) => Effect.Effect<void>
   readonly close: Effect.Effect<void>
+  /** Optional Brotli archive health. */
   readonly healthy: () => boolean
+  /** Complete session-timeline retention health. */
+  readonly timelineHealthy: () => boolean
 }
 
 export type ProjectionMetadata = {
@@ -82,6 +110,7 @@ export type ProjectionMetadata = {
   providerTruncated: boolean
   outputPath?: string
   providerOutputPath?: string
+  timelineOutput?: boolean
   outputProjection?: {
     strategy: ToolOutputProjection.Strategy
     originalLines: number
@@ -106,6 +135,7 @@ export function mergeMetadata<T extends Record<string, unknown>>(metadata: T, pr
     truncated: producerTruncated || projected.truncated,
     ...(producerDeclared && { producerTruncated }),
     providerTruncated: projected.truncated,
+    ...(projected.truncated && projected.timelineOutput ? { timelineOutput: true } : {}),
     ...(projected.truncated && {
       ...(projected.outputPath
         ? existingOutputPath
@@ -130,6 +160,39 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
+    const database = yield* Database.Service
+    const beginTimeline = (owner: TimelineOwner) =>
+      SessionToolOutput.begin(owner).pipe(Effect.provideService(Database.Service, database))
+    const appendTimelineChunk = (owner: TimelineOwner, index: number, offset: number, text: string) =>
+      SessionToolOutput.append(owner, index, offset, text).pipe(Effect.provideService(Database.Service, database))
+    const finishTimeline = (owner: TimelineOwner) =>
+      SessionToolOutput.finish(owner).pipe(Effect.provideService(Database.Service, database))
+    const persistTimeline = (owner: TimelineOwner, text: string) =>
+      SessionToolOutput.persist(owner, text).pipe(Effect.provideService(Database.Service, database))
+
+    // Full-output timeline retention is a recovery feature, not semantic tool
+    // success. Missing/invalid ownership or storage failure must never turn an
+    // otherwise successful tool result into a Session failure.
+    const retainTimeline = Effect.fn("Truncate.retainTimeline")(function* (owner: TimelineOwner, text: string) {
+      if (!owner.toolCallID) {
+        yield* Effect.logWarning("skipping durable tool-output timeline retention without a tool-call owner", {
+          sessionID: owner.sessionID,
+          messageID: owner.messageID,
+        })
+        return false
+      }
+      return yield* persistTimeline(owner, text).pipe(
+        Effect.as(true),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to retain complete tool output in the session timeline; continuing with bounded provider output", {
+            sessionID: owner.sessionID,
+            messageID: owner.messageID,
+            toolCallID: owner.toolCallID,
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(false)),
+        ),
+      )
+    })
 
     const cleanup = Effect.fn("Truncate.cleanup")(function* () {
       const cutoff = Date.now() - Duration.toMillis(RETENTION)
@@ -167,74 +230,145 @@ const layer = Layer.effect(
       write: () => Effect.void,
       close: Effect.void,
       healthy: () => false,
+      timelineHealthy: () => false,
     })
 
-    const writer = Effect.fn("Truncate.writer")(function* (initial = "") {
+    const writer = Effect.fn("Truncate.writer")(function* (initial = "", owner?: TimelineOwner) {
+      let timelineHealthy = false
+      if (owner?.toolCallID) {
+        timelineHealthy = yield* beginTimeline(owner).pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("failed to initialize durable streaming tool-output timeline; continuing without timeline recovery", {
+              sessionID: owner.sessionID,
+              messageID: owner.messageID,
+              toolCallID: owner.toolCallID,
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as(false)),
+          ),
+        )
+      } else {
+        yield* Effect.logWarning("streaming tool output has no durable tool-call owner; continuing without timeline recovery", {
+          ...(owner ? { sessionID: owner.sessionID, messageID: owner.messageID } : {}),
+        })
+      }
       const file = path.join(TRUNCATION_DIR, `${ToolID.ascending()}.br`)
-      const ready = yield* fs.ensureDir(TRUNCATION_DIR).pipe(
+      const archiveReady = yield* fs.ensureDir(TRUNCATION_DIR).pipe(
         Effect.as(true),
         Effect.catch((cause) =>
-          Effect.logWarning("failed to initialize streaming tool-output retention; continuing without recovery", {
+          Effect.logWarning("failed to initialize streaming tool-output archive; continuing without archive recovery", {
             cause: String(cause),
           }).pipe(Effect.as(false)),
         ),
       )
-      if (!ready) return disabledWriter()
-
-      const raw = yield* Effect.try({
-        try: () => ToolOutputRetention.createWriter(file),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.map(Option.some),
-        Effect.catch((cause) =>
-          Effect.logWarning("failed to create streaming tool-output writer; continuing without recovery", {
-            cause: String(cause),
-          }).pipe(Effect.as(Option.none<ToolOutputRetention.Writer>())),
-        ),
-      )
-      if (Option.isNone(raw)) return disabledWriter()
-      let healthy = true
-      const writeChunk = (text: string) =>
-        healthy
-          ? Effect.tryPromise({
-              try: () => raw.value.write(text),
-              catch: (cause) => cause,
-            }).pipe(
+      const raw = archiveReady
+        ? yield* Effect.try({
+            try: () => ToolOutputRetention.createWriter(file),
+            catch: (cause) => cause,
+          }).pipe(
+            Effect.map(Option.some),
+            Effect.catch((cause) =>
+              Effect.logWarning("failed to create streaming tool-output writer; continuing without archive recovery", {
+                cause: String(cause),
+              }).pipe(Effect.as(Option.none<ToolOutputRetention.Writer>())),
+            ),
+          )
+        : Option.none<ToolOutputRetention.Writer>()
+      let archiveHealthy = Option.isSome(raw)
+      let nextOffset = 0
+      let chunkIndex = 0
+      const buffer = SessionToolOutput.createChunkBuffer()
+      const appendTimeline = (target: TimelineOwner, value: string) =>
+        Effect.forEach(
+          buffer.push(value),
+          (ready) => {
+            const index = chunkIndex++
+            const offset = nextOffset
+            nextOffset += Array.from(ready).length
+            return appendTimelineChunk(target, index, offset, ready)
+          },
+          { discard: true },
+        ).pipe(Effect.as(undefined))
+      const writeChunk = (value: string) =>
+        Effect.gen(function* () {
+          if (archiveHealthy && Option.isSome(raw)) {
+            yield* Effect.tryPromise({ try: () => raw.value.write(value), catch: (cause) => cause }).pipe(
               Effect.catch((cause) =>
                 Effect.sync(() => {
-                  healthy = false
+                  archiveHealthy = false
+                }).pipe(Effect.andThen(Effect.logWarning("failed to write optional compressed tool-output archive", { cause: String(cause) }))),
+              ),
+            )
+          }
+          if (timelineHealthy && owner) {
+            // Coalesce many deltas into fixed Unicode-safe chunks; each flush is
+            // durable before the producer acknowledges the chunk to the UI.
+            yield* appendTimeline(owner, value).pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() => {
+                  timelineHealthy = false
                 }).pipe(
                   Effect.andThen(
-                    Effect.logWarning("failed while retaining streaming tool output; continuing without recovery", {
-                      cause: String(cause),
+                    Effect.logWarning("failed while retaining streaming tool output in the session timeline; continuing without timeline recovery", {
+                      sessionID: owner.sessionID,
+                      messageID: owner.messageID,
+                      toolCallID: owner.toolCallID,
+                      cause: Cause.pretty(cause),
                     }),
                   ),
                 ),
               ),
             )
-          : Effect.void
-      const close = Effect.tryPromise({
-        try: () => raw.value.close(),
-        catch: (cause) => cause,
-      }).pipe(
-        Effect.catch((cause) =>
-          Effect.sync(() => {
-            healthy = false
-          }).pipe(
-            Effect.andThen(
-              Effect.logWarning("failed to finalize streaming tool output retention", { cause: String(cause) }),
+          }
+        })
+      const close = Effect.gen(function* () {
+        if (archiveHealthy && Option.isSome(raw)) {
+          yield* Effect.tryPromise({ try: () => raw.value.close(), catch: (cause) => cause }).pipe(
+            Effect.catch((cause) =>
+              Effect.sync(() => {
+                archiveHealthy = false
+              }).pipe(Effect.andThen(Effect.logWarning("failed to finalize optional compressed tool-output archive", { cause: String(cause) }))),
             ),
-          ),
-        ),
-      )
+          )
+        }
+        if (timelineHealthy && owner) {
+          yield* Effect.gen(function* () {
+            for (const ready of buffer.flush()) {
+              yield* appendTimelineChunk(owner, chunkIndex++, nextOffset, ready)
+              nextOffset += Array.from(ready).length
+            }
+            yield* finishTimeline(owner)
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => {
+                timelineHealthy = false
+              }).pipe(
+                Effect.andThen(
+                  Effect.logWarning("failed to finalize streaming tool output in the session timeline; continuing without timeline recovery", {
+                    sessionID: owner.sessionID,
+                    messageID: owner.messageID,
+                    toolCallID: owner.toolCallID,
+                    cause: Cause.pretty(cause),
+                  }),
+                ),
+              ),
+            ),
+          )
+        }
+      })
+      if (!archiveHealthy && !timelineHealthy) {
+        if (initial) yield* Effect.void
+        return disabledWriter()
+      }
       if (initial) yield* writeChunk(initial)
       return {
         get outputPath() {
-          return healthy ? file : undefined
+          return archiveHealthy ? file : undefined
         },
         write: writeChunk,
         close,
-        healthy: () => healthy,
+        healthy: () => archiveHealthy,
+        timelineHealthy: () => timelineHealthy,
       } satisfies Writer
     })
 
@@ -248,7 +382,12 @@ const layer = Layer.effect(
       }
     })
 
-    const output = Effect.fn("Truncate.output")(function* (text: string, options: Options = {}, agent?: Agent.Info) {
+    const output = Effect.fn("Truncate.output")(function* (
+      text: string,
+      options: Options = {},
+      agent?: Agent.Info,
+      owner?: TimelineOwner,
+    ) {
       const resolved = yield* limits()
       const maxLines = options.maxLines ?? resolved.maxLines
       const maxBytes = options.maxBytes ?? resolved.maxBytes
@@ -258,6 +397,18 @@ const layer = Layer.effect(
       if (!analysis.truncated) {
         return { content: text, truncated: false } as const
       }
+
+      // Provider context stays bounded regardless of whether this execution has
+      // a durable ToolPart owner. When the producer already owns complete
+      // timeline retention (for example streaming shell output), preserve that
+      // authority rather than replacing it with this smaller provider input.
+      // Otherwise timeline recovery remains opportunistic: ownership or storage
+      // defects must not convert semantic tool success into failure.
+      const timelineOutput = options.timelineRetained === true
+        ? true
+        : owner
+          ? yield* retainTimeline(owner, text)
+          : false
 
       // The producer has already succeeded. Managed retention improves
       // recoverability, but a storage defect must not convert that success into
@@ -278,7 +429,9 @@ const layer = Layer.effect(
         : ""
       const marker = outputPath
         ? `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing ${direction === "balanced" ? "beginning + end" : direction}). Full output saved to ${outputPath} (brotli compressed). Use archive({action:"read", path:"${outputPath}"}) to inspect it.${taskHint} ...`
-        : `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing ${direction === "balanced" ? "beginning + end" : direction}). Full-output retention failed; omitted content is unavailable from managed storage. ...`
+        : timelineOutput
+          ? `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing ${direction === "balanced" ? "beginning + end" : direction}). Full output is retained in the durable session timeline; archive recovery is unavailable. ...`
+          : `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing ${direction === "balanced" ? "beginning + end" : direction}). Full-output retention failed; omitted content is unavailable from managed storage. ...`
       const projected = ToolOutputProjection.project(
         text,
         { maxLines, maxBytes, marker, strategy: direction },
@@ -288,6 +441,7 @@ const layer = Layer.effect(
       return {
         content: projected.content,
         truncated: true,
+        ...(timelineOutput ? { timelineOutput: true as const } : {}),
         ...(outputPath ? { outputPath } : {}),
         originalLines: projected.originalLines,
         originalBytes: projected.originalBytes,
@@ -305,10 +459,10 @@ const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ cleanup, write, writer, output, limits })
+    return Service.of({ cleanup, write, writer, output, limits, retainTimeline })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node, Database.node] })
 
 export * as Truncate from "./truncate"

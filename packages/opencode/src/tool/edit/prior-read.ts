@@ -12,11 +12,12 @@ export type ReadRecord = {
 /**
  * Prior-read enforcement (D47).
  *
- * Records are scoped by session. Reads establish model grounding; successful
- * mutations made by that same session advance the observed file version so a
- * follow-up edit does not need a redundant re-read. Another session (or an
- * external editor/process) cannot advance this session's record, so real
- * out-of-session drift still hard-refuses.
+ * Records are scoped by session. Full text reads establish line grounding;
+ * navigation views record freshness without claiming complete text grounding.
+ * Successful mutations made by that same session advance the observed file
+ * version so a follow-up edit does not need a redundant re-read. Another
+ * session (or an external editor/process) cannot advance this session's
+ * record, so detected out-of-session drift still hard-refuses.
  *
  * A mutation does not magically give the model line-number grounding: writes
  * preserve groundedByRead=false until the session actually reads the file.
@@ -26,7 +27,17 @@ export class ReadCache {
   constructor(private readonly max = 512) {}
 
   private key(sessionID: string, filePath: string) {
-    return `${sessionID}\u0000${FSUtil.normalizePath(filePath)}`
+    // Resolve symlink and dot-segment aliases on every platform. The read and
+    // edit tools can be given different spellings for the same file; keeping
+    // separate cache entries would let one spelling miss another spelling's
+    // freshness record.
+    let canonical = FSUtil.normalizePath(filePath)
+    try {
+      canonical = FSUtil.resolve(filePath)
+    } catch {
+      // Missing paths still need a stable key (for create/delete flows).
+    }
+    return `${sessionID}\u0000${canonical}`
   }
 
   private set(sessionID: string, filePath: string, record: ReadRecord) {
@@ -38,13 +49,13 @@ export class ReadCache {
     this.entries.set(key, record)
   }
 
-  recordRead(sessionID: string, filePath: string, mtimeMs: number, size: number) {
+  recordRead(sessionID: string, filePath: string, mtimeMs: number, size: number, groundedByRead = true) {
     this.set(sessionID, filePath, {
       observedAtMs: Date.now(),
       exists: true,
       mtimeMs,
       size,
-      groundedByRead: true,
+      groundedByRead,
     })
   }
 
@@ -120,8 +131,8 @@ export const enforce = Effect.fn("PriorRead.enforce")(function* (
   if (!record.groundedByRead && LINE_TARGETED.has(strategy)) {
     return {
       warning:
-        `This file has only been written, not read, in this session — line numbers may be stale. ` +
-        `The edit was still validated against current contents, but prefer reading before line-targeted edits.`,
+        `This file has only been written, not read as full text in this session — it may instead have been inspected through outline/grep/around. ` +
+        `Line numbers may be stale. The edit was still validated against current contents; read the relevant text before line-targeted edits.`,
     }
   }
   return {}

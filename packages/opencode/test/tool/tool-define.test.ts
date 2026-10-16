@@ -2,12 +2,23 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Schema } from "effect"
 import { Agent } from "../../src/agent/agent"
-import { MessageID, SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { Tool } from "@/tool/tool"
 import { Truncate } from "@/tool/truncate"
 import { testEffect } from "../lib/effect"
+import { Database } from "@opencode-ai/core/database/database"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
+import * as SessionToolOutput from "@opencode-ai/core/session/tool-output"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Truncate.node, Agent.node])))
+const ownerIt = testEffect(
+  LayerNode.compile(LayerNode.group([Truncate.node, Agent.node, Database.node]), [
+    [Database.node, Database.layerFromPath(":memory:")],
+  ]),
+)
 
 const params = Schema.Struct({ input: Schema.String })
 
@@ -107,6 +118,109 @@ describe("Tool.define", () => {
     }),
   )
 
+  it.effect("derives a retention owner only for explicitly provider-owned calls", () =>
+    Effect.gen(function* () {
+      const base = makeCtx()
+      expect(Tool.timelineOwner(base)).toBeUndefined()
+      expect(Tool.timelineOwner({ ...base, callID: "call_1" })).toEqual({
+        sessionID: base.sessionID,
+        messageID: base.messageID,
+        toolCallID: "call_1",
+      })
+      expect(Tool.timelineOwner({ ...base, callID: "call_1", retention: "none" })).toBeUndefined()
+    }),
+  )
+
+  ownerIt.live("timelineOutput advertisement implies a complete durable page", () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("ses_timeline_e2e")
+      const messageID = MessageID.make("msg_timeline_e2e")
+      const callID = "call_timeline_e2e"
+      const directory = AbsolutePath.make(process.cwd())
+      const now = Date.now()
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: directory, sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: sessionID,
+          directory,
+          title: "timeline e2e",
+          version: "test",
+          time_created: now,
+          time_updated: now,
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(MessageTable)
+        .values({
+          id: messageID,
+          session_id: sessionID,
+          time_created: now,
+          time_updated: now,
+          data: {
+            role: "user",
+            time: { created: now },
+            agent: "build",
+            model: { providerID: "test", modelID: "test" },
+          } as never,
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(PartTable)
+        .values({
+          id: PartID.ascending(),
+          message_id: messageID,
+          session_id: sessionID,
+          time_created: now,
+          time_updated: now,
+          data: {
+            type: "tool",
+            callID,
+            tool: "timeline-e2e",
+            state: { status: "running", input: {}, time: { start: now } },
+          } as never,
+        })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+
+      const full = "Z".repeat(Truncate.MAX_BYTES * 2)
+      const info = yield* Tool.define(
+        "timeline-e2e",
+        Effect.succeed({
+          description: "oversized provider output",
+          parameters: params,
+          execute() {
+            return Effect.succeed({ title: "timeline-e2e", output: full, metadata: {} })
+          },
+        }),
+      )
+      const tool = yield* info.init()
+      const result = yield* tool.execute({ input: "x" }, { ...makeCtx(), sessionID, messageID, callID })
+      const metadata = result.metadata as typeof result.metadata & Truncate.ProjectionMetadata
+
+      expect(metadata.timelineOutput).toBe(true)
+      const page = yield* SessionToolOutput.page({ sessionID, messageID, toolCallID: callID, offset: 0 })
+      expect(page?.complete).toBe(true)
+      expect(page?.totalChars).toBe(full.length)
+      const pageText = page?.text ?? ""
+      expect(pageText.length).toBeGreaterThan(0)
+      expect(full.startsWith(pageText)).toBe(true)
+    }),
+  )
+
   it.effect("producer truncated=false cannot bypass the final provider-facing bound", () =>
     Effect.gen(function* () {
       const info = yield* Tool.define(
@@ -130,6 +244,10 @@ describe("Tool.define", () => {
       expect(metadata.truncated).toBe(true)
       expect(metadata.producerTruncated).toBe(false)
       expect(metadata.providerTruncated).toBe(true)
+      // Direct/tool-test contexts legitimately have no provider tool-call ID.
+      // Oversized output must remain a bounded success without pretending that
+      // durable timeline recovery exists.
+      expect("timelineOutput" in metadata).toBe(false)
       expect(result.output).toContain("HEAD-")
       expect(result.output).toContain("-TAIL")
       expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThanOrEqual(Truncate.MAX_BYTES)

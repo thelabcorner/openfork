@@ -2,7 +2,7 @@ Manages background jobs and starts event-driven monitors. Ordinary long-running 
 
 Actions (use the `action` parameter):
 
-- `monitor` — Start a long-running shell command whose meaningful stdout lines may wake this session in future turns. Requires `command` and a short `description`. The command should stay quiet unless state actually changes. `persistent:true` runs until killed; otherwise `timeout` defaults to 300000 ms. The returned id is managed by the same status/read/wait/send/kill actions below.
+- `monitor` — Start a long-running **read-only observation** command whose meaningful stdout lines may wake this session in future turns. Requires `command` and a short `description`. Never mutate workspace files in a monitor: use `bash` with `background:true` for mutations. The command should stay quiet unless state actually changes. `persistent:true` runs until killed; otherwise `timeout` defaults to 300000 ms. Persistent watches use a separate bounded capacity pool from background servers/builds. The returned id is managed by the same status/read/wait/send/kill actions below.
 
 - `list` — List every background job in this project plus `stale` leftovers from before a restart. Columns: id, status, kind (shell|monitor), command (+ monitor description), started time, log path.
 - `status` — Full status for one job: status (running/completed/error/cancelled/stale), kind, description (for monitors), exit code, command, started/completed times, and the log path. Pass the job `id` returned at launch.

@@ -106,4 +106,37 @@ describe("ShellPrompt", () => {
     expect(result.description).toContain("cmd-compatible `/d /s /c` parsing on Windows")
     expect(result.description).not.toContain("mkdir /Users/name/My Documents")
   })
+
+  test("PowerShell profiles lead with a hard not-Bash boundary", () => {
+    for (const shell of [
+      "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ]) {
+      const result = ShellPrompt.render(shell, "win32", limits, 120_000)
+      expect(result.description).toContain("This runtime is PowerShell, not Bash")
+      expect(result.description).toContain("## This interpreter is PowerShell — not Bash")
+      expect(result.description).toContain("NOT installed")
+      expect(result.description).toContain("use the Find tool with the `grep` parameter")
+      expect(result.description).toContain("/dev/null` does not exist on Windows")
+      expect(result.description).toContain("`$null`")
+      expect(result.description).toContain("surgical text changes use the Edit tool")
+      expect(result.description).toContain("no heredocs")
+    }
+  })
+
+  test("cmd profiles lead with a hard not-Bash boundary", () => {
+    const result = ShellPrompt.render("C:\\Windows\\System32\\cmd.exe", "win32", limits, 120_000)
+    expect(result.description).toContain("This runtime is cmd.exe, not Bash")
+    expect(result.description).toContain("## This interpreter is cmd.exe — not Bash")
+    expect(result.description).toContain("are NOT installed")
+    expect(result.description).toContain("use the Edit tool")
+    expect(result.description).toContain("`NUL`")
+  })
+
+  test("POSIX shells do not receive the Windows not-Bash deny-list", () => {
+    const result = ShellPrompt.render("/bin/bash", "linux", limits, 120_000)
+    expect(result.description).not.toContain("This interpreter is PowerShell")
+    expect(result.description).not.toContain("This interpreter is cmd.exe")
+    expect(result.description).not.toContain("NOT installed")
+  })
 })

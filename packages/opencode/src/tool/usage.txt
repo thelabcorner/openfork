@@ -1,0 +1,13 @@
+Inspect OpenFork's durable token and cost accounting through compact bounded projections without hydrating conversation history.
+
+Actions:
+- totals: compact spend/token/session/rate summary for a time window (default 30d).
+- breakdown: top provider/model/variant/project rows, bounded by limit.
+- timeline: bounded hour/day cost, token, or message series for trend questions.
+- maintenance: host-owned compaction/summary/special-agent accounting, kept separate from ordinary usage.
+- profile: recent per-model cost/cache profile used by OpenFork's model-selection systems.
+- context: one session's fixed-size durable context/accounting projection; never loads its transcript.
+
+Use window presets (1h, 12h, 1d, 7d, 14d, 30d, 90d, all) for normal questions, or explicit since+until epoch milliseconds. Range analytics run grouped SQL on the dedicated serialized Usage scan lane: no message/part hydration, no giant UsageSummary fetch-and-slice, no tool-level cache, and no parallel scan fan-out.
+
+Prefer totals first, then request a specific breakdown/timeline only when needed. Results are intentionally bounded for model context; limit/maxPoints can widen them within hard caps. Quota/remaining provider limits belong to @quota, not this tool.

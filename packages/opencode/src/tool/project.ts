@@ -14,8 +14,8 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { ProjectInspection } from "@/project/inspection"
+import { ProjectToolchain } from "@/project/toolchain"
 import { ChildProcess } from "effect/unstable/process"
-import { which } from "@opencode-ai/core/util/which"
 import DESCRIPTION from "./project.txt"
 
 export const Parameters = Schema.Struct({
@@ -89,7 +89,7 @@ const MANIFEST_NAMES = new Set([
 
 const SOURCE_ROOTS = ["src", "lib", "app", "cmd", "packages", "crates"]
 
-const escapeXml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+const escapeXml = ProjectInspection.escapeXml
 
 // Human-readable size, e.g. 123456 -> "121 KB".
 function humanSize(bytes: number): string {
@@ -283,31 +283,6 @@ const GIT_ARGS = [
   "core.quotepath=false",
   ...GitRuntime.args([]),
 ] as const
-
-// Probe runtimes/versions for the toolchain action. Order matters for the
-// reported list; each entry is (label, [binary, ...candidates], versionFlag).
-const RUNTIME_PROBES: ReadonlyArray<{ name: string; binaries: string[]; flag: string }> = [
-  { name: "bun", binaries: ["bun"], flag: "--version" },
-  { name: "node", binaries: ["node"], flag: "--version" },
-  { name: "npm", binaries: ["npm"], flag: "--version" },
-  { name: "pnpm", binaries: ["pnpm"], flag: "--version" },
-  { name: "yarn", binaries: ["yarn"], flag: "--version" },
-  { name: "python", binaries: ["python", "python3"], flag: "--version" },
-  { name: "go", binaries: ["go"], flag: "version" },
-  { name: "rustc", binaries: ["rustc"], flag: "--version" },
-]
-
-// Key env vars surfaced in the toolchain action. Keep it to non-secret,
-// project-relevant vars only — never auth tokens or credentials.
-const TOOLCHAIN_ENV: ReadonlyArray<[string, string]> = [
-  ["PATH", "first entry of $PATH"],
-  ["NODE_ENV", "node environment"],
-  ["CI", "CI detection"],
-  ["VIRTUAL_ENV", "python virtualenv"],
-  ["GOPATH", "go workspace"],
-  ["CARGO_HOME", "cargo home"],
-  ["BUN_INSTALL", "bun install dir"],
-]
 
 function detectNode(text: string | undefined, files: ReadonlySet<string>): StackInfo | undefined {
   const pkg = jsonObject(text)
@@ -1022,47 +997,6 @@ export const ProjectTool = Tool.define<
       return { rows, grouped, now }
     })
 
-    const probeToolchain = Effect.fn("ProjectTool.probeToolchain")(function* (signal: AbortSignal) {
-      const run = Effect.fnUntraced(function* (cmd: string, flag: string) {
-        const result = yield* app
-          .run(ChildProcess.make(cmd, [flag], { env: {}, stdin: "ignore", stdout: "pipe", stderr: "pipe" }), {
-            maxOutputBytes: 4_000,
-            timeout: "5 seconds",
-            signal,
-          })
-          .pipe(Effect.catch(() => Effect.succeed(undefined)))
-        if (!result) return undefined
-        return {
-          exitCode: result.exitCode,
-          stdout: result.stdout.toString("utf8"),
-          stderr: result.stderr.toString("utf8"),
-        }
-      })
-      const runtimes: Array<{ name: string; version?: string; path?: string }> = []
-      for (const probe of RUNTIME_PROBES) {
-        let version: string | undefined
-        let binaryPath: string | undefined
-        for (const binary of probe.binaries) {
-          const found = which(binary)
-          const result = yield* run(binary, probe.flag)
-          if (result && result.exitCode === 0) {
-            version = (result.stdout || result.stderr).split("\n")[0]?.trim() || undefined
-            if (found) binaryPath = found
-            break
-          }
-        }
-        if (version || binaryPath) runtimes.push({ name: probe.name, version, path: binaryPath })
-      }
-      const env: Array<{ name: string; value?: string; hint: string }> = []
-      for (const [name, hint] of TOOLCHAIN_ENV) {
-        const value = process.env[name]
-        if (value !== undefined) {
-          env.push({ name, value: name === "PATH" ? value.split(path.delimiter)[0] : value, hint })
-        }
-      }
-      return { runtimes, env }
-    })
-
     return {
       description: DESCRIPTION,
       parameters: Parameters,
@@ -1155,27 +1089,15 @@ export const ProjectTool = Tool.define<
 
           // toolchain: installed runtimes + versions + env snapshot
           if (action === "toolchain") {
-            const { runtimes, env } = yield* probeToolchain(ctx.abort)
-            const lines = [
-              `<toolchain git="${git !== undefined}" root="${escapeXml(git?.root ?? base)}">`,
-              ...runtimes.map(
-                (r) =>
-                  `  <runtime name="${escapeXml(r.name)}"${r.version ? ` version="${escapeXml(r.version)}"` : ""}${r.path ? ` path="${escapeXml(r.path)}"` : ""} />`,
-              ),
-              ...env.map(
-                (e) =>
-                  `  <env name="${escapeXml(e.name)}" value="${escapeXml(e.value ?? "")}" hint="${escapeXml(e.hint)}" />`,
-              ),
-              "</toolchain>",
-            ]
-            const output = lines.join("\n")
+            const inspection = yield* ProjectToolchain.probe(app, ctx.abort)
+            const output = ProjectToolchain.render(inspection, { root: git?.root ?? base, git: git !== undefined })
             return {
               title: "toolchain",
               output,
               metadata: {
                 tier: "toolchain",
                 path: scopeRel,
-                files: runtimes.length,
+                files: inspection.runtimes.length,
                 truncated: false,
                 preview: output.slice(0, 500),
                 git: git !== undefined,
@@ -1329,7 +1251,7 @@ export const ProjectTool = Tool.define<
               gitXml(),
               initXml(),
               `<tree depth="${depth}" entries="${t.entries}" totalFiles="${t.totalFiles}" totalBytes="${humanSize(t.totalBytes)}">`,
-              ...t.lines,
+              ...t.lines.map(escapeXml),
               "</tree>",
               statsLine(),
             ].join("\n")
@@ -1354,7 +1276,7 @@ export const ProjectTool = Tool.define<
               initXml(),
               scripts?.length ? scriptsXml(scripts) : "",
               `<tree depth="${depth}" entries="${t.entries}" totalFiles="${t.totalFiles}" totalBytes="${humanSize(t.totalBytes)}">`,
-              ...t.lines,
+              ...t.lines.map(escapeXml),
               "</tree>",
               entryXml,
               configXml,

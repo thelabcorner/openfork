@@ -8,6 +8,7 @@ import { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
+import { HOST_LIMITS } from "@/code/execution"
 
 export const CODE_MODE_TOOL = "execute"
 
@@ -146,26 +147,34 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
   const result: CallToolResult = yield* Effect.gen(function* () {
     yield* input.ctx.ask({ permission: input.entry.key, metadata: {}, patterns: ["*"], always: ["*"] })
     // Deliberately mirrors McpCatalog.convertTool's transport call so the MCP service stays free of tool-loop concerns.
-    return yield* Effect.promise(async () => {
-      const raw = await input.entry.tool.client.callTool(
-        { name: input.entry.tool.def.name, arguments: input.args },
-        CallToolResultSchema,
-        {
-          resetTimeoutOnProgress: true,
-          signal: input.ctx.abort,
-          timeout: input.entry.tool.timeout,
-          // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
-          onprogress: () => {},
-        },
-      )
-      if (raw.isError)
-        throw new Error(
-          raw.content
-            .flatMap((item) => (item.type === "text" ? [item.text] : []))
-            .filter((text) => text.trim())
-            .join("\n\n") || "MCP tool returned an error",
+    return yield* Effect.tryPromise({
+      try: async (signal) => {
+        const raw = await input.entry.tool.client.callTool(
+          { name: input.entry.tool.def.name, arguments: input.args },
+          CallToolResultSchema,
+          {
+            resetTimeoutOnProgress: true,
+            // A script deadline must cancel the physical MCP RPC, not merely
+            // abandon its interpreter result. The Effect-owned signal aborts on
+            // interpreter timeout/interruption; the Session signal still aborts
+            // on user cancellation. Using ctx.abort alone leaked requests after
+            // Code Mode's execution deadline.
+            signal: AbortSignal.any([input.ctx.abort, signal]),
+            timeout: input.entry.tool.timeout,
+            // The MCP SDK only sends a progress token when this hook is present, enabling timeout resets.
+            onprogress: () => {},
+          },
         )
-      return raw
+        if (raw.isError)
+          throw new Error(
+            raw.content
+              .flatMap((item) => (item.type === "text" ? [item.text] : []))
+              .filter((text) => text.trim())
+              .join("\n\n") || "MCP tool returned an error",
+          )
+        return raw
+      },
+      catch: (cause) => cause instanceof Error ? cause : new Error(String(cause)),
     })
   }).pipe(
     Effect.withSpan("Tool.execute", {
@@ -238,6 +247,11 @@ export const CodeModeTool = Tool.define(
 
         const runtime = CodeMode.make({
           tools: toolTree(catalog, callTool),
+          // The MCP-backed execute entry point must share the same bounded
+          // interpreter policy as the native Code tool. Without limits, a
+          // hung plugin/MCP leaf can keep the V1 Session busy indefinitely.
+          // See upstream OpenCode issue #54220.
+          limits: HOST_LIMITS,
           onToolCallStart: ({ index, name, input }) =>
             Effect.suspend(() => {
               const shown = (() => {

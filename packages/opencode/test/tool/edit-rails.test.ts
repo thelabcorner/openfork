@@ -2,8 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Option } from "effect"
-import { EditTool } from "../../src/tool/edit"
+import { Cause, Effect, Exit, Option, Schema } from "effect"
+import { EditTool, Parameters } from "../../src/tool/edit"
 import {
   applyBatch,
   appendToFile,
@@ -102,6 +102,21 @@ const check = (before: string, result: StrategyResult): string => {
 // ---- pure strategy unit tests (no runtime needed) ---------------------------
 
 describe("edit strategy helpers (pure)", () => {
+  test("batch wire schema accepts every advertised strategy and preserves excess selectors for rejection", () => {
+    const cases = [
+      { op: { oldString: "b", newText: "B" }, expected: "a\nB\nc\n" },
+      { op: { insertAt: 1, oldText: "a", newText: "inserted" }, expected: "a\ninserted\nb\nc\n" },
+      { op: { insertAfter: 1, oldText: "a", newText: "inserted" }, expected: "a\ninserted\nb\nc\n" },
+      { op: { appendFile: true as const, newText: "tail" }, expected: "a\nb\nc\ntail" },
+      { op: { nearText: "b", oldText: "b", newText: "B" }, expected: "a\nB\nc\n" },
+    ]
+    for (const { op, expected } of cases) {
+      const decoded = Schema.decodeUnknownSync(Parameters)({ filePath: "file.txt", edits: [op] })
+      expect(check("a\nb\nc\n", applyBatch("a\nb\nc\n", decoded.edits! as never))).toBe(expected)
+    }
+    const decoded = Schema.decodeUnknownSync(Parameters)({ edits: [{ oldString: "a", newString: "A", line: 1 }] })
+    expect(() => applyBatch("a", decoded.edits! as never)).toThrow(/cannot combine/)
+  })
   test("replaceLine replaces the target line and echoes oldPreview", () => {
     const result = replaceLine("a\nb\nc", 2, "B", "b")
     expect(check("a\nb\nc", result)).toBe("a\nB\nc")
@@ -251,7 +266,9 @@ describe("edit strategy helpers (pure)", () => {
   })
 
   test("applyEditStrategy rejects multiple strategy groups (ambiguity guard)", () => {
-    expect(() => applyEditStrategy("a\nb", { line: 1, insertAt: 1, newText: "x", oldText: "a" })).toThrow(/multiple strategies/)
+    expect(() => applyEditStrategy("a\nb", { line: 1, insertAt: 1, newText: "x", oldText: "a" })).toThrow(
+      /multiple strategies/,
+    )
   })
 
   test("applyEditStrategy rejects when no strategy is present", () => {
@@ -317,7 +334,7 @@ describe("edit strategy helpers (pure)", () => {
   })
 
   test("unicode-equivalent needles resolve with a warning", () => {
-    const before = "const name = \"value\"\n"
+    const before = 'const name = "value"\n'
     const resolution = resolveMatch(before, "const name = \u201cvalue\u201d")
     expect(resolution.match.via).toBe("unicode-equivalent")
     expect(resolution.warnings).toHaveLength(1)
@@ -400,14 +417,18 @@ describe("prior-read enforcement (pure)", () => {
 
   test("warns (not refuses) on missing records for line-targeted strategies", async () => {
     const cache = new ReadCache()
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "line"))
+    const outcome = await Effect.runPromise(
+      enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "line"),
+    )
     expect(outcome.refusal).toBeUndefined()
     expect(outcome.warning).toContain("no read record")
   })
 
   test("stays silent on missing records for the exact path", async () => {
     const cache = new ReadCache()
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "exact"))
+    const outcome = await Effect.runPromise(
+      enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "exact"),
+    )
     expect(outcome).toEqual({})
   })
 
@@ -427,10 +448,19 @@ describe("patch rollback (pure)", () => {
     ])
     const stub = {
       readFile: (p: string) => Effect.succeed(current.get(p)!),
+      stat: () => Effect.succeed({ mode: 0o644 }),
+      access: () => Effect.void,
+      chmod: () => Effect.void,
       writeWithDirs: (p: string, c: string) =>
         Effect.sync(() => {
           writes.push([p, c])
           current.set(p, new TextEncoder().encode(c))
+        }),
+      rename: (from: string, to: string) =>
+        Effect.sync(() => {
+          const bytes = current.get(from)!
+          current.set(to, bytes)
+          current.delete(from)
         }),
       remove: (p: string) =>
         Effect.sync(() => {
@@ -468,13 +498,12 @@ describe("patch rollback (pure)", () => {
     )
     expect(error.message).toBe("boom")
     expect(removed).toEqual(["/b.txt"])
-    expect(writes).toEqual([["/a.txt", "old-a"]])
+    expect(writes.map(([, content]) => content)).toEqual(["old-a"])
+    expect(new TextDecoder().decode(current.get("/a.txt"))).toBe("old-a")
   })
 
   test("withRollback never overwrites a newer external edit", async () => {
-    const current = new Map<string, Uint8Array>([
-      ["/a.txt", new TextEncoder().encode("external-newer")],
-    ])
+    const current = new Map<string, Uint8Array>([["/a.txt", new TextEncoder().encode("external-newer")]])
     const writes: string[] = []
     const stub = {
       readFile: (p: string) => Effect.succeed(current.get(p)!),
@@ -489,15 +518,17 @@ describe("patch rollback (pure)", () => {
       Effect.flip(
         withRollback(
           stub,
-          [{
-            filePath: "/a.txt",
-            existedBefore: true,
-            contentBefore: "before",
-            bom: false,
-            committed: true,
-            expectedExists: true,
-            expectedContent: new TextEncoder().encode("patch-write"),
-          }],
+          [
+            {
+              filePath: "/a.txt",
+              existedBefore: true,
+              contentBefore: "before",
+              bom: false,
+              committed: true,
+              expectedExists: true,
+              expectedContent: new TextEncoder().encode("patch-write"),
+            },
+          ],
           Effect.fail(new Error("later file failed")),
         ),
       ),
@@ -530,7 +561,13 @@ describe("tool.edit safety rails (integration)", () => {
       let asked = 0
       const result = yield* run(
         { filePath: filepath, line: 2, newText: "line2", oldText: "line2" },
-        { ...ctx, ask: () => Effect.sync(() => { asked++ }) },
+        {
+          ...ctx,
+          ask: () =>
+            Effect.sync(() => {
+              asked++
+            }),
+        },
       )
       expect(result.metadata.applied).toBe(0)
       expect(asked).toBe(0)
@@ -720,10 +757,96 @@ describe("tool.edit safety rails (integration)", () => {
       yield* put(filepath, original)
       const err = yield* fail({
         filePath: filepath,
-        edits: [{ line: 1, newText: "ONE", oldText: "one" }, { oldString: "not in file", newString: "x" }],
+        edits: [
+          { line: 1, newText: "ONE", oldText: "one" },
+          { oldString: "not in file", newString: "x" },
+        ],
       })
       expect(err).toBeInstanceOf(Error)
       expect(yield* load(filepath)).toBe(original)
+    }),
+  )
+
+  it.instance("batch newText alias reproduces the photographed call without changing CRLF or asking twice", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "export.test.mjs")
+      yield* put(filepath, "before\r\nanchor\r\nafter\r\n")
+      let asks = 0
+      const result = yield* run(
+        {
+          filePath: filepath,
+          edits: [
+            { oldString: "anchor", newText: "regression\nanchor" },
+            { oldString: "after", newString: "AFTER" },
+          ],
+        },
+        {
+          ...ctx,
+          ask: () =>
+            Effect.sync(() => {
+              asks++
+            }),
+        },
+      )
+      expect(yield* load(filepath)).toBe("before\r\nregression\r\nanchor\r\nAFTER\r\n")
+      expect(result.metadata.applied).toBe(2)
+      expect(asks).toBe(1)
+    }),
+  )
+
+  it.instance("top-level multiline oldString accepts the documented newText alias", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "top-level-alias.txt")
+      yield* put(filepath, "before\r\nfirst\r\nsecond\r\nafter\r\n")
+      let asks = 0
+      const result = yield* run(
+        {
+          filePath: filepath,
+          oldString: "first\nsecond",
+          newText: "FIRST\nSECOND\nthird",
+        },
+        {
+          ...ctx,
+          ask: () => Effect.sync(() => void asks++),
+        },
+      )
+      expect(result.metadata.applied).toBe(1)
+      expect(yield* load(filepath)).toBe("before\r\nFIRST\r\nSECOND\r\nthird\r\nafter\r\n")
+      expect(asks).toBe(1)
+    }),
+  )
+
+  it.instance("conflicting batch aliases and selectors fail before permission or mutation", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      const original = "one\ntwo\nthree"
+      yield* put(filepath, original)
+      let asks = 0
+      for (const op of [
+        { oldString: "one", newString: "ONE", newText: "different" },
+        { oldString: "one", newString: "ONE", line: 1 },
+        { line: 1, oldText: "one", newText: "ONE", appendFile: true },
+        { startLine: 1, endLine: 1, delete: true, newText: "ONE" },
+        { oldString: "one", newText: "ONE", replaceAll: true },
+      ]) {
+        expect(
+          (yield* fail(
+            { filePath: filepath, edits: [op] },
+            {
+              ...ctx,
+              ask: () =>
+                Effect.sync(() => {
+                  asks++
+                }),
+            },
+          )).message,
+        ).toMatch(/conflicting|cannot combine/)
+        expect(yield* load(filepath)).toBe(original)
+      }
+      expect(asks).toBe(0)
     }),
   )
 
@@ -783,9 +906,11 @@ describe("tool.edit safety rails (integration)", () => {
       const test = yield* TestInstance
       const filepath = path.join(test.directory, "file.txt")
       yield* put(filepath, "target = 1\nother = 2\n")
-      const mutatingAsk = () =>
-        Effect.promise(() => fs.appendFile(filepath, "unrelated = 3\n")).pipe(Effect.asVoid)
-      const result = yield* run({ filePath: filepath, oldString: "target = 1", newString: "target = 9" }, { ...ctx, ask: mutatingAsk })
+      const mutatingAsk = () => Effect.promise(() => fs.appendFile(filepath, "unrelated = 3\n")).pipe(Effect.asVoid)
+      const result = yield* run(
+        { filePath: filepath, oldString: "target = 1", newString: "target = 9" },
+        { ...ctx, ask: mutatingAsk },
+      )
       expect(result.output).toContain("re-validated")
       expect(yield* load(filepath)).toBe("target = 9\nother = 2\nunrelated = 3\n")
     }),
@@ -798,7 +923,8 @@ describe("tool.edit safety rails (integration)", () => {
       yield* put(filepath, "target = 1\nother = 2\n")
       // Note: the mutation must not contain the needle even as a substring —
       // "target = 100" still contains "target = 1" and would exactly match.
-      const mutatingAsk = () => Effect.promise(() => fs.writeFile(filepath, "target = 200\nother = 2\n")).pipe(Effect.asVoid)
+      const mutatingAsk = () =>
+        Effect.promise(() => fs.writeFile(filepath, "target = 200\nother = 2\n")).pipe(Effect.asVoid)
       const err = yield* fail(
         { filePath: filepath, oldString: "target = 1", newString: "target = 9" },
         { ...ctx, ask: mutatingAsk },

@@ -53,7 +53,7 @@ export function fromSchema(schema: Schema.Top): JSONSchema7 {
       ...document.schema,
       ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
     })
-    const inlined = ensureObjectRootProperties(dropDefinitionsIfResolved(inlineLocalReferences(result)))
+    const inlined = ensureObjectRootProperties(resolveLocalReferences(result))
     if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
     cache.set(schema, inlined)
     return inlined
@@ -81,7 +81,7 @@ export function fromTool(tool: Tool.Def): JSONSchema7 {
 export function fromJsonSchema(schema: JSONSchema7): JSONSchema7 {
   assertJsonSchemaDepth(schema)
   const normalized = normalize(schema)
-  const inlined = ensureObjectRootProperties(dropDefinitionsIfResolved(inlineLocalReferences(normalized)))
+  const inlined = ensureObjectRootProperties(resolveLocalReferences(normalized))
   assertJsonSchemaDepth(inlined)
   if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
   return inlined
@@ -217,6 +217,23 @@ function inlineLocalReferences(value: unknown, definitions?: JsonObject, seen = 
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [key, inlineLocalReferences(item, localDefinitions, seen)]),
   )
+}
+
+/**
+ * The common provider tool schema has no local references. Avoid copying the
+ * entire normalized schema tree in that case: normalization already owns a
+ * fresh tree, so a second recursive clone has no observable purpose. This
+ * check also covers definitions: only remove them when no local references
+ * need them. Dynamic/plugin schemas are checked each time, not cached by
+ * object identity, so in-place definition changes cannot produce stale output.
+ */
+function resolveLocalReferences(value: unknown): unknown {
+  if (!hasLocalReference(value)) {
+    if (!isRecord(value) || (!Object.hasOwn(value, "$defs") && !Object.hasOwn(value, "definitions"))) return value
+    const { $defs: _, definitions: __, ...rest } = value
+    return rest
+  }
+  return dropDefinitionsIfResolved(inlineLocalReferences(value))
 }
 
 function dropDefinitionsIfResolved(value: unknown): unknown {

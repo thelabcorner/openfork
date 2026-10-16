@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Layer } from "effect"
 import { GoalAgent } from "@opencode-ai/core/goal/agent"
+import { GoalCreationPolicy } from "@opencode-ai/core/goal/creation-policy"
 import { GoalTool } from "../../src/tool/goal"
 import { Tool } from "../../src/tool/tool"
 import { Truncate } from "../../src/tool/truncate"
@@ -41,8 +42,10 @@ const truncate = Layer.succeed(
         write: () => Effect.void,
         close: Effect.void,
         healthy: () => true,
+        timelineHealthy: () => false,
       }),
     output: (text) => Effect.succeed({ content: text, truncated: false as const }),
+    retainTimeline: () => Effect.succeed(false),
     limits: () => Effect.succeed({ maxLines: 2_000, maxBytes: 50 * 1024 }),
   }),
 )
@@ -98,6 +101,45 @@ describe("tool.goal", () => {
           previousAssistantText: "This is multi-step work. Should I create a Goal and start it for you?",
         },
       ])
+    }),
+  )
+
+  it.effect("passes an @goal mention human request through the bounded history guard", () =>
+    Effect.gen(function* () {
+      captured.length = 0
+      const info = yield* GoalTool
+      const tool = yield* info.init()
+      const ctx: Tool.Context = {
+        sessionID: SessionID.make("ses_goal_v1"),
+        messageID: MessageID.make("msg_goal_v1_assistant_mention"),
+        callID: "call_goal_create_mention",
+        agent: "build",
+        abort: AbortSignal.any([]),
+        messages: [
+          {
+            info: { id: MessageID.make("msg_goal_mention_request"), role: "user" },
+            parts: [{ type: "text", text: "create a @goal and start working on implementing the plan e2e." }],
+          },
+        ] as any,
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      yield* tool.execute(
+        {
+          action: "create",
+          objective: "Implement the plan end to end",
+          criteria: ["The plan is implemented end to end"],
+        },
+        ctx,
+      )
+
+      expect(captured).toHaveLength(1)
+      expect(captured[0]).toMatchObject({
+        userMessageID: "msg_goal_mention_request",
+        userText: "create a @goal and start working on implementing the plan e2e.",
+      })
+      expect(GoalCreationPolicy.authorize(captured[0]).allowed).toBe(true)
     }),
   )
 
