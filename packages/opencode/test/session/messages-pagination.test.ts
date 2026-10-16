@@ -3,6 +3,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { Database } from "@opencode-ai/core/database/database"
+import { PartTable } from "@opencode-ai/core/session/sql"
 import { Effect, Option } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -174,6 +176,212 @@ describe("MessageV2.page", () => {
 
         const result = yield* MessageV2.page({ sessionID, limit: 4 })
         expect(result.items.map((item) => item.info.id)).toEqual(ids)
+      }),
+    ),
+  )
+
+  it.instance("bounds timeline part hydration while keyed reads retain full content", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const messageID = yield* addUser(sessionID)
+        for (let index = 0; index < 100; index++) {
+          yield* session.updatePart({
+            id: PartID.ascending(),
+            sessionID,
+            messageID,
+            type: "text",
+            text: `part-${index}-${"x".repeat(128)}`,
+          })
+        }
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID,
+          type: "text",
+          text: "oversized-tail-" + "y".repeat(512 * 1024),
+        })
+
+        const page = yield* MessageV2.timelinePage({ sessionID, limit: 1 })
+        expect(page.items).toHaveLength(1)
+        expect(page.items[0]?.parts).toHaveLength(64)
+        expect(page.windowed).toEqual([{ messageID, omittedParts: 37 }])
+
+        const restored = yield* MessageV2.timelinePartsPage({ sessionID, messageID })
+        expect(restored.data).toHaveLength(101)
+        expect(restored.nextCursor).toBeUndefined()
+        const oversizedPart = restored.data.at(-1)
+        if (!oversizedPart || oversizedPart.type !== "text") throw new Error("oversized text part was not restored")
+        expect(oversizedPart.text.startsWith("oversized-tail-")).toBe(true)
+        expect(oversizedPart.text.length).toBe("oversized-tail-".length + 512 * 1024)
+
+        const full = yield* MessageV2.get({ sessionID, messageID })
+        expect(full.parts).toHaveLength(101)
+        expect(full.parts.at(-1)).toMatchObject({ text: expect.stringContaining("oversized-tail-") })
+      }),
+    ),
+  )
+
+  it.instance("opens an 80k-part timeline page without hydrating the full message", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const session = yield* SessionNs.Service
+        const database = yield* Database.Service
+        const messageID = yield* addUser(sessionID)
+        const now = Date.now()
+        const rows = Array.from({ length: 80_000 }, (_, index) => ({
+          id: PartID.ascending(),
+          session_id: sessionID,
+          message_id: messageID,
+          time_created: now + index,
+          time_updated: now + index,
+          data: { type: "text" as const, text: `part-${index}` },
+          search_text: `part-${index}`,
+        }))
+        for (let offset = 0; offset < rows.length; offset += 2_000) {
+          yield* database.db.insert(PartTable).values(rows.slice(offset, offset + 2_000)).run().pipe(Effect.orDie)
+        }
+
+        const started = performance.now()
+        const page = yield* MessageV2.timelinePage({ sessionID, limit: 1 })
+        const elapsedMs = performance.now() - started
+        console.info("80k-part SQLite timeline page", { elapsedMs, returnedParts: page.items[0]?.parts.length })
+        expect(page.items[0]?.parts).toHaveLength(64)
+        expect(page.windowed).toEqual([{ messageID, omittedParts: 79_936 }])
+
+        const restored = new Set<string>()
+        let cursor: MessageV2.TimelineRecoveryCursor | undefined
+        let pageCount = 0
+        do {
+          const content = yield* MessageV2.timelinePartsPage({ sessionID, messageID, cursor })
+          expect(content.data.length).toBeLessThanOrEqual(MessageV2.TIMELINE_RECOVERY_PART_PAGE_SIZE)
+          for (const part of content.data) {
+            expect(restored.has(part.id)).toBe(false)
+            restored.add(part.id)
+          }
+          pageCount++
+          cursor = content.nextCursor
+        } while (cursor)
+        expect(pageCount).toBeGreaterThan(1)
+        expect(restored.size).toBe(80_000)
+      }),
+    ),
+    30_000,
+  )
+
+  it.instance("counts the timeline byte budget in UTF-8 bytes", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const messageID = yield* addUser(sessionID)
+        const now = Date.now()
+        const rows = Array.from({ length: 30 }, (_, index) => ({
+          id: PartID.ascending(),
+          session_id: sessionID,
+          message_id: messageID,
+          time_created: now + index,
+          time_updated: now + index,
+          data: { type: "text" as const, text: "🙂".repeat(5_000) },
+          search_text: "",
+        }))
+        for (let offset = 0; offset < rows.length; offset += 2_000) {
+          yield* database.db.insert(PartTable).values(rows.slice(offset, offset + 2_000)).run().pipe(Effect.orDie)
+        }
+
+        const page = yield* MessageV2.timelinePage({ sessionID, limit: 1 })
+        const parts = page.items[0]?.parts ?? []
+        const bytes = new TextEncoder().encode(JSON.stringify(parts)).byteLength
+        expect(parts.length).toBeLessThan(rows.length)
+        expect(bytes).toBeLessThanOrEqual(384 * 1024)
+      }),
+    ),
+  )
+
+  it.instance("caps oversized caller limits at the timeline owner", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        yield* fill(sessionID, 101)
+        const page = yield* MessageV2.timelinePage({ sessionID, limit: 100_000 })
+        expect(page.items).toHaveLength(100)
+        expect(page.more).toBe(true)
+        expect(page.cursor).toBeDefined()
+      }),
+    ),
+  )
+
+  it.instance("pages explicitly requested part inspection without hydrating unbounded content", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const messageID = yield* addUser(sessionID)
+        const now = Date.now()
+        const rows = Array.from({ length: 20 }, (_, index) => ({
+          id: PartID.ascending(),
+          session_id: sessionID,
+          message_id: messageID,
+          time_created: now + index,
+          time_updated: now + index,
+          data: {
+            type: "text" as const,
+            text: index === 0 ? "a".repeat(10_000) : `part-${index}`,
+          },
+          search_text: "",
+        }))
+        for (let offset = 0; offset < rows.length; offset += 20) {
+          yield* database.db.insert(PartTable).values(rows.slice(offset, offset + 20)).run().pipe(Effect.orDie)
+        }
+
+        const first = yield* MessageV2.inspectionPartsPage({ sessionID, messageID })
+        expect(first.data).toHaveLength(1)
+        expect(first.data[0]).toMatchObject({
+          partID: rows[0]?.id,
+          offset: 0,
+          totalChars: JSON.stringify(rows[0]?.data).length,
+        })
+        expect(first.data[0]?.text.length).toBeLessThanOrEqual(MessageV2.INSPECTION_PART_SLICE_CHARS)
+        expect(first.nextCursor).toBeDefined()
+
+        let cursor = first.nextCursor
+        let largePartSlices = 1
+        let remaining:
+          | {
+              data: { partID: string; type: string; offset: number; totalChars: number; text: string }[]
+              nextCursor?: string
+            }
+          | undefined
+        while (cursor) {
+          const page = yield* MessageV2.inspectionPartsPage({
+            sessionID,
+            messageID,
+            cursor: MessageV2.decodeInspectionPartCursor(cursor),
+          })
+          for (const item of page.data) {
+            expect(item.text.length).toBeLessThanOrEqual(MessageV2.INSPECTION_PART_SLICE_CHARS)
+          }
+          largePartSlices += page.data.filter((item) => item.partID === rows[0]?.id).length
+          if (page.data.some((item) => item.partID === rows[1]?.id)) {
+            remaining = page
+            break
+          }
+          cursor = page.nextCursor
+        }
+        expect(largePartSlices).toBe(Math.ceil(JSON.stringify(rows[0]?.data).length / MessageV2.INSPECTION_PART_SLICE_CHARS))
+        expect(remaining).toBeDefined()
+        expect(remaining?.data).toHaveLength(16)
+        expect(remaining?.data[0]?.partID).toBe(rows[0]?.id)
+        expect(remaining?.data[1]?.partID).toBe(rows[1]?.id)
+        expect(remaining?.data.at(-1)?.partID).toBe(rows[15]?.id)
+        expect(remaining?.nextCursor).toBeDefined()
+
+        const final = yield* MessageV2.inspectionPartsPage({
+          sessionID,
+          messageID,
+          cursor: MessageV2.decodeInspectionPartCursor(remaining!.nextCursor!),
+        })
+        expect(final.data).toHaveLength(4)
+        expect(final.data[0]?.partID).toBe(rows[16]?.id)
+        expect(final.data.at(-1)?.partID).toBe(rows[19]?.id)
+        expect(final.nextCursor).toBeUndefined()
       }),
     ),
   )
@@ -789,6 +997,10 @@ describe("MessageV2.filterCompacted", () => {
         type: "text",
         text: "summary",
       })
+      const marker = (yield* session.messages({ sessionID: created.id }))
+        .find((msg) => msg.info.id === c1)?.parts.find((part) => part.type === "compaction")
+      if (!marker || marker.type !== "compaction") throw new Error("Expected promoted source compaction marker")
+      yield* session.updatePart({ ...marker, pending: false, checkpoint_message_id: s1 })
 
       const u3 = yield* addUser(created.id, "third")
       const a3 = yield* addAssistant(created.id, u3, { finish: "end_turn" })
@@ -812,6 +1024,22 @@ describe("MessageV2.filterCompacted", () => {
       if (!tailPart || tailPart.type !== "compaction") throw new Error("Expected forked compaction part")
       expect(tailPart.tail_start_id).toBeDefined()
       expect(childFiltered.some((m) => m.info.id === tailPart.tail_start_id)).toBe(true)
+      const forkedSummary = childFiltered.find((m) => m.info.role === "assistant" && m.info.summary)
+      expect(tailPart.checkpoint_message_id).toBe(forkedSummary?.info.id)
+      expect(tailPart.checkpoint_message_id).not.toBe(s1)
+      expect(tailPart.pending).toBe(false)
+
+      // Forking at a marker before its promoted summary exists in the child
+      // cannot inherit the parent session's forward checkpoint identity.
+      const interruptedFork = yield* session.fork({ sessionID: created.id, messageID: c1, edge: "after" })
+      const interrupted = MessageV2.filterCompacted(yield* MessageV2.stream(interruptedFork.id))
+      const interruptedMarker = interrupted.flatMap((m) => m.parts).find((p) => p.type === "compaction")
+      expect(interruptedMarker?.type === "compaction" ? interruptedMarker.pending : undefined).toBe(true)
+      expect(interruptedMarker?.type === "compaction" ? interruptedMarker.checkpoint_message_id : undefined)
+        .toBeUndefined()
+      expect(interrupted.some((m) => m.parts.some((p) => p.type === "text" && p.text === "first reply")))
+        .toBe(true)
+      yield* session.remove(interruptedFork.id)
 
       yield* session.remove(forked.id)
       yield* session.remove(created.id)

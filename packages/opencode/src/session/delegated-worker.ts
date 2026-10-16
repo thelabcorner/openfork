@@ -129,6 +129,34 @@ export function projectActivity(input: {
   if (input.owner) return "awaiting_provider"
 }
 
+/**
+ * Is the recorded Session execution owner still *evidenced live*?
+ *
+ * A durable execution-owner row is authority to have executed, never proof that
+ * execution is happening right now. The row outlives whatever wrote it: a hard
+ * crash, a foreign runtime, or a half-finished recovery claim all leave a row
+ * that is indistinguishable from a live one by inspection. So a liveness
+ * projection may only rest on RuntimeOwner's own heartbeat evidence, using the
+ * identical candidate gate SessionExecutionOwner applies before it is willing to
+ * spend a local process probe. A missing runtime row is unproven, not live.
+ *
+ * This never infers death. Heartbeat age is only a reason to *stop* claiming
+ * liveness; retiring a stale owner stays SessionExecutionOwner's
+ * tryClaimRecovery/completeRecovery path, which additionally requires positive
+ * local death proof plus negative containment. `age > X` is never reclaim
+ * authority here or anywhere above it.
+ */
+export function ownerExecutionLive(
+  ownership: SessionExecutionOwner.Snapshot,
+  now: number,
+): boolean {
+  return (
+    ownership.ownerID !== undefined &&
+    ownership.runtime !== undefined &&
+    now - ownership.runtime.heartbeatAt < SessionExecutionOwner.RUNTIME_OWNER_STALE_AFTER_MS
+  )
+}
+
 export interface SelectionChange {
   readonly previousModel: ModelSelection
   readonly model: ModelSelection
@@ -245,135 +273,125 @@ export const make = Effect.gen(function* () {
     )
   })
 
-  const isDescendantSession = Effect.fn(
-    "DelegatedWorker.isDescendantSession",
-  )(function* (candidateID: SessionID, ancestorID: SessionID) {
-    let current: SessionID | undefined = candidateID
-    const seen = new Set<string>()
-    for (let depth = 0; current && depth < 64; depth++) {
-      const key = String(current)
-      if (key === String(ancestorID)) return true
-      if (seen.has(key)) return false
-      seen.add(key)
-      const row: Session.Info | undefined = yield* sessions
-        .get(current)
-        .pipe(Effect.catch(() => Effect.succeed(undefined)))
-      current = row?.parentID
-    }
-    return false
+  // One authoritative blocker projection for both singleton and batch reads.
+  // Reuse the bounded parent-ID path instead of N descendant full-Session reads.
+  const blockingRequests = Effect.fn("DelegatedWorker.blockingRequests")(function* (
+    sessionID: SessionID,
+    includeDescendants: boolean,
+  ) {
+    const matches = yield* blockingRequestsBatch([{ sessionID, nestedDelegation: includeDescendants }])
+    return matches.get(sessionID) ?? []
   })
-
-  const blockingRequests = Effect.fn("DelegatedWorker.blockingRequests")(
-    function* (
-      sessionID: SessionID,
-      includeDescendants: boolean,
-    ) {
-      const [permissions, questions] = yield* Effect.all(
-        [permission.list(), question.list()],
-        { concurrency: 2 },
-      )
-      const visible = new Set<string>([String(sessionID)])
-      if (includeDescendants) {
-        const candidates = new Map<string, SessionID>()
-        for (const request of permissions) {
-          if (request.sessionID !== sessionID) {
-            candidates.set(String(request.sessionID), request.sessionID)
-          }
-        }
-        for (const request of questions) {
-          if (request.sessionID !== sessionID) {
-            candidates.set(String(request.sessionID), request.sessionID)
-          }
-        }
-        for (const candidate of candidates.values()) {
-          if (yield* isDescendantSession(candidate, sessionID)) {
-            visible.add(String(candidate))
-          }
-        }
-      }
-      const belongsToWorkerTree = (requestSessionID: SessionID) =>
-        visible.has(String(requestSessionID))
-      return [
-        ...permissions
-          .filter((request) => belongsToWorkerTree(request.sessionID))
-          .map(
-            (request): Blocker => ({
-              type: "permission",
-              id: String(request.id),
-              sessionID: request.sessionID,
-              permission: request.permission,
-              externalDirectory:
-                request.permission === "external_directory",
-            }),
-          ),
-        ...questions
-          .filter((request) => belongsToWorkerTree(request.sessionID))
-          .map(
-            (request): Blocker => ({
-              type: "question",
-              id: String(request.id),
-              sessionID: request.sessionID,
-              questionCount: request.questions.length,
-            }),
-          ),
-      ]
-    },
-  )
 
   const blockingRequestsBatch = Effect.fn("DelegatedWorker.blockingRequestsBatch")(function* (
     workers: readonly { readonly sessionID: SessionID; readonly nestedDelegation: boolean }[],
   ) {
     const result = new Map<SessionID, Blocker[]>()
     const unique = [...new Map(workers.map((worker) => [worker.sessionID, worker])).values()]
+    const bySession = new Map(unique.map((worker) => [worker.sessionID, worker]))
     for (const worker of unique) result.set(worker.sessionID, [])
     if (unique.length === 0) return result
 
     const [permissions, questions] = yield* Effect.all([permission.list(), question.list()], { concurrency: 2 })
     const nested = new Set(unique.filter((worker) => worker.nestedDelegation).map((worker) => worker.sessionID))
-    const candidates = new Map<string, { readonly sessionID: SessionID; readonly blockers: Blocker[] }>()
+    const candidates = new Map<string, SessionID>()
+    const orderedBlockers: Blocker[] = []
+    // Session parents are immutable. Pending permission/question requests from
+    // siblings commonly share a long ancestry chain. Memoize each parent
+    // lookup for THIS batch only; never cache blocker or owner state across
+    // permission changes or worker generations.
+    const parents = new Map<SessionID, SessionID | undefined>()
 
     for (const request of permissions) {
       const key = String(request.sessionID)
-      const item = candidates.get(key) ?? { sessionID: request.sessionID, blockers: [] }
-      item.blockers.push({
+      candidates.set(key, request.sessionID)
+      orderedBlockers.push({
         type: "permission",
         id: String(request.id),
         sessionID: request.sessionID,
         permission: request.permission,
         externalDirectory: request.permission === "external_directory",
       })
-      candidates.set(key, item)
     }
     for (const request of questions) {
       const key = String(request.sessionID)
-      const item = candidates.get(key) ?? { sessionID: request.sessionID, blockers: [] }
-      item.blockers.push({
+      candidates.set(key, request.sessionID)
+      orderedBlockers.push({
         type: "question",
         id: String(request.id),
         sessionID: request.sessionID,
         questionCount: request.questions.length,
       })
-      candidates.set(key, item)
     }
 
-    for (const candidate of candidates.values()) {
-      const directWorker = unique.find((worker) => worker.sessionID === candidate.sessionID)
-      if (directWorker && !nested.has(directWorker.sessionID)) {
-        result.get(directWorker.sessionID)!.push(...candidate.blockers)
+    if (nested.size > 0 && candidates.size > 0 && candidates.size <= 25 && Object.hasOwn(sessions, "ancestorParentIDsMany")) {
+      // A bounded single SQL recursive walk is faster for small nested groups.
+      // Retain the breadth-level batching below for broad groups: recursive
+      // UNION ALL duplicates common ancestors and scales poorly above ~25.
+      const starts = [...candidates.values()]
+      const found = yield* sessions.ancestorParentIDsMany!(starts)
+      for (const [id, parent] of found) parents.set(id, parent)
+      // Missing seeds/parents are terminal; never hydrate their full Session
+      // rows merely because the minimal projection found no matching row.
+      for (const id of starts) if (!parents.has(id)) parents.set(id, undefined)
+      for (const parent of [...parents.values()]) {
+        if (parent && !parents.has(parent)) parents.set(parent, undefined)
       }
-      if (nested.size === 0) continue
+    } else if (nested.size > 0 && candidates.size > 0 && Object.hasOwn(sessions, "parentIDsMany")) {
+      // Batch each ancestry LEVEL, not each worker or pending request. Many
+      // siblings share ancestors, and selecting only id+parent_id avoids
+      // decoding full Session rows on the hot blocker-resolution path.
+      // Retain no ancestry cache after this one snapshot projection.
+      let frontier = new Set<SessionID>(candidates.values())
+      for (let depth = 0; depth < 64 && frontier.size > 0; depth++) {
+        const unknown = [...frontier].filter((id) => !parents.has(id))
+        if (unknown.length > 0) {
+          const found = yield* sessions.parentIDsMany!(unknown)
+          for (const id of unknown) parents.set(id, found.get(id))
+        }
+        const next = new Set<SessionID>()
+        for (const id of frontier) {
+          const parent = parents.get(id)
+          if (parent && !parents.has(parent)) next.add(parent)
+        }
+        frontier = next
+      }
+    }
+
+    // Preserve the producer's permission-first/question-second ordering even
+    // though all parent lookups are grouped by Session for SQL efficiency.
+    const matches = new Map<string, Set<SessionID>>()
+    for (const candidate of candidates.values()) {
+      const targets = new Set<SessionID>()
+      const directWorker = bySession.get(candidate)
+      if (directWorker && !nested.has(directWorker.sessionID)) {
+        targets.add(directWorker.sessionID)
+      }
+      if (nested.size === 0) {
+        matches.set(String(candidate), targets)
+        continue
+      }
 
       // Walk each pending request's ancestry once, matching every nested worker
       // on that path. This replaces one ancestry walk per worker per 100ms poll.
-      let current: SessionID | undefined = candidate.sessionID
+      let current: SessionID | undefined = candidate
       const seen = new Set<string>()
       for (let depth = 0; current && depth < 64; depth++) {
         const key = String(current)
         if (seen.has(key)) break
         seen.add(key)
-        if (nested.has(current)) result.get(current)!.push(...candidate.blockers)
-        const row: Session.Info | undefined = yield* sessions.get(current).pipe(Effect.catch(() => Effect.succeed(undefined)))
-        current = row?.parentID
+        if (nested.has(current)) targets.add(current)
+        if (!parents.has(current)) {
+          const row: Session.Info | undefined = yield* sessions.get(current).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          parents.set(current, row?.parentID)
+        }
+        current = parents.get(current)
+      }
+      matches.set(String(candidate), targets)
+    }
+    for (const blocker of orderedBlockers) {
+      for (const target of matches.get(String(blocker.sessionID)) ?? []) {
+        result.get(target)!.push(blocker)
       }
     }
     return result
@@ -545,6 +563,50 @@ export const make = Effect.gen(function* () {
       return { session, origin }
     },
   )
+
+  const requireWorkers = Effect.fn("DelegatedWorker.requireWorkers")(function* (
+    ids: readonly SessionID[],
+    identity: Identity,
+  ) {
+    const unique = [...new Set(ids)]
+    if (unique.length === 0) return []
+    // The exact protected delegation origin is a two-column Session projection;
+    // do not decode summary diffs, model/config, permissions or other mutable
+    // Session fields just to authenticate an addressed worker batch.
+    if (Object.hasOwn(sessions, "workerOriginsMany")) {
+      const found = yield* sessions.workerOriginsMany!(unique)
+      const verified: { sessionID: SessionID; origin: SessionMetadataOwnership.WorkerDelegationOrigin; nestedDelegation: boolean }[] = []
+      for (const sessionID of unique) {
+        const origin = found.get(sessionID)
+        if (!origin || origin.producer !== identity.producer || origin.principalRef !== identity.principalRef) {
+          return yield* Effect.fail(new InvalidWorker())
+        }
+        verified.push({ sessionID, origin, nestedDelegation: origin.nestedDelegation })
+      }
+      return verified
+    }
+    // Decode producer-owned metadata through the authoritative Session owner.
+    // Every row is still checked against the caller's exact producer/principal.
+    // Effect's partial Service mocks synthesize throwing functions for absent
+    // method properties, so typeof alone would incorrectly invoke one.
+    if (Object.hasOwn(sessions, "getMany")) {
+      const found = yield* sessions.getMany!(unique)
+      const verified: { sessionID: SessionID; origin: SessionMetadataOwnership.WorkerDelegationOrigin; nestedDelegation: boolean }[] = []
+      for (const sessionID of unique) {
+        const origin = SessionMetadataOwnership.workerDelegation(found.get(sessionID)?.metadata)
+        if (!origin || origin.producer !== identity.producer || origin.principalRef !== identity.principalRef) {
+          return yield* Effect.fail(new InvalidWorker())
+        }
+        verified.push({ sessionID, origin, nestedDelegation: origin.nestedDelegation })
+      }
+      return verified
+    }
+    // Old partial service mocks retain their prior semantics.
+    return yield* Effect.forEach(unique, (sessionID) =>
+      requireWorker(sessionID, identity).pipe(Effect.map(({ origin }) => ({
+        sessionID, origin, nestedDelegation: origin.nestedDelegation,
+      }))), { concurrency: 4 })
+  })
 
   const admitPrompt = Effect.fn("DelegatedWorker.admitPrompt")(
     function* (input: {
@@ -822,10 +884,18 @@ export const make = Effect.gen(function* () {
     },
   )
 
+
     const durableSnapshot = Effect.fn("DelegatedWorker.durableSnapshot")(
-    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[]) {
-      const { origin } = yield* requireWorker(sessionID, identity)
-      const ownership = yield* execution.snapshot(sessionID)
+    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[], verifiedOrigin?: SessionMetadataOwnership.WorkerDelegationOrigin, knownOwnership?: SessionExecutionOwner.Snapshot) {
+      // snapshotMany has already authenticated this immutable producer-owned
+      // origin. Avoid reloading the same Session row for each fallback path.
+      const origin = verifiedOrigin ?? (yield* requireWorker(sessionID, identity)).origin
+      const ownership = knownOwnership ?? (yield* execution.snapshot(sessionID))
+      // Only heartbeat-evidenced owners may carry a live-progress projection on a
+      // durable snapshot. `state` below is already derived purely from the
+      // transcript, so a stale, foreign, or dead owner row must not reintroduce
+      // liveness through `activity`.
+      const ownerLive = ownerExecutionLive(ownership, Date.now())
       const blockedBy = sharedBlockers ?? (yield* blockingRequests(sessionID, origin.nestedDelegation))
       const messages = yield* sessions
         .messages({ sessionID, limit: 32 })
@@ -859,7 +929,7 @@ export const make = Effect.gen(function* () {
               : assistant
                 ? "completed"
                 : "idle"
-      const projectedActivity = deferActivity ? undefined : yield* activity(sessionID, Boolean(ownership.ownerID))
+      const projectedActivity = deferActivity ? undefined : yield* activity(sessionID, ownerLive)
       const snapshotResult = {
         sessionID,
         state,
@@ -876,16 +946,16 @@ export const make = Effect.gen(function* () {
         ...(projectedActivity ? { activity: projectedActivity } : {}),
       } satisfies Snapshot
       return deferActivity
-        ? Object.assign(snapshotResult, { [DEFERRED_ACTIVITY_OWNER]: Boolean(ownership.ownerID) })
+        ? Object.assign(snapshotResult, { [DEFERRED_ACTIVITY_OWNER]: ownerLive })
         : snapshotResult
     },
   )
 
   const snapshot = Effect.fn("DelegatedWorker.snapshot")(
-    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[]) {
-      const { origin } = yield* requireWorker(sessionID, identity)
-      const live = yield* background.get(sessionID)
-      if (!live) return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers)
+    function* (sessionID: SessionID, identity: Identity, deferActivity = false, sharedBlockers?: readonly Blocker[], verifiedOrigin?: SessionMetadataOwnership.WorkerDelegationOrigin, knownLive?: { readonly value: BackgroundJob.Info | undefined }, knownOwnership?: SessionExecutionOwner.Snapshot) {
+      const origin = verifiedOrigin ?? (yield* requireWorker(sessionID, identity)).origin
+      const live = knownLive ? knownLive.value : yield* background.get(sessionID)
+      if (!live) return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers, origin, knownOwnership)
       let current = live
       let blockedBy: readonly Blocker[] = []
       if (live.status === "running") {
@@ -897,7 +967,7 @@ export const make = Effect.gen(function* () {
           // ordinary running snapshots.
           const refreshed = yield* background.get(sessionID)
           if (!refreshed) {
-            return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers)
+            return yield* durableSnapshot(sessionID, identity, deferActivity, sharedBlockers, origin, knownOwnership)
           }
           current = refreshed
           if (refreshed.status === "running") {
@@ -908,7 +978,7 @@ export const make = Effect.gen(function* () {
           }
         }
       }
-      const ownership = yield* execution.snapshot(sessionID)
+      const ownership = knownOwnership ?? (yield* execution.snapshot(sessionID))
       const state: State =
         current.status === "running"
           ? blockedBy.length > 0
@@ -940,49 +1010,55 @@ export const make = Effect.gen(function* () {
     },
   )
 
+  const ownerSnapshotsFor = Effect.fn("DelegatedWorker.ownerSnapshotsFor")(function* (
+    ids: readonly SessionID[],
+  ) {
+    if (Object.hasOwn(execution, "snapshotMany")) return yield* execution.snapshotMany(ids)
+    const states = yield* Effect.forEach([...new Set(ids)], (id) => execution.snapshot(id), { concurrency: 4 })
+    return new Map(states.map((state) => [state.sessionID, state]))
+  })
+
   const snapshotMany = Effect.fn("DelegatedWorker.snapshotMany")(function* (
     sessionIDs: readonly SessionID[],
     identity: Identity,
   ) {
-    const workers = yield* Effect.forEach(
-      [...new Set(sessionIDs)],
-      (sessionID) => requireWorker(sessionID, identity).pipe(
-        Effect.map(({ origin }) => ({ sessionID, nestedDelegation: origin.nestedDelegation })),
-      ),
-      { concurrency: 4 },
-    )
+    const workers = yield* requireWorkers(sessionIDs, identity)
     const blockers = yield* blockingRequestsBatch(workers)
-    const rows = (yield* Effect.forEach(
+    const liveJobs = yield* background.getMany(sessionIDs)
+    const ownerSnapshots = yield* ownerSnapshotsFor(sessionIDs)
+    let rows = (yield* Effect.forEach(
       workers,
-      (worker) => snapshot(worker.sessionID, identity, true, blockers.get(worker.sessionID) ?? []),
+      (worker) => snapshot(worker.sessionID, identity, true, blockers.get(worker.sessionID) ?? [], worker.origin, { value: liveJobs.get(worker.sessionID) }, ownerSnapshots.get(worker.sessionID)),
       { concurrency: 4 },
     )) as DeferredActivitySnapshot[]
+    if (rows.some((item) => item.state === "blocked")) {
+      // Re-read the shared pending sets once if a request resolved while the
+      // worker states were being assembled. This preserves terminal/current
+      // blocker precedence without restoring per-worker blocker scans.
+      const latestBlockers = yield* blockingRequestsBatch(workers)
+      const latestJobs = yield* background.getMany(sessionIDs)
+      const latestOwners = yield* ownerSnapshotsFor(sessionIDs)
+      rows = (yield* Effect.forEach(
+        workers,
+        (worker) => snapshot(worker.sessionID, identity, true, latestBlockers.get(worker.sessionID) ?? [], worker.origin, { value: latestJobs.get(worker.sessionID) }, latestOwners.get(worker.sessionID)),
+        { concurrency: 4 },
+      )) as DeferredActivitySnapshot[]
+    }
+    // Activity belongs to the selected final worker-state projection. Computing
+    // it before the blocker revalidation wastes a DB batch and can pair freshly
+    // rechecked owners with an earlier, now-stale activity snapshot.
     const activityInputs = rows.flatMap((row) =>
       row[DEFERRED_ACTIVITY_OWNER] === undefined
         ? []
         : [{ sessionID: row.sessionID, owner: row[DEFERRED_ACTIVITY_OWNER] }],
     )
     const activities = yield* activityBatch(activityInputs)
-    const project = (current: readonly DeferredActivitySnapshot[]) => current.map((row) => {
+    return rows.map((row) => {
       const owner = row[DEFERRED_ACTIVITY_OWNER]
       const { [DEFERRED_ACTIVITY_OWNER]: _deferredOwner, ...snapshot } = row
       const projectedActivity = owner === undefined ? undefined : activities.get(row.sessionID)
       return { ...snapshot, ...(projectedActivity ? { activity: projectedActivity } : {}) } satisfies Snapshot
     })
-    let projected = project(rows)
-    if (projected.some((item) => item.state === "blocked")) {
-      // Re-read the shared pending sets once if a request resolved while the
-      // worker states were being assembled. This preserves terminal/current
-      // blocker precedence without restoring per-worker blocker scans.
-      const latestBlockers = yield* blockingRequestsBatch(workers)
-      const latestRows = (yield* Effect.forEach(
-        workers,
-        (worker) => snapshot(worker.sessionID, identity, true, latestBlockers.get(worker.sessionID) ?? []),
-        { concurrency: 4 },
-      )) as DeferredActivitySnapshot[]
-      projected = project(latestRows)
-    }
-    return projected
   })
 
   const waitMany = Effect.fn("DelegatedWorker.waitMany")(function* (input: {
@@ -995,30 +1071,50 @@ export const make = Effect.gen(function* () {
 
     const startedAt = yield* Clock.currentTimeMillis
     const deadline = input.timeout === undefined ? undefined : startedAt + Math.max(0, input.timeout)
-    const workers = yield* Effect.forEach(
-      sessionIDs,
-      (sessionID) => requireWorker(sessionID, input.identity).pipe(
-        Effect.map(({ origin }) => ({ sessionID, nestedDelegation: origin.nestedDelegation })),
-      ),
-      { concurrency: 4 },
-    )
+    const workers = yield* requireWorkers(sessionIDs, input.identity)
     if (Option.isNone(eventsOption)) return yield* snapshotMany(sessionIDs, input.identity)
     const events = eventsOption.value
     const workerIDs = new Set(sessionIDs)
     const includesDescendants = workers.some((worker) => worker.nestedDelegation)
     const wake = yield* Queue.dropping<void>(1)
     const notify = () => Queue.offer(wake, undefined).pipe(Effect.asVoid)
-    const isRelevant = (sessionID: SessionID) => includesDescendants || workerIDs.has(sessionID)
-    const unsubscribers = yield* Effect.all([
-      events.listenType(Permission.Event.Asked, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
-      events.listenType(Permission.Event.Replied, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
-      events.listenType(Question.Event.Asked, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
-      events.listenType(Question.Event.Replied, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
-      events.listenType(Question.Event.Rejected, (event) => isRelevant(event.data.sessionID) ? notify() : Effect.void),
-    ])
+    // A batch waiter knows its exact Session IDs. Register indexed observers
+    // rather than five global type listeners that every other worker's
+    // permission/question event must invoke and filter. Nested delegation is
+    // the explicit exception: descendant IDs are not known at subscription.
+    const subscriptions = includesDescendants
+      ? [
+          events.listenType(Permission.Event.Asked, notify),
+          events.listenType(Permission.Event.Replied, notify),
+          events.listenType(Question.Event.Asked, notify),
+          events.listenType(Question.Event.Replied, notify),
+          events.listenType(Question.Event.Rejected, notify),
+        ]
+      : Object.hasOwn(events, "listenSessionTypes")
+        ? [events.listenSessionTypes(
+            [
+              Permission.Event.Asked,
+              Permission.Event.Replied,
+              Question.Event.Asked,
+              Question.Event.Replied,
+              Question.Event.Rejected,
+            ],
+            [...workerIDs],
+            notify,
+          )]
+        : [...workerIDs].flatMap((sessionID) => [
+            events.listenSessionType(Permission.Event.Asked, sessionID, notify),
+            events.listenSessionType(Permission.Event.Replied, sessionID, notify),
+            events.listenSessionType(Question.Event.Asked, sessionID, notify),
+            events.listenSessionType(Question.Event.Replied, sessionID, notify),
+            events.listenSessionType(Question.Event.Rejected, sessionID, notify),
+          ])
 
-    return yield* Effect.ensuring(
-      Effect.gen(function* () {
+    // Acquire and release are one bracketed Effect. Cancellation during an
+    // N-worker registration must never strand partly installed observers.
+    return yield* Effect.acquireUseRelease(
+      Effect.all(subscriptions),
+      () => Effect.gen(function* () {
         let current = yield* snapshotMany(sessionIDs, input.identity)
         while (true) {
           // Preserve the current batchWait contract: return on the first
@@ -1029,15 +1125,14 @@ export const make = Effect.gen(function* () {
 
           const now = yield* Clock.currentTimeMillis
           if (deadline !== undefined && now >= deadline) return yield* snapshotMany(sessionIDs, input.identity)
-          const running = current.filter((item) => item.state === "running").map((item) => item.sessionID)
-          let completion: Effect.Effect<unknown> = Effect.never
-          for (const sessionID of running) {
-            completion = Effect.raceFirst(
-              completion,
-              background.wait({ id: sessionID }).pipe(Effect.as(undefined)),
-            )
-          }
-          const change = Effect.raceFirst(completion, Queue.take(wake))
+           const running = current.filter((item) => item.state === "running")
+           // One indexed completion suspension replaces an O(running workers)
+           // Effect.raceFirst tree. Exact generation matching prevents a
+           // recycled job ID from stealing an earlier generation's wait.
+           const completion = background.waitAny({
+             jobs: running.map(({ sessionID, generation }) => ({ id: sessionID, generation })),
+           })
+           const change = Effect.raceFirst(completion, Queue.take(wake))
           const wakeResult = deadline === undefined
             ? yield* change
             : yield* Effect.raceFirst(
@@ -1048,7 +1143,7 @@ export const make = Effect.gen(function* () {
           current = yield* snapshotMany(sessionIDs, input.identity)
         }
       }),
-      Effect.forEach(unsubscribers, (unsubscribe) => unsubscribe, { discard: true }),
+      (unsubscribers) => Effect.forEach(unsubscribers, (unsubscribe) => unsubscribe, { discard: true }),
     )
   })
 

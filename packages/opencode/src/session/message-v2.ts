@@ -1,5 +1,6 @@
-import { SessionID, MessageID } from "./schema"
+import { SessionID, MessageID, PartID } from "./schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { isUnavailableReasoningSentinel } from "@opencode-ai/core/reasoning-sentinel"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import {
@@ -20,15 +21,28 @@ import {
 import { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { SessionEvent } from "@opencode-ai/core/session/event"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
+import { asc } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
 import { lt } from "drizzle-orm"
+import { gt } from "drizzle-orm"
+import { gte } from "drizzle-orm"
+import { lte } from "drizzle-orm"
 import { or } from "drizzle-orm"
+import { sql } from "drizzle-orm"
 import { MessageTable, PartTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  legacyPartKind,
+  legacyPartStatus,
+  legacyPartSigned,
+  legacyPartOpaque,
+} from "@opencode-ai/core/session/legacy-part-query"
 import { SessionMessage as CurrentSessionMessage } from "@opencode-ai/core/session/message"
 import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
 import { ProviderError } from "@/provider/error"
@@ -40,6 +54,8 @@ import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
 import * as DateTime from "effect/DateTime"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import type { SessionTurnProvenance as SharedTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
+import { hasUsableCompactionCheckpoint } from "./compaction-checkpoint"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -100,32 +116,266 @@ const part = (row: typeof PartTable.$inferSelect) =>
 const older = (row: Cursor) =>
   or(lt(MessageTable.time_created, row.time), and(eq(MessageTable.time_created, row.time), lt(MessageTable.id, row.id)))
 
-function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$inferSelect)[]) {
-  const ids = rows.map((row) => row.id)
+function hydrateRows(rows: (typeof MessageTable.$inferSelect)[], partRows: (typeof PartTable.$inferSelect)[]) {
   const partByMessage = new Map<string, Part[]>()
-  return Effect.gen(function* () {
-    if (ids.length > 0) {
-      const partRows = yield* db
-        .select()
-        .from(PartTable)
-        .where(inArray(PartTable.message_id, ids))
-        .orderBy(PartTable.message_id, PartTable.id)
-        .all()
-        .pipe(Effect.orDie)
-      for (const row of partRows) {
-        const next = part(row)
-        const list = partByMessage.get(row.message_id)
-        if (list) list.push(next)
-        else partByMessage.set(row.message_id, [next])
-      }
-    }
+  for (const row of partRows) {
+    const next = part(row)
+    const list = partByMessage.get(row.message_id)
+    if (list) list.push(next)
+    else partByMessage.set(row.message_id, [next])
+  }
+  return rows.map((row) => ({
+    info: info(row),
+    parts: partByMessage.get(row.id) ?? [],
+  }))
+}
 
-    return rows.map((row) => ({
-      info: info(row),
-      parts: partByMessage.get(row.id) ?? [],
-    }))
+function hydrate(db: Pick<Database.Interface["db"], "select">, rows: (typeof MessageTable.$inferSelect)[]) {
+  const ids = rows.map((row) => row.id)
+  return Effect.gen(function* () {
+    if (!ids.length) return []
+    const partRows = yield* db
+      .select()
+      .from(PartTable)
+      .where(inArray(PartTable.message_id, ids))
+      .orderBy(PartTable.message_id, PartTable.id)
+      .all()
+      .pipe(Effect.orDie)
+    return hydrateRows(rows, partRows)
   })
 }
+
+function hydrateSession(db: Pick<Database.Interface["db"], "select">, sessionID: SessionID, rows: (typeof MessageTable.$inferSelect)[]) {
+  return Effect.gen(function* () {
+    if (!rows.length) return []
+    // The session predicate keeps SQLite bind count independent of transcript
+    // length. PartTable.session_id is indexed for this snapshot query.
+    const partRows = yield* db
+      .select()
+      .from(PartTable)
+      .where(eq(PartTable.session_id, sessionID))
+      .orderBy(PartTable.message_id, PartTable.id)
+      .all()
+      .pipe(Effect.orDie)
+    return hydrateRows(rows, partRows)
+  })
+}
+
+/**
+ * A V1 prompt drain owns one legacy history projection. The legacy Message and
+ * Part tables remain authoritative for V1 execution; durable V1 events update
+ * this in-memory view after the initial consistent SQLite snapshot. This
+ * avoids paging and hydrating the full transcript on every provider/tool step.
+ */
+export const makeDrainHistory = Effect.fn("MessageV2.makeDrainHistory")(function* (input: {
+  readonly sessionID: SessionID
+  readonly db: Database.Interface["db"]
+  readonly events: EventV2.Interface
+}) {
+  let messages: WithParts[] | undefined
+  const indexByID = new Map<MessageID, number>()
+  let frontier = -1
+  let loading = true
+  let stale = false
+  let overflowed = false
+  let historyRevision = 0
+  let compactedRevision = -1
+  let compactedHistory: WithParts[] | undefined
+  const buffered: EventV2.Payload[] = []
+  const pendingBySeq = new Map<number, EventV2.Payload>()
+  const buffer = (event: EventV2.Payload) => {
+    if (buffered.length >= 2048) {
+      buffered.length = 0
+      overflowed = true
+      stale = true
+      return
+    }
+    buffered.push(event)
+  }
+
+  const compare = (left: WithParts, right: WithParts) => {
+    const time = right.info.time.created - left.info.time.created
+    if (time !== 0) return time
+    return left.info.id === right.info.id ? 0 : left.info.id > right.info.id ? -1 : 1
+  }
+  const insert = (message: WithParts) => {
+    let low = 0
+    let high = messages!.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (compare(messages![middle]!, message) <= 0) low = middle + 1
+      else high = middle
+    }
+    messages!.splice(low, 0, message)
+    for (let index = low; index < messages!.length; index++) indexByID.set(messages![index]!.info.id, index)
+  }
+
+  const applyOne = (event: EventV2.Payload) => {
+    const seq = event.durable?.seq
+    if (seq === undefined || seq !== frontier + 1) return
+    frontier = seq
+    if (stale || !messages) return
+    const data = event.data as { readonly sessionID?: string }
+    if (data.sessionID !== input.sessionID) return
+    // `filterCompacted` scans and allocates across the full transcript. The
+    // prompt loop may ask for history several times at the same safe boundary
+    // (for example after reconciliation reports no changes), so memoize this
+    // derived order until the durable projection actually changes.
+    historyRevision++
+    compactedHistory = undefined
+
+    switch (event.type) {
+      case SessionV1.Event.MessageUpdated.type: {
+        const value = event.data as typeof SessionV1.Event.MessageUpdated.Type["data"]
+        const currentIndex = indexByID.get(value.info.id)
+        const current = currentIndex === undefined ? undefined : messages[currentIndex]
+        const next = { info: value.info as unknown as Info, parts: current?.parts ?? [] } satisfies WithParts
+        if (!current) insert(next)
+        else if (current.info.time.created !== next.info.time.created) {
+          const index = indexByID.get(value.info.id)
+          if (index !== undefined) {
+            messages.splice(index, 1)
+            indexByID.delete(value.info.id)
+            for (let cursor = index; cursor < messages.length; cursor++) indexByID.set(messages[cursor]!.info.id, cursor)
+          }
+          insert(next)
+        } else {
+          const index = indexByID.get(value.info.id)
+          if (index === undefined) {
+            stale = true
+            return
+          }
+          messages[index] = next
+        }
+        return
+      }
+      case SessionV1.Event.PartUpdated.type: {
+        const value = event.data as typeof SessionV1.Event.PartUpdated.Type["data"]
+        const messageIndex = indexByID.get(value.part.messageID)
+        const message = messageIndex === undefined ? undefined : messages[messageIndex]
+        if (!message) {
+          stale = true
+          return
+        }
+        const index = message.parts.findIndex((item) => item.id === value.part.id)
+        const next = value.part as unknown as Part
+        if (index < 0) message.parts.push(next)
+        else message.parts[index] = next
+        message.parts.sort((left, right) => (left.id === right.id ? 0 : left.id < right.id ? -1 : 1))
+        return
+      }
+      case SessionV1.Event.PartRemoved.type: {
+        const value = event.data as typeof SessionV1.Event.PartRemoved.Type["data"]
+        const messageIndex = indexByID.get(value.messageID)
+        const message = messageIndex === undefined ? undefined : messages[messageIndex]
+        if (!message) return
+        message.parts = message.parts.filter((item) => item.id !== value.partID)
+        return
+      }
+      case SessionV1.Event.MessageRemoved.type: {
+        const value = event.data as typeof SessionV1.Event.MessageRemoved.Type["data"]
+        const index = indexByID.get(value.messageID)
+        if (index !== undefined) {
+          messages.splice(index, 1)
+          indexByID.delete(value.messageID)
+          for (let cursor = index; cursor < messages.length; cursor++) indexByID.set(messages[cursor]!.info.id, cursor)
+        }
+        return
+      }
+      case SessionEvent.Prompted.type:
+      case SessionEvent.SyntheticPromoted.type:
+      case SessionEvent.RevertEvent.Committed.type:
+        // These producers materialize legacy rows in their projector without
+        // publishing the corresponding V1 message/part events.
+        stale = true
+        return
+    }
+  }
+
+  const apply = (event: EventV2.Payload) => {
+    const seq = event.durable?.seq
+    if (seq === undefined || seq <= frontier) return
+    if (seq > frontier + 1) {
+      pendingBySeq.set(seq, event)
+      if (pendingBySeq.size > 2048) {
+        pendingBySeq.clear()
+        stale = true
+      }
+      return
+    }
+    applyOne(event)
+    while (!stale) {
+      const next = pendingBySeq.get(frontier + 1)
+      if (!next) break
+      pendingBySeq.delete(frontier + 1)
+      applyOne(next)
+    }
+  }
+
+  const onEvent = (event: EventV2.Payload) => {
+    if (loading || stale || !messages) {
+      buffer(event)
+      return Effect.void
+    }
+    return Effect.sync(() => apply(event))
+  }
+
+  const close = yield* input.events.listenAggregate(input.sessionID, onEvent)
+
+  const reload = Effect.fnUntraced(function* () {
+    loading = true
+    // Events buffered before this snapshot are represented by the database
+    // state at its first read. Reset first so only events racing this snapshot
+    // need to be replayed or trigger another bounded reload.
+    buffered.length = 0
+    pendingBySeq.clear()
+    overflowed = false
+    const snapshot = yield* input.db.transaction((tx) =>
+      Effect.gen(function* () {
+        // Pair the legacy rows with the durable event frontier from one WAL
+        // snapshot so listener events can be replayed without a race.
+        const seq = yield* EventV2.latestSequence(tx, input.sessionID)
+        const rows = yield* tx
+          .select()
+          .from(MessageTable)
+          .where(eq(MessageTable.session_id, input.sessionID))
+          .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+          .all()
+          .pipe(Effect.orDie)
+        const hydrated = yield* hydrateSession(tx, input.sessionID, rows)
+        return { seq, messages: hydrated }
+      }),
+    )
+    messages = snapshot.messages
+    historyRevision++
+    compactedHistory = undefined
+    indexByID.clear()
+    for (const [index, message] of messages.entries()) indexByID.set(message.info.id, index)
+    frontier = snapshot.seq
+    stale = false
+    while (buffered.length > 0) {
+      const pendingEvents = buffered.splice(0).sort((left, right) => (left.durable?.seq ?? -1) - (right.durable?.seq ?? -1))
+      for (const event of pendingEvents) apply(event)
+      if (stale) break
+    }
+    if (pendingBySeq.size > 0 && !pendingBySeq.has(frontier + 1)) stale = true
+    if (overflowed) stale = true
+    loading = false
+  })
+
+  const history = Effect.fn("MessageV2.drainHistory")(function* () {
+    if (pendingBySeq.size > 0 && !pendingBySeq.has(frontier + 1)) stale = true
+    if (!messages || stale) yield* reload()
+    if (stale) yield* reload()
+    if (!compactedHistory || compactedRevision !== historyRevision) {
+      compactedHistory = filterCompacted(messages!)
+      compactedRevision = historyRevision
+    }
+    return compactedHistory
+  })
+
+  return { history, close } as const
+})
 
 function providerMeta(metadata: Record<string, any> | undefined) {
   if (!metadata) return undefined
@@ -134,15 +384,21 @@ function providerMeta(metadata: Record<string, any> | undefined) {
 }
 
 export function latestCompletedCompaction(msgs: readonly WithParts[]) {
-  const completed = new Set<string>()
+  const completed = new Map<string, Set<string>>()
   for (const msg of msgs) {
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error) completed.add(msg.info.parentID)
+    if (msg.info.role !== "assistant" || !hasUsableCompactionCheckpoint(msg)) continue
+    const ids = completed.get(msg.info.parentID) ?? new Set<string>()
+    ids.add(msg.info.id)
+    completed.set(msg.info.parentID, ids)
   }
   let result: WithParts | undefined
   for (const msg of msgs) {
-    if (msg.info.role !== "user" || !completed.has(msg.info.id)) continue
+    if (msg.info.role !== "user") continue
     if (SessionTurnProvenance.isHistoricalInfo(msg.info)) continue
-    if (!msg.parts.some((part) => part.type === "compaction")) continue
+    const marker = msg.parts.find((part): part is CompactionPart => part.type === "compaction")
+    if (!marker || marker.pending === true) continue
+    const candidates = completed.get(msg.info.id)
+    if (!candidates || (marker.checkpoint_message_id && !candidates.has(marker.checkpoint_message_id))) continue
     if (!result || isAfter(msg.info, result.info)) result = msg
   }
   return result
@@ -183,7 +439,50 @@ export function projectStateForModel(input: WithParts[]) {
     )
       activeUser = msg.info
   }
-  if (states.size === 0) return ordinary
+  // A completed usage-limit continuation can be physically newer than user
+  // messages that were already queued when the provider stopped. Once that
+  // continuation is retired to historical lifetime it is no longer the active
+  // structural turn, but raw timestamp order would still put its provider
+  // exchange *after* the queued user on the wire. Move only those inverted,
+  // historical recovery exchanges immediately before the active user. Older
+  // historical rows keep their original position.
+  let providerOrdinary = ordinary
+  if (activeUser) {
+    // Keep the overwhelmingly common no-recovery path allocation-free: only
+    // allocate the Set and split arrays after an inverted recovery row exists.
+    let invertedRecoveryIDs: Set<MessageID> | undefined
+    for (const message of ordinary) {
+      if (message.info.role !== "user" || !isAfter(message.info, activeUser)) continue
+      const provenance = message.info.provenance
+      if (
+        provenance?.owner === "host" &&
+        provenance.source === SessionTurnProvenance.Source.RecoveryContinuation &&
+        provenance.lifetime === "historical"
+      ) {
+        ;(invertedRecoveryIDs ??= new Set()).add(message.info.id)
+      }
+    }
+    if (invertedRecoveryIDs?.size) {
+      const recoveryHistory: WithParts[] = []
+      const rest: WithParts[] = []
+      for (const message of ordinary) {
+        const belongs =
+          invertedRecoveryIDs.has(message.info.id) ||
+          (message.info.role === "assistant" && invertedRecoveryIDs.has(message.info.parentID))
+        ;(belongs ? recoveryHistory : rest).push(message)
+      }
+      const activeIndex = rest.findIndex((message) => message.info.id === activeUser!.id)
+      if (activeIndex >= 0) {
+        providerOrdinary = [
+          ...rest.slice(0, activeIndex),
+          ...recoveryHistory,
+          ...rest.slice(activeIndex),
+        ]
+      }
+    }
+  }
+
+  if (states.size === 0) return providerOrdinary
   const projected = [...states.values()].sort((a, b) => {
     const pa = a.info.role === "user" && a.info.provenance?.owner === "host" ? a.info.provenance.source : ""
     const pb = b.info.role === "user" && b.info.provenance?.owner === "host" ? b.info.provenance.source : ""
@@ -195,10 +494,10 @@ export function projectStateForModel(input: WithParts[]) {
           : 2
     return rank(pa) - rank(pb) || pa.localeCompare(pb)
   })
-  if (!activeUser) return [...projected, ...ordinary]
-  const index = ordinary.findIndex((message) => message.info.id === activeUser!.id)
-  if (index < 0) return [...projected, ...ordinary]
-  return [...ordinary.slice(0, index), ...projected, ...ordinary.slice(index)]
+  if (!activeUser) return [...projected, ...providerOrdinary]
+  const index = providerOrdinary.findIndex((message) => message.info.id === activeUser!.id)
+  if (index < 0) return [...projected, ...providerOrdinary]
+  return [...providerOrdinary.slice(0, index), ...projected, ...providerOrdinary.slice(index)]
 }
 
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
@@ -215,9 +514,16 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
   // to extract media and inject as user messages. Some SDKs only support a subset
   // of media in tool results; e.g. Bedrock supports images but not PDFs there.
   //
-  // Only apply this workaround if the model actually supports that media input -
-  // otherwise unsupportedParts() will turn it into a user-visible error.
+  // Never embed a tool attachment that the model cannot consume: the user-only
+  // modality guard does not inspect nested tool results. Extract unsupported
+  // media so ProviderTransform can replace it with an actionable text error,
+  // preventing persistent 400 errors on every replay of a tool-bearing turn.
   const supportsMediaInToolResult = (attachment: { mime: string }) => {
+    const mime = attachment.mime.toLowerCase()
+    if (mime.startsWith("image/") && !model.capabilities.input.image) return false
+    if (mime.startsWith("video/") && !model.capabilities.input.video) return false
+    if (mime.startsWith("audio/") && !model.capabilities.input.audio) return false
+    if (mime === "application/pdf" && !model.capabilities.input.pdf) return false
     if (model.api.npm === "@ai-sdk/anthropic") return true
     if (model.api.npm === "@ai-sdk/openai") return true
     if (model.api.npm === "@ai-sdk/amazon-bedrock/mantle") return true
@@ -438,7 +744,10 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         }
         if (part.type === "reasoning") {
           if (differentModel) {
-            if (part.text.trim().length > 0)
+            // A missing-reasoning notice is not assistant prose. Do not inject
+            // provider-only placeholders into another model's conversation.
+            // Same-model replay retains its provider continuation structures.
+            if (part.text.trim().length > 0 && !isUnavailableReasoningSentinel(part.text))
               assistantMessage.parts.push({
                 type: "text",
                 text: part.text,
@@ -909,7 +1218,7 @@ export const currentPage = Effect.fn("MessageV2.currentPage")(function* (input: 
         .pipe(Effect.orDie)
     : undefined
   if (before && !anchor) {
-    return { items: [] as SessionV1.WithParts[], more: false, cursor: undefined }
+    return { items: [] as SessionV1.WithParts[], more: false, cursor: undefined, windowed: [] as { messageID: string; omittedParts: number }[] }
   }
 
   const rows = yield* db
@@ -938,6 +1247,7 @@ export const currentPage = Effect.fn("MessageV2.currentPage")(function* (input: 
     items,
     more,
     cursor: more && tail ? cursor.encode({ id: MessageID.ascending(tail.id), time: tail.time_created }) : undefined,
+    windowed: [] as { messageID: string; omittedParts: number }[],
   }
 })
 
@@ -970,12 +1280,12 @@ export const currentGet = Effect.fn("MessageV2.currentGet")(function* (input: {
   return item
 })
 
-export const page = Effect.fn("MessageV2.page")(function* (input: {
+export function pageOn(input: {
   sessionID: SessionID
   limit: number
   before?: string
-}) {
-  const { db } = yield* Database.Service
+}, db: Pick<Database.DatabaseShape, "select">) {
+  return Effect.gen(function* () {
   const before = input.before ? cursor.decode(input.before) : undefined
   const where = before
     ? and(eq(MessageTable.session_id, input.sessionID), older(before))
@@ -1011,6 +1321,497 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
     items,
     more,
     cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+  }
+  })
+}
+
+export const page = Effect.fn("MessageV2.page")(function* (input: {
+  sessionID: SessionID
+  limit: number
+  before?: string
+}) {
+  const { db } = yield* Database.Service
+  return yield* pageOn(input, db)
+})
+
+/**
+ * Versioned scalar-only part view for ordinary Context ledger pages. The
+ * message headers still come from the canonical V1 message projection, but
+ * all Part.data bodies—including multi-megabyte tool outputs—remain in SQLite.
+ *
+ * If ANY selected part predates the projection, is opaque, or has invalid
+ * facts, return undefined: callers MUST use the exact canonical pageOn() path
+ * instead of silently inventing missing token/signature values.
+ */
+export function pageContextFactsOn(
+  input: { sessionID: SessionID; limit: number; before?: string },
+  db: Pick<Database.DatabaseShape, "select">,
+) {
+  return Effect.gen(function* () {
+    const before = input.before ? cursor.decode(input.before) : undefined
+    const predicate = before
+      ? and(eq(MessageTable.session_id, input.sessionID), older(before))
+      : eq(MessageTable.session_id, input.sessionID)
+    // Context ledger rows need only the durable identity, presentation role,
+    // creation time, and ownership semantics. Never read full Message.data
+    // into JS when producer-written Part facts already eliminate part bodies.
+    // Large embedded provider metadata may otherwise dominate a 50-row page.
+    const rows = yield* db.select({
+      id: MessageTable.id,
+      sessionID: MessageTable.session_id,
+      timeCreated: sql<number | null>`json_extract(${MessageTable.data}, '$.time.created')`,
+      role: sql<string | null>`json_extract(${MessageTable.data}, '$.role')`,
+      provenance: sql<string | null>`json_extract(${MessageTable.data}, '$.provenance')`,
+      opaque: MessageTable.context_opaque,
+      physicalTime: MessageTable.time_created,
+    }).from(MessageTable)
+      .where(predicate)
+      .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+      .limit(input.limit + 1)
+      .all()
+      .pipe(Effect.orDie)
+    const more = rows.length > input.limit
+    const slice = more ? rows.slice(0, input.limit) : rows
+    if (slice.some((row) => row.opaque)) return undefined
+    const ids = slice.map((row) => row.id)
+    const parts = ids.length
+      ? yield* db.select({
+          id: PartTable.id,
+          messageID: PartTable.message_id,
+          version: PartTable.context_projection_version,
+          kind: PartTable.context_kind,
+          tokens: PartTable.context_tokens,
+          preview: PartTable.context_preview,
+          signed: PartTable.context_signed,
+          status: PartTable.context_status,
+          synthetic: PartTable.context_synthetic,
+          ignored: PartTable.context_ignored,
+          opaque: PartTable.context_opaque,
+        })
+          .from(PartTable)
+          .where(inArray(PartTable.message_id, ids))
+          .orderBy(PartTable.message_id, PartTable.id)
+          .all()
+          .pipe(Effect.orDie)
+      : []
+    if (parts.some((part) =>
+       part.version !== 1 || !part.kind ||
+      !Number.isSafeInteger(part.tokens) || part.tokens < 0 ||
+      ((part.kind === "text" || part.kind === "reasoning" || part.kind === "tool") && part.preview === null)
+    )) return undefined
+
+    const byMessage = new Map<string, Part[]>()
+    const facts = new Map<string, { tokens: number; signed: boolean }>()
+    for (const row of parts) {
+      // Minimal temporary adapter for the exact shared ledger classifier.
+      // It is confined to this projector: no synthetic Part is returned by
+      // the public MessageV2 history APIs or accepted by execution code.
+      const item = row.kind === "tool"
+        ? { id: row.id, type: "tool", tool: row.preview!, state: { status: row.status ?? "pending", output: "", error: "" } }
+        : row.kind === "text" || row.kind === "reasoning"
+          ? { id: row.id, type: row.kind, text: row.preview!, synthetic: row.synthetic, ignored: row.ignored }
+          : { id: row.id, type: row.kind }
+      const list = byMessage.get(row.messageID)
+      if (list) list.push(item as Part)
+      else byMessage.set(row.messageID, [item as Part])
+      facts.set(row.id, { tokens: row.tokens, signed: row.signed })
+    }
+    const items = slice.map((row) => ({
+      info: {
+        id: row.id,
+        sessionID: row.sessionID,
+        role: row.role,
+        time: { created: row.timeCreated },
+        ...(row.provenance ? { provenance: JSON.parse(row.provenance) } : {}),
+      } as Info,
+      parts: byMessage.get(row.id) ?? [],
+    }))
+    items.reverse()
+    const tail = slice.at(-1)
+    return {
+      items,
+      facts,
+      more,
+      cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.physicalTime }) : undefined,
+    }
+  })
+}
+
+const TIMELINE_PARTS_PER_MESSAGE = 64
+const TIMELINE_PART_PAGE_BYTES = 384 * 1024
+export const TIMELINE_MESSAGE_PAGE_LIMIT = 100
+
+// Explicit detail inspection is a separate, user-opened surface. Each wire
+// page contains at most 16 bounded JSON slices; oversized individual parts
+// continue by character offset instead of being materialized into the session
+// store or timeline.
+export const INSPECTION_PART_PAGE_SIZE = 16
+export const INSPECTION_PART_SLICE_CHARS = 1024
+
+// Timeline recovery pages restore complete structured parts into the shared
+// timeline store. The page is bounded by both item count and encoded bytes;
+// one oversized part is admitted alone so no content can become unreachable.
+export const TIMELINE_RECOVERY_PART_PAGE_SIZE = 512
+export const TIMELINE_RECOVERY_PART_PAGE_BYTES = 2 * 1024 * 1024
+export const TIMELINE_RECOVERY_MESSAGE_LIMIT = 200
+
+export type TimelineRecoveryCursor = PartID
+
+export function decodeTimelineRecoveryCursor(input: string): TimelineRecoveryCursor {
+  if (!input.startsWith("prt")) throw new Error("Invalid timeline recovery cursor")
+  return PartID.make(input)
+}
+
+export const timelinePartsPage = Effect.fn("MessageV2.timelinePartsPage")(function* (input: {
+  sessionID: SessionID
+  messageID: MessageID
+  cursor?: TimelineRecoveryCursor
+}) {
+  const { db } = yield* Database.Service
+  const message = yield* db
+    .select({ id: MessageTable.id })
+    .from(MessageTable)
+    .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, input.messageID)))
+    .get()
+    .pipe(Effect.orDie)
+  if (!message) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+
+  const candidates = yield* db
+    .select({
+      id: PartTable.id,
+      bytes: sql<number>`length(cast(${PartTable.data} as blob))`,
+    })
+    .from(PartTable)
+    .where(
+      and(
+        eq(PartTable.session_id, input.sessionID),
+        eq(PartTable.message_id, input.messageID),
+        input.cursor ? lt(PartTable.id, input.cursor) : undefined,
+      ),
+    )
+    .orderBy(desc(PartTable.id))
+    .limit(TIMELINE_RECOVERY_PART_PAGE_SIZE + 1)
+    .all()
+    .pipe(Effect.orDie)
+
+  const selected: typeof candidates = []
+  let bytes = 0
+  for (const row of candidates) {
+    if (selected.length >= TIMELINE_RECOVERY_PART_PAGE_SIZE) break
+    // Always make progress, including when one stored part exceeds the page
+    // budget. Large parts are still delivered whole and handled by the
+    // renderer's worker/virtualized content paths.
+    if (selected.length > 0 && bytes + row.bytes > TIMELINE_RECOVERY_PART_PAGE_BYTES) break
+    selected.push(row)
+    bytes += row.bytes
+  }
+
+  const ids = selected.map((row) => row.id)
+  const rows = ids.length
+    ? yield* db
+        .select()
+        .from(PartTable)
+        .where(and(eq(PartTable.session_id, input.sessionID), inArray(PartTable.id, ids)))
+        .orderBy(asc(PartTable.id))
+        .all()
+        .pipe(Effect.orDie)
+    : []
+  const hasMore = candidates.length > selected.length
+  const next = selected.at(-1)
+  return {
+    data: rows.map(part),
+    nextCursor: hasMore && next ? next.id : undefined,
+  }
+})
+
+export type TimelineRecoveryBatchCursor = { partID: PartID; messageIDs: MessageID[] }
+
+export function encodeTimelineRecoveryBatchCursor(cursor: TimelineRecoveryBatchCursor) {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url")
+}
+
+export function decodeTimelineRecoveryBatchCursor(input: string, messageIDs: readonly MessageID[]): TimelineRecoveryBatchCursor {
+  const value = JSON.parse(Buffer.from(input, "base64url").toString("utf8")) as Record<string, unknown>
+  if (
+    typeof value.partID !== "string" ||
+    !value.partID.startsWith("prt") ||
+    !Array.isArray(value.messageIDs) ||
+    value.messageIDs.some((id) => typeof id !== "string")
+  ) throw new Error("Invalid timeline recovery batch cursor")
+  const expected = [...messageIDs].sort()
+  const actual = (value.messageIDs as string[]).sort()
+  if (expected.length !== actual.length || expected.some((id, index) => id !== actual[index]))
+    throw new Error("Timeline recovery cursor does not match requested messages")
+  return { partID: PartID.make(value.partID), messageIDs: actual.map((id) => MessageID.make(id)) }
+}
+
+// One session-page request restores parts for all windowed messages in the
+// currently loaded page. PartID is globally ordered, so one cursor traverses
+// the requested owner set without issuing one request per message.
+export const timelinePartsBatchPage = Effect.fn("MessageV2.timelinePartsBatchPage")(function* (input: {
+  sessionID: SessionID
+  messageIDs: readonly MessageID[]
+  cursor?: TimelineRecoveryBatchCursor
+}) {
+  const { db } = yield* Database.Service
+  const messageIDs = [...new Set(input.messageIDs)].sort()
+  if (messageIDs.length > TIMELINE_RECOVERY_MESSAGE_LIMIT)
+    return yield* new NotFoundError({ message: "Timeline recovery message page exceeds its bound" })
+  if (input.cursor && (input.cursor.messageIDs.length !== messageIDs.length || input.cursor.messageIDs.some((id, i) => id !== messageIDs[i])))
+    return yield* new NotFoundError({ message: "Timeline recovery cursor owner set changed" })
+
+  const owners = messageIDs.length
+    ? yield* db.select({ id: MessageTable.id }).from(MessageTable)
+        .where(and(eq(MessageTable.session_id, input.sessionID), inArray(MessageTable.id, messageIDs)))
+        .all().pipe(Effect.orDie)
+    : []
+  if (owners.length !== messageIDs.length)
+    return yield* new NotFoundError({ message: "One or more timeline recovery messages do not belong to this session" })
+
+  const candidates = messageIDs.length
+    ? yield* db.select({ id: PartTable.id, messageID: PartTable.message_id, bytes: sql<number>`length(cast(${PartTable.data} as blob))` })
+        .from(PartTable)
+        .where(and(
+          eq(PartTable.session_id, input.sessionID),
+          inArray(PartTable.message_id, messageIDs),
+          input.cursor ? lt(PartTable.id, input.cursor.partID) : undefined,
+        ))
+        .orderBy(desc(PartTable.id))
+        .limit(TIMELINE_RECOVERY_PART_PAGE_SIZE + 1)
+        .all().pipe(Effect.orDie)
+    : []
+
+  const selected: typeof candidates = []
+  let bytes = 0
+  for (const row of candidates) {
+    if (selected.length >= TIMELINE_RECOVERY_PART_PAGE_SIZE) break
+    if (selected.length > 0 && bytes + row.bytes > TIMELINE_RECOVERY_PART_PAGE_BYTES) break
+    selected.push(row)
+    bytes += row.bytes
+  }
+  const ids = selected.map((row) => row.id)
+  const rows = ids.length
+    ? yield* db.select().from(PartTable)
+        .where(and(eq(PartTable.session_id, input.sessionID), inArray(PartTable.id, ids)))
+        .orderBy(asc(PartTable.id)).all().pipe(Effect.orDie)
+    : []
+  const hasMore = candidates.length > selected.length
+  const nextRow = selected.at(-1)
+  return {
+    data: rows.map((row) => ({ messageID: MessageID.make(row.message_id), part: part(row) })),
+    nextCursor: hasMore && nextRow
+      ? encodeTimelineRecoveryBatchCursor({ partID: nextRow.id, messageIDs })
+      : undefined,
+    completeMessageIDs: hasMore ? [] : messageIDs,
+  }
+})
+
+export type InspectionPartCursor = { partID: PartID; offset: number }
+
+export function encodeInspectionPartCursor(cursor: InspectionPartCursor) {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url")
+}
+
+export function decodeInspectionPartCursor(input: string): InspectionPartCursor {
+  const value = JSON.parse(Buffer.from(input, "base64url").toString("utf8")) as Record<string, unknown>
+  if (
+    typeof value.partID !== "string" ||
+    !value.partID.startsWith("prt") ||
+    !Number.isSafeInteger(value.offset) ||
+    (value.offset as number) < 0
+  )
+    throw new Error("Invalid part cursor")
+  return { partID: PartID.make(value.partID), offset: value.offset as number }
+}
+
+export const inspectionPartsPage = Effect.fn("MessageV2.inspectionPartsPage")(function* (input: {
+  sessionID: SessionID
+  messageID: MessageID
+  cursor?: InspectionPartCursor
+}) {
+  const { db } = yield* Database.Service
+  const message = yield* db
+    .select({ id: MessageTable.id })
+    .from(MessageTable)
+    .where(and(eq(MessageTable.session_id, input.sessionID), eq(MessageTable.id, input.messageID)))
+    .get()
+    .pipe(Effect.orDie)
+  if (!message) return yield* new NotFoundError({ message: `Message not found: ${input.messageID}` })
+
+  const cursor = input.cursor
+  const firstOffset = cursor?.offset ?? 0
+  if (cursor) {
+    const anchor = yield* db
+      .select({ totalChars: sql<number>`length(${PartTable.data})` })
+      .from(PartTable)
+      .where(
+        and(
+          eq(PartTable.session_id, input.sessionID),
+          eq(PartTable.message_id, input.messageID),
+          eq(PartTable.id, cursor.partID),
+        ),
+      )
+      .get()
+      .pipe(Effect.orDie)
+    if (!anchor || firstOffset > anchor.totalChars)
+      return yield* new NotFoundError({ message: `Invalid part cursor for ${input.messageID}` })
+  }
+  const where = and(
+    eq(PartTable.session_id, input.sessionID),
+    eq(PartTable.message_id, input.messageID),
+    cursor
+      ? firstOffset > 0
+        ? gte(PartTable.id, cursor.partID)
+        : gt(PartTable.id, cursor.partID)
+      : undefined,
+  )
+  const rows = yield* db
+    .select({
+      id: PartTable.id,
+      type: sql<string>`${legacyPartKind}`,
+      totalChars: sql<number>`length(${PartTable.data})`,
+      text: sql<string>`substr(
+        ${PartTable.data},
+        case when ${PartTable.id} = ${cursor?.partID ?? ""} then ${firstOffset + 1} else 1 end,
+        ${INSPECTION_PART_SLICE_CHARS}
+      )`,
+    })
+    .from(PartTable)
+    .where(where)
+    .orderBy(asc(PartTable.id))
+    .limit(INSPECTION_PART_PAGE_SIZE + 1)
+    .all()
+    .pipe(Effect.orDie)
+
+  if (cursor && firstOffset > 0 && rows[0]?.id !== cursor.partID)
+    return yield* new NotFoundError({ message: `Part not found: ${cursor.partID}` })
+
+  const selected = rows.slice(0, INSPECTION_PART_PAGE_SIZE)
+  const data: {
+    partID: PartID
+    type: string
+    offset: number
+    totalChars: number
+    text: string
+  }[] = []
+  let nextCursor: InspectionPartCursor | undefined
+  for (const [index, row] of selected.entries()) {
+    const offset = cursor && index === 0 && row.id === cursor.partID ? firstOffset : 0
+    data.push({ partID: PartID.make(row.id), type: row.type, offset, totalChars: row.totalChars, text: row.text })
+    // SQLite TEXT length/substr count Unicode code points, while JS
+    // String.length counts UTF-16 code units. Keep the opaque cursor in the
+    // same unit as the database to avoid duplicate/skipped emoji content.
+    const nextOffset = offset + [...row.text].length
+    if (nextOffset < row.totalChars) {
+      nextCursor = { partID: PartID.make(row.id), offset: nextOffset }
+      break
+    }
+  }
+  if (!nextCursor && rows.length > selected.length) {
+    const last = selected.at(-1)
+    if (last) nextCursor = { partID: PartID.make(last.id), offset: 0 }
+  }
+  return {
+    data,
+    nextCursor: nextCursor ? encodeInspectionPartCursor(nextCursor) : undefined,
+  }
+})
+
+export const timelinePage = Effect.fn("MessageV2.timelinePage")(function* (input: {
+  sessionID: SessionID
+  limit: number
+  before?: string
+}) {
+  const { db } = yield* Database.Service
+  const limit = Math.max(1, Math.min(input.limit, TIMELINE_MESSAGE_PAGE_LIMIT))
+  const before = input.before ? cursor.decode(input.before) : undefined
+  const where = before
+    ? and(eq(MessageTable.session_id, input.sessionID), older(before))
+    : eq(MessageTable.session_id, input.sessionID)
+  const rows = yield* db
+    .select()
+    .from(MessageTable)
+    .where(where)
+    .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+    .limit(limit + 1)
+    .all()
+    .pipe(Effect.orDie)
+  if (rows.length === 0) {
+    const row = yield* db
+      .select({ id: SessionTable.id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, input.sessionID))
+      .get()
+      .pipe(Effect.orDie)
+    if (!row) return yield* new NotFoundError({ message: `Session not found: ${input.sessionID}` })
+    return {
+      items: [] as WithParts[],
+      more: false,
+      cursor: undefined,
+      windowed: [] as { messageID: string; omittedParts: number }[],
+    }
+  }
+
+  const more = rows.length > limit
+  const slice = more ? rows.slice(0, limit) : rows
+  const ids = slice.map((row) => row.id)
+  const perMessageBytes = Math.max(1024, Math.floor(TIMELINE_PART_PAGE_BYTES / Math.max(1, slice.length)))
+  const ranked = db
+    .select({
+      id: PartTable.id,
+      message_id: PartTable.message_id,
+      session_id: PartTable.session_id,
+      data: PartTable.data,
+      rank: sql<number>`row_number() over (partition by ${PartTable.message_id} order by ${PartTable.id} desc)`.as(
+        "rank",
+      ),
+      // SQLite length(TEXT) counts Unicode code points, not encoded bytes.
+      // The timeline budget is a transport/heap bound, so count the UTF-8
+      // bytes stored in the JSON column instead.
+      bytes: sql<number>`sum(length(cast(${PartTable.data} as blob))) over (
+        partition by ${PartTable.message_id} order by ${PartTable.id} desc
+        rows between unbounded preceding and current row
+      )`.as("bytes"),
+    })
+    .from(PartTable)
+    .where(
+      and(
+        inArray(PartTable.message_id, ids),
+        lte(sql<number>`length(cast(${PartTable.data} as blob))`, perMessageBytes),
+      ),
+    )
+    .as("timeline_part_window")
+  const [partRows, counts] = yield* Effect.all([
+    db
+      .select({ id: ranked.id, message_id: ranked.message_id, session_id: ranked.session_id, data: ranked.data })
+      .from(ranked)
+      .where(and(lte(ranked.rank, TIMELINE_PARTS_PER_MESSAGE), lte(ranked.bytes, perMessageBytes)))
+      .orderBy(asc(ranked.message_id), asc(ranked.id))
+      .all()
+      .pipe(Effect.orDie),
+    db
+      .select({ messageID: PartTable.message_id, count: sql<number>`count(*)` })
+      .from(PartTable)
+      .where(inArray(PartTable.message_id, ids))
+      .groupBy(PartTable.message_id)
+      .all()
+      .pipe(Effect.orDie),
+  ])
+  const items = hydrateRows(slice, partRows as (typeof PartTable.$inferSelect)[])
+  const selected = new Map<string, number>()
+  for (const row of partRows) selected.set(row.message_id, (selected.get(row.message_id) ?? 0) + 1)
+  const total = new Map(counts.map((row) => [row.messageID, row.count]))
+  const windowed = ids.flatMap((messageID) => {
+    const omittedParts = (total.get(messageID) ?? 0) - (selected.get(messageID) ?? 0)
+    return omittedParts > 0 ? [{ messageID, omittedParts }] : []
+  })
+  items.reverse()
+  const tail = slice.at(-1)
+  return {
+    items,
+    more,
+    cursor: more && tail ? cursor.encode({ id: tail.id, time: tail.time_created }) : undefined,
+    windowed,
   }
 })
 
@@ -1066,58 +1867,299 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   }
 })
 
-export function filterCompacted(msgs: Iterable<WithParts>) {
+/**
+ * Content-free admission facts for Context mutations.
+ *
+ * The admission guard needs message provenance, the presence of signed
+ * reasoning and ownership of explicitly targeted part IDs. It does NOT need
+ * text, file, tool input, or tool output. Query these small facts from the
+ * durable V1 producer without decoding every part body into JavaScript.
+ *
+ * Producer-certified scalar facts avoid parsing current V1 part JSON.
+ * Unversioned/unknown parts still use authoritative JSON and fail closed
+ * rather than accidentally treating malformed historical data as unsigned.
+ */
+export const probeContextTargetsFrom = Effect.fn("MessageV2.probeContextTargetsFrom")(function* (input: {
+  sessionID: SessionID
+  messageIDs: readonly MessageID[]
+  signatureMessageIDs: readonly MessageID[]
+  partIDs: readonly PartID[]
+}, tx: Pick<Database.DatabaseShape, "select">) {
+  const result = new Map<MessageID, {
+    info: SharedTurnProvenance.InfoLike
+    signedReasoning: boolean
+    hasEditablePart: boolean
+    opaqueParts: boolean
+  }>()
+  const partOwners = new Map<PartID, MessageID>()
+  const partFacts = new Map<PartID, { type: string; status?: string }>()
+  const batchSize = 128
+
+  const messageIDs = [...new Set(input.messageIDs)]
+  for (let offset = 0; offset < messageIDs.length; offset += batchSize) {
+    const ids = messageIDs.slice(offset, offset + batchSize)
+    const rows = yield* tx
+      .select({
+        id: MessageTable.id,
+        role: sql<string | null>`json_extract(${MessageTable.data}, '$.role')`,
+        owner: sql<string | null>`json_extract(${MessageTable.data}, '$.provenance.owner')`,
+        source: sql<string | null>`json_extract(${MessageTable.data}, '$.provenance.source')`,
+        lifetime: sql<string | null>`json_extract(${MessageTable.data}, '$.provenance.lifetime')`,
+      })
+      .from(MessageTable)
+      .where(and(eq(MessageTable.session_id, input.sessionID), inArray(MessageTable.id, ids)))
+      .all()
+      .pipe(Effect.orDie)
+    for (const row of rows) {
+      // Admission needs ONLY provenance semantics, not message body, system
+      // prompt, or arbitrary metadata. SQLite extracts four tiny scalars even
+      // when the V1 message JSON itself is very large.
+      const provenance: SharedTurnProvenance.ProvenanceLike | undefined =
+        row.owner === "host" && row.source !== null
+          ? {
+              owner: "host",
+              source: row.source,
+              ...(row.lifetime === "historical" ? { lifetime: "historical" as const } : {}),
+            }
+          : row.owner === "user" && row.source !== null
+            ? {
+                owner: "user",
+                source: row.source,
+                ...(row.lifetime === "historical" ? { lifetime: "historical" as const } : {}),
+              }
+            : undefined
+      result.set(row.id, {
+        info: { role: row.role ?? undefined, provenance },
+        signedReasoning: false,
+        hasEditablePart: false,
+        opaqueParts: false,
+      })
+    }
+  }
+
+  // Only exclusions/edits need the signature check. Pin, restore and include
+  // operations without a part ID incur zero part-table reads.
+  const signatureIDs = [...new Set(input.signatureMessageIDs)]
+  for (let offset = 0; offset < signatureIDs.length; offset += batchSize) {
+    const ids = signatureIDs.slice(offset, offset + batchSize)
+    const rows = yield* tx
+      .select({
+        messageID: PartTable.message_id,
+        signed: sql<number>`MAX(${legacyPartSigned})`,
+        editable: sql<number>`MAX(CASE WHEN ${legacyPartKind}
+          IN ('text', 'reasoning') THEN 1 ELSE 0 END)`,
+        opaque: sql<number>`MAX(${legacyPartOpaque})`,
+      })
+      .from(PartTable)
+      .where(and(eq(PartTable.session_id, input.sessionID), inArray(PartTable.message_id, ids)))
+      .groupBy(PartTable.message_id)
+      .all()
+      .pipe(Effect.orDie)
+    for (const row of rows) {
+      const item = result.get(row.messageID)
+      if (item) {
+        item.signedReasoning = row.signed === 1
+        item.hasEditablePart = row.editable === 1
+        // An OPCL-externalized V1 part has no inline signature/type. Never
+        // infer unsigned or editable from its opaque reference; the mutation
+        // admission layer refuses destructive operations until a genuine
+        // producer-owned part projection can prove the guard.
+        item.opaqueParts = row.opaque === 1
+      }
+    }
+  }
+
+  // Ownership validation uses the globally indexed Part primary key and
+  // session predicate. No part JSON needs to cross the SQLite/JS boundary.
+  const partIDs = [...new Set(input.partIDs)]
+  for (let offset = 0; offset < partIDs.length; offset += batchSize) {
+    const ids = partIDs.slice(offset, offset + batchSize)
+    const rows = yield* tx
+      .select({
+        id: PartTable.id,
+        messageID: PartTable.message_id,
+        type: legacyPartKind,
+        status: legacyPartStatus,
+      })
+      .from(PartTable)
+      .where(and(eq(PartTable.session_id, input.sessionID), inArray(PartTable.id, ids)))
+      .all()
+      .pipe(Effect.orDie)
+    for (const row of rows) {
+      // Unknown/opaque historical part kinds cannot authorize a Context edit.
+      // Preserve fail-closed behavior rather than projecting a null type into
+      // the structurally verified part-fact map.
+      if (row.type === null) continue
+      partOwners.set(row.id, row.messageID)
+      partFacts.set(row.id, { type: row.type, status: row.status ?? undefined })
+    }
+  }
+  return { messages: result, partOwners, partFacts }
+})
+
+export const probeContextTargets = Effect.fn("MessageV2.probeContextTargets")(function* (
+  input: Parameters<typeof probeContextTargetsFrom>[0],
+) {
+  const { readDb } = yield* Database.Service
+  // Public inspector uses one coherent committed read snapshot; durable
+  // mutation admission uses probeContextTargetsFrom with the writer instead.
+  return yield* readDb.transaction((tx) => probeContextTargetsFrom(input, tx), { behavior: "deferred" })
+})
+
+/**
+ * Canonical newest-to-oldest V1 compaction collector. Both array filtering and
+ * the paged SQLite reader use this exact state machine; the latter can stop
+ * fetching once the effective-history boundary is proven.
+ */
+function compactionCollector() {
   const result = [] as WithParts[]
   const completed = new Set<string>()
+  const candidateIDs = new Set<string>()
   let retain: MessageID | undefined
-  for (const msg of msgs) {
+  const push = (msg: WithParts): boolean => {
     result.push(msg)
     if (retain) {
-      if (msg.info.id === retain) break
-      continue
+      return msg.info.id === retain
     }
     if (msg.info.role === "user" && completed.has(msg.info.id)) {
       const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
+      if (!part) return false
+      // A completed assistant response is only a candidate until the durable
+      // marker is explicitly promoted. Old markers lacking pending keep the
+      // historical behavior; interrupted new compactions retain full history.
+      if (part.pending === true) return false
+      if (part.checkpoint_message_id && !candidateIDs.has(part.checkpoint_message_id)) return false
+      if (!part.tail_start_id) return true
       retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
+      return msg.info.id === retain
     }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+    if (msg.info.role === "assistant" && hasUsableCompactionCheckpoint(msg)) {
       completed.add(msg.info.parentID)
+      candidateIDs.add(msg.info.id)
+    }
+    return false
   }
-  result.reverse()
-  const compactionIndex = result.findLastIndex(
-    (msg) =>
-      msg.info.role === "user" &&
-      msg.parts.some((item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined),
-  )
-  const compaction = result[compactionIndex]
-  const part = compaction?.parts.find(
-    (item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined,
-  )
-  const summaryIndex = compaction
-    ? result.findIndex(
-        (msg, index) =>
-          index > compactionIndex &&
-          msg.info.role === "assistant" &&
-          msg.info.summary &&
-          msg.info.parentID === compaction.info.id,
-      )
-    : -1
-  const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
-  if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
-    return [
-      ...result.slice(compactionIndex, summaryIndex + 1),
-      ...result.slice(tailIndex, compactionIndex),
-      ...result.slice(summaryIndex + 1),
-    ]
+  const finish = () => {
+    result.reverse()
+    const promoted = result.findLast((msg) =>
+      msg.info.role === "user" && msg.parts.some(
+        (part) => part.type === "compaction" && part.pending !== true && Boolean(part.checkpoint_message_id),
+      ),
+    )
+    const promotedID = promoted?.parts.find(
+      (part): part is CompactionPart => part.type === "compaction",
+    )?.checkpoint_message_id
+    // Multiple complete assistant candidates can share one parent after crash
+    // and retry. Never replay or select an abandoned candidate in place of the
+    // exact assistant promoted by the marker's atomic update.
+    const visible = promotedID
+      ? result.filter((msg) =>
+          msg.info.role !== "assistant" ||
+          msg.info.parentID !== promoted!.info.id ||
+          !msg.info.summary ||
+          msg.info.id === promotedID,
+        )
+      : result
+    const compactionIndex = visible.findLastIndex(
+      (msg) =>
+        msg.info.role === "user" &&
+        msg.parts.some(
+          (item): item is CompactionPart =>
+            item.type === "compaction" && item.pending !== true && item.tail_start_id !== undefined,
+        ),
+    )
+    const compaction = visible[compactionIndex]
+    const part = compaction?.parts.find(
+      (item): item is CompactionPart =>
+        item.type === "compaction" && item.pending !== true && item.tail_start_id !== undefined,
+    )
+    const summaryIndex = compaction
+      ? visible.findIndex(
+          (msg, index) =>
+            index > compactionIndex &&
+            msg.info.role === "assistant" &&
+            hasUsableCompactionCheckpoint(msg) &&
+            msg.info.parentID === compaction.info.id &&
+            (!part?.checkpoint_message_id || msg.info.id === part.checkpoint_message_id),
+        )
+      : -1
+    const tailIndex = part?.tail_start_id ? visible.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
+    if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
+      return [
+        ...visible.slice(compactionIndex, summaryIndex + 1),
+        ...visible.slice(tailIndex, compactionIndex),
+        ...visible.slice(summaryIndex + 1),
+      ]
+    }
+    return visible
   }
-  return result
+  return { push, finish }
 }
+
+export function filterCompacted(msgs: Iterable<WithParts>) {
+  const collector = compactionCollector()
+  for (const msg of msgs) if (collector.push(msg)) break
+  return collector.finish()
+}
+
+/** Internal signal to retry large history reads on the dedicated scan lane. */
+export class ContextHistoryScanRequired extends Error {
+  constructor() {
+    super("Context effective history exceeded the interactive read budget")
+    this.name = "ContextHistoryScanRequired"
+  }
+}
+
+/**
+ * Inspect compaction-aware V1 history inside an already-pinned transaction.
+ * Context's ledger+overlay snapshot can share this with its own SQL queries;
+ * the public streamCompacted convenience path creates that transaction.
+ * A limited reader must fail instead of returning a partial ledger: its owner
+ * can retry on a separate WAL reader using a fresh, internally consistent
+ * snapshot, rather than monopolizing latency-sensitive SQLite read admission.
+ */
+export function readCompactedFrom(
+  sessionID: SessionID,
+  reader: Pick<Database.DatabaseShape, "select">,
+  options?: { maxPages?: number },
+) {
+  return Effect.gen(function* () {
+      const collector = compactionCollector()
+      let before: string | undefined
+      let pages = 0
+      while (true) {
+        const next = yield* pageOn({ sessionID, limit: 50, before }, reader).pipe(
+          Effect.catchIf(NotFoundError.isInstance, () =>
+            Effect.succeed({ items: [] as WithParts[], more: false, cursor: undefined }),
+          ),
+        )
+        pages++
+        if (next.items.length === 0) break
+        let reachedBoundary = false
+        for (let i = next.items.length - 1; i >= 0; i--) {
+          if (collector.push(next.items[i]!)) {
+            reachedBoundary = true
+            break
+          }
+        }
+        if (reachedBoundary || !next.more || !next.cursor) break
+        if (options?.maxPages !== undefined && pages >= options.maxPages)
+          return yield* Effect.fail(new ContextHistoryScanRequired())
+        before = next.cursor
+      }
+      return collector.finish()
+  })
+}
+
+export const streamCompacted = Effect.fnUntraced(function* (sessionID: SessionID) {
+  // DEFERRED WAL snapshot is consistent across cursor pages without taking
+  // ownership of the primary writer's connection.
+  const { readDb } = yield* Database.Service
+  return yield* readDb.transaction(
+    (tx) => readCompactedFrom(sessionID, tx),
+    { behavior: "deferred" },
+  )
+})
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
   return filterCompacted(yield* stream(sessionID))
@@ -1257,6 +2299,16 @@ export function fromError(
           { cause: e },
         ).toObject()
       }
+      if (parsed.type === "stale_reasoning") {
+        return new APIError(
+          {
+            message: parsed.message,
+            isRetryable: false,
+            responseBody: parsed.responseBody,
+          },
+          { cause: e },
+        ).toObject()
+      }
 
       return new APIError(
         {
@@ -1279,6 +2331,16 @@ export function fromError(
             return new ContextOverflowError(
               {
                 message: parsed.message,
+                responseBody: parsed.responseBody,
+              },
+              { cause: e },
+            ).toObject()
+          }
+          if (parsed.type === "stale_reasoning") {
+            return new APIError(
+              {
+                message: parsed.message,
+                isRetryable: false,
                 responseBody: parsed.responseBody,
               },
               { cause: e },

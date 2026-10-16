@@ -32,6 +32,50 @@ function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
   return { name: "", data: { message } }
 }
 
+describe("stream EOF retry safety", () => {
+  test("premature stream EOF is terminal even if a provider wrapper marks it retryable", () => {
+    const error = new SessionV1.APIError({
+      message: "Provider stream ended without a terminal finish event",
+      isRetryable: true,
+      statusCode: 502,
+    }).toObject()
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+    expect(SessionRetry.classify(error, retryProvider)).toMatchObject({
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+    })
+  })
+
+  test("OpenAI-compatible transport-only DONE is terminal rather than replayable", () => {
+    for (const message of [
+      "OpenAI-compatible stream ended without a recognized finish_reason",
+      "OpenAI-compatible stream ended without a completed model step",
+    ]) {
+      const error = new SessionV1.APIError({
+        message,
+        isRetryable: true,
+        statusCode: 502,
+      }).toObject()
+      expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+      expect(SessionRetry.classify(error, retryProvider)).toMatchObject({
+        class: "request-invalid",
+        retry: "none",
+        routeEffect: "none",
+      })
+    }
+  })
+
+  test("unrelated retryable network and gateway errors keep existing policy", () => {
+    const error = new SessionV1.APIError({
+      message: "Connection reset",
+      statusCode: 502,
+      isRetryable: true,
+    }).toObject()
+    expect(SessionRetry.classify(error, retryProvider).retry).toBe("same-route")
+  })
+})
+
 describe("session.retry.delay", () => {
   test("caps delay at 30 seconds when headers missing", () => {
     const error = apiError()
@@ -55,6 +99,17 @@ describe("session.retry.delay", () => {
   test("uses retry-after seconds when reasonable", () => {
     const error = apiError({ "retry-after": "30" })
     expect(SessionRetry.delay(3, error)).toBe(30000)
+  })
+
+  test("uses the strict case-insensitive reset parser for both delay and deadline", () => {
+    const now = Date.UTC(2026, 9, 3, 12)
+    const error = apiError({ "ReTrY-AfTeR": "3" })
+    expect(SessionRetry.retryResetAt(error, now)).toBe(now + 3000)
+    expect(SessionRetry.delay(3, error, 0, now)).toBe(3000)
+
+    const malformed = apiError({ "Retry-After": "2seconds" })
+    expect(SessionRetry.retryResetAt(malformed, now)).toBeUndefined()
+    expect(SessionRetry.delay(1, malformed, 0, now)).toBe(2000)
   })
 
   test("accepts http-date retry-after values", () => {
@@ -147,6 +202,42 @@ describe("session.retry.delay", () => {
     }),
   )
 
+  it.instance("upstream 504 idle timeouts terminate immediately, while ordinary 504s retain five retries", () =>
+    Effect.gen(function* () {
+      const upstreamIdle = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Streaming response failed: [504] Upstream idle timeout exceeded",
+          statusCode: 504,
+          isRetryable: true,
+          responseHeaders: { "retry-after-ms": "0" },
+        }).toObject(),
+      )
+      const ordinaryGateway = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Gateway timeout [504]",
+          statusCode: 504,
+          isRetryable: true,
+          responseHeaders: { "retry-after-ms": "0" },
+        }).toObject(),
+      )
+      const collect = (error: SessionV1.APIError, count: number) =>
+        Effect.gen(function* () {
+          const attempts: number[] = []
+          const step = yield* Schedule.toStepWithMetadata(
+            SessionRetry.policy({
+              provider: "opencode-go",
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              set: ({ attempt }) => Effect.sync(() => { attempts.push(attempt) }),
+            }),
+          )
+          yield* Effect.forEach(Array.from({ length: count }), () => Effect.ignore(step(error)))
+          return attempts
+        })
+      expect(yield* collect(upstreamIdle, 3)).toEqual([])
+      expect(yield* collect(ordinaryGateway, SessionRetry.RETRY_MAX_RETRIES + 1)).toEqual([1, 2, 3, 4, 5])
+    }),
+  )
+
   it.instance("does not automatically retry a terminal free-limit failure", () =>
     Effect.gen(function* () {
       let attempts = 0
@@ -192,6 +283,56 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
+  test("does not replay prompt-rendering failures or penalize the route even when wrapped in a 5xx", () => {
+    const message = "Upstream request failed: [prompt_rendering_failed] The request could not be rendered into a prompt for this model."
+    const error = new SessionV1.APIError({
+      message,
+      isRetryable: true,
+      statusCode: 502,
+      responseBody: JSON.stringify({ error: { code: "prompt_rendering_failed" } }),
+    }).toObject()
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+    expect(SessionRetry.classify(error, retryProvider)).toMatchObject({
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+    })
+
+    const echoed = new SessionV1.APIError({
+      message: "Upstream temporarily unavailable",
+      isRetryable: true,
+      statusCode: 502,
+      responseBody: JSON.stringify({ error: { code: "server_error" }, echoedUserText: "prompt_rendering_failed" }),
+    }).toObject()
+    expect(SessionRetry.classify(echoed, retryProvider)).toMatchObject({
+      class: "provider-transient",
+      retry: "same-route",
+      routeEffect: "none",
+    })
+  })
+
+  test("locally exhausted provider progress deadline is terminal, unlike ordinary network timeouts", () => {
+    for (const phase of ["waiting for first content", "provider stream idle"]) {
+      const message = `Provider response timed out (${phase}, 90000ms)`
+      expect(SessionRetry.retryable(wrap(message), retryProvider)).toBeUndefined()
+      expect(SessionRetry.classify(wrap(message), retryProvider)).toMatchObject({
+        class: "request-invalid",
+        retry: "none",
+        routeEffect: "none",
+      })
+    }
+    expect(SessionRetry.retryable(wrap("request timed out"), retryProvider)).toEqual({
+      message: "request timed out",
+    })
+    const localStall = wrap("Local provider event processing stalled (snapshot-post-step, 300000ms)")
+    expect(SessionRetry.retryable(localStall, retryProvider)).toBeUndefined()
+    expect(SessionRetry.classify(localStall, retryProvider)).toMatchObject({
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+    })
+  })
+
   test("retries serialized too_many_requests messages", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { type: "too_many_requests" } }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Too Many Requests" })
@@ -443,6 +584,39 @@ describe("session.retry.retryable", () => {
     })
   })
 
+  test("uses the canonical reset parser for Go retry-after-ms display", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Subscription quota exceeded. You can continue using free models.",
+        isRetryable: true,
+        statusCode: 429,
+        responseHeaders: {
+          "ReTrY-AfTeR-Ms": "19380000",
+        },
+        responseBody: JSON.stringify({
+          type: "error",
+          error: {
+            type: "GoUsageLimitError",
+            message: "Subscription quota exceeded. You can continue using free models.",
+          },
+          metadata: {
+            workspace: "wrk_01K6XGM22R6FM8JVABE9XDQXGH",
+            limitName: "5 hour",
+          },
+        }),
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "opencode-go")).toMatchObject({
+      message:
+        "5 hour usage limit reached. It will reset in 5 hours 23 minutes. To continue using this model now, enable usage from your available balance - https://opencode.ai/workspace/wrk_01K6XGM22R6FM8JVABE9XDQXGH/go",
+      action: {
+        message:
+          "5 hour usage limit reached. It will reset in 5 hours 23 minutes. To continue using this model now, enable usage from your available balance",
+      },
+    })
+  })
+
   test("maps Go subscription limits without limit metadata", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
@@ -488,6 +662,36 @@ describe("session.retry.classify", () => {
         responseHeaders: input.responseHeaders,
       }).toObject(),
     )
+
+  test("classifies stale encrypted reasoning before transient/rate-limit heuristics", () => {
+    const stale = error({
+      message: "reasoning `encrypted_content` was not issued to this caller",
+      statusCode: 429,
+      responseHeaders: { "retry-after": "30" },
+      responseBody:
+        '{"error":{"type":"invalid_request_error","message":"reasoning `encrypted_content` was not issued to this caller","max_tokens":500}}',
+      isRetryable: true,
+    })
+
+    expect(SessionRetry.retryable(stale, "opencode")).toBeUndefined()
+    expect(SessionRetry.classify(stale, "opencode", { routeKind: "public" })).toEqual({
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+      message: "reasoning `encrypted_content` was not issued to this caller",
+    })
+  })
+
+  test("does not retry a raw stale-reasoning failure just because its text contains a 500 marker", () => {
+    const stale = wrap("reasoning `encrypted_content` was not issued to this caller; request 500")
+    expect(SessionRetry.retryable(stale, "opencode")).toBeUndefined()
+    expect(SessionRetry.classify(stale, "opencode")).toEqual({
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+      message: "reasoning `encrypted_content` was not issued to this caller; request 500",
+    })
+  })
 
   const freeLimit = () =>
     error({
@@ -590,9 +794,9 @@ describe("session.retry.classify", () => {
     const seconds = error({
       message: "rate limited",
       statusCode: 429,
-      responseHeaders: { "ReTrY-AfTeR": "2.5" },
+      responseHeaders: { "ReTrY-AfTeR": "3" },
     })
-    expect(SessionRetry.retryResetAt(seconds, now)).toBe(now + 2_500)
+    expect(SessionRetry.retryResetAt(seconds, now)).toBe(now + 3_000)
 
     const milliseconds = error({
       message: "rate limited",
@@ -608,10 +812,22 @@ describe("session.retry.classify", () => {
     })
     expect(SessionRetry.retryResetAt(date, now)).toBe(Date.UTC(2026, 8, 26, 18, 5, 0))
 
+    for (const legacy of [
+      "Sunday, 06-Nov-94 08:49:37 GMT",
+      "Sun Nov  6 08:49:37 1994",
+    ]) {
+      expect(
+        SessionRetry.retryResetAt(
+          error({ message: "rate limited", statusCode: 429, responseHeaders: { "retry-after": legacy } }),
+          now,
+        ),
+      ).toBe(Date.UTC(1994, 10, 6, 8, 49, 37))
+    }
+
     const absent = error({ message: "rate limited", statusCode: 429 })
     expect(SessionRetry.retryResetAt(absent, now)).toBeUndefined()
 
-    for (const malformed of ["-1", "2seconds", "1e3"]) {
+    for (const malformed of ["-1", "2.5", "2seconds", "1e3", "Wed, 21 Oct 2099 07:28:00"]) {
       expect(
         SessionRetry.retryResetAt(
           error({
@@ -668,6 +884,28 @@ describe("session.retry.classify", () => {
       retry: "none",
       routeEffect: "account-cooldown",
       message: "rate limited",
+    })
+  })
+
+  test("classifies an unattributed 429 with trusted Retry-After as terminal recovery without route health", () => {
+    const now = Date.UTC(2026, 9, 3, 12)
+    expect(
+      SessionRetry.classify(
+        error({
+          message: "rate limited",
+          statusCode: 429,
+          responseHeaders: { "ReTrY-AfTeR": "60" },
+        }),
+        "generic-provider",
+        undefined,
+        now,
+      ),
+    ).toEqual({
+      class: "rate-limit",
+      retry: "none",
+      routeEffect: "none",
+      message: "rate limited",
+      resetAt: now + 60_000,
     })
   })
 
@@ -761,6 +999,45 @@ describe("session.retry.classify", () => {
         routeEffect: "account-quota-exhausted",
       })
       expect(observations[0]?.resetAt).toBeGreaterThan(Date.now())
+    }),
+  )
+})
+
+describe("session.retry.terminal-rate-limit", () => {
+  it.instance("settles a trusted generic Retry-After 429 immediately", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const observed: SessionRetry.ProviderFailureDecision[] = []
+      const limited = apiError({ "RETRY-AFTER": "3600" })
+      const withStatus = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          ...limited.data,
+          statusCode: 429,
+        }).toObject(),
+      )
+      const exit = yield* Effect.exit(
+        Effect.gen(function* () {
+          attempts++
+          return yield* Effect.fail(withStatus)
+        }).pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "generic-provider",
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              observe: ({ decision }) =>
+                Effect.sync(() => {
+                  observed.push(decision)
+                }),
+              set: () => Effect.void,
+            }),
+          ),
+        ),
+      )
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toBe(1)
+      expect(observed[0]).toMatchObject({ class: "rate-limit", retry: "none", routeEffect: "none" })
+      expect(observed[0]?.resetAt).toBeGreaterThan(Date.now())
     }),
   )
 })

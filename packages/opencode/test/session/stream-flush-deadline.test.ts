@@ -82,3 +82,31 @@ test("interruption cancels the alarm and flushes pending content exactly once", 
     expect(pending).toBe(false)
   }))
 })
+
+test("interruption releases a provider-scoped AbortController beneath the merged alarm stream", async () => {
+  await Effect.runPromise(Effect.gen(function* () {
+    const opened = yield* Deferred.make<void>()
+    let aborted = false
+    const provider = Stream.scoped(Stream.unwrap(Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => new AbortController()),
+        (controller) => Effect.sync(() => {
+          controller.abort()
+          aborted = true
+        }),
+      )
+      yield* Deferred.succeed(opened, undefined)
+      return Stream.never
+    })))
+    const fiber = yield* consumeWithFlushDeadline(provider, {
+      delayMs: 5,
+      consume: () => Effect.void,
+      pending: () => false,
+      flush: Effect.void,
+      stop: () => false,
+    }).pipe(Effect.forkChild)
+    yield* Deferred.await(opened)
+    yield* Fiber.interrupt(fiber)
+    expect(aborted).toBe(true)
+  }))
+})

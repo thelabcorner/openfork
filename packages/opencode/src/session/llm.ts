@@ -33,16 +33,35 @@ import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attrib
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
+import { abortableProviderIterable } from "./llm/abortable-provider-iterable"
+import { registerProviderTransport } from "./llm/provider-transport"
+import { needsNativeReasoningTransport } from "./llm/reasoning-runtime-selection"
+import { requireTerminalFinish } from "./llm/terminal-stream"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { laceObservePolicy, laceObserveScope } from "./llm/lace-observation-policy"
+import { createLaceAISdkObserver, laceObserveAIEnabled } from "./llm/lace-ai-sdk-observer"
 import { bindPermission } from "./llm/permission-binding"
 import { healLegacyFindCall } from "./llm/tool-call-heal"
+import { restoreMuseToolEvent } from "./llm/muse-tool-names"
+import { Identifier } from "@/id/id"
+import { requiresAccountBackedHostedRoute } from "@/special-agent/hosted-route-policy"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
+
+// Defense in depth: host-owned special agents must not send hosted Public/free
+// requests through the V1 streaming path, even if a caller forgets to disable
+// Public during model resolution. Ordinary user turns retain their own route.
+
+// SDK-level observations are deliberately separate from native compiled-body
+// witnesses. This captures post-transform V3 inputs, NOT final provider bytes.
+const laceAISdkObserver = createLaceAISdkObserver()
 
 export type StreamInput = {
   user: SessionV1.User
   sessionID: string
+  /** Attempt-local, payload-free stage witnesses; not sent to providers or persisted. */
+  progress?: { sdk: (type: string) => void; normalized: (type: string) => void }
   parentSessionID?: string
   model: Provider.Model
   agent: Agent.Info
@@ -107,6 +126,18 @@ const live: Layer.Layer<
     const claudeBindings = yield* ClaudeBindingPersistence.bindingStorageFromService
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
+      if (
+        requiresAccountBackedHostedRoute({
+          hostedProvider: Provider.isHostedZenProvider(input.model.providerID),
+          agent: input.agent.name,
+          sessionAgent: input.user.agent,
+        }) &&
+        input.route?.routeKind !== "account"
+      ) {
+        return yield* Effect.fail(new Error(
+          "Hosted OpenCode Public free tier cannot execute OpenFork special agents. Select an authenticated account-backed model.",
+        ))
+      }
       yield* Effect.logInfo("stream", {
         providerID: input.model.providerID,
         modelID: input.model.id,
@@ -157,8 +188,13 @@ const live: Layer.Layer<
           }
           try {
             const args = typeof healed.input === "string" ? JSON.parse(healed.input) : healed.input
+            // The workflow service may omit the request/tool-call ID. Mint a
+            // durable, process-unique identity instead of executing unowned.
+            const callID = _requestID && _requestID.length > 0
+              ? _requestID
+              : Identifier.create("call", "ascending")
             const result = await t.execute!(args, {
-              toolCallId: _requestID,
+              toolCallId: callID,
               messages: input.messages,
               abortSignal: input.abort,
             })
@@ -295,7 +331,37 @@ const live: Layer.Layer<
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
-      if (flags.experimentalNativeLlm) {
+       // OpenAI-compatible SDK providers do not provide a uniform media input
+       // protocol. Route audio/video turns through our native Chat adapter.
+       // Do not switch unrelated requests or providers that own other formats.
+       const nativeMedia =
+         input.model.api.npm === "@ai-sdk/openai-compatible" &&
+         prepared.messages.some(
+           (msg) =>
+             msg.role === "user" &&
+             Array.isArray(msg.content) &&
+             msg.content.some((part) =>
+               part.type === "file" &&
+               ((part.mediaType.startsWith("video/") && input.model.capabilities.input.video) ||
+                 (part.mediaType.startsWith("audio/") && input.model.capabilities.input.audio)),
+             ),
+         )
+        const nativeReasoning = needsNativeReasoningTransport(input.model)
+        if (flags.experimentalNativeLlm || nativeMedia || nativeReasoning) {
+        const laceEnabled = laceObservePolicy(input.sessionID, process.env)
+        const laceContext = laceEnabled && input.route ? yield* InstanceState.context : undefined
+        const lace = laceContext && input.route
+          ? laceObserveScope({
+              projectID: laceContext.project.id,
+              directory: laceContext.directory,
+              worktree: laceContext.worktree,
+              sessionID: input.sessionID,
+              routeKind: input.route.routeKind,
+              ...(input.route.routeKind === "account" ? { accountID: input.route.accountID } : {}),
+              continuity: input.continuity ?? (input.small ? "isolated" : "session"),
+              requestID: input.user.id,
+            })
+          : undefined
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -311,6 +377,7 @@ const live: Layer.Layer<
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
+          ...(lace ? { lace } : {}),
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected", {
@@ -320,8 +387,16 @@ const live: Layer.Layer<
           })
           return {
             type: "native" as const,
-            stream: native.stream,
+            stream: native.stream.pipe(Stream.map((event) => restoreMuseToolEvent(event, prepared.canonicalByAlias))),
           }
+        }
+        if (nativeMedia) {
+          throw new Error(`The selected model advertises audio/video input, but its configured provider route cannot deliver it: ${native.reason}. Use a supported route or a local media extraction fallback.`)
+        }
+        if (nativeReasoning) {
+          // The installed AI SDK silently discards reasoning_text chunks. Do
+          // not fall back to a provider adapter known to lose model output.
+          throw new Error(`This model requires native reasoning_text decoding, but the native provider route is unavailable: ${native.reason}`)
         }
         yield* Effect.logInfo("llm runtime selected", {
           "llm.runtime": "ai-sdk",
@@ -345,6 +420,20 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
+      const laceAIEnabled = input.route && laceObserveAIEnabled(input.sessionID, process.env)
+      const laceAIContext = laceAIEnabled ? yield* InstanceState.context : undefined
+      const laceAIScope = laceAIContext && input.route
+        ? laceObserveScope({
+            projectID: laceAIContext.project.id,
+            directory: laceAIContext.directory,
+            worktree: laceAIContext.worktree,
+            sessionID: input.sessionID,
+            routeKind: input.route.routeKind,
+            ...(input.route.routeKind === "account" ? { accountID: input.route.accountID } : {}),
+            continuity: input.continuity ?? (input.small ? "isolated" : "session"),
+            requestID: input.user.id,
+          })
+        : undefined
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
@@ -415,6 +504,39 @@ const live: Layer.Layer<
                       input.model,
                       prepared.messageTransformOptions,
                     )
+                    // Read-only, post-transform AI SDK V3 witness (not HTTP bytes).
+                    // Observation is never allowed to fail the provider call.
+                    if (laceAIScope) {
+                      try {
+                        const observation = laceAISdkObserver.observe({
+                          owner: laceAIScope.owner,
+                          session: laceAIScope.session,
+                          provider: input.model.providerID,
+                          model: input.model.id,
+                          route: input.model.api.npm,
+                          prompt: args.params.prompt,
+                          tools: args.params.tools,
+                          options: {
+                            toolChoice: args.params.toolChoice,
+                            providerOptions: args.params.providerOptions,
+                            responseFormat: args.params.responseFormat,
+                            temperature: args.params.temperature,
+                            topP: args.params.topP,
+                            topK: args.params.topK,
+                          },
+                        })
+                        if (observation.status !== "observed" || observation.kind !== "identical") {
+                          bridge.fork(Effect.logDebug("LACE AI SDK pre-wire observation", {
+                            status: observation.status,
+                            ...(observation.status === "observed"
+                              ? { change: observation.kind, messages: observation.messageCount }
+                              : {}),
+                          }))
+                        }
+                      } catch {
+                        // Optional telemetry is never a dependency of inference.
+                      }
+                    }
                   }
                   return args.params
                 },
@@ -431,6 +553,7 @@ const live: Layer.Layer<
             },
           },
         }),
+        canonicalByAlias: prepared.canonicalByAlias,
       }
     })
 
@@ -438,24 +561,39 @@ const live: Layer.Layer<
       Stream.scoped(
         Stream.unwrap(
           Effect.gen(function* () {
-            const ctrl = yield* Effect.acquireRelease(
-              Effect.sync(() => new AbortController()),
-              (ctrl) => Effect.sync(() => ctrl.abort()),
+            const transport = yield* Effect.acquireRelease(
+              Effect.sync(() => {
+                const controller = new AbortController()
+                return { controller, release: registerProviderTransport(input.sessionID, controller) }
+              }),
+              ({ controller, release }) => Effect.sync(() => {
+                controller.abort()
+                release()
+              }),
             )
 
-            const result = yield* run({ ...input, abort: ctrl.signal })
+            const result = yield* run({ ...input, abort: transport.controller.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") return requireTerminalFinish(result.stream, transport.controller.signal).pipe(
+              Stream.tap((event) => Effect.sync(() => input.progress?.normalized(event.type))),
+            )
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
-            const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
-            )
+            const state = LLMAISDK.adapterState({
+              requireChatFinishReason: input.model.api.npm === "@ai-sdk/openai-compatible",
+            })
+            return requireTerminalFinish(
+              Stream.fromAsyncIterable(abortableProviderIterable(result.result.fullStream, transport.controller), (e) =>
+                e instanceof Error ? e : new Error(String(e)),
+              ).pipe(
+                Stream.tap((event) => Effect.sync(() => input.progress?.sdk(event.type))),
+                Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+                Stream.flatMap((events) => Stream.fromIterable(events)),
+                Stream.map((event) => restoreMuseToolEvent(event, result.canonicalByAlias)),
+              ),
+              transport.controller.signal,
+            ).pipe(Stream.tap((event) => Effect.sync(() => input.progress?.normalized(event.type))))
           }),
         ),
       )

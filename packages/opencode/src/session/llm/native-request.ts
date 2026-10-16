@@ -1,5 +1,5 @@
 import type { JsonSchema, LLMRequest, ProviderMetadata } from "@opencode-ai/llm"
-import { LLM, Message, SystemPart, ToolCallPart, ToolDefinition, ToolResultPart } from "@opencode-ai/llm"
+import { LLM, Message, Model as NativeModel, SystemPart, ToolCallPart, ToolDefinition, ToolResultPart } from "@opencode-ai/llm"
 import {
   AmazonBedrock,
   Anthropic,
@@ -168,12 +168,16 @@ export const model = (input: Provider.Model | RequestInput, headers?: Record<str
   if (model.api.npm === "@ai-sdk/anthropic") return Anthropic.configure(options).model(model.api.id)
   if (model.api.npm === "@ai-sdk/google") return Google.configure(options).model(model.api.id)
   if (model.api.npm === "@ai-sdk/amazon-bedrock") return AmazonBedrock.configure(options).model(model.api.id)
-  if (model.api.npm === "@ai-sdk/openai-compatible")
-    return OpenAICompatible.configure({
+  if (model.api.npm === "@ai-sdk/openai-compatible") {
+    const selected = OpenAICompatible.configure({
       ...options,
       provider: String(model.providerID),
       baseURL: requireBaseURL(model, url),
     }).model(model.api.id)
+    const field = typeof model.capabilities.interleaved === "object" ? model.capabilities.interleaved.field : undefined
+    if (field !== "reasoning" && field !== "reasoning_content" && field !== "reasoning_text") return selected
+    return NativeModel.update(selected, { compatibility: { ...selected.compatibility, reasoningField: field } })
+  }
   if (model.api.npm === "@openrouter/ai-sdk-provider") return OpenRouter.configure(options).model(model.api.id)
   throw new Error(`Native LLM request adapter does not support provider package ${model.api.npm}`)
 }

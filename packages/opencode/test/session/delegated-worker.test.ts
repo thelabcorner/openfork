@@ -12,6 +12,7 @@ import { OxpRequestControlV1 } from "@/oxp/request-control-v1"
 import { InstanceStore } from "@/project/instance-store"
 import { DelegatedWorker } from "@/session/delegated-worker"
 import { Session } from "@/session/session"
+import { SessionID } from "@/session/schema"
 import { tmpdir } from "../fixture/fixture"
 import { pollWithTimeout } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
@@ -88,6 +89,46 @@ function runInInstance<A, E, R>(llm: TestLLMServer["Service"], fn: () => Effect.
 }
 
 describe("DelegatedWorker start path", () => {
+  test("reads parent IDs through a bounded WAL projection without hydrating complete Session rows", async () => {
+    const llm = await llmRuntime.runPromise(TestLLMServer)
+    await AppRuntime.runPromise(
+      runInInstance(llm, () =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const root = yield* sessions.create({ title: "parent-batch-root" })
+          const child = yield* sessions.create({ title: "parent-batch-child", parentID: root.id })
+          const grandchild = yield* sessions.create({ title: "parent-batch-grandchild", parentID: child.id })
+          const unknown = SessionID.make("ses_parent_batch_does_not_exist")
+          const rows = yield* sessions.parentIDsMany!([grandchild.id, child.id, root.id, unknown, child.id])
+          expect(rows.size).toBe(3)
+          expect(rows.get(root.id)).toBeUndefined()
+          expect(rows.get(child.id)).toBe(root.id)
+          expect(rows.get(grandchild.id)).toBe(child.id)
+          expect(rows.has(unknown)).toBe(false)
+          expect(yield* sessions.parentIDsMany!([])).toEqual(new Map())
+          const distant = Array.from({ length: 805 }, (_, index) => SessionID.make(`ses_nonexistent_ancestor_${index}`))
+          const paged = yield* sessions.parentIDsMany!([...distant, root.id, child.id, grandchild.id])
+          expect(paged.size).toBe(3)
+          expect(paged.get(grandchild.id)).toBe(child.id)
+          expect(paged.get(child.id)).toBe(root.id)
+
+          // The depth-capped single-query closure is a distinct, optional
+          // producer-side projection. Exercise its physical WAL/SQLite path,
+          // missing IDs, deduplication, and multi-page seed admission.
+          const ancestors = yield* sessions.ancestorParentIDsMany!([
+            grandchild.id, grandchild.id, unknown, ...distant.slice(0, 27),
+          ])
+          expect(ancestors.size).toBe(3)
+          expect(ancestors.get(grandchild.id)).toBe(child.id)
+          expect(ancestors.get(child.id)).toBe(root.id)
+          expect(ancestors.get(root.id)).toBeUndefined()
+          expect(ancestors.has(unknown)).toBe(false)
+          expect(yield* sessions.ancestorParentIDsMany!([])).toEqual(new Map())
+        }),
+      ),
+    )
+  }, 30_000)
+
   test("admits the host delegation turn, reaches generation 1, and returns the completion result", async () => {
     const llm = await llmRuntime.runPromise(TestLLMServer)
     await llmRuntime.runPromise(llm.pushMatch((hit) => !isTitleRequest(hit), workerReply("delegated worker result")))
@@ -124,6 +165,26 @@ describe("DelegatedWorker start path", () => {
           })
           expect(completed.state).toBe("completed")
           expect(completed.result).toContain("delegated worker result")
+
+          // Exercise the actual SQL-backed Session.getMany worker
+          // authentication path, not the single-session mock fallback.
+          const batch = yield* worker.snapshotMany([session.id, session.id], IDENTITY)
+          expect(batch).toHaveLength(1)
+          expect(batch[0]?.sessionID).toBe(session.id)
+          const waited = yield* worker.waitMany({
+            sessionIDs: [session.id, session.id], identity: IDENTITY, timeout: 1_000,
+          })
+          expect(waited).toHaveLength(1)
+          expect(waited[0]?.state).toBe("completed")
+          const unauthorized = yield* worker.snapshotMany([session.id], {
+            ...IDENTITY,
+            principalRef: "oxp:unauthorized",
+          }).pipe(Effect.flip)
+          expect(unauthorized).toBeInstanceOf(DelegatedWorker.InvalidWorker)
+          const missing = yield* worker.snapshotMany([
+            session.id, SessionID.make("ses_nonexistent_delegation_batch"),
+          ], IDENTITY).pipe(Effect.flip)
+          expect(missing).toBeInstanceOf(DelegatedWorker.InvalidWorker)
 
           const ownership = yield* execution.snapshot(session.id)
           expect(ownership.generation).toBe(1)

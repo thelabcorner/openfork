@@ -12,6 +12,7 @@ import { SwarmSchema } from "@opencode-ai/core/swarm/schema"
 import { SessionSynthetic } from "@opencode-ai/schema/session-synthetic"
 import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
 import { Swarm } from "@opencode-ai/schema/swarm"
+import { SessionAttachment } from "@opencode-ai/core/session/attachment"
 import { SessionPrompt } from "@/session/prompt"
 import { InstanceStore } from "@/project/instance-store"
 
@@ -142,13 +143,26 @@ export const layer = Layer.effect(
         actor: { type: "host" },
         ref: input.runID,
       })
+      // Resolve the coordinator's explicit attachment selection bound to this
+      // exact task run and member session. Grants are idempotent on the run
+      // identity, so a delivery retry reuses them and never duplicates bytes.
+      const attachment = yield* resolveAssignmentAttachments({
+        task: input.task,
+        memberSessionID: input.token.sessionID,
+        runID: input.runID,
+        sessionInputID: input.sessionInputID,
+      })
+      const content = {
+        text: SwarmRender.assignment(input.task, handoff, attachment.manifest),
+        ...(attachment.files.length ? { files: attachment.files } : {}),
+      }
       return yield* instances
         .provide(
           { directory },
           prompt.admitSynthetic({
             id: input.sessionInputID,
             sessionID: input.token.sessionID as never,
-            content: { text: SwarmRender.assignment(input.task, handoff) },
+            content,
             origin,
             admissionClass: "host",
             delivery: "queue",
@@ -169,6 +183,74 @@ export const layer = Layer.effect(
           Effect.mapError((error) => new AdmissionConflictError({ reason: defectText(error), code: "session.host_admission" })),
           Effect.catchDefect(translateDefect),
         )
+    })
+
+    /**
+     * Resolve a task's selected attachment handles against the coordinator's
+     * session index and bind grants to the exact target run/member session.
+     */
+    const resolveAssignmentAttachments = Effect.fn("SwarmSessionAdmission.resolveAssignmentAttachments")(function* (input: {
+      task: Swarm.Task
+      memberSessionID: string
+      runID: Swarm.TaskRunID
+      sessionInputID: string
+    }) {
+      const empty = {
+        files: [] as Array<{ uri: string; mime: string; name?: string }>,
+        manifest: undefined as string | undefined,
+      }
+      const raw = input.task.metadata?.attachments
+      if (!raw || typeof raw !== "object") return empty
+      const spec = raw as { sourceSessionID?: unknown; handles?: unknown }
+      const sourceSessionID = typeof spec.sourceSessionID === "string" ? spec.sourceSessionID : undefined
+      const handles = Array.isArray(spec.handles)
+        ? spec.handles.filter((handle): handle is string => typeof handle === "string")
+        : []
+      if (!sourceSessionID || handles.length === 0) return empty
+
+      const selected = yield* SessionAttachment.resolveSelection(db, {
+        handles,
+        scope: { kind: "index", sessionID: sourceSessionID },
+      }).pipe(Effect.orDie)
+
+      const files: Array<{ uri: string; mime: string; name?: string }> = []
+      const manifestLines: string[] = []
+      for (const item of selected) {
+        const upload = item.upload
+        if (!SessionAttachment.isEligibleOrigin(upload.origin) || SessionAttachment.classifyMime(upload.mime) !== "eligible")
+          continue
+        if (upload.byteLength > SessionAttachment.Policy.maxPerFileBytes) continue
+        // Resolve bytes via the owner's live-grant resolver; the inline data URL
+        // is what the member's initial provider request serializes. The durable
+        // manifest never carries bytes.
+        const idempotencyKey = `${input.runID}:${upload.handle}`
+        const grant = yield* SessionAttachment.createGrant(db, {
+          attachment: item,
+          target: {
+            kind: "swarm",
+            taskID: input.task.id,
+            runID: input.runID,
+            sessionInputID: input.sessionInputID as never,
+            memberSessionID: input.memberSessionID as never,
+          },
+          idempotencyKey,
+        }).pipe(Effect.orDie)
+        const [resolved] = yield* SessionAttachment.resolveBytes(db, [grant.id]).pipe(Effect.orDie)
+        if (!resolved) continue
+        files.push({
+          uri: resolved.url,
+          mime: resolved.mime,
+          ...(resolved.filename ? { name: resolved.filename } : {}),
+        })
+        manifestLines.push(`- ${upload.handle}: ${upload.filename ?? "(unnamed)"} (${upload.mime}, ${upload.byteLength} bytes)`)
+      }
+      return {
+        files,
+        manifest:
+          manifestLines.length === 0
+            ? undefined
+            : ["Selected attachments for this assignment (already authorized):", ...manifestLines].join("\n"),
+      }
     })
 
     const peer: Interface["peer"] = Effect.fn("SwarmSessionAdmission.peer")(function* (input) {

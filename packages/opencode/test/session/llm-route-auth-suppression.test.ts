@@ -129,6 +129,7 @@ const streamInput = (input: {
   readonly modelID: string
   readonly mdl: Provider.Model
   readonly route?: LLM.StreamInput["route"]
+  readonly agentName?: string
 }): LLM.StreamInput => {
   const sessionID = SessionID.make("ses_route_auth_suppression_0000000000")
   return {
@@ -137,12 +138,12 @@ const streamInput = (input: {
       sessionID,
       role: "user",
       time: { created: Date.now() },
-      agent: "build",
+      agent: input.agentName ?? "build",
       model: { providerID: ProviderV2.ID.make(input.providerID), modelID: ModelV2.ID.make(input.modelID) },
     },
     sessionID,
     model: input.mdl,
-    agent: { name: "build", mode: "primary", options: {}, permission: [] },
+    agent: { name: input.agentName ?? "build", mode: "primary", options: {}, permission: [] },
     system: ["route auth suppression system policy"],
     messages: [{ role: "user", content: "hello" }],
     tools: {},
@@ -152,6 +153,42 @@ const streamInput = (input: {
 }
 
 describe("LLM committed-route Auth suppression", () => {
+  it.instance("rejects every tested hosted special agent on Public before auth lookup or provider dispatch", () =>
+    Effect.gen(function* () {
+      for (const name of ["goal-auditor", "goal-revisor", "spad-auditor", "project-copy-name", "prompt-revisor", "title", "compaction", "summary", "dreamer"]) {
+        authQueries.length = 0
+        const built = scenario({
+          providerID: "opencode",
+          modelID: "big-pickle",
+          boundSecret: PUBLIC_SENTINEL,
+          route: { routeKind: "public" },
+        })
+        const failure = yield* Effect.exit(run(
+          streamInput({ providerID: "opencode", modelID: "big-pickle", mdl: built.mdl, route: { routeKind: "public" }, agentName: name }),
+          built.provider.layer,
+        ))
+        expect(failure._tag).toBe("Failure")
+        expect(authQueries).toEqual([])
+        expect(built.wire).toEqual([])
+      }
+    }),
+  )
+
+  it.instance("account-backed hosted Goal Auditor dispatches without ambient auth", () =>
+    Effect.gen(function* () {
+      authQueries.length = 0
+      const route = { routeKind: "account", accountID: "acct-auditor" } as const
+      const built = scenario({ providerID: "opencode", modelID: "big-pickle", boundSecret: BOUND_ACCOUNT_SECRET, route })
+      yield* run(
+        streamInput({ providerID: "opencode", modelID: "big-pickle", mdl: built.mdl, route, agentName: "goal-auditor" }),
+        built.provider.layer,
+      )
+      expect(authQueries).toEqual([])
+      expect(built.wire).toHaveLength(1)
+      expect(built.wire[0]?.headers["authorization"]).toBe(`Bearer ${BOUND_ACCOUNT_SECRET}`)
+    }),
+  )
+
   it.instance("a committed Public route never queries Auth and never puts the ambient secret on the wire", () =>
     Effect.gen(function* () {
       authQueries.length = 0

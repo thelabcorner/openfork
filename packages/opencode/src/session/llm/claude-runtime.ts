@@ -35,6 +35,7 @@ import {
 } from "@/claude/failure"
 import { claudeFallbackCatalogID, modelNameFromId } from "@/claude/models"
 import { BridgeStore, completeEffect, parkEffect, validateScope, type BridgeRequest, type Scope } from "@/claude/bridge"
+import { StreamText } from "../stream-text"
 import { healLegacyFindCall, isCanonicalFindToolMap } from "./tool-call-heal"
 import {
   advanceBindingLeaf,
@@ -663,7 +664,7 @@ interface ResolvedToolUse {
 interface PartialTextBlock {
   readonly type: "text" | "thinking"
   readonly id: string
-  text: string
+  readonly text: StreamText
   ended: boolean
 }
 
@@ -682,7 +683,7 @@ function toolUseOf(block: ContentBlock): ResolvedToolUse | undefined {
 }
 
 function consumeCompletedPartial(state: PartialStreamState, type: PartialTextBlock["type"], text: string): boolean {
-  const index = state.completed.findIndex((block) => block.type === type && block.text === text)
+  const index = state.completed.findIndex((block) => block.type === type && block.text.toString() === text)
   if (index < 0) return false
   state.completed.splice(index, 1)
   return true
@@ -696,7 +697,7 @@ function emitPartialStreamEvent(out: PushChannel<LLMEvent>, event: unknown, stat
     const blockType = event.content_block.type
     if (blockType === "text" || blockType === "thinking") {
       const id = `stream-${blockType}-${index}-${++state.sequence}`
-      const block: PartialTextBlock = { type: blockType, id, text: "", ended: false }
+      const block: PartialTextBlock = { type: blockType, id, text: new StreamText(), ended: false }
       state.blocks.set(index, block)
       out.push(blockType === "text" ? LLMEvent.textStart({ id }) : LLMEvent.reasoningStart({ id }))
     }
@@ -712,11 +713,11 @@ function emitPartialStreamEvent(out: PushChannel<LLMEvent>, event: unknown, stat
     if (!block) {
       const blockType = deltaType === "text_delta" ? "text" : "thinking"
       const id = `stream-${blockType}-${index}-${++state.sequence}`
-      block = { type: blockType, id, text: "", ended: false }
+      block = { type: blockType, id, text: new StreamText(), ended: false }
       state.blocks.set(index, block)
       out.push(blockType === "text" ? LLMEvent.textStart({ id }) : LLMEvent.reasoningStart({ id }))
     }
-    block.text += text
+    block.text.append(text)
     out.push(
       block.type === "text"
         ? LLMEvent.textDelta({ id: block.id, text })

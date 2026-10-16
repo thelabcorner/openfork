@@ -466,6 +466,22 @@ describe("session.llm-native.request", () => {
     ).toEqual({ type: "unsupported", reason: "API key is not configured" })
   })
 
+  test("propagates declared reasoning_text into the native Chat model compatibility contract", () => {
+    const selected = LLMNative.model({
+      ...baseModel,
+      providerID: ProviderV2.ID.make("opencode-go"),
+      api: { ...baseModel.api, npm: "@ai-sdk/openai-compatible", url: "https://example.test/v1" },
+      capabilities: { ...baseModel.capabilities, interleaved: { field: "reasoning_text" } },
+    })
+    expect(selected.compatibility?.reasoningField).toBe("reasoning_text")
+    const canonical = LLMNative.model({
+      ...baseModel,
+      providerID: ProviderV2.ID.make("opencode-go"),
+      api: { ...baseModel.api, npm: "@ai-sdk/openai-compatible", url: "https://example.test/v1" },
+    })
+    expect(canonical.compatibility?.reasoningField).toBeUndefined()
+  })
+
   test("enables native runtime for Anthropic API-key models", () => {
     expect(
       LLMNativeRuntime.status({

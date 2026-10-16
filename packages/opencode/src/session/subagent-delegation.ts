@@ -4,9 +4,11 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Database } from "@opencode-ai/core/database/database"
+import { Provider } from "@/provider/provider"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import type { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
-import { Effect, Exit, Option, Scope } from "effect"
+import { Effect, Exit, Option, Scope, Cause } from "effect"
+import { Agent as AgentContract } from "@opencode-ai/schema/agent"
 import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
 import { EffectBridge } from "@/effect/bridge"
@@ -18,6 +20,8 @@ import { MessageID, SessionID } from "./schema"
 import type { SessionPromptOps } from "./prompt-contract"
 import { DelegatedWorkerPolicy } from "./delegated-worker-policy"
 import { SupervisorRegistryTag } from "./subagent-supervision-contract"
+import { SessionAttachment } from "@opencode-ai/core/session/attachment"
+import type { SessionAttachment as SessionAttachmentContract } from "@opencode-ai/schema/session-attachment"
 import * as SubagentSupervisionMetadata from "./subagent-supervision-metadata"
 
 export const ID = "task"
@@ -34,7 +38,7 @@ export const BACKGROUND_DESCRIPTION = [
   "foreground (default) blocks until the child finishes. background detaches and returns immediately. supervisor detaches but keeps you responsible for the worker.",
   "Foreground and background use the same child session, history, tools, and permissions; only parent waiting behavior changes.",
   "A running background task can be foregrounded by calling task again with its task_id and no prompt.",
-  "A running task can be re-prompted in the same session by supplying task_id and prompt; choose mode=\"background\" to keep it detached or omit mode to wait for the queued continuation.",
+  'A running task can be re-prompted in the same session by supplying task_id and prompt; choose mode="background" to keep it detached or omit mode to wait for the queued continuation.',
   "Use background only for independent work that can run while you continue elsewhere; you will be notified automatically when it finishes.",
   "Use supervisor when you must stay responsible for the worker: inspect progress, audit evidence, and steer before integrating.",
   "When launching several independent subagents, call this tool several times in the SAME assistant message.",
@@ -136,9 +140,7 @@ function policyFromWorkerDelegation(
       providerID: ProviderV2.ID.make(origin.model.providerID),
       modelID: ModelV2.ID.make(origin.model.modelID),
       ...(origin.model.accountID ? { accountID: origin.model.accountID } : {}),
-      ...(origin.model.variant && origin.model.variant !== "default"
-        ? { variant: origin.model.variant }
-        : {}),
+      ...(origin.model.variant && origin.model.variant !== "default" ? { variant: origin.model.variant } : {}),
       routeIntent: origin.model.routeIntent,
     },
   }
@@ -181,13 +183,26 @@ export interface Input {
   readonly subagentType: string
   readonly taskID?: string
   readonly command?: string
+  readonly model?: {
+    readonly providerID: string
+    readonly modelID: string
+    readonly accountID?: string
+    readonly variant?: string
+  }
   readonly background?: boolean
   readonly mode?: TaskMode
+  /**
+   * Optional symbolic attachment handles to deliver to the child's initial
+   * model request. Empty/omitted means zero attachment bytes are transferred.
+   */
+  readonly attachments?: ReadonlyArray<string>
 }
 
 export interface ExecutionContext {
   readonly parentSessionID: SessionID
   readonly assistantMessageID: MessageID
+  /** Durable tool call identity of this Task invocation; disambiguates parallel Task calls. */
+  readonly toolCallID?: string
   readonly parentAgent: string
   readonly abort: AbortSignal
   readonly messages: SessionV1.WithParts[]
@@ -206,7 +221,32 @@ export interface Result {
 
 export interface Interface {
   readonly execute: (input: Input, context: ExecutionContext) => Effect.Effect<Result, Error>
+  /**
+   * Host-only entry point for one detached background worker Session owned by
+   * a built-in of the host-owned special-agent class (today: `dreamer` via the
+   * `dream` tool). It reuses the same Task `BackgroundJob`/child Session
+   * lifecycle owner and the same admission gates (depth, model policy, the
+   * `task` permission ask), but applies the special-agent class fence instead
+   * of the delegatable-subagent capability gate: the worker always runs
+   * detached, and no generic `subagent_type` Task surface can reach it.
+   */
+  readonly executeSpecialAgent: (input: SpecialAgentInput, context: ExecutionContext) => Effect.Effect<Result, Error>
 }
+
+/**
+ * Input shape for the special-agent background worker entry point. There is
+ * deliberately no `mode`/`background` field: special-agent workers are always
+ * detached, and this seam is host-code-only, not a provider-callable input.
+ */
+export interface SpecialAgentInput {
+  readonly description: string
+  readonly prompt?: string
+  /** Built-in id of a host-owned special agent (see `AgentContract.isSpecialAgentID`). */
+  readonly agent: string
+  readonly taskID?: string
+}
+
+type DelegationEntry = "task" | "special-agent"
 
 function renderOutput(input: {
   sessionID: SessionID
@@ -245,628 +285,785 @@ function lastTextPart(parts: SessionV1.WithParts["parts"]) {
   return undefined
 }
 
-function resumeHint(sessionID: SessionID) {
+function resumeHint(sessionID: SessionID, entry: DelegationEntry) {
+  const resume =
+    entry === "special-agent"
+      ? `Resume that session by calling dream with action "resume" and task_id "${sessionID}"`
+      : `Resume that session with full context by calling task again with task_id "${sessionID}" and a continuation prompt`
   return [
     `Work completed so far is preserved in session ${sessionID}; do not redo it from scratch.`,
-    `Resume that session with full context by calling task again with task_id "${sessionID}" and a continuation prompt, or inspect it with the session tool (action "messages", sessionId "${sessionID}").`,
+    `${resume}, or inspect it with the session tool (action "messages", sessionId "${sessionID}").`,
   ].join(" ")
 }
 
-function failRecoverable(sessionID: SessionID, error: string, parts: SessionV1.WithParts["parts"]) {
+function failRecoverable(
+  sessionID: SessionID,
+  error: string,
+  parts: SessionV1.WithParts["parts"],
+  entry: DelegationEntry,
+) {
   const text = lastTextPart(parts)
   const partial = text ? `\n\nPartial progress before failure:\n${truncatePartial(text)}` : ""
   return Effect.fail(
-    new Error(`Subagent failed (task_id: ${sessionID}): ${error}${partial}\n\n${resumeHint(sessionID)}`),
+    new Error(`Subagent failed (task_id: ${sessionID}): ${error}${partial}\n\n${resumeHint(sessionID, entry)}`),
   )
 }
 
 export const make = Effect.gen(function* () {
-    const agent = yield* Agent.Service
-    const background = yield* BackgroundJob.Service
-    const config = yield* Config.Service
-    const sessions = yield* Session.Service
-    const scope = yield* Scope.Scope
-    const database = yield* Database.Service
+  const agent = yield* Agent.Service
+  const background = yield* BackgroundJob.Service
+  const config = yield* Config.Service
+  const sessions = yield* Session.Service
+  const scope = yield* Scope.Scope
+  const database = yield* Database.Service
 
-const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(function* (
-      input: Input,
-      context: ExecutionContext,
-    ) {
-      const cfg = yield* config.get()
-      const promptText = input.prompt?.trim() ? input.prompt : undefined
+  const run = Effect.fn("SubagentDelegation.run")(function* (
+    input: Input,
+    context: ExecutionContext,
+    entry: DelegationEntry,
+  ) {
+    const cfg = yield* config.get()
+    const promptText = input.prompt?.trim() ? input.prompt : undefined
 
-      // Mode resolution is frozen for compatibility:
-      //   mode ?? (background === true ? "background" : "foreground")
-      // Combining both explicit signals is ambiguous and must fail loudly
-      // rather than silently reconciling conflicting intent.
-      if (input.mode !== undefined && input.background !== undefined) {
-        return yield* Effect.fail(
-          new Error(
-            'Task accepts either explicit `mode` or the legacy `background` boolean, not both. Provide a single "mode" of "foreground", "background", or "supervisor" (or omit both for foreground).',
-          ),
-        )
-      }
-      const resolvedMode: TaskMode =
-        input.mode ?? (input.background === true ? "background" : "foreground")
-      const isSupervisor = resolvedMode === "supervisor"
-      // Supervisor maps to detached execution; background boolean stays present
-      // for compatibility. Foreground => false; background/supervisor => true.
-      const runInBackground = resolvedMode !== "foreground"
-      // Deterministic cohort identity: every supervisor call emitted in one
-      // assistant turn shares the same group ID.
-      const supervisionGroupID = `sup:${context.assistantMessageID}`
-
-      const parent = yield* sessions.get(context.parentSessionID)
-      let depth = 0
-      let current = parent
-      const visited = new Set<SessionID>([parent.id])
-      while (current.parentID && depth < 64 && !visited.has(current.parentID)) {
-        visited.add(current.parentID)
-        depth++
-        current = yield* sessions.get(current.parentID)
-      }
-      if (depth >= (cfg.subagent_depth ?? 1)) {
-        return yield* Effect.fail(
-          new Error(
-            `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
-          ),
-        )
-      }
-
-      // Resolve the requested agent and enforce its delegation capability
-      // BEFORE asking for Task permission. A prompt for an agent that can never
-      // be delegated is a permission the user can approve that changes nothing,
-      // so the ordering here is a correctness property, not a style choice.
-      const next = yield* agent.get(input.subagentType)
-      if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${input.subagentType} is not a valid agent type`))
-      }
-
-      // `mode` is the canonical delegation capability. The Task tool description
-      // already advertises only `mode !== "primary"` agents (ToolRegistry
-      // .describeTask), so enforcing the same rule here — the single owner every
-      // delegation path flows through, whether the model called the Task tool or
-      // a `task` prompt input spawned the child — is what stops a model from
-      // bypassing its own tool description by naming a primary agent.
-      //
-      // `hidden` is deliberately not consulted: it is a chooser-discoverability
-      // flag, not a capability.
-      //
-      // Resume fails closed as well. A child session whose agent was switched to
-      // `primary` after it started is refused instead of being silently
-      // continued, so a capability change can never quietly re-grant
-      // delegation for a task that began under the old mode. The user-facing
-      // remedy is explicit in the error.
-      if (next.mode === "primary") {
-        return yield* Effect.fail(
-          new Error(
-            `Agent "${next.name}" is configured as a primary agent and cannot be used as a subagent. ` +
-              `Set its "mode" to "subagent" or "all" in OpenFork configuration to delegate work to it.`,
-          ),
-        )
-      }
-
-      const authorizedAgentNames = context.authorizedAgentNames
-      if (!authorizedAgentNames?.has(input.subagentType)) {
-        yield* context.ask({
-          permission: ID,
-          patterns: [input.subagentType],
-          always: ["*"],
-          metadata: {
-            description: input.description,
-            subagent_type: input.subagentType,
-          },
-        })
-      }
-
-      const session = input.taskID
-        ? yield* sessions.get(SessionID.make(input.taskID)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        : undefined
-      if (input.taskID && !session) {
-        return yield* Effect.fail(
-          new Error(`Unknown task_id "${input.taskID}". Omit task_id to start a new subagent instead of duplicating work.`),
-        )
-      }
-      if (session && session.parentID !== context.parentSessionID) {
-        return yield* Effect.fail(new Error(`Task ${session.id} does not belong to parent session ${context.parentSessionID}.`))
-      }
-      if (session?.agent && session.agent !== next.name) {
-        return yield* Effect.fail(
-          new Error(
-            `Task ${session.id} belongs to @${session.agent}; resume it with subagent_type "${session.agent}" instead of "${next.name}".`,
-          ),
-        )
-      }
-      if (!session && !promptText) {
-        return yield* Effect.fail(new Error("prompt is required when starting a new subagent task."))
-      }
-
-      const ops = context.promptOps
-      if (!ops) return yield* Effect.fail(new Error("Subagent delegation requires Session prompt control"))
-
-      const msg = yield* MessageV2.get({ sessionID: context.parentSessionID, messageID: context.assistantMessageID }).pipe(
-        Effect.provideService(Database.Service, database),
-        Effect.orDie,
+    // Mode resolution is frozen for compatibility:
+    //   mode ?? (background === true ? "background" : "foreground")
+    // Combining both explicit signals is ambiguous and must fail loudly
+    // rather than silently reconciling conflicting intent.
+    if (input.mode !== undefined && input.background !== undefined) {
+      return yield* Effect.fail(
+        new Error(
+          'Task accepts either explicit `mode` or the legacy `background` boolean, not both. Provide a single "mode" of "foreground", "background", or "supervisor" (or omit both for foreground).',
+        ),
       )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
-      const parentMessageID =
-        "parentID" in msg.info && typeof msg.info.parentID === "string" ? MessageID.make(msg.info.parentID) : undefined
-      if (!parentMessageID) return yield* Effect.fail(new Error("Assistant message has no parent user turn"))
-      const parentTurn =
-        context.messages.find((message) => message.info.id === parentMessageID) ??
-        (yield* MessageV2.get({ sessionID: context.parentSessionID, messageID: parentMessageID }).pipe(
+    }
+    const resolvedMode: TaskMode = input.mode ?? (input.background === true ? "background" : "foreground")
+    const isSupervisor = resolvedMode === "supervisor"
+    // Supervisor maps to detached execution; background boolean stays present
+    // for compatibility. Foreground => false; background/supervisor => true.
+    const runInBackground = resolvedMode !== "foreground"
+    // Deterministic cohort identity: every supervisor call emitted in one
+    // assistant turn shares the same group ID.
+    const supervisionGroupID = `sup:${context.assistantMessageID}`
+
+    const parent = yield* sessions.get(context.parentSessionID)
+    let depth = 0
+    let current = parent
+    const visited = new Set<SessionID>([parent.id])
+    while (current.parentID && depth < 64 && !visited.has(current.parentID)) {
+      visited.add(current.parentID)
+      depth++
+      current = yield* sessions.get(current.parentID)
+    }
+    if (depth >= (cfg.subagent_depth ?? 1)) {
+      return yield* Effect.fail(
+        new Error(
+          `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
+        ),
+      )
+    }
+
+    // Resolve the requested agent and enforce its delegation capability
+    // BEFORE asking for Task permission. A prompt for an agent that can never
+    // be delegated is a permission the user can approve that changes nothing,
+    // so the ordering here is a correctness property, not a style choice.
+    const next = yield* agent.get(input.subagentType)
+    if (!next) {
+      return yield* Effect.fail(new Error(`Unknown agent type: ${input.subagentType} is not a valid agent type`))
+    }
+    // Special-agent class fence. Host-owned special agents are not delegated
+    // subagents: the generic Task surface refuses them by built-in id even if
+    // a misconfiguration changed their exposure fields, and the
+    // special-agent entry point admits nothing but that class. Dreamer always
+    // runs detached through it, so foreground/supervisor intent fails closed
+    // before any child Session exists.
+    const specialAgent = AgentContract.isSpecialAgentID(next.name)
+    if (entry === "task" && specialAgent) {
+      return yield* Effect.fail(
+        new Error(
+          `Agent "${next.name}" is a host-owned special agent and cannot be delegated through Task. ` +
+            `Use its dedicated host entry point (for example, the dream tool for dreamer).`,
+        ),
+      )
+    }
+    if (entry === "special-agent" && !specialAgent) {
+      return yield* Effect.fail(
+        new Error(
+          `Agent "${next.name}" is not a host-owned special agent; the special-agent entry point admits only the built-in special class.`,
+        ),
+      )
+    }
+    if (entry === "special-agent" && resolvedMode !== "background") {
+      return yield* Effect.fail(
+        new Error("Dreamer must run in background mode; the special-agent entry point never attaches or supervises."),
+      )
+    }
+
+    // `mode` is the canonical delegation capability for ordinary catalog
+    // agents. The Task tool description already advertises only
+    // `mode !== "primary"` agents (ToolRegistry.describeTask), so enforcing the
+    // same rule here — the single owner every delegated path flows through,
+    // whether the model called the Task tool or a `task` prompt input spawned
+    // the child — is what stops a model from bypassing its own tool
+    // description by naming a primary agent. Host-owned special agents were
+    // already separated by the class fence above, so this gate does not apply
+    // to the special-agent entry point's own validated class.
+    //
+    // `hidden` is deliberately not consulted: it is a chooser-discoverability
+    // flag, not a capability.
+    //
+    // Resume fails closed as well. A child session whose agent was switched to
+    // `primary` after it started is refused instead of being silently
+    // continued, so a capability change can never quietly re-grant
+    // delegation for a task that began under the old mode. The user-facing
+    // remedy is explicit in the error.
+    if (entry === "task" && next.mode === "primary") {
+      return yield* Effect.fail(
+        new Error(
+          `Agent "${next.name}" is configured as a primary agent and cannot be used as a subagent. ` +
+            `Set its "mode" to "subagent" or "all" in OpenFork configuration to delegate work to it.`,
+        ),
+      )
+    }
+
+    const authorizedAgentNames = context.authorizedAgentNames
+    if (!authorizedAgentNames?.has(input.subagentType)) {
+      yield* context.ask({
+        permission: ID,
+        patterns: [input.subagentType],
+        always: ["*"],
+        metadata: {
+          description: input.description,
+          subagent_type: input.subagentType,
+        },
+      })
+    }
+
+    const session = input.taskID
+      ? yield* sessions.get(SessionID.make(input.taskID)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      : undefined
+    if (input.taskID && !session) {
+      return yield* Effect.fail(
+        new Error(
+          `Unknown task_id "${input.taskID}". Omit task_id to start a new subagent instead of duplicating work.`,
+        ),
+      )
+    }
+    if (session && session.parentID !== context.parentSessionID) {
+      return yield* Effect.fail(
+        new Error(`Task ${session.id} does not belong to parent session ${context.parentSessionID}.`),
+      )
+    }
+    if (session?.agent && session.agent !== next.name) {
+      return yield* Effect.fail(
+        new Error(
+          `Task ${session.id} belongs to @${session.agent}; resume it with subagent_type "${session.agent}" instead of "${next.name}".`,
+        ),
+      )
+    }
+    if (!session && !promptText) {
+      return yield* Effect.fail(new Error("prompt is required when starting a new subagent task."))
+    }
+
+    const ops = context.promptOps
+    if (!ops) return yield* Effect.fail(new Error("Subagent delegation requires Session prompt control"))
+
+    const msg = yield* MessageV2.get({
+      sessionID: context.parentSessionID,
+      messageID: context.assistantMessageID,
+    }).pipe(Effect.provideService(Database.Service, database), Effect.orDie)
+    if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+    const parentMessageID =
+      "parentID" in msg.info && typeof msg.info.parentID === "string" ? MessageID.make(msg.info.parentID) : undefined
+    if (!parentMessageID) return yield* Effect.fail(new Error("Assistant message has no parent user turn"))
+    const parentTurn =
+      context.messages.find((message) => message.info.id === parentMessageID) ??
+      (yield* MessageV2.get({ sessionID: context.parentSessionID, messageID: parentMessageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.catchCause(() => Effect.succeed(undefined)),
+      ))
+    if (!parentTurn || parentTurn.info.role !== "user") {
+      return yield* Effect.fail(
+        new Error(
+          `Task authorization parent ${parentMessageID} is unavailable or is not a user-role turn; refusing to infer delegated authority.`,
+        ),
+      )
+    }
+    let policyTurn = parentTurn
+    const causalRootID = SessionTurnProvenance.causalRootMessageID(parentTurn)
+    if (causalRootID && causalRootID !== parentTurn.info.id) {
+      const resolvedPolicyTurn =
+        context.messages.find((message) => message.info.id === causalRootID) ??
+        (yield* MessageV2.get({ sessionID: context.parentSessionID, messageID: causalRootID }).pipe(
           Effect.provideService(Database.Service, database),
           Effect.catchCause(() => Effect.succeed(undefined)),
         ))
-      if (!parentTurn || parentTurn.info.role !== "user") {
+      if (!resolvedPolicyTurn || !SessionTurnProvenance.isWorkerPromptTurn(resolvedPolicyTurn)) {
         return yield* Effect.fail(
           new Error(
-            `Task authorization parent ${parentMessageID} is unavailable or is not a user-role turn; refusing to infer delegated authority.`,
+            `Task authorization root ${causalRootID} is unavailable or is not a worker prompt; refusing to infer authority from a host continuation.`,
           ),
         )
       }
-      let policyTurn = parentTurn
-      const causalRootID = SessionTurnProvenance.causalRootMessageID(parentTurn)
-      if (causalRootID && causalRootID !== parentTurn.info.id) {
-        const resolvedPolicyTurn =
-          context.messages.find((message) => message.info.id === causalRootID) ??
-          (yield* MessageV2.get({ sessionID: context.parentSessionID, messageID: causalRootID }).pipe(
-            Effect.provideService(Database.Service, database),
-            Effect.catchCause(() => Effect.succeed(undefined)),
-          ))
-        if (!resolvedPolicyTurn || !SessionTurnProvenance.isWorkerPromptTurn(resolvedPolicyTurn)) {
-          return yield* Effect.fail(
-            new Error(
-              `Task authorization root ${causalRootID} is unavailable or is not a worker prompt; refusing to infer authority from a host continuation.`,
-            ),
-          )
+      policyTurn = resolvedPolicyTurn
+    }
+    if (policyTurn && !SessionTurnProvenance.isWorkerPromptTurn(policyTurn)) {
+      return yield* Effect.fail(
+        new Error(
+          `Task authorization parent ${policyTurn.info.id} is not a provenance-qualified worker prompt; refusing to infer delegated authority from provider role=user.`,
+        ),
+      )
+    }
+    // Turn-scoped delegated authority belongs to the causal worker root,
+    // never to a host-authored continuation that merely lowers as
+    // provider role=user. This prevents synthetic metadata from widening
+    // nested-subagent permissions or changing the user-authorized model.
+    const turnPolicy =
+      policyTurn?.info.role === "user"
+        ? policyTurn.parts
+            .filter((part): part is SessionV1.TextPart => part.type === "text")
+            .map((part) => policyFromLocalMcp(asRecord(part.metadata).localMcp))
+            .find((policy): policy is DelegatedTaskPolicy => policy !== undefined)
+        : undefined
+    const oxpTurnPolicy =
+      policyTurn?.info.role === "user" &&
+      ((policyTurn.info.provenance?.owner === "host" &&
+        policyTurn.info.provenance.source === SessionTurnProvenance.Source.OxpDelegation) ||
+        (policyTurn.info.provenance?.owner === "user" &&
+          SessionMetadataOwnership.hasWorkerDelegationOrigin(parent.metadata)))
+        ? policyTurn.parts
+            .filter((part): part is SessionV1.TextPart => part.type === "text")
+            .map((part) => DelegatedWorkerPolicy.turnPolicy(asRecord(part.metadata)))
+            .find((policy): policy is DelegatedWorkerPolicy.TurnPolicy => policy !== undefined)
+        : undefined
+    const protectedDelegation = SessionMetadataOwnership.hasWorkerDelegationOrigin(parent.metadata)
+    const protectedPolicy = policyFromWorkerDelegation(parent.metadata)
+    if (protectedDelegation && !protectedPolicy) {
+      return yield* Effect.fail(new Error("Delegated worker policy is malformed; refusing nested subagent execution."))
+    }
+    const legacySessionPolicy = policyFromLocalMcp(asRecord(parent.metadata).localMcp)
+    // Protected producer-owned delegation policy is authoritative for an OXP
+    // worker. Legacy LocalMCP turn/session metadata remains a compatibility
+    // path only and can never widen or replace the protected envelope.
+    if (protectedPolicy && !oxpTurnPolicy) {
+      return yield* Effect.fail(
+        new Error("Delegated worker turn is missing its protected nested-delegation policy snapshot."),
+      )
+    }
+    const delegatedPolicy = protectedPolicy
+      ? {
+          ...protectedPolicy,
+          allowed: protectedPolicy.allowed && oxpTurnPolicy!.nestedDelegation,
         }
-        policyTurn = resolvedPolicyTurn
-      }
-      if (policyTurn && !SessionTurnProvenance.isWorkerPromptTurn(policyTurn)) {
+      : (turnPolicy ?? legacySessionPolicy)
+    if (delegatedPolicy && !delegatedPolicy.allowed) {
+      return yield* Effect.fail(new Error("Nested subagent spawning is not authorized for this delegated worker."))
+    }
+    if (delegatedPolicy && !delegatedPolicy.model) {
+      return yield* Effect.fail(
+        new Error(
+          "Strict subagent model policy requires a user-authorized model. The agent may not choose, infer, or inherit a model for this task.",
+        ),
+      )
+    }
+    const strictModel = delegatedPolicy?.model
+    if (session && strictModel) {
+      const existingLocalMcp = asRecord(asRecord(session.metadata).localMcp)
+      const protectedChild = SessionMetadataOwnership.workerDelegation(session.metadata)
+      if (protectedPolicy && !protectedChild) {
         return yield* Effect.fail(
           new Error(
-            `Task authorization parent ${policyTurn.info.id} is not a provenance-qualified worker prompt; refusing to infer delegated authority from provider role=user.`,
+            "Task " +
+              session.id +
+              " is not part of the current protected delegation lineage. Spawn a new task instead of adopting an existing child.",
           ),
         )
       }
-      // Turn-scoped delegated authority belongs to the causal worker root,
-      // never to a host-authored continuation that merely lowers as
-      // provider role=user. This prevents synthetic metadata from widening
-      // nested-subagent permissions or changing the user-authorized model.
-      const turnPolicy =
-        policyTurn?.info.role === "user"
-          ? policyTurn.parts
-              .filter((part): part is SessionV1.TextPart => part.type === "text")
-              .map((part) => policyFromLocalMcp(asRecord(part.metadata).localMcp))
-              .find((policy): policy is DelegatedTaskPolicy => policy !== undefined)
-          : undefined
-      const oxpTurnPolicy =
-        policyTurn?.info.role === "user" &&
-        policyTurn.info.provenance?.owner === "host" &&
-        policyTurn.info.provenance.source ===
-          SessionTurnProvenance.Source.OxpDelegation
-          ? policyTurn.parts
-              .filter(
-                (part): part is SessionV1.TextPart => part.type === "text",
-              )
-              .map((part) =>
-                DelegatedWorkerPolicy.turnPolicy(
-                  asRecord(part.metadata),
-                ),
-              )
-              .find(
-                (policy): policy is DelegatedWorkerPolicy.TurnPolicy =>
-                  policy !== undefined,
-              )
-          : undefined
-      const protectedDelegation = SessionMetadataOwnership.hasWorkerDelegationOrigin(parent.metadata)
-      const protectedPolicy = policyFromWorkerDelegation(parent.metadata)
-      if (protectedDelegation && !protectedPolicy) {
-        return yield* Effect.fail(
-          new Error(
-            "Delegated worker policy is malformed; refusing nested subagent execution.",
-          ),
-        )
-      }
-      const legacySessionPolicy = policyFromLocalMcp(asRecord(parent.metadata).localMcp)
-      // Protected producer-owned delegation policy is authoritative for an OXP
-      // worker. Legacy LocalMCP turn/session metadata remains a compatibility
-      // path only and can never widen or replace the protected envelope.
-      if (protectedPolicy && !oxpTurnPolicy) {
-        return yield* Effect.fail(
-          new Error(
-            "Delegated worker turn is missing its protected nested-delegation policy snapshot.",
-          ),
-        )
-      }
-      const delegatedPolicy = protectedPolicy
-        ? {
-            ...protectedPolicy,
-            allowed:
-              protectedPolicy.allowed &&
-              oxpTurnPolicy!.nestedDelegation,
-          }
-        : turnPolicy ?? legacySessionPolicy
-      if (delegatedPolicy && !delegatedPolicy.allowed) {
-        return yield* Effect.fail(
-          new Error("Nested subagent spawning is not authorized for this delegated worker."),
-        )
-      }
-      if (delegatedPolicy && !delegatedPolicy.model) {
-        return yield* Effect.fail(
-          new Error(
-            "Strict subagent model policy requires a user-authorized model. The agent may not choose, infer, or inherit a model for this task.",
-          ),
-        )
-      }
-      const strictModel = delegatedPolicy?.model
-      if (session && strictModel) {
-        const existingLocalMcp = asRecord(asRecord(session.metadata).localMcp)
-        const protectedChild = SessionMetadataOwnership.workerDelegation(session.metadata)
-        if (protectedPolicy && !protectedChild) {
-          return yield* Effect.fail(
-            new Error(
-              "Task " +
-                session.id +
-                " is not part of the current protected delegation lineage. Spawn a new task instead of adopting an existing child.",
-            ),
-          )
-        }
-        const recorded =
-          (protectedChild
-            ? {
-                providerID: ProviderV2.ID.make(protectedChild.model.providerID),
-                modelID: ModelV2.ID.make(protectedChild.model.modelID),
-                ...(protectedChild.model.accountID
-                  ? { accountID: protectedChild.model.accountID }
-                  : {}),
-                ...(protectedChild.model.variant &&
-                protectedChild.model.variant !== "default"
-                  ? { variant: protectedChild.model.variant }
-                  : {}),
-                routeIntent: protectedChild.model.routeIntent,
-              }
-            : undefined) ?? delegatedModel(existingLocalMcp.modelSelection)
-        const sessionModel = session.model
+      const recorded =
+        (protectedChild
           ? {
-              providerID: session.model.providerID,
-              id: session.model.id,
-              accountID: session.model.accountID,
-              variant: session.model.variant,
+              providerID: ProviderV2.ID.make(protectedChild.model.providerID),
+              modelID: ModelV2.ID.make(protectedChild.model.modelID),
+              ...(protectedChild.model.accountID ? { accountID: protectedChild.model.accountID } : {}),
+              ...(protectedChild.model.variant && protectedChild.model.variant !== "default"
+                ? { variant: protectedChild.model.variant }
+                : {}),
+              routeIntent: protectedChild.model.routeIntent,
             }
-          : undefined
-        const bound = recorded ?? (sessionModel && sameModel(sessionModel, strictModel) ? strictModel : undefined)
-        if (!bound || !sameModel(bound, strictModel)) {
-          return yield* Effect.fail(
-            new Error(
-              `Task ${session.id} is not bound to the current user-authorized subagent model ${strictModel.providerID}/${strictModel.modelID}. Spawn a new task instead of changing a resumed task model.`,
-            ),
-          )
-        }
-        if (!recorded) {
-          // A legacy child whose durable model already matches may be resumed,
-          // but upgrade it to the strict recursive policy before any new prompt
-          // so its own descendants cannot fall back to agent/parent selection.
-          yield* sessions.setMetadata({
-            sessionID: session.id,
-            metadata: {
-              ...asRecord(session.metadata),
-              localMcp: {
-                ...existingLocalMcp,
-                delegatedSubagent: true,
-                strictSubagentModelPolicy: true,
-                nestedSubagentsAllowed: true,
-                modelSelection: {
-                  providerID: strictModel.providerID,
-                  modelID: strictModel.modelID,
-                    ...(strictModel.accountID
-                      ? { accountID: strictModel.accountID }
-                      : {}),
-                  variant: strictModel.variant ?? "default",
-                  source: "inherited_user_policy",
-                },
-              },
-            },
-          })
-        }
-      }
-      const parentVariant = msg.info.variant
-      const model = strictModel ?? next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
-      const taskVariant = strictModel ? strictModel.variant : next.model ? undefined : parentVariant
-      const workerOrigin = SessionMetadataOwnership.workerDelegation(parent.metadata)
-      const childPermission = deriveSubagentSessionPermission({
-        parentSessionPermission: parent.permission ?? [],
-        subagent: next,
-        autoApproveAsks: parent.agent === "yolo" || context.parentAgent === "yolo",
-      })
-      const childToolDenies = [
-        ...(next.permission.some((rule) => rule.permission === "todowrite")
-          ? []
-          : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
-        ...(next.permission.some((rule) => rule.permission === ID)
-          ? []
-          : [{ permission: ID, pattern: "*" as const, action: "deny" as const }]),
-        ...(cfg.experimental?.primary_tools?.map((permission) => ({
-          permission,
-          pattern: "*" as const,
-          action: "deny" as const,
-        })) ?? []),
-      ]
-      const nextSession =
-        session ??
-        (yield* sessions.create({
-          parentID: context.parentSessionID,
-          title: input.description + ` (@${next.name} subagent)`,
-          agent: next.name,
-          ...(strictModel
-            ? {
-                model: {
-                  providerID: strictModel.providerID,
-                  id: strictModel.modelID,
-                  ...(strictModel.accountID
-                    ? { accountID: strictModel.accountID }
-                    : {}),
-                  ...(strictModel.variant ? { variant: strictModel.variant } : {}),
-                },
-                metadata: workerOrigin
-                  ? SessionMetadataOwnership.delegatedWorker({
-                      ...workerOrigin,
-                      agent: next.name,
-                      parentWorkerID: parent.id,
-                      model: {
-                        providerID: strictModel.providerID,
-                        modelID: strictModel.modelID,
-                        ...(strictModel.accountID
-                          ? { accountID: strictModel.accountID }
-                          : {}),
-                        ...(strictModel.variant
-                          ? { variant: strictModel.variant }
-                          : {}),
-                        ...(strictModel.routeIntent
-                          ? { routeIntent: strictModel.routeIntent }
-                          : {}),
-                      },
-                    })
-                  : {
-                      localMcp: {
-                        delegatedSubagent: true,
-                        strictSubagentModelPolicy: true,
-                        nestedSubagentsAllowed: true,
-                        modelSelection: {
-                          providerID: strictModel.providerID,
-                          modelID: strictModel.modelID,
-                          ...(strictModel.accountID
-                            ? { accountID: strictModel.accountID }
-                            : {}),
-                          variant: strictModel.variant ?? "default",
-                          source: "inherited_user_policy",
-                        },
-                      },
-                    },
-              }
-            : {}),
-          permission: [
-            ...childPermission,
-            ...childToolDenies.filter(
-              (deny) =>
-                !childPermission.some(
-                  (rule) =>
-                    rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
-                ),
-            ),
-          ],
-        }))
-
-      const metadata = {
-        parentSessionId: context.parentSessionID,
-        sessionId: nextSession.id,
-        model,
-        ...(taskVariant ? { variant: taskVariant } : {}),
-        mode: resolvedMode,
-        background: runInBackground,
-        ...(isSupervisor
-          ? {
-              supervisorSessionId: context.parentSessionID,
-              supervisionGroupId: supervisionGroupID,
-            }
-          : {}),
-      }
-
-      yield* context.metadata({
-        title: input.description,
-        metadata,
-      })
-
-      // Worker 4's supervision service is optional: consume it via serviceOption
-      // so Task delegation compiles and works before/without the service.
-      const supervisorRegistry = Option.getOrUndefined(yield* Effect.serviceOption(SupervisorRegistryTag))
-
-      const delegationEnvelope: SubagentSupervisionMetadata.TaskDelegation | undefined = isSupervisor
+          : undefined) ?? delegatedModel(existingLocalMcp.modelSelection)
+      const sessionModel = session.model
         ? {
-            mode: "supervisor",
-            supervisorSessionID: context.parentSessionID,
-            supervisionGroupID,
-            description: input.description,
-            createdFromMessageID: context.assistantMessageID,
+            providerID: session.model.providerID,
+            id: session.model.id,
+            accountID: session.model.accountID,
+            variant: session.model.variant,
           }
         : undefined
+      const bound = recorded ?? (sessionModel && sameModel(sessionModel, strictModel) ? strictModel : undefined)
+      if (!bound || !sameModel(bound, strictModel)) {
+        return yield* Effect.fail(
+          new Error(
+            `Task ${session.id} is not bound to the current user-authorized subagent model ${strictModel.providerID}/${strictModel.modelID}. Spawn a new task instead of changing a resumed task model.`,
+          ),
+        )
+      }
+      if (!recorded) {
+        // A legacy child whose durable model already matches may be resumed,
+        // but upgrade it to the strict recursive policy before any new prompt
+        // so its own descendants cannot fall back to agent/parent selection.
+        yield* sessions.setMetadata({
+          sessionID: session.id,
+          metadata: {
+            ...asRecord(session.metadata),
+            localMcp: {
+              ...existingLocalMcp,
+              delegatedSubagent: true,
+              strictSubagentModelPolicy: true,
+              nestedSubagentsAllowed: true,
+              modelSelection: {
+                providerID: strictModel.providerID,
+                modelID: strictModel.modelID,
+                ...(strictModel.accountID ? { accountID: strictModel.accountID } : {}),
+                variant: strictModel.variant ?? "default",
+                source: "inherited_user_policy",
+              },
+            },
+          },
+        })
+      }
+    }
+    const parentVariant = msg.info.variant
+    // A Task's default is the model that actually produced the parent turn.
+    // Agent configuration is a role default, not a model override for a
+    // delegated child. Explicit task selection is checked against this
+    // workspace's provider catalog before a child Session is created.
+    const requestedModel = input.model
+      ? {
+          providerID: ProviderV2.ID.make(input.model.providerID.trim()),
+          modelID: ModelV2.ID.make(input.model.modelID.trim()),
+          ...(input.model.accountID?.trim() ? { accountID: input.model.accountID.trim() } : {}),
+          ...(input.model.variant?.trim() && input.model.variant !== "default"
+            ? { variant: input.model.variant.trim() }
+            : {}),
+        }
+      : undefined
+    if (requestedModel && (!requestedModel.providerID || !requestedModel.modelID)) {
+      return yield* Effect.fail(new Error("Subagent model selection requires both providerID and modelID."))
+    }
+    const selectedModel = strictModel ?? requestedModel ?? {
+      providerID: msg.info.providerID,
+      modelID: msg.info.modelID,
+      ...(parent.model?.accountID && parent.model.providerID === msg.info.providerID && parent.model.id === msg.info.modelID
+        ? { accountID: parent.model.accountID }
+        : {}),
+    }
+    if (requestedModel && strictModel && !sameModel(requestedModel, strictModel)) {
+      return yield* Effect.fail(
+        new Error(
+          `This delegated worker is bound to ${strictModel.providerID}/${strictModel.modelID}; it cannot select ${requestedModel.providerID}/${requestedModel.modelID}.`,
+        ),
+      )
+    }
+    const selectedVariant = strictModel ? strictModel.variant : requestedModel?.variant ?? (requestedModel ? undefined : parentVariant)
+    if (requestedModel && !strictModel) {
+      const providers = yield* Effect.serviceOption(Provider.Service)
+      if (Option.isNone(providers)) {
+        return yield* Effect.fail(new Error("Cannot resolve the requested subagent model without the workspace provider catalog."))
+      }
+      const resolved = yield* providers.value
+        .getModel(requestedModel.providerID, requestedModel.modelID, requestedModel.accountID)
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new Error(
+                `Requested subagent model ${requestedModel.providerID}/${requestedModel.modelID}` +
+                  (requestedModel.accountID ? ` (account ${requestedModel.accountID})` : "") +
+                  ` is unavailable: ${error.message}`,
+              ),
+          ),
+        )
+      if (requestedModel.variant && !resolved.variants?.[requestedModel.variant]) {
+        return yield* Effect.fail(
+          new Error(
+            `Requested subagent model ${requestedModel.providerID}/${requestedModel.modelID} does not provide variant ${requestedModel.variant}.`,
+          ),
+        )
+      }
+    }
+    const model = {
+      providerID: selectedModel.providerID,
+      modelID: selectedModel.modelID,
+      ...(selectedModel.accountID ? { accountID: selectedModel.accountID } : {}),
+    }
+    const taskVariant = selectedVariant
+    const workerOrigin = SessionMetadataOwnership.workerDelegation(parent.metadata)
+    const childPermission = deriveSubagentSessionPermission({
+      parentSessionPermission: parent.permission ?? [],
+      subagent: next,
+      autoApproveAsks: parent.agent === "yolo" || context.parentAgent === "yolo",
+    })
+    const childToolDenies = [
+      ...(next.permission.some((rule) => rule.permission === "todowrite")
+        ? []
+        : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
+      ...(next.permission.some((rule) => rule.permission === ID)
+        ? []
+        : [{ permission: ID, pattern: "*" as const, action: "deny" as const }]),
+      ...(cfg.experimental?.primary_tools?.map((permission) => ({
+        permission,
+        pattern: "*" as const,
+        action: "deny" as const,
+      })) ?? []),
+    ]
+    const nextSession =
+      session ??
+      (yield* sessions.create({
+        parentID: context.parentSessionID,
+        title: input.description + ` (@${next.name} ${entry === "special-agent" ? "special agent" : "subagent"})`,
+        agent: next.name,
+        model: {
+          providerID: selectedModel.providerID,
+          id: selectedModel.modelID,
+          ...(selectedModel.accountID ? { accountID: selectedModel.accountID } : {}),
+          ...(selectedVariant ? { variant: selectedVariant } : {}),
+        },
+        ...(strictModel
+          ? {
+              metadata: workerOrigin
+                ? SessionMetadataOwnership.delegatedWorker({
+                    ...workerOrigin,
+                    agent: next.name,
+                    parentWorkerID: parent.id,
+                    model: {
+                      providerID: strictModel.providerID,
+                      modelID: strictModel.modelID,
+                      ...(strictModel.accountID ? { accountID: strictModel.accountID } : {}),
+                      ...(strictModel.variant ? { variant: strictModel.variant } : {}),
+                      ...(strictModel.routeIntent ? { routeIntent: strictModel.routeIntent } : {}),
+                    },
+                  })
+                : {
+                    localMcp: {
+                      delegatedSubagent: true,
+                      strictSubagentModelPolicy: true,
+                      nestedSubagentsAllowed: true,
+                      modelSelection: {
+                        providerID: strictModel.providerID,
+                        modelID: strictModel.modelID,
+                        ...(strictModel.accountID ? { accountID: strictModel.accountID } : {}),
+                        variant: strictModel.variant ?? "default",
+                        source: "inherited_user_policy",
+                      },
+                    },
+                  },
+            }
+          : {}),
+        permission: [
+          ...childPermission,
+          ...childToolDenies.filter(
+            (deny) =>
+              !childPermission.some(
+                (rule) =>
+                  rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
+              ),
+          ),
+        ],
+      }))
 
-      // Durable supervision ownership lives on the child Session and is written
-      // through the fork-local metadata helper (mutable/caller-replaceable, not
-      // producer-owned identity). Non-supervisor modes strip/ignore it.
-      const establishSupervision = Effect.fnUntraced(function* () {
-        if (!delegationEnvelope) return
-        const current = yield* sessions.get(nextSession.id)
+    const metadata = {
+      parentSessionId: context.parentSessionID,
+      sessionId: nextSession.id,
+      model,
+      ...(taskVariant ? { variant: taskVariant } : {}),
+      mode: resolvedMode,
+      background: runInBackground,
+      ...(isSupervisor
+        ? {
+            supervisorSessionId: context.parentSessionID,
+            supervisionGroupId: supervisionGroupID,
+          }
+        : {}),
+    }
+
+    yield* context.metadata({
+      title: input.description,
+      metadata,
+    })
+
+    // --- Attachment handoff -------------------------------------------------
+    // Selection is explicit and empty by default. Handles resolve only against
+    // the exact triggering user turn, an explicit index, or a grant this child
+    // already holds. Grants are snapshotted before scheduling and are idempotent
+    // on the delegation invocation identity, so retries never duplicate bytes or
+    // grant edges. Selected bytes are injected into the child's initial provider
+    // request; unsupported MIME/model fails visibly rather than silently dropping.
+    const requestedHandles = input.attachments ?? []
+    const taskIdempotencyKey = (attachmentKey: string) =>
+      [context.parentSessionID, context.assistantMessageID, context.toolCallID ?? "no-call", nextSession.id, attachmentKey].join(":")
+
+    const attachmentSnapshot = yield* Effect.gen(function* () {
+      if (requestedHandles.length === 0) return { parts: [] as SessionV1.FilePartInput[], granted: [] as string[] }
+      const scope: SessionAttachment.SelectionScope = session
+        ? { kind: "active-grant", sessionID: context.parentSessionID, workerSessionID: nextSession.id }
+        : { kind: "current-turn", sessionID: context.parentSessionID, messageID: parentMessageID }
+
+      // A resumed child may only add attachments from its own active grants or
+      // the current turn; a new child resolves from its exact triggering turn.
+      const selected = yield* SessionAttachment.resolveSelection(database.db, {
+        handles: requestedHandles,
+        scope,
+      }).pipe(Effect.orDie)
+
+      const parts: SessionV1.FilePartInput[] = []
+      const granted: string[] = []
+      for (const item of selected) {
+        const upload = item.upload
+        const eligibility = SessionAttachment.classifyMime(upload.mime)
+        if (!SessionAttachment.isEligibleOrigin(upload.origin) || eligibility !== "eligible") {
+          yield* Effect.logWarning("attachment handoff skipped: ineligible", {
+            handle: upload.handle,
+            origin: upload.origin,
+            mime: upload.mime,
+          })
+          continue
+        }
+        if (upload.byteLength > SessionAttachment.Policy.maxPerFileBytes) {
+          yield* Effect.logWarning("attachment handoff skipped: over per-file budget", {
+            handle: upload.handle,
+            byteLength: upload.byteLength,
+          })
+          continue
+        }
+        const grant = yield* SessionAttachment.createGrant(database.db, {
+          attachment: item,
+          target: {
+            kind: "task",
+            sourceSessionID: context.parentSessionID,
+            assistantMessageID: context.assistantMessageID,
+            toolCallID: context.toolCallID ?? "no-call",
+            toolPartID: `prt_task_${context.toolCallID ?? "no-call"}`,
+            childSessionID: nextSession.id,
+          },
+          idempotencyKey: taskIdempotencyKey(upload.handle),
+        }).pipe(Effect.orDie)
+        const [resolvedUpload] = yield* SessionAttachment.resolveBytes(database.db, [grant.id]).pipe(Effect.orDie)
+        if (!resolvedUpload) continue
+        parts.push({
+          type: "file",
+          mime: resolvedUpload.mime,
+          ...(resolvedUpload.filename ? { filename: resolvedUpload.filename } : {}),
+          url: resolvedUpload.url,
+        })
+        yield* SessionAttachment.recordInclusion(database.db, {
+          grantID: grant.id,
+          resolved: true,
+          includedInProviderRequest: false,
+          providerID: model.providerID,
+          modelID: model.modelID,
+        }).pipe(Effect.orDie)
+        granted.push(grant.id)
+      }
+      return { parts, granted }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.gen(function* () {
+          // Attachment resolution failure must not silently drop selected bytes.
+          yield* Effect.logError("attachment handoff resolution failed", { cause: Cause.pretty(cause) })
+          return { parts: [] as SessionV1.FilePartInput[], granted: [] as string[] }
+        }),
+      ),
+    )
+
+    // Worker 4's supervision service is optional: consume it via serviceOption
+    // so Task delegation compiles and works before/without the service.
+    const supervisorRegistry = Option.getOrUndefined(yield* Effect.serviceOption(SupervisorRegistryTag))
+
+    const delegationEnvelope: SubagentSupervisionMetadata.TaskDelegation | undefined = isSupervisor
+      ? {
+          mode: "supervisor",
+          supervisorSessionID: context.parentSessionID,
+          supervisionGroupID,
+          description: input.description,
+          createdFromMessageID: context.assistantMessageID,
+        }
+      : undefined
+
+    // Durable supervision ownership lives on the child Session and is written
+    // through the fork-local metadata helper (mutable/caller-replaceable, not
+    // producer-owned identity). Non-supervisor modes strip/ignore it.
+    const establishSupervision = Effect.fnUntraced(function* () {
+      if (!delegationEnvelope) return
+      const current = yield* sessions.get(nextSession.id)
+      yield* sessions.setMetadata({
+        sessionID: nextSession.id,
+        metadata: SubagentSupervisionMetadata.withTaskDelegation(delegationEnvelope, current.metadata),
+      })
+      if (supervisorRegistry) {
+        yield* supervisorRegistry.register({
+          supervisorSessionID: context.parentSessionID,
+          childSessionID: nextSession.id,
+          supervisionGroupID,
+          mode: "supervisor",
+          description: input.description,
+          createdFromMessageID: context.assistantMessageID,
+        })
+      }
+    })
+
+    // Relinquishing supervision keeps the child detached and running; it only
+    // drops the active supervisory relationship.
+    //
+    // It is a strict no-op when the child carries no durable supervision
+    // envelope and no supervision registry is present, so a plain foreground
+    // task on a never-supervised child never mutates child metadata. The
+    // durable `taskDelegation` strip is gated on `hasTaskDelegationOrigin`;
+    // the live unregister is gated on an actual registry being installed.
+    const relinquishSupervision = Effect.fnUntraced(function* () {
+      if (!supervisorRegistry) {
+        // No live registry: the only thing that can be relinquished is the
+        // durable envelope. Skip the read entirely for a brand-new child that
+        // cannot carry one.
+        if (!input.taskID) return
+      }
+      const current = yield* sessions.get(nextSession.id)
+      const supervised = SubagentSupervisionMetadata.hasTaskDelegationOrigin(current.metadata)
+      if (supervisorRegistry) yield* supervisorRegistry.unregister(nextSession.id)
+      if (supervised) {
         yield* sessions.setMetadata({
           sessionID: nextSession.id,
-          metadata: SubagentSupervisionMetadata.withTaskDelegation(delegationEnvelope, current.metadata),
+          metadata: SubagentSupervisionMetadata.withoutTaskDelegation(current.metadata),
         })
-        if (supervisorRegistry) {
-          yield* supervisorRegistry.register({
-            supervisorSessionID: context.parentSessionID,
-            childSessionID: nextSession.id,
-            supervisionGroupID,
-            mode: "supervisor",
-            description: input.description,
-            createdFromMessageID: context.assistantMessageID,
-          })
-        }
-      })
+      }
+    })
 
-      // Relinquishing supervision keeps the child detached and running; it only
-      // drops the active supervisory relationship.
-      //
-      // It is a strict no-op when the child carries no durable supervision
-      // envelope and no supervision registry is present, so a plain foreground
-      // task on a never-supervised child never mutates child metadata. The
-      // durable `taskDelegation` strip is gated on `hasTaskDelegationOrigin`;
-      // the live unregister is gated on an actual registry being installed.
-      const relinquishSupervision = Effect.fnUntraced(function* () {
-        if (!supervisorRegistry) {
-          // No live registry: the only thing that can be relinquished is the
-          // durable envelope. Skip the read entirely for a brand-new child that
-          // cannot carry one.
-          if (!input.taskID) return
-        }
-        const current = yield* sessions.get(nextSession.id)
-        const supervised = SubagentSupervisionMetadata.hasTaskDelegationOrigin(current.metadata)
-        if (supervisorRegistry) yield* supervisorRegistry.unregister(nextSession.id)
-        if (supervised) {
-          yield* sessions.setMetadata({
-            sessionID: nextSession.id,
-            metadata: SubagentSupervisionMetadata.withoutTaskDelegation(current.metadata),
-          })
-        }
-      })
-
-      const runTask = Effect.fn("SubagentDelegation.runTask")(function* (prompt: string) {
-        const resolved = yield* ops.resolvePromptParts(prompt)
-        // Supervisor workers receive the compact worker protocol; other modes
-        // are byte-for-byte unchanged.
-        const parts = isSupervisor
-          ? [...resolved, { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL }]
-          : resolved
-        const result = yield* ops.prompt(
-          {
-            messageID: MessageID.ascending(),
-            sessionID: nextSession.id,
-            model: {
-              modelID: model.modelID,
-              providerID: model.providerID,
-              ...("accountID" in model && model.accountID
-                ? { accountID: model.accountID }
-                : {}),
-            },
-            variant: taskVariant,
-            agent: next.name,
-            parts,
+    const runTask = Effect.fn("SubagentDelegation.runTask")(function* (prompt: string) {
+      const resolved = yield* ops.resolvePromptParts(prompt)
+      // Selected attachment bytes precede the task text so the child's initial
+      // provider request carries them; supervisor workers also receive the
+      // compact worker protocol. Other modes are otherwise unchanged.
+      const withAttachments = [...attachmentSnapshot.parts, ...resolved]
+      const parts = isSupervisor
+        ? [...withAttachments, { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL }]
+        : withAttachments
+      const result = yield* ops.prompt(
+        {
+          messageID: MessageID.ascending(),
+          sessionID: nextSession.id,
+          model: {
+            modelID: model.modelID,
+            providerID: model.providerID,
+            ...("accountID" in model && model.accountID ? { accountID: model.accountID } : {}),
           },
-          workerOrigin
-            ? {
-                source: SessionTurnProvenance.Source.OxpDelegation,
-                ref: workerOrigin.invocationRef,
-                principalRef: workerOrigin.principalRef,
-              }
-            : undefined,
-        )
-        if (result.info.role === "assistant" && result.info.error) {
-          const message =
-            "message" in result.info.error.data && typeof result.info.error.data.message === "string"
-              ? result.info.error.data.message
-              : result.info.error.name
-          return yield* failRecoverable(nextSession.id, message, result.parts)
-        }
-        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
-        if (failed?.type === "tool" && failed.state.status === "error") {
-          return yield* failRecoverable(nextSession.id, failed.state.error ?? "unknown tool error", result.parts)
-        }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
-      })
+          variant: taskVariant,
+          agent: next.name,
+          parts,
+        },
+        workerOrigin
+          ? {
+              source: SessionTurnProvenance.Source.OxpDelegation,
+              ref: workerOrigin.invocationRef,
+              principalRef: workerOrigin.principalRef,
+            }
+          : undefined,
+      )
+      if (result.info.role === "assistant" && result.info.error) {
+        const message =
+          "message" in result.info.error.data && typeof result.info.error.data.message === "string"
+            ? result.info.error.data.message
+            : result.info.error.name
+        return yield* failRecoverable(nextSession.id, message, result.parts, entry)
+      }
+      const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+      if (failed?.type === "tool" && failed.state.status === "error") {
+        return yield* failRecoverable(nextSession.id, failed.state.error ?? "unknown tool error", result.parts, entry)
+      }
+      return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+    })
 
-      // Safe-boundary supervisory steering. This is materially different from
-      // `background.extend`, which only queues a continuation behind the
-      // child's whole turn: `ops.steer` durably admits trusted host input to
-      // the child's SessionInput inbox in the host `steer` lane, so the worker
-      // reorients at its next safe provider-cycle boundary instead of waiting
-      // for a post-completion continuation cycle. It never creates a second
-      // child Session or a duplicate execution generation.
-      const steerChild = Effect.fn("SubagentDelegation.steerChild")(function* (prompt: string) {
-        const steer = ops.steer
-        if (typeof steer !== "function") {
-          // Fail loudly: silently downgrading supervisor steering to a queued
-          // background continuation would re-create "renamed Background" and
-          // violate the architectural invariant.
-          return yield* Effect.die(
-            new Error(
-              "Supervisor steering requires SessionPromptOps.steer, but the prompt control surface did not provide it. Refusing to downgrade supervisor steering to a queued background continuation.",
-            ),
-          )
-        }
-        const resolved = yield* ops.resolvePromptParts(prompt)
-        const parts = [...resolved, { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL }]
-        const steered = yield* steer.call(
-          ops,
-          {
-            sessionID: nextSession.id,
-            agent: next.name,
-            model: {
-              modelID: model.modelID,
-              providerID: model.providerID,
-              ...("accountID" in model && model.accountID ? { accountID: model.accountID } : {}),
-            },
-            variant: taskVariant,
-            parts,
+    // Safe-boundary supervisory steering. This is materially different from
+    // `background.extend`, which only queues a continuation behind the
+    // child's whole turn: `ops.steer` durably admits trusted host input to
+    // the child's SessionInput inbox in the host `steer` lane, so the worker
+    // reorients at its next safe provider-cycle boundary instead of waiting
+    // for a post-completion continuation cycle. It never creates a second
+    // child Session or a duplicate execution generation.
+    const steerChild = Effect.fn("SubagentDelegation.steerChild")(function* (prompt: string) {
+      const steer = ops.steer
+      if (typeof steer !== "function") {
+        // Fail loudly: silently downgrading supervisor steering to a queued
+        // background continuation would re-create "renamed Background" and
+        // violate the architectural invariant.
+        return yield* Effect.die(
+          new Error(
+            "Supervisor steering requires SessionPromptOps.steer, but the prompt control surface did not provide it. Refusing to downgrade supervisor steering to a queued background continuation.",
+          ),
+        )
+      }
+      const resolved = yield* ops.resolvePromptParts(prompt)
+      const parts = [
+        ...attachmentSnapshot.parts,
+        ...resolved,
+        { type: "text" as const, text: SUPERVISOR_WORKER_PROTOCOL },
+      ]
+      const steered = yield* steer.call(
+        ops,
+        {
+          sessionID: nextSession.id,
+          agent: next.name,
+          model: {
+            modelID: model.modelID,
+            providerID: model.providerID,
+            ...("accountID" in model && model.accountID ? { accountID: model.accountID } : {}),
           },
-          workerOrigin
-            ? {
-                source: SessionTurnProvenance.Source.OxpDelegation,
-                ref: workerOrigin.invocationRef,
-                principalRef: workerOrigin.principalRef,
-              }
-            : undefined,
-        )
-        if (steered.info.role === "assistant" && steered.info.error) {
-          const message =
-            "message" in steered.info.error.data && typeof steered.info.error.data.message === "string"
-              ? steered.info.error.data.message
-              : steered.info.error.name
-          return yield* failRecoverable(nextSession.id, message, steered.parts)
-        }
-        return steered.parts.findLast((item) => item.type === "text")?.text ?? ""
-      })
+          variant: taskVariant,
+          parts,
+        },
+        workerOrigin
+          ? {
+              source: SessionTurnProvenance.Source.OxpDelegation,
+              ref: workerOrigin.invocationRef,
+              principalRef: workerOrigin.principalRef,
+            }
+          : undefined,
+      )
+      if (steered.info.role === "assistant" && steered.info.error) {
+        const message =
+          "message" in steered.info.error.data && typeof steered.info.error.data.message === "string"
+            ? steered.info.error.data.message
+            : steered.info.error.name
+        return yield* failRecoverable(nextSession.id, message, steered.parts, entry)
+      }
+      return steered.parts.findLast((item) => item.type === "text")?.text ?? ""
+    })
 
-      const childTail = Effect.fn("SubagentDelegation.childTail")(function* (sessionID: SessionID) {
-        const history = yield* sessions
-          .messages({ sessionID })
-          .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
-        for (let i = history.length - 1; i >= 0; i--) {
-          const text = history[i] ? lastTextPart(history[i]!.parts) : undefined
-          if (text) return truncatePartial(text)
-        }
-        return undefined
-      })
+    const childTail = Effect.fn("SubagentDelegation.childTail")(function* (sessionID: SessionID) {
+      const history = yield* sessions
+        .messages({ sessionID })
+        .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
+      for (let i = history.length - 1; i >= 0; i--) {
+        const text = history[i] ? lastTextPart(history[i]!.parts) : undefined
+        if (text) return truncatePartial(text)
+      }
+      return undefined
+    })
 
-      const inject = Effect.fn("SubagentDelegation.injectBackgroundResult")(function* (
-        state: "completed" | "error",
-        text: string,
-      ) {
-        const currentParent = yield* sessions.get(context.parentSessionID)
-        const currentRoot = yield* sessions
-          .findMessage(context.parentSessionID, SessionTurnProvenance.isWorkerPromptTurn)
-          .pipe(Effect.orDie)
-        if (Option.isNone(currentRoot) || currentRoot.value.info.role !== "user") {
-          yield* Effect.logWarning("dropping background task notification without a live worker root", {
-            parentSessionID: context.parentSessionID,
-            childSessionID: nextSession.id,
-          })
-          return
-        }
-        yield* ops
-          .prompt({
+    const inject = Effect.fn("SubagentDelegation.injectBackgroundResult")(function* (
+      state: "completed" | "error",
+      text: string,
+    ) {
+      const currentParent = yield* sessions.get(context.parentSessionID)
+      const currentRoot = yield* sessions
+        .findMessage(context.parentSessionID, SessionTurnProvenance.isWorkerPromptTurn)
+        .pipe(Effect.orDie)
+      if (Option.isNone(currentRoot) || currentRoot.value.info.role !== "user") {
+        yield* Effect.logWarning("dropping background task notification without a live worker root", {
+          parentSessionID: context.parentSessionID,
+          childSessionID: nextSession.id,
+        })
+        return
+      }
+      yield* ops
+        .prompt(
+          {
             sessionID: context.parentSessionID,
             agent: currentParent.agent ?? context.parentAgent,
             variant: parentVariant,
@@ -885,252 +1082,269 @@ const execute: Interface["execute"] = Effect.fn("SubagentDelegation.execute")(fu
                 }),
               },
             ],
-          }, {
+          },
+          {
             source: SessionTurnProvenance.Source.TaskSummary,
             sourceMessageID: currentRoot.value.info.id,
             ref: nextSession.id,
-          })
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
-      })
-
-      const notify = Effect.fn("SubagentDelegation.notifyBackgroundResult")(function* (jobID: string) {
-        yield* background.wait({ id: jobID }).pipe(
-          Effect.flatMap((result) =>
-            Effect.gen(function* () {
-              const completed = result.info
-              if (!completed) return
-              const latest = yield* background.get(jobID)
-              const stillSameGeneration =
-                completed.generation !== undefined && latest?.generation === completed.generation
-              const backgroundAtDelivery = stillSameGeneration
-                ? latest?.metadata?.background === true
-                : completed.metadata?.background === true
-              if (!backgroundAtDelivery) return
-              if (completed.status === "completed") return yield* inject("completed", completed.output ?? "")
-              if (completed.status === "error") return yield* inject("error", completed.error ?? "")
-            }),
-          ),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
-      })
-
-      function backgroundResult(summary: string, text: string) {
-        return {
-          title: input.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: nextSession.id,
           },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary,
-            text,
+        )
+        .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+    })
+
+    const notify = Effect.fn("SubagentDelegation.notifyBackgroundResult")(function* (jobID: string) {
+      yield* background.wait({ id: jobID }).pipe(
+        Effect.flatMap((result) =>
+          Effect.gen(function* () {
+            const completed = result.info
+            if (!completed) return
+            const latest = yield* background.get(jobID)
+            const stillSameGeneration =
+              completed.generation !== undefined && latest?.generation === completed.generation
+            const backgroundAtDelivery = stillSameGeneration
+              ? latest?.metadata?.background === true
+              : completed.metadata?.background === true
+            if (!backgroundAtDelivery) return
+            if (completed.status === "completed") return yield* inject("completed", completed.output ?? "")
+            if (completed.status === "error") return yield* inject("error", completed.error ?? "")
           }),
-        }
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+    })
+
+    function backgroundResult(summary: string, text: string) {
+      return {
+        title: input.description,
+        metadata: {
+          ...metadata,
+          background: true,
+          jobId: nextSession.id,
+        },
+        output: renderOutput({
+          sessionID: nextSession.id,
+          state: "running",
+          summary,
+          text,
+        }),
+      }
+    }
+
+    const promotionMetadata = context.metadata({
+      title: input.description,
+      metadata: { ...metadata, background: true, jobId: nextSession.id },
+    })
+
+    const waitForeground = Effect.fn("SubagentDelegation.waitForeground")(function* () {
+      const runCancel = yield* EffectBridge.make()
+      // Once foreground Task cancellation begins, quiescing the owned child
+      // Session is cleanup, not optional follow-up work. A parent runner
+      // interruption may race the BackgroundJob cancelled notification; make
+      // the child barrier uninterruptible so authority cannot return to the
+      // parent while the child remains live.
+      const cancel = ops.cancel(nextSession.id).pipe(Effect.uninterruptible)
+
+      function onAbort() {
+        runCancel.fork(cancel)
       }
 
-      const promotionMetadata = context.metadata({
-        title: input.description,
-        metadata: { ...metadata, background: true, jobId: nextSession.id },
-      })
-
-      const waitForeground = Effect.fn("SubagentDelegation.waitForeground")(function* () {
-        const runCancel = yield* EffectBridge.make()
-        // Once foreground Task cancellation begins, quiescing the owned child
-        // Session is cleanup, not optional follow-up work. A parent runner
-        // interruption may race the BackgroundJob cancelled notification; make
-        // the child barrier uninterruptible so authority cannot return to the
-        // parent while the child remains live.
-        const cancel = ops.cancel(nextSession.id).pipe(Effect.uninterruptible)
-
-        function onAbort() {
-          runCancel.fork(cancel)
-        }
-
-        return yield* Effect.acquireUseRelease(
-          Effect.sync(() => {
-            context.abort.addEventListener("abort", onAbort)
-            if (context.abort.aborted) onAbort()
-          }),
-          () =>
-            Effect.gen(function* () {
-              const result = yield* Effect.raceFirst(
-                background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-                background.waitForPromotion(nextSession.id),
-              )
-              if (!result) return yield* Effect.fail(new Error(`Subagent job disappeared (task_id: ${nextSession.id}).`))
-              if (result.metadata?.background === true) {
-                return backgroundResult("Task moved to background", BACKGROUND_STARTED)
-              }
-              if (result.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-              if (result.status === "cancelled") {
-                // Foreground Task cancellation owns child execution cancellation.
-                // Do not rely on a model-tool AbortSignal side channel: callers
-                // such as SessionPrompt may cancel the parent-owned BackgroundJob
-                // directly, which wakes this wait as an ordinary cancelled state
-                // rather than an Effect interruption. The delegation backend must
-                // establish child Session quiescence before reporting settlement.
-                yield* cancel
-                const tail = yield* childTail(nextSession.id)
-                const partial = tail ? `\n\nPartial progress before cancellation:\n${tail}` : ""
-                return yield* Effect.fail(
-                  new Error(`Task cancelled (task_id: ${nextSession.id}).${partial}\n\n${resumeHint(nextSession.id)}`),
-                )
-              }
-              return {
-                title: input.description,
-                metadata: { ...metadata, background: false },
-                output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result.output ?? "" }),
-              }
-            }),
-          (_, exit) =>
-            Effect.gen(function* () {
-              if (Exit.hasInterrupts(exit))
-                yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
-            }).pipe(
-              Effect.ensuring(
-                Effect.sync(() => {
-                  context.abort.removeEventListener("abort", onAbort)
-                }),
-              ),
-            ),
-        )
-      })
-
-      const existingJob = yield* background.get(nextSession.id)
-      if (existingJob?.status === "running") {
-        if (existingJob.type !== ID) {
-          return yield* Effect.fail(new Error(`Task session ${nextSession.id} is owned by running ${existingJob.type} job.`))
-        }
-
-        if (runInBackground) {
-          const detached =
-            existingJob.metadata?.background === true ? existingJob : yield* background.promote(nextSession.id)
-          if (detached?.status === "running") {
-            if (isSupervisor) {
-              // Adopt (or re-affirm) supervision of the running worker without
-              // restarting it. A prompt-bearing supervisor call is genuine
-              // safe-boundary steering (ops.steer), NOT a queued continuation,
-              // and never starts a new execution generation.
-              yield* establishSupervision()
-              if (!promptText) return backgroundResult("Worker adopted into supervision", SUPERVISOR_STARTED)
-              yield* steerChild(promptText)
-              return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
-            } else {
-              // mode:"background" on an existing running worker relinquishes
-              // supervision (if any) while leaving the worker detached. Its
-              // queued-continuation semantics stay EXACTLY as they were.
-              yield* relinquishSupervision()
-              if (!promptText) return backgroundResult("Task running in background", BACKGROUND_STARTED)
-              const extended = yield* background.extend({
-                id: nextSession.id,
-                run: runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
-              })
-              if (extended) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
+      return yield* Effect.acquireUseRelease(
+        Effect.sync(() => {
+          context.abort.addEventListener("abort", onAbort)
+          if (context.abort.aborted) onAbort()
+        }),
+        () =>
+          Effect.gen(function* () {
+            const result = yield* Effect.raceFirst(
+              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
+              background.waitForPromotion(nextSession.id),
+            )
+            if (!result) return yield* Effect.fail(new Error(`Subagent job disappeared (task_id: ${nextSession.id}).`))
+            if (result.metadata?.background === true) {
+              return backgroundResult("Task moved to background", BACKGROUND_STARTED)
             }
-          }
-        } else {
-          const attached = yield* background.foreground(nextSession.id, promotionMetadata)
-          if (attached?.status === "running") {
-            // Supervisor -> foreground attaches without restart and drops the
-            // active supervisory relationship.
+            if (result.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            if (result.status === "cancelled") {
+              // Foreground Task cancellation owns child execution cancellation.
+              // Do not rely on a model-tool AbortSignal side channel: callers
+              // such as SessionPrompt may cancel the parent-owned BackgroundJob
+              // directly, which wakes this wait as an ordinary cancelled state
+              // rather than an Effect interruption. The delegation backend must
+              // establish child Session quiescence before reporting settlement.
+              yield* cancel
+              const tail = yield* childTail(nextSession.id)
+              const partial = tail ? `\n\nPartial progress before cancellation:\n${tail}` : ""
+              return yield* Effect.fail(
+                new Error(`Task cancelled (task_id: ${nextSession.id}).${partial}\n\n${resumeHint(nextSession.id, entry)}`),
+              )
+            }
+            return {
+              title: input.description,
+              metadata: { ...metadata, background: false },
+              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result.output ?? "" }),
+            }
+          }),
+        (_, exit) =>
+          Effect.gen(function* () {
+            if (Exit.hasInterrupts(exit))
+              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                context.abort.removeEventListener("abort", onAbort)
+              }),
+            ),
+          ),
+      )
+    })
+
+    const existingJob = yield* background.get(nextSession.id)
+    if (existingJob?.status === "running") {
+      if (existingJob.type !== ID) {
+        return yield* Effect.fail(
+          new Error(`Task session ${nextSession.id} is owned by running ${existingJob.type} job.`),
+        )
+      }
+
+      if (runInBackground) {
+        const detached =
+          existingJob.metadata?.background === true ? existingJob : yield* background.promote(nextSession.id)
+        if (detached?.status === "running") {
+          if (isSupervisor) {
+            // Adopt (or re-affirm) supervision of the running worker without
+            // restarting it. A prompt-bearing supervisor call is genuine
+            // safe-boundary steering (ops.steer), NOT a queued continuation,
+            // and never starts a new execution generation.
+            yield* establishSupervision()
+            if (!promptText) return backgroundResult("Worker adopted into supervision", SUPERVISOR_STARTED)
+            yield* steerChild(promptText)
+            return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
+          } else {
+            // mode:"background" on an existing running worker relinquishes
+            // supervision (if any) while leaving the worker detached. Its
+            // queued-continuation semantics stay EXACTLY as they were.
             yield* relinquishSupervision()
-            if (!promptText) return yield* waitForeground()
+            if (!promptText) return backgroundResult("Task running in background", BACKGROUND_STARTED)
             const extended = yield* background.extend({
               id: nextSession.id,
               run: runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
             })
-            if (extended) return yield* waitForeground()
+            if (extended) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
           }
+        }
+      } else {
+        const attached = yield* background.foreground(nextSession.id, promotionMetadata)
+        if (attached?.status === "running") {
+          // Supervisor -> foreground attaches without restart and drops the
+          // active supervisory relationship.
+          yield* relinquishSupervision()
+          if (!promptText) return yield* waitForeground()
+          const extended = yield* background.extend({
+            id: nextSession.id,
+            run: runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+          })
+          if (extended) return yield* waitForeground()
         }
       }
+    }
 
-      if (!promptText) {
-        const previous = yield* background.get(nextSession.id)
-        if (previous?.status === "completed") {
-          if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
-          if (isSupervisor) yield* establishSupervision()
-          else yield* relinquishSupervision()
-          return {
-            title: input.description,
-            metadata: { ...metadata, background: false },
-            output: renderOutput({ sessionID: nextSession.id, state: "completed", text: previous.output ?? "" }),
-          }
+    if (!promptText) {
+      const previous = yield* background.get(nextSession.id)
+      if (previous?.status === "completed") {
+        if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
+        if (isSupervisor) yield* establishSupervision()
+        else yield* relinquishSupervision()
+        return {
+          title: input.description,
+          metadata: { ...metadata, background: false },
+          output: renderOutput({ sessionID: nextSession.id, state: "completed", text: previous.output ?? "" }),
         }
-        if (previous?.status === "error") {
-          if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
-          if (!isSupervisor) yield* relinquishSupervision()
-          return yield* Effect.fail(new Error(previous.error ?? "Task failed"))
+      }
+      if (previous?.status === "error") {
+        if (previous.metadata?.background === true) yield* background.foreground(nextSession.id)
+        if (!isSupervisor) yield* relinquishSupervision()
+        return yield* Effect.fail(new Error(previous.error ?? "Task failed"))
+      }
+      return yield* Effect.fail(
+        new Error(
+          input.taskID
+            ? `Task ${nextSession.id} is not currently running; provide prompt to continue that child session.`
+            : "prompt is required when starting a new subagent task.",
+        ),
+      )
+    }
+
+    const runPrompt = () => runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id)))
+    while (true) {
+      const attempt = yield* background.tryStart({
+        id: nextSession.id,
+        type: ID,
+        title: input.description,
+        metadata,
+        onPromote: promotionMetadata,
+        continueOnFailure: true,
+        run: runPrompt(),
+      })
+      if (attempt.started) {
+        yield* notify(attempt.info.id)
+        if (isSupervisor) {
+          yield* establishSupervision()
+          return backgroundResult("Supervised worker started", SUPERVISOR_STARTED)
         }
+        if (runInBackground) {
+          yield* relinquishSupervision()
+          return backgroundResult("Background task started", BACKGROUND_STARTED)
+        }
+        return yield* waitForeground()
+      }
+      if (attempt.info.type !== ID) {
         return yield* Effect.fail(
-          new Error(
-            input.taskID
-              ? `Task ${nextSession.id} is not currently running; provide prompt to continue that child session.`
-              : "prompt is required when starting a new subagent task.",
-          ),
+          new Error(`Task session ${nextSession.id} is owned by running ${attempt.info.type} job.`),
         )
       }
 
-      const runPrompt = () => runTask(promptText).pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id)))
-      while (true) {
-        const attempt = yield* background.tryStart({
-          id: nextSession.id,
-          type: ID,
-          title: input.description,
-          metadata,
-          onPromote: promotionMetadata,
-          continueOnFailure: true,
-          run: runPrompt(),
-        })
-        if (attempt.started) {
-          yield* notify(attempt.info.id)
-          if (isSupervisor) {
-            yield* establishSupervision()
-            return backgroundResult("Supervised worker started", SUPERVISOR_STARTED)
-          }
-          if (runInBackground) {
-            yield* relinquishSupervision()
-            return backgroundResult("Background task started", BACKGROUND_STARTED)
-          }
-          return yield* waitForeground()
+      if (runInBackground) {
+        const detached =
+          attempt.info.metadata?.background === true ? attempt.info : yield* background.promote(nextSession.id)
+        if (detached?.status !== "running") continue
+        if (isSupervisor) {
+          // The child is already running, so a prompt-bearing supervisor call
+          // is safe-boundary steering, not a queued continuation.
+          yield* establishSupervision()
+          yield* steerChild(promptText)
+          return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
         }
-        if (attempt.info.type !== ID) {
-          return yield* Effect.fail(
-            new Error(`Task session ${nextSession.id} is owned by running ${attempt.info.type} job.`),
-          )
-        }
-
-        if (runInBackground) {
-          const detached =
-            attempt.info.metadata?.background === true ? attempt.info : yield* background.promote(nextSession.id)
-          if (detached?.status !== "running") continue
-          if (isSupervisor) {
-            // The child is already running, so a prompt-bearing supervisor call
-            // is safe-boundary steering, not a queued continuation.
-            yield* establishSupervision()
-            yield* steerChild(promptText)
-            return backgroundResult("Supervised worker steered", SUPERVISOR_UPDATED)
-          }
-          yield* relinquishSupervision()
-          if (yield* background.extend({ id: nextSession.id, run: runPrompt() })) {
-            return backgroundResult("Background task updated", BACKGROUND_UPDATED)
-          }
-          continue
-        }
-
-        const attached = yield* background.foreground(nextSession.id, promotionMetadata)
-        if (attached?.status !== "running") continue
+        yield* relinquishSupervision()
         if (yield* background.extend({ id: nextSession.id, run: runPrompt() })) {
-          return yield* waitForeground()
+          return backgroundResult("Background task updated", BACKGROUND_UPDATED)
         }
+        continue
       }
-    })
 
+      const attached = yield* background.foreground(nextSession.id, promotionMetadata)
+      if (attached?.status !== "running") continue
+      if (yield* background.extend({ id: nextSession.id, run: runPrompt() })) {
+        return yield* waitForeground()
+      }
+    }
+  })
 
+  const execute: Interface["execute"] = (input, context) => run(input, context, "task")
 
-    return { execute } satisfies Interface
+  const executeSpecialAgent: Interface["executeSpecialAgent"] = (input, context) =>
+    run(
+      {
+        description: input.description,
+        prompt: input.prompt,
+        subagentType: input.agent,
+        taskID: input.taskID,
+        mode: "background",
+      },
+      context,
+      "special-agent",
+    )
+
+  return { execute, executeSpecialAgent } satisfies Interface
 })
 
 export * as SubagentDelegation from "./subagent-delegation"

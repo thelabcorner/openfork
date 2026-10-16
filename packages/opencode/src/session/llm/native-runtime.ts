@@ -19,7 +19,11 @@ import {
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
+import { createLaceNativeObserver, type LaceNativeOwner } from "./lace-native-observer"
 import { healLegacyFindCall, preserveCanonicalFindToolMap } from "./tool-call-heal"
+
+// Bounded process-local diagnostics only; never persisted or used for routing.
+const laceNativeObserver = createLaceNativeObserver(128)
 
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
@@ -43,6 +47,8 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
+  /** Trusted V1 owner; absence disables optional LACE observation. */
+  readonly lace?: LaceNativeOwner
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -52,9 +58,11 @@ export function status(input: Pick<StreamInput, "model" | "provider" | "auth">):
 function statusWithFetch(
   input: Pick<StreamInput, "model" | "provider" | "auth">,
   fetch: typeof globalThis.fetch | undefined,
+  allowMediaCompatible = false,
 ): RuntimeStatus {
   const providerID = input.model.providerID
-  if (providerID !== "openai" && providerID !== "anthropic" && !providerID.startsWith("opencode"))
+  if (providerID !== "openai" && providerID !== "anthropic" && !providerID.startsWith("opencode") &&
+      !(allowMediaCompatible && input.model.api.npm === "@ai-sdk/openai-compatible"))
     return { type: "unsupported", reason: "provider is not openai, opencode, or anthropic" }
   const npm = input.model.api.npm
   if (npm !== "@ai-sdk/openai" && npm !== "@ai-sdk/openai-compatible" && npm !== "@ai-sdk/anthropic")
@@ -75,7 +83,12 @@ function statusWithFetch(
 
 export function stream(input: StreamInput): StreamResult {
   const baseFetch = providerFetch(input)
-  const current = statusWithFetch(input, baseFetch)
+  const mediaCompatible = input.model.api.npm === "@ai-sdk/openai-compatible" &&
+    input.messages.some((msg) => msg.role === "user" && Array.isArray(msg.content) &&
+      msg.content.some((part) => part.type === "file" &&
+        ((part.mediaType.startsWith("video/") && input.model.capabilities.input.video) ||
+         (part.mediaType.startsWith("audio/") && input.model.capabilities.input.audio))))
+  const current = statusWithFetch(input, baseFetch, mediaCompatible)
   if (current.type === "unsupported") return current
 
   const routedAccountIDs = new Set<string>()
@@ -110,12 +123,25 @@ export function stream(input: StreamInput): StreamResult {
       Effect.gen(function* () {
         const settlements = yield* FiberSet.make<void>()
         const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
-        const provider = input.llmClient
-          .stream(
-            LLMRequest.update(request, {
-              tools: [...request.tools, ...toDefinitions(tools)],
-            }),
-          )
+        const nativeRequest = LLMRequest.update(request, {
+          tools: [...request.tools, ...toDefinitions(tools)],
+        })
+        const provider = Stream.unwrap(
+          Effect.gen(function* () {
+            if (!input.lace) return input.llmClient.stream(nativeRequest)
+            // The observer compiles exactly once; the stream belongs to the
+            // compiled transport. Unavailable observations cannot affect dispatch.
+            const compiled = yield* laceNativeObserver.compile(input.llmClient, nativeRequest, input.lace)
+            yield* Effect.logDebug("LACE native observe-only", {
+              status: compiled.lace.status,
+              ...(compiled.lace.status === "observed"
+                ? { change: compiled.lace.observation.kind,
+                    retainedRegions: compiled.lace.observation.retainedRegionCount }
+                : {}),
+            })
+            return compiled.stream
+          }),
+        )
           .pipe(
             Stream.map((event) => {
               if (!LLMEvent.is.stepFinish(event)) return event
@@ -213,16 +239,28 @@ export function nativeTools(tools: Record<string, Tool>, input: Pick<StreamInput
         description: item.description ?? "",
         jsonSchema: nativeSchema(item.inputSchema),
         execute: (args: unknown, ctx) =>
-          Effect.tryPromise({
-            try: () => {
-              if (!item.execute) throw new Error(`Tool has no execute handler: ${name}`)
-              return item.execute(args, {
-                toolCallId: ctx?.id ?? name,
-                messages: input.messages,
-                abortSignal: input.abort,
+          Effect.gen(function* () {
+            // ToolRuntime.dispatch always supplies the canonical provider call
+            // ID. A missing ID must never degrade to the tool name: that would
+            // mint a fabricated durable ToolPart and collide across calls.
+            const callID = ctx?.id
+            if (!callID) {
+              return yield* new ToolFailure({
+                message: `Tool "${name}" was dispatched without a provider tool-call ID`,
               })
-            },
-            catch: (error) => new ToolFailure({ message: errorMessage(error), error }),
+            }
+            if (!item.execute) {
+              return yield* new ToolFailure({ message: `Tool has no execute handler: ${name}` })
+            }
+            return yield* Effect.tryPromise({
+              try: () =>
+                item.execute!(args, {
+                  toolCallId: callID,
+                  messages: input.messages,
+                  abortSignal: input.abort,
+                }),
+              catch: (error) => new ToolFailure({ message: errorMessage(error), error }),
+            })
           }),
       }),
       ]),

@@ -26,6 +26,8 @@ import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attrib
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
 import { ToolOutputProjection } from "@opencode-ai/core/tool-output-projection"
+import { hasUsableCompactionCheckpoint } from "./compaction-checkpoint"
+import { firstFittingSuffix, isMonotoneTextSuffix } from "./lace-checkpoint-retention"
 
 export const Event = SessionCompactionEvent
 
@@ -47,6 +49,12 @@ const usageRoute = (
     ? { routeKind: "account", accountID: route.accountID! }
     : { routeKind: "public" }
 }
+
+/** Secret-free settlement attribution of a one-call (non-durable) route. */
+const transientUsageRoute = (routed: Provider.TransientRoutedModel): UsageRouteAttribution.Committed =>
+  routed.route.route.kind === "account"
+    ? { routeKind: "account", accountID: routed.route.route.accountID }
+    : { routeKind: "public" }
 
 function parseCompactionModel(value: string): { providerID: ProviderV2.ID; modelID: ModelV2.ID } | undefined {
   const trimmed = value.trim()
@@ -140,20 +148,20 @@ function summaryText(message: SessionV1.WithParts) {
 }
 
 function completedCompactions(messages: SessionV1.WithParts[]) {
-  const users = new Map<MessageID, number>()
+  const users = new Map<MessageID, { index: number; checkpointID?: MessageID }>()
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
     if (msg.info.role !== "user") continue
-    if (!msg.parts.some((part) => part.type === "compaction")) continue
-    users.set(msg.info.id, i)
+    const marker = msg.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+    if (!marker || marker.pending === true) continue
+    users.set(msg.info.id, { index: i, checkpointID: marker.checkpoint_message_id })
   }
 
   return messages.flatMap((msg, assistantIndex): CompletedCompaction[] => {
-    if (msg.info.role !== "assistant") return []
-    if (!msg.info.summary || !msg.info.finish || msg.info.error) return []
-    const userIndex = users.get(msg.info.parentID)
-    if (userIndex === undefined) return []
-    return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
+    if (msg.info.role !== "assistant" || !hasUsableCompactionCheckpoint(msg)) return []
+    const marker = users.get(msg.info.parentID)
+    if (!marker || (marker.checkpointID && marker.checkpointID !== msg.info.id)) return []
+    return [{ userIndex: marker.index, assistantIndex, summary: summaryText(msg) }]
   })
 }
 
@@ -191,6 +199,29 @@ function splitTurn(input: {
   return Effect.gen(function* () {
     if (input.budget <= 0) return undefined
     if (input.turn.end - input.turn.start <= 1) return undefined
+    // A long sequence of finished text-only assistant messages is monotone
+    // under the V1 model-message projection: dropping the oldest message
+    // cannot make the suffix larger. Use exact suffix estimates with a
+    // logarithmic number of projections instead of reserializing every
+    // successively shorter suffix (quadratic on pathological turns).
+    //
+    // All complex turns retain the existing conservative linear search:
+    // provider continuation, tool causality, and multimedia parts need
+    // dedicated atomicity and serialization proof before binary search.
+    const suffix = input.messages.slice(input.turn.start + 1, input.turn.end)
+    if (isMonotoneTextSuffix(suffix)) {
+      const starts = suffix.map((_, index) => input.turn.start + index + 1)
+      const start = yield* firstFittingSuffix({
+        starts,
+        budget: input.budget,
+        estimate: (start) =>
+          input.estimate({
+            messages: input.messages.slice(start, input.turn.end),
+            model: input.model,
+          }),
+      })
+      return start === undefined ? undefined : { start, id: input.messages[start]!.info.id }
+    }
     for (let start = input.turn.start + 1; start < input.turn.end; start++) {
       const size = yield* input.estimate({
         messages: input.messages.slice(start, input.turn.end),
@@ -321,6 +352,11 @@ const layer = Layer.effect(
       readonly tier: CompactionTier
       readonly model: Provider.Model
       readonly route?: ProviderRouteResolution.RouteAttribution
+      /**
+       * Secret-free settlement attribution for a transient route. A one-call
+       * route has no durable lease, so it cannot reuse `route`/`lease`.
+       */
+      readonly usage?: UsageRouteAttribution.Committed
       readonly lease?: ProviderRouteResolution.ProviderRouteLease
       readonly ref: { providerID: ProviderV2.ID; modelID: ModelV2.ID; accountID?: string }
     }
@@ -357,13 +393,17 @@ const layer = Layer.effect(
           continue
         }
 
-        if (input.route?.providerID === parsed.providerID) {
+        if (
+          input.route?.providerID === parsed.providerID &&
+          !(Provider.isHostedZenProvider(parsed.providerID) && input.route.routeKind === "public")
+        ) {
           const inherited = yield* provider
             .resolveInheritedRoutedModel({
               sessionID: input.sessionID,
               providerID: parsed.providerID,
               modelID: parsed.modelID,
               route: input.route,
+              executionPurpose: "special-agent",
             })
             .pipe(Effect.option)
           if (inherited._tag === "None") {
@@ -385,15 +425,18 @@ const layer = Layer.effect(
         }
 
         // Configured compaction tiers/agent models are explicit maintenance
-        // overrides. A provider distinct from the parent may own its own
-        // provider-specific route, but that route must be resolved before
-        // transport and later settled under its own attribution.
+        // overrides. A provider distinct from the parent may use its own
+        // provider/account, but maintenance must never create or rebind a
+        // durable ProviderRoute row on the parent Session. Resolve one
+        // non-persistent route and settle it under its own attribution.
         const routed = yield* provider
-          .resolveRoutedModel({
-            sessionID: input.sessionID,
+          .resolveTransientRoutedModel({
             providerID: parsed.providerID,
             modelID: parsed.modelID,
-            ...(parsed.accountID ? { accountID: parsed.accountID } : {}),
+            ...(parsed.accountID
+              ? { accountID: parsed.accountID }
+              : { routeIntent: { kind: "auto" as const } }),
+            executionPurpose: "special-agent",
           })
           .pipe(Effect.option)
         if (routed._tag === "None") {
@@ -405,12 +448,25 @@ const layer = Layer.effect(
           continue
         }
         if (routed.value) {
+          if (Provider.isHostedZenProvider(parsed.providerID) && routed.value.route.route.kind !== "account") continue
           candidates.push({
             tier: def.tier,
             model: routed.value.model,
-            route: routed.value.route.attribution,
-            lease: routed.value.route.lease,
+            usage: transientUsageRoute(routed.value),
             ref: parsed,
+          })
+          continue
+        }
+
+        // Only providers the OpenCode routing domain does not own may keep the
+        // mature direct-provider path. A hosted provider that reached this point
+        // has no authoritative route, so spending an ambient credential (or the
+        // hosted Public free tier) here is exactly the regression to prevent.
+        if (Provider.isHostedZenProvider(parsed.providerID)) {
+          yield* Effect.logWarning("compaction override skipped: hosted provider has no authoritative route", {
+            tier: def.tier,
+            providerID: parsed.providerID,
+            modelID: parsed.modelID,
           })
           continue
         }
@@ -443,6 +499,7 @@ const layer = Layer.effect(
       fallback: Provider.Model
       fallbackRoute?: ProviderRouteResolution.RouteAttribution
       fallbackLease?: ProviderRouteResolution.ProviderRouteLease
+      fallbackUsage?: UsageRouteAttribution.Committed
     }) {
       if (input.candidates.length === 0) {
         return {
@@ -450,6 +507,7 @@ const layer = Layer.effect(
           tier: "session" as const,
           route: input.fallbackRoute,
           lease: input.fallbackLease,
+          ...(input.fallbackUsage ? { usage: input.fallbackUsage } : {}),
         }
       }
       for (const c of input.candidates) {
@@ -470,6 +528,7 @@ const layer = Layer.effect(
         tier: "session" as const,
         route: input.fallbackRoute,
         lease: input.fallbackLease,
+        ...(input.fallbackUsage ? { usage: input.fallbackUsage } : {}),
       }
     })
 
@@ -485,6 +544,12 @@ const layer = Layer.effect(
         .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
       if (!msgs) return
 
+      // Only an admitted, promoted checkpoint is a pruning barrier. A blank,
+      // interrupted or still-pending attempt must not prematurely terminate
+      // tool-output reduction in the surviving full history.
+      const admittedSummaries = new Set(
+        completedCompactions(msgs).map((entry) => msgs[entry.assistantIndex]!.info.id),
+      )
       let total = 0
       let pruned = 0
       const toPrune: SessionV1.ToolPart[] = []
@@ -494,7 +559,7 @@ const layer = Layer.effect(
         const msg = msgs[msgIndex]
         if (SessionTurnProvenance.isSemanticUserTurn(msg)) turns++
         if (turns < 2) continue
-        if (msg.info.role === "assistant" && msg.info.summary) break loop
+        if (msg.info.role === "assistant" && admittedSummaries.has(msg.info.id)) break loop
         for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
           const part = msg.parts[partIndex]
           if (part.type !== "tool") continue
@@ -566,22 +631,58 @@ const layer = Layer.effect(
       let sessionModel: Provider.Model
       let sessionRoute: ProviderRouteResolution.RouteAttribution | undefined
       let sessionLease: ProviderRouteResolution.ProviderRouteLease | undefined
-      if (input.route) {
+      let sessionUsage: UsageRouteAttribution.Committed | undefined
+      if (
+        input.route &&
+        !(Provider.isHostedZenProvider(userMessage.model.providerID) && input.route.routeKind === "public")
+      ) {
         const inherited = yield* provider
           .resolveInheritedRoutedModel({
             sessionID: input.sessionID,
             providerID: userMessage.model.providerID,
             modelID: userMessage.model.modelID,
             route: input.route,
+            executionPurpose: "special-agent",
           })
           .pipe(Effect.orDie)
         sessionModel = inherited.model
         sessionRoute = inherited.route.attribution
         sessionLease = inherited.route.lease
       } else {
-        sessionModel = yield* provider
-          .getModel(userMessage.model.providerID, userMessage.model.modelID, userMessage.model.accountID)
-          .pipe(Effect.orDie)
+        // No usable committed parent route (legacy Session, or a worker bound
+        // to OpenCode-only Public). Choose an account-backed transient route
+        // for this one compaction, never changing the parent's durable binding.
+        // Maintenance still must not spend an ambient hosted credential:
+        // resolve one transient route, fail closed for a hosted provider, and
+        // keep the direct-provider path only for providers the OpenCode
+        // routing domain positively declines to own.
+        const transient = yield* provider
+          .resolveTransientRoutedModel({
+            providerID: userMessage.model.providerID,
+            modelID: userMessage.model.modelID,
+            ...(userMessage.model.accountID
+              ? { accountID: userMessage.model.accountID }
+              : { routeIntent: { kind: "auto" as const } }),
+            executionPurpose: "special-agent",
+          })
+          .pipe(Effect.option)
+        if (transient._tag === "Some" && transient.value &&
+            (!Provider.isHostedZenProvider(userMessage.model.providerID) || transient.value.route.route.kind === "account")) {
+          sessionModel = transient.value.model
+          sessionUsage = transientUsageRoute(transient.value)
+        } else if (Provider.isHostedZenProvider(userMessage.model.providerID)) {
+          return yield* new Provider.RouteResolutionError({
+            providerID: userMessage.model.providerID,
+            modelID: userMessage.model.modelID,
+            cause: new Error(
+              "No authoritative OpenCode route resolved for this hosted compaction request; refusing ambient credential fallback",
+            ),
+          })
+        } else {
+          sessionModel = yield* provider
+            .getModel(userMessage.model.providerID, userMessage.model.modelID, userMessage.model.accountID)
+            .pipe(Effect.orDie)
+        }
       }
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
@@ -631,10 +732,14 @@ const layer = Layer.effect(
         fallback: sessionModel,
         ...(sessionRoute ? { fallbackRoute: sessionRoute } : {}),
         ...(sessionLease ? { fallbackLease: sessionLease } : {}),
+        ...(sessionUsage ? { fallbackUsage: sessionUsage } : {}),
       })
       const model = picked.model
       const selectedRoute = picked.route
       const selectedLease = picked.lease
+      // A transient cross-provider override settles under its own one-call
+      // attribution. It has no durable lease, so never forward one for it.
+      const selectedUsage = picked.usage ?? usageRoute(selectedRoute)
       yield* Effect.logInfo("compaction tier selected", {
         sessionID: input.sessionID,
         tier: picked.tier,
@@ -643,8 +748,8 @@ const layer = Layer.effect(
         needed,
         context: model.limit.context,
         headSize: selected.head.length,
-        routeKind: selectedRoute?.routeKind ?? "legacy",
-        routeAccountID: selectedRoute?.accountID ?? null,
+        routeKind: selectedUsage?.routeKind ?? "legacy",
+        routeAccountID: selectedUsage?.accountID ?? null,
       })
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
@@ -678,7 +783,8 @@ const layer = Layer.effect(
         assistantMessage: msg,
         sessionID: input.sessionID,
         model,
-        ...(usageRoute(selectedRoute) ? { routeAttribution: usageRoute(selectedRoute) } : {}),
+        durableHistory: messages,
+        ...(selectedUsage ? { routeAttribution: selectedUsage } : {}),
         ...(selectedLease ? { routeLease: selectedLease } : {}),
       })
       const result = yield* processor.process({
@@ -718,14 +824,61 @@ const layer = Layer.effect(
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+      // Inference completing is not proof of a promotable checkpoint. The
+      // persisted text/finish state, not the processor's return code, is what
+      // the effective-history reader will consume after restart. Check it
+      // before committing a tail boundary or admitting auto-continuation.
+      const currentMessages = yield* session.messages({ sessionID: input.sessionID })
+      const checkpoint = currentMessages.find((item) => item.info.id === msg.id)
+      const currentMarker = currentMessages
+        .find((item) => item.info.id === input.parentID)?.parts
+        .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      // A stale runner cannot intentionally replace an already promoted
+      // candidate. This is a defensive check, NOT a substitute for a DB CAS
+      // transaction when concurrent compaction owners race after this read.
+      if (compactionPart && (!currentMarker || (
+        currentMarker.pending !== true &&
+        currentMarker.checkpoint_message_id &&
+        currentMarker.checkpoint_message_id !== msg.id
+      ))) {
+        processor.message.error = new SessionV1.APIError({
+          message: "Compaction checkpoint superseded by another committed attempt.",
+          isRetryable: false,
+        }).toObject()
+        processor.message.finish = "error"
+        yield* session.updateMessage(processor.message)
+        return "stop"
+      }
+      if (processor.message.error || !checkpoint || !hasUsableCompactionCheckpoint(checkpoint)) {
+        if (!processor.message.error) {
+          processor.message.error = new SessionV1.APIError({
+            message: "Compaction produced no complete usable text checkpoint; original history was retained.",
+            isRetryable: false,
+          }).toObject()
+        }
+        processor.message.finish = "error"
+        yield* session.updateMessage(processor.message)
+        yield* Effect.logWarning("compaction checkpoint rejected", {
+          sessionID: input.sessionID,
+          checkpointID: msg.id,
+          hasPersistedMessage: Boolean(checkpoint),
+        })
+        return "stop"
+      }
+
+      if (currentMarker && (
+        currentMarker.pending === true ||
+        currentMarker.checkpoint_message_id !== msg.id ||
+        (selected.tail_start_id && currentMarker.tail_start_id !== selected.tail_start_id)
+      )) {
         yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
+          ...currentMarker,
+          ...(currentMarker.pending === true ? { pending: false } : {}),
+          checkpoint_message_id: msg.id,
+          ...(selected.tail_start_id ? { tail_start_id: selected.tail_start_id } : {}),
         })
       }
 
-      const currentMessages = yield* session.messages({ sessionID: input.sessionID })
       const hasNewerUserMessage = currentMessages.some(
         (message) =>
           SessionTurnProvenance.isSemanticUserTurn(message) &&
@@ -856,6 +1009,7 @@ const layer = Layer.effect(
         sessionID: msg.sessionID,
         type: "compaction",
         auto: input.auto,
+        pending: true,
         ...(input.continueAfter ? { continueAfter: true } : {}),
         overflow: input.overflow,
       })

@@ -11,19 +11,9 @@ import { SessionContextStateTable } from "@opencode-ai/core/session/sql"
 import { eq } from "drizzle-orm"
 import { estimateTokens } from "./state"
 
-function previewForMessage(msg: WithParts): string {
-  const firstText = msg.parts.find((p) => p.type === "text") as SessionV1.TextPart | undefined
-  if (firstText?.text) return firstText.text.slice(0, 120)
-  const tool = msg.parts.find((p) => p.type === "tool") as SessionV1.ToolPart | undefined
-  if (tool) return `[tool: ${tool.tool}]`
-  if (msg.parts.some((p) => p.type === "compaction")) return "[compaction]"
-  if (msg.parts.some((p) => p.type === "reasoning")) return "[reasoning]"
-  return `[${msg.info.role}]`
-}
-
-function typeForMessage(msg: WithParts): SessionContext.LedgerEntryType {
-  if (msg.parts.some((p) => p.type === "compaction")) return "compaction"
-  if (msg.parts.some((p) => p.type === "tool")) return "tool"
+function typeForMessage(msg: WithParts, hasCompaction: boolean, hasTool: boolean): SessionContext.LedgerEntryType {
+  if (hasCompaction) return "compaction"
+  if (hasTool) return "tool"
   if (msg.info.role === "user") {
     const kind = SessionTurnProvenance.semanticKind(msg)
     if (kind === "shell") return "shell"
@@ -35,7 +25,8 @@ function typeForMessage(msg: WithParts): SessionContext.LedgerEntryType {
   return "system"
 }
 
-function estimateMessageTokens(msg: WithParts): number {
+/** Shared approximate token unit for the ledger and effective-context preview. */
+export function estimateMessageTokens(msg: WithParts): number {
   let total = 0
   for (const p of msg.parts) {
     if (p.type === "text") total += estimateTokens((p as SessionV1.TextPart).text)
@@ -55,44 +46,125 @@ export const build = Effect.fn("SessionLedger.build")(function* (input: {
   sessionID: string
   messages: WithParts[]
 }) {
-  const { db } = yield* Database.Service
-  const stateRows = yield* db
-    .select()
+  // Ledger inspection must not queue behind provider/session writers. Read
+  // committed context overlays through the WAL reader (aliases db for :memory:).
+  const { readDb } = yield* Database.Service
+  const stateRows = yield* readDb
+    .select({
+      message_id: SessionContextStateTable.message_id,
+      excluded: SessionContextStateTable.excluded,
+      pinned: SessionContextStateTable.pinned,
+      override_data: SessionContextStateTable.override_data,
+    })
     .from(SessionContextStateTable)
     .where(eq(SessionContextStateTable.session_id, input.sessionID as any))
     .all()
     .pipe(Effect.orDie)
+  return buildWithRows(input, stateRows)
+})
 
+export type LedgerOverlayRow = Pick<
+  typeof SessionContextStateTable.$inferSelect,
+  "message_id" | "excluded" | "pinned" | "override_data"
+>
+
+/** Scalar part facts emitted by the canonical V1 event projector (version 1). */
+export type LedgerPartFact = {
+  tokens: number
+  signed: boolean
+}
+
+/** Pure ledger projection; callers can share one transaction with history. */
+export function buildWithRows(
+  input: { sessionID: string; messages: WithParts[] },
+  stateRows: readonly LedgerOverlayRow[],
+  partFacts?: ReadonlyMap<string, LedgerPartFact>,
+): SessionContext.Ledger {
   const stateMap = new Map(stateRows.map((r) => [r.message_id, r]))
 
   const entries: SessionContext.LedgerEntry[] = input.messages.map((msg) => {
-    // Historical invalid overlays may still exist in old databases. STATE is
-    // authoritative domain projection, so those rows must not affect the
-    // effective ledger or any totals derived from it.
-    const s = SessionTurnProvenance.hasStateSemanticsTurn(msg) ? undefined : stateMap.get(msg.info.id)
-    const hasSignedReasoning = msg.parts.some(
-      (p) => p.type === "reasoning" && (p as any).metadata?.anthropic?.signature != null,
+    // One linear walk yields all part-derived facts: preview, signed-reasoning
+    // guard, semantic type, token estimate and edit-target eligibility. The
+    // earlier implementation repeatedly rescanned every part for each fact.
+    let tokenEstimate = 4
+    let firstText: string | undefined
+    let firstTool: string | undefined
+    let hasCompaction = false
+    let hasReasoning = false
+    let hasSignedReasoning = false
+    const raw = stateMap.get(msg.info.id)
+    const override = raw?.override_data as Record<string, unknown> | null | undefined
+    const targetPartID = typeof override?.partID === "string" ? override.partID : undefined
+    let hasEditTarget = false
+    let hasCollapseTarget = false
+    for (const p of msg.parts) {
+      const fact = partFacts?.get(p.id)
+      if (p.type === "text") {
+        if (firstText === undefined) firstText = p.text
+        tokenEstimate += fact ? fact.tokens : estimateTokens(p.text)
+        if (!targetPartID || targetPartID === p.id) hasEditTarget = true
+      } else if (p.type === "reasoning") {
+        hasReasoning = true
+        hasSignedReasoning ||= fact ? fact.signed : (p as any).metadata?.anthropic?.signature != null
+        tokenEstimate += fact ? fact.tokens : estimateTokens(p.text)
+        if (!targetPartID || targetPartID === p.id) hasEditTarget = true
+      } else if (p.type === "tool") {
+        if (firstTool === undefined) firstTool = p.tool
+        if (p.state.status === "completed") {
+          tokenEstimate += fact ? fact.tokens : estimateTokens(p.state.output)
+          if (targetPartID === p.id) hasCollapseTarget = true
+        } else if (p.state.status === "error") tokenEstimate += fact ? fact.tokens : estimateTokens(p.state.error)
+      } else if (p.type === "compaction") hasCompaction = true
+      else if (p.type === "file") tokenEstimate += fact ? fact.tokens : 200
+    }
+    // Authoritative host STATE projections and signed reasoning ignore
+    // historical invalid overlays. Pinned always overrides excluded; never
+    // present an effectively included message as removed or count it in the
+    // excluded-token total.
+    const s = raw && !SessionTurnProvenance.hasStateSemanticsTurn(msg) ? raw : undefined
+    const excluded = !!s?.excluded && !s?.pinned && !hasSignedReasoning
+    const edited = !excluded && !!s?.override_data && (
+      (override?.text != null && !hasSignedReasoning && hasEditTarget) ||
+      (override?.collapsed === true && hasCollapseTarget)
     )
+    const preview = firstText
+      ? firstText.slice(0, 120)
+      : firstTool !== undefined
+        ? `[tool: ${firstTool}]`
+        : hasCompaction ? "[compaction]" : hasReasoning ? "[reasoning]" : `[${msg.info.role}]`
     return {
       messageID: msg.info.id as any,
-      type: typeForMessage(msg),
+      type: typeForMessage(msg, hasCompaction, firstTool !== undefined),
       role: msg.info.role,
-      preview: previewForMessage(msg),
-      tokenEstimate: estimateMessageTokens(msg),
-      excluded: s?.excluded ?? false,
+      preview,
+      tokenEstimate,
+      excluded,
       pinned: s?.pinned ?? false,
-      edited: !!s?.override_data,
+      edited,
       hasSignedReasoning,
       partCount: msg.parts.length,
       timeCreated: msg.info.time.created,
     }
   })
 
-  const excludedCount = entries.filter((e) => e.excluded).length
-  const pinnedCount = entries.filter((e) => e.pinned).length
-  const editedCount = entries.filter((e) => e.edited).length
-  const estimatedTokens = entries.filter((e) => !e.excluded).reduce((sum, e) => sum + e.tokenEstimate, 0)
-  const estimatedTokensExcluded = entries.filter((e) => e.excluded).reduce((sum, e) => sum + e.tokenEstimate, 0)
+  // One linear traversal with no temporary filter arrays. A large actionable
+  // ledger is already O(messages); avoid repeatedly allocating copies of
+  // every included/excluded row solely to derive five scalar totals.
+  let excludedCount = 0
+  let pinnedCount = 0
+  let editedCount = 0
+  let estimatedTokens = 0
+  let estimatedTokensExcluded = 0
+  for (const entry of entries) {
+    if (entry.excluded) {
+      excludedCount++
+      estimatedTokensExcluded += entry.tokenEstimate
+    } else {
+      estimatedTokens += entry.tokenEstimate
+    }
+    if (entry.pinned) pinnedCount++
+    if (entry.edited) editedCount++
+  }
 
   const ledger: SessionContext.Ledger = {
     sessionID: input.sessionID as any,
@@ -108,7 +180,7 @@ export const build = Effect.fn("SessionLedger.build")(function* (input: {
   }
 
   return ledger
-})
+}
 
 function previewForCurrentMessage(msg: CurrentSessionMessage.Message): string {
   if (msg.type === "user" || msg.type === "synthetic") return msg.text.slice(0, 120) || `[${msg.type}]`

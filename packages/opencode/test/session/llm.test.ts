@@ -944,6 +944,62 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
+    "rejects truncated AI SDK Chat streams through real V1 provider orchestration",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture(vivgridFixture.providerID, vivgridFixture.modelID)
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse([{
+            id: "chatcmpl-truncated",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: { role: "assistant", content: "incomplete" } }],
+          }], true),
+        )
+        const resolved = yield* Provider.use.getModel(
+          ProviderV2.ID.make(vivgridFixture.providerID),
+          ModelV2.ID.make(fixture.model.id),
+        )
+        const sessionID = SessionID.make("session-test-truncated-provider-chat")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const error = yield* drain({
+          user: {
+            id: MessageID.make("msg_user-truncated-provider-chat"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make(vivgridFixture.providerID), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        }).pipe(Effect.flip)
+        yield* Effect.promise(() => request)
+        expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+        expect(error.message).toBe("OpenAI-compatible stream ended without a recognized finish_reason")
+      }),
+    {
+      config: () => ({
+        enabled_providers: [vivgridFixture.providerID],
+        provider: {
+          [vivgridFixture.providerID]: {
+            options: { apiKey: "test-key", baseURL: `${state.server!.url.origin}/v1` },
+          },
+        },
+      }),
+    },
+  )
+
+  it.instance(
     "surfaces network_error finish reasons as retryable stream failures",
     () =>
       Effect.gen(function* () {
@@ -1413,6 +1469,125 @@ describe("session.llm.stream", () => {
 
         const maxTokens = body.max_output_tokens as number | undefined
         expect(maxTokens).toBe(undefined) // match codex cli behavior
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "round-trips Muse transport tool aliases through the real Responses stream without persisting aliases",
+    () =>
+      Effect.gen(function* () {
+        const fixture = loadFixture("openai", "gpt-5.2").model
+        const canonical = "mcp:browser/read"
+        const { normalizeMuseToolNames } = yield* Effect.promise(() => import("@/session/llm/muse-tool-names"))
+        const muse = { providerID: "openai", api: { id: "muse-spark-1.3-contributor" } } as any
+        const alias = Object.keys(normalizeMuseToolNames(muse, { [canonical]: {} as any }, []).tools)[0]!
+        const args = '{"path":"src/test.ts"}'
+        const chunks = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-muse-alias",
+              created_at: Math.floor(Date.now() / 1000),
+              model: muse.api.id,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: {
+              type: "function_call",
+              id: "item-muse-alias",
+              call_id: "call-muse-alias",
+              name: alias,
+              arguments: "",
+              status: "in_progress",
+            },
+          },
+          {
+            type: "response.function_call_arguments.delta",
+            output_index: 0,
+            item_id: "item-muse-alias",
+            delta: args,
+          },
+          {
+            type: "response.function_call_arguments.done",
+            output_index: 0,
+            item_id: "item-muse-alias",
+            arguments: args,
+          },
+          {
+            type: "response.output_item.done",
+            output_index: 0,
+            item: {
+              type: "function_call",
+              id: "item-muse-alias",
+              call_id: "call-muse-alias",
+              name: alias,
+              arguments: args,
+              status: "completed",
+            },
+          },
+          {
+            type: "response.completed",
+            response: {
+              incomplete_details: null,
+              usage: {
+                input_tokens: 10,
+                input_tokens_details: null,
+                output_tokens: 5,
+                output_tokens_details: null,
+              },
+              service_tier: null,
+            },
+          },
+        ]
+        const request = waitRequest("/responses", createEventResponse(chunks, true))
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(fixture.id))
+        const selected = { ...resolved, api: { ...resolved.api, id: muse.api.id } }
+        const sessionID = SessionID.make("session-test-muse-transport-alias")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const events = yield* collectWith(
+          AppNodeBuilder.build(LLM.node, [
+            [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: false })],
+          ]),
+          {
+            user: {
+              id: MessageID.make("msg_user-muse-transport-alias"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.openai, modelID: selected.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: selected,
+            agent,
+            system: [],
+            messages: [{ role: "user", content: "Read the file" }],
+            tools: {
+              [canonical]: tool({
+                description: "Read file",
+                inputSchema: z.object({ path: z.string() }),
+                execute: async () => ({ output: "done" }),
+              }),
+            },
+          },
+        )
+        const capture = yield* Effect.promise(() => request)
+        const tools = capture.body.tools as Array<{ name?: string }>
+        expect(tools.some((item) => item.name === alias)).toBe(true)
+        expect(tools.every((item) => item.name !== canonical)).toBe(true)
+        expect((tools.find((item) => item.name === alias) as { strict?: boolean }).strict).toBe(false)
+        expect(events.some((event) => event.type === "tool-call" && event.name === canonical)).toBe(true)
+        expect(events.some((event) => event.type === "tool-result" && event.name === canonical)).toBe(true)
+        expect(events.every((event) => !("name" in event) || event.name !== alias)).toBe(true)
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )

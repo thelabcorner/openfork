@@ -5,7 +5,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { sql } from "drizzle-orm"
 import { APICallError, tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -28,6 +28,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderAccountRouteHealthTable } from "@opencode-ai/core/provider-route-health.sql"
 import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
 import { SessionSchema as CoreSessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -209,6 +210,7 @@ const root = LayerNode.group([
   Database.node,
   EventV2Bridge.node,
   SessionStatus.node,
+  SessionExecutionOwner.node,
   CrossSpawnSpawner.node,
 ])
 const replacements = [
@@ -261,6 +263,116 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+// Real V1 processor, Session, status owner and durable message storage, but a
+// deterministic provider stream that sends only transport start and hangs.
+let silentProviderCalls = 0
+const silentProviderLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => {
+      silentProviderCalls++
+      return Stream.make(LLMEvent.stepStart({ index: 0 })).pipe(Stream.concat(Stream.never))
+    },
+  }),
+)
+const itSilentProvider = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, silentProviderLLM]]))
+
+let staleReasoningAttempts = 0
+let staleReasoningRequests: Array<LLM.StreamInput["messages"]> = []
+const staleReasoningLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      staleReasoningAttempts++
+      staleReasoningRequests.push(structuredClone(input.messages))
+      if (staleReasoningAttempts === 1) {
+        return Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.providerError({ message: "reasoning `encrypted_content` was not issued to this caller" }),
+        )
+      }
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-stale-recovered" }),
+        LLMEvent.textDelta({ id: "text-stale-recovered", text: "recovered" }),
+        LLMEvent.textEnd({ id: "text-stale-recovered" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const staleReasoningProvider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: ref.providerID,
+    id: ref.modelID,
+    limit: { context: 100_000, output: 10_000 },
+  }),
+})
+const staleReasoningEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, staleReasoningLLM],
+  [Provider.node, staleReasoningProvider.layer],
+])
+const itStaleReasoning = testEffect(staleReasoningEnv)
+
+const promptRenderingRef = {
+  providerID: ProviderV2.ID.make("opencode-go"),
+  modelID: ModelV2.ID.make("cat-jam-free"),
+}
+let promptRenderingAttempts = 0
+let promptRenderingRequests: Array<LLM.StreamInput["messages"]> = []
+let promptRenderingAfterEvent = false
+let promptRenderingAlwaysFail = false
+let promptRenderingAsEvent = false
+const promptRenderingLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      promptRenderingAttempts++
+      promptRenderingRequests.push(structuredClone(input.messages))
+      const failure = Stream.fail(
+        new APICallError({
+          message: "Upstream request failed: [prompt_rendering_failed] The request could not be rendered",
+          url: "https://example.test/v1/chat/completions",
+          requestBodyValues: {},
+          statusCode: 502,
+          responseHeaders: {},
+          responseBody: JSON.stringify({ error: { code: "prompt_rendering_failed" } }),
+          isRetryable: true,
+        }),
+      )
+      if (promptRenderingAttempts === 1 && promptRenderingAsEvent) {
+        return Stream.make(LLMEvent.providerError({
+          message: "Upstream request failed: [prompt_rendering_failed] The request could not be rendered",
+        }))
+      }
+      if (promptRenderingAfterEvent) return Stream.make(LLMEvent.stepStart({ index: 0 })).pipe(Stream.concat(failure))
+      if (promptRenderingAttempts === 1 || promptRenderingAlwaysFail) return failure
+      return Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "render-recovered" }),
+        LLMEvent.textDelta({ id: "render-recovered", text: "portable history accepted" }),
+        LLMEvent.textEnd({ id: "render-recovered" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      )
+    },
+  }),
+)
+const promptRenderingProvider = ProviderTest.fake({
+  model: ProviderTest.model({
+    providerID: promptRenderingRef.providerID,
+    id: promptRenderingRef.modelID,
+    api: { id: promptRenderingRef.modelID, url: "https://example.test/v1", npm: "@ai-sdk/openai-compatible" },
+  }),
+})
+const itPromptRendering = testEffect(LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, promptRenderingLLM],
+  [Provider.node, promptRenderingProvider.layer],
+]))
 
 const claudeFallbackLLM = Layer.succeed(
   LLM.Service,
@@ -386,8 +498,11 @@ const coalesceLLM = Layer.succeed(
       releaseCoalesce = yield* Deferred.make<void>()
       return Stream.make(
         LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.reasoningStart({ id: "reasoning-1" }),
+        ...Array.from({ length: 10_000 }, () => LLMEvent.reasoningDelta({ id: "reasoning-1", text: "x" })),
+        LLMEvent.reasoningEnd({ id: "reasoning-1" }),
         LLMEvent.textStart({ id: "text-1" }),
-        ...Array.from({ length: 50 }, () => LLMEvent.textDelta({ id: "text-1", text: "x" })),
+        ...Array.from({ length: 10_000 }, () => LLMEvent.textDelta({ id: "text-1", text: "x" })),
       ).pipe(
         Stream.concat(Stream.fromEffect(Deferred.await(releaseCoalesce)).pipe(Stream.drain)),
         Stream.concat(Stream.make(
@@ -1646,6 +1761,209 @@ it.live("session.processor effect tests mark interruptions aborted without manua
   ),
 )
 
+it.live("session.processor effect tests log interruptions without an error severity", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const sts = yield* SessionStatus.Service
+        const logs: Array<{ logLevel: string; message: unknown }> = []
+        const capture = Logger.make((options) => {
+          logs.push({ logLevel: options.logLevel, message: options.message })
+        })
+
+        yield* llm.hang
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt log")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "interrupt log" }],
+            tools: {},
+          })
+          .pipe(Effect.provide(Logger.layer([capture])), Effect.forkChild)
+
+        yield* llm.wait(1)
+        yield* Fiber.interrupt(run)
+        yield* Fiber.await(run)
+
+        const interrupted = logs.filter(
+          (entry) => Array.isArray(entry.message) && entry.message[0] === "process interrupted",
+        )
+        expect(interrupted.length).toBeGreaterThan(0)
+        expect(interrupted.every((entry) => entry.logLevel === "Info")).toBe(true)
+        expect(
+          logs.some(
+            (entry) =>
+              entry.logLevel === "Error" && Array.isArray(entry.message) && entry.message[0] === "process",
+          ),
+        ).toBe(false)
+        const detail = interrupted[0]?.message
+        expect(Array.isArray(detail)).toBe(true)
+        if (Array.isArray(detail)) {
+          const fields = detail[1] as Record<string, unknown>
+          expect(fields["session.id"]).toBe(chat.id)
+          expect(fields.messageID).toBe(msg.id)
+          expect("stack" in fields).toBe(false)
+        }
+        expect((yield* sts.get(chat.id)).type).toBe("idle")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests attribute interruption provenance at the request owner", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) => {
+      const logs: Array<{ logLevel: string; message: unknown }> = []
+      const capture = Logger.make((options) => {
+        logs.push({ logLevel: options.logLevel, message: options.message })
+      })
+      return Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const ownership = yield* SessionExecutionOwner.Service
+
+        yield* llm.hang
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "interrupt provenance")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const acquired = yield* ownership.tryAcquire(chat.id)
+        expect(acquired.state).toBe("acquired")
+        if (acquired.state !== "acquired") return
+        yield* ownership.requestInterrupt(chat.id, "operator", acquired.token.generation)
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "interrupt provenance" }],
+            tools: {},
+          })
+          .pipe(Effect.provide(Logger.layer([capture])), Effect.forkChild)
+
+        yield* llm.wait(1)
+        yield* Fiber.interrupt(run)
+        yield* Fiber.await(run)
+
+        const requested = logs.find(
+          (entry) => Array.isArray(entry.message) && entry.message[0] === "session interrupt requested",
+        )
+        expect(requested).toBeDefined()
+        if (requested && Array.isArray(requested.message)) {
+          const fields = requested.message[1] as Record<string, unknown>
+          expect(fields["session.id"]).toBe(chat.id)
+          expect(fields.reason).toBe("operator")
+          expect(fields.state).toBe("requested")
+          expect(fields.interruptGeneration).toBe(1)
+        }
+        expect(
+          logs.some((entry) => Array.isArray(entry.message) && entry.message[0] === "process interrupted"),
+        ).toBe(true)
+        yield* ownership.release(acquired.token)
+      }).pipe(Effect.provide(Logger.layer([capture])))
+    },
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests keep genuine failure logs at error severity", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const logs: Array<{ logLevel: string; message: unknown }> = []
+        const capture = Logger.make((options) => {
+          logs.push({ logLevel: options.logLevel, message: options.message })
+        })
+
+        yield* llm.error(400, { error: { message: "no_kv_space" } })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "failure log")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "failure log" }],
+            tools: {},
+          })
+          .pipe(Effect.provide(Logger.layer([capture])))
+
+        expect(value).toBe("stop")
+        const failed = logs.filter(
+          (entry) =>
+            entry.logLevel === "Error" && Array.isArray(entry.message) && entry.message[0] === "process",
+        )
+        expect(failed.length).toBeGreaterThan(0)
+        const detail = failed[0]?.message
+        if (Array.isArray(detail)) {
+          const fields = detail[1] as Record<string, unknown>
+          expect(typeof fields.error).toBe("string")
+        }
+        expect(
+          logs.some((entry) => Array.isArray(entry.message) && entry.message[0] === "process interrupted"),
+        ).toBe(false)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 itProviderError.live("session.processor effect tests fail provider-executed error results", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1692,6 +2010,59 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
       }),
     { config: cfg },
   ),
+)
+
+itSilentProvider.live("session.processor settles a silent provider and clears busy status", () =>
+  provideTmpdirInstance(
+    (dir) => Effect.gen(function* () {
+      const previous = process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+      process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = "90"
+      silentProviderCalls = 0
+      try {
+        const { processors, session, provider } = yield* boot()
+        const statuses = yield* SessionStatus.Service
+        const events = yield* EventV2Bridge.Service
+        const seen: string[] = []
+        const off = yield* events.listen((event) => {
+          seen.push(event.type)
+          return Effect.void
+        })
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "silent provider")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "silent provider" }],
+          tools: {},
+        })
+        yield* off
+        expect(result).toBe("stop")
+        expect(silentProviderCalls).toBe(1)
+        expect(handle.message.error).toBeDefined()
+        expect((yield* statuses.get(chat.id)).type).toBe("idle")
+        expect(seen).toContain(Session.Event.Error.type)
+        expect(seen).toContain(SessionStatus.Event.Idle.type)
+      } finally {
+        if (previous === undefined) delete process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+        else process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = previous
+      }
+    }),
+    { config: cfg },
+  ),
+  20_000,
 )
 
 itFragmentFailure.live("session.processor effect tests retain partial legacy parts without v2 events", () =>
@@ -1747,6 +2118,246 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
   ),
 )
 
+itStaleReasoning.live("session.processor repairs stale encrypted reasoning from owned history once", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      staleReasoningAttempts = 0
+      staleReasoningRequests = []
+
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "stale reasoning")
+      const previous = yield* assistant(chat.id, parent.id, directory)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: previous.id,
+        sessionID: chat.id,
+        type: "reasoning",
+        text: "thinking",
+        time: { start: 1 },
+        metadata: {
+          openai: { itemId: "rs_1", reasoningEncryptedContent: "blob", trace: "keep" },
+          providerNote: "keep",
+        },
+      } as unknown as SessionV1.ReasoningPart)
+
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+      const durableHistory = yield* session.messages({ sessionID: chat.id })
+      const handle = yield* processors.create({
+        assistantMessage: msg,
+        sessionID: chat.id,
+        model: mdl,
+        durableHistory,
+      })
+
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: ref.providerID, modelID: ref.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "reasoning",
+                text: "thinking",
+                providerOptions: {
+                  openai: { itemId: "rs_1", reasoningEncryptedContent: "blob" },
+                },
+              },
+            ],
+          },
+        ],
+        tools: {},
+      })
+
+      expect(value).toBe("continue")
+      expect(staleReasoningAttempts).toBe(2)
+      expect(staleReasoningRequests[0]?.[0]?.content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking",
+          providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "blob" } },
+        },
+      ])
+      expect(staleReasoningRequests[1]?.[0]?.content).toEqual([{ type: "reasoning", text: "thinking" }])
+
+      const stored = yield* MessageV2.parts(previous.id)
+      const storedReasoning = stored.find((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
+      expect(storedReasoning?.text).toBe("thinking")
+      expect(storedReasoning?.metadata).toEqual({ openai: { trace: "keep" }, providerNote: "keep" })
+    }),
+  ),
+)
+
+itPromptRendering.live("session.processor retries a rejected Go prompt once with reasoning-free tool-preserving history", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      promptRenderingAttempts = 0
+      promptRenderingRequests = []
+      promptRenderingAfterEvent = false
+      promptRenderingAlwaysFail = false
+      promptRenderingAsEvent = false
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "continue")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(promptRenderingRef.providerID, promptRenderingRef.modelID)
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+      const previous = [
+        { role: "assistant", content: [{ type: "reasoning", text: "prior reasoning" }, { type: "text", text: "Done" },
+          { type: "tool-call", toolCallId: "prior-call", toolName: "read", input: { path: "AGENTS.md" } }] },
+        { role: "tool", content: [{ type: "tool-result", toolCallId: "prior-call", toolName: "read", output: { type: "text", value: "doc" } }] },
+        { role: "user", content: "continue" },
+      ] satisfies LLM.StreamInput["messages"]
+      const value = yield* handle.process({
+        user: {
+          id: parent.id,
+          sessionID: chat.id,
+          role: "user",
+          time: parent.time,
+          agent: parent.agent,
+          model: { providerID: promptRenderingRef.providerID, modelID: promptRenderingRef.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id,
+        model: mdl,
+        agent: agent(),
+        system: [],
+        messages: previous,
+        tools: {},
+      })
+      expect(value).toBe("continue")
+      expect(promptRenderingAttempts).toBe(2)
+      expect(promptRenderingRequests[0]).toEqual(previous)
+      expect(promptRenderingRequests[1]).toEqual([
+        { role: "assistant", content: previous[0]!.content.slice(1) },
+        previous[1], previous[2],
+      ])
+      expect(previous[0]!.content[0]).toEqual({ type: "reasoning", text: "prior reasoning" })
+    }),
+  ),
+)
+
+itPromptRendering.live("session.processor does not retry a prompt rejection after a provider event", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      promptRenderingAttempts = 0
+      promptRenderingRequests = []
+      promptRenderingAfterEvent = true
+      promptRenderingAlwaysFail = false
+      promptRenderingAsEvent = false
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "continue")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(promptRenderingRef.providerID, promptRenderingRef.modelID)
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+      yield* handle.process({
+        user: {
+          id: parent.id, sessionID: chat.id, role: "user", time: parent.time, agent: parent.agent,
+          model: { providerID: promptRenderingRef.providerID, modelID: promptRenderingRef.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id, model: mdl, agent: agent(), system: [],
+        messages: [{ role: "assistant", content: [{ type: "reasoning", text: "private" }] }],
+        tools: {},
+      })
+      expect(promptRenderingAttempts).toBe(1)
+    }),
+  ),
+)
+
+itPromptRendering.live("session.processor stops after one compatibility retry when the hosted model rejects again", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      promptRenderingAttempts = 0
+      promptRenderingRequests = []
+      promptRenderingAfterEvent = false
+      promptRenderingAlwaysFail = true
+      promptRenderingAsEvent = false
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "continue")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(promptRenderingRef.providerID, promptRenderingRef.modelID)
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+      const result = yield* handle.process({
+        user: {
+          id: parent.id, sessionID: chat.id, role: "user", time: parent.time, agent: parent.agent,
+          model: { providerID: promptRenderingRef.providerID, modelID: promptRenderingRef.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id, model: mdl, agent: agent(), system: [],
+        messages: [
+          { role: "assistant", content: [{ type: "reasoning", text: "private" }, { type: "text", text: "visible" }] },
+          { role: "user", content: "continue" },
+        ],
+        tools: {},
+      })
+      expect(result).toBe("stop")
+      expect(promptRenderingAttempts).toBe(2)
+      expect(promptRenderingRequests[1]).toEqual([
+        { role: "assistant", content: [{ type: "text", text: "visible" }] },
+        { role: "user", content: "continue" },
+      ])
+    }),
+  ),
+)
+
+itPromptRendering.live("session.processor recovers from a lone native provider-error event without replaying tools", () =>
+  provideTmpdirInstance((directory) =>
+    Effect.gen(function* () {
+      promptRenderingAttempts = 0
+      promptRenderingRequests = []
+      promptRenderingAfterEvent = false
+      promptRenderingAlwaysFail = false
+      promptRenderingAsEvent = true
+      const processors = yield* SessionProcessor.Service
+      const session = yield* Session.Service
+      const provider = yield* Provider.Service
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "continue")
+      const msg = yield* assistant(chat.id, parent.id, directory)
+      const mdl = yield* provider.getModel(promptRenderingRef.providerID, promptRenderingRef.modelID)
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+      const value = yield* handle.process({
+        user: {
+          id: parent.id, sessionID: chat.id, role: "user", time: parent.time, agent: parent.agent,
+          model: { providerID: promptRenderingRef.providerID, modelID: promptRenderingRef.modelID },
+        } satisfies SessionV1.User,
+        sessionID: chat.id, model: mdl, agent: agent(), system: [],
+        messages: [
+          { role: "assistant", content: [{ type: "reasoning", text: "prior" }, { type: "text", text: "previous" }] },
+          { role: "user", content: "continue" },
+        ],
+        tools: {},
+      })
+      expect(value).toBe("continue")
+      expect(promptRenderingAttempts).toBe(2)
+      expect(promptRenderingRequests[1]).toEqual([
+        { role: "assistant", content: [{ type: "text", text: "previous" }] },
+        { role: "user", content: "continue" },
+      ])
+    }),
+  ),
+)
+
 itCoalesce.live("session.processor effect tests coalesce rapid text deltas into fewer part delta events", () =>
   provideTmpdirInstance(
     (dir) =>
@@ -1761,6 +2372,7 @@ itCoalesce.live("session.processor effect tests coalesce rapid text deltas into 
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
         const deltas: string[] = []
         const livePrefixes: string[] = []
+        const liveReasoning: string[] = []
         const offsets: number[] = []
         const off = yield* events.listen((event) => {
           if (event.type === MessageV2.Event.PartDelta.type) {
@@ -1769,6 +2381,7 @@ itCoalesce.live("session.processor effect tests coalesce rapid text deltas into 
             if (payload.offset !== undefined) offsets.push(payload.offset)
             for (const value of currentParts.snapshot(chat.id, [msg.id])) {
               if (value.type === "text") livePrefixes.push(value.text)
+              if (value.type === "reasoning") liveReasoning.push(value.text)
             }
             if (releaseCoalesce) return Deferred.succeed(releaseCoalesce, undefined).pipe(Effect.asVoid)
           }
@@ -1796,18 +2409,23 @@ itCoalesce.live("session.processor effect tests coalesce rapid text deltas into 
 
         const parts = yield* MessageV2.parts(msg.id)
         const text = parts.find((part): part is SessionV1.TextPart => part.type === "text")
+        const reasoning = parts.find((part): part is SessionV1.ReasoningPart => part.type === "reasoning")
 
         expect(value).toBe("continue")
-        expect(text?.text).toBe("x".repeat(50))
+        expect(text?.text).toBe("x".repeat(10_000))
+        expect(reasoning?.text).toBe("x".repeat(10_000))
         // No content may be lost or reordered by coalescing.
-        expect(deltas.join("")).toBe("x".repeat(50))
-        // 50 provider chunks must not produce 50 publishes.
-        expect(deltas.length).toBeLessThan(50)
+        expect(deltas.join("")).toBe("x".repeat(20_000))
+        // 20,000 text/reasoning chunks must remain a bounded set of publishes.
+        expect(deltas.length).toBeLessThan(20_000)
+        expect(offsets.at(-1)! + deltas.at(-1)!.length).toBe(10_000)
         // An active detail repair can recover already-produced text before the
         // final durable PartUpdated; the borrowed producer state is released
         // after that boundary and cannot leak into a later execution.
         expect(livePrefixes.length).toBeGreaterThan(0)
         expect(livePrefixes.every((text) => text.length > 0)).toBe(true)
+        expect(livePrefixes.at(-1)).toBe("x".repeat(10_000))
+        expect(liveReasoning.at(-1)).toBe("x".repeat(10_000))
         expect(offsets[0]).toBe(0)
         expect(currentParts.snapshot(chat.id, [msg.id])).toEqual([])
       }),

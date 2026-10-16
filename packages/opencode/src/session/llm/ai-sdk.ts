@@ -8,8 +8,12 @@ import { routedAccountFromResponse } from "@/provider/routing-metadata"
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
 
-export function adapterState() {
+export function adapterState(options: { requireChatFinishReason?: boolean } = {}) {
   return {
+    // Session's selected provider protocol owns strictness; other SDK adapters
+    // must not inherit Chat-specific completion assumptions.
+    requireChatFinishReason: options.requireChatFinishReason === true,
+    recognizedChatSteps: 0,
     step: 0,
     text: 0,
     reasoning: 0,
@@ -122,6 +126,14 @@ export function toLLMEvents(
     case "finish-step":
       if (event.rawFinishReason === "network_error")
         return Effect.fail(new ProviderError.ResponseStreamError("Provider finish_reason: network_error"))
+      // @ai-sdk/openai-compatible may synthesize finish-step/finish when SSE
+      // receives [DONE] despite never receiving any model finish_reason. A
+      // transport sentinel is not evidence that inference completed, and V1
+      // must not admit the synthesized terminal event or replay committed tools.
+      if (state.requireChatFinishReason && finishReason(event.finishReason) === "unknown")
+        return Effect.fail(new ProviderError.ResponseStreamError(
+          "OpenAI-compatible stream ended without a recognized finish_reason",
+        ))
       return Effect.sync(() => {
         const original = withRoutingMetadata(providerMetadata(event.providerMetadata), event.response)
         const metadata =
@@ -135,6 +147,7 @@ export function toLLMEvents(
                 },
               }
         state.copilotTotalNanoAiu = undefined
+        if (state.requireChatFinishReason) state.recognizedChatSteps++
         return [
           LLMEvent.stepFinish({
             index: state.step++,
@@ -147,6 +160,10 @@ export function toLLMEvents(
       })
 
     case "finish":
+      if (state.requireChatFinishReason && state.recognizedChatSteps === 0)
+        return Effect.fail(new ProviderError.ResponseStreamError(
+          "OpenAI-compatible stream ended without a completed model step",
+        ))
       return Effect.sync(() => {
         const events = [
           LLMEvent.finish({
@@ -157,7 +174,7 @@ export function toLLMEvents(
         ]
         // Reset so the adapter can be reused for a follow-up stream without leaking
         // counters or block IDs. adapterState() is the single source of truth for shape.
-        Object.assign(state, adapterState())
+        Object.assign(state, adapterState({ requireChatFinishReason: state.requireChatFinishReason }))
         return events
       })
 

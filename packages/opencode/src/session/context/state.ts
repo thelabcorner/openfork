@@ -86,6 +86,8 @@ export const isExcluded = Effect.fn("SessionContextState.isExcluded")(function* 
 export const applyOps = Effect.fn("SessionContextState.applyOps")(function* (input: {
   sessionID: SessionID
   operations: SessionContext.ContextOperation[]
+  /** Optional host admission; runs inside EventV2's writer transaction before projectors. */
+  admit?: (seq: number) => Effect.Effect<void>
 }) {
   const events = yield* EventV2Bridge.Service
   const now = Date.now()
@@ -100,14 +102,16 @@ export const applyOps = Effect.fn("SessionContextState.applyOps")(function* (inp
     batchID,
     operations: input.operations as any,
     timestamp: now,
-  })
+  }, { admit: input.admit })
 
   return { batchID, timestamp: now }
 })
 
 export const getOpsHistory = Effect.fn("SessionContextState.getOpsHistory")(function* (sessionID: SessionID) {
-  const { db } = yield* Database.Service
-  const rows = yield* db
+  // Audit inspection is a committed, read-only query. Avoid blocking the
+  // primary EventV2 append/projector writer permit on transcript-sized logs.
+  const { readDb } = yield* Database.Service
+  const rows = yield* readDb
     .select()
     .from(SessionContextOpsTable)
     .where(eq(SessionContextOpsTable.session_id, sessionID))
@@ -123,8 +127,8 @@ export const getOpsHistory = Effect.fn("SessionContextState.getOpsHistory")(func
 })
 
 export const getForkOrigin = Effect.fn("SessionContextState.getForkOrigin")(function* (sessionID: SessionID) {
-  const { db } = yield* Database.Service
-  const row = yield* db
+  const { readDb } = yield* Database.Service
+  const row = yield* readDb
     .select()
     .from(SessionForkOriginTable)
     .where(eq(SessionForkOriginTable.session_id, sessionID))
