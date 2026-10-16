@@ -1,13 +1,12 @@
-import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, type Ref } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Ref } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { createMutation } from "@tanstack/solid-query"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import type { ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
-import { displayName, projectForSession } from "@/pages/layout/helpers"
+import { projectForSessionIndexed } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
 import type { GroupTab } from "@/context/tabs"
@@ -15,12 +14,9 @@ import type { AppTabPage } from "@/context/app-tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
+import { stopSession } from "@/utils/session-stop"
+import { showToast } from "@/utils/toast"
 import "./titlebar-tab-nav.css"
-
-const PREVIEW_BOOTSTRAP_DELAY = 450
-const TabPreviewPopover = lazy(() =>
-  import("./titlebar-tab-popover").then((module) => ({ default: module.TabPreviewPopover })),
-)
 
 // MouseEvent.button uses 1 for the middle/wheel button.
 const MIDDLE_MOUSE_BUTTON = 1
@@ -47,7 +43,9 @@ export function TabNavItem(props: {
   const [editing, setEditing] = createSignal(false)
   let tabRoot!: HTMLDivElement
   let titleEl!: HTMLSpanElement
-  const rename = createMutation(() => ({ mutationFn: props.onRename }))
+  // The tab needs only a mutually exclusive rename action, not one TanStack
+  // mutation observer and query-client subscription per rendered tab.
+  let renamePending = false
 
   const closeTab = (event: MouseEvent) => {
     event.preventDefault()
@@ -64,7 +62,7 @@ export function TabNavItem(props: {
   const project = createMemo(() => {
     const session = props.session()
     if (!session) return
-    return projectForSession(session, serverCtx()?.projects.list() ?? [])
+    return projectForSessionIndexed(session, serverCtx()?.projects.index())
   })
   const title = createMemo(() => props.session()?.title ?? props.fallbackTitle)
 
@@ -73,46 +71,15 @@ export function TabNavItem(props: {
     const api = sessionApiOf(serverCtx())
     const state = sessionState()
     if (!id || !api) return
-    if (state === "working") void api.interrupt({ sessionID: id })
+    if (state === "working" || state === "interrupted") {
+      void stopSession(api, id).catch((error) => showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: error instanceof Error ? error.message : String(error),
+      }))
+    }
     else if (state === "paused") void api.resume({ sessionID: id })
   }
-
-  const projectName = createMemo(() => {
-    const session = props.session()
-    if (!session) return
-    return displayName(project() ?? { worktree: session.directory })
-  })
-  const previewPath = createMemo(() => {
-    const session = props.session()
-    if (!session) return
-    const home = serverCtx()?.sync.data.path.home
-    return home ? session.directory.replace(home, "~") : session.directory
-  })
-  const serverLabel = () => props.serverLabel?.()
-
-  const [popoverOpen, setPopoverOpen] = createSignal(false)
-  const [previewRuntimeRequested, setPreviewRuntimeRequested] = createSignal(false)
-  let previewBootstrapTimer: ReturnType<typeof setTimeout> | undefined
-  const previewBlocked = () => !!props.dragging || editing() || !!props.pressed || !props.session()
-
-  const cancelPreviewBootstrap = () => {
-    if (previewBootstrapTimer === undefined) return
-    clearTimeout(previewBootstrapTimer)
-    previewBootstrapTimer = undefined
-  }
-
-  const bootstrapPreview = () => {
-    if (previewRuntimeRequested() || previewBlocked()) return
-    cancelPreviewBootstrap()
-    previewBootstrapTimer = setTimeout(() => {
-      previewBootstrapTimer = undefined
-      if (previewBlocked() || !tabRoot?.matches(":hover")) return
-      setPreviewRuntimeRequested(true)
-      setPopoverOpen(true)
-    }, PREVIEW_BOOTSTRAP_DELAY)
-  }
-
-  onCleanup(cancelPreviewBootstrap)
 
   const selectTitle = () => {
     const range = document.createRange()
@@ -123,7 +90,7 @@ export function TabNavItem(props: {
   }
 
   const closeRename = async (save: boolean) => {
-    if (rename.isPending || !editing()) return
+    if (renamePending || !editing()) return
 
     const original = props.session()?.title ?? ""
     const next = (titleEl.textContent ?? "").trim()
@@ -135,7 +102,12 @@ export function TabNavItem(props: {
       return
     }
 
-    await rename.mutateAsync(next)
+    renamePending = true
+    try {
+      await props.onRename(next)
+    } finally {
+      renamePending = false
+    }
   }
 
   createEffect(() => {
@@ -149,7 +121,7 @@ export function TabNavItem(props: {
   const openRename = (event: MouseEvent) => {
     event.preventDefault()
     event.stopPropagation()
-    if (!canOpenTabRename(props.dragging, editing(), rename.isPending)) return
+    if (!canOpenTabRename(props.dragging, editing(), renamePending)) return
     const session = props.session()
     if (!session) return
     titleEl.textContent = session.title
@@ -194,11 +166,6 @@ export function TabNavItem(props: {
       data-active={props.active}
       data-dragging={props.dragging}
       data-state={props.active || props.pressed ? "pressed" : undefined}
-      onPointerEnter={bootstrapPreview}
-      onPointerLeave={() => {
-        cancelPreviewBootstrap()
-        if (!previewRuntimeRequested()) setPopoverOpen(false)
-      }}
       onMouseDown={(event) => {
         if (event.button !== MIDDLE_MOUSE_BUTTON) return
         event.preventDefault()
@@ -266,6 +233,7 @@ export function TabNavItem(props: {
                       directory={session.directory}
                       sessionId={session.id}
                       server={props.server}
+                      serverCtx={props.serverCtx}
                     />
                   )}
                 </Show>
@@ -317,12 +285,12 @@ export function TabNavItem(props: {
         />
       </a>
 
-      <Show when={sessionState() === "working" || sessionState() === "paused"}>
+      <Show when={sessionState() === "working" || sessionState() === "paused" || sessionState() === "interrupted"}>
         <div data-slot="tab-state">
           <IconButtonV2
             size="small"
             variant="ghost-muted"
-            data-tab-action={sessionState() === "working" ? "stop" : "resume"}
+            data-tab-action={sessionState() === "paused" ? "resume" : "stop"}
             class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
             onPointerDown={(event) => {
               event.preventDefault()
@@ -333,9 +301,9 @@ export function TabNavItem(props: {
               event.stopPropagation()
               runStateAction()
             }}
-            icon={<IconV2 name={sessionState() === "working" ? "stop" : "play"} />}
+            icon={<IconV2 name={sessionState() === "paused" ? "play" : "stop"} />}
             aria-label={
-              sessionState() === "working" ? language.t("common.stopSession") : language.t("common.resumeSession")
+              sessionState() === "paused" ? language.t("common.resumeSession") : language.t("common.stopSession")
             }
           />
         </div>
@@ -346,7 +314,8 @@ export function TabNavItem(props: {
           variant="ghost-muted"
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
           onPointerDown={(event) => {
-            event.preventDefault()
+            // Exclude this control from drag activation without canceling the
+            // native pointer sequence (which can suppress synthesized clicks).
             event.stopPropagation()
           }}
           onClick={closeTab}
@@ -357,31 +326,7 @@ export function TabNavItem(props: {
     </div>
   )
 
-  return (
-    <Show when={previewRuntimeRequested()} fallback={tab}>
-      <Suspense fallback={tab}>
-        <TabPreviewPopover
-          trigger={tab}
-          open={popoverOpen() && !previewBlocked()}
-          onOpenChange={(value) => {
-            if (value && previewBlocked()) return
-            setPopoverOpen(value)
-          }}
-          data={{
-            project: project(),
-            directory: props.session()?.directory,
-            projectName: projectName(),
-            title: props.session()?.title,
-            path: previewPath(),
-            serverName: serverLabel(),
-          }}
-          server={props.server}
-          serverCtx={props.serverCtx}
-          currentSessionID={sessionID()}
-        />
-      </Suspense>
-    </Show>
-  )
+  return tab
 }
 
 export function DraftTabItem(props: {
@@ -465,11 +410,11 @@ export function DraftTabItem(props: {
           size="small"
           variant="ghost-muted"
           onPointerDown={(event) => {
-            event.preventDefault()
+            // Exclude this control from drag activation without canceling the
+            // native pointer sequence (which can suppress synthesized clicks).
             event.stopPropagation()
           }}
           onMouseDown={(event) => {
-            event.preventDefault()
             event.stopPropagation()
           }}
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
@@ -567,11 +512,11 @@ export function AppTabItem(props: {
           size="small"
           variant="ghost-muted"
           onPointerDown={(event) => {
-            event.preventDefault()
+            // Exclude this control from drag activation without canceling the
+            // native pointer sequence (which can suppress synthesized clicks).
             event.stopPropagation()
           }}
           onMouseDown={(event) => {
-            event.preventDefault()
             event.stopPropagation()
           }}
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100"
@@ -606,9 +551,6 @@ export function GroupTabNavItem(props: {
     event.stopPropagation()
     props.onClose()
   }
-  const [popoverOpen, setPopoverOpen] = createSignal(false)
-  const previewBlocked = () => !!props.dragging || !!props.pressed
-
   const tab = (
     <div
       ref={(el) => forwardTabRef(props.ref, el)}
@@ -674,11 +616,11 @@ export function GroupTabNavItem(props: {
           size="small"
           variant="ghost-muted"
           onPointerDown={(event) => {
-            event.preventDefault()
+            // Exclude this control from drag activation without canceling the
+            // native pointer sequence (which can suppress synthesized clicks).
             event.stopPropagation()
           }}
           onMouseDown={(event) => {
-            event.preventDefault()
             event.stopPropagation()
           }}
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
@@ -690,20 +632,5 @@ export function GroupTabNavItem(props: {
     </div>
   )
 
-  return (
-    <TabPreviewPopover
-      trigger={tab}
-      open={popoverOpen() && !previewBlocked()}
-      onOpenChange={(value) => {
-        if (value && previewBlocked()) return
-        setPopoverOpen(value)
-      }}
-      data={{
-        title: props.title,
-      }}
-      server={props.tab.server}
-      serverCtx={props.serverCtx}
-      groupID={props.tab.groupId}
-    />
-  )
+  return tab
 }

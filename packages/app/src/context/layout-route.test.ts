@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { ServerConnection } from "./server"
+import type { ServerConnection } from "./server"
 import { legacySessionHref, sessionHref } from "@/utils/session-route"
 import { currentRoute } from "./layout-route"
 
@@ -15,8 +15,10 @@ describe("currentRoute", () => {
   // Regression: `/oxp/activity/:id` used to fall through to the directory
   // branch, fail to base64-decode "oxp", and report "home" — which left the
   // titlebar highlighting Home while the OXP tab was the open tab.
-  test("resolves a selected OXP activity to the OXP tab", () => {
-    expect(currentRoute("/oxp/activity/oxpa_example", "")).toEqual({ type: "oxp" })
+  test("resolves selected OXP activity identity for independently highlighted tabs", () => {
+    expect(currentRoute("/oxp/activity/oxpa_example", "")).toEqual({ type: "oxp", activityID: "oxpa_example" })
+    expect(currentRoute("/oxp/activity/oxpa_other", "")).toEqual({ type: "oxp", activityID: "oxpa_other" })
+    expect(currentRoute("/oxp/activity/a%20b", "")).toEqual({ type: "oxp", activityID: "a b" })
   })
 
   test("leaves malformed app-tab paths on home", () => {
@@ -25,7 +27,7 @@ describe("currentRoute", () => {
   })
 
   test("still resolves session routes", () => {
-    expect(currentRoute(sessionHref(ServerConnection.Key.make("local"), "ses_1"), "")).toMatchObject({
+    expect(currentRoute(sessionHref("local" as ServerConnection.Key, "ses_1"), "")).toMatchObject({
       type: "session",
       sessionId: "ses_1",
     })

@@ -86,6 +86,7 @@ import {
 import { ProjectDragOverlay, SortableProject, type ProjectSidebarContext } from "./layout/sidebar-project"
 import { SidebarContent } from "./layout/sidebar-shell"
 import { useSettingsNavigation } from "@/components/settings-v2/navigation"
+import { sessionStatusIsWorking } from "@/utils/session-status"
 
 export default function LegacyLayout(props: ParentProps) {
   const serverSDK = useServerSDK()
@@ -1947,7 +1948,7 @@ export default function LegacyLayout(props: ParentProps) {
       const next = new Set<string>()
       const statuses = serverSync().session.data.session_status
       for (const [sessionID, status] of Object.entries(statuses)) {
-        if ((status?.type ?? "idle") === "idle") continue
+        if (!sessionStatusIsWorking(status?.type)) continue
         const directory = serverSync().session.get(sessionID)?.directory
         if (!directory) continue
         next.add(pathKey(directory))

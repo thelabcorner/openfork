@@ -1,6 +1,6 @@
 import type { ServerCtx } from "@/context/global"
 
-export type TabSessionState = "idle" | "working" | "paused"
+export type TabSessionState = "idle" | "working" | "paused" | "interrupted"
 
 // The `session_paused` accessor lands with the app-state sidecar (slice 2); read it
 // defensively so the tab degrades to today's behavior until that ships. It is NEVER
@@ -11,6 +11,9 @@ const sessionPaused = (ctx: ServerCtx | undefined, sessionID: string) =>
 
 export function tabSessionState(ctx: ServerCtx | undefined, sessionID: string | undefined): TabSessionState {
   if (!ctx || !sessionID) return "idle"
+  // A fenced but unverified generation is not actually executing. Expose a
+  // repair-capable Stop rather than a counterfeit working spinner.
+  if (ctx.sync.session.data.session_status[sessionID]?.type === "interrupted") return "interrupted"
   if (sessionPaused(ctx, sessionID)) return "paused"
   return ctx.sync.session.data.session_working(sessionID) ? "working" : "idle"
 }

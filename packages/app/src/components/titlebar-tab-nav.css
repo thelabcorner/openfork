@@ -80,6 +80,15 @@
   color: var(--v2-state-fg-danger);
 }
 
+/* Opacity alone does NOT remove a control from hit testing. Invisible
+   close/state buttons must never steal the first click on an inactive tab. */
+@media (hover: hover) {
+  [data-titlebar-tab]:not(:hover):not([data-active="true"]):not(:focus-within)
+    :is([data-slot="tab-close"], [data-slot="tab-state"]) {
+    pointer-events: none;
+  }
+}
+
 /* Hover-reveal also reveals on keyboard focus so the action button is reachable
    and visible when tabbing through the tab (link -> state -> close). */
 [data-titlebar-tab] [data-slot="tab-state"] button:focus-visible {
@@ -98,6 +107,13 @@
   /* Hard floor: icon (16px) + horizontal padding (2×6px) = 28px.
      Tabs never fully collapse — always at least an icon remains tappable. */
   min-width: 28px;
+}
+
+/* One strip-owned intersection observer marks horizontally clipped tabs.
+   Working-session dots retain their exact animation while on screen, but the
+   25 opacity animations per offscreen spinner stop consuming frame work. */
+[data-titlebar-tab-slot][data-tab-offscreen] [data-component="session-progress-indicator-v2"] [data-dot] {
+  animation-play-state: paused;
 }
 
 [data-color-scheme="dark"] [data-titlebar-tab-slot] {
@@ -201,6 +217,14 @@
    Triggering slightly earlier gives inactive tabs more room before they need
    to scroll — they show icon only at ~52px wide, which is still a clean tap target. */
 @container (max-width: 52px) {
+  /* At the 28px tab floor an absolute 20px close button covers the icon.
+     An inactive compact tab must select on the first click, not close. */
+  [data-titlebar-tab]:not([data-active="true"]):not(:focus-within)
+    :is([data-slot="tab-close"], [data-slot="tab-state"]) {
+    opacity: 0;
+    pointer-events: none;
+  }
+
   [data-titlebar-tab-link] {
     justify-content: center;
     gap: 0;

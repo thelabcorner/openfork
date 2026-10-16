@@ -1,5 +1,5 @@
-import { createEffect, createMemo, createResource, For, onCleanup, onMount, Show } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createEffect, createMemo, createResource, createSignal, For, lazy, on, onCleanup, onMount, Show, Suspense } from "solid-js"
+import { createStore, produce } from "solid-js/store"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
 import { isSortable, useSortable } from "@dnd-kit/solid/sortable"
@@ -17,8 +17,17 @@ import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
 import { showToast } from "@/utils/toast"
 import { useSessionGroups } from "@/context/session-groups"
+import { useOxpActivity } from "@/context/oxp-activity"
+import { oxpActivityIDFromHref } from "@/context/app-tabs"
 import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
-import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
+import { adjacentTabKey, mergeVisibleTabOrder, projectTabOrder, staleTabVisibilityKeys } from "./titlebar-tab-order"
+import { trackTabStripVisibility } from "./titlebar-tab-visibility"
+import { indexTabServerContexts } from "./titlebar-tab-servers"
+import { createTabPreviewController } from "./titlebar-tab-preview-controller"
+
+const SharedTabPreview = lazy(() =>
+  import("./titlebar-tab-popover").then((module) => ({ default: module.TabPreviewPopover })),
+)
 import type { Session } from "@opencode-ai/sdk/v2"
 
 function SessionTabSlot(props: {
@@ -101,7 +110,11 @@ function SessionTabEntry(props: {
     () => {
       if (!props.active()) return null
       const ctx = props.serverCtx()
-      return ctx ? { id: props.tab.sessionId, ctx } : null
+      // The shared session store is authoritative. A warm tab revisit should
+      // not schedule a resource/promise lifecycle just to resolve an already
+      // available session. On cache eviction, the missing active tab still
+      // resolves at critical priority exactly as before.
+      return ctx && !cachedSession() ? { id: props.tab.sessionId, ctx } : null
     },
     ({ id, ctx }) => ctx.sync.session.resolve(id, { priority: "critical" }).catch(() => undefined),
   )
@@ -375,26 +388,101 @@ export function TitlebarTabStrip(props: {
 }) {
   const global = useGlobal()
   const language = useLanguage()
+  const oxpActivity = useOxpActivity()
+  const tabs = useTabs()
   const command = useCommand()
   let scrollRef!: HTMLDivElement
   let listRef!: HTMLDivElement
+  // Exactly one intent controller for the entire tab strip, not one per tab.
+  const preview = createTabPreviewController()
+  const [previewRequested, setPreviewRequested] = createSignal(false)
+  createEffect(() => {
+    if (preview.current()) setPreviewRequested(true)
+  })
   let resizeFrame: number | undefined
   const [visibility, setVisibility] = createStore<Record<string, boolean>>({})
-  const visibleTabs = createMemo(() =>
-    props.tabs.filter((tab) => tab.type === "draft" || tab.type === "app" || visibility[tabKey(tab)]),
+  // A window can open/close thousands of tabs without remounting this strip.
+  // Prune only when the tab collection changes, not on session/status updates.
+  createEffect(on(
+    () => props.tabs.map(tabKey),
+    (keys) => {
+      const stale = staleTabVisibilityKeys(visibility, keys)
+      if (!stale.length) return
+      setVisibility(produce((state) => {
+        for (const key of stale) delete state[key]
+      }))
+    },
+  ))
+  const tabOrder = createMemo(() =>
+    projectTabOrder(props.tabs, tabKey, (tab, key) => tab.type === "draft" || tab.type === "app" || !!visibility[key]),
   )
-  const visibleTabIds = () => visibleTabs().map(tabKey)
-  const visibleIndexMap = createMemo(() => {
-    const map = new Map<string, number>()
-    visibleTabs().forEach((tab, i) => map.set(tabKey(tab), i))
-    return map
-  })
+  const visibleTabs = () => tabOrder().visible
+  const visibleTabIds = () => tabOrder().ids
+  const visibleIndexMap = () => tabOrder().index
   const serverConnections = createMemo(() => {
     const map = new Map<ServerConnection.Key, ReturnType<typeof global.servers.list>[number]>()
     for (const connection of global.servers.list()) map.set(ServerConnection.key(connection), connection)
     return map
   })
+  const serverContexts = createMemo(() =>
+    indexTabServerContexts(props.tabs, serverConnections(), (connection) => global.ensureServerCtx(connection)),
+  )
   const multipleServers = createMemo(() => serverConnections().size > 1)
+
+  // Delegation avoids reactive owners, timers, portals and pointer wrappers on
+  // every tab. The inspector resolves data only after a completed hover dwell.
+  const tabAnchor = (target: EventTarget | null) =>
+    target instanceof Element ? target.closest<HTMLElement>("[data-titlebar-tab]") : null
+  const hoverTab = (event: PointerEvent) => {
+    if (event.pointerType === "touch") return
+    const anchor = tabAnchor(event.target)
+    if (!anchor || !listRef.contains(anchor)) return
+    if (event.relatedTarget instanceof Node && anchor.contains(event.relatedTarget)) return
+    if (isTabActionTarget(event.target)) return
+    if (anchor.dataset.dragging === "true" || anchor.dataset.editing === "true") return
+    const key = anchor.closest<HTMLElement>("[data-titlebar-tab-slot]")?.dataset.tabKey
+    const tab = key ? tabOrder().byKey.get(key) : undefined
+    if (!tab || (tab.type !== "session" && tab.type !== "group")) return
+    const ctx = () => serverContexts().get(tab.server)
+    preview.hover({
+      anchor,
+      tab,
+      serverCtx: ctx,
+      serverLabel: () => {
+        if (!multipleServers()) return
+        const conn = serverConnections().get(tab.server)
+        return conn ? serverName(conn) : undefined
+      },
+    })
+  }
+  const leaveTab = (event: PointerEvent) => {
+    const anchor = tabAnchor(event.target)
+    if (!anchor || (event.relatedTarget instanceof Node && anchor.contains(event.relatedTarget))) return
+    preview.leave(anchor)
+  }
+  const previewVisible = createMemo(() => !!preview.current())
+  createEffect(() => {
+    if (!previewVisible()) return
+    // Electron/Windows may omit pointerleave as the mouse leaves the OS window.
+    // Install global dismissal only during a visible preview: no idle listeners.
+    const onBlur = () => preview.close(true)
+    const onVisibility = () => {
+      if (document.hidden) preview.close(true)
+    }
+    window.addEventListener("blur", onBlur)
+    document.addEventListener("visibilitychange", onVisibility)
+    onCleanup(() => {
+      window.removeEventListener("blur", onBlur)
+      document.removeEventListener("visibilitychange", onVisibility)
+    })
+  })
+  createEffect(() => {
+    const active = preview.current()
+    if (!active) return
+    const key = tabKey(active.tab)
+    if (!tabOrder().byKey.has(key) || !visibleIndexMap().has(key) || !active.anchor.isConnected)
+      preview.close(true)
+  })
 
   command.register("titlebar-tab-cycle", () => [
     {
@@ -435,7 +523,7 @@ export function TitlebarTabStrip(props: {
   function selectAdjacentTab(offset: -1 | 1) {
     const current = props.currentTab()
     const key = adjacentTabKey(visibleTabIds(), current ? tabKey(current) : undefined, offset)
-    const next = props.tabs.find((tab) => tabKey(tab) === key)
+    const next = key ? tabOrder().byKey.get(key) : undefined
     if (next) props.onNavigate(next)
   }
 
@@ -458,6 +546,15 @@ export function TitlebarTabStrip(props: {
 
   onMount(() => {
     scheduleOverflow()
+    const stopVisibilityTracking = trackTabStripVisibility(scrollRef, listRef)
+    // Capture without preventDefault: close/activate gestures must never be
+    // swallowed by a hover component or nested stopPropagation handler.
+    const dismiss = () => preview.close(true)
+    scrollRef.addEventListener("pointerdown", dismiss, true)
+    onCleanup(() => {
+      scrollRef.removeEventListener("pointerdown", dismiss, true)
+      stopVisibilityTracking()
+    })
   })
 
   onCleanup(() => {
@@ -476,6 +573,10 @@ export function TitlebarTabStrip(props: {
         data-slot="titlebar-tabs-scroll"
         class="flex min-w-0 h-full flex-row items-center gap-1.5 overflow-x-auto no-scrollbar [app-region:no-drag]"
         ref={scrollRef}
+        onScroll={() => preview.close(true)}
+        onPointerOver={hoverTab}
+        onPointerOut={leaveTab}
+        onPointerCancel={() => preview.close(true)}
       >
         <DragDropProvider
           sensors={[
@@ -494,9 +595,10 @@ export function TitlebarTabStrip(props: {
             Feedback.configure({ dropAnimation: null }),
           ]}
           onDragStart={(event) => {
+            preview.close(true)
             const source = event.operation.source
             if (!source) return
-            const tab = props.tabs.find((item) => tabKey(item) === source.id.toString())
+            const tab = tabOrder().byKey.get(source.id.toString())
             if (!tab) return
             const tabEl = source.element?.querySelector<HTMLDivElement>("[data-titlebar-tab]")
             props.onNavigate(tab, tabEl ?? undefined)
@@ -510,7 +612,7 @@ export function TitlebarTabStrip(props: {
             if (initialIndex !== index) {
               props.onReorder(
                 mergeVisibleTabOrder(
-                  props.tabs.map(tabKey),
+                  tabOrder().allKeys,
                   current,
                   arrayMove(current, source.initialIndex, source.index),
                 ),
@@ -525,11 +627,12 @@ export function TitlebarTabStrip(props: {
                 let ref!: HTMLDivElement
                 const visibleIndex = () => visibleIndexMap().get(id) ?? -1
                 const pending = () => props.pendingTabKey?.() === id
-                const serverCtx = createMemo(() => {
-                  if (tab.type === "app") return
-                  const conn = serverConnections().get(tab.server)
-                  if (conn) return global.ensureServerCtx(conn)
-                })
+                // Keep each tab's equality-checked memo: a reorder rebuilds
+                // the shared index but must not invalidate every downstream
+                // session/status/avatar owner when its ServerCtx is unchanged.
+                const serverCtx = createMemo(() =>
+                  tab.type === "app" ? undefined : serverContexts().get(tab.server),
+                )
                 const serverLabel = () => {
                   if (tab.type === "app") return
                   if (!multipleServers()) return
@@ -538,10 +641,29 @@ export function TitlebarTabStrip(props: {
                 }
 
                 if (tab.type === "app") {
+                  const activityID = tab.page === "oxp"
+                    ? oxpActivityIDFromHref(tab.href)
+                    : undefined
+                  const oxpTitle = () => {
+                    const summary = activityID ? oxpActivity.activity(activityID) : undefined
+                    return summary?.title ?? summary?.lastRootAlias
+                  }
+                  // Persist the compact title projection, so inactive OXP tabs
+                  // retain useful labels across restarts without forcing a
+                  // transcript fetch (or one HTTP request per restored tab).
+                  if (activityID) {
+                    createEffect(() => {
+                      const value = oxpTitle()
+                      if (value) tabs.rememberAppTabTitle(tab, value)
+                    })
+                  }
                   const title = () => {
                     if (tab.page === "settings") return language.t("sidebar.settings")
                     if (tab.page === "usage") return language.t("usage.panel.title")
-                    if (tab.page === "oxp") return language.t("oxpActivity.tab.title")
+                    if (tab.page === "oxp") {
+                      if (!activityID) return language.t("oxpActivity.tab.title")
+                      return oxpTitle() ?? tabs.info[id]?.title ?? language.t("oxpActivity.untitled")
+                    }
                     if (tab.page === "agents") return language.t("agents.title")
                     return language.t("scheduledTasks.title")
                   }
@@ -623,6 +745,17 @@ export function TitlebarTabStrip(props: {
           </div>
         </DragDropProvider>
       </div>
+      <Show when={previewRequested()}>
+        <Suspense>
+          <SharedTabPreview
+            intent={preview.current}
+            onContentEnter={preview.contentEnter}
+            onContentLeave={preview.contentLeave}
+            onContextMenuOpenChange={preview.contextMenuOpenChange}
+            onClose={() => preview.close(true)}
+          />
+        </Suspense>
+      </Show>
       <div
         data-slot="titlebar-tabs-fade-left"
         aria-hidden="true"

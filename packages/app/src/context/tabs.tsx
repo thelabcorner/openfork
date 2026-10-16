@@ -11,10 +11,13 @@ import { uuid } from "@/utils/uuid"
 import { SessionTabsRemovedDetail } from "@/components/titlebar-session-events"
 import { sessionHref } from "@/utils/session-route"
 import { createTabMemory } from "./tab-memory"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 import { nextTabAfterClose, pushClosedTab, removeClosedTabs, takeClosedTab, type ClosedTab } from "./closed-tabs"
 import type { PromptModel } from "./prompt-state"
 import { migrateTabs } from "./tab-migration"
+import { appendSessionTabs, missingSessionTabs } from "./tab-session-batch"
 import {
+  appTabKey,
   appTabPageFromPathname,
   normalizeAppTabHref,
   type AppTabPage,
@@ -75,7 +78,7 @@ export const tabHref = (tab: Tab) => {
 }
 
 export const tabKey = (tab: Tab) => {
-  if (tab.type === "app") return `app:${tab.page}`
+  if (tab.type === "app") return appTabKey(tab.page, tab.href)
   if (tab.type === "draft") return `draft:${tab.draftID}`
   return `${tab.server}\n${tabHref(tab)}`
 }
@@ -110,6 +113,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
     let setRecentPersist: typeof setRecent | undefined
     let setInfoPersist: typeof setInfo | undefined
     let setClosedPersist: typeof setClosed | undefined
+    const pendingInfoPersist = new Set<string>()
 
     const owner = getOwner()
     const afterFirstPaint = (fn: () => void) => {
@@ -144,6 +148,13 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
           for (const key of Object.keys(info)) next[key] = info[key]
           setInfo(reconcile(next))
           setInfoPersist = pSetInfo
+          // Titles can arrive from the live OXP summary before delayed
+          // storage hydration. Flush those early writes exactly once; don't
+          // lose them merely because the title has not changed again.
+          for (const key of pendingInfoPersist) {
+            if (info[key]) pSetInfo(key, info[key])
+          }
+          pendingInfoPersist.clear()
         })
         createEffect(() => {
           if (!pClosedReady()) return
@@ -184,11 +195,12 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
 
     const upsertAppTab = (page: AppTabPage, href?: string) => {
       const next: AppTab = { type: "app", page, href: normalizeAppTabHref(page, href) }
-      const index = store.findIndex((tab) => tab.type === "app" && tab.page === page)
+      const key = tabKey(next)
+      const index = store.findIndex((tab) => tab.type === "app" && tabKey(tab) === key)
       if (index === -1) {
         setStore(
           produce((tabs) => {
-            if (tabs.some((tab) => tab.type === "app" && tab.page === page)) return
+            if (tabs.some((tab) => tab.type === "app" && tabKey(tab) === key)) return
             tabs.push(next)
           }),
         )
@@ -273,7 +285,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
     createEffect(() => {
       if (!closedReady()) return
       const servers = new Set(server.list.map(ServerConnection.key))
-      const next = closed.filter((entry) => servers.has(entry.tab.server))
+      const next = closed.filter((entry) => entry.tab.type === "app" || servers.has(entry.tab.server))
       if (next.length !== closed.length) {
         setClosed(() => next)
         setClosedPersist?.(() => next)
@@ -336,7 +348,9 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
 
       for (const { index, tab } of targets) {
         closed.add(tabKey(tab))
-        if (tab.type === "session") updateClosed((stack) => pushClosedTab(stack, tab, index))
+        if (tab.type === "session" || (tab.type === "app" && tab.page === "oxp")) {
+          updateClosed((stack) => pushClosedTab(stack, tab, index))
+        }
       }
 
       void startTransition(() => {
@@ -374,6 +388,19 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
     }
 
     const actions = {
+      // One store transaction for bulk open from the session hover inspector.
+      // Re-check against the live store inside the transition so an unrelated
+      // tab opened between scheduling and execution cannot be duplicated.
+      addSessionTabs: (input: { server: ServerConnection.Key; sessionIds: Iterable<string> }) => {
+        const incoming = [...input.sessionIds]
+        if (!incoming.length) return
+        void startTransition(() => {
+          setStore(produce((tabs) => {
+            const missing = missingSessionTabs(tabs, input.server, incoming)
+            appendSessionTabs(tabs, missing)
+          }))
+        })
+      },
       addSessionTab: (tab: Omit<SessionTab, "type">) => {
         const next = { type: "session" as const, ...tab }
         const existing = store.find((item) => tabKey(item) === tabKey(next))
@@ -423,6 +450,9 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         return tab
       },
       async newDraft(draft: Omit<DraftTab, "type" | "draftID">, prompt?: string, model?: PromptModel) {
+        if (!isAbsoluteWorkspaceDirectory(draft.directory)) {
+          throw new Error("Cannot create a session draft without an explicit absolute workspace directory")
+        }
         const draftID = uuid()
         const tab = { type: "draft" as const, draftID, ...draft }
         const { createDraftPromptSession } = await loadPromptRuntime()
@@ -470,7 +500,9 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       closeTab(index: number) {
         const tab = store[index]
         if (!tab) return
-        if (tab.type === "session") updateClosed((stack) => pushClosedTab(stack, tab, index))
+        if (tab.type === "session" || (tab.type === "app" && tab.page === "oxp")) {
+          updateClosed((stack) => pushClosedTab(stack, tab, index))
+        }
         removeTab(index)
       },
       // Batch closes reuse closeTab per target index in descending order so
@@ -532,8 +564,25 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         )
         if (index !== -1) removeTab(index)
       },
+      removeOxpActivityTab(activityID: string) {
+        const key = appTabKey("oxp", `/oxp/activity/${encodeURIComponent(activityID)}`)
+        updateClosed((stack) =>
+          stack.filter((entry) => entry.tab.type !== "app" || tabKey(entry.tab) !== key),
+        )
+        const index = store.findIndex((tab) => tab.type === "app" && tabKey(tab) === key)
+        if (index !== -1) removeTab(index)
+      },
+      rememberAppTabTitle(tab: AppTab, title: string) {
+        const key = tabKey(tab)
+        const current = info[key]
+        if (current?.title === title) return
+        const next = { ...current, title }
+        setInfo(key, next)
+        if (setInfoPersist) setInfoPersist(key, next)
+        else pendingInfoPersist.add(key)
+      },
       removeServer(key: ServerConnection.Key) {
-        updateClosed((stack) => stack.filter((entry) => entry.tab.server !== key))
+        updateClosed((stack) => stack.filter((entry) => entry.tab.type === "app" || entry.tab.server !== key))
         const drafts = store.flatMap((tab) => (tab.type === "draft" && tab.server === key ? [tab.draftID] : []))
         const removed = store.filter((tab) => tab.type !== "app" && tab.server === key).map(tabKey)
         setStore((tabs) => tabs.filter((tab) => tab.type === "app" || tab.server !== key))

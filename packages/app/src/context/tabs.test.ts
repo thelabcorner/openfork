@@ -6,7 +6,8 @@ import type { SessionTab, Tab } from "./tabs"
 import type { useTabs } from "./tabs"
 import { migrateTabs } from "./tab-migration"
 import type { ServerConnection } from "./server"
-import { appTabPageFromPathname, normalizeAppTabHref } from "./app-tabs"
+import { appTabKey, appTabPageFromPathname, normalizeAppTabHref, oxpActivityIDFromPathname } from "./app-tabs"
+import { isAbsoluteWorkspaceDirectory } from "@/utils/path-key"
 
 const server = "local\nhttp://localhost:4096" as ServerConnection.Key
 
@@ -30,6 +31,35 @@ describe("tab migration", () => {
     expect(migrateTabs({}, server)).toEqual([])
   })
 
+  test("drops drafts without an explicit absolute workspace location", () => {
+    expect(
+      migrateTabs(
+        [
+          { type: "draft", draftID: "global", server, directory: "global" },
+          { type: "draft", draftID: "relative", server, directory: "workspace" },
+          { type: "draft", draftID: "empty", server, directory: "" },
+          { type: "draft", draftID: "win", server, directory: "C:\\work\\repo" },
+          { type: "draft", draftID: "unc", server, directory: "\\\\host\\share\\repo" },
+          { type: "draft", draftID: "posix", server, directory: "/work/repo" },
+        ],
+        server,
+      ),
+    ).toEqual([
+      { type: "draft", draftID: "win", server, directory: "C:\\work\\repo" },
+      { type: "draft", draftID: "unc", server, directory: "\\\\host\\share\\repo" },
+      { type: "draft", draftID: "posix", server, directory: "/work/repo" },
+    ])
+  })
+
+  test("recognizes absolute workspace paths and rejects transport sentinels", () => {
+    expect(isAbsoluteWorkspaceDirectory("global")).toBe(false)
+    expect(isAbsoluteWorkspaceDirectory("")).toBe(false)
+    expect(isAbsoluteWorkspaceDirectory("relative/repo")).toBe(false)
+    expect(isAbsoluteWorkspaceDirectory("C:\\work\\repo")).toBe(true)
+    expect(isAbsoluteWorkspaceDirectory("\\\\host\\share\\repo")).toBe(true)
+    expect(isAbsoluteWorkspaceDirectory("/work/repo")).toBe(true)
+  })
+
   test("restores application tabs without coupling them to a server", () => {
     expect(
       migrateTabs(
@@ -49,10 +79,37 @@ describe("tab migration", () => {
       { type: "app", page: "oxp", href: "/oxp/activity/oxpa_example" },
     ])
   })
+
+  test("restores independently persisted OXP activities without merging their tab identities", () => {
+    const result = migrateTabs([
+      { type: "app", page: "oxp", href: "/oxp/activity/oxpa_first" },
+      { type: "app", page: "oxp", href: "/oxp/activity/oxpa_second" },
+      { type: "app", page: "settings", href: "/settings" },
+    ], server)
+    expect(result).toHaveLength(3)
+    expect(result.flatMap((tab) => tab.type === "app" ? [appTabKey(tab.page, tab.href)] : [])).toEqual([
+      "app:oxp:oxpa_first", "app:oxp:oxpa_second", "app:settings",
+    ])
+  })
+
+  test("keys OXP activity tabs by durable activity ID, not their app page", () => {
+    expect(appTabKey("oxp", "/oxp/activity/oxpa_a")).toBe("app:oxp:oxpa_a")
+    expect(appTabKey("oxp", "/oxp/activity/oxpa_b")).toBe("app:oxp:oxpa_b")
+    expect(appTabKey("oxp", "/oxp/activity/oxpa_a?view=context#tool")).toBe("app:oxp:oxpa_a")
+    expect(appTabKey("oxp", "/oxp")).toBe("app:oxp")
+    expect(appTabKey("oxp", "/settings")).toBe("app:oxp")
+    expect(appTabKey("settings", "/settings?tab=a")).toBe("app:settings")
+    expect(appTabKey("settings", "/settings?tab=b")).toBe("app:settings")
+    expect(appTabKey("usage", "/usage")).toBe("app:usage")
+    expect(oxpActivityIDFromPathname("/oxp/activity/a%20b")).toBe("a b")
+    expect(appTabKey("oxp", "/oxp/activity/a%20b")).toBe("app:oxp:a%20b")
+    expect(oxpActivityIDFromPathname("/oxp/activity/%")).toBeUndefined()
+    expect(oxpActivityIDFromPathname("/oxp/activity")).toBeUndefined()
+  })
 })
 
 describe("application tab routes", () => {
-  test("recognizes only first-class singleton application surfaces", () => {
+  test("recognizes first-class application routes, including distinct OXP activity routes", () => {
     expect(appTabPageFromPathname("/settings")).toBe("settings")
     expect(appTabPageFromPathname("/usage")).toBe("usage")
     expect(appTabPageFromPathname("/scheduled")).toBe("scheduled")
@@ -115,8 +172,8 @@ describe("closed tab stack", () => {
     )
 
     expect(stack).toHaveLength(25)
-    expect(stack[0]?.tab.sessionId).toBe("s5")
-    expect(stack.at(-1)?.tab.sessionId).toBe("s29")
+    expect(stack[0]?.tab).toEqual(sessionTab("s5"))
+    expect(stack.at(-1)?.tab).toEqual(sessionTab("s29"))
   })
 
   test("pops the most recently closed tab", () => {
@@ -126,7 +183,7 @@ describe("closed tab stack", () => {
     ]
     const result = takeClosedTab(stack, [])
 
-    expect(result.entry?.tab.sessionId).toBe("b")
+    expect(result.entry?.tab).toEqual(sessionTab("b"))
     expect(result.stack).toEqual([{ tab: sessionTab("a"), index: 0 }])
   })
 
@@ -137,7 +194,7 @@ describe("closed tab stack", () => {
     ]
     const result = takeClosedTab(stack, [sessionTab("b")])
 
-    expect(result.entry?.tab.sessionId).toBe("a")
+    expect(result.entry?.tab).toEqual(sessionTab("a"))
     expect(result.stack).toEqual([])
   })
 
@@ -158,6 +215,18 @@ describe("closed tab stack", () => {
     expect(removeClosedTabs(stack, server, ["a"])).toEqual([{ tab: sessionTab("b"), index: 1 }])
   })
 
+  test("records OXP activity tabs, skips singleton pages, and reopens by activity identity", () => {
+    const first: Tab = { type: "app", page: "oxp", href: "/oxp/activity/oxpa_a" }
+    const second: Tab = { type: "app", page: "oxp", href: "/oxp/activity/oxpa_b" }
+    const stack = pushClosedTab(pushClosedTab([], first, 1), second, 2)
+    expect(stack).toHaveLength(2)
+    expect(pushClosedTab(stack, { type: "app", page: "settings", href: "/settings" }, 3)).toEqual(stack)
+    expect(pushClosedTab(stack, { type: "app", page: "oxp", href: "/oxp" }, 3)).toEqual(stack)
+    expect(takeClosedTab(stack, [second]).entry?.tab).toEqual(first)
+    expect(takeClosedTab(stack, []).entry?.tab).toEqual(second)
+    expect(removeClosedTabs(stack, server, ["irrelevant"])).toEqual(stack)
+  })
+
   test("does not navigate when a background tab closes", () => {
     const tabs = [sessionTab("a"), sessionTab("b"), sessionTab("c")]
 
@@ -172,6 +241,7 @@ type PersistModule = typeof import("@/utils/persist")
 
 describe("tab batch close", () => {
   let tabs: TabsStore
+  let tabKey: (tab: Tab) => string
   let TabsProvider: (typeof import("@/context/tabs"))["TabsProvider"]
   let useTabsStore: (typeof import("@/context/tabs"))["useTabs"]
   let Persist: PersistModule["Persist"]
@@ -236,7 +306,7 @@ describe("tab batch close", () => {
       useParams: () => ({}),
       useLocation: () => ({ get pathname() { return pathname }, query: {} }),
     }))
-    ;({ TabsProvider, useTabs: useTabsStore } = await import("@/context/tabs"))
+    ;({ TabsProvider, useTabs: useTabsStore, tabKey } = await import("@/context/tabs"))
     ;({ Persist, draftPersistedKeys } = await import("@/utils/persist"))
   })
 
@@ -416,5 +486,67 @@ describe("tab batch close", () => {
 
     expect(tabs.store).toHaveLength(0)
     expect(navigateCalls.length).toBe(before) // no navigation at all
+  })
+
+  test("opens and selects independent OXP activities without replacing existing tabs", async () => {
+    mount({ tabs: [sessionTab("a")] })
+    tabs.openAppTab("oxp", "/oxp/activity/oxpa_first")
+    tabs.openAppTab("oxp", "/oxp/activity/oxpa_second")
+    await flush()
+    expect(tabs.store.map(tabKey)).toEqual([
+      tabKey(sessionTab("a")), "app:oxp:oxpa_first", "app:oxp:oxpa_second",
+    ])
+    expect(navigateCalls.at(-1)).toBe("/oxp/activity/oxpa_second")
+
+    const first = tabs.store.find((tab) => tabKey(tab) === "app:oxp:oxpa_first")
+    expect(first).toBeDefined()
+    tabs.select(first!)
+    expect(navigateCalls.at(-1)).toBe("/oxp/activity/oxpa_first")
+
+    tabs.openAppTab("oxp", "/oxp/activity/oxpa_first?view=context")
+    await flush()
+    expect(tabs.store.filter((tab) => tab.type === "app")).toHaveLength(2)
+    expect(tabKey(tabs.store.at(-1)!)).toBe("app:oxp:oxpa_second")
+    expect(navigateCalls.at(-1)).toBe("/oxp/activity/oxpa_first?view=context")
+
+    const index = tabs.store.findIndex((tab) => tabKey(tab) === "app:oxp:oxpa_first")
+    tabs.closeTab(index)
+    await flush()
+    expect(tabs.store.map(tabKey)).toContain("app:oxp:oxpa_second")
+    expect(tabs.store.map(tabKey)).not.toContain("app:oxp:oxpa_first")
+    tabs.reopenClosedTab()
+    await flush()
+    expect(tabs.store.map(tabKey)).toContain("app:oxp:oxpa_first")
+    expect(navigateCalls.at(-1)).toBe("/oxp/activity/oxpa_first?view=context")
+  })
+
+  test("purges a deleted OXP activity tab and its reopen history only", async () => {
+    mount({ tabs: [
+      { type: "app", page: "oxp", href: "/oxp/activity/oxpa_first" },
+      { type: "app", page: "oxp", href: "/oxp/activity/oxpa_second" },
+    ] })
+    tabs.closeTab(0)
+    await flush()
+    tabs.removeOxpActivityTab("oxpa_first")
+    tabs.reopenClosedTab()
+    await flush()
+    expect(tabs.store.map(tabKey)).toEqual(["app:oxp:oxpa_second"])
+    tabs.removeOxpActivityTab("oxpa_second")
+    await flush()
+    expect(tabs.store).toHaveLength(0)
+  })
+
+  test("stores individual OXP display titles without changing tab identity", async () => {
+    const first: Tab = { type: "app", page: "oxp", href: "/oxp/activity/oxpa_first" }
+    const second: Tab = { type: "app", page: "oxp", href: "/oxp/activity/oxpa_second" }
+    mount({ tabs: [first, second] })
+    await flush()
+    tabs.rememberAppTabTitle(first, "First ChatGPT Conversation")
+    tabs.rememberAppTabTitle(second, "Second ChatGPT Conversation")
+    tabs.rememberAppTabTitle(first, "Renamed Conversation")
+    await flush()
+    expect(tabs.info[tabKey(first)]?.title).toBe("Renamed Conversation")
+    expect(tabs.info[tabKey(second)]?.title).toBe("Second ChatGPT Conversation")
+    expect(tabs.store.map(tabKey)).toEqual(["app:oxp:oxpa_first", "app:oxp:oxpa_second"])
   })
 })

@@ -1,11 +1,12 @@
 import type { ServerConnection } from "./server"
 import { requireServerKey } from "@/utils/session-route"
 import { decode64 } from "@/utils/base64"
-import { appTabPageFromPathname, type AppTabPage } from "./app-tabs"
+import { appTabPageFromPathname, oxpActivityIDFromPathname, type AppTabPage } from "./app-tabs"
 
 export type LayoutRoute =
   | { type: "home" }
-  | { type: AppTabPage }
+  | { type: Exclude<AppTabPage, "oxp"> }
+  | { type: "oxp"; activityID?: string }
   | { type: "draft"; draftID: string; server?: ServerConnection.Key }
   | { type: "dir-new-sesssion"; dir: string; dirBase64: string; server?: ServerConnection.Key }
   | { type: "session"; sessionId: string; server?: ServerConnection.Key }
@@ -20,6 +21,10 @@ export const currentRoute = (pathname: string, search: string): LayoutRoute => {
   // fall through to the directory branch, `decode64("oxp")` fails, the route
   // reports "home", and the tab strip highlights Home while an app tab is open.
   const appPage = appTabPageFromPathname(pathname)
+  if (appPage === "oxp") {
+    const activityID = oxpActivityIDFromPathname(pathname)
+    return activityID ? { type: "oxp", activityID } : { type: "oxp" }
+  }
   if (appPage) return { type: appPage }
 
   if (parts[0] === "new-session") {

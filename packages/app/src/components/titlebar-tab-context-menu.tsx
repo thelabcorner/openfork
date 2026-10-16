@@ -1,6 +1,7 @@
 import { createSignal, lazy, Show, Suspense, type ParentProps } from "solid-js"
 import type { ServerConnection } from "@/context/server"
 import type { Session } from "@opencode-ai/sdk/v2"
+import { contextMenuPosition } from "./context-menu-position"
 
 const TitlebarTabContextMenuRuntime = lazy(() =>
   import("./titlebar-tab-context-menu-runtime").then((module) => ({ default: module.TitlebarTabContextMenuRuntime })),
@@ -34,7 +35,7 @@ export function TitlebarTabContextMenu(props: Props) {
         class="block h-full w-full min-w-0"
         onContextMenu={(event) => {
           event.preventDefault()
-          setCursor({ x: event.clientX, y: event.clientY })
+          setCursor(contextMenuPosition(event, event.currentTarget))
         }}
       >
         {props.children}
@@ -51,6 +52,7 @@ export function TitlebarTabContextMenu(props: Props) {
               groupName={props.groupName}
               cursor={position}
               onOpenChange={(open) => {
+                if (cursor() !== position) return
                 props.onOpenChange?.(open)
                 if (!open) setCursor(undefined)
               }}

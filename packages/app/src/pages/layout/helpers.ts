@@ -55,6 +55,34 @@ export const childSessionOnPath = (
 export const displayName = (project: { name?: string; worktree: string }) =>
   project.name || getFilename(project.worktree) || project.worktree
 
+/** Shared project projection for dense navigation. Build once per project-list
+ * revision instead of constructing an ID map and searching projects per tab. */
+export function indexProjects<T extends { id?: string; worktree: string; sandboxes?: string[] }>(projects: readonly T[]) {
+  const byID = new Map<string, T>()
+  const byDirectory = new Map<string, T>()
+  for (const project of projects) {
+    // projectForSession historically selected the *last* duplicate project ID.
+    if (project.id) byID.set(project.id, project)
+    // Directory resolution historically selected the *first* matching project.
+    const add = (directory: string) => {
+      const key = pathKey(directory)
+      if (!byDirectory.has(key)) byDirectory.set(key, project)
+    }
+    add(project.worktree)
+    for (const sandbox of project.sandboxes ?? []) add(sandbox)
+  }
+  return { byID, byDirectory }
+}
+
+export function projectForSessionIndexed<T extends { id?: string; worktree: string; sandboxes?: string[] }>(
+  session: Session | undefined,
+  index: ReturnType<typeof indexProjects<T>> | undefined,
+): T | undefined {
+  if (!session || !index) return
+  const projectID = (session as Session & { projectID?: string }).projectID
+  return (projectID ? index.byID.get(projectID) : undefined) ?? index.byDirectory.get(pathKey(session.directory))
+}
+
 export function toggleHomeProjectSelection(
   current: HomeProjectSelection | undefined,
   server: ServerConnection.Key,
