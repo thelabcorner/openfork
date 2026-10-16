@@ -8,8 +8,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Provider } from "@/provider/provider"
-import { Context, Effect, Layer, SynchronizedRef } from "effect"
-import type * as ACPError from "./error"
+import { Context, Effect, Exit, Layer, SynchronizedRef } from "effect"
+import * as ACPError from "./error"
 
 export type ModelOption = {
   readonly providerID: ProviderV2.ID
@@ -173,9 +173,12 @@ const layer = Layer.effect(
             loader.load(directory).pipe(
               Effect.tapError(() =>
                 SynchronizedRef.update(snapshots, (state) => {
-                  const next = new Map(state)
-                  next.delete(directory)
-                  return next
+                  // A superseded in-flight failure must never evict a newer
+                  // refresh result for this directory.
+                  if (state.get(directory) !== next) return state
+                  const updated = new Map(state)
+                  updated.delete(directory)
+                  return updated
                 }),
               ),
             ),
@@ -186,7 +189,24 @@ const layer = Layer.effect(
     })
 
     const get = Effect.fn("ACPDirectory.get")(function* (directory: string) {
-      return yield* yield* cached(directory)
+      let generation = yield* cached(directory)
+      // A get started before a refresh must not complete with superseded
+      // model/agent/permission configuration. Observe which generation owns
+      // the cache AFTER awaiting the loader, including its error path.
+      // Bounded attempts avoid infinite loops under a refresh storm.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const result = yield* generation.pipe(Effect.exit)
+        const latest = (yield* SynchronizedRef.get(snapshots)).get(directory)
+        if (latest && latest !== generation) {
+          generation = latest
+          continue
+        }
+        if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+        return result.value
+      }
+      return yield* new ACPError.ServiceFailureError({
+        safeMessage: "Directory configuration changed repeatedly during loading",
+      })
     })
 
     const refresh = Effect.fn("ACPDirectory.refresh")(function* (directory: string) {
@@ -197,9 +217,12 @@ const layer = Layer.effect(
             loader.load(directory).pipe(
               Effect.tapError(() =>
                 SynchronizedRef.update(snapshots, (state) => {
-                  const next = new Map(state)
-                  next.delete(directory)
-                  return next
+                  // Refresh uses a new generation. Old refresh failures are
+                  // not allowed to evict the currently installed generation.
+                  if (state.get(directory) !== next) return state
+                  const updated = new Map(state)
+                  updated.delete(directory)
+                  return updated
                 }),
               ),
             ),

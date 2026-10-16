@@ -247,8 +247,31 @@ export function make(input: {
     }
   })
 
+
+  type ListCursor = { updatedAt: number; sessionId?: string }
+
+  const parseListCursor = (value: string | undefined): ListCursor | undefined => {
+    if (!value) return
+    // Backward compatibility for cursors emitted before stable tie-breaking.
+    const legacy = Number(value)
+    if (Number.isFinite(legacy)) return { updatedAt: legacy }
+    const marker = /^v1:(\d+):(.*)$/.exec(value)
+    if (!marker) return
+    const updatedAt = Number(marker[1])
+    if (!Number.isFinite(updatedAt)) return
+    try {
+      return { updatedAt, sessionId: decodeURIComponent(marker[2]!) }
+    } catch {
+      return
+    }
+  }
+
+  const encodeListCursor = (item: SessionInfo) =>
+    `v1:${new Date(item.updatedAt ?? 0).getTime()}:${encodeURIComponent(item.sessionId)}`
+
   const listSessions = Effect.fn("ACP.listSessions")(function* (params: ListSessionsRequest) {
-    const cursor = params.cursor ? Number(params.cursor) : undefined
+    const cursor = parseListCursor(params.cursor ?? undefined)
+    const retrievedAt = Date.now()
     const limit = 100
     const sessions = yield* request(
       () =>
@@ -267,6 +290,15 @@ export function make(input: {
         cwd: item.directory,
         title: item.title,
         updatedAt: new Date(item.time.updated).toISOString(),
+        _meta: {
+          openforkTemporal: {
+            updatedAtBasis: "session_record",
+            recordUpdatedAt: item.time.updated,
+            recordUpdatedAtIso: new Date(item.time.updated).toISOString(),
+            observedAt: retrievedAt,
+            observedAtIso: new Date(retrievedAt).toISOString(),
+          },
+        },
       }),
     )
     const liveEntries = (yield* session.list(params.cwd ?? undefined))
@@ -276,20 +308,32 @@ export function make(input: {
           sessionId: item.id,
           cwd: item.cwd,
           updatedAt: item.createdAt.toISOString(),
+          _meta: {
+            openforkTemporal: {
+              updatedAtBasis: "live_session_created_fallback",
+              observedAt: retrievedAt,
+              observedAtIso: new Date(retrievedAt).toISOString(),
+            },
+          },
         }),
       )
-    const sorted = [...liveEntries, ...serverEntries].toSorted(
-      (a, b) => new Date(b.updatedAt ?? 0).getTime() - new Date(a.updatedAt ?? 0).getTime(),
-    )
-    const filtered =
-      cursor === undefined || !Number.isFinite(cursor)
-        ? sorted
-        : sorted.filter((item) => new Date(item.updatedAt ?? 0).getTime() < cursor)
+    const sorted = [...liveEntries, ...serverEntries].toSorted((a, b) => {
+      const timeDelta = new Date(b.updatedAt ?? 0).getTime() - new Date(a.updatedAt ?? 0).getTime()
+      if (timeDelta !== 0) return timeDelta
+      return b.sessionId.localeCompare(a.sessionId)
+    })
+    const filtered = cursor === undefined
+      ? sorted
+      : sorted.filter((item) => {
+          const updatedAt = new Date(item.updatedAt ?? 0).getTime()
+          if (updatedAt !== cursor.updatedAt) return updatedAt < cursor.updatedAt
+          return cursor.sessionId !== undefined && item.sessionId.localeCompare(cursor.sessionId) < 0
+        })
     const page = filtered.slice(0, limit)
     const last = page.at(-1)
     return {
       sessions: page,
-      ...(filtered.length > limit && last ? { nextCursor: String(new Date(last.updatedAt ?? 0).getTime()) } : {}),
+      ...(filtered.length > limit && last ? { nextCursor: encodeListCursor(last) } : {}),
     }
   })
 

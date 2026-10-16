@@ -1,11 +1,12 @@
 import { describe, expect } from "bun:test"
 import { Directory } from "@/acp/directory"
+import * as ACPError from "@/acp/error"
 import { Command } from "@/command"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Provider } from "@/provider/provider"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { it } from "../lib/effect"
 
 const command = (name: string): Command.Info => ({
@@ -101,6 +102,96 @@ const fakeLayer = (calls: string[]) =>
   ])
 
 describe("ACP directory snapshot", () => {
+  it.effect("a currently authoritative failed loader is evicted and the next get retries", () => {
+    let calls = 0
+    const layer = LayerNode.compile(Directory.node, [[
+      Directory.loaderNode,
+      Layer.succeed(Directory.Loader, Directory.Loader.of({
+        load: (directory) => Effect.gen(function* () {
+          if (++calls === 1) return yield* new ACPError.ServiceFailureError({
+            safeMessage: "temporary provider discovery failure",
+          })
+          return snapshot(directory)
+        }),
+      })),
+    ]])
+    return Effect.gen(function* () {
+      const directory = yield* Directory.Service
+      const failed = yield* directory.get("alpha").pipe(Effect.exit)
+      expect(Exit.isFailure(failed)).toBe(true)
+      expect((yield* directory.get("alpha")).directory).toBe("alpha")
+      expect(calls).toBe(2)
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a failed stale load resolves through the refreshed generation instead of evicting it", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let calls = 0
+      const layer = LayerNode.compile(Directory.node, [[
+        Directory.loaderNode,
+        Layer.succeed(Directory.Loader, Directory.Loader.of({
+          load: (directory) => Effect.gen(function* () {
+            calls++
+            if (calls === 1) {
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(release)
+              return yield* new ACPError.ServiceFailureError({
+                safeMessage: "simulated old-generation failure",
+              })
+            }
+            return snapshot("fresh-" + directory)
+          }),
+        })),
+      ]])
+      yield* Effect.gen(function* () {
+        const directory = yield* Directory.Service
+        const old = yield* directory.get("alpha").pipe(Effect.exit, Effect.forkScoped)
+        yield* Deferred.await(started)
+        const fresh = yield* directory.refresh("alpha")
+        expect(fresh.directory).toBe("fresh-alpha")
+        yield* Deferred.succeed(release, undefined)
+        const result = yield* Fiber.join(old)
+        expect(Exit.isSuccess(result)).toBe(true)
+        if (Exit.isSuccess(result)) expect(result.value).toBe(fresh)
+        const cached = yield* directory.get("alpha")
+        expect(cached).toBe(fresh)
+        expect(calls).toBe(2)
+      }).pipe(Effect.provide(layer))
+    }))),
+
+  it.effect("an older successful provider load cannot override a newer refresh", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let calls = 0
+      const layer = LayerNode.compile(Directory.node, [[
+        Directory.loaderNode,
+        Layer.succeed(Directory.Loader, Directory.Loader.of({
+          load: (directory) => Effect.gen(function* () {
+            calls++
+            if (calls === 1) {
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(release)
+              return snapshot("stale-" + directory)
+            }
+            return snapshot("current-" + directory)
+          }),
+        })),
+      ]])
+      yield* Effect.gen(function* () {
+        const directory = yield* Directory.Service
+        const old = yield* directory.get("alpha").pipe(Effect.forkScoped)
+        yield* Deferred.await(started)
+        const fresh = yield* directory.refresh("alpha")
+        yield* Deferred.succeed(release, undefined)
+        expect(yield* Fiber.join(old)).toBe(fresh)
+        expect((yield* directory.get("alpha")).directory).toBe("current-alpha")
+        expect(calls).toBe(2)
+      }).pipe(Effect.provide(layer))
+    }))),
+
   it.effect("two concurrent callers share one load", () => {
     const calls: string[] = []
     return Effect.gen(function* () {

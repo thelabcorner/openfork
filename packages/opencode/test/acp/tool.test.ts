@@ -1,6 +1,8 @@
 import { resolve } from "path"
 import { describe, expect, test } from "bun:test"
+import { isCodeRunTrace } from "@opencode-ai/schema/session-v1"
 import {
+  audioContents,
   completedToolContent,
   completedToolUpdate,
   completedToolRawOutput,
@@ -13,6 +15,49 @@ import {
 } from "../../src/acp/tool"
 
 describe("acp tool conversion", () => {
+  test("native Read forwards verified audio as ACP content without mistaking handles for bytes", () => {
+    const wav = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]).toString("base64")
+    const attachments = [
+      { mime: "audio/wav", url: `data:audio/wav;base64,${wav}` },
+      { mime: "audio/mpeg", url: `data:audio/mpeg;base64,${wav}` },
+      { mime: "audio/wav", url: "https://external.example/voice.wav" },
+      { mime: "video/mp4", url: "data:video/mp4;base64,AAAA" },
+    ]
+    expect(audioContents(attachments)).toEqual([
+      { type: "content", content: { type: "audio", mimeType: "audio/wav", data: wav } },
+    ])
+    const read = completedToolContent("read", {
+      status: "completed", input: { filePath: "voice.wav" },
+      output: "Audio read successfully", attachments,
+    })
+    expect(read).toEqual([
+      { type: "content", content: { type: "text", text: "Audio read successfully" } },
+      { type: "content", content: { type: "audio", mimeType: "audio/wav", data: wav } },
+    ])
+    const edit = completedToolContent("edit", {
+      status: "completed", input: {}, output: "Edited", attachments,
+    })
+    expect(JSON.stringify(edit)).not.toContain('"type":"audio"')
+    const video = completedToolContent("read", {
+      status: "completed", input: { filePath: "recording.mp4" },
+      output: "Video read successfully",
+      attachments: [{ mime: "video/mp4", url: "data:video/mp4;base64,AAAA" }],
+    })
+    expect(video).toEqual([
+      { type: "content", content: { type: "text", text: "Video read successfully" } },
+      { type: "content", content: { type: "text", text: expect.stringContaining("not decoded into ACP tool content") } },
+    ])
+  })
+  test("ACP audio transfer has a 2 MiB combined encoded data budget", () => {
+    const wav = Buffer.concat([
+      Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]),
+      Buffer.alloc(1200 * 1024),
+    ]).toString("base64")
+    expect(audioContents([
+      { mime: "audio/wav", url: `data:audio/wav;base64,${wav}` },
+      { mime: "audio/wav", url: `data:audio/wav;base64,${wav}` },
+    ])).toHaveLength(1)
+  })
   test("maps OpenCode tool ids to ACP tool kinds", () => {
     expect(toToolKind("bash")).toBe("execute")
     expect(toToolKind("shell")).toBe("execute")
@@ -291,6 +336,44 @@ describe("acp tool conversion", () => {
         content: { type: "image", mimeType: "image/webp", data: "AAAA" },
       },
     ])
+  })
+
+  test("preserves schema-owned CodeRunTrace metadata through generic ACP raw output", () => {
+    const trace = {
+      version: 1 as const,
+      rootFrameID: "code:prt_acp",
+      frames: [
+        {
+          frameID: "code:prt_acp#1",
+          ref: "native:read",
+          kind: "native" as const,
+          depth: 0,
+          startedAt: 1,
+          finishedAt: 2,
+          durationMs: 1,
+          status: "succeeded" as const,
+          attachmentCount: 0,
+        },
+      ],
+      counters: { calls: 1, failed: 0, active: 0 },
+    }
+    expect(isCodeRunTrace(trace)).toBe(true)
+
+    const update = completedToolUpdate({
+      toolCallId: "call_code_acp",
+      toolName: "code",
+      state: {
+        status: "completed",
+        input: { action: "run" },
+        output: '{"ok":true}',
+        metadata: { action: "run", trace },
+      },
+    })
+
+    expect(update.status).toBe("completed")
+    const raw = update.rawOutput as { metadata?: { trace?: unknown } }
+    expect(raw.metadata?.trace).toEqual(trace)
+    expect(isCodeRunTrace(raw.metadata?.trace)).toBe(true)
   })
 
   test("reads shell output snapshot from string metadata output", () => {
