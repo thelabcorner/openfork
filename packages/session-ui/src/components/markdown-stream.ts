@@ -8,6 +8,8 @@ export type Block = {
   mode: "full" | "live" | "code"
   language?: string
   complete?: boolean
+  /** Exact paragraph projection for syntax-free oversized prose. */
+  plainParagraph?: boolean
 }
 
 export type Projection = {
@@ -37,7 +39,7 @@ function refs(text: string) {
 }
 
 function language(value: string | undefined) {
-  return value?.trim().split(/\s+/, 1)[0] || undefined
+  return value?.trim().split(/\s+/, 1)[0]?.toLowerCase() || undefined
 }
 
 function openCode(raw: string) {

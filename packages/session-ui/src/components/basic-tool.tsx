@@ -80,9 +80,15 @@ export interface BasicToolProps {
   defaultOpen?: boolean
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  /** `true` requests a pre-paint measurement for explicit expansion. */
+  onContentRendered?: (immediate?: boolean) => void
+  /** Hold a tool's action-control height across running → completed. */
+  stabilizeTriggerHeight?: boolean
   forceOpen?: boolean
   allowOpenWhilePending?: boolean
   defer?: boolean
+  /** ToolRegistry supplies this name. Prefer an explicit `defer` override. */
+  deferContent?: boolean
   locked?: boolean
   animated?: boolean
   onSubtitleClick?: () => void
@@ -133,14 +139,15 @@ function scheduleFrameMount(fn: () => void) {
 }
 
 export function BasicTool(props: BasicToolProps) {
+  const defer = () => props.defer ?? props.deferContent ?? false
   const [state, setState] = createStore({
     open: props.defaultOpen ?? false,
-    ready: !props.defer && (props.defaultOpen ?? false),
+    ready: !defer() && (props.defaultOpen ?? false),
   })
   const open = () => props.open ?? state.open
   const ready = () => state.ready
   const pending = () => props.status === "pending" || props.status === "running"
-  const hasChildren = () => (props.defer ? "children" in props : props.children)
+  const hasChildren = () => (defer() ? "children" in props : props.children)
   const dynamicTrigger = typeof props.trigger === "function" ? props.trigger(open) : undefined
 
   let cancelReady: (() => void) | undefined
@@ -156,18 +163,22 @@ export function BasicTool(props: BasicToolProps) {
       cancelReady = undefined
       if (!open()) return
       setState("ready", true)
+      props.onContentRendered?.(true)
     })
   }
 
   onCleanup(cancel)
 
   onMount(() => {
-    if (props.defer && open()) scheduleReady(true)
+    if (defer() && open()) scheduleReady(true)
   })
 
   const setOpen = (value: boolean) => {
     if (props.open === undefined) setState("open", value)
     props.onOpenChange?.(value)
+    // A closing body unmounts with the controlled state. Refresh the outer
+    // row before the fallback ResizeObserver's deferred measurement.
+    if (!value || !defer()) props.onContentRendered?.(true)
   }
 
   createEffect(() => {
@@ -180,7 +191,7 @@ export function BasicTool(props: BasicToolProps) {
     on(
       open,
       (value) => {
-        if (!props.defer) return
+        if (!defer()) return
         if (!value) {
           cancel()
           setState("ready", false)
@@ -365,7 +376,12 @@ export function BasicTool(props: BasicToolProps) {
   )
 
   return (
-    <Collapsible open={open()} onOpenChange={handleOpenChange} class="tool-collapsible">
+    <Collapsible
+      open={open()}
+      onOpenChange={handleOpenChange}
+      class="tool-collapsible"
+      data-stable-trigger-height={props.stabilizeTriggerHeight ? "true" : undefined}
+    >
       <Show
         when={props.triggerAsLink || props.triggerHref}
         fallback={
@@ -399,12 +415,12 @@ export function BasicTool(props: BasicToolProps) {
             overflow: initialOpen ? "visible" : "hidden",
           }}
         >
-          <Show when={!props.defer || ready()}>{body()}</Show>
+          <Show when={!defer() || ready()}>{body()}</Show>
         </div>
       </Show>
       <Show when={!props.animated && hasChildren() && !props.hideDetails}>
         <Collapsible.Content>
-          <Show when={!props.defer || ready()}>{body()}</Show>
+          <Show when={!defer() || ready()}>{body()}</Show>
         </Collapsible.Content>
       </Show>
     </Collapsible>
@@ -450,6 +466,11 @@ export function GenericTool(props: {
   result?: string
   resultTone?: ResultTone
   argsSkip?: string[]
+  defaultOpen?: boolean
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  deferContent?: boolean
+  onContentRendered?: (immediate?: boolean) => void
 }) {
   const i18n = useI18n()
 
@@ -465,6 +486,11 @@ export function GenericTool(props: {
         resultTone: props.resultTone,
       }}
       hideDetails={props.hideDetails}
+      defaultOpen={props.defaultOpen}
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      deferContent={props.deferContent}
+      onContentRendered={props.onContentRendered}
     >
       <ToolParams input={props.input} skip={props.argsSkip} />
       <Show when={props.output}>

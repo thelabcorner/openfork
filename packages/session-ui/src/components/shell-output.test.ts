@@ -1,7 +1,35 @@
 import { describe, expect, test } from "bun:test"
-import { parseShellOutput } from "./shell-output"
+import { parseShellOutput, reconcileShellOutputSegments } from "./shell-output"
 
 describe("parseShellOutput", () => {
+  test("reuses unchanged colored prefix spans but replaces changed text and style", () => {
+    const previous = parseShellOutput("\u001b[31mred\u001b[0m tail").segments
+    const same = parseShellOutput("\u001b[31mred\u001b[0m tail").segments
+    expect(reconcileShellOutputSegments(previous, same)).toBe(previous)
+    const next = reconcileShellOutputSegments(previous, parseShellOutput("\u001b[31mred\u001b[0m tail grown").segments)
+    expect(next[0]).toBe(previous[0])
+    expect(next[1]).not.toBe(previous[1])
+    expect(next[1]?.text).toBe(" tail grown")
+    const recolored = reconcileShellOutputSegments(previous, parseShellOutput("\u001b[32mred\u001b[0m tail").segments)
+    expect(recolored[0]).not.toBe(previous[0])
+    expect(recolored[1]).toBe(previous[1])
+  })
+
+  test("uses the lossless plain-text fast path for long output without controls", () => {
+    const text = "uncolored log\n".repeat(5000)
+    const parsed = parseShellOutput(text)
+    expect(parsed.text).toBe(text)
+    expect(parsed.segments).toEqual([{ text, style: {} }])
+    expect(parseShellOutput("")).toEqual({ text: "", segments: [] })
+    expect(parseShellOutput("plain\nline")).toEqual({
+      text: "plain\nline",
+      segments: [{ text: "plain\nline", style: {} }],
+    })
+    // All C1 control bytes, including the 0x80..0x8F range, must still pass
+    // through the ANSI scanner rather than leaking into visible text.
+    expect(parseShellOutput("a\u0085b").text).toBe("ab")
+  })
+
   test("normalizes line endings and returns plain output without ANSI controls", () => {
     // CRLF is a line break; a lone CR returns to column zero, so "three"
     // overwrites "two" rather than appearing on a line of its own.

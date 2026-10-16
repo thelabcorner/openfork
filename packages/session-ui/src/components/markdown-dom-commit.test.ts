@@ -346,3 +346,62 @@ test("a token split across frames keeps one stable span when the next generation
   )
   expect(markdownDomCommitSnapshot().queuedJobs).toBe(0)
 })
+
+test("detached rich replacement keeps the previously painted body until the new body completes", () => {
+  installDom()
+  const parent = new FakeNode()
+  const original = new FakeNode()
+  original.appendChild(new FakeNode(FakeNode.TEXT_NODE, "previous complete message"))
+  parent.appendChild(original)
+  const replacement = new FakeNode()
+  replacement.isConnected = false
+  let published = 0
+  expect(commitMarkdownDom({
+    key: "atomic-markdown",
+    html: "",
+    plainText: "new complete message",
+    allowDetached: true,
+    parent: parent as unknown as HTMLElement,
+    wrapper: replacement as unknown as HTMLElement,
+    priority: "tail",
+    isCurrent: () => parent.children[0] === original,
+    complete: () => {
+      parent.childNodes[0] = replacement
+      replacement.parentNode = parent
+      replacement.isConnected = true
+      published++
+    },
+  })).toBe(true)
+  // Not even the next animation frame may clear the existing painted text.
+  expect(parent.children[0]).toBe(original)
+  expect(original.childNodes[0]?.nodeValue).toBe("previous complete message")
+  drainFrames()
+  expect(published).toBe(1)
+  expect(parent.children[0]).toBe(replacement)
+  expect(replacement.childNodes.map((node) => node.nodeValue).join("")).toBe("new complete message")
+  expect(markdownDomCommitSnapshot().queuedJobs).toBe(0)
+})
+
+test("detached commit remains rejected without an explicit atomic-replacement opt-in", () => {
+  installDom()
+  const parent = new FakeNode()
+  const original = new FakeNode()
+  parent.appendChild(original)
+  const replacement = new FakeNode()
+  replacement.isConnected = false
+  let published = 0
+  expect(commitMarkdownDom({
+    key: "no-detached-opt-in",
+    html: "",
+    plainText: "new text",
+    parent: parent as unknown as HTMLElement,
+    wrapper: replacement as unknown as HTMLElement,
+    priority: "visible",
+    isCurrent: () => true,
+    complete: () => published++,
+  })).toBe(true)
+  drainFrames()
+  expect(published).toBe(0)
+  expect(parent.children[0]).toBe(original)
+  expect(markdownDomCommitSnapshot().queuedJobs).toBe(0)
+})

@@ -55,6 +55,17 @@ test("accumulates stable worker tokens and replaces the unstable tail", () => {
   expect(second.language).toBe("typescript")
 })
 
+test("preserves stable token identity when only the streamed unstable suffix changes", () => {
+  const first = applyMarkdownWorkerResponse(undefined, response(1, true, [["prefix", "color:red"]], [["x", ""]]))
+  const next = applyMarkdownWorkerResponse(first, response(2, false, [], [["xy", ""]]))
+  expect(next.stable).toBe(first.stable)
+  expect(next.unstable).not.toBe(first.unstable)
+  expect(next.unstable).toEqual([["xy", ""]])
+  const grown = applyMarkdownWorkerResponse(next, response(3, false, [["xy", ""]], [["z", ""]]))
+  expect(grown.stable).not.toBe(next.stable)
+  expect(next.stable).toEqual([["prefix", "color:red"]])
+})
+
 test("increments generation only when the worker resets token identity", () => {
   const first = applyMarkdownWorkerResponse(undefined, response(1, true, [["const", ""]], []))
   const append = applyMarkdownWorkerResponse(first, response(2, false, [[" x", ""]], []))

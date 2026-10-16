@@ -95,6 +95,15 @@ describe("getToolResult", () => {
     })
   })
 
+  test("write prefers structured final file change counts", () => {
+    expect(
+      getToolResult({
+        tool: "write",
+        metadata: { filediff: { additions: 3, deletions: 2 }, diff: "--- a/x\n+++ b/x\n+wrong\n" },
+      }),
+    ).toEqual({ changes: { additions: 3, deletions: 2 } })
+  })
+
   test("todowrite reports progress", () => {
     const todos = [{ status: "completed" }, { status: "completed" }, { status: "pending" }]
     expect(getToolResult({ tool: "todowrite", args: { todos } })).toEqual({ text: "2 / 3", tone: undefined })

@@ -154,20 +154,27 @@ test("shared visibility blocks offscreen and minimized consumers, then resumes o
   expect(FakeMutationObserver.current!.targets.size).toBe(0)
 })
 
-test("document-hidden and aria-hidden states remain negative visibility invariants", () => {
+test("visible streaming content stays admitted under an aria-hidden ancestor", () => {
   installDom()
   const root = (globalThis.document as unknown as { documentElement: FakeElement }).documentElement
   const element = new FakeElement()
-  element.parentElement = root
-  element.attributes.set("aria-hidden", "true")
+  const ancestor = new FakeElement()
+  ancestor.parentElement = root
+  ancestor.attributes.set("aria-hidden", "true")
+  element.parentElement = ancestor
   let visibility = true
   const stop = observeMarkdownVisibility(element as unknown as Element, (value) => (visibility = value))
   FakeIntersectionObserver.current!.intersect(element as unknown as Element, true)
-  expect(visibility).toBe(false)
-  element.attributes.delete("aria-hidden")
-  FakeMutationObserver.current!.mutate(element as unknown as Element)
+  expect(visibility).toBe(true)
+  ancestor.attributes.delete("aria-hidden")
+  FakeMutationObserver.current!.mutate(ancestor as unknown as Element)
   expect(visibility).toBe(true)
   setDocumentHidden(true)
+  expect(visibility).toBe(false)
+  setDocumentHidden(false)
+  expect(visibility).toBe(true)
+  ancestor.style.display = "none"
+  FakeMutationObserver.current!.mutate(ancestor as unknown as Element)
   expect(visibility).toBe(false)
   stop()
 })

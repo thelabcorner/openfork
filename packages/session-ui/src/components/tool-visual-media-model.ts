@@ -22,14 +22,15 @@ export type VisualArtifactPreviewResolver = (
   input: VisualArtifactRequest,
 ) => Promise<VisualArtifactPreview | null>
 
-export type VisualMediaSourceKind = "screenshot" | "baseline" | "current" | "diff" | "frames" | "gif"
+export type VisualMediaSourceKind = "screenshot" | "baseline" | "current" | "diff" | "frames" | "gif" | "read"
 
 export type VisualMediaSource = {
   key: string
   kind: VisualMediaSourceKind
   inline?: {
     mime: string
-    data: string
+    data?: string
+    url?: string
   }
   artifact?: VisualArtifactRequest
 }
@@ -42,8 +43,8 @@ export type VisualDiffSummary = {
 }
 
 export type VisualToolPresentation = {
-  kind: "screenshot" | "capture" | "diff" | "record"
-  origin: "browser" | "snapeye"
+  kind: "screenshot" | "capture" | "diff" | "record" | "read"
+  origin: "browser" | "snapeye" | "file"
   name?: string
   runId?: string
   width?: number

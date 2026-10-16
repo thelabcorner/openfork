@@ -1,4 +1,4 @@
-import { For, type Accessor } from "solid-js"
+import { createMemo, Index, type Accessor } from "solid-js"
 
 const ESC = "\u001b"
 const BEL = "\u0007"
@@ -409,6 +409,7 @@ function consumeControl(input: string, start: number): AnsiSequence | undefined 
 
 /** A carriage return, `ESC[2K` (erase line), or `ESC[G`/`ESC[1G` (go to col 1). */
 const LINE_RESET = /\r|\u001b\[2K|\u001b\[1?G/
+const SHELL_CONTROL_OR_RETURN = /[\u001b\u0080-\u009f\r]/
 
 /**
  * Drops the printable characters from a chunk but keeps its control sequences,
@@ -454,6 +455,13 @@ function resolveLineRewrites(value: string) {
 }
 
 export function parseShellOutput(input: string): ParsedShellOutput {
+  // Most tool logs are ordinary UTF-8 text, but the full ANSI scanner used to
+  // visit every character and allocate a style snapshot on every paced update.
+  // A regex scan in native code is substantially cheaper for this hot path,
+  // and bypasses both CR rewriting and the control-state machine entirely.
+  if (!SHELL_CONTROL_OR_RETURN.test(input))
+    return { text: input, segments: input ? [{ text: input, style: {} }] : [] }
+
   const value = resolveLineRewrites(input.replace(/\r\n/g, "\n"))
   const segments: ShellOutputSegment[] = []
   const style = EMPTY_STYLE()
@@ -496,26 +504,66 @@ function segmentStyle(style: ShellOutputStyle): ShellOutputCssVariables | undefi
   return properties
 }
 
+function sameSegment(left: ShellOutputSegment, right: ShellOutputSegment) {
+  if (left.text !== right.text) return false
+  const a = left.style
+  const b = right.style
+  return a.foreground === b.foreground && a.background === b.background &&
+    a.decoration === b.decoration && a.bold === b.bold && a.dim === b.dim &&
+    a.italic === b.italic && a.blink === b.blink && a.inverse === b.inverse && a.hidden === b.hidden
+}
+
+/**
+ * Reuse unchanged ANSI segment identities between full authoritative parses.
+ * Solid's <Index> then updates only the changed slot's DOM bindings rather
+ * than reapplying attributes/styles to thousands of unchanged colored spans.
+ * No mutation of previous parser output; safe for CR rewrites and truncation.
+ */
+export function reconcileShellOutputSegments(
+  previous: readonly ShellOutputSegment[],
+  incoming: readonly ShellOutputSegment[],
+): ShellOutputSegment[] {
+  if (previous === incoming) return previous as ShellOutputSegment[]
+  const result = new Array<ShellOutputSegment>(incoming.length)
+  let changed = previous.length !== incoming.length
+  for (let index = 0; index < incoming.length; index++) {
+    const next = incoming[index]!
+    const old = previous[index]
+    result[index] = old && sameSegment(old, next) ? old : next
+    if (result[index] !== old) changed = true
+  }
+  return changed ? result : previous as ShellOutputSegment[]
+}
+
 export function ShellOutput(props: { parsed: Accessor<ParsedShellOutput> }) {
+  const segments = createMemo<ShellOutputSegment[]>(
+    (previous = []) => reconcileShellOutputSegments(previous, props.parsed().segments),
+    [],
+  )
   return (
-    <For each={props.parsed().segments}>
+    // Every streaming append produces a new parsed segment array. <For> keys
+    // nodes by object identity, so it destroys and recreates EVERY ANSI span
+    // at the output cadence even when only the last text segment changed.
+    // <Index> preserves DOM nodes at stable positions; it updates the text
+    // and style of the changed segment instead of flashing the entire log.
+    <Index each={segments()}>
       {(segment) => {
-        const style = segment.style
+        const style = () => segment().style
         return (
           <span
             data-slot="shell-output-segment"
-            data-shell-bold={style.bold ? "true" : undefined}
-            data-shell-dim={style.dim ? "true" : undefined}
-            data-shell-italic={style.italic ? "true" : undefined}
-            data-shell-blink={style.blink ? "true" : undefined}
-            data-shell-inverse={style.inverse ? "true" : undefined}
-            data-shell-hidden={style.hidden ? "true" : undefined}
-            style={segmentStyle(style)}
+            data-shell-bold={style().bold ? "true" : undefined}
+            data-shell-dim={style().dim ? "true" : undefined}
+            data-shell-italic={style().italic ? "true" : undefined}
+            data-shell-blink={style().blink ? "true" : undefined}
+            data-shell-inverse={style().inverse ? "true" : undefined}
+            data-shell-hidden={style().hidden ? "true" : undefined}
+            style={segmentStyle(style())}
           >
-            {segment.text}
+            {segment().text}
           </span>
         )
       }}
-    </For>
+    </Index>
   )
 }

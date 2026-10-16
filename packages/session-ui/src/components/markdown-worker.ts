@@ -14,12 +14,14 @@ import {
 } from "./markdown-worker-protocol"
 import {
   createMarkdownWorkerAdmission,
+  MARKDOWN_WORKER_MAX_JOB_BYTES,
   markdownLaneForPriority,
   type MarkdownWorkPriority,
 } from "./markdown-worker-admission"
 import type { Projection } from "./markdown-stream"
 import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
 import { hasTextPrefix } from "./text-prefix"
+import { nextHighlightStateBytes } from "./markdown-highlight-accounting"
 
 type HighlightPending = {
   key: string
@@ -147,12 +149,6 @@ function traceWorkerFinish(
   })
 }
 
-function stateBytes(state: MarkdownWorkerState) {
-  return (
-    state.stable.reduce((total, token) => total + token[0].length * 2 + token[1].length * 2, 0) +
-    state.unstable.reduce((total, token) => total + token[0].length * 2 + token[1].length * 2, 0)
-  )
-}
 function deleteState(key: string) {
   states.delete(key)
   stateBytesTotal -= stateSizes.get(key) ?? 0
@@ -172,7 +168,7 @@ const admission = createMarkdownWorkerAdmission<MarkdownWorkerRequest>({
   // Keep one atomic parse/project/highlight dispatch small enough to bound
   // worker memory and service time. Tail work has its own lane, but this also
   // bounds the cost of each background unit and worker-to-renderer transfer.
-  maxJobBytes: 8 * 1024 * 1024,
+  maxJobBytes: MARKDOWN_WORKER_MAX_JOB_BYTES,
 })
 
 function createTransport<T extends { id: number; key: string }>(
@@ -645,14 +641,20 @@ function getWorkers() {
     }
     if (result.complete) hostHighlightSources.delete(key)
     else hostHighlightSources.set(key, { text: result.text, language: result.language })
-    const state = applyMarkdownWorkerResponse(states.get(key), event.data)
+    const previous = states.get(key)
+    const previousBytes = stateSizes.get(key)
+    const state = applyMarkdownWorkerResponse(previous, event.data)
     if (shouldReleaseMarkdownWorkerState(result.complete, latest.get(key), event.data.id)) {
       deleteState(key)
       keys.delete(key)
       latest.delete(key)
     } else {
       deleteState(key)
-      const size = stateBytes(state)
+      // Exact O(changed suffix) accounting: stable tokens are immutable until
+      // a reset, so repeated tail-only messages must not rescan entire code.
+      const size = state === previous && previousBytes !== undefined
+        ? previousBytes
+        : nextHighlightStateBytes(previous, previousBytes, event.data)
       if (size <= MAX_STATE_BYTES) {
         states.set(key, state)
         stateSizes.set(key, size)

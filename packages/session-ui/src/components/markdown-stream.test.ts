@@ -224,10 +224,10 @@ describe("markdown stream", () => {
     ])
   })
 
-  test("uses only the language portion of fence metadata", () => {
-    expect(stream("```ts title=example\nconst x = 1", true)).toEqual([
+  test("normalizes and isolates the language portion of fence metadata", () => {
+    expect(stream("```TS title=example\nconst x = 1", true)).toEqual([
       {
-        raw: "```ts title=example\nconst x = 1",
+        raw: "```TS title=example\nconst x = 1",
         src: "const x = 1",
         mode: "code",
         language: "ts",

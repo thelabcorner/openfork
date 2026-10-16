@@ -12,6 +12,7 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { SessionThroughput } from "@opencode-ai/core/session/throughput"
 import { toThroughputMessage } from "./message-part"
+import { isPendingUnavailableReasoningPrefix, isUnavailableReasoningSentinel } from "@opencode-ai/core/reasoning-sentinel"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { createEffect, createMemo, createRoot, createSignal, For, on, onCleanup, ParentProps, Show } from "solid-js"
 import { createStore } from "solid-js/store"
@@ -109,7 +110,8 @@ function partState(part: PartType, showReasoningSummaries: boolean) {
   }
   if (part.type === "text") return part.text?.trim() ? ("visible" as const) : undefined
   if (part.type === "reasoning") {
-    if (showReasoningSummaries && part.text?.trim()) return "visible" as const
+    if (showReasoningSummaries && part.text?.trim() && !isUnavailableReasoningSentinel(part.text) &&
+      !(part.time?.end === undefined && isPendingUnavailableReasoningPrefix(part.text))) return "visible" as const
     return
   }
   if (PART_MAPPING[part.type]) return "visible" as const

@@ -2,6 +2,8 @@ import type { FileContent } from "@opencode-ai/sdk/v2"
 import { createEffect, createMemo, Match, on, onCleanup, Show, Switch, untrack, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import {
   dataUrlFromMediaValue,
   hasMediaValue,
@@ -31,6 +33,13 @@ function mediaValue(cfg: FileMediaOptions, mode: "image" | "audio") {
 
 export function FileMedia(props: { media?: FileMediaOptions; fallback: () => JSX.Element }) {
   const i18n = useI18n()
+  const dialog = useDialog()
+  const openPreview = (src: string) => dialog.show(() => <ImagePreview src={src} alt={cfg()?.path} />)
+  const previewKey = (event: KeyboardEvent, src: string) => {
+    if (event.key !== "Enter" && event.key !== " ") return
+    event.preventDefault()
+    openPreview(src)
+  }
   const [remote, setRemote] = createStore<{
     key?: string
     loading?: boolean
@@ -231,6 +240,10 @@ export function FileMedia(props: { media?: FileMediaOptions; fallback: () => JSX
                   <img
                     src={value()}
                     alt={cfg()?.path}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => openPreview(value())}
+                    onKeyDown={(event) => previewKey(event, value())}
                     class="max-h-[60vh] max-w-full rounded border border-border-weak-base bg-background-base object-contain"
                     onLoad={onLoad}
                   />
@@ -261,6 +274,10 @@ export function FileMedia(props: { media?: FileMediaOptions; fallback: () => JSX
                     <img
                       src={value()}
                       alt={cfg()?.path}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => openPreview(value())}
+                      onKeyDown={(event) => previewKey(event, value())}
                       class="max-h-[60vh] max-w-full rounded border border-border-weak-base bg-background-base object-contain"
                       onLoad={onLoad}
                     />

@@ -8,6 +8,7 @@ import {
   Match,
   onMount,
   Show,
+  Suspense,
   Switch,
   onCleanup,
   Index,
@@ -33,12 +34,24 @@ import {
   QuestionInfo,
 } from "@opencode-ai/sdk/v2"
 import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
+import { isCodeRunTrace } from "@opencode-ai/schema/v1/session"
 import { useData, useSessionNavigation } from "../context"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
 import { BasicTool, GenericTool, type TriggerTitle } from "./basic-tool"
-import { ToolBoundedList, ToolEmpty, ToolParams, ToolRow, ToolScrollArea } from "./tool-parts"
+import {
+  ToolBadge,
+  ToolBlock,
+  ToolBoundedList,
+  ToolEmpty,
+  ToolNotice,
+  ToolParams,
+  ToolRow,
+  ToolScrollArea,
+  ToolStats,
+  type Tone,
+} from "./tool-parts"
 import {
   DirectoryOutput,
   GlobResults,
@@ -82,6 +95,8 @@ import { messageProvenancePresentation } from "./message-provenance-presentation
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { isPendingUnavailableReasoningPrefix, isUnavailableReasoningSentinel } from "@opencode-ai/core/reasoning-sentinel"
+import { nextPacedTextEnd, STREAM_RENDER_PACE_MS } from "./message-part-pace"
 import { hasTextPrefix } from "./text-prefix"
 import { SmartToolOutput } from "./tool-output"
 import { ShellTimer } from "./shell-timer"
@@ -92,6 +107,10 @@ import { getToolResult } from "./tool-result"
 import { TypecheckOutput } from "./typecheck-tool"
 import { SqliteOutput } from "./sqlite-tool"
 import { SympyOutput } from "./sympy-tool"
+import { CodeOutput } from "./code-tool"
+import { QuotaOutput, UsageOutput } from "./accounting-tools"
+import { LazyTool, lazyToolIcon } from "./lazy-tool"
+import { lazyToolIdentity } from "./lazy-tool-model"
 import {
   ArchiveOutput,
   BackgroundOutput,
@@ -111,6 +130,9 @@ import {
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 import { traceMarkdown } from "./markdown-trace"
 import { ToolVisualMedia } from "./tool-visual-media"
+import { readToolVisualPresentation } from "./read-tool-visual-model"
+import { readToolPlayableMedia } from "./read-tool-playable-model"
+import { ToolPlayableMedia } from "./read-tool-playable-media"
 import {
   type VisualArtifactPreviewResolver,
   type VisualToolPresentation,
@@ -253,7 +275,7 @@ export interface MessagePartProps {
   onToolOpenChange?: (open: boolean) => void
   deferToolContent?: boolean
   virtualizeDiff?: boolean
-  onContentRendered?: () => void
+  onContentRendered?: (immediate?: boolean) => void
   showAssistantCopyPartID?: string | null
   turnDurationMs?: number
   turnThroughputRate?: number
@@ -305,34 +327,7 @@ export type PartComponent = Component<MessagePartProps>
 
 export const PART_MAPPING: Record<string, PartComponent | undefined> = {}
 
-const TEXT_RENDER_PACE_MS = 24
-const TEXT_RENDER_IMMEDIATE = 512
-const TEXT_RENDER_SNAP = /[\s.,!?;:)\]]/
 const TOOL_OUTPUT_RENDER_PACE_MS = 100
-const TOOL_OUTPUT_STREAM_PREVIEW_CHARS = 64 * 1024
-const TOOL_OUTPUT_OMITTED_PREFIX = "[Earlier output omitted while the tool is running]\n"
-
-function toolOutputStreamPreview(value: unknown) {
-  if (typeof value !== "string" || value.startsWith(TOOL_OUTPUT_OMITTED_PREFIX) || value.length <= TOOL_OUTPUT_STREAM_PREVIEW_CHARS)
-    return value
-  return TOOL_OUTPUT_OMITTED_PREFIX + value.slice(-TOOL_OUTPUT_STREAM_PREVIEW_CHARS)
-}
-
-function step(size: number) {
-  if (size <= 12) return 2
-  if (size <= 48) return 4
-  if (size <= 96) return 8
-  return Math.min(256, Math.ceil(size / 4))
-}
-
-function next(text: string, start: number) {
-  const end = Math.min(text.length, start + step(text.length - start))
-  const max = Math.min(text.length, end + 8)
-  for (let i = end; i < max; i++) {
-    if (TEXT_RENDER_SNAP.test(text[i] ?? "")) return i + 1
-  }
-  return end
-}
 
 function createPacedValue(getValue: () => string, live?: () => boolean) {
   const [value, setValue] = createSignal(getValue())
@@ -363,13 +358,15 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
       sync(text)
       return
     }
-    if (text.length - shown.length <= TEXT_RENDER_IMMEDIATE) {
+    // A backgrounded window must not replay a backlog of thousands of tokens
+    // over seconds upon restoration. Snapshot authoritative text at once.
+    if (typeof document !== "undefined" && document.hidden) {
       sync(text)
       return
     }
-    const end = next(text, shown.length)
+    const end = nextPacedTextEnd(text, shown.length)
     sync(text.slice(0, end))
-    if (end < text.length) timeout = setTimeout(run, TEXT_RENDER_PACE_MS)
+    if (end < text.length) timeout = setTimeout(run, STREAM_RENDER_PACE_MS)
   }
 
   createEffect(() => {
@@ -389,7 +386,7 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
     // markdown tree and morphing its DOM once per provider token defeats the
     // transport coalescer when several sessions are active; the latest text
     // is still rendered exactly, just at a bounded cadence.
-    timeout = setTimeout(run, TEXT_RENDER_PACE_MS)
+    timeout = setTimeout(run, STREAM_RENDER_PACE_MS)
   })
 
   onCleanup(() => {
@@ -625,6 +622,19 @@ export function getToolInfo(
     }
   }
   switch (tool) {
+    case "tool": {
+      const lazy = lazyToolIdentity(input, metadata)
+      return {
+        icon: lazyToolIcon(lazy.target, lazy.action),
+        title: lazy.action === "list" ? i18n.t("ui.tool.lazy.catalog") : lazy.name ?? i18n.t("ui.tool.lazy.capability"),
+        subtitle:
+          lazy.action === "list"
+            ? i18n.t("ui.tool.lazy.discover")
+            : lazy.action === "describe"
+              ? i18n.t("ui.tool.lazy.inspect")
+              : lazy.operation ?? lazy.subject ?? i18n.t("ui.tool.lazy.execute"),
+      }
+    }
     case "read":
       return {
         icon: "glasses",
@@ -680,10 +690,12 @@ export function getToolInfo(
         typeof input.subagent_type === "string" && input.subagent_type
           ? input.subagent_type[0]!.toUpperCase() + input.subagent_type.slice(1)
           : undefined
+      const attachmentCount = Array.isArray(input.attachments) ? input.attachments.length : 0
+      const attachmentLabel = attachmentCount > 0 ? ` · ${i18n.plural("ui.tool.task.attachments", attachmentCount)}` : ""
       return {
         icon: "task",
         title: agentTitle(i18n, type),
-        subtitle: input.description,
+        subtitle: `${input.description ?? ""}${attachmentLabel}`,
       }
     }
     case "bash":
@@ -769,6 +781,12 @@ export function getToolInfo(
         title: i18n.t("ui.tool.json"),
         subtitle: actionLabel(input.mode),
       }
+    case "code":
+      return {
+        icon: "code",
+        title: i18n.t("ui.tool.code"),
+        subtitle: actionLabel(input.action),
+      }
     case "archive":
       return {
         icon: "archive",
@@ -786,6 +804,18 @@ export function getToolInfo(
         icon: "server",
         title: i18n.t("ui.tool.sqlite"),
         subtitle: actionLabel(input.action),
+      }
+    case "quota":
+      return {
+        icon: "providers",
+        title: i18n.t("ui.tool.quota"),
+        subtitle: actionLabel(input.action ?? "providers"),
+      }
+    case "usage":
+      return {
+        icon: "usage",
+        title: i18n.t("ui.tool.usage"),
+        subtitle: actionLabel(input.action ?? "totals"),
       }
     case "symbols":
       return {
@@ -957,7 +987,11 @@ export function renderable(part: PartType, showReasoningSummaries = true) {
   // visible?" check O(total streamed text) per token. `\S` short-circuits at
   // the first real character (normally the first byte) and allocates nothing.
   if (part.type === "text") return /\S/.test(part.text ?? "")
-  if (part.type === "reasoning") return showReasoningSummaries && /\S/.test(part.text ?? "")
+  if (part.type === "reasoning") {
+    const text = part.text ?? ""
+    return showReasoningSummaries && /\S/.test(text) && !isUnavailableReasoningSentinel(text) &&
+      !(part.time?.end === undefined && isPendingUnavailableReasoningPrefix(text))
+  }
   return !!PART_MAPPING[part.type]
 }
 
@@ -1421,7 +1455,7 @@ export function ContextToolGroup(props: {
   busy?: boolean
   open?: boolean
   onOpenChange?: (open: boolean) => void
-  onSizeChange?: () => void
+  onSizeChange?: (immediate?: boolean) => void
 }) {
   const i18n = useI18n()
   const [localOpen, setLocalOpen] = createSignal(false)
@@ -1436,6 +1470,8 @@ export function ContextToolGroup(props: {
   const handleOpenChange = (value: boolean) => {
     if (props.open === undefined) setLocalOpen(value)
     props.onOpenChange?.(value)
+    // Kobalte mounts/unmounts the group content in phases; let the normal
+    // frame-batched measurement observe the final DOM height.
     props.onSizeChange?.()
   }
 
@@ -1508,6 +1544,10 @@ export function ContextToolGroup(props: {
               const toggle = () => {
                 if (!output()) return
                 setItemsOpen(partAccessor().id, (value) => !value)
+                // Measure the parent virtual row after the nested body has
+                // mounted/unmounted; otherwise it can remain clipped at the
+                // previous group height until a later ResizeObserver pass.
+                props.onSizeChange?.()
               }
               return (
                 <div data-slot="context-tool-group-item">
@@ -1557,7 +1597,7 @@ export function ContextToolGroup(props: {
                     </Show>
                   </div>
                   <Show when={output() && itemOpen()}>
-                    {contextItemBody(partAccessor(), output()!, fileComponent)}
+                    {contextItemBody(partAccessor(), output()!, fileComponent, props.onSizeChange)}
                   </Show>
                 </div>
               )
@@ -1569,28 +1609,47 @@ export function ContextToolGroup(props: {
   )
 }
 
-function contextItemBody(part: ToolPart, output: string, fileComponent: ValidComponent) {
+function contextItemBody(
+  part: ToolPart,
+  output: string,
+  fileComponent: ValidComponent,
+  onContentRendered?: (immediate?: boolean) => void,
+) {
   const input = (part.state.input ?? {}) as Record<string, unknown>
   const metadata = ("metadata" in part.state ? part.state.metadata : undefined) as Record<string, unknown> | undefined
 
   if (part.tool === "read") {
+    const visual = readToolVisualPresentation(
+      input,
+      metadata ?? {},
+      "attachments" in part.state ? part.state.attachments : undefined,
+    )
+    const playable = readToolPlayableMedia(input, "attachments" in part.state ? part.state.attachments : undefined)
     const display = metadata?.display as ReadDisplay | undefined
     if (display?.type === "file") {
       return (
         <div data-component="read-content">
-          <Dynamic
-            component={fileComponent}
-            mode="text"
-            file={{
-              name: display.path,
-              contents: display.text,
-              cacheKey: sampledChecksum(display.text),
-            }}
-            overflow="scroll"
-          />
+          <Show when={visual}>
+            {(presentation) => <ToolVisualMedia presentation={presentation()} onContentRendered={onContentRendered} />}
+          </Show>
+          <Suspense fallback={<div data-component="tool-file-loading" class="h-6" aria-busy="true" />}>
+            <Dynamic
+              component={fileComponent}
+              mode="text"
+              file={{
+                name: display.path,
+                contents: display.text,
+                cacheKey: sampledChecksum(display.text),
+              }}
+              overflow="scroll"
+              onRendered={onContentRendered}
+            />
+          </Suspense>
         </div>
       )
     }
+    if (visual) return <ToolVisualMedia presentation={visual} onContentRendered={onContentRendered} />
+    if (playable) return <ToolPlayableMedia media={playable} onContentRendered={onContentRendered} />
     if (display?.type === "directory") return <DirectoryOutput entries={display.entries} />
     return <SmartToolOutput output={output} />
   }
@@ -2019,6 +2078,7 @@ export function Part(props: MessagePartProps) {
 export interface ToolProps {
   input: Record<string, any>
   metadata: Record<string, any>
+  attachments?: readonly { type: string; mime: string; url: string }[]
   tool: string
   sessionID?: string
   callID?: string
@@ -2030,7 +2090,7 @@ export interface ToolProps {
   onOpenChange?: (open: boolean) => void
   deferContent?: boolean
   virtualizeDiff?: boolean
-  onContentRendered?: () => void
+  onContentRendered?: (immediate?: boolean) => void
   forceOpen?: boolean
   locked?: boolean
   resolveVisualArtifact?: VisualArtifactPreviewResolver
@@ -2087,13 +2147,18 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
   const emptyMetadata: Record<string, any> = {}
 
   const input = () => part().state?.input ?? emptyInput
+  const attachments = () => {
+    const state = part().state
+    return "attachments" in state ? state.attachments : undefined
+  }
   // @ts-expect-error
   const partMetadata = () => part().state?.metadata ?? emptyMetadata
   let latestMetadata = partMetadata()
   let latestOutput: unknown = (part().state as any).output ?? latestMetadata.output
   let outputTimer: ReturnType<typeof setTimeout> | undefined
-  const initialOutput = part().state.status === "running" ? toolOutputStreamPreview(latestOutput) : latestOutput
-  const [outputProjection, setOutputProjection] = createSignal({ metadata: latestMetadata, output: initialOutput })
+  // Cadence bounds rendering demand; preserve the complete authoritative
+  // output in every projection, including while the tool is running.
+  const [outputProjection, setOutputProjection] = createSignal({ metadata: latestMetadata, output: latestOutput })
   createEffect(() => {
     const metadata = partMetadata()
     const output = (part().state as any).output ?? metadata.output
@@ -2109,7 +2174,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
     if (outputTimer !== undefined) return
     outputTimer = setTimeout(() => {
       outputTimer = undefined
-      setOutputProjection({ metadata: latestMetadata, output: toolOutputStreamPreview(latestOutput) })
+      setOutputProjection({ metadata: latestMetadata, output: latestOutput })
     }, TOOL_OUTPUT_RENDER_PACE_MS)
   })
   onCleanup(() => {
@@ -2184,6 +2249,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               sessionID={part().sessionID}
               callID={part().callID}
               metadata={displayMetadata()}
+              attachments={attachments()}
               // @ts-expect-error
               output={outputProjection().output}
               status={part().state.status}
@@ -2288,7 +2354,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
   const streaming = createMemo(
     () => props.message.role === "assistant" && typeof (props.message as AssistantMessage).time.completed !== "number",
   )
-  const text = () => readPartText(data.store.part_text_accum_delta, part())
+  const text = createMemo(() => readPartText(data.store.part_text_accum_delta, part(), streaming()))
   const isLastTextPart = createMemo(() => {
     const last = (data.store.part?.[props.message.id] ?? [])
       .filter((item): item is TextPart => item?.type === "text" && !!item.text?.trim())
@@ -2346,7 +2412,11 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
   const streaming = createMemo(
     () => props.message.role === "assistant" && typeof (props.message as AssistantMessage).time.completed !== "number",
   )
-  const text = () => readPartText(data.store.part_text_accum_delta, part())
+  const text = createMemo(() => {
+    const value = readPartText(data.store.part_text_accum_delta, part(), streaming())
+    return isUnavailableReasoningSentinel(value) ||
+      (streaming() && part().time?.end === undefined && isPendingUnavailableReasoningPrefix(value)) ? "" : value
+  })
 
   return (
     <Show when={text()}>
@@ -2373,6 +2443,8 @@ ToolRegistry.register({
       return value.filter((p): p is string => typeof p === "string")
     })
     const display = createMemo(() => props.metadata.display as ReadDisplay | undefined)
+    const visual = createMemo(() => readToolVisualPresentation(props.input, props.metadata, props.attachments))
+    const playable = createMemo(() => readToolPlayableMedia(props.input, props.attachments))
     return (
       <>
         <BasicTool
@@ -2386,12 +2458,20 @@ ToolRegistry.register({
             ...resultProps(props),
           }}
         >
+          <Show when={visual()}>
+            {(presentation) => (
+              <ToolVisualMedia presentation={presentation()} onContentRendered={props.onContentRendered} />
+            )}
+          </Show>
+          <Show when={playable()}>
+            {(media) => <ToolPlayableMedia media={media()} onContentRendered={props.onContentRendered} />}
+          </Show>
           <Show
             when={display()?.type === "file" && display()}
             fallback={
               <Show
                 when={display()?.type === "directory" && display()}
-                fallback={<SmartToolOutput output={props.output} />}
+                fallback={<Show when={!visual() && !playable()}><SmartToolOutput output={props.output} /></Show>}
               >
                 {(dir) => <DirectoryOutput entries={(dir() as ReadDisplay & { type: "directory" }).entries} />}
               </Show>
@@ -2401,17 +2481,19 @@ ToolRegistry.register({
               const info = () => file() as ReadDisplay & { type: "file" }
               return (
                 <div data-component="read-content">
-                  <Dynamic
-                    component={fileComponent}
-                    mode="text"
-                    file={{
-                      name: info().path,
-                      contents: info().text,
-                      cacheKey: sampledChecksum(info().text),
-                    }}
-                    overflow="scroll"
-                    onRendered={props.onContentRendered}
-                  />
+                  <Suspense fallback={<div data-component="tool-file-loading" class="h-6" aria-busy="true" />}>
+                    <Dynamic
+                      component={fileComponent}
+                      mode="text"
+                      file={{
+                        name: info().path,
+                        contents: info().text,
+                        cacheKey: sampledChecksum(info().text),
+                      }}
+                      overflow="scroll"
+                      onRendered={props.onContentRendered}
+                    />
+                  </Suspense>
                 </div>
               )
             }}
@@ -2718,6 +2800,9 @@ ToolRegistry.register({
     const [copied, setCopied] = createSignal(false)
     const background = createMemo(() => props.metadata.background === true)
     const startedAt = createMemo(() => (typeof props.metadata.startedAt === "number" ? props.metadata.startedAt : undefined))
+    const queueStartedAt = createMemo(
+      () => (typeof props.metadata.queueStartedAt === "number" ? props.metadata.queueStartedAt : undefined),
+    )
     const timeoutMs = createMemo(() => {
       const value = background() ? props.metadata.timeoutMs : props.metadata.timeout
       return typeof value === "number" ? value : undefined
@@ -2761,15 +2846,17 @@ ToolRegistry.register({
         {...resultProps(props)}
         icon="console"
         allowOpenWhilePending
+        stabilizeTriggerHeight
         trigger={(open) => (
           <div data-slot="basic-tool-tool-info-structured">
             <div data-slot="basic-tool-tool-info-main">
               <span data-slot="basic-tool-tool-title">
                 <TextShimmer text={i18n.t("ui.tool.shell")} active={pending()} />
               </span>
-              <Show when={startedAt()}>
+              <Show when={startedAt() !== undefined || queueStartedAt() !== undefined}>
                 <ShellTimer
-                  startedAt={startedAt()!}
+                  startedAt={startedAt()}
+                  queueStartedAt={queueStartedAt()}
                   timeoutMs={timeoutMs()}
                   running={timerRunning()}
                   endedAt={endedAt()}
@@ -2821,7 +2908,7 @@ ToolRegistry.register({
                 $
               </span>
               <div data-slot="bash-command-code">
-                <Markdown text={"```bash\n" + command() + "\n```"} />
+                <pre><code>{command()}</code></pre>
               </div>
             </div>
           </Show>
@@ -2934,13 +3021,18 @@ ToolRegistry.register({
               }
             >
               <div data-component="edit-content">
-                <Dynamic
-                  component={fileComponent}
-                  mode="diff"
-                  virtualize={props.virtualizeDiff}
-                  onRendered={props.onContentRendered}
-                  {...fileCompProps()}
-                />
+                {/* The File viewer is route-lazy. Keep its first-load suspension
+                    inside the tool: bubbling to the route Suspense temporarily
+                    replaces the entire conversation with its fallback. */}
+                <Suspense fallback={<div data-component="tool-file-loading" aria-busy="true" />}>
+                  <Dynamic
+                    component={fileComponent}
+                    mode="diff"
+                    virtualize={props.virtualizeDiff}
+                    onRendered={props.onContentRendered}
+                    {...fileCompProps()}
+                  />
+                </Suspense>
               </div>
             </ToolFileAccordion>
           </Show>
@@ -2957,9 +3049,38 @@ ToolRegistry.register({
     const i18n = useI18n()
     const fileComponent = useFileComponent()
     const diagnostics = createMemo(() => getDiagnostics(props.metadata.diagnostics, props.input.filePath))
-    const path = createMemo(() => props.input.filePath || "")
+    const path = createMemo(
+      () => props.metadata?.filediff?.file || props.metadata?.filepath || props.input.filePath || "",
+    )
     const filename = () => getFilename(props.input.filePath ?? "")
     const pending = () => props.status === "pending" || props.status === "running"
+    const fileCompProps = createMemo(() => {
+      const filediff = props.metadata?.filediff
+      if (filediff) {
+        try {
+          const fileDiff = resolveFileDiff({
+            file: filediff.file || props.input.filePath || "",
+            patch: typeof filediff.patch === "string" ? filediff.patch : undefined,
+            before: typeof filediff.before === "string" ? filediff.before : undefined,
+            after: typeof filediff.after === "string" ? filediff.after : undefined,
+          })
+          if (fileDiff)
+            return {
+              mode: "diff" as const,
+              fileDiff,
+              hunkSeparators: fileDiff.isPartial ? ("simple" as const) : ("line-info-basic" as const),
+            }
+        } catch {}
+      }
+      return {
+        mode: "text" as const,
+        file: {
+          name: props.input.filePath,
+          contents: props.input.content || "",
+          cacheKey: sampledChecksum(props.input.content || ""),
+        },
+      }
+    })
     return (
       <div data-component="write-tool">
         <BasicTool
@@ -2978,30 +3099,31 @@ ToolRegistry.register({
                     <span data-slot="message-part-title-filename">{filename()}</span>
                   </Show>
                 </div>
-                <Show when={!pending() && props.input.filePath?.includes("/")}>
+                <Show when={!pending() && path().includes("/")}>
                   <div data-slot="message-part-path">
-                    <span data-slot="message-part-directory">{getDirectory(props.input.filePath!)}</span>
+                    <span data-slot="message-part-directory">{getDirectory(path())}</span>
                   </div>
                 </Show>
               </div>
-              <div data-slot="message-part-actions">{/* <DiffChanges diff={diff} /> */}</div>
+              <div data-slot="message-part-actions">
+                <Show when={!pending() && props.metadata.filediff}>
+                  <DiffChanges changes={props.metadata.filediff!} />
+                </Show>
+              </div>
             </div>
           }
         >
           <Show when={props.input.content && path()}>
             <ToolFileAccordion path={path()}>
               <div data-component="write-content">
-                <Dynamic
-                  component={fileComponent}
-                  mode="text"
-                  file={{
-                    name: props.input.filePath,
-                    contents: props.input.content,
-                    cacheKey: sampledChecksum(props.input.content),
-                  }}
-                  overflow="scroll"
-                  onRendered={props.onContentRendered}
-                />
+                <Suspense fallback={<div data-component="tool-file-loading" class="h-6" aria-busy="true" />}>
+                  <Dynamic
+                    component={fileComponent}
+                    {...fileCompProps()}
+                    overflow="scroll"
+                    onRendered={props.onContentRendered}
+                  />
+                </Suspense>
               </div>
             </ToolFileAccordion>
           </Show>
@@ -3125,14 +3247,16 @@ ToolRegistry.register({
                           <Accordion.Content>
                             <Show when={props.deferContent === false || visible()}>
                               <div data-component="apply-patch-file-diff">
-                                <Dynamic
-                                  component={fileComponent}
-                                  mode="diff"
-                                  virtualize={props.virtualizeDiff}
-                                  fileDiff={file.view.fileDiff}
-                                  hunkSeparators={file.view.fileDiff.isPartial ? "simple" : "line-info-basic"}
-                                  onRendered={props.onContentRendered}
-                                />
+                                <Suspense fallback={<div data-component="tool-file-loading" class="h-6" aria-busy="true" />}>
+                                  <Dynamic
+                                    component={fileComponent}
+                                    mode="diff"
+                                    virtualize={props.virtualizeDiff}
+                                    fileDiff={file.view.fileDiff}
+                                    hunkSeparators={file.view.fileDiff.isPartial ? "simple" : "line-info-basic"}
+                                    onRendered={props.onContentRendered}
+                                  />
+                                </Suspense>
                               </div>
                             </Show>
                           </Accordion.Content>
@@ -3202,13 +3326,15 @@ ToolRegistry.register({
               }
             >
               <div data-component="apply-patch-file-diff">
-                <Dynamic
-                  component={fileComponent}
-                  mode="diff"
-                  virtualize={props.virtualizeDiff}
-                  fileDiff={single()!.view.fileDiff}
-                  onRendered={props.onContentRendered}
-                />
+                <Suspense fallback={<div data-component="tool-file-loading" class="h-6" aria-busy="true" />}>
+                  <Dynamic
+                    component={fileComponent}
+                    mode="diff"
+                    virtualize={props.virtualizeDiff}
+                    fileDiff={single()!.view.fileDiff}
+                    onRendered={props.onContentRendered}
+                  />
+                </Suspense>
               </div>
             </ToolFileAccordion>
           </BasicTool>
@@ -3619,6 +3745,36 @@ ToolRegistry.register({
 })
 
 ToolRegistry.register({
+  name: "quota",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <Show when={props.output}>
+          <QuotaOutput output={props.output!} metadata={props.metadata} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "usage",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <Show when={props.output}>
+          <UsageOutput output={props.output!} metadata={props.metadata} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
   name: "skill",
   render(props) {
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
@@ -3662,6 +3818,25 @@ function builtinRenderer(Output: (p: { output: string; input?: Record<string, an
     )
   }
 }
+
+ToolRegistry.register({
+  name: "code",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <CodeOutput
+          output={props.output}
+          input={props.input}
+          metadata={props.metadata}
+          pending={props.status === "pending" || props.status === "running"}
+        />
+      </BasicTool>
+    )
+  },
+})
 
 ToolRegistry.register({ name: "monitor", render: builtinRenderer(MonitorOutput) })
 ToolRegistry.register({ name: "checkpoint", render: builtinRenderer(CheckpointOutput, "mode") })
@@ -3727,6 +3902,33 @@ for (const name of BROWSER_TOOLS) {
 for (const name of BROWSER_VISUAL_TOOLS) {
   ToolRegistry.register({ name, render: BrowserVisualTool })
 }
+
+// The lazy gateway is transport-only. A delegated tool with an existing native
+// presentation should reuse it verbatim, retaining the exact tool identity and
+// output layout. Unknown lazy capabilities use the compact broker projection.
+ToolRegistry.register({
+  name: "tool",
+  render(props) {
+    const identity = createMemo(() => lazyToolIdentity(props.input, props.metadata))
+    const delegated = createMemo(() => {
+      const target = identity().target
+      if (identity().action !== "call" || !target || target === "tool") return undefined
+      return ToolRegistry.render(target)
+    })
+    return (
+      <Show when={delegated()} fallback={<LazyTool {...props} />}>
+        {(render) => (
+          <Dynamic
+            component={render()}
+            {...props}
+            tool={identity().target!}
+            input={identity().args}
+          />
+        )}
+      </Show>
+    )
+  },
+})
 
 ToolRegistry.register({
   name: "browser",

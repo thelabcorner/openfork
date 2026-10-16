@@ -160,6 +160,7 @@
   overflow: auto;
   scrollbar-width: none;
   overscroll-behavior: contain;
+  overflow-anchor: none;
   background:
     linear-gradient(45deg, color-mix(in srgb, var(--v2-text-text-base) 2.5%, transparent) 25%, transparent 25%) 0 0 / 16px 16px,
     linear-gradient(-45deg, color-mix(in srgb, var(--v2-text-text-base) 2.5%, transparent) 25%, transparent 25%) 0 8px / 16px 16px,
@@ -181,6 +182,10 @@
     cursor: grabbing;
     user-select: none;
   }
+
+  &[data-zoomed="true"] {
+    touch-action: none;
+  }
 }
 
 [data-component="tool-visual-media"][data-zoomed="true"] [data-slot="tool-visual-viewport"] {
@@ -192,6 +197,7 @@
   min-height: 0;
   max-height: none;
   aspect-ratio: auto;
+  touch-action: none;
 }
 
 [data-slot="tool-visual-stage"] {
@@ -209,10 +215,16 @@
     max-width: none;
     max-height: none;
     object-fit: contain;
+    image-rendering: auto;
     border-radius: 4px;
     box-shadow: 0 1px 4px color-mix(in srgb, var(--v2-alpha-dark-100, #000) 14%, transparent);
     user-select: none;
     -webkit-user-drag: none;
+  }
+
+  img:not([style*="width"]) {
+    width: 100%;
+    height: 100%;
   }
 }
 

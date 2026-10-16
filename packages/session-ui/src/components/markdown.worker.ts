@@ -7,8 +7,6 @@ import type { TokensList } from "marked"
 import {
   bundledLanguages,
   createHighlighter,
-  getTokenStyleObject,
-  stringifyTokenStyle,
   type BundledLanguage,
   type ThemedToken,
 } from "shiki"
@@ -23,6 +21,8 @@ import {
 } from "./markdown-worker-protocol"
 import { createLatestWorkerQueue } from "./markdown-worker-queue"
 import { appendPlainMarkdownTokens } from "./markdown-incremental-tokens"
+import { convertHighlightTokens, flattenHighlightLines } from "./markdown-highlight-tokens"
+import { createTokenStyleSerializer } from "./markdown-token-style"
 import { project, type Projection } from "./markdown-stream"
 
 type Stream = {
@@ -50,6 +50,24 @@ const parseStates = new Map<string, ParseState>()
 const parseStateSizes = new Map<string, number>()
 let parseStateBytesTotal = 0
 let highlighter: ReturnType<typeof createHighlighter> | undefined
+const readyLanguages = new Set<string>()
+const loadingLanguages = new Map<string, Promise<void>>()
+type LoadedHighlighter = Awaited<ReturnType<typeof createHighlighter>>
+/** A worker loads each grammar once, including its aliases. Coalesce concurrent
+ * parser/highlight requests while preserving retry after failed loads. */
+async function ensureLanguage(instance: LoadedHighlighter, language: string) {
+  if (readyLanguages.has(language)) return
+  let loading = loadingLanguages.get(language)
+  if (!loading) {
+    loading = (async () => {
+      if (!instance.getLoadedLanguages().includes(language))
+        await instance.loadLanguage(bundledLanguages[language as BundledLanguage])
+      readyLanguages.add(language)
+    })().finally(() => loadingLanguages.delete(language))
+    loadingLanguages.set(language, loading)
+  }
+  await loading
+}
 const workerReceived = new Map<number, number>()
 function disposeStream(key: string) {
   streams.delete(key)
@@ -110,9 +128,8 @@ const parser = createMarkdownParser(async (code, language) => {
   const languageID = language.trim().split(/\s+/, 1)[0]?.toLowerCase()
   if (languageID === "mermaid" || languageID === "mmd") return plainCode(code, languageID)
   const instance = await getHighlighter()
-  const name = language in bundledLanguages ? language : "text"
-  if (!instance.getLoadedLanguages().includes(name))
-    await instance.loadLanguage(bundledLanguages[name as BundledLanguage])
+  const name = languageID && Object.hasOwn(bundledLanguages, languageID) ? languageID : "text"
+  await ensureLanguage(instance, name)
   return instance.codeToHtml(code, { lang: name as BundledLanguage, theme: "OpenCode", tabindex: false })
 })
 
@@ -291,9 +308,9 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
   const workerQueueMs = started - received
   try {
     const instance = await getHighlighter()
-    const language = request.language in bundledLanguages ? request.language : "text"
-    if (!instance.getLoadedLanguages().includes(language))
-      await instance.loadLanguage(bundledLanguages[language as BundledLanguage])
+    const languageID = request.language.trim().split(/\s+/, 1)[0]?.toLowerCase()
+    const language = languageID && Object.hasOwn(bundledLanguages, languageID) ? languageID : "text"
+    await ensureLanguage(instance, language)
 
     if (request.complete) {
       // Completion intentionally arrives as a full reset. The streaming path
@@ -308,11 +325,7 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
         key: request.key,
         language,
         reset: true,
-        stable: result.tokens
-          .flatMap((line, index) =>
-            index === result.tokens.length - 1 ? line : [...line, { content: "\n", offset: 0 }],
-          )
-          .map(token),
+        stable: flattenHighlightLines(result.tokens, token, request.text),
         unstable: [],
         workerMs: performance.now() - started,
         workerQueueMs,
@@ -357,8 +370,8 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
       key: request.key,
       language,
       reset,
-      stable: result.stable.filter((token) => token.content.length > 0).map(token),
-      unstable: result.unstable.filter((token) => token.content.length > 0).map(token),
+      stable: convertHighlightTokens(result.stable, token),
+      unstable: convertHighlightTokens(result.unstable, token),
       workerMs: performance.now() - started,
       workerQueueMs,
     })
@@ -382,6 +395,7 @@ function post(response: MarkdownWorkerResponse) {
   self.postMessage(response)
 }
 
+const tokenStyle = createTokenStyleSerializer()
 function token(value: ThemedToken): MarkdownToken {
-  return [value.content, stringifyTokenStyle(value.htmlStyle ?? getTokenStyleObject(value))]
+  return [value.content, tokenStyle(value)]
 }

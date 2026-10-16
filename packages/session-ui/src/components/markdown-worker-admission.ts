@@ -1,4 +1,5 @@
 export type MarkdownWorkPriority = "background" | "visible" | "tail"
+export const MARKDOWN_WORKER_MAX_JOB_BYTES = 8 * 1024 * 1024
 
 /** Keep all optional/background work off the lane used by selected and live content. */
 export function markdownLaneForPriority(key: string, priority: MarkdownWorkPriority, lanes: number) {

@@ -16,3 +16,5 @@
 @import "../components/tool-error-card.css" layer(components);
 @import "../components/tool-status-title.css" layer(components);
 @import "../components/tool-visual-media.css" layer(components);
+@import "../components/code-tool.css" layer(components);
+@import "../components/lazy-tool.css" layer(components);

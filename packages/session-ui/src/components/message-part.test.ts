@@ -25,4 +25,9 @@ describe("readPartText", () => {
   test("trims leading and trailing whitespace", () => {
     expect(readPartText(undefined, { id: "part_1", text: "\n  body  \n" })).toBe("body")
   })
+  test("preserves incomplete whitespace while streaming", () => {
+    const part = { id: "part_1", text: "\n  body  \r\n" }
+    expect(readPartText(undefined, part, true)).toBe("\n  body  \r\n")
+    expect(readPartText(undefined, part, false)).toBe("body")
+  })
 })

@@ -20,7 +20,18 @@ import {
 import { type PreloadFileDiffResult, type PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
 import { createMediaQuery } from "@solid-primitives/media"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { ComponentProps, createEffect, createMemo, createSignal, onCleanup, onMount, Show, splitProps } from "solid-js"
+import {
+  ComponentProps,
+  createEffect,
+  createMemo,
+  createSignal,
+  Match,
+  onCleanup,
+  onMount,
+  Show,
+  splitProps,
+  Switch,
+} from "solid-js"
 import { createDefaultOptions, styleVariables } from "../pierre"
 import { markCommentedDiffLines, markCommentedFileLines } from "../pierre/commented-lines"
 import { fixDiffSelection, findDiffSide, type DiffSelectionSide } from "../pierre/diff-selection"
@@ -743,7 +754,7 @@ function TextViewer<T>(props: TextFileProps<T>) {
   const [local, others] = splitProps(props, textKeys)
 
   const text = () => {
-    const value = local.file.contents as unknown
+    const value = local.file?.contents as unknown
     if (typeof value === "string") return value
     if (Array.isArray(value)) return value.join("\n")
     if (value == null) return ""
@@ -758,7 +769,7 @@ function TextViewer<T>(props: TextFileProps<T>) {
   }
 
   const bytes = createMemo(() => {
-    const value = local.file.contents as unknown
+    const value = local.file?.contents as unknown
     if (typeof value === "string") return value.length
     if (Array.isArray(value)) {
       return value.reduce(
@@ -921,9 +932,10 @@ function TextViewer<T>(props: TextFileProps<T>) {
         instance = value
       },
       draw: (value) => {
+        const file = local.file
         const contents = text()
         value.render({
-          file: typeof local.file.contents === "string" ? local.file : { ...local.file, contents },
+          file: file ? (typeof file.contents === "string" ? file : { ...file, contents }) : { name: "", contents },
           lineAnnotations: [],
           containerWrapper: viewer.container,
         })
@@ -1221,10 +1233,25 @@ function DiffViewer<T>(props: DiffFileProps<T>) {
 // Public API
 // ---------------------------------------------------------------------------
 
-export function File<T>(props: FileProps<T>) {
-  if (props.mode === "text") {
-    return <FileMedia media={props.media} fallback={() => TextViewer(props)} />
-  }
+function FileMediaText<T>(props: FileProps<T>) {
+  if (props.mode !== "text") return null
+  return <FileMedia media={props.media} fallback={() => TextViewer(props)} />
+}
 
+function FileMediaDiff<T>(props: FileProps<T>) {
+  if (props.mode === "text") return null
   return <FileMedia media={props.media} fallback={() => DiffViewer(props)} />
+}
+
+export function File<T>(props: FileProps<T>) {
+  return (
+    <Switch>
+      <Match when={props.mode === "text"}>
+        <FileMediaText {...props} />
+      </Match>
+      <Match when={props.mode !== "text"}>
+        <FileMediaDiff {...props} />
+      </Match>
+    </Switch>
+  )
 }
