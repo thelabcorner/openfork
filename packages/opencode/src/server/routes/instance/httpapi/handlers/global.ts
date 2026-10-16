@@ -38,7 +38,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { and, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
@@ -785,7 +785,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       const telemetry = yield* SessionTelemetry.Service
       const [snapshot, working] = yield* Effect.all([
         telemetry.snapshot(ctx.payload.sessions),
-        execution.listWorkingForSessionIDs(ctx.payload.sessions),
+        execution.listWorkingForSessionIDs(ctx.payload.sessions.filter(Schema.is(SessionID))),
       ])
       // A same-process runner defect can leave a live telemetry overlay after
       // its exact local activation has disappeared. The owner projection is

@@ -180,7 +180,7 @@ export const sessionReadHandlers = HttpApiBuilder.group(SessionReadApi, "session
 
     const timelinePartsBatch = Effect.fn("SessionReadHttpApi.timelinePartsBatch")(function* (ctx: {
       params: { sessionID: SessionID }
-      query: { messageIDs: MessageID[]; cursor?: string }
+      query: { messageIDs: readonly MessageID[]; cursor?: string }
     }) {
       yield* requireSession(ctx.params.sessionID)
       if (ctx.query.messageIDs.length > MessageV2.TIMELINE_RECOVERY_MESSAGE_LIMIT)
