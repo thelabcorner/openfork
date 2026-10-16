@@ -175,7 +175,7 @@ function planWorkspaceRequest(
 
 function planRequest(
   request: HttpServerRequest.HttpServerRequest,
-  session?: Session.Info,
+  session?: Pick<Session.Info, "directory" | "workspaceID">,
 ): Effect.Effect<RequestPlan, never, Workspace.Service> {
   return Effect.gen(function* () {
     const url = requestURL(request)
@@ -254,7 +254,9 @@ function routeHttpApiWorkspace<E>(
     const request = yield* HttpServerRequest.HttpServerRequest
     const sessionID = getWorkspaceRouteSessionID(requestURL(request))
     const session = sessionID
-      ? yield* Session.Service.use((svc) => svc.get(sessionID)).pipe(
+      ? yield* Session.Service.use((svc) =>
+          svc.getRoutingLocation ? svc.getRoutingLocation(sessionID) : svc.get(sessionID)
+        ).pipe(
           Effect.catchIf(
             (error): error is NotFoundError => NotFoundError.isInstance(error),
             () => Effect.succeed(undefined),

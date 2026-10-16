@@ -1,7 +1,6 @@
 import { Command } from "@/command"
 import * as InstanceState from "@/effect/instance-state"
 import { Format } from "@/format"
-import { Global } from "@opencode-ai/core/global"
 import { LSP } from "@/lsp/lsp"
 import { Vcs } from "@/project/vcs"
 import { Skill } from "@/skill"
@@ -22,24 +21,6 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
     const dispose = Effect.fn("InstanceHttpApi.dispose")(function* () {
       yield* markInstanceForDisposal(yield* InstanceState.context)
       return true
-    })
-
-    const getPath = Effect.fn("InstanceHttpApi.path")(function* () {
-      const ctx = yield* InstanceState.context
-      return {
-        home: Global.Path.home,
-        state: Global.Path.state,
-        config: Global.Path.config,
-        worktree: ctx.worktree,
-        directory: ctx.directory,
-      }
-    })
-
-    const getVcs = Effect.fn("InstanceHttpApi.vcs")(function* () {
-      const [branch, default_branch] = yield* Effect.all([vcs.branch(), vcs.defaultBranch()], {
-        concurrency: "unbounded",
-      })
-      return { branch, default_branch }
     })
 
     const getVcsStatus = Effect.fn("InstanceHttpApi.vcsStatus")(function* () {
@@ -89,8 +70,6 @@ export const instanceHandlers = HttpApiBuilder.group(InstanceHttpApi, "instance"
 
     return handlers
       .handle("dispose", dispose)
-      .handle("path", getPath)
-      .handle("vcs", getVcs)
       .handle("vcsStatus", getVcsStatus)
       .handle("vcsDiff", getVcsDiff)
       .handle("vcsDiffRaw", getVcsDiffRaw)

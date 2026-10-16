@@ -20,6 +20,7 @@ import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { RevisionProgress } from "@opencode-ai/core/revision-progress"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
@@ -54,6 +55,8 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
 import { ofxpHandlers } from "../../src/server/routes/instance/httpapi/handlers/ofxp"
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
+import { promptRevisionProgressHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revision-progress"
+import { promptRevisorRunHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revisor-runs"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
@@ -161,6 +164,8 @@ const apiLayer = HttpRouter.serve(
       providerSettingsHandlers,
       quotaHandlers,
       revisionDraftHandlers,
+      promptRevisionProgressHandlers,
+      promptRevisorRunHandlers,
       scheduledTaskHandlers,
       swarmHandlers,
       usageHandlers,
@@ -181,7 +186,7 @@ const apiLayer = HttpRouter.serve(
     )),
   Layer.provide(
     Layer.mock(Auth.Service)({
-      all: () => Effect.succeed({}),
+      all: () => Effect.succeed({ workbuddy: { type: "api", key: "workbuddy-test-marker" } as Auth.Info }),
       get: () => Effect.succeed(undefined),
     }),
   ),
@@ -524,8 +529,50 @@ const apiLayer = HttpRouter.serve(
         recover: () => Effect.succeed(undefined),
         consume: () => Effect.void,
       }),
+      Layer.mock(RevisionProgress.Service)({
+        latest: (operationID) =>
+          Effect.succeed(
+            operationID === "op-live"
+              ? { operationID, percent: 42, phase: "reading", updatedAt: 7 }
+              : undefined,
+          ),
+      }),
       Layer.mock(Usage.Service)({
         summary: () => Effect.die("unused usage summary"),
+        workload: (request) => Effect.succeed({
+          since: request.since, until: request.until,
+          providerID: request.providerID ?? null, modelID: request.modelID ?? null, projectID: request.projectID ?? null,
+          watermark: { generationCompletedAt: null, toolCompletedAt: null },
+          generation: {
+            settlements: 0,
+            quantiles: "exact" as const,
+            requestToFirstToken: { samples: 0, sumMs: 0, p50Ms: null, p95Ms: null },
+            clientToFirstToken: { samples: 0, sumMs: 0, p50Ms: null, p95Ms: null },
+            streamedGeneration: { samples: 0, sumMs: 0, p50Ms: null, p95Ms: null },
+            providerInternalTTFT: null,
+          },
+          tools: {
+            provenance: "unavailable" as const, coverage: "unavailable" as const, firstRecordedAt: null,
+            quantiles: "unavailable" as const,
+            totals: { calls: 0, success: 0, error: 0, abort: 0, denied: 0, timeout: 0, unknown: 0,
+              duration: { samples: 0, sumMs: 0, p50Ms: null, p95Ms: null } },
+            rows: [], topFailingRows: [], topSlowRows: [], totalTools: 0, omittedTools: 0,
+          },
+          projects: {
+            provenance: "unavailable" as const, coverage: "unavailable" as const, quantiles: "unavailable" as const,
+            totals: { calls: 0, success: 0, error: 0, abort: 0, denied: 0, timeout: 0, unknown: 0,
+              duration: { samples: 0, sumMs: 0, p50Ms: null, p95Ms: null } },
+            rows: [], topFailingRows: [], topSlowRows: [], totalProjects: 0, omittedProjects: 0,
+          },
+          generationProjects: {
+            provenance: "unavailable" as const, coverage: "unavailable" as const,
+            totals: { settlements: 0, generationMs: 0, generationRecords: 0, tokenRecords: 0,
+              tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 } },
+            unattributed: { settlements: 0, generationMs: 0, generationRecords: 0, tokenRecords: 0,
+              tokens: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reasoning: 0 } },
+            rows: [], totalProjects: 0, omittedProjects: 0,
+          },
+        }),
         modelProfile: () => Effect.succeed({ models: [] }),
         pricingCatalog: () => Effect.succeed({ models: [] }),
         sessionContext: (sessionID) =>
@@ -578,7 +625,18 @@ describe("Tier-0 root ownership", () => {
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.get("/provider-settings").pipe(HttpClient.execute)
       expect(response.status).toBe(200)
-      expect(yield* response.json).toEqual({ providers: [] })
+      expect(yield* response.json).toEqual({
+        providers: [
+          {
+            id: "workbuddy",
+            name: "WorkBuddy",
+            source: "custom",
+            connected: true,
+            hasPaidModels: false,
+            connections: [],
+          },
+        ],
+      })
     }),
   )
 
@@ -685,6 +743,23 @@ describe("Tier-0 root ownership", () => {
       const response = yield* HttpClientRequest.get("/usage/model-profile").pipe(HttpClient.execute)
       expect(response.status).toBe(200)
       expect(yield* response.json).toEqual({ models: [] })
+    }),
+  )
+
+  it.live("serves filtered workload on Tier 0 without an implicit Instance or directory", () =>
+    Effect.gen(function* () {
+      const before = yield* Ref.get(instanceLoads)
+      const response = yield* HttpClientRequest.get(`${UsagePaths.workload}?since=1&until=100&providerID=p&modelID=m`).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      const result = (yield* response.json) as { providerID: string; modelID: string; tools: { provenance: string } }
+      expect(result.providerID).toBe("p")
+      expect(result.modelID).toBe("m")
+      expect(result.tools.provenance).toBe("unavailable")
+      expect(yield* Ref.get(instanceLoads)).toBe(before)
+
+      const invalid = yield* HttpClientRequest.get(`${UsagePaths.workload}?since=100&until=1`).pipe(HttpClient.execute)
+      expect(invalid.status).toBe(400)
+      expect(yield* Ref.get(instanceLoads)).toBe(before)
     }),
   )
 
@@ -1021,6 +1096,46 @@ describe("Tier-0 root ownership", () => {
       const response = yield* HttpClientRequest.get(GlobalPaths.sessionRoots + "?" + query).pipe(HttpClient.execute)
       expect(response.status).toBe(200)
       expect(yield* response.json).toEqual([])
+    }),
+  )
+
+  it.live("serves live prompt revision progress without an Instance", () =>
+    Effect.gen(function* () {
+      const live = yield* HttpClientRequest.get(
+        "/prompt/revise/progress?operationID=" + encodeURIComponent("op-live"),
+      ).pipe(HttpClient.execute)
+      expect(live.status).toBe(200)
+      expect(yield* live.json).toEqual({ operationID: "op-live", percent: 42, phase: "reading", updatedAt: 7 })
+
+      const idle = yield* HttpClientRequest.get(
+        "/prompt/revise/progress?operationID=" + encodeURIComponent("op-idle"),
+      ).pipe(HttpClient.execute)
+      expect(idle.status).toBe(200)
+      expect(yield* idle.json).toBeNull()
+      // Negative ownership invariant: this Tier-0 read must create zero
+      // workspace Instances, even with no directory query parameter at all.
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
+    }),
+  )
+
+  it.live("serves detached revision run status and cancel without an Instance", () =>
+    Effect.gen(function* () {
+      const key = `tier0-run-${crypto.randomUUID()}`
+      const status = yield* HttpClientRequest.get(
+        "/prompt/revise/run?kind=prompt&key=" + encodeURIComponent(key),
+      ).pipe(HttpClient.execute)
+      expect(status.status).toBe(200)
+      expect(yield* status.json).toBeNull()
+
+      const cancel = yield* HttpClientRequest.post("/prompt/revise/cancel").pipe(
+        HttpClientRequest.setBody(HttpBody.jsonUnsafe({ kind: "prompt", key })),
+        HttpClient.execute,
+      )
+      expect(cancel.status).toBe(200)
+      expect(yield* cancel.json).toBe(false)
+      // Negative ownership invariant: run lifecycle reads/controls are
+      // process-global registry state and must never create Instances.
+      expect(yield* Ref.get(instanceLoads)).toBe(0)
     }),
   )
 

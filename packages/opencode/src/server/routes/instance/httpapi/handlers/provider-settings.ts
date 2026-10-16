@@ -39,7 +39,10 @@ export const providerSettingsHandlers = HttpApiBuilder.group(RootHttpApi, "provi
       const configured = globalConfig.provider ?? {}
       const disabled = new Set(globalConfig.disabled_providers ?? [])
       const enabled = globalConfig.enabled_providers ? new Set(globalConfig.enabled_providers) : undefined
-      const ids = new Set([...Object.keys(catalog), ...Object.keys(configured)])
+      // Built-in plugin providers can have a saved legacy Auth record without
+      // a Models.dev or config row. Include those identities in this global,
+      // bootstrap-free settings projection without initializing plugin runtime.
+      const ids = new Set([...Object.keys(catalog), ...Object.keys(configured), ...Object.keys(legacyCredentials)])
 
       return {
         providers: [...ids]
@@ -50,6 +53,7 @@ export const providerSettingsHandlers = HttpApiBuilder.group(RootHttpApi, "provi
             const env = configuredProvider?.env ?? modelProvider?.env ?? []
             const hasEnvironment = env.some((name) => !!process.env[name])
             const hasConfig = configuredProvider !== undefined
+            const hasLegacyAuth = legacyCredentials[id] !== undefined
             const credentialConnections = (saved.get(id) ?? [])
               .toReversed()
               .map((item) => ({
@@ -64,13 +68,15 @@ export const providerSettingsHandlers = HttpApiBuilder.group(RootHttpApi, "provi
               ? configSource(configuredProvider)
               : hasEnvironment
                 ? ("env" as const)
-                : ("api" as const)
+                : hasLegacyAuth
+                  ? ("custom" as const)
+                  : ("api" as const)
             const hasPaidModels = Object.values(modelProvider?.models ?? {}).some(
               (model) => (model.cost?.input ?? 0) > 0 || (model.cost?.output ?? 0) > 0,
             )
             return {
               id,
-              name: configuredProvider?.name ?? modelProvider?.name ?? id,
+              name: configuredProvider?.name ?? modelProvider?.name ?? (id === "workbuddy" ? "WorkBuddy" : id),
               source,
               connected: connections.length > 0 || legacyCredentials[id] !== undefined || hasConfig,
               hasPaidModels,

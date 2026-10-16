@@ -133,13 +133,21 @@ export const goalHandlers = HttpApiBuilder.group(InstanceHttpApi, "goal", (handl
                   })
                   return
                 }
-                const message = error instanceof Error ? error.message : String(error)
-                yield* automation
-                  .failAudit({ sessionID, error: `Goal audit orchestration failed: ${message}` })
-                  .pipe(Effect.ignore)
+                // The auditor's finalizer can already have released its exact
+                // lease to durable audit_requested while the enclosing HTTP
+                // dispatch throws. Never erase that cursor with failAudit, and
+                // never overwrite a competing worker or auditor that won the
+                // Session after this request began.
+                const runtime = yield* automation.runtime(sessionID).pipe(
+                  Effect.catchCause(() => Effect.succeed(undefined)),
+                )
+                if (!runtime && (yield* automation.shouldAudit(sessionID))) {
+                  yield* automation.requestAudit(sessionID).pipe(Effect.ignore)
+                }
                 yield* Effect.logError("Goal audit orchestration failed", {
                   sessionID,
                   goalID: ctx.params.goalID,
+                  phase: runtime?.phase,
                   cause: Cause.pretty(cause),
                 })
               }),

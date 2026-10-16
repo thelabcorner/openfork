@@ -5,6 +5,7 @@ import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "e
 import { HttpApiError, HttpApiMiddleware } from "effect/unstable/httpapi"
 import { hasPtyConnectTicketURL } from "@/server/shared/pty-ticket"
 import { isPublicUIPath } from "@/server/shared/public-ui"
+import { authChallenge, isApiRequestPath, isDocumentNavigation } from "@opencode-ai/server/auth-challenge"
 export {
   Authorization as ServerAuthorization,
   authorizationLayer as serverAuthorizationLayer,
@@ -12,7 +13,18 @@ export {
 
 const AUTH_TOKEN_QUERY = "auth_token"
 const UNAUTHORIZED = 401
-const WWW_AUTHENTICATE = 'Basic realm="Secure Area"'
+
+const API_AUTH_CHALLENGE = authChallenge({ apiRequest: true })
+
+function routerAuthChallenge(request: HttpServerRequest.HttpServerRequest, url: URL) {
+  const documentNavigation = isDocumentNavigation({
+    method: request.method,
+    destination: request.headers["sec-fetch-dest"],
+    mode: request.headers["sec-fetch-mode"],
+    accept: request.headers.accept,
+  })
+  return authChallenge({ apiRequest: isApiRequestPath(url.pathname), documentNavigation })
+}
 
 function authenticationRequired(config: ServerAuth.Info) {
   return ServerAuth.required(config) || ServerAuth.publiclyExposed(config)
@@ -51,7 +63,7 @@ function validateCredential<A, E, R>(
     if (!authenticationRequired(config)) return yield* effect
     if (!ServerAuth.authorized(credential, config)) {
       yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-        Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
+        Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", API_AUTH_CHALLENGE)),
       )
       return yield* new HttpApiError.Unauthorized({})
     }
@@ -138,7 +150,7 @@ function authorizeWithDevices<A, E, R>(
     if (ServerAuth.authorized(credential, config)) return yield* effect
     if (yield* deviceAuthorized(url, request, credential, devices)) return yield* effect
     yield* HttpEffect.appendPreResponseHandler((_request, response) =>
-      Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
+      Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", API_AUTH_CHALLENGE)),
     )
     return yield* new HttpApiError.Unauthorized({})
   })
@@ -154,7 +166,7 @@ function validateRawCredential<A, E, R>(
     return Effect.succeed(
       HttpServerResponse.empty({
         status: UNAUTHORIZED,
-        headers: { "www-authenticate": WWW_AUTHENTICATE },
+        headers: { "www-authenticate": API_AUTH_CHALLENGE },
       }),
     )
   return effect
@@ -180,7 +192,7 @@ export const authorizationRouterMiddleware = HttpRouter.middleware()(
         if (!authorized)
           return HttpServerResponse.empty({
             status: UNAUTHORIZED,
-            headers: { "www-authenticate": WWW_AUTHENTICATE },
+            headers: { "www-authenticate": routerAuthChallenge(request, url) },
           })
         return yield* effect
       })

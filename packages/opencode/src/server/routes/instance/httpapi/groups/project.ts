@@ -29,16 +29,6 @@ export const ProjectApi = HttpApi.make("project")
             description: "Get a list of projects that have been opened with OpenFork.",
           }),
         ),
-        HttpApiEndpoint.get("current", `${root}/current`, {
-          query: WorkspaceRoutingQuery,
-          success: described(Project.Info, "Current project information"),
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "project.current",
-            summary: "Get current project",
-            description: "Retrieve the currently active project that OpenFork is working with.",
-          }),
-        ),
         HttpApiEndpoint.post("initGit", `${root}/git/init`, {
           query: WorkspaceRoutingQuery,
           success: described(Project.Info, "Project information after git initialization"),
@@ -89,5 +79,34 @@ export const ProjectApi = HttpApi.make("project")
       title: "OpenFork experimental HttpApi",
       version: "0.0.1",
       description: "Experimental HttpApi surface for selected instance routes.",
+    }),
+  )
+
+// Project identity is needed before runtime bootstrap (for example when a
+// draft is opened in a cold workspace). Resolve it from the explicit location
+// without acquiring InstanceContextMiddleware.
+export const ProjectCurrentApi = HttpApi.make("project-current")
+  .add(
+    HttpApiGroup.make("project-current")
+      .add(
+        HttpApiEndpoint.get("current", `${root}/current`, {
+          query: WorkspaceRoutingQuery,
+          success: described(Project.Info, "Current project information"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "project.current",
+            summary: "Get current project",
+            description: "Retrieve project information for the explicitly routed workspace.",
+          }),
+        ),
+      )
+      .middleware(WorkspaceRoutingMiddleware)
+      .middleware(Authorization),
+  )
+  .annotateMerge(
+    OpenApi.annotations({
+      title: "OpenFork project identity read",
+      version: "0.0.1",
+      description: "Explicit-location project identity without execution instance bootstrap.",
     }),
   )

@@ -7,7 +7,7 @@ import { Integration } from "@opencode-ai/core/integration"
 import { SkillV2 } from "@opencode-ai/core/skill"
 import { InstanceDisposed } from "@/server/event"
 import { Question } from "@/question"
-import { ConfigApi } from "./groups/config"
+import { ConfigApi, ConfigReadApi } from "./groups/config"
 import { AgentCatalogApi } from "./groups/agent-catalog"
 import { ProviderCatalogApi } from "./groups/provider-catalog"
 import { OpenRouterReferenceApi } from "./groups/openrouter-reference"
@@ -21,18 +21,20 @@ import { ForkCredentialApi } from "./groups/fork-credential"
 import { EventApi } from "./groups/event"
 import { ExperimentalApi } from "./groups/experimental"
 import { FileApi } from "./groups/file"
-import { InstanceApi } from "./groups/instance"
+import { InstanceApi, VcsBranchApi } from "./groups/instance"
+import { PathApi } from "./groups/path"
 import { McpApi } from "./groups/mcp"
 import { OfxpApi } from "./groups/ofxp"
 import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { PermissionApi } from "./groups/permission"
 import { PermissionControlApi } from "./groups/permission"
-import { ProjectApi } from "./groups/project"
+import { ProjectApi, ProjectCurrentApi } from "./groups/project"
 import { ProjectCopyApi } from "./groups/project-copy"
 import { ProviderApi } from "./groups/provider"
 import { ProviderSettingsApi } from "./groups/provider-settings"
 import { PtyApi, PtyConnectApi, PtyShellApi } from "./groups/pty"
 import { QuotaApi } from "./groups/quota"
+import { TelegramApi } from "./groups/telegram"
 import { QuestionApi } from "./groups/question"
 import { QuestionControlApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
@@ -40,6 +42,8 @@ import { SessionReadApi } from "./groups/session-read"
 import { SessionControlApi } from "./groups/session-control"
 import { SessionContextApi } from "./groups/session-context"
 import { SessionGroupApi } from "./groups/session-group"
+import { SessionLimitRecoveryApi } from "./groups/session-limit-recovery"
+import { SessionAttachmentApi } from "./groups/session-attachment"
 import { GoalApi } from "./groups/goal"
 import { ScheduledTaskApi } from "./groups/scheduled-task"
 import { SwarmApi } from "./groups/swarm"
@@ -51,6 +55,8 @@ import { UsageApi } from "./groups/usage"
 import { WakaTimeApi } from "./groups/wakatime"
 import { WorkspaceApi } from "./groups/workspace"
 import { PromptRevisorApi } from "./groups/prompt-revisor"
+import { PromptRevisionProgressApi } from "./groups/prompt-revision-progress"
+import { PromptRevisorRunsApi } from "./groups/prompt-revisor-runs"
 import { RevisionDraftApi } from "./groups/revision-draft"
 import { makeApi } from "@opencode-ai/protocol/api"
 import { LocationMiddleware } from "@opencode-ai/server/location"
@@ -95,6 +101,10 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(OfxpApi)
   // Bootstrap-free revision mailbox: stable target identity + durable SQLite only.
   .addHttpApi(RevisionDraftApi)
+  // Tier 0 advisory live progress: process-global latest-value memory only.
+  .addHttpApi(PromptRevisionProgressApi)
+  // Tier 0 detached-run lifecycle: process-global status/cancel registry.
+  .addHttpApi(PromptRevisorRunsApi)
   // Tier 0 scheduling: durable global catalog state, never behind instance middleware.
   .addHttpApi(ScheduledTaskApi)
   // Tier 0 Swarm projection: durable orchestration state only; live Session truth stays elsewhere.
@@ -103,12 +113,16 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .middleware(Authorization)
 
 export const InstanceHttpApi = HttpApi.make("opencode-instance")
+  .addHttpApi(ConfigReadApi)
   .addHttpApi(ConfigApi)
   .addHttpApi(ExperimentalApi)
   .addHttpApi(FileApi)
   .addHttpApi(InstanceApi)
+  .addHttpApi(PathApi)
+  .addHttpApi(VcsBranchApi)
   .addHttpApi(McpApi)
   .addHttpApi(ProjectApi)
+  .addHttpApi(ProjectCurrentApi)
   .addHttpApi(ProjectCopyApi)
   .addHttpApi(PtyApi)
   .addHttpApi(QuestionApi)
@@ -129,6 +143,12 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
 
 export const OpenCodeHttpApi = HttpApi.make("opencode")
   .addHttpApi(RootHttpApi)
+  // The Telegram channel is hosted on a dedicated Tier-0 route graph so
+  // RootHttpApi test fixtures do not acquire a notification-service dependency.
+  // It must still be included in the public aggregate for SDK/OpenAPI generation.
+  .addHttpApi(TelegramApi)
+  .addHttpApi(SessionLimitRecoveryApi)
+  .addHttpApi(SessionAttachmentApi)
   .addHttpApi(AgentCatalogApi)
   .addHttpApi(ProviderCatalogApi)
   // Tier-0 public reference metadata. Keep this out of RootHttpApi as well as

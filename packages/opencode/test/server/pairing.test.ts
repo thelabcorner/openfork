@@ -14,6 +14,7 @@ const original = {
   envUsername: process.env.OPENCODE_SERVER_USERNAME,
   envPublicURL: process.env.OPENCODE_PUBLIC_URL,
   envPWAURL: process.env.OPENCODE_PWA_URL,
+  envNodeEnv: process.env.NODE_ENV,
 }
 const auth = { username: "opencode", password: "pairing-secret" }
 
@@ -28,6 +29,8 @@ afterEach(async () => {
   else process.env.OPENCODE_PUBLIC_URL = original.envPublicURL
   if (original.envPWAURL === undefined) delete process.env.OPENCODE_PWA_URL
   else process.env.OPENCODE_PWA_URL = original.envPWAURL
+  if (original.envNodeEnv === undefined) delete process.env.NODE_ENV
+  else process.env.NODE_ENV = original.envNodeEnv
   await resetDatabase()
 })
 
@@ -58,6 +61,12 @@ interface PairBegin {
   code: string
   url: string
   expiresAt: string
+}
+
+async function beginURL(listener: Awaited<ReturnType<typeof startListener>>) {
+  const response = await begin(listener)
+  expect(response.status).toBe(200)
+  return ((await response.json()) as PairBegin).url
 }
 
 interface PairClaim {
@@ -106,6 +115,8 @@ describe("device pairing over Server.listen", () => {
     "full ceremony: begin -> claim -> device-token auth incl. SSE query param -> revoke",
     async () => {
     await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
+    delete process.env.OPENCODE_PUBLIC_URL
+    delete process.env.OPENCODE_PWA_URL
     const listener = await startListener()
     try {
       // begin requires auth
@@ -116,15 +127,69 @@ describe("device pairing over Server.listen", () => {
       expect(begun.status).toBe(200)
       const pair = (await begun.json()) as PairBegin
       expect(pair.code).toMatch(new RegExp(`^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{${PAIRING.codeLength}}$`))
-      expect(pair.url).toContain(`#pair=${pair.code}`)
+      // Without a configured static PWA origin, do not encode the protected
+      // API origin as a phone navigation target; manual code entry remains.
+      expect(pair.url).toBe("")
       expect(new Date(pair.expiresAt).getTime()).toBeGreaterThan(Date.now())
 
-      process.env.OPENCODE_PUBLIC_URL = "https://api.example.test/oc"
       process.env.OPENCODE_PWA_URL = "https://mobile.example.test/"
+      delete process.env.OPENCODE_PUBLIC_URL
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.test/"
+      process.env.OPENCODE_PWA_URL = "https://mobile.example.test/app?mode=pwa"
       const publicPair = await begin(listener)
       expect(publicPair.status).toBe(200)
       const publicPairBody = (await publicPair.json()) as PairBegin
-      expect(publicPairBody.url).toMatch(/^https:\/\/mobile\.example\.test\/\?server=https%3A%2F%2Fapi\.example\.test%2Foc#pair=/)
+      expect(publicPairBody.url).toBe(
+        `https://mobile.example.test/app?mode=pwa&server=${encodeURIComponent("https://api.example.test")}#pair=${publicPairBody.code}`,
+      )
+
+      for (const invalidAPIURL of [
+        "https://api.example.test/oc",
+        "https://api.example.test/?project=local",
+        "https://api.example.test/#route",
+      ]) {
+        process.env.OPENCODE_PUBLIC_URL = invalidAPIURL
+        expect(await beginURL(listener)).toBe("")
+      }
+
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.test/"
+      process.env.OPENCODE_PWA_URL = "https://api.example.test/mobile/"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PWA_URL = "https://user:pass@mobile.example.test/"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PWA_URL = "https://mobile.example.test/"
+      process.env.OPENCODE_PUBLIC_URL = "https://user:pass@api.example.test/"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PUBLIC_URL = "http://192.168.1.20:4096"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PWA_URL = "http://mobile.example.test/"
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.test/"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PWA_URL = "https://mobile.example.test/"
+      process.env.OPENCODE_PUBLIC_URL = "http://192.168.1.20:4096"
+      process.env.NODE_ENV = "development"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PWA_URL = "http://localhost:3301/"
+      process.env.OPENCODE_PUBLIC_URL = "http://127.0.0.2:4096"
+      process.env.NODE_ENV = "development"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.OPENCODE_PUBLIC_URL = "http://127.0.0.1:4096"
+      process.env.NODE_ENV = "production"
+      expect(await beginURL(listener)).toBe("")
+
+      process.env.NODE_ENV = "development"
+      const localPairURL = await beginURL(listener)
+      const localApiURL = encodeURIComponent("http://127.0.0.1:4096")
+      expect(localPairURL.startsWith(`http://localhost:3301/?server=${localApiURL}#pair=`)).toBe(true)
 
       // claim is unauthenticated by design and returns a one-time token
       const claimedResponse = await claim(listener, pair.code)

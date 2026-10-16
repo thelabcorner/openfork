@@ -11,6 +11,7 @@ import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { RevisionProgress } from "@opencode-ai/core/revision-progress"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
@@ -45,6 +46,8 @@ import { ofxpHandlers } from "../../src/server/routes/instance/httpapi/handlers/
 import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
 import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
+import { promptRevisionProgressHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revision-progress"
+import { promptRevisorRunHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revisor-runs"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
@@ -168,6 +171,8 @@ const apiBaseLayer = HttpRouter.serve(
       providerSettingsHandlers,
       quotaHandlers,
       revisionDraftHandlers,
+      promptRevisionProgressHandlers,
+      promptRevisorRunHandlers,
       scheduledTaskHandlers,
       swarmHandlers,
       usageHandlers,
@@ -222,6 +227,7 @@ const apiLayer = apiBaseLayer.pipe(
   Layer.provide(Layer.mock(OxpActivity.Service)({})),
   Layer.provide(Layer.mock(OxpActivityInspection.Service)({})),
   Layer.provide(Layer.mock(RevisionDraft.Service)({})),
+  Layer.provide(Layer.mock(RevisionProgress.Service)({ latest: () => Effect.succeed(undefined) })),
   Layer.provide(Layer.mock(ScheduledTask.Service)({})),
   Layer.provide(Layer.mock(ScheduledTaskSessionBinding.Service)({})),
   Layer.provide(Layer.mock(SwarmMemberSessionWake.Service)({})),

@@ -37,6 +37,7 @@ import { Project } from "@/project/project"
 import { Vcs } from "@/project/vcs"
 import { ProviderAuth } from "@/provider/auth"
 import { Provider } from "@/provider/provider"
+import { ProviderRoute } from "@opencode-ai/core/provider-route"
 import * as ProviderCatalog from "@/provider/catalog"
 import { Question } from "@/question"
 import { PendingResponseRegistry } from "@/server/pending-response-registry"
@@ -48,6 +49,7 @@ import { SessionProcessor } from "@/session/processor"
 import { SessionPrompt } from "@/session/prompt"
 import { GoalAuditRecovery } from "@/session/goal-audit-recovery"
 import { GoalContinuationRecovery } from "@/session/goal-continuation-recovery"
+import { LimitRecoveryRunner } from "@/session/limit-recovery-runner"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
@@ -59,9 +61,7 @@ import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
 import { ScheduledTaskLease } from "@opencode-ai/core/scheduled-task/lease"
-import { SwarmV2 } from "@opencode-ai/core/swarm"
-import { SwarmMemberSessionWake } from "@/swarm/member-session-wake"
-import { SwarmProfilePreflight } from "@/swarm/profile-preflight"
+import { SwarmRuntimeGraph } from "@/swarm/runtime-graph"
 import { ScheduledTaskRunner } from "@/scheduled-task/runner"
 import { ScheduledTaskExecutor } from "@/scheduled-task/executor"
 import * as SessionContextProjector from "@/session/context/projector"
@@ -111,6 +111,7 @@ import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { RevisionProgress } from "@opencode-ai/core/revision-progress"
 import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
@@ -142,16 +143,20 @@ import { OpenRouterFreeUsageApi } from "./groups/openrouter-free-usage"
 import { SessionReadApi } from "./groups/session-read"
 import { SessionCreateApi } from "./groups/session-create"
 import { SessionControlApi } from "./groups/session-control"
+import { SessionLimitRecoveryApi } from "./groups/session-limit-recovery"
+import { SessionAttachmentApi } from "./groups/session-attachment"
 import { PermissionControlApi } from "./groups/permission"
 import { QuestionControlApi } from "./groups/question"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { RuntimeOwner } from "@opencode-ai/core/runtime-owner"
+import { SessionOperatorRecovery } from "@/session/operator-stop"
 import { PtyConnectApi, PtyShellApi } from "./groups/pty"
 import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { DeviceApi } from "./groups/device"
 import { eventHandlers } from "./handlers/event"
 import { pairHandlers, pairClaimHandlers } from "./handlers/pair"
 import { deviceHandlers } from "./handlers/device"
-import { configHandlers } from "./handlers/config"
+import { configHandlers, configReadHandlers } from "./handlers/config"
 import { agentCatalogHandlers } from "./handlers/agent-catalog"
 import { providerCatalogHandlers } from "./handlers/provider-catalog"
 import { openRouterReferenceHandlers } from "./handlers/openrouter-reference"
@@ -168,19 +173,26 @@ import { sessionCreateHandlers } from "./handlers/session-create"
 import { sessionControlHandlers } from "./handlers/session-control"
 import { permissionControlHandlers, questionControlHandlers } from "./handlers/pending-response-control"
 import { instanceHandlers } from "./handlers/instance"
+import { pathHandlers } from "./handlers/path"
 import { mcpHandlers } from "./handlers/mcp"
 import { ofxpHandlers } from "./handlers/ofxp"
 import { permissionHandlers } from "./handlers/permission"
-import { projectHandlers } from "./handlers/project"
+import { projectCurrentHandlers, projectHandlers } from "./handlers/project"
+import { vcsBranchHandlers } from "./handlers/vcs-branch"
 import { projectCopyHandlers } from "./handlers/project-copy"
 import { providerHandlers } from "./handlers/provider"
 import { providerSettingsHandlers } from "./handlers/provider-settings"
 import { ptyConnectHandlers, ptyHandlers, ptyShellHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { quotaHandlers } from "./handlers/quota"
+import { telegramHandlers } from "./handlers/telegram"
+import { TelegramApi } from "./groups/telegram"
+import * as Telegram from "@/notification/telegram"
 import { sessionHandlers } from "./handlers/session"
 import { sessionContextHandlers } from "./handlers/session-context"
 import { sessionGroupHandlers } from "./handlers/session-group"
+import { sessionLimitRecoveryHandlers } from "./handlers/session-limit-recovery"
+import { sessionAttachmentHandlers } from "./handlers/session-attachment"
 import { goalHandlers } from "./handlers/goal"
 import { scheduledTaskHandlers } from "./handlers/scheduled-task"
 import { swarmHandlers } from "./handlers/swarm"
@@ -191,6 +203,8 @@ import { tuiHandlers } from "./handlers/tui"
 import { usageHandlers } from "./handlers/usage"
 import { wakatimeHandlers } from "./handlers/wakatime"
 import { revisionDraftHandlers } from "./handlers/revision-draft"
+import { promptRevisionProgressHandlers } from "./handlers/prompt-revision-progress"
+import { promptRevisorRunHandlers } from "./handlers/prompt-revisor-runs"
 import { handlers } from "@opencode-ai/server/handlers"
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { layer as locationLayer } from "@opencode-ai/server/location"
@@ -267,11 +281,34 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
     quotaHandlers,
     ofxpHandlers,
     revisionDraftHandlers,
+    promptRevisionProgressHandlers,
+    promptRevisorRunHandlers,
     scheduledTaskHandlers,
     swarmHandlers,
   ]),
   Layer.provide(schemaErrorLayer),
   Layer.provide(httpApiAuthLayer),
+)
+// The notification channel is a separate Tier-0 API; existing RootHttpApi
+// fixtures and server owners are not burdened with notification dependencies.
+const telegramRoutes = HttpApiBuilder.layer(TelegramApi).pipe(
+  Layer.provide(telegramHandlers),
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer]),
+  // The shared served app graph below owns the single Telegram hub.
+  // Do not build a second Telegram.node just for this route: duplicate
+  // instances split settings from the active scheduler/delivery receipts.
+)
+const sessionLimitRecoveryRoutes = HttpApiBuilder.layer(SessionLimitRecoveryApi).pipe(
+  Layer.provide(sessionLimitRecoveryHandlers),
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer]),
+  // Durable session lookup and event delivery only; deliberately no workspace routing or Instance bootstrap.
+  Layer.provide(AppNodeBuilderV1.build(LayerNode.group([Database.node, EventV2Bridge.node]))),
+)
+const sessionAttachmentRoutes = HttpApiBuilder.layer(SessionAttachmentApi).pipe(
+  Layer.provide(sessionAttachmentHandlers),
+  Layer.provide([schemaErrorLayer, httpApiAuthLayer]),
+  // Tier 1: durable session attachment index only; deliberately no workspace routing or Instance bootstrap.
+  Layer.provide(AppNodeBuilderV1.build(LayerNode.group([Database.node]))),
 )
 const agentCatalogRoutes = HttpApiBuilder.layer(AgentCatalogApi).pipe(
   Layer.provide(agentCatalogHandlers),
@@ -336,7 +373,11 @@ const sessionControlRoutes = HttpApiBuilder.layer(SessionControlApi).pipe(
   // Abort uses durable Session ownership plus RunState's active-handle index;
   // it must remain independent of InstanceContext/bootstrap.
   Layer.provide([httpApiAuthLayer, workspaceRoutingLive]),
-  Layer.provide(AppNodeBuilderV1.build(LayerNode.group([SessionExecutionOwner.node, GoalAutomation.node]))),
+  Layer.provide(
+    AppNodeBuilderV1.build(
+      LayerNode.group([RuntimeOwner.node, SessionExecutionOwner.node, GoalAutomation.node, Database.node, EventV2Bridge.node, SessionStatus.node, SessionOperatorRecovery.node]),
+    ),
+  ),
 )
 const permissionControlRoutes = HttpApiBuilder.layer(PermissionControlApi).pipe(
   Layer.provide(permissionControlHandlers),
@@ -373,11 +414,15 @@ const ptyShellApiRoutes = HttpApiBuilder.layer(PtyShellApi).pipe(
 const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
   Layer.provide([
     configHandlers,
+    configReadHandlers,
     experimentalHandlers,
     fileHandlers,
     instanceHandlers,
+    pathHandlers,
+    vcsBranchHandlers,
     mcpHandlers,
     projectHandlers,
+    projectCurrentHandlers,
     projectCopyHandlers,
     ptyHandlers,
     questionHandlers,
@@ -491,6 +536,10 @@ const app = LayerNode.group([
   Plugin.node,
   ModelsDev.node,
   Provider.node,
+  // ProviderRoute is also consumed directly by prompt-revisor route handlers.
+  // Provider.node lists it as a private dependency, which does not export the
+  // service to sibling handlers in this served graph.
+  ProviderRoute.node,
   ProviderCatalog.node,
   SystemOne.node,
   ProviderAuth.node,
@@ -503,6 +552,7 @@ const app = LayerNode.group([
   PermissionSaved.node,
   Todo.node,
   Session.node,
+  RuntimeOwner.node,
   SessionExecutionOwner.node,
   SessionGroup.node,
   Goal.node,
@@ -514,12 +564,13 @@ const app = LayerNode.group([
   ScheduledTaskLease.node,
   ScheduledTaskExecutor.node,
   ScheduledTaskRunner.node,
-  SwarmV2.node,
-  SwarmMemberSessionWake.node,
-  SwarmProfilePreflight.node,
+  // The HTTP sidecar must own the SAME Swarm workers, dispatch and deadlines
+  // as direct AppRuntime. Exposing only the DB/wake services strands workers.
+  SwarmRuntimeGraph.node,
   SessionProjector.node,
   SessionContextProjector.node,
   SessionStatus.node,
+  SessionOperatorRecovery.node,
   SessionUsage.node,
   SessionTelemetry.node,
   OxpActivity.node,
@@ -527,6 +578,7 @@ const app = LayerNode.group([
   OxpAttribution.node,
   UsageRecord.node,
   RevisionDraft.node,
+  RevisionProgress.node,
   BackgroundJob.node,
   RuntimeFlags.node,
   OfxpInvocation.node,
@@ -540,6 +592,7 @@ const app = LayerNode.group([
   SessionRevert.node,
   SessionSummary.node,
   SessionPrompt.node,
+  LimitRecoveryRunner.node,
   GoalAuditRecovery.node,
   GoalContinuationRecovery.node,
   Instruction.node,
@@ -570,6 +623,7 @@ const app = LayerNode.group([
   PushV2.node,
   Usage.node,
   Quota.node,
+  Telegram.node,
   Capacity.node,
   // Tier-0 process-global WakaTime exporter, owned by Core. This served graph
   // (built by both Server.listen and Server.Default()'s in-process fetch, under
@@ -606,6 +660,9 @@ export function createRoutes(
 
   return Layer.mergeAll(
     rootApiRoutes,
+    telegramRoutes,
+    sessionLimitRecoveryRoutes,
+    sessionAttachmentRoutes,
     agentCatalogRoutes,
     providerCatalogRoutes,
     openRouterReferenceRoutes,

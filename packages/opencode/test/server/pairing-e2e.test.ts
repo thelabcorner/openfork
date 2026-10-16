@@ -119,6 +119,29 @@ async function startGateListener(auth?: { username: string; password: string }) 
   }
 }
 
+async function startGateListenerWithPairingURLs(
+  auth: { username: string; password: string },
+  pwaURL: string,
+  publicURL: string,
+) {
+  const previousPwa = process.env.OPENCODE_PWA_URL
+  const previousPublic = process.env.OPENCODE_PUBLIC_URL
+  process.env.OPENCODE_PWA_URL = pwaURL
+  process.env.OPENCODE_PUBLIC_URL = publicURL
+  const restorePairingURLs = () => {
+    if (previousPwa === undefined) delete process.env.OPENCODE_PWA_URL
+    else process.env.OPENCODE_PWA_URL = previousPwa
+    if (previousPublic === undefined) delete process.env.OPENCODE_PUBLIC_URL
+    else process.env.OPENCODE_PUBLIC_URL = previousPublic
+  }
+  try {
+    return { ...(await startGateListener(auth)), restorePairingURLs }
+  } catch (error) {
+    restorePairingURLs()
+    throw error
+  }
+}
+
 async function stopListener(listener: Listener) {
   await listener.stop(true)
 }
@@ -246,10 +269,11 @@ describe("pairing integration gate", () => {
     "ceremony: begin -> claim -> Bearer+Basic authed requests -> SSE query-param only -> revoke -> 401",
     async () => {
       const root = await gateEnv()
-      const { listener, withTimeout } = await startGateListener({
-        username: BASIC_USERNAME,
-        password: BASIC_PASSWORD,
-      })
+      const { listener, withTimeout, restorePairingURLs } = await startGateListenerWithPairingURLs(
+        { username: BASIC_USERNAME, password: BASIC_PASSWORD },
+        "https://mobile.example.com/",
+        "https://api.example.com",
+      )
       try {
         const basic = basicHeader(BASIC_USERNAME, BASIC_PASSWORD)
 
@@ -260,7 +284,9 @@ describe("pairing integration gate", () => {
         expect(beginBody.code).toBeTruthy()
         // The QR URL must carry the code in the FRAGMENT (#pair=) — the PWA
         // claim-on-boot parses location.hash; a ?pair= query would never fire.
-        expect(beginBody.url).toContain(`#pair=${beginBody.code}`)
+        expect(beginBody.url).toBe(
+          `https://mobile.example.com/?server=${encodeURIComponent("https://api.example.com")}#pair=${beginBody.code}`,
+        )
 
         // --- unauthenticated requests are rejected while credentials are set ---
         const probeURL = new URL(`${AUTH_PROBE_PATH}?directory=${encodeURIComponent(root)}`, listener.url)
@@ -331,7 +357,11 @@ describe("pairing integration gate", () => {
         expect((await fetch(probeURL, { headers: bearer })).status).toBe(401)
         expect((await fetch(probeURL, { headers: deviceBasic })).status).toBe(401)
       } finally {
-        await withTimeout(stopGateListener(listener), 15_000, "ceremony listener stop")
+        try {
+          await withTimeout(stopGateListener(listener), 15_000, "ceremony listener stop")
+        } finally {
+          restorePairingURLs()
+        }
       }
     },
   )
@@ -358,6 +388,53 @@ describe("pairing integration gate", () => {
         expect(begin.status).toBe(200)
         const { code, url } = (await begin.json()) as { code: string; url: string }
         expect(url).toBe(`https://pwa.example.com/?server=${encodeURIComponent("https://api.example.com")}#pair=${code}`)
+
+        for (const invalidApiURL of [
+          "https://api.example.com/oc",
+          "https://api.example.com/?project=local",
+          "https://api.example.com/#route",
+        ]) {
+          process.env.OPENCODE_PUBLIC_URL = invalidApiURL
+          const invalidTarget = await jsonRequest(
+            new URL(PAIR_BEGIN, listener.url),
+            "POST",
+            {},
+            basicHeader(BASIC_USERNAME, BASIC_PASSWORD),
+          )
+          expect(invalidTarget.status).toBe(200)
+          expect(((await invalidTarget.json()) as { url: string }).url).toBe("")
+        }
+
+        delete process.env.OPENCODE_PUBLIC_URL
+        const missingApi = await jsonRequest(
+          new URL(PAIR_BEGIN, listener.url),
+          "POST",
+          {},
+          basicHeader(BASIC_USERNAME, BASIC_PASSWORD),
+        )
+        expect(missingApi.status).toBe(200)
+        expect(((await missingApi.json()) as { url: string }).url).toBe("")
+
+        process.env.OPENCODE_PUBLIC_URL = "https://api.example.com"
+        process.env.OPENCODE_PWA_URL = "https://api.example.com/mobile/"
+        const sameOrigin = await jsonRequest(
+          new URL(PAIR_BEGIN, listener.url),
+          "POST",
+          {},
+          basicHeader(BASIC_USERNAME, BASIC_PASSWORD),
+        )
+        expect(sameOrigin.status).toBe(200)
+        expect(((await sameOrigin.json()) as { url: string }).url).toBe("")
+
+        delete process.env.OPENCODE_PWA_URL
+        const missingPwa = await jsonRequest(
+          new URL(PAIR_BEGIN, listener.url),
+          "POST",
+          {},
+          basicHeader(BASIC_USERNAME, BASIC_PASSWORD),
+        )
+        expect(missingPwa.status).toBe(200)
+        expect(((await missingPwa.json()) as { url: string }).url).toBe("")
       } finally {
         if (previousPwa === undefined) delete process.env.OPENCODE_PWA_URL
         else process.env.OPENCODE_PWA_URL = previousPwa

@@ -33,6 +33,7 @@ export const KillPayload = Schema.Struct({
 export const KillResponse = Schema.Struct({
   killed: Schema.Boolean.annotate({ description: "Whether a live execution was found and terminated" }),
   status: Schema.optional(Schema.String.annotate({ description: "Background job status when jobId was targeted" })),
+  generation: Schema.optional(Schema.Number),
 }).annotate({ identifier: "ToolKillResponse" })
 
 export const ToolPaths = {
@@ -59,13 +60,13 @@ export const ToolApi = HttpApi.make("tool")
         HttpApiEndpoint.post("kill", ToolPaths.kill, {
           query: WorkspaceRoutingQuery,
           payload: KillPayload,
-          success: described(KillResponse, "Shell kill result"),
+          success: described(KillResponse, "Tool stop result"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "tool.kill",
-            summary: "Kill a shell execution",
+            summary: "Stop a tool execution",
             description:
-              "Terminate one live shell execution: either the foreground tool call identified by callID (the command process tree is force-killed and the agent continues with an aborted result) or a background job identified by jobId.",
+              "Request cancellation of a foreground tool call or background job. Stop reconciles an unresolved call whose executor is proven dead by pausing the Session, recording unfinished results as unknown, and releasing only its exact execution generation. Live owners receive a durable interrupt request.",
           }),
         ),
       )

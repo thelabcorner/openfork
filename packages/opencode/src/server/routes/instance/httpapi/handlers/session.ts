@@ -13,9 +13,11 @@ import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
+import { titleFailureMessage } from "@/session/title-failure"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import { requireResumeReady } from "@/session/resume-recovery"
 import { SessionSummary } from "@/session/summary"
 import { Provider } from "@/provider/provider"
 import { canonicalT3CodeModelRef, canonicalT3CodeModelSlug } from "@/compat/t3code"
@@ -32,6 +34,7 @@ import {
   DiffQuery,
   ForkPayload,
   InitPayload,
+  ModelSwitchPayload,
   ListQuery,
   PromptPayload,
   RegenerateTitlePayload,
@@ -40,7 +43,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { ServiceUnavailableError, SessionBusyError } from "../errors"
+import { InvalidRequestError, ServiceUnavailableError, SessionBusyError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -79,7 +82,6 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       })
     })
 
-
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
     })
@@ -116,11 +118,28 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // fork/etc remain fenced) but are intentionally user-drivable through the
       // ordinary Session conversation surface.
       const current = yield* requireSession(sessionID)
-      yield* promptSvc.assertUserPromptable(sessionID).pipe(
-        Effect.mapError(() => new HttpApiError.BadRequest({})),
-      )
+      yield* promptSvc.assertUserPromptable(sessionID).pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
       return current
     })
+
+    const requireInteractivePromptableSession = Effect.fn("SessionHttpApi.requireInteractivePromptableSession")(
+      function* (sessionID: SessionID) {
+        const current = yield* requireSession(sessionID)
+        yield* promptSvc.assertInteractiveUserPromptable(sessionID).pipe(
+          Effect.mapError(
+            (error) =>
+              new InvalidRequestError({
+                kind: error.kind,
+                message:
+                  error.kind === "delegated_worker"
+                    ? "This worker accepts follow-up messages using its assigned agent, model, account and variant. Its configuration must be changed by its owning controller."
+                    : `This ${error.kind} session does not accept interactive prompts.`,
+              }),
+          ),
+        )
+        return current
+      },
+    )
 
     const diff = Effect.fn("SessionHttpApi.diff")(function* (ctx: {
       params: { sessionID: SessionID }
@@ -175,9 +194,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               Effect.mapError(() => new HttpApiError.BadRequest({})),
             )
 
-        const model = yield* providerSvc.getModel(nextModel.providerID, nextModel.id).pipe(
-          Effect.mapError(() => new HttpApiError.BadRequest({})),
-        )
+        const model = yield* providerSvc
+          .getModel(nextModel.providerID, nextModel.id)
+          .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
         const variant = nextModel.variant === "default" ? "default" : nextModel.variant
         const published = Object.keys(model.variants ?? {})
         if (variant !== "default" && published.length > 0 && !published.includes(variant)) {
@@ -230,8 +249,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     // existing session.updated event. V1 runs bypass the V2 drain, so pause also
     // cancels the in-flight V1 run and resume drains admitted-but-not-run input.
     const pause = Effect.fn("SessionHttpApi.pause")(function* (ctx: { params: { sessionID: SessionID } }) {
-      const current = yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
-      yield* authorizePublicMutableSession(current)
+      const current = yield* SessionError.mapStorageNotFoundSession(
+        ctx.params.sessionID,
+        session.get(ctx.params.sessionID),
+      )
+      if (!SessionMetadataOwnership.isHumanControllableWorker(current.metadata ?? undefined)) {
+        yield* authorizePublicMutableSession(current)
+      }
       yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: current.pausedAt ?? Date.now() })
       // Persist the hard gate before interrupting execution so no concurrent wake
       // can reclaim the Goal continuation in the cancellation window. Pause then
@@ -241,15 +265,40 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const resume = Effect.fn("SessionHttpApi.resume")(function* (ctx: { params: { sessionID: SessionID } }) {
-      const current = yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
-      yield* authorizePublicMutableSession(current)
+      const current = yield* SessionError.mapStorageNotFoundSession(
+        ctx.params.sessionID,
+        session.get(ctx.params.sessionID),
+      )
+      if (!SessionMetadataOwnership.isHumanControllableWorker(current.metadata ?? undefined)) {
+        yield* authorizePublicMutableSession(current)
+      }
+      yield* requireResumeReady(ctx.params.sessionID).pipe(
+        Effect.catch((error) => Effect.logWarning(error.message, { sessionID: ctx.params.sessionID }).pipe(
+          Effect.andThen(Effect.fail(new HttpApiError.BadRequest({}))),
+        )),
+      )
       yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: undefined })
       // Drain messages admitted while paused (each loop invocation answers the
       // latest pending user message; never auto-retries an interrupted turn).
+      // A busy Session is benign contention: its current generation promotes
+      // pending inbox work (or releaseIfDrained observes it atomically), so a
+      // failed local acquire must not surface as a resume error.
       yield* promptSvc.loop({ sessionID: ctx.params.sessionID }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logError("resume drain failed", { sessionID: ctx.params.sessionID, cause }),
-        ),
+        Effect.catchCause((cause) => {
+          const error = Cause.squash(cause)
+          if (
+            error instanceof Session.BusyError ||
+            (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
+          ) {
+            return Effect.logInfo("resume wake coalesced with existing Session owner", {
+              sessionID: ctx.params.sessionID,
+            })
+          }
+          return Effect.logError("resume drain failed", {
+            sessionID: ctx.params.sessionID,
+            cause: Cause.pretty(cause),
+          })
+        }),
         Effect.forkIn(scope, { startImmediately: true }),
       )
       return HttpApiSchema.NoContent.make()
@@ -290,7 +339,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
                 cause: Cause.pretty(cause),
               })
               return yield* new ServiceUnavailableError({
-                message: "Failed to generate session title",
+                 message: titleFailureMessage(Cause.squash(cause)),
                 service: "session-title",
               })
             }),
@@ -302,7 +351,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           baselineTitle: baseline.title,
         })
         return yield* new ServiceUnavailableError({
-          message: "Title generation produced no usable title",
+            message: "Title model could not generate a title. Choose a different model and retry.",
           service: "session-title",
         })
       }
@@ -411,23 +460,107 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    const mapPromptAdmissionError =
+      (sessionID: SessionID) =>
+      <A, E, R>(self: Effect.Effect<A, E, R>) =>
+        self.pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("interactive prompt admission rejected", {
+              sessionID,
+              error: error instanceof Error ? error.message : String(error),
+              kind: error instanceof SessionPrompt.HostOwnedSessionError ? error.kind : "admission",
+            }),
+          ),
+          Effect.mapError(
+            (error) =>
+              new InvalidRequestError({
+                kind: error instanceof SessionPrompt.HostOwnedSessionError ? error.kind : "admission",
+                message:
+                  error instanceof SessionPrompt.HostOwnedSessionError
+                    ? "Follow-up messages must use this worker's assigned agent, model, account and variant; permission overrides are not allowed."
+                    : error instanceof Error
+                      ? error.message
+                      : "Unable to admit this prompt.",
+              }),
+          ),
+        )
+
     const prompt = Effect.fn("SessionHttpApi.prompt")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requirePromptableSession(ctx.params.sessionID)
+      yield* requireInteractivePromptableSession(ctx.params.sessionID)
       const payload = ctx.payload.model
         ? { ...ctx.payload, model: canonicalT3CodeModelRef(ctx.payload.model) }
         : ctx.payload
       const message = yield* promptSvc
-        .prompt({
+        .interactivePrompt({
           ...payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(mapPromptAdmissionError(ctx.params.sessionID))
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
+    })
+
+    const switchModel = Effect.fn("SessionHttpApi.switchModel")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof ModelSwitchPayload.Type
+    }) {
+      // Scheduled-run roots are conversationally promptable despite
+      // producer-owned metadata. Child/delegated/special-agent model selection
+      // belongs to their controller. Match SessionPrompt.switchModel's fence.
+      yield* requireSession(ctx.params.sessionID)
+      yield* promptSvc.assertUserPromptable(ctx.params.sessionID).pipe(
+        Effect.mapError(
+          (error) =>
+            new InvalidRequestError({
+              kind: error.kind,
+              message:
+                error.kind === "child" || error.kind === "delegated_worker"
+                  ? "This worker's model selection is managed by its owning controller and cannot be switched here."
+                  : `This ${error.kind} session does not allow interactive model switching.`,
+            }),
+        ),
+      )
+      const model = yield* providerSvc
+        .getModel(ctx.payload.providerID, ctx.payload.modelID, ctx.payload.accountID)
+        .pipe(
+          Effect.mapError((error) =>
+            new InvalidRequestError({
+              kind: "model",
+              field: "modelID",
+              message: Provider.ModelNotFoundError.isInstance(error)
+                ? `The selected model ${error.providerID}/${error.modelID} is no longer available.${
+                    error.suggestions?.length ? ` Available alternatives: ${error.suggestions.join(", ")}.` : ""
+                  }`
+                : "The selected model or account could not be resolved. Refresh the model list and select an available model.",
+            }),
+          ),
+        )
+      const variant = ctx.payload.variant
+      const published = Object.keys(model.variants ?? {})
+      if (variant && variant !== "default" && published.length > 0 && !published.includes(variant)) {
+        return yield* new InvalidRequestError({
+          kind: "model",
+          field: "variant",
+          message: `The ${variant} reasoning variant is not supported by ${model.providerID}/${model.id}. Select a supported variant or Default.`,
+        })
+      }
+      const accepted = yield* promptSvc.switchModel({
+        sessionID: ctx.params.sessionID,
+        assistantMessageID: ctx.payload.assistantMessageID,
+        requestSentAt: ctx.payload.requestSentAt,
+        model: {
+          providerID: ctx.payload.providerID,
+          modelID: ctx.payload.modelID,
+          ...(ctx.payload.accountID ? { accountID: ctx.payload.accountID } : {}),
+          ...(variant ? { variant } : {}),
+        },
+      })
+      if (!accepted) return yield* new HttpApiError.Conflict({})
+      return true
     })
 
     const promptAsync = Effect.fn("SessionHttpApi.promptAsync")(function* (ctx: {
@@ -437,7 +570,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // Async prompt acknowledges before its execution fiber settles. Reject any
       // non-user-promptable Session synchronously here so callers can never
       // receive a false 204-success for work the service boundary will refuse.
-      yield* requirePromptableSession(ctx.params.sessionID)
+      yield* requireInteractivePromptableSession(ctx.params.sessionID)
       // `prompt_async` acknowledges with 204 before the fork settles, so
       // deterministic admission errors must be rejected BEFORE forking. An
       // invalid agent used to return success and only fail asynchronously,
@@ -445,7 +578,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // feed a retry loop. Session creation has the same invariant above; keep
       // per-prompt overrides aligned with it.
       if (ctx.payload.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
-        return yield* new HttpApiError.BadRequest({})
+        return yield* new InvalidRequestError({
+          kind: "agent",
+          field: "agent",
+          message: `Agent not found: ${ctx.payload.agent}`,
+        })
       }
       const payload = ctx.payload.model
         ? { ...ctx.payload, model: canonicalT3CodeModelRef(ctx.payload.model) }
@@ -456,8 +593,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       // owner's release-if-drained transaction will continue it. A busy wake is
       // therefore successful coalescing, not a user-visible Session error.
       yield* promptSvc
-        .prompt({ ...payload, sessionID: ctx.params.sessionID, noReply: true })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .interactivePrompt({ ...payload, sessionID: ctx.params.sessionID, noReply: true })
+        .pipe(mapPromptAdmissionError(ctx.params.sessionID))
       if (ctx.payload.noReply !== true) {
         yield* promptSvc.loop({ sessionID: ctx.params.sessionID }).pipe(
           Effect.catchCause((cause) =>
@@ -629,6 +766,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("unshare", unshare)
       .handle("summarize", summarize)
       .handle("prompt", prompt)
+      .handle("switchModel", switchModel)
       .handle("promptAsync", promptAsync)
       .handle("command", command)
       .handle("shell", shell)

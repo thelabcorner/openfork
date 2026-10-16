@@ -5,6 +5,7 @@ import { PublicApi } from "../../src/server/routes/instance/httpapi/public"
 type Method = "get" | "post" | "put" | "delete" | "patch"
 type OpenApiSchema = {
   readonly $ref?: string
+  readonly additionalProperties?: OpenApiSchema | boolean
   readonly anyOf?: ReadonlyArray<OpenApiSchema>
   readonly type?: string
   readonly enum?: readonly unknown[]
@@ -101,6 +102,16 @@ describe("PublicApi OpenAPI v2 errors", () => {
         "SkillV2Source",
       ]),
     )
+  })
+
+  test("keeps Tool metadata open-ended while publishing the schema-owned Code trace", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+
+    for (const name of ["ToolStateRunning", "ToolStateCompleted", "ToolStateError", "ToolPart"] as const) {
+      const metadata = spec.components.schemas[name]?.properties?.metadata
+      expect(metadata?.properties?.trace, name).toEqual({ $ref: "#/components/schemas/CodeRunTrace" })
+      expect(metadata?.additionalProperties, name).toEqual({})
+    }
   })
 
   test("documents nested legacy global sync events", () => {

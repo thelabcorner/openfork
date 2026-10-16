@@ -12,6 +12,7 @@ import { OxpActivity } from "@opencode-ai/core/oxp-activity/activity"
 import { OxpActivityInspection } from "@opencode-ai/core/oxp-activity/inspection"
 import { OxpAttribution } from "@opencode-ai/core/oxp-attribution/attribution"
 import { RevisionDraft } from "@opencode-ai/core/revision-draft"
+import { RevisionProgress } from "@opencode-ai/core/revision-progress"
 import { ScheduledTask } from "@opencode-ai/core/scheduled-task"
 import { ScheduledTaskSessionBinding } from "@opencode-ai/core/scheduled-task/session-binding"
 import { OfxpInvocation } from "@opencode-ai/core/ofxp-invocation"
@@ -40,6 +41,8 @@ import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers
 import { wakatimeHandlers } from "../../src/server/routes/instance/httpapi/handlers/wakatime"
 import { quotaHandlers } from "../../src/server/routes/instance/httpapi/handlers/quota"
 import { revisionDraftHandlers } from "../../src/server/routes/instance/httpapi/handlers/revision-draft"
+import { promptRevisionProgressHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revision-progress"
+import { promptRevisorRunHandlers } from "../../src/server/routes/instance/httpapi/handlers/prompt-revisor-runs"
 import { scheduledTaskHandlers } from "../../src/server/routes/instance/httpapi/handlers/scheduled-task"
 import { swarmHandlers } from "../../src/server/routes/instance/httpapi/handlers/swarm"
 import { SwarmMemberSessionWake } from "../../src/swarm/member-session-wake"
@@ -56,25 +59,17 @@ const oxpAttributionSnapshot: OxpAttribution.Snapshot = {
   totals: {
     calls: 2,
     activities: 1,
-    inferredRounds: 2,
-    uniqueRequestChars: 120,
-    uniqueResultChars: 240,
-    uniqueChars: 360,
-    uniqueTokens: 90,
-    amplification: 1.5,
-    requestChars: 180,
-    resultChars: 360,
-    chars: 540,
-    requestTokens: 45,
-    resultTokens: 90,
-    tokens: 135,
+    inferredTurns: 2,
+    estimatedSurroundingTokens: 210,
+    estimatedTotalTokens: 300,
+    requestChars: 120,
+    resultChars: 240,
+    chars: 360,
+    requestTokens: 30,
+    resultTokens: 60,
+    tokens: 90,
     byTool: [],
     bySource: [],
-  },
-  sensitivity: {
-    low: { rho: 0.75, tokens: 120 },
-    calibrated: { rho: 0.9, tokens: 135 },
-    high: { rho: 0.99, tokens: 150 },
   },
   coverage: {
     request: {
@@ -96,43 +91,44 @@ const oxpAttributionSnapshot: OxpAttribution.Snapshot = {
     complete: true,
   },
   model: {
-    kind: "geometric-context-residency",
-    rho: 0.9,
-    gapThresholdMs: 1_000,
+    kind: "empirical-tool-usage",
     requestCharsPerToken: 4,
     resultCharsPerToken: 4,
+    turnGapThresholdMs: 1_500,
     components: {
-      callTranscript: true,
-      returnedContent: true,
-      repeatedContextExposure: true,
+      observedToolPayload: true,
+      estimatedOxpTokens: true,
+      empiricallyEstimatedUpstream: true,
+      geometricResidency: false,
       availabilitySchema: false,
     },
     calibration: {
       productionDigest: "production-digest",
+      payloadDigest: "payload-digest",
       sourceDigest: "source-digest",
       calibratedAt: "2026-10-02T00:00:00.000Z",
       observations: 100,
       corpus: {
-        observations: 100,
-        activities: 10,
-        tools: 4,
-        toolStatusGroups: 8,
-        minStartedAt: 1,
-        maxStartedAt: 2,
-        maxCompletedAt: 3,
+        pairedMessages: 100,
+        sessions: 10,
+        usageRows: 120,
+        toolRows: 150,
+        maxStartedAt: 1_790_000_000_000,
+      },
+      tokenizer: {
+        encoding: "o200k_base",
+        sampledInvocations: 80,
       },
       validation: {
-        toolPriorChars: 1,
-        statusPriorChars: 1,
-        statusSpecialization: "tool-status",
-        exposureAggregateBiasRMSE: 0.01,
-        exposureWAPE: 0.02,
+        cvSessionWAPE: 0.26,
+        cvSessionMedianAPE: 0.18,
+        cvSessionP90APE: 0.56,
+        maxAbsFoldBias: 0.23,
+        labeledGaps: 1_000,
+        boundaryRawError: 0.01,
+        boundaryBalancedError: 0.02,
       },
     },
-  },
-  causalAttribution: {
-    available: false,
-    reason: "trace-chain-unavailable",
   },
 }
 
@@ -150,6 +146,8 @@ const apiLayer = HttpRouter.serve(
       wakatimeHandlers,
       quotaHandlers,
       revisionDraftHandlers,
+      promptRevisionProgressHandlers,
+      promptRevisorRunHandlers,
       scheduledTaskHandlers,
       swarmHandlers,
     ]),
@@ -225,6 +223,16 @@ const apiLayer = HttpRouter.serve(
       snapshot: (input) =>
         Effect.succeed({
           ...oxpAttributionSnapshot,
+          ...(input?.includeWorkload ? { workload: {
+            scope: { since: input.since!, until: input.until! }, bucketWidthMs: 1,
+            totals: { calls: 2, successes: 1, failures: 1, denied: 0, cancelled: 0, interrupted: 0,
+              running: 0, unknown: 0, failureRate: 0.5, measuredDurations: 2, missingDurations: 0,
+              toolWallMs: 35, p50Ms: null, p95Ms: null },
+            tools: [], topFailures: [], topTime: [], otherTools: 0, otherCalls: 0,
+            buckets: [{ start: input.since!, calls: 2, successes: 1, failures: 1 }],
+            coverage: { historicalCompleteness: "unknown" as const, quantileSampleLimit: 5000,
+              p50MinimumSamples: 5 as const, p95MinimumSamples: 20 as const },
+          } } : {}),
           scope: {
             ...(input?.since === undefined ? {} : { since: input.since }),
             ...(input?.until === undefined ? {} : { until: input.until }),
@@ -233,6 +241,7 @@ const apiLayer = HttpRouter.serve(
         }),
     }),
     Layer.mock(RevisionDraft.Service)({}),
+    Layer.mock(RevisionProgress.Service)({ latest: () => Effect.succeed(undefined) }),
     Layer.mock(ScheduledTask.Service)({}),
     Layer.mock(ScheduledTaskSessionBinding.Service)({}),
     Layer.mock(SwarmV2.Service)({}),
@@ -350,15 +359,42 @@ describe("global HttpApi", () => {
         HttpClient.execute,
       )
       expect(response.status).toBe(200)
-      expect(yield* response.json).toMatchObject({
+      const body = (yield* response.json) as Record<string, unknown>
+      expect(body.workload).toBeUndefined()
+      expect(body).toMatchObject({
         generatedAt: 123,
         scope: { since: 100, until: 200 },
-        totals: { calls: 2, tokens: 135, amplification: 1.5 },
-        causalAttribution: {
-          available: false,
-          reason: "trace-chain-unavailable",
+        totals: { calls: 2, tokens: 90, estimatedTotalTokens: 300 },
+        model: {
+          kind: "empirical-tool-usage",
+          calibration: {
+            productionDigest: "production-digest",
+            payloadDigest: "payload-digest",
+            corpus: { maxStartedAt: 1_790_000_000_000 },
+          },
         },
       })
+      // Obsolete geometric-residency surface must not reappear on the wire.
+      const serialized = JSON.stringify(body)
+      for (const obsolete of ["uniqueTokens", "exposureTokens", "amplification", "rho", "causalAttribution"]) {
+        expect(serialized).not.toContain(obsolete)
+      }
+    }),
+  )
+
+  it.live("serves an opt-in bounded OXP workload and rejects an unbounded range", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get(`${GlobalPaths.oxpAttribution}?since=100&until=200&includeWorkload=true`).pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toMatchObject({ workload: {
+        scope: { since: 100, until: 200 },
+        totals: { calls: 2, failures: 1, failureRate: 0.5 },
+        buckets: [{ start: 100, calls: 2 }],
+      } })
+      const missing = yield* HttpClientRequest.get(`${GlobalPaths.oxpAttribution}?includeWorkload=true`).pipe(HttpClient.execute)
+      expect(missing.status).toBe(400)
+      const oversized = yield* HttpClientRequest.get(`${GlobalPaths.oxpAttribution}?since=0&until=7776000001&includeWorkload=true`).pipe(HttpClient.execute)
+      expect(oversized.status).toBe(400)
     }),
   )
 

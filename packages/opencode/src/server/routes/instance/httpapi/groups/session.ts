@@ -20,6 +20,7 @@ import {
 } from "../middleware/workspace-routing"
 import {
   ApiNotFoundError,
+  InvalidRequestError,
   PermissionNotFoundError,
   ServiceUnavailableError,
   SessionBusyError,
@@ -41,11 +42,7 @@ export const ListQuery = Schema.Struct({
   // SQLite treats a negative LIMIT as unbounded. Keep list reads explicitly
   // bounded when a caller supplies a limit.
   limit: Schema.optional(
-    Schema.NumberFromString.check(
-      Schema.isInt(),
-      Schema.isGreaterThanOrEqualTo(0),
-      Schema.isLessThanOrEqualTo(500),
-    ),
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(500)),
   ),
 })
 export const DiffQuery = Schema.Struct({
@@ -98,6 +95,14 @@ export const SummarizePayload = Schema.Struct({
   auto: Schema.optional(Schema.Boolean),
 })
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
+export const ModelSwitchPayload = Schema.Struct({
+  assistantMessageID: MessageID,
+  requestSentAt: Schema.Number.check(Schema.isFinite()),
+  providerID: ProviderV2.ID,
+  modelID: ModelV2.ID,
+  accountID: Schema.optional(Schema.String),
+  variant: Schema.optional(Schema.String),
+})
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
@@ -129,6 +134,7 @@ export const SessionPaths = {
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
+  switchModel: `${root}/:sessionID/model-switch`,
   promptAsync: `${root}/:sessionID/prompt_async`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
@@ -238,8 +244,7 @@ export const SessionApi = HttpApi.make("session")
           OpenApi.annotations({
             identifier: "session.regenerateTitle",
             summary: "Regenerate session title",
-            description:
-              "Generate a new title from the session's conversation and update the session.",
+            description: "Generate a new title from the session's conversation and update the session.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {
@@ -298,7 +303,7 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(SessionV1.WithParts, "Created message"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, InvalidRequestError, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt",
@@ -306,12 +311,25 @@ export const SessionApi = HttpApi.make("session")
             description: "Create and send a new message to a session, streaming the AI response.",
           }),
         ),
+        HttpApiEndpoint.post("switchModel", SessionPaths.switchModel, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: ModelSwitchPayload,
+          success: described(Schema.Boolean, "Model switch accepted"),
+          error: [HttpApiError.BadRequest, InvalidRequestError, HttpApiError.Conflict, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.switchModel",
+            summary: "Switch the active model",
+            description: "Interrupt a live provider generation and continue the same task with the selected model.",
+          }),
+        ),
         HttpApiEndpoint.post("promptAsync", SessionPaths.promptAsync, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
           payload: PromptPayload,
           success: described(HttpApiSchema.NoContent, "Prompt accepted"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, InvalidRequestError, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.prompt_async",

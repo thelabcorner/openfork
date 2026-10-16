@@ -442,10 +442,49 @@ describe("HttpApi UI fallback", () => {
         password: "secret",
         username: "opencode",
         disableEmbeddedWebUi: true,
-      }).request("/")
+      }).request("/", {
+        headers: {
+          accept: "text/html",
+          origin: "oc://renderer",
+          "sec-fetch-dest": "document",
+          "sec-fetch-mode": "navigate",
+        },
+      })
 
       expect(response.status).toBe(401)
       expect(response.headers.get("www-authenticate")).toBe('Basic realm="Secure Area"')
+    }),
+  )
+
+  it.live("uses Bearer for fallback API fetches regardless of Origin metadata", () =>
+    Effect.gen(function* () {
+      for (const origin of [undefined, "http://localhost", "http://localhost:3301", "not an origin"]) {
+        const response = yield* uiApp({ password: "secret", disableEmbeddedWebUi: true }).request(
+          "/session/ses_missing?directory=%2Ftmp",
+          {
+            headers: {
+              accept: "application/json",
+              ...(origin === undefined ? {} : { origin }),
+            },
+          },
+        )
+
+        expect(response.status).toBe(401)
+        expect(response.headers.get("www-authenticate")).toBe('Bearer realm="OpenFork"')
+      }
+
+      const apiNavigation = yield* uiApp({ password: "secret", disableEmbeddedWebUi: true }).request(
+        "/session/ses_missing",
+        {
+          headers: {
+            accept: "text/html",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+          },
+        },
+      )
+      expect(apiNavigation.status).toBe(401)
+      expect(apiNavigation.headers.get("www-authenticate")).toBe('Bearer realm="OpenFork"')
     }),
   )
 
@@ -522,6 +561,18 @@ describe("HttpApi UI fallback", () => {
 
       expect(response.status).toBe(204)
       expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:3000")
+      expect(response.headers.get("www-authenticate")).toBeNull()
+
+      const apiPreflight = yield* app({ password: "secret", username: "opencode" }).request("/session", {
+        method: "OPTIONS",
+        headers: {
+          origin: "http://localhost:3301",
+          "access-control-request-method": "GET",
+          "access-control-request-headers": "authorization",
+        },
+      })
+      expect(apiPreflight.status).toBe(204)
+      expect(apiPreflight.headers.get("www-authenticate")).toBeNull()
     }),
   )
 })

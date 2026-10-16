@@ -1241,6 +1241,61 @@ const scenarios: Scenario[] = [
     }))
     .status(404),
   http.protected
+    .get("/session/{sessionID}/limit-recovery", "session.limitRecovery.get")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP surface" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      check(body === null, "session without a durable recovery cursor should return null")
+    }),
+  http.protected
+    .patch("/session/{sessionID}/limit-recovery/auto-resume", "session.limitRecovery.autoResume")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP auto resume" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery/auto-resume", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { generation: 0, enabled: true },
+    }))
+    .status(404),
+  http.protected
+    .post("/session/{sessionID}/limit-recovery/resume", "session.limitRecovery.resume")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP resume" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery/resume", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { generation: 0 },
+    }))
+    .status(404),
+  http.protected
+    .post("/session/{sessionID}/limit-recovery/snooze-until-reset", "session.limitRecovery.snooze")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP snooze" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery/snooze-until-reset", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { generation: 0 },
+    }))
+    .status(404),
+  http.protected
+    .post("/session/{sessionID}/limit-recovery/wake", "session.limitRecovery.wake")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP wake" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery/wake", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { generation: 0 },
+    }))
+    .status(404),
+  http.protected
+    .delete("/session/{sessionID}/limit-recovery", "session.limitRecovery.cancel")
+    .seeded((ctx) => ctx.session({ title: "Recovery HTTP cancel" }))
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/limit-recovery", { sessionID: ctx.state.id }),
+      headers: ctx.headers(),
+      body: { generation: 0 },
+    }))
+    .status(404),
+  http.protected
     .patch("/session/{sessionID}", "session.update")
     .mutating()
     .seeded((ctx) => ctx.session({ title: "Before rename" }))

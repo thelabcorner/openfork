@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { gunzipSync, inflateSync } from "node:zlib"
+import { GlobalBus } from "../../src/bus/global"
 import { Server } from "../../src/server/server"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
@@ -145,6 +146,48 @@ describe("HttpApi compression", () => {
       } finally {
         controller.abort()
         await response.body?.cancel().catch(() => {})
+      }
+    })
+
+    test("repeated global SSE disconnects release per-response listeners", async () => {
+      const baseline = GlobalBus.listenerCount("event")
+      const replayBaseline = GlobalBus.listenerCount("event.replay")
+
+      const open = async () => {
+        const response = await app().request("/global/event")
+        if (response.status !== 200) {
+          await response.body?.cancel().catch(() => {})
+          throw new Error(`expected global SSE status 200, received ${response.status}`)
+        }
+        const reader = response.body?.getReader()
+        if (!reader) throw new Error("global SSE response did not expose a body reader")
+        try {
+          const first = await reader.read()
+          expect(first.done).toBe(false)
+          return reader
+        } catch (error) {
+          await reader.cancel().catch(() => {})
+          throw error
+        }
+      }
+
+      const close = async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
+        await reader.cancel()
+        for (let attempt = 0; attempt < 20 && GlobalBus.listenerCount("event") !== baseline; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 0))
+        }
+        expect(GlobalBus.listenerCount("event")).toBe(baseline)
+        expect(GlobalBus.listenerCount("event.replay")).toBe(replayBaseline)
+      }
+
+      const overlapping = await Promise.all([open(), open(), open()])
+      expect(GlobalBus.listenerCount("event")).toBe(baseline + overlapping.length)
+      await Promise.all(overlapping.map(close))
+
+      // Churn beyond one connection generation; no old response may retain its
+      // GlobalBus callback or add another process-lifetime replay capture.
+      for (let attempt = 0; attempt < 12; attempt++) {
+        await close(await open())
       }
     })
   })

@@ -24,6 +24,8 @@ export interface RouteInput {
   readonly kind: Kind
   readonly requestID: string
   readonly directory: string
+  /** Equivalent caller hint spellings; the registered request owns its location. */
+  readonly directoryCandidates?: ReadonlyArray<string>
   readonly sessionID?: string
   readonly payload: unknown
 }
@@ -114,7 +116,7 @@ const layer = Layer.effect(
         const entry = pending.get(id)
         if (
           !entry ||
-          entry.directory !== input.directory ||
+          (entry.directory !== input.directory && !input.directoryCandidates?.includes(entry.directory)) ||
           (input.sessionID !== undefined && entry.sessionID !== input.sessionID) ||
           entry.settling
         ) {
@@ -124,9 +126,11 @@ const layer = Layer.effect(
         entry.settling = true
         return yield* Effect.uninterruptible(
           entry.settle(input.payload).pipe(
-            Effect.tap(() => Effect.sync(() => {
-              if (pending.get(id) === entry) pending.delete(id)
-            })),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                if (pending.get(id) === entry) pending.delete(id)
+              }),
+            ),
             Effect.onExit((exit) =>
               Effect.sync(() => {
                 if (pending.get(id) === entry && exit._tag === "Failure") entry.settling = false
@@ -149,9 +153,12 @@ const layer = Layer.effect(
           }
           if (!overflowEpisode) {
             overflowEpisode = true
-            yield* Effect.logWarning("pending response event notification queue is full; scheduling snapshot recovery", {
-              directory,
-            })
+            yield* Effect.logWarning(
+              "pending response event notification queue is full; scheduling snapshot recovery",
+              {
+                directory,
+              },
+            )
           }
         }
       }),

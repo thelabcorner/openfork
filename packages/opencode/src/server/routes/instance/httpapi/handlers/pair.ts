@@ -9,21 +9,47 @@ function clientIP(request: HttpServerRequest.HttpServerRequest) {
   return Option.getOrUndefined(request.remoteAddress)
 }
 
+function isLoopback(hostname: string) {
+  const host = hostname.toLowerCase()
+  // Match packages/mobile/src/pairing-input.ts exactly. Broader loopback
+  // aliases would generate QR targets the mobile parser deliberately rejects.
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1"
+}
+
 function configuredPWAURL(code: string) {
   const configured = process.env.OPENCODE_PWA_URL?.trim()
   if (!configured) return
 
+  const publicURL = process.env.OPENCODE_PUBLIC_URL?.trim()
+  if (!publicURL) return
+
   try {
     const pwa = new URL(configured)
-    if (pwa.protocol !== "http:" && pwa.protocol !== "https:") return
-
-    const server = process.env.OPENCODE_PUBLIC_URL?.trim()
-    if (server) {
-      const api = new URL(server)
-      if (api.protocol !== "http:" && api.protocol !== "https:") return
-      api.hash = ""
-      pwa.searchParams.set("server", api.toString().replace(/\/$/, ""))
+    const api = new URL(publicURL)
+    if (
+      (pwa.protocol !== "http:" && pwa.protocol !== "https:") ||
+      (api.protocol !== "http:" && api.protocol !== "https:")
+    ) {
+      return
     }
+    if (pwa.username || pwa.password || api.username || api.password) return
+    if (api.pathname !== "/" || api.search || api.hash) return
+
+    const secureOrigins = pwa.protocol === "https:" && api.protocol === "https:"
+    // Plain HTTP is limited to explicit local development/test endpoints;
+    // production and remote LAN/tunnel QR targets must use HTTPS.
+    const localDevelopmentOrigins =
+      (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") &&
+      pwa.protocol === "http:" &&
+      api.protocol === "http:" &&
+      isLoopback(pwa.hostname) &&
+      isLoopback(api.hostname)
+    if (!secureOrigins && !localDevelopmentOrigins) return
+
+    // A QR must open the independently hosted PWA, not the protected API
+    // origin. Distinct paths do not make a same-origin PWA safe here.
+    if (pwa.origin === api.origin) return
+    pwa.searchParams.set("server", api.origin)
     pwa.hash = `pair=${encodeURIComponent(code)}`
     return pwa.toString()
   } catch {
@@ -31,22 +57,14 @@ function configuredPWAURL(code: string) {
   }
 }
 
-function pairURL(request: HttpServerRequest.HttpServerRequest, code: string) {
+function pairURL(code: string) {
   const configured = configuredPWAURL(code)
   if (configured) return configured
-
-  const url = new URL(request.url, "http://localhost")
-  const protocol = request.headers["x-forwarded-proto"] ?? url.protocol.replace(":", "")
-  const host =
-    request.headers["x-forwarded-host"]?.split(",")[0].trim() ??
-    (request.headers as Record<string, string | undefined>)["host"]?.split(",")[0].trim() ??
-    (request.headers as Record<string, string | undefined>)["Host"]?.split(",")[0].trim() ??
-    url.host
-  // Fragment, not query: the code must never reach server access logs or
-  // referrers — clients consume and strip it from location.hash.
-  const server = process.env.OPENCODE_PUBLIC_URL?.trim()
-  const query = server ? `?server=${encodeURIComponent(server.replace(/\/$/, ""))}` : ""
-  return `${protocol}://${host}/${query}#pair=${encodeURIComponent(code)}`
+  // The API origin is not necessarily the independently hosted PWA origin.
+  // Returning it as a QR destination can navigate into a protected API and
+  // trigger a browser-owned Basic-auth prompt before pairing can begin.
+  // Keep manual code entry available, and require an explicit PWA URL for QR.
+  return ""
 }
 
 export const pairHandlers = HttpApiBuilder.group(PairBeginApi, "pair-begin", (handlers) =>
@@ -57,8 +75,7 @@ export const pairHandlers = HttpApiBuilder.group(PairBeginApi, "pair-begin", (ha
       "begin",
       Effect.fn("PairHttpApi.begin")(function* () {
         const pairing = yield* devices.beginPairing()
-        const request = yield* HttpServerRequest.HttpServerRequest
-        return { code: pairing.code, url: pairURL(request, pairing.code), expiresAt: pairing.expiresAt }
+        return { code: pairing.code, url: pairURL(pairing.code), expiresAt: pairing.expiresAt }
       }),
     )
   }),
