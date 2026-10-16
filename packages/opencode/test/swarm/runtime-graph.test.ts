@@ -37,7 +37,7 @@ describe("Swarm runtime graph: every host must execute workers", () => {
   ]
 
   test("owns every worker lifecycle service once, including reconciliation and dispatch", () => {
-    expect(SwarmRuntimeGraph.nodes).toEqual(required)
+    expect([...SwarmRuntimeGraph.nodes]).toEqual([...required])
     expect(new Set(SwarmRuntimeGraph.nodes.map((node) => node.name)).size).toBe(required.length)
     expect(SwarmRuntimeGraph.node.kind).toBe("group")
     expect(SwarmRuntimeGraph.node.dependencies).toEqual(required)
