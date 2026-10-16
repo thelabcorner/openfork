@@ -237,6 +237,8 @@ describe("server session", () => {
 
     blocker.resolve()
     await Promise.all([held, background, foreground, unrelated])
+    expect(order).toContain("session-info")
+    expect(order).toContain("session-messages")
     expect(order.slice(0, 2).sort()).toEqual(["session-info", "session-messages"])
     expect(order.at(-1)).toBe("unrelated")
   })
@@ -403,6 +405,96 @@ describe("server session", () => {
     })
     expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual(["msg_1_user", "msg_2_assistant"])
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
+  })
+
+  test("applies proven V2 history appends at the authoritative array tail", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set(
+      "session_message",
+      "child",
+      Array.from({ length: 320 }, (_, index) => ({
+        id: `msg_history_${index}`,
+        type: "user" as const,
+        text: `history ${index}`,
+        time: { created: index + 1 },
+      })),
+    )
+    const before = ctx.store.data.session_message.child
+    const lastBefore = before?.at(-1)
+
+    ctx.store.applyV2({
+      id: "evt_live_synthetic",
+      type: "session.synthetic",
+      created: 321,
+      location: { directory: "/repo" },
+      durable: { aggregateID: "child", seq: 1, version: 1 },
+      data: { sessionID: "child", text: "live host turn", description: "test" },
+    } as OpenCodeEvent)
+
+    expect(ctx.store.data.session_message.child).toBe(before)
+    expect(ctx.store.data.session_message.child).toHaveLength(321)
+    expect(ctx.store.data.session_message.child?.at(319)).toBe(lastBefore)
+    expect(ctx.store.data.session_message.child?.at(320)).toMatchObject({
+      id: "msg_live_synthetic",
+      type: "synthetic",
+      text: "live host turn",
+    })
+    expect(ctx.store.data.message.child?.at(-1)).toMatchObject({ id: "msg_live_synthetic", role: "user" })
+  })
+
+  test("merges live V2 content received during the first history hydration", async () => {
+    const page = deferredResponse()
+    const client = messageClient(page.promise)
+    const store = createServerSession(client)
+    const loading = store.sync("child")
+    await client.requested(1)
+
+    const apply = (input: object) => store.applyV2(input as OpenCodeEvent)
+    apply({
+      id: "evt_step_during_load",
+      created: 2,
+      type: "session.step.started",
+      durable: { aggregateID: "child", seq: 1, version: 1 },
+      location: { directory: "/repo" },
+      data: {
+        sessionID: "child",
+        assistantMessageID: "msg_live",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+      },
+    })
+    apply({
+      id: "evt_text_start_during_load",
+      created: 3,
+      type: "session.text.started",
+      durable: { aggregateID: "child", seq: 2, version: 1 },
+      location: { directory: "/repo" },
+      data: { sessionID: "child", assistantMessageID: "msg_live", ordinal: 0 },
+    })
+    apply({
+      id: "evt_text_delta_during_load",
+      created: 4,
+      type: "session.text.delta",
+      location: { directory: "/repo" },
+      data: { sessionID: "child", assistantMessageID: "msg_live", ordinal: 0, delta: "live text" },
+    })
+
+    expect(store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_live",
+      type: "assistant",
+      content: [{ type: "text", text: "live text" }],
+    })
+
+    page.resolve(response())
+    await loading
+
+    expect(store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_live",
+      type: "assistant",
+      content: [{ type: "text", text: "live text" }],
+    })
+    store.release("child")
   })
 
   test("projects current session.next streams with stable legacy part identities", () => {
@@ -934,7 +1026,7 @@ describe("server session", () => {
     const messageApi = {
       list: async (input: unknown) => {
         requests.push(input)
-        return { data: [assistant, user], cursor: { previous: null, next: null } }
+        return { data: [assistant, user], windowed: [], bytes: 512, cursor: { previous: null, next: null } }
       },
     } as unknown as MessageApi
     const store = createServerSession(client, {} as SessionApi, messageApi)
@@ -945,6 +1037,345 @@ describe("server session", () => {
     expect(requests).toEqual([{ sessionID: "root", limit: 20, order: "desc" }])
     expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, assistant.id])
     expect(store.data.message.root.map((message) => message.id)).toEqual([user.id, assistant.id])
+  })
+
+  test("recovers multiple windowed messages in one session-page request", async () => {
+    const user = userMessage("msg_z_user", { sessionID: "root" })
+    const second = userMessage("msg_a_user", { sessionID: "root", time: { created: 2 } })
+    const requests: { sessionID: string; messageIDs: string[]; cursor?: string }[] = []
+    const client = messageClient({
+      data: [
+        { info: user, parts: [textPart(user.id, { id: "prt_preview_1", text: "preview one" })] },
+        { info: second, parts: [textPart(second.id, { id: "prt_preview_2", text: "preview two" })] },
+      ],
+      response: {
+        headers: new Headers({
+          "x-windowed-messages": JSON.stringify([
+            { messageID: user.id, omittedParts: 1 },
+            { messageID: second.id, omittedParts: 1 },
+          ]),
+        }),
+      },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, {
+      sessionRead: {
+        timelinePartsBatch: async (input: { sessionID: string; messageIDs: string[]; cursor?: string }) => {
+          requests.push(input)
+          return {
+            data: {
+              data: [
+                { messageID: user.id, part: textPart(user.id, { sessionID: "root", id: "prt_recovered_1", text: "complete one" }) },
+                { messageID: second.id, part: textPart(second.id, { sessionID: "root", id: "prt_recovered_2", text: "complete two" }) },
+              ],
+              completeMessageIDs: input.messageIDs,
+            },
+          }
+        },
+      },
+    })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+
+    await store.sync("root")
+    await store.retryTimelineContent("root")
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.messageIDs.toSorted()).toEqual([user.id, second.id].toSorted())
+    expect(store.data.message_window[user.id]).toBeUndefined()
+    expect(store.data.message_window[second.id]).toBeUndefined()
+    expect(store.data.part[user.id]?.some((part) => part.id === "prt_recovered_1")).toBe(true)
+    expect(store.data.part[second.id]?.some((part) => part.id === "prt_recovered_2")).toBe(true)
+  })
+
+  test("drains more than 200 loaded owners through bounded batches without refusing content", async () => {
+    const messages = Array.from({ length: 450 }, (_, index) => userMessage(`msg_${String(index).padStart(4, "0")}`, { sessionID: "root", time: { created: index + 1 } }))
+    const requests: string[][] = []
+    const client = messageClient({
+      data: messages.map((info) => ({ info, parts: [] })),
+      response: { headers: new Headers({ "x-windowed-messages": JSON.stringify(messages.map((info) => ({ messageID: info.id, omittedParts: 1 }))) }) },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, { sessionRead: {
+      timelinePartsBatch: async (input: { sessionID: string; messageIDs: string[] }) => {
+        requests.push(input.messageIDs)
+        return { data: {
+          data: input.messageIDs.map((messageID) => ({ messageID, part: textPart(messageID, { sessionID: "root", id: `prt_${messageID}`, text: `complete ${messageID}` }) })),
+          completeMessageIDs: input.messageIDs,
+        } }
+      },
+    } })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+    await store.sync("root")
+    for (let index = 0; index < 200 && store.timelineContentStatus("root").pendingCount; index++) await Promise.resolve()
+    expect(requests.map((owners) => owners.length)).toEqual([200, 200, 50])
+    expect(new Set(requests.flat()).size).toBe(450)
+    expect(store.timelineContentStatus("root")).toEqual({ pendingCount: 0, error: undefined })
+    expect(messages.every((message) => store.data.part[message.id]?.[0]?.id === `prt_${message.id}`)).toBe(true)
+    store.release("root")
+  })
+
+  test("pages a mixed-owner set without gaps, duplicates, or cross-message merges", async () => {
+    const first = userMessage("msg_z_user", { sessionID: "root" })
+    const second = userMessage("msg_a_user", { sessionID: "root", time: { created: 2 } })
+    const requests: { sessionID: string; messageIDs: string[]; cursor?: string }[] = []
+    const pageOne = [
+      { messageID: first.id, part: textPart(first.id, { sessionID: "root", id: "prt_1", text: "one" }) },
+      { messageID: second.id, part: textPart(second.id, { sessionID: "root", id: "prt_2", text: "two" }) },
+    ]
+    const pageTwo = [
+      { messageID: first.id, part: textPart(first.id, { sessionID: "root", id: "prt_3", text: "three" }) },
+      { messageID: second.id, part: textPart(second.id, { sessionID: "root", id: "prt_4", text: "four" }) },
+    ]
+    let pageIndex = 0
+    const client = messageClient({
+      data: [
+        { info: first, parts: [] },
+        { info: second, parts: [] },
+      ],
+      response: {
+        headers: new Headers({
+          "x-windowed-messages": JSON.stringify([
+            { messageID: first.id, omittedParts: 2 },
+            { messageID: second.id, omittedParts: 2 },
+          ]),
+        }),
+      },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, {
+      sessionRead: {
+        timelinePartsBatch: async (input: { sessionID: string; messageIDs: string[]; cursor?: string }) => {
+          requests.push(input)
+          const index = pageIndex++
+          return {
+            data: {
+              data: index === 0 ? pageOne : pageTwo,
+              nextCursor: index === 0 ? "cursor-1" : undefined,
+              completeMessageIDs: index === 0 ? [] : input.messageIDs,
+            },
+          }
+        },
+      },
+    })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+
+    await store.sync("root")
+    await store.retryTimelineContent("root")
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.cursor).toBeUndefined()
+    expect(requests[1]?.cursor).toBe("cursor-1")
+    expect(requests[0]?.messageIDs).toEqual(requests[1]?.messageIDs)
+    expect(store.data.message_window[first.id]).toBeUndefined()
+    expect(store.data.message_window[second.id]).toBeUndefined()
+    expect(store.data.part[first.id]?.map((part) => part.id)).toContain("prt_1")
+    expect(store.data.part[first.id]?.map((part) => part.id)).toContain("prt_3")
+    expect(store.data.part[second.id]?.map((part) => part.id)).toContain("prt_2")
+    expect(store.data.part[second.id]?.map((part) => part.id)).toContain("prt_4")
+    expect(store.data.part[first.id]?.some((part) => part.id === "prt_2" || part.id === "prt_4")).toBe(false)
+    expect(store.data.part[second.id]?.some((part) => part.id === "prt_1" || part.id === "prt_3")).toBe(false)
+  })
+
+  test("recovery snapshots cannot erase streamed text, restore removed parts, or resurrect removed messages", async () => {
+    const first = userMessage("msg_first", { sessionID: "root" })
+    const second = userMessage("msg_second", { sessionID: "root", time: { created: 2 } })
+    const live = textPart(first.id, { sessionID: "root", id: "prt_live", text: "hello" })
+    const removed = textPart(first.id, { sessionID: "root", id: "prt_removed", text: "remove me" })
+    const recovered = textPart(first.id, { sessionID: "root", id: "prt_recovered", text: "complete durable content" })
+    const tool: Part = { id: "prt_tool", sessionID: "root", messageID: first.id, type: "tool", callID: "call", tool: "bash", state: { status: "pending", input: {}, raw: "" } }
+    const completedTool: Part = { ...tool, state: { status: "completed", input: { command: "echo full command" }, output: "full command", title: "echo", metadata: {}, time: { start: 1, end: 2 } } }
+    const page = Promise.withResolvers<any>()
+    const client = messageClient({
+      data: [{ info: first, parts: [live, removed, tool] }, { info: second, parts: [] }],
+      response: { headers: new Headers({ "x-windowed-messages": JSON.stringify([first, second].map((info) => ({ messageID: info.id, omittedParts: 1 }))) }) },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, { sessionRead: { timelinePartsBatch: () => page.promise } })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+    await store.sync("root")
+    const hydration = store.retryTimelineContent("root")
+    store.apply({ type: "message.part.delta", properties: { sessionID: "root", messageID: first.id, partID: live.id, field: "text", delta: " world", offset: 5 } })
+    store.apply({ type: "message.part.removed", properties: { sessionID: "root", messageID: first.id, partID: removed.id } })
+    store.apply({ type: "message.part.updated", properties: { sessionID: "root", part: completedTool } })
+    store.apply({ type: "message.removed", properties: { sessionID: "root", messageID: second.id } })
+    page.resolve({ data: {
+      data: [live, removed, recovered, tool, textPart(second.id, { sessionID: "root", id: "prt_resurrected" })].map((part) => ({ messageID: part.messageID, part })),
+      completeMessageIDs: [first.id, second.id],
+    } })
+    await hydration
+    expect(store.data.part[first.id]?.find((part) => part.id === live.id)).toMatchObject({ text: "hello world" })
+    expect(store.data.part[first.id]?.some((part) => part.id === removed.id)).toBe(false)
+    expect(store.data.part[first.id]?.some((part) => part.id === recovered.id)).toBe(true)
+    expect(store.data.part[first.id]?.find((part) => part.id === tool.id)).toMatchObject({ state: { status: "completed", input: { command: "echo full command" }, output: "full command" } })
+    expect(store.data.part[second.id]).toBeUndefined()
+    expect(store.data.message.root?.some((info) => info.id === second.id)).toBe(false)
+    expect(store.timelineContentStatus("root")).toEqual({ pendingCount: 0, error: undefined })
+    store.release("root")
+  })
+
+  test("a refreshed bootstrap window is recovered again without applying the older snapshot", async () => {
+    const message = userMessage("msg_window", { sessionID: "root" })
+    const initial = textPart(message.id, { sessionID: "root", id: "prt_window", text: "old preview" })
+    const refreshed = { ...initial, text: "new preview" }
+    const makePage = (part: Part) => ({ data: [{ info: message, parts: [part] }], response: { headers: new Headers({ "x-windowed-messages": JSON.stringify([{ messageID: message.id, omittedParts: 1 }]) }) } })
+    const older = Promise.withResolvers<any>()
+    let requests = 0
+    const client = messageClient(makePage(initial), makePage(refreshed)) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, { sessionRead: { timelinePartsBatch: () => ++requests === 1 ? older.promise : Promise.resolve({ data: { data: [{ messageID: message.id, part: { ...initial, text: "new complete content" } }], completeMessageIDs: [message.id] } }) } })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+    await store.sync("root")
+    const hydration = store.retryTimelineContent("root")
+    await store.sync("root", { force: true })
+    older.resolve({ data: { data: [{ messageID: message.id, part: { ...initial, text: "stale complete content" } }], completeMessageIDs: [message.id] } })
+    await hydration
+    expect(store.data.part[message.id]?.[0]).not.toMatchObject({ text: "stale complete content" })
+    for (let index = 0; index < 100 && store.timelineContentStatus("root").pendingCount; index++) await Promise.resolve()
+    expect(requests).toBe(2)
+    expect(store.data.part[message.id]?.[0]).toMatchObject({ text: "new complete content" })
+    expect(store.timelineContentStatus("root")).toEqual({ pendingCount: 0, error: undefined })
+    store.release("root")
+  })
+
+  test("reports a missing batch route once at session scope without per-message fallback", async () => {
+    const first = userMessage("msg_z_user", { sessionID: "root" })
+    const second = userMessage("msg_a_user", { sessionID: "root", time: { created: 2 } })
+    const requests: unknown[] = []
+    const partRequests: unknown[] = []
+    const client = messageClient({
+      data: [
+        { info: first, parts: [] },
+        { info: second, parts: [] },
+      ],
+      response: {
+        headers: new Headers({
+          "x-windowed-messages": JSON.stringify([
+            { messageID: first.id, omittedParts: 1 },
+            { messageID: second.id, omittedParts: 1 },
+          ]),
+        }),
+      },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function; parts: Function } }
+    Object.assign(client, {
+      sessionRead: {
+        timelinePartsBatch: async (input: unknown) => {
+          requests.push(input)
+          return { error: { message: "route not found" }, response: new Response(null, { status: 404 }) }
+        },
+        parts: async (input: unknown) => {
+          partRequests.push(input)
+          return { data: { data: [] } }
+        },
+      },
+    })
+    const store = createServerSession(client, {
+      retry: (task) => retryImmediately(task, { attempts: 1 }),
+    })
+    store.remember(session("root"))
+    store.resume("root")
+
+    await store.sync("root")
+    await store.retryTimelineContent("root")
+
+    expect(requests).toHaveLength(1)
+    expect(partRequests).toHaveLength(0)
+    expect(store.timelineContentStatus("root").pendingCount).toBe(0)
+    expect(store.timelineContentStatus("root").error).toBeTruthy()
+    expect(store.data.message_window[first.id]?.error).toBeTruthy()
+    expect(store.data.message_window[second.id]?.error).toBeTruthy()
+  })
+
+  test("discards a recovery page after the session generation changes", async () => {
+    const message = userMessage("msg_z_user", { sessionID: "root" })
+    const pendingResponse = Promise.withResolvers<any>()
+    const requestStarted = Promise.withResolvers<void>()
+    let requested = 0
+    const client = messageClient({
+      data: [{ info: message, parts: [] }],
+      response: {
+        headers: new Headers({
+          "x-windowed-messages": JSON.stringify([{ messageID: message.id, omittedParts: 1 }]),
+        }),
+      },
+    }) as unknown as OpencodeClient & { sessionRead: { timelinePartsBatch: Function } }
+    Object.assign(client, {
+      sessionRead: {
+        timelinePartsBatch: () => {
+          requested++
+          requestStarted.resolve()
+          return pendingResponse.promise
+        },
+      },
+    })
+    const store = createServerSession(client, { retry: retryImmediately })
+    store.remember(session("root"))
+    store.resume("root")
+    await store.sync("root")
+    const hydration = store.retryTimelineContent("root")
+    await requestStarted.promise
+    expect(requested).toBe(1)
+
+    store.release("root")
+    const releasedWindow = store.data.message_window[message.id]
+    pendingResponse.resolve({
+      data: {
+        data: [{ messageID: message.id, part: textPart(message.id, { id: "prt_stale", text: "stale" }) }],
+        completeMessageIDs: [message.id],
+      },
+    })
+    await hydration
+    expect(store.data.part[message.id]).toBeUndefined()
+    expect(store.data.message_window[message.id]).toEqual(releasedWindow)
+  })
+
+  test("returns progressive message detail without hydrating shared timeline state", async () => {
+    const partial = {
+      id: "msg_a_assistant",
+      type: "assistant",
+      content: [{ type: "text", text: "preview…" }],
+      time: { created: 2 },
+    }
+    const page = {
+      data: [{ partID: "prt_large", type: "text", offset: 0, totalChars: 50_000, text: "x".repeat(1024) }],
+      nextCursor: "bounded-next-page",
+    }
+    const requests: unknown[] = []
+    const client = {
+      sessionRead: {
+        parts: async (input: unknown) => {
+          requests.push(input)
+          return { data: page }
+        },
+      },
+    } as unknown as OpencodeClient
+    const messageApi = {
+      list: async () => ({
+        data: [partial],
+        windowed: [{ messageID: partial.id, omittedContentItems: 79_936, truncatedStrings: 1 }],
+        bytes: 256,
+        cursor: { previous: null, next: null },
+      }),
+    } as unknown as MessageApi
+    const store = createServerSession(client, {} as SessionApi, messageApi)
+    store.remember(session("root"))
+
+    await store.sync("root")
+    const messages = store.data.message.root
+    const parts = store.data.part[partial.id]
+    const omissions = store.data.message_window[partial.id]
+
+    const result = await store.inspectMessageParts("root", partial.id)
+
+    expect(requests).toEqual([{ sessionID: "root", messageID: partial.id }])
+    expect(result).toEqual(page)
+    expect(store.data.message.root).toBe(messages)
+    expect(store.data.part[partial.id]).toBe(parts)
+    expect(store.data.message_window[partial.id]).toBe(omissions)
   })
 
   test("extends a current page to include the user for split assistant turns", async () => {
@@ -1121,18 +1552,26 @@ describe("server session", () => {
 
     await store.sync("root")
 
+    const structureChange = store.structureChange("root")
+    const hydratedRevision = structureChange().revision
+
     expect(store.data.message.root.map((message) => message.id)).toEqual([user.id, assistant.id])
     expect(store.data.session_message.root).toMatchObject([
       { id: user.id, type: "user", text: "text" },
       { id: assistant.id, type: "assistant" },
     ])
 
-    const next = userMessage("message-3", { sessionID: "root" })
+    const next = userMessage("message-3", { sessionID: "root", time: { created: 3 } })
     store.apply({ type: "message.updated", properties: { info: next } })
     expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, assistant.id, next.id])
+    expect(structureChange()).toMatchObject({
+      revision: hydratedRevision + 1,
+      operation: { kind: "append", message: { id: next.id, type: "user" } },
+    })
 
     store.apply({ type: "message.removed", properties: { sessionID: "root", messageID: next.id } })
     expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, assistant.id])
+    expect(structureChange()).toMatchObject({ operation: { kind: "reset" } })
   })
 
   test("backfills an assistant-only initial page through its user root", async () => {
@@ -2395,6 +2834,21 @@ describe("server session", () => {
     expect(ctx.store.get("root")?.directory).toBe("/repo")
     expect(ctx.store.data.session_working("root")).toBe(true)
     expect(ctx.get).toEqual([])
+  })
+
+  test("does not present an interrupted session as working", () => {
+    const ctx = setup({})
+    const applyStatus = (status: { type: "busy" | "idle" | "interrupted" | "retry"; attempt?: number; message?: string; next?: number }) =>
+      ctx.store.apply({ type: "session.status", properties: { sessionID: "root", status } })
+
+    applyStatus({ type: "busy" })
+    expect(ctx.store.data.session_working("root")).toBe(true)
+    applyStatus({ type: "retry", attempt: 1, message: "retrying", next: 100 })
+    expect(ctx.store.data.session_working("root")).toBe(true)
+    applyStatus({ type: "interrupted" })
+    expect(ctx.store.data.session_working("root")).toBe(false)
+    applyStatus({ type: "idle" })
+    expect(ctx.store.data.session_working("root")).toBe(false)
   })
 
   test("preserves pinned session content under server-wide cache pressure", () => {

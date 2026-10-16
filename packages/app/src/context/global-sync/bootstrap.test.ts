@@ -192,7 +192,8 @@ describe("bootstrapDirectory", () => {
 
     expect(store.status).toBe("complete")
     expect(legacyConfigReads).toEqual(["directory"])
-    expect(mcpReads.sort()).toEqual(["command", "resource", "status"])
+    expect(mcpReads.sort()).toEqual(["resource", "status"])
+    expect(store.command).toEqual([])
   })
 
   test("skips legacy config while refreshing a v2 directory", async () => {

@@ -7,6 +7,85 @@ const event = (input: object) => input as OpenCodeEvent
 const base = { created: 1, location: { directory: "/repo" }, durable: { aggregateID: "ses_1", seq: 1, version: 1 } }
 
 describe("v2 session reducer", () => {
+  test("reports append-only structural changes without scanning for duplicate ids repeatedly", () => {
+    const reducer = createV2SessionReducer()
+    const backing: SessionMessageInfo[] = Array.from({ length: 320 }, (_, index) => ({
+      id: `msg_history_${index}`,
+      type: "user" as const,
+      text: `history ${index}`,
+      time: { created: index + 1 },
+    }))
+    let indexedReads = 0
+    const messages = new Proxy(backing, {
+      get(target, property, receiver) {
+        if (typeof property === "string" && /^\d+$/.test(property)) indexedReads += 1
+        return Reflect.get(target, property, receiver)
+      },
+    })
+    reducer.invalidate("ses_1")
+
+    const append = (id: string, seq: number) => {
+      const result = reducer.reduce(
+        messages,
+        event({
+          ...base,
+          durable: { aggregateID: "ses_1", seq, version: 1 },
+          id: `evt_${id}`,
+          type: "session.synthetic",
+          data: { sessionID: "ses_1", text: id, description: "test" },
+        }),
+      )
+      expect(result?.kind).toBe("messages")
+      if (result?.kind !== "messages") throw new Error("expected append reduction")
+      expect(result.incremental).toMatchObject({ kind: "append", index: messages.length })
+      const next = result.incremental
+      if (!next || next.kind !== "append") throw new Error("expected append operation")
+      // The explicit operation is the hot-path contract; consumers need not
+      // request `messages` and materialize a copied full transcript.
+      expect(next.message.id).toBe(`msg_${id}`)
+      backing.push(next.message)
+      return result
+    }
+
+    for (let index = 0; index < 320; index++) append(`append_${index}`, index + 1)
+    expect(messages).toHaveLength(640)
+    // The first append builds the reducer's ID index from the authoritative
+    // snapshot once. The remaining 319 proven appends and duplicate replay
+    // must not visit prior array entries.
+    expect(indexedReads).toBe(320)
+
+    const duplicate = reducer.reduce(
+      messages,
+      event({
+        ...base,
+        id: "evt_append_319",
+        type: "session.synthetic",
+        data: { sessionID: "ses_1", text: "append_319", description: "test" },
+      }),
+    )
+    expect(duplicate).toMatchObject({ kind: "unchanged", sessionID: "ses_1", touched: [] })
+
+    // A same-length authoritative reorder cannot use the stale append index.
+    // Hydration callers explicitly invalidate; the next append rebuilds once.
+    reducer.invalidate("ses_1")
+    const reordered = [messages.at(-1)!, ...messages.slice(0, -1)]
+    backing.splice(0, backing.length, ...reordered)
+    const afterReset = reducer.reduce(
+      messages,
+      event({
+        ...base,
+        id: "evt_after_reset",
+        type: "session.synthetic",
+        data: { sessionID: "ses_1", text: "after reset", description: "test" },
+      }),
+    )
+    expect(afterReset?.kind).toBe("messages")
+    expect(afterReset?.kind === "messages" ? afterReset.incremental : undefined).toMatchObject({
+      kind: "append",
+      index: 640,
+    })
+  })
+
   test("projects promoted input and streaming assistant content", () => {
     const reducer = createV2SessionReducer()
     let messages: SessionMessageInfo[] = []

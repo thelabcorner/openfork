@@ -14,7 +14,7 @@ import type {
   VcsInfo,
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
-import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
+import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { CommandInfo, McpResource, McpServer } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@/utils/session-message-info"
 import type { Accessor } from "solid-js"
@@ -79,6 +79,9 @@ export type State = {
   }
   session_message: {
     [sessionID: string]: SessionMessageInfo[]
+  }
+  message_window?: {
+    [messageID: string]: { omittedContentItems: number; truncatedStrings: number; error?: string } | undefined
   }
   part: {
     [messageID: string]: Part[]

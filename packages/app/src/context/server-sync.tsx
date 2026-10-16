@@ -28,6 +28,7 @@ import {
   loadReferencesQuery,
 } from "./global-sync/bootstrap"
 import { createChildStoreManager } from "./global-sync/child-store"
+import { createCommandCatalogOwner } from "./global-sync/command-catalog"
 import { applyDirectoryEvent, applyGlobalEvent } from "./global-sync/event-reducer"
 import { reconcilePendingBySession } from "./global-sync/pending-response-snapshot"
 import { createPendingResponseRepairOwner } from "./global-sync/pending-response-repair"
@@ -66,6 +67,7 @@ import { createHomeSessionIndexCache, homeSessionIndexRefreshRelevant } from "./
 import { persisted } from "@/utils/persist"
 import type { ServerApi } from "@/utils/server"
 import type {
+  CommandInfo,
   McpListInput,
   McpListOutput,
   McpResource,
@@ -245,26 +247,6 @@ export const loadMcpResourcesQuery = (
     placeholderData: {},
   })
 
-export const loadLspQuery = (
-  scope: ServerScope,
-  directory: string,
-  sdk: OpencodeClient,
-  requests?: ServerRequestScheduler,
-) =>
-  queryOptions({
-    queryKey: [scope, directoryKey(directory), "lsp"] as const,
-    staleTime: 5 * 60_000,
-    gcTime: 10 * 60_000,
-    refetchOnMount: false,
-    refetchOnReconnect: false,
-    refetchOnWindowFocus: false,
-    retry: 1,
-    queryFn: () => {
-      const request = () => sdk.lsp.status()
-      return (requests ? requests.schedule("background", request, { kind: "lsp-status" }) : request()).then((r) => r.data ?? [])
-    },
-  })
-
 export const loadActiveSessionsQuery = (
   scope: ServerScope,
   api: SessionActiveApi,
@@ -375,7 +357,6 @@ function makeQueryOptionsApi(
     mcp: (directory: PathKey) => loadMcpQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol, requests),
     mcpResources: (directory: PathKey) =>
       loadMcpResourcesQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol, requests),
-    lsp: (directory: PathKey) => loadLspQuery(scope, directory, sdkFor(directory), requests),
     sessions: (directory: PathKey) => ({ queryKey: [scope, directory, "loadSessions"] as const }),
     // No tool-def query is registered today (tool calls render from streamed ToolParts), but the
     // query key is the contract `tool.reloaded` invalidates so a future /experimental/tool fetch
@@ -679,6 +660,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   let bootingRoot = false
   let eventFrame: number | undefined
   let eventTimer: ReturnType<typeof setTimeout> | undefined
+  let releaseEventStream: (() => void) | undefined
 
   const sessionOf = (value: unknown): string | undefined => {
     if (value === null || typeof value !== "object") return undefined
@@ -810,6 +792,29 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     })()
   }
 
+  // A crashed/restarted sidecar can invalidate a Session execution generation
+  // while the tab is hidden, without delivering an orderly session.idle event.
+  // On foreground regain, verify ONE server-global active projection rather
+  // than polling/hydrating every Session or trusting old client-side spinners.
+  // Reuse the existing coalesced SSE repair pipeline and its stale-response
+  // generation fence; do not create another activity owner.
+  let lastForegroundProofAt = 0
+  const verifyOnForeground = () => {
+    if (activityRepairDisposed || (typeof document !== "undefined" && document.visibilityState !== "visible")) return
+    const now = performance.now()
+    if (now - lastForegroundProofAt < 10_000) return
+    lastForegroundProofAt = now
+    scheduleActivityRepair()
+  }
+  if (typeof window !== "undefined" && typeof document !== "undefined") {
+    window.addEventListener("focus", verifyOnForeground, { passive: true })
+    document.addEventListener("visibilitychange", verifyOnForeground, { passive: true })
+    onCleanup(() => {
+      window.removeEventListener("focus", verifyOnForeground)
+      document.removeEventListener("visibilitychange", verifyOnForeground)
+    })
+  }
+
   const time = (name: "applyV2" | "apply" | "dir" | "home" | "invalid", fn: () => void, sessionID?: string) => {
     const started = phaseTrace.enabled ? performance.now() : 0
     if (!perf.enabled) {
@@ -828,6 +833,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   onCleanup(() => {
     if (eventFrame !== undefined) cancelAnimationFrame(eventFrame)
     if (eventTimer !== undefined) clearTimeout(eventTimer)
+    releaseEventStream?.()
+    releaseEventStream = undefined
   })
 
   const setProjects = (next: Project[] | ((draft: Project[]) => Project[])) => {
@@ -905,6 +912,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     bootstrapInstance,
   })
 
+  let invalidateCommandCatalog: (directory: string) => void = () => {}
   const children = createChildStoreManager({
     owner,
     scope: serverSDK.scope,
@@ -914,28 +922,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     onBootstrap: (directory) => {
       void bootstrapInstance(directory)
     },
-    onMcp: (directory, setStore) => {
-      void loadCommands(
-        directory,
-        serverSDK.api.command,
-        sdkFor(directory),
-        serverSDK.protocol,
-        serverSDK.requests,
-        "background",
-      )
-        .then((commands) => setStore("command", commands))
-        .catch((err) => {
-          if (isCancelledRequestError(err)) return
-          showToast({
-            variant: "error",
-            title: language.t("toast.project.reloadFailed.title", { project: getFilename(directory) }),
-            description: formatServerError(err, language.t),
-          })
-        })
-    },
     onDispose: (directory) => {
       const key = directoryKey(directory)
       queue.clear(key)
+      invalidateCommandCatalog(key)
       sessionMeta.delete(key)
       staleSessionLists.delete(key)
       sdkCache.delete(key)
@@ -948,10 +938,39 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
   })
 
+  // The command catalog combines workspace commands, MCP prompts, and Skills,
+  // and its server route initializes the execution Instance. Keep it out of
+  // directory bootstrap; only explicit slash-picker/command-submit demand may
+  // start this shared request.
+  const commandCatalog = createCommandCatalogOwner<CommandInfo>({
+    load: (directory) =>
+      loadCommands(
+        directory,
+        serverSDK.api.command,
+        sdkFor(directory),
+        serverSDK.protocol,
+        serverSDK.requests,
+        "interactive",
+      ),
+    commit: (directory, commands) => children.child(directory, { bootstrap: false })[1]("command", commands),
+  })
+  invalidateCommandCatalog = commandCatalog.invalidate
+  const invalidateCommands = (directory: string) => {
+    const key = directoryKey(directory)
+    commandCatalog.invalidate(key)
+    const child = children.children[key]
+    child?.[1]("command", [])
+  }
+  const ensureCommands = (directory: string, options?: { isCurrent?: () => boolean }) =>
+    commandCatalog.ensure(directoryKey(directory), options?.isCurrent)
+
   async function loadSessions(
     directory: string,
     options?: { limit?: number; shrinkTo?: number; priority?: ServerRequestPriority; projectID?: string },
   ) {
+    // "global" is the transport scope for process-wide events, not a workspace
+    // directory. Never turn that sentinel into a cwd-relative session census.
+    if (directory === "global") return
     const key = directoryKey(directory)
     const staleGeneration = staleSessionLists.get(key)
     const priority = options?.priority ?? "interactive"
@@ -1375,6 +1394,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         eventType === "project.directories.updated"
       )
         bootstrap.refetch()
+      if (eventType === "config.updated" || eventType === "command.updated") {
+        for (const directory of Object.keys(children.children)) invalidateCommands(directory)
+      }
       if (connectedRepair || eventType === "global.disposed") {
         for (const directory of Object.keys(children.children)) {
           const key = directoryKey(directory)
@@ -1424,6 +1446,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         eventType === "agent.updated"
       )
         queue.push(eventKey)
+      if (eventType === "mcp.status.changed" || eventType === "command.updated" || eventType === "config.updated")
+        invalidateCommands(eventDirectory)
       if (eventType === "mcp.status.changed")
         time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcp(eventKey)))
       if (eventType === "mcp.resources.changed")
@@ -1444,9 +1468,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
           sessionContent: false,
           permission: session.data.permission,
           vcsCache: children.vcsCache.get(eventKey),
-          loadLsp: () => {
+          loadLsp: (servers) => {
             if (!children.active(eventKey)) return
-            void queryClient.fetchQuery(queryOptionsApi.lsp(eventKey))
+            setStore("lsp", reconcile(servers, { merge: false }))
           },
           loadReferences: () => {
             if (!children.active(eventKey)) return
@@ -1478,13 +1502,16 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         eventFrame = undefined
         eventTimer = setTimeout(() => {
           eventTimer = undefined
-          void serverSDK.event.start()
+          // The full SessionSync owns a long-lived lease; release it when its
+          // context is disposed. A remote inspector's shorter lease can keep
+          // the same transport alive without pinning a discarded SessionSync.
+          releaseEventStream = serverSDK.event.acquire()
         }, 0)
       })
     } else {
       eventTimer = setTimeout(() => {
         eventTimer = undefined
-        void serverSDK.event.start()
+        releaseEventStream = serverSDK.event.acquire()
       }, 0)
     }
   })
@@ -1504,6 +1531,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     mutationFn: (config: Config) => serverSDK.client.global.config.update({ config }),
     onSuccess: (_data, config) => {
       bootstrap.refetch()
+      for (const directory of Object.keys(children.children)) invalidateCommands(directory)
       if (config.agent) {
         void queryClient
           .invalidateQueries({
@@ -1587,6 +1615,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       ensure: ensureProviderCatalog,
       ensureDirectory: children.enableProviderQueries,
     },
+    commands: {
+      ensure: ensureCommands,
+    },
     telemetry: {
       ensure: ensureTelemetry,
       get: (sessionID: string) => globalStore.telemetry[sessionID],
@@ -1623,6 +1654,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
             await sdk.mcp.auth.authenticate({ name })
           },
           refresh: async () => {
+            invalidateCommands(key)
             await queryClient.refetchQueries(queryOptionsApi.mcp(key))
             await queryClient.refetchQueries(queryOptionsApi.mcpResources(key))
           },

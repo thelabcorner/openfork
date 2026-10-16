@@ -607,15 +607,16 @@ describe("applyDirectoryEvent", () => {
     })
 
     applyDirectoryEvent({
-      event: { type: "lsp.updated" },
+      event: { type: "lsp.updated", properties: { servers: [{ id: "ts", name: "typescript", root: "", status: "connected" }] } },
       store,
       setStore,
       push(directory) {
         pushes.push(directory)
       },
       directory: "/tmp",
-      loadLsp() {
+      loadLsp(servers) {
         lspLoads += 1
+        expect(servers).toEqual([{ id: "ts", name: "typescript", root: "", status: "connected" }])
       },
     })
 

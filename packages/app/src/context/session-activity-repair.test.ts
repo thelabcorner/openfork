@@ -16,6 +16,16 @@ describe("applySessionActivityRepair", () => {
     expect(session.data.session_status.ses_stale).toBeUndefined()
   })
 
+  test("retains the stopped-but-fenced crash recovery state instead of painting it idle or running", () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("session_status", "ses_crashed_worker", { type: "busy" })
+    applySessionActivityRepair(session, {
+      ses_crashed_worker: { type: "interrupted" },
+    }, ["ses_crashed_worker"], new Set())
+    expect(session.data.session_status.ses_crashed_worker).toEqual({ type: "interrupted" })
+    expect(session.data.session_working("ses_crashed_worker")).toBe(false)
+  })
+
   test("projects running and paused active sessions without hydrating session info", () => {
     const session = createServerSession({} as OpencodeClient)
 
