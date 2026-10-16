@@ -290,13 +290,17 @@ const lowerToolResultContent = Effect.fn("BedrockConverse.lowerToolResultContent
 })
 
 const lowerToolResult = Effect.fn("BedrockConverse.lowerToolResult")(function* (part: ToolResultPart) {
-  return {
+  // Widen the branch-specific content union to the canonical Bedrock schema.
+  // "satisfies" verifies shape but retains narrower inferred branches, which
+  // prevents the image-hoisting discriminator from narrowing tool results.
+  const block: BedrockToolResultBlock = {
     toolResult: {
       toolUseId: part.id,
       content: yield* lowerToolResultContent(part),
       status: part.result.type === "error" ? "error" : "success",
     },
-  } satisfies BedrockToolResultBlock
+  }
+  return block
 })
 
 const lowerMessages = Effect.fn("BedrockConverse.lowerMessages")(function* (
