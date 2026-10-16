@@ -1,0 +1,60 @@
+# OpenFork SQLite native-read resilience overhaul — 2026-10-11
+
+## Problem and evidence
+
+OXP/worker/session supervision experienced recurring SQLite permit starvation: synchronous SQLite C code in a Node/Bun worker can take minutes while a connection holds its one-permit semaphore. `Fiber.interrupt` alone does not interrupt that native SQLite computation, and `Worker.terminate()` cannot guarantee a timely preemption of a synchronous native SQLite call. Previously observed fingerprints include `c2b111a6` (reported 325+ second permit occupancy) and `e3be8ca2` (`Usage.ZenFree.snapshot`, 4,072 ms). The older FTS/Zen SQL-plan changes reduce frequency but cannot guarantee absence of other runaway plans.
+
+## Source changes (actual production runtime)
+
+- **NEW `packages/core/src/database/sqlite-scan-process.ts`**: self-contained, read-only SQLite Node subprocess. Each query has a hard wall-clock budget (default 10 s, configurable for tests, minimum 100 ms/maximum 60 s). On deadline, the client rejects with `SQLITE_SCAN_DEADLINE`, kills the process, and lazily starts a fresh database handle for the next query. Explicit Effect interruptions use `cancelActive()` with `SQLITE_SCAN_CANCELLED` and the same cleanup. The connection is genuinely native read-only; only selected read/transaction SQL classes are allowed, and extension loading is forbidden. It will not execute through writable primary/control lanes.
+- **`packages/core/src/database/sqlite.node.ts`**: selects this killable subprocess ONLY for named file-backed read-only `scan`, `scan-pool`, or `interactive` lanes; primary writers/control writers continue awaiting native completion/acknowledged COMMIT and are NEVER killed. The read-only adapter registers an Effect interrupt handler that terminates the active process BEFORE releasing the scoped connection permit. It uses existing Effect/Drizzle and query-origin diagnostics, no new external interfaces required.
+- **`packages/core/src/database/database.ts`**: default file-backed analytical reader-pool size changed from 1 to 2 lazily initialized readers, bounded 1–4 via the existing `OPENFORK_EXPERIMENTAL_USAGE_READERS` override. Memory databases remain one connection. This reduces head-of-line blocking from one expensive analytical request.
+- **`packages/opencode/src/oxp/session.ts`**: OXP `session.search` now holds a whole `withScanDb` leased reader from its start through root revalidation and result projection, falling back to `scanDb()` only with legacy injected database fixtures. Preserves approved-root scoping and supervision checks.
+- **`packages/opencode/src/exchange/memory.ts` and `memory-read-runtime.ts`**: both Memory→Session recall adapters similarly use a leased reader rather than the shared singleton `scanDb()`. These preexisting modified/untracked files were surgically edited, not overwritten.
+- The previously implemented FTS-first session SQL and Usage.ZenFree.snapshot indexed query remain separately owned source changes; no unrelated rewrites were performed in this task.
+
+## Process boundary engineering details
+
+- The subprocess uses Node `DatabaseSync` in its own OS process; parent timers and the parent event loop remain usable even while SQLite C code blocks the child main thread. `child.kill('SIGKILL')` gives an actual preemptive OS isolation boundary, unlike worker-thread termination.
+- Node V8 advanced IPC preserves 64-bit BigInt and binary values. Bun's incompatible child-process advanced IPC receives a tagged precision-preserving wire fallback. Verified against genuine Node subprocess and Bun harness.
+- Child has a secondary watchdog worker that checks the parent PID periodically, intended to prevent an orphaned synchronous scan from pinning a WAL snapshot indefinitely after a sidecar failure. This protection needs stronger independently clocked fault injection for certification.
+- 256 MiB V8 heap limit curbs JS hydration. **Not** a full native-process RSS/cgroup/job-object memory cap. Process count is bounded by lazy reader slots per Database lifetime, but distinct DB instances still require system-wide accounting.
+- On a killed read transaction, SQLite closes/discards the entire read-only connection/WAL snapshot; framework ROLLBACK following a forced kill is a benign no-op. Tested for no WAL lock stranding. No write transaction is discarded or replayed.
+- Database query type controls are defense-in-depth. `readonly:true` is the data-integrity boundary; `PRAGMA` and `WITH` are not adequate standalone read-only parsers.
+- Each child query's budget is per-statement, not an absolute multi-statement transaction deadline. Heavy reads may still be CPU expensive until their deadline, and a slow full-scan failure is reported rather than silently replayed.
+
+## Verification — actual executed results
+
+1. `cd packages/core && bun test test/database/sqlite-scan-process-hard-deadline-20261011.test.ts`: 3 PASS, 15 assertions, ~2.04 s. Tests: 350 ms runaway is forcibly terminated; next read succeeds; BigInt/blob IPC roundtrip, no writes; 600 ms runaway on one child does not block other child read or a WAL writer, and original reader reconnects.
+2. `cd packages/core && bun test test/database/sqlite-node-killable-scan-integration-20261011.test.ts`: four tests including real Effect/Drizzle Node driver: timeout recovery, explicit Fiber interruption, interrupt inside a read-only transaction with safe rollback behavior, and interactive reader C-loop timeout/recovery. Combined with reader-pool tests in a four-file run: **8 PASS, 40 assertions, 2.92 s** (after fixing both runtime factory branches to recognize interactive). A temporarily failing interactive test uncovered missing lane parity in nativeLayer and was corrected before green recheck.
+3. `cd packages/core && bun test test/database/sqlite-worker.test.ts test/database/sqlite-worker-permit.test.ts test/database/sqlite-read-worker-scheduling.test.ts test/database/sqlite-node-killable-scan-integration-20261011.test.ts test/database/sqlite-scan-process-hard-deadline-20261011.test.ts test/database/default-scan-concurrency-20261011.test.ts test/database-scan-pool-integration.test.ts`: **12 PASS, 66 assertions, 6.25s** before last interactive-lane test/default additions; repeat is recommended for final integration certification.
+4. Core `bun run typecheck` completed exit 0 after native process integration/explicit cancellation/guardian, with source and test changes. Full `packages/opencode` typecheck exits 2 with numerous errors elsewhere in CLI, server, compatibility and test fixtures; do NOT call repo-wide typecheck green.
+5. OXP `test/oxp/session.test.ts`: 15/15 PASS, 103 assertions; Memory+OXP mixed suite passed (federated memory recall and primary-writer isolation included).
+6. True Node (not just Bun tests) bundled scanner smoke: `NODE_V8_IPC_OK deadline_ms=369 read_only_recovered=1 bigint_blob_fidelity=1`, exit 0.
+7. Controlled parent-death / orphan-probe: `ORPHAN_GUARD_OK parent_exited=1 scanner_reaped_ms=1`, exit 0; this quick exit may also reflect the existing IPC disconnect handler, so does **not** independently certify the guardian under an actively running native C loop.
+8. Existing default pool WAL test held two snapshot readers while running 1,000 primary writes; p95 ~0.18ms on synthetic fixture, no corruption/cleanup failure.
+
+## Remaining non-negotiable gates and safety
+
+- NO live user database changed, NO production sidecar restarted/activated. OXP status currently reports `runtime.refreshable=false`, so the running desktop may still use old code and show prior symptoms. Source/test proof is not deployment proof.
+- This implementation covers **Node runtime named read-only lanes**; Bun's production `sqlite.bun-worker` is a distinct path and still awaits hard cancellation parity. Existing Bun tests prove asynchronous event-loop responsiveness and separate admission, not guaranteed preemption of a blocked SQLite C statement.
+- Read-only subprocess has no explicit OS-level RSS ceiling, cross-database host-wide worker budget, or independently certified large-database (multi-GB) WAL/page-cache performance. Node process spawning per first query/after failure adds startup latency versus worker threads, so benchmark p95/p99 user-visible read latency, CPU, memory and IPC size before broad deployment.
+- Sidecar and OXP worker lifecycle acceptance must be measured under real 20–100 worker search/cancel/steer pressure: zero 30-second permit acquisitions, bounded cancellation, root authority intact, no stuck session worker, memory stable, and resuming stored sessions after a failed scanner.
+- Native query cannot be safely hard-killed on **writer lanes** until there is a durable transaction-outcome acknowledgment/fencing protocol. No unverified fast-abort of COMMIT/ROLLBACK was introduced.
+- OXP `oxp-sync-project-roots` startup error in the uploaded log was not proven to be caused by SQLite; requires separate root-authority diagnostics.
+- All dirty/coordinated Git changes were preserved; no reset, clean, mass-stage, commit or force push. Only a temporary test bundle created by this work was removed after test verification.
+
+## Final expanded regression pass and cross-consumer lease fix
+
+- Full **seven-file Core worker/scan suite** rerun after native interactive parity fix, read-only SQL admission hardening, and multi-client WAL stress: **14/14 PASS**, **75 assertions**, 8.46s. Includes true Node worker RPC/permit tests, Bun event-loop scheduling, Node scanner hard deadline/restart, interrupted read-only WAL transaction, pinned default 2-reader pool, and concurrent writer progress. All test DBs are isolated fixtures.
+- The temporary interactive-lane timeout **was a real test-discovered wiring defect**: the Effect SQL adapter selected the killable process but the native factory still instantiated the old unkillable worker for the `interactive` lane. Both conditions now agree; dedicated interactive C-loop kill/reopen test is GREEN and the full regression rerun passed.
+- **ZenFree bypass removed:** `packages/opencode/src/usage/zen-free.ts` now holds the standard `withScanDb` lease around its two-statement read; legacy fixture fallback remains `scanDb()`. Previously, direct `scanDb()` could interleave within an independent consumer's leased connection and pinned WAL snapshot. The quota singleflight/cache behavior remains unchanged. New `packages/opencode/test/usage/zen-free-pooled-lease-20261011.test.ts` forces direct singleton `scanDb()` to fail and proves 16 callers cause only one pooled lease and two statements. Original/incremental Zen suite **5/5 PASS, 47 assertions**.
+- Scope remains **source + isolated regression proven**, not deployed to active Desktop sidecar. No live DB mutation, app restart, or interfering Git operations.
+
+## Final related OXP + Memory verification (post-Zen lease)
+
+`cd packages/opencode && bun test test/oxp/session.test.ts test/exchange/memory-scan-primary-isolation-20261011.test.ts test/exchange/memory-recall.test.ts test/usage/zen-free-pooled-lease-20261011.test.ts`: **36/36 PASS, 190 assertions, 5.07s**. Scoped OXP authority and cancellation tests, Memory semantic evidence, six Memory reads while the primary writer is held, and the Zen shared-lease negative control all passed. `packages/core bun run typecheck` exit 0; scoped `git diff --check` exit 0 (CRLF normalization warnings only).
+
+Core final regression: `cd packages/core && bun test test/database/sqlite-worker.test.ts test/database/sqlite-worker-permit.test.ts test/database/sqlite-read-worker-scheduling.test.ts test/database/sqlite-node-killable-scan-integration-20261011.test.ts test/database/sqlite-scan-process-hard-deadline-20261011.test.ts test/database/default-scan-concurrency-20261011.test.ts test/database-scan-pool-integration.test.ts` => **14/14 PASS, 75 assertions, 8.46 s**. In a previous run of only the changed files, **8/8 PASS, 40 assertions**.
+
+The initial package-wide `packages/opencode` typecheck remains exit 2 with unrelated preexisting CLI, server handler, fixture and test typing defects; a repo-wide green check is NOT claimed.
