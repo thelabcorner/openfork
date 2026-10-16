@@ -22,8 +22,10 @@ describe("mobile pairing input", () => {
     expect(normalizeServerUrl("http://api.example.com", { allowInsecureRemote: true })).toBe("http://api.example.com")
   })
 
-  test("strips credentials and fragments from the persisted endpoint", () => {
-    expect(normalizeServerUrl("https://user:pass@api.example.com/base#pair=ABC")).toBe("https://api.example.com/base")
+  test("rejects credential-bearing and path-prefixed endpoints rather than silently stripping details", () => {
+    expect(() => normalizeServerUrl("https://user:pass@api.example.com/base#pair=ABC")).toThrow("username or password")
+    expect(() => normalizeServerUrl("https://api.example.com/base")).toThrow("API origin")
+    expect(() => normalizeServerUrl("https://api.example.com/#pair=ABC")).toThrow("API origin")
   })
 
   test("rejects non-HTTP schemes and empty input", () => {

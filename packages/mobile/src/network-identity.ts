@@ -7,6 +7,20 @@ export type NetworkIdentity = {
   protocolMax: number
 }
 
+// The public projection and durable pin must have identical validation.
+// In particular, an empty peer/fingerprint/realm is not an identity and a
+// malformed persisted protocol range must never become a trusted pin.
+function validIdentityString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 &&
+    value.trim() === value && !/[\x00-\x1f\x7f]/.test(value)
+}
+
+function validProtocolBounds(min: unknown, max: unknown): min is number {
+  return typeof min === "number" && typeof max === "number" &&
+    Number.isSafeInteger(min) && Number.isSafeInteger(max) &&
+    min >= 0 && max >= min
+}
+
 export function parseNetworkIdentityProjection(value: unknown): NetworkIdentity | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return
   const root = value as Record<string, unknown>
@@ -15,14 +29,10 @@ export function parseNetworkIdentityProjection(value: unknown): NetworkIdentity 
   const ofxp = ofxpValue as Record<string, unknown>
   if (
     ofxp.enabled !== true ||
-    typeof root.realmID !== "string" ||
-    typeof ofxp.peerID !== "string" ||
-    typeof ofxp.fingerprint !== "string" ||
-    typeof ofxp.protocolMin !== "number" ||
-    typeof ofxp.protocolMax !== "number" ||
-    !Number.isSafeInteger(ofxp.protocolMin) ||
-    !Number.isSafeInteger(ofxp.protocolMax) ||
-    ofxp.protocolMin > ofxp.protocolMax
+    !validIdentityString(root.realmID) ||
+    !validIdentityString(ofxp.peerID) ||
+    !validIdentityString(ofxp.fingerprint) ||
+    !validProtocolBounds(ofxp.protocolMin, ofxp.protocolMax)
   ) return
   return {
     ...(typeof root.instanceID === "string" ? { instanceID: root.instanceID } : {}),
@@ -30,7 +40,7 @@ export function parseNetworkIdentityProjection(value: unknown): NetworkIdentity 
     peerID: ofxp.peerID,
     fingerprint: ofxp.fingerprint,
     protocolMin: ofxp.protocolMin,
-    protocolMax: ofxp.protocolMax,
+    protocolMax: ofxp.protocolMax as number, // checked by validProtocolBounds
   }
 }
 
@@ -39,11 +49,11 @@ export function parseStoredNetworkIdentity(raw: string | undefined): NetworkIden
   try {
     const value = JSON.parse(raw) as Partial<NetworkIdentity>
     if (
-      typeof value.realmID !== "string" ||
-      typeof value.peerID !== "string" ||
-      typeof value.fingerprint !== "string" ||
-      typeof value.protocolMin !== "number" ||
-      typeof value.protocolMax !== "number"
+      !validIdentityString(value.realmID) ||
+      !validIdentityString(value.peerID) ||
+      !validIdentityString(value.fingerprint) ||
+      !validProtocolBounds(value.protocolMin, value.protocolMax) ||
+      (value.instanceID !== undefined && !validIdentityString(value.instanceID))
     ) return
     return value as NetworkIdentity
   } catch {

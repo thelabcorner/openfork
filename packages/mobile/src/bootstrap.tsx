@@ -1,13 +1,16 @@
-import { createSignal, lazy, onMount, Show, Suspense } from "solid-js"
+import { createSignal, lazy, onCleanup, onMount, Show, Suspense } from "solid-js"
 import type { PwaEndpointMigrationResult } from "@opencode-ai/app/pwa-client"
 import {
-  parseNetworkIdentityProjection,
   parseStoredNetworkIdentity,
   sameNetworkIdentity,
   pinnedIdentityVerdict,
   type NetworkIdentity,
 } from "./network-identity"
 import { normalizePairCode, normalizeServerUrl, validPairCode } from "./pairing-input"
+import { parseLinkPairCode } from "./pairing-payload"
+import { canRestoreDeviceToken, claimPair, credentialVerdict, probeNetworkIdentity } from "./pairing-client"
+import { createAttemptGate } from "./attempt-gate"
+import { readTrustedPairing, writeTrustedPairing, removeTrustedPairing, type TrustedPairing } from "./paired-storage"
 
 const loadPwaClient = () => import("@opencode-ai/app/pwa-client")
 const preloadPwaClient = () => void loadPwaClient().catch(() => {})
@@ -51,23 +54,41 @@ function readNetworkIdentity() {
   return parseStoredNetworkIdentity(readStorage(NETWORK_IDENTITY_KEY))
 }
 
-function writeNetworkIdentity(identity: NetworkIdentity | undefined) {
-  if (!identity) return
-  writeStorage(NETWORK_IDENTITY_KEY, JSON.stringify(identity))
+function loadTrustedPairing() {
+  try { return readTrustedPairing(localStorage, { allowInsecureRemote: import.meta.env.DEV }) }
+  catch { return { kind: "corrupt" } as const }
+}
+
+function persistTrustedPairing(value: TrustedPairing) {
+  let saved = false
+  try { saved = writeTrustedPairing(localStorage, value, { allowInsecureRemote: import.meta.env.DEV }) }
+  catch { /* Browser storage may be disabled. */ }
+  if (saved) {
+    // Legacy keys are migration inputs only; clear after the atomic commit.
+    clearStorage(SERVER_URL_KEY)
+    clearStorage(DEVICE_TOKEN_KEY)
+    clearStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
+    clearStorage(DEVICE_ID_KEY)
+    clearStorage(NETWORK_IDENTITY_KEY)
+  }
+  return saved
 }
 
 function launchConfig() {
   const search = new URLSearchParams(location.search)
   const hash = new URLSearchParams(location.hash.replace(/^#/, ""))
-  const pairCode = normalizePairCode(hash.get("pair") ?? search.get("pair") ?? "") || undefined
+  const rawPairCode = hash.get("pair") ?? search.get("pair")
+  const pairCode = parseLinkPairCode(rawPairCode)
   const requested = search.get("server")?.trim() || undefined
-  const storedServer = readStorage(SERVER_URL_KEY)
+  const trusted = loadTrustedPairing()
+  const legacy = trusted.kind === "absent"
+  const storedServer = trusted.kind === "valid" ? trusted.value.serverUrl : legacy ? readStorage(SERVER_URL_KEY) : undefined
   const baked = (import.meta.env.VITE_OPENCODE_SERVER_URL as string | undefined)?.trim() || undefined
-  const storedToken = readStorage(DEVICE_TOKEN_KEY) ?? readStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
-  const deviceID = readStorage(DEVICE_ID_KEY)
-  const networkIdentity = readNetworkIdentity()
+  const storedToken = trusted.kind === "valid" ? trusted.value.token : legacy ? readStorage(DEVICE_TOKEN_KEY) ?? readStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY) : undefined
+  const deviceID = trusted.kind === "valid" ? trusted.value.deviceID : legacy ? readStorage(DEVICE_ID_KEY) : undefined
+  const networkIdentity = trusted.kind === "valid" ? trusted.value.networkIdentity : legacy ? readNetworkIdentity() : undefined
 
-  if (pairCode) {
+  if (rawPairCode !== null) {
     // Pair codes are bearer secrets. Strip them before any app/runtime code can
     // observe the address bar or a user can accidentally share the URL.
     hash.delete("pair")
@@ -90,65 +111,6 @@ function launchConfig() {
   return { serverUrl, pairCode, storedToken, deviceID, networkIdentity }
 }
 
-function authorization(token?: string) {
-  return token ? `Basic ${btoa(`device:${token}`)}` : undefined
-}
-
-async function credentialVerdict(serverUrl: string, token?: string): Promise<"valid" | "invalid" | "unknown"> {
-  try {
-    const auth = authorization(token)
-    const response = await fetch(new URL("/global/health", `${serverUrl}/`), {
-      headers: auth ? { Authorization: auth } : undefined,
-    })
-    if (response.status === 401 || response.status === 403) return "invalid"
-    return response.ok ? "valid" : "unknown"
-  } catch {
-    // A dead tunnel or offline phone is not credential revocation. Preserve
-    // the token and let the shared connection gate perform live retries.
-    return "unknown"
-  }
-}
-
-async function probeNetworkIdentity(serverUrl: string): Promise<NetworkIdentity | undefined> {
-  try {
-    const response = await fetch(new URL("/instance/identity", `${serverUrl}/`), {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-    })
-    if (!response.ok) return
-    return parseNetworkIdentityProjection(await response.json())
-  } catch {
-    return undefined
-  }
-}
-
-async function claimPair(serverUrl: string, code: string) {
-  const response = await fetch(new URL("/pair/claim", `${serverUrl}/`), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, name: "OpenFork Mobile" }),
-  })
-  const body = (await response.json().catch(() => ({}))) as PairResponse & {
-    data?: { message?: string; reason?: string; retryAfterMs?: number }
-  }
-  if (!response.ok) {
-    if (response.status === 429) {
-      const seconds = Math.max(1, Math.ceil((body.data?.retryAfterMs ?? 0) / 1000))
-      throw new Error(`Too many attempts — try again in ${seconds}s`)
-    }
-    if (body.data?.reason === "expired") throw new Error("This pairing code has expired")
-    if (body.data?.reason === "invalid") throw new Error("Unknown or already used pairing code")
-    throw new Error(body.data?.message || `Pairing failed (${response.status})`)
-  }
-  const token =
-    typeof body.token === "string" ? body.token : typeof body.deviceToken === "string" ? body.deviceToken : undefined
-  if (!token) throw new Error("The server did not return a device token")
-  const deviceID = typeof body.device?.id === "string" ? body.device.id : undefined
-  const networkIdentity = await probeNetworkIdentity(serverUrl)
-  return { token, deviceID, networkIdentity }
-}
-
 export function MobileBootstrap() {
   const launch = launchConfig()
   const [serverUrl, setServerUrl] = createSignal(launch.serverUrl ?? "")
@@ -158,9 +120,14 @@ export function MobileBootstrap() {
   const [error, setError] = createSignal("")
   const [camera, setCamera] = createSignal(false)
   const [advanced, setAdvanced] = createSignal(!launch.serverUrl)
+  const [storageWarning, setStorageWarning] = createSignal("")
   let storedToken = launch.storedToken
   let storedDeviceID = launch.deviceID
   let storedIdentity = launch.networkIdentity
+  const attempts = createAttemptGate()
+  // Route transitions and PWA remounts can destroy this component while a
+  // pairing, restore, or migration request remains outstanding.
+  onCleanup(() => attempts.invalidate())
 
   const connect = (next: Connection) => {
     setConnection(next)
@@ -168,6 +135,8 @@ export function MobileBootstrap() {
   }
 
   const pair = async (nextCode = code(), nextServer = serverUrl()) => {
+    if (phase() === "pairing") return
+    const attempt = attempts.start()
     const normalizedCode = normalizePairCode(nextCode)
     if (!validPairCode(normalizedCode)) {
       setError("Enter the 6-character code shown by OpenFork Desktop")
@@ -188,15 +157,16 @@ export function MobileBootstrap() {
     setPhase("pairing")
     setError("")
     try {
-      const claimed = await claimPair(normalizedServer, normalizedCode)
+      const claimed = await claimPair(normalizedServer, normalizedCode, fetch, attempt.signal)
+      if (!attempt.current()) return
       // Pairing has succeeded; overlap app parsing with the remaining storage and
       // render transition instead of starting the large shared runtime afterward.
       preloadPwaClient()
-      writeStorage(SERVER_URL_KEY, normalizedServer)
-      writeStorage(DEVICE_TOKEN_KEY, claimed.token)
-      clearStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
-      if (claimed.deviceID) writeStorage(DEVICE_ID_KEY, claimed.deviceID)
-      writeNetworkIdentity(claimed.networkIdentity)
+      // Commit endpoint, identity pin and token as ONE browser-storage record.
+      // A tab kill can no longer produce a new token paired with an old pin.
+      const saved = persistTrustedPairing({ serverUrl: normalizedServer, token: claimed.token,
+        deviceID: claimed.deviceID, networkIdentity: claimed.networkIdentity })
+      setStorageWarning(saved ? "" : "Paired for this session, but browser storage is unavailable. Scan a fresh QR after reopening.")
       storedToken = claimed.token
       storedDeviceID = claimed.deviceID
       storedIdentity = claimed.networkIdentity
@@ -208,12 +178,17 @@ export function MobileBootstrap() {
         networkIdentity: claimed.networkIdentity,
       })
     } catch (cause) {
+      if (!attempt.current()) return
       setError(cause instanceof Error ? cause.message : "Pairing failed")
       setPhase("pair")
     }
   }
 
   const forget = () => {
+    // A late pairing claim, restore probe, or endpoint migration must never
+    // revive credentials or connection state after explicit user revocation.
+    attempts.invalidate()
+    try { removeTrustedPairing(localStorage) } catch { /* storage unavailable */ }
     clearStorage(SERVER_URL_KEY)
     clearStorage(DEVICE_TOKEN_KEY)
     clearStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
@@ -225,6 +200,7 @@ export function MobileBootstrap() {
     setConnection(undefined)
     setCode("")
     setError("")
+    setStorageWarning("")
     setCamera(false)
     setPhase("pair")
   }
@@ -234,6 +210,7 @@ export function MobileBootstrap() {
       await pair(launch.pairCode, launch.serverUrl)
       return
     }
+    const attempt = attempts.start()
     if (!serverUrl()) {
       setPhase("pair")
       return
@@ -245,6 +222,14 @@ export function MobileBootstrap() {
     } catch {
       setPhase("pair")
       setAdvanced(true)
+      return
+    }
+
+    if (storedToken && !canRestoreDeviceToken(storedToken, storedIdentity)) {
+      // A legacy unpinned token cannot safely be sent for TOFU validation:
+      // an endpoint replacement could capture the device secret first.
+      setError("This older pairing has no trusted server identity. Re-pair using a fresh desktop QR code.")
+      setPhase("pair")
       return
     }
 
@@ -261,7 +246,8 @@ export function MobileBootstrap() {
       // credential firewall: no device secret is sent until the endpoint proves
       // it is still the paired OpenFork node.
       if (storedIdentity) {
-        liveIdentity = await probeNetworkIdentity(normalizedServer)
+        liveIdentity = await probeNetworkIdentity(normalizedServer, fetch, attempt.signal)
+        if (!attempt.current()) return
         if (!liveIdentity) {
           setError("The paired OpenFork Network identity is not reachable yet. No device credential was sent.")
           return
@@ -273,21 +259,14 @@ export function MobileBootstrap() {
         }
       }
 
-      const verdict = await credentialVerdict(normalizedServer, storedToken)
+      const verdict = await credentialVerdict(normalizedServer, storedToken, fetch, attempt.signal)
+      if (!attempt.current()) return
       if (verdict !== "invalid") {
-        writeStorage(SERVER_URL_KEY, normalizedServer)
-        writeStorage(DEVICE_TOKEN_KEY, storedToken)
-        clearStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
-
-        // Legacy pairings upgrade to identity-pinned TOFU after their first
-        // successful authenticated restore. Existing pinned pairings have
-        // already verified this exact identity above.
-        liveIdentity ??= await probeNetworkIdentity(normalizedServer)
-        if (liveIdentity) {
-          storedIdentity = liveIdentity
-          writeNetworkIdentity(liveIdentity)
+        if (storedIdentity) {
+          const saved = persistTrustedPairing({ serverUrl: normalizedServer, token: storedToken,
+            deviceID: storedDeviceID, networkIdentity: storedIdentity })
+          if (!saved) setStorageWarning("Browser storage is unavailable. This pairing may not survive a restart.")
         }
-
         connect({
           serverUrl: normalizedServer,
           deviceToken: storedToken,
@@ -296,6 +275,7 @@ export function MobileBootstrap() {
         })
         return
       }
+      try { removeTrustedPairing(localStorage) } catch { /* storage unavailable */ }
       clearStorage(DEVICE_TOKEN_KEY)
       clearStorage(EMBEDDED_PWA_DEVICE_TOKEN_KEY)
       storedToken = undefined
@@ -305,7 +285,9 @@ export function MobileBootstrap() {
     }
 
     // Preserve support for deliberately unauthenticated development servers.
-    if ((await credentialVerdict(normalizedServer)) === "valid") {
+    const anonymous = await credentialVerdict(normalizedServer, undefined, fetch, attempt.signal)
+    if (!attempt.current()) return
+    if (anonymous === "valid") {
       writeStorage(SERVER_URL_KEY, normalizedServer)
       connect({ serverUrl: normalizedServer })
       return
@@ -318,6 +300,7 @@ export function MobileBootstrap() {
     const pinned = storedIdentity
     if (!token) return "credential-invalid"
     if (!pinned) return "unpinned"
+    const attempt = attempts.start()
 
     let normalized: string
     try {
@@ -327,18 +310,21 @@ export function MobileBootstrap() {
     }
     if (normalized === serverUrl()) return "migrated"
 
-    const verdict = pinnedIdentityVerdict(pinned, await probeNetworkIdentity(normalized))
+    const verdict = pinnedIdentityVerdict(pinned, await probeNetworkIdentity(normalized, fetch, attempt.signal))
+    if (!attempt.current()) return "unreachable"
     if (verdict !== "match") {
       if (verdict === "unavailable") return "identity-unavailable"
       if (verdict === "mismatch") return "identity-mismatch"
       return "unpinned"
     }
 
-    const credential = await credentialVerdict(normalized, token)
+    const credential = await credentialVerdict(normalized, token, fetch, attempt.signal)
+    if (!attempt.current()) return "unreachable"
     if (credential === "invalid") return "credential-invalid"
     if (credential !== "valid") return "unreachable"
 
-    writeStorage(SERVER_URL_KEY, normalized)
+    if (!persistTrustedPairing({ serverUrl: normalized, token, deviceID: storedDeviceID, networkIdentity: pinned }))
+      return "unreachable"
     setServerUrl(normalized)
     connect({ serverUrl: normalized, deviceToken: token, deviceID: storedDeviceID, networkIdentity: pinned })
     return "migrated"
@@ -514,6 +500,9 @@ export function MobileBootstrap() {
             </div>
           }
         >
+          <Show when={storageWarning()}>
+            <div class="pwa-bootstrap-alert" role="alert">{storageWarning()}</div>
+          </Show>
           <PwaClientApp
             serverUrl={current.serverUrl}
             deviceToken={current.deviceToken}

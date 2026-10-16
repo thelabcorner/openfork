@@ -59,6 +59,23 @@ describe("mobile OFXP identity pinning", () => {
     expect(parseStoredNetworkIdentity(JSON.stringify(identity))).toEqual(identity)
     expect(parseStoredNetworkIdentity("{")).toBeUndefined()
   })
+
+  test("rejects empty identity fields, invalid bounds and non-finite stored versions", () => {
+    for (const field of ["realmID", "peerID", "fingerprint"] as const) {
+      const corrupted = { ...identity, [field]: "" }
+      expect(parseStoredNetworkIdentity(JSON.stringify(corrupted))).toBeUndefined()
+      expect(parseNetworkIdentityProjection({ realmID: corrupted.realmID,
+        ofxp: { enabled: true, peerID: corrupted.peerID, fingerprint: corrupted.fingerprint,
+          protocolMin: corrupted.protocolMin, protocolMax: corrupted.protocolMax } })).toBeUndefined()
+    }
+    for (const bounds of [{ protocolMin: 3, protocolMax: 2 },
+      { protocolMin: -1, protocolMax: 2 }, { protocolMin: 1.5, protocolMax: 2 },
+      { protocolMin: 1, protocolMax: Number.MAX_SAFE_INTEGER + 1 }]) {
+      expect(parseStoredNetworkIdentity(JSON.stringify({ ...identity, ...bounds }))).toBeUndefined()
+    }
+    expect(parseStoredNetworkIdentity(JSON.stringify({ ...identity, peerID: "peer\nspoof" }))).toBeUndefined()
+    expect(parseStoredNetworkIdentity(JSON.stringify({ ...identity, instanceID: 42 }))).toBeUndefined()
+  })
 })
 
 describe("mobile OFXP endpoint identity verdicts", () => {

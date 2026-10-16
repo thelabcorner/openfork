@@ -65,6 +65,12 @@ async function upstream(input: { instanceID?: string } = {}) {
         return
       }
 
+      if (request.url === "/session/unauthorized") {
+        response.writeHead(401, { "www-authenticate": 'Basic realm="Secure Area"', "content-type": "application/json" })
+        response.end(JSON.stringify({ name: "Unauthorized" }))
+        return
+      }
+
       if (request.url === "/event") {
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" })
         response.write("data: first\n\n")
@@ -127,6 +133,18 @@ describe("dev API proxy", () => {
     expect(await response.json()).toMatchObject({ ok: true, path: "/session/abc?limit=2" })
     expect(back.seen).toHaveLength(1)
     expect(back.seen[0]!.url).toBe("/session/abc?limit=2")
+  })
+
+  test("keeps a denied API request denied without exposing a browser Basic challenge", async () => {
+    const back = await upstream()
+    const dev = await front(() => bound(back.url))
+
+    const response = await fetch(`${dev.url}/session/unauthorized`)
+    expect(response.status).toBe(401)
+    expect(response.headers.get("www-authenticate")).toBe('Bearer realm="OpenFork"')
+    expect(response.headers.get("cache-control")).toBe("no-store")
+    expect(await response.json()).toEqual({ name: "Unauthorized" })
+    expect(back.seen).toHaveLength(1)
   })
 
   test("forwards the request body and method", async () => {
