@@ -12,7 +12,7 @@ const root = resolve(import.meta.dir, "..")
 const folder = await mkdtemp(join(tmpdir(), "openfork-acp-async-acceptance-"))
 const database = join(folder, "acp.sqlite")
 const cwd = process.argv[2] ? resolve(process.argv[2]) : root
-const env = { ...process.env, OPENCODE_DB: database, OPENFORK_SQLITE_ASYNC_WORKER: "1", OPENCODE_DISABLE_CHANNEL_DB: "1" }
+const env: NodeJS.ProcessEnv = { ...process.env, OPENCODE_DB: database, OPENFORK_SQLITE_ASYNC_WORKER: "1", OPENCODE_DISABLE_CHANNEL_DB: "1" }
 delete env.OPENCODE_INSTANCE_ID
 const child = Bun.spawn(["bun", "run", "src/index.ts", "acp"], {
   cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe",
