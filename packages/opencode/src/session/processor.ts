@@ -1,8 +1,9 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import * as CodeInputAdmission from "@/code/input-admission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Context, Scope, Schema, Option } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -24,13 +25,21 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionLimitRecovery } from "@opencode-ai/core/session/limit-recovery"
+import { SessionLimitRecovery as SessionLimitRecoveryContract } from "@opencode-ai/schema/session-limit-recovery"
+import { Quota } from "@/quota/quota"
+import { selectRecoveryQuotaReset } from "./limit-recovery-quota"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { Goal } from "@opencode-ai/core/goal"
 import { SessionError } from "@opencode-ai/schema/session-error"
 import { UsageRecord } from "@opencode-ai/core/usage/record"
 import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import { ProviderRouteHealth } from "@opencode-ai/core/provider-route-health"
 import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
-import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { Usage, isStaleReasoningFailure, type LLMEvent } from "@opencode-ai/llm"
+import { SessionStaleReasoning } from "./stale-reasoning"
+import { SessionPromptRenderingRecovery } from "./prompt-rendering-recovery"
 import { ForkCredentials } from "@/fork/credentials"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -41,11 +50,16 @@ import { SpadSupervisor } from "./spad/supervisor"
 import type { SpadAction } from "./spad/types"
 import { isSpadMutatingTool, toolResourceKey } from "./spad/thrash"
 import { consumeWithFlushDeadline } from "./stream-flush-deadline"
+import { ProviderProgressTimeoutError, createProviderStreamProbe, withProviderProgressDeadline } from "./first-content-deadline"
+import { StreamText } from "./stream-text"
 import * as CurrentParts from "@opencode-ai/core/session/current-parts"
 import { toolMayMutateWorkspace } from "@/tool/registry"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
+import { NativeToolSettlement } from "./native-tool-settlement"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
+type HaltSource = "interrupt" | "failure"
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -55,6 +69,10 @@ export interface Handle {
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
   ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  /** Exact durable ToolPart currently owned by a provider tool call, if admitted. */
+  readonly toolPartID?: (toolCallID: string) => SessionV1.ToolPart["id"] | undefined
+  /** Mark that a nested/delegated leaf attempted a workspace mutation this step. */
+  readonly markWorkspaceMutation?: () => Effect.Effect<void>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
@@ -65,13 +83,26 @@ export interface Handle {
     },
   ) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  /** Settle at the executor boundary even if the provider drops its result. */
+  readonly failToolCall?: (toolCallID: string, error: unknown) => Effect.Effect<boolean>
+  readonly startToolCall?: (toolCallID: string, name: string, args: Record<string, unknown>) => Effect.Effect<void>
   readonly recovery?: { readonly prompt: string }
+  /** Host watchdog exhausted after provider progress ceased (not user abort). */
+  readonly providerTimedOut: boolean
 }
 
 type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  /** Already admitted Session project identity; direct callers may omit it. */
+  projectID?: string
+  /**
+   * Exact durable V1 history the turn owner already held when this step's
+   * provider request was built. Stale-reasoning recovery repairs caller-bound
+   * replay handles from this snapshot instead of re-hydrating the transcript.
+   */
+  durableHistory?: readonly SessionV1.WithParts[]
   /** Secret-free settlement projection of the committed route. */
   routeAttribution?: UsageRouteAttribution.Committed
   /**
@@ -133,7 +164,9 @@ interface ProcessorContext extends Input {
   needsRecovery: { readonly prompt: string } | undefined
   needsSpadAbort: string | undefined
   currentText: SessionV1.TextPart | undefined
+  currentTextContent: StreamText | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  reasoningContent: Record<string, StreamText>
   /** Whether we have already recorded the first-token timestamp on the message. */
   firstTokenRecorded: boolean
   /** Buffered, not-yet-published text delta for the active text part. */
@@ -142,6 +175,9 @@ interface ProcessorContext extends Input {
   pendingReasoningDelta: Record<string, PendingDelta>
   /** Distinct physical provider accounts observed across this turn's steps. */
   routedAccountIDs: Set<string>
+  recoveredStaleReasoning: boolean
+  turnOutputStarted: boolean
+  providerTimedOut: boolean
 }
 
 type StreamEvent = LLMEvent
@@ -188,6 +224,8 @@ const layer = Layer.effect(
     const usageRecord = yield* UsageRecord.Service
     const routeHealth = yield* ProviderRouteHealth.Service
     const forkCredentials = yield* ForkCredentials.Service
+    const quota = yield* Quota.Service
+    const goals = yield* Goal.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Start (or reuse) the pre-turn capture before the LLM stream, but never
@@ -213,11 +251,16 @@ const layer = Layer.effect(
         needsCompaction: false,
         needsRecovery: undefined,
         currentText: undefined,
+        currentTextContent: undefined,
         reasoningMap: {},
+        reasoningContent: {},
         firstTokenRecorded: false,
         pendingTextDelta: undefined,
         pendingReasoningDelta: {},
         routedAccountIDs: new Set(),
+        recoveredStaleReasoning: false,
+        turnOutputStarted: false,
+        providerTimedOut: false,
       }
 
       const healthLease =
@@ -299,10 +342,48 @@ const layer = Layer.effect(
       })
 
       let aborted = false
+      // Keep only call identities after executor settlement. The provider may
+      // deliver its result later; it must observe the same terminal Part rather
+      // than recreate a pending call or lose result telemetry.
+      const settledToolcalls = new Map<string, ToolCall>()
+      const executingHostTools = new Set<string>()
+      const toolAdmissionLocks = KeyedMutex.makeUnsafe<string>()
+      let projectID = input.projectID
+      const recordToolSettlement = Effect.fnUntraced(function* (
+        part: SessionV1.ToolPart,
+        status: NativeToolSettlement.Status,
+      ) {
+        // Provider-side tools did not execute in this host.
+        if (part.metadata?.providerExecuted || part.state.status === "pending") return
+        const startedAt = part.state.time.start
+        const completedAt = "end" in part.state.time ? part.state.time.end : undefined
+        if (completedAt === undefined) return
+        const id = part.id
+        const write = Effect.gen(function* () {
+          projectID ??= (yield* session.get(ctx.sessionID)).projectID
+          yield* NativeToolSettlement.record(database, {
+            id,
+            session_id: ctx.sessionID,
+            project_id: projectID,
+            provider_id: ctx.model.providerID,
+            model_id: ctx.model.id,
+            tool: part.tool,
+            status,
+            started_at: startedAt,
+            completed_at: completedAt,
+            duration_ms: Math.max(0, completedAt - startedAt),
+          })
+        })
+        // Analytics failure cannot re-execute a tool or strand a terminal waiter.
+        yield* write.pipe(Effect.catchCause(() =>
+          Effect.logWarning("native tool settlement write failed", { sessionID: ctx.sessionID, partID: id }),
+        ))
+      })
       const livePartReleases = new Map<string, () => void>()
       const retainLivePart = (part: SessionV1.TextPart | SessionV1.ReasoningPart) => {
         const key = { sessionID: part.sessionID, messageID: part.messageID, partID: part.id }
-        const token = currentParts.register({ ...key, snapshot: () => part })
+        const content = part.type === "text" ? ctx.currentTextContent : ctx.reasoningContent[part.id]
+        const token = currentParts.register({ ...key, snapshot: () => ({ ...part, text: content?.toString() ?? part.text }) })
         livePartReleases.set(part.id, () => currentParts.release(key, token))
       }
       const releaseLivePart = (partID: string) => {
@@ -319,6 +400,11 @@ const layer = Layer.effect(
       // then distinguish an unproven recovery attempt from an ordinary healthy
       // busy turn and preempt only the former.
       let retryingWithoutProgress = false
+      // A rejected hosted prompt can be safely projected once only when the
+      // original request produced NO provider event. This is stricter than
+      // turnOutputStarted: usage/step/tool events may precede visible text.
+      let recoveredPromptRendering = false
+      let providerEventsThisAttempt = false
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -327,13 +413,16 @@ const layer = Layer.effect(
         })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
+        executingHostTools.delete(toolCallID)
+        const call = ctx.toolcalls[toolCallID]
+        const done = call?.done
+        if (call) settledToolcalls.set(toolCallID, call)
         delete ctx.toolcalls[toolCallID]
         if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
-        const call = ctx.toolcalls[toolCallID]
+        const call = ctx.toolcalls[toolCallID] ?? settledToolcalls.get(toolCallID)
         if (!call) return undefined
         const part = yield* session.getPart({
           partID: call.partID,
@@ -347,12 +436,13 @@ const layer = Layer.effect(
         return { call, part }
       })
 
-      const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
+      const updateToolCallUnlocked = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match) return undefined
+        if (match.part.state.status === "completed" || match.part.state.status === "error") return match.part
         const part = yield* session.updatePart(update(match.part))
         ctx.toolcalls[toolCallID] = {
           ...match.call,
@@ -362,8 +452,10 @@ const layer = Layer.effect(
         }
         return part
       })
+      const updateToolCall = (...args: Parameters<typeof updateToolCallUnlocked>) =>
+        toolAdmissionLocks.withLock(args[0])(updateToolCallUnlocked(...args))
 
-      const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
+      const completeToolCallUnlocked = Effect.fn("SessionProcessor.completeToolCall")(function* (
         toolCallID: string,
         output: {
           title: string
@@ -373,42 +465,71 @@ const layer = Layer.effect(
         },
       ) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
+        if (!match || (match.part.state.status !== "running" && match.part.state.status !== "pending")) return
+        const normalized = yield* Effect.forEach(output.attachments ?? [], (attachment) =>
+          attachment.mime.startsWith("image/")
+            ? image.normalize(attachment).pipe(
+                Effect.catchIf((error) => error instanceof Image.ResizerUnavailableError,
+                  () => Effect.succeed(attachment)),
+                Effect.exit,
+              )
+            : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
+        )
+        const omitted = normalized.filter(Exit.isFailure).length
+        const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "completed",
             input: match.part.state.input,
-            output: output.output,
+            output: omitted === 0 ? output.output
+              : `${output.output}\n\n[${omitted} image${omitted === 1 ? "" : "s"} omitted: could not be resized below the image size limit.]`,
             metadata: output.metadata,
             title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
-            attachments: output.attachments,
+            time: { start: match.part.state.status === "running" ? match.part.state.time.start : Date.now(), end: Date.now() },
+            attachments: attachments.length ? attachments : undefined,
           },
         })
+        yield* recordToolSettlement(part, "success")
         yield* settleToolCall(toolCallID)
       })
+      const completeToolCall = (...args: Parameters<typeof completeToolCallUnlocked>) =>
+        toolAdmissionLocks.withLock(args[0])(completeToolCallUnlocked(...args))
 
-      const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
+      const failToolCallUnlocked = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
         const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
-          },
-        })
+        if (!match || (match.part.state.status !== "running" && match.part.state.status !== "pending")) return false
+         // The tool-abort signal can race the runner's final sweep. The
+         // provider/tool stream may settle a tool-error first, so the later
+         // sweep sees status=error and correctly refuses to overwrite it.
+         // Preserve the original AbortError classification at this seam;
+         // otherwise the durable transcript loses interrupted=true even
+         // though the host successfully aborted the tool before Goal auditing.
+         const interrupted = error instanceof Error && error.name === "AbortError"
+         const priorMetadata = match.part.state.status === "running" ? match.part.state.metadata : {}
+          const part = yield* session.updatePart({
+            ...match.part,
+            state: {
+              status: "error",
+             input: match.part.state.input,
+             error: errorMessage(error),
+             // Keep streamed progress metadata on ordinary failures, but mark
+             // genuine AbortErrors without relying on user-controlled strings.
+             metadata: { ...priorMetadata, ...(interrupted ? { interrupted: true } : {}) },
+              time: { start: match.part.state.status === "running" ? match.part.state.time.start : Date.now(), end: Date.now() },
+            },
+          })
+          const denied = error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError
+          yield* recordToolSettlement(part, denied ? "denied" : interrupted ? "abort" :
+            error instanceof Error && error.name === "TimeoutError" ? "timeout" : "error")
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
         yield* settleToolCall(toolCallID)
         return true
       })
+      const failToolCall = (...args: Parameters<typeof failToolCallUnlocked>) =>
+        toolAdmissionLocks.withLock(args[0])(failToolCallUnlocked(...args))
 
       const flushTextDelta = Effect.fnUntraced(function* () {
         const pending = ctx.pendingTextDelta
@@ -423,7 +544,7 @@ const layer = Layer.effect(
           partID: ctx.currentText.id,
           field: "text",
           delta: pending.text,
-          offset: ctx.currentText.text.length - pending.text.length,
+          offset: (ctx.currentTextContent?.length ?? 0) - pending.text.length,
         })
       })
 
@@ -441,7 +562,7 @@ const layer = Layer.effect(
           partID: part.id,
           field: "text",
           delta: pending.text,
-          offset: part.text.length - pending.text.length,
+          offset: (ctx.reasoningContent[part.id]?.length ?? 0) - pending.text.length,
         })
       })
 
@@ -478,14 +599,15 @@ const layer = Layer.effect(
         if (!(reasoningID in ctx.reasoningMap)) return
         yield* flushReasoningDelta(reasoningID)
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
-        ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
+        ctx.reasoningMap[reasoningID].text = ctx.reasoningContent[ctx.reasoningMap[reasoningID].id]?.toString() ?? ""
         ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
         yield* session.updatePart(ctx.reasoningMap[reasoningID])
         releaseLivePart(ctx.reasoningMap[reasoningID].id)
+        delete ctx.reasoningContent[ctx.reasoningMap[reasoningID].id]
         delete ctx.reasoningMap[reasoningID]
       })
 
-      const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
+      const ensureToolCallUnlocked = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
         id: string
         name: string
         providerExecuted?: boolean
@@ -529,6 +651,20 @@ const layer = Layer.effect(
           sessionID: part.sessionID,
         }
         return { call: ctx.toolcalls[input.id], part }
+      })
+
+      const ensureToolCall = (input: Parameters<typeof ensureToolCallUnlocked>[0]) =>
+        toolAdmissionLocks.withLock(input.id)(ensureToolCallUnlocked(input))
+
+      const startToolCall = Effect.fn("SessionProcessor.startToolCall")(function* (
+        id: string, name: string, args: Record<string, unknown>,
+      ) {
+        yield* ensureToolCall({ id, name })
+        yield* updateToolCall(id, (part) => part.state.status !== "pending" ? part : {
+          ...part,
+          state: { status: "running", input: args, time: { start: Date.now() } },
+        })
+        executingHostTools.add(id)
       })
 
       const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
@@ -584,12 +720,18 @@ const layer = Layer.effect(
             })
           : Effect.void
 
-      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent, markPhase: (phase: string) => void = () => {}) {
         // Flush coalesced deltas at block boundaries so text is visible before
         // tool execution starts and a stalled stream never holds the trailing
         // chunk indefinitely. Delta events themselves batch via the
         // time/size thresholds in bufferTextDelta/bufferReasoningDelta.
         if (value.type !== "text-delta" && value.type !== "reasoning-delta") yield* flushAllDeltas()
+        if (
+          value.type !== "provider-error" &&
+          value.type !== "step-start" &&
+          value.type !== "step-finish" &&
+          value.type !== "finish"
+        ) ctx.turnOutputStarted = true
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -618,6 +760,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.reasoningContent[ctx.reasoningMap[value.id]!.id] = new StreamText()
             retainLivePart(ctx.reasoningMap[value.id])
             yield* session.updatePart(ctx.reasoningMap[value.id])
             return
@@ -642,11 +785,14 @@ const layer = Layer.effect(
                 if (signed) {
                   // Signed thinking must remain observe-only for replay safety.
                 } else {
-                  const full = ctx.reasoningMap[value.id].text + value.text
+                  const content = ctx.reasoningContent[ctx.reasoningMap[value.id].id]!
+                  content.append(value.text)
+                  const full = content.toString()
                   const cut = action.noTruncate
                     ? full.length
                     : Math.max(0, Math.min(full.length, action.quarantineFrom))
-                  ctx.reasoningMap[value.id].text = full.slice(0, cut)
+                  content.replace(full.slice(0, cut))
+                  ctx.reasoningMap[value.id].text = content.toString()
                   // A recovery rewrite supersedes buffered deltas; drop them so
                   // the full-part update below is the single source of truth.
                   delete ctx.pendingReasoningDelta[value.id]
@@ -656,7 +802,7 @@ const layer = Layer.effect(
                 }
               }
             }
-            ctx.reasoningMap[value.id].text += value.text
+            ctx.reasoningContent[ctx.reasoningMap[value.id].id]!.append(value.text)
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* bufferReasoningDelta(value.id, value.text)
             return
@@ -690,6 +836,7 @@ const layer = Layer.effect(
             }
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
+            const durableInput = value.name === "code" ? CodeInputAdmission.durableInput(input) : input
             if (toolMayMutateWorkspace(value.name, input)) {
               ctx.workspaceMutationObserved = true
             }
@@ -698,10 +845,10 @@ const layer = Layer.effect(
               tool: value.name,
               state:
                 match.state.status === "running"
-                  ? { ...match.state, input }
+                  ? { ...match.state, input: durableInput }
                   : {
                       status: "running",
-                      input,
+                      input: durableInput,
                       time: { start: Date.now() },
                     },
               metadata: match.metadata?.providerExecuted
@@ -760,28 +907,9 @@ const layer = Layer.effect(
               return
             }
             const rawOutput = toolResultOutput(value)
-            const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
-              attachment.mime.startsWith("image/")
-                ? image.normalize(attachment).pipe(
-                    Effect.catchIf(
-                      (error) => error instanceof Image.ResizerUnavailableError,
-                      () => Effect.succeed(attachment),
-                    ),
-                    Effect.exit,
-                  )
-                : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
-            )
-            const omitted = normalized.filter(Exit.isFailure).length
-            const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
-            const output = {
-              ...rawOutput,
-              output:
-                omitted === 0
-                  ? rawOutput.output
-                  : `${rawOutput.output}\n\n[${omitted} image${omitted === 1 ? "" : "s"} omitted: could not be resized below the image size limit.]`,
-              attachments: attachments.length ? attachments : undefined,
-            }
-            yield* completeToolCall(value.id, output)
+            yield* completeToolCall(value.id, rawOutput)
+            const settled = yield* readToolCall(value.id)
+            const output = settled?.part.state.status === "completed" ? settled.part.state : rawOutput
             if (toolCall) {
               const resource = toolResourceKey(toolCall.part.tool, toolCall.part.state.input)
               const resultAction = ctx.spad?.pushToolResult(
@@ -834,13 +962,52 @@ const layer = Layer.effect(
             return
 
           case "step-finish": {
+            // Snapshot is auxiliary step enrichment, not a prerequisite for
+            // consuming the provider's terminal event. A contended Git capture
+            // must never strand the provider stream for the entire idle budget.
+            const boundedSnapshot = <A, E, R>(
+              phase: string,
+              task: Effect.Effect<A, E, R>,
+            ): Effect.Effect<A | undefined, E, R> =>
+              Effect.gen(function* () {
+                // Snapshot enrichment is explicitly optional. Failed Git
+                // captures and filesystem errors must not turn successful
+                // provider output into a failed assistant request. Preserve
+                // cancellation, rather than swallowing interrupted fibers.
+                const result = yield* task.pipe(
+                  Effect.timeoutOption("30 seconds"),
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterruptsOnly(cause)
+                      ? Effect.failCause(cause)
+                      : Effect.logWarning("step snapshot enrichment failed", {
+                          sessionID: ctx.sessionID,
+                          messageID: ctx.assistantMessage.id,
+                          phase,
+                          cause: Cause.pretty(cause),
+                        }).pipe(Effect.as(Option.none<A>())),
+                  ),
+                )
+                if (result._tag === "Some") return result.value
+                yield* Effect.logWarning("step snapshot enrichment timed out", {
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.id,
+                  phase,
+                  timeoutMs: 30_000,
+                })
+                return undefined
+              })
             // A guarded local mutation can only complete after baselineFiber's
             // Snapshot write lock is released. Therefore this join is instant
             // on mutating steps; read-only/text-only steps never wait on Git.
+            markPhase("snapshot-baseline")
             const beforeSnapshot = ctx.workspaceMutationObserved
-              ? (ctx.snapshot ?? (yield* Fiber.join(ctx.baselineFiber)))
+              ? (ctx.snapshot ?? (yield* boundedSnapshot("baseline", Fiber.join(ctx.baselineFiber))))
               : undefined
-            const completedSnapshot = ctx.workspaceMutationObserved ? yield* snapshot.track() : undefined
+            markPhase("snapshot-post-step")
+            const completedSnapshot = ctx.workspaceMutationObserved
+              ? yield* boundedSnapshot("post-step", snapshot.track())
+              : undefined
+            markPhase("reasoning-settlement")
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             // Anthropic reports thinking blocks it removed before the model saw the
             // prompt. Prefix mismatches mean opencode changed history behind a signed
@@ -874,6 +1041,7 @@ const layer = Layer.effect(
             ctx.assistantMessage.tokens = usage.tokens
             if (value.servedModel) ctx.assistantMessage.servedModel = value.servedModel
             const completedAt = Date.now()
+            markPhase("telemetry-settlement")
             yield* telemetry.settle({
               sessionID: ctx.sessionID,
               assistantMessageID: ctx.assistantMessage.id,
@@ -881,6 +1049,7 @@ const layer = Layer.effect(
               cost: ctx.assistantMessage.cost,
               tokens: usage.tokens,
             })
+            markPhase("step-part-persistence")
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
@@ -891,13 +1060,15 @@ const layer = Layer.effect(
               tokens: usage.tokens,
               cost: usage.cost,
             })
+            markPhase("assistant-persistence")
             yield* session.updateMessage(ctx.assistantMessage)
             if (beforeSnapshot && completedSnapshot) {
               // `completedSnapshot` is the exact post-step tree we just
               // captured. Compare the immutable trees directly instead of
               // forcing Snapshot.patch() to rescan and restage the worktree.
-              const patch = yield* snapshot.patch(beforeSnapshot, completedSnapshot)
-              if (patch.files.length) {
+              markPhase("snapshot-patch")
+              const patch = yield* boundedSnapshot("patch", snapshot.patch(beforeSnapshot, completedSnapshot))
+              if (patch?.files.length) {
                 ctx.spad?.markProgress()
                 yield* session.updatePart({
                   id: PartID.ascending(),
@@ -914,6 +1085,7 @@ const layer = Layer.effect(
             // Arm the next provider step at the same pre-mutation boundary.
             // Snapshot is single-flight, so an unchanged project normally
             // reuses the just-completed materialization.
+            markPhase("snapshot-rearm")
             ctx.baselineFiber = yield* snapshot.track().pipe(Effect.forkIn(scope))
             yield* summary
               .summarize({
@@ -948,6 +1120,7 @@ const layer = Layer.effect(
               time: { start: Date.now() },
               metadata: value.providerMetadata,
             }
+            ctx.currentTextContent = new StreamText()
             retainLivePart(ctx.currentText)
             yield* session.updatePart(ctx.currentText)
             return
@@ -961,9 +1134,13 @@ const layer = Layer.effect(
               return
             }
             if (action?.type === "recover") {
-              const full = ctx.currentText.text + value.text
+              const content = ctx.currentTextContent ?? new StreamText()
+              content.append(value.text)
+              const full = content.toString()
               const cut = action.noTruncate ? full.length : Math.max(0, Math.min(full.length, action.quarantineFrom))
-              ctx.currentText.text = full.slice(0, cut)
+              content.replace(full.slice(0, cut))
+              ctx.currentTextContent = content
+              ctx.currentText.text = content.toString()
               // Recovery rewrite supersedes buffered deltas; drop them so the
               // full-part update below is the single source of truth.
               ctx.pendingTextDelta = undefined
@@ -971,7 +1148,7 @@ const layer = Layer.effect(
               ctx.needsRecovery = { prompt: action.recoveryPrompt }
               return
             }
-            ctx.currentText.text += value.text
+            ctx.currentTextContent?.append(value.text)
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* bufferTextDelta(value.text)
             return
@@ -979,6 +1156,7 @@ const layer = Layer.effect(
           case "text-end":
             if (!ctx.currentText) return
             yield* flushTextDelta()
+            ctx.currentText.text = ctx.currentTextContent?.toString() ?? ctx.currentText.text
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
             ctx.currentText.text = (yield* plugin.trigger(
@@ -998,6 +1176,7 @@ const layer = Layer.effect(
             yield* session.updatePart(ctx.currentText)
             releaseLivePart(ctx.currentText.id)
             ctx.currentText = undefined
+            ctx.currentTextContent = undefined
             return
 
           case "finish":
@@ -1005,10 +1184,54 @@ const layer = Layer.effect(
         }
       })
 
+      const settleRemainingTools = Effect.fn("SessionProcessor.settleRemainingTools")(function* () {
+        yield* Effect.forEach(
+          Object.values(ctx.toolcalls),
+          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+          { concurrency: 8 },
+        )
+        for (const toolCallID of Object.keys(ctx.toolcalls)) {
+          yield* toolAdmissionLocks.withLock(toolCallID)(Effect.gen(function* () {
+          const match = yield* readToolCall(toolCallID)
+          if (!match) return
+          if (match.part.state.status === "pending" || match.part.state.status === "running") {
+            const part = match.part
+            const end = Date.now()
+            const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
+            const settled = yield* session.updatePart({
+              ...part,
+              state: {
+                ...part.state,
+                status: "error",
+                error: "Tool execution aborted",
+                metadata: { ...metadata, interrupted: true },
+                time: { start: "time" in part.state ? part.state.time.start : end, end },
+              },
+            })
+            yield* recordToolSettlement(settled, "abort")
+          }
+          yield* settleToolCall(toolCallID)
+          }))
+        }
+        ctx.assistantMessage.time.completed = Date.now()
+        yield* session.updateMessage(ctx.assistantMessage)
+      })
+
       const cleanup = Effect.fn("SessionProcessor.cleanup")(function* () {
+        ctx.assistantMessage.time.completed ??= Date.now()
         if (ctx.workspaceMutationObserved) {
-          const beforeSnapshot = ctx.snapshot ?? (yield* Fiber.join(ctx.baselineFiber))
-          const patch = beforeSnapshot ? yield* snapshot.patch(beforeSnapshot) : undefined
+          // Snapshot enrichment cannot indefinitely hold operator cancellation
+          // after the tool/assistant boundary has already been settled.
+          const patch = yield* Effect.gen(function* () {
+            const beforeSnapshot = ctx.snapshot ?? (yield* Fiber.join(ctx.baselineFiber))
+            return beforeSnapshot ? yield* snapshot.patch(beforeSnapshot) : undefined
+          }).pipe(
+            Effect.interruptible,
+            Effect.timeout("30 seconds"),
+            Effect.catch((error) => Effect.logWarning("Session snapshot cleanup did not complete", {
+              sessionID: ctx.sessionID, messageID: ctx.assistantMessage.id, error,
+            }).pipe(Effect.as(undefined))),
+          )
           if (patch?.files.length) {
             ctx.spad?.markProgress()
             yield* session.updatePart({
@@ -1024,54 +1247,36 @@ const layer = Layer.effect(
           ctx.workspaceMutationObserved = false
         }
 
-        // Flush coalesced deltas before the full-part writes below so an
-        // interrupted stream still delivers its trailing text as deltas; the
-        // full updates then supersede them via the barrier path.
-        yield* flushAllDeltas()
+        // Cleanup owns the authoritative full-part writes immediately below.
+        // Stream teardown has already attempted a bounded best-effort delta
+        // publication. Retrying the SAME optional delta from cleanup would
+        // recreate an unbounded SSE/SQLite wait after a watchdog cancellation.
+        // The full text/reasoning content buffers are still intact and are
+        // written as complete parts, so discarding only *unpublished UI deltas*
+        // loses no canonical message data.
+        ctx.pendingTextDelta = undefined
+        ctx.pendingReasoningDelta = {}
 
         if (ctx.currentText) {
           const end = Date.now()
+          ctx.currentText.text = ctx.currentTextContent?.toString() ?? ctx.currentText.text
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
           yield* session.updatePart(ctx.currentText)
           ctx.currentText = undefined
+          ctx.currentTextContent = undefined
         }
 
         for (const part of Object.values(ctx.reasoningMap)) {
           const end = Date.now()
+          part.text = ctx.reasoningContent[part.id]?.toString() ?? part.text
           yield* session.updatePart({
             ...part,
             time: { start: part.time.start ?? end, end },
           })
         }
         ctx.reasoningMap = {}
+        ctx.reasoningContent = {}
         ctx.pendingReasoningDelta = {}
-
-        yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
-          { concurrency: 8 },
-        )
-
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
-          const part = match.part
-          const end = Date.now()
-          const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
-            ...part,
-            state: {
-              ...part.state,
-              status: "error",
-              error: "Tool execution aborted",
-              metadata: { ...metadata, interrupted: true },
-              time: { start: "time" in part.state ? part.state.time.start : end, end },
-            },
-          })
-        }
-        ctx.toolcalls = {}
-        ctx.assistantMessage.time.completed = Date.now()
-        yield* session.updateMessage(ctx.assistantMessage)
 
         const qualifiedAccountID =
           typeof ctx.model.id === "string" ? splitAccountModelID(ctx.model.id).accountID : undefined
@@ -1146,14 +1351,23 @@ const layer = Layer.effect(
         })
       })
 
-      const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
-        yield* Effect.logError("process", {
-          "session.id": input.sessionID,
-          messageID: input.assistantMessage.id,
-          error: errorMessage(e),
-          errorDetails: SessionError.summary(e),
-          stack: e instanceof Error ? e.stack : undefined,
-        })
+      const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown, source: HaltSource = "failure") {
+        if (source === "failure" && e instanceof ProviderProgressTimeoutError)
+          ctx.providerTimedOut = true
+        if (source === "interrupt") {
+          yield* Effect.logInfo("process interrupted", {
+            "session.id": input.sessionID,
+            messageID: input.assistantMessage.id,
+          })
+        } else {
+          yield* Effect.logError("process", {
+            "session.id": input.sessionID,
+            messageID: input.assistantMessage.id,
+            error: errorMessage(e),
+            errorDetails: SessionError.summary(e),
+            stack: e instanceof Error ? e.stack : undefined,
+          })
+        }
         const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
@@ -1183,13 +1397,17 @@ const layer = Layer.effect(
         ctx.needsCompaction = false
         ctx.needsRecovery = undefined
         ctx.needsSpadAbort = undefined
+        ctx.providerTimedOut = false
         ctx.spad?.markGeneration()
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
-          yield* Effect.gen(function* () {
+          const runAttempt = Effect.fnUntraced(function* () {
+            providerEventsThisAttempt = false
             ctx.currentText = undefined
+            ctx.currentTextContent = undefined
             ctx.reasoningMap = {}
+            ctx.reasoningContent = {}
             if (!retryingWithoutProgress) yield* status.set(ctx.sessionID, { type: "busy" })
 
             // Per-attempt dispatch origin, captured before the provider stream
@@ -1207,40 +1425,86 @@ const layer = Layer.effect(
               sessionID: ctx.sessionID,
               assistantMessageID: ctx.assistantMessage.id,
               requestSentAt: ctx.assistantMessage.time.requestSentAt,
+              isCompaction: ctx.assistantMessage.summary === true,
               model: {
                 providerID: ctx.model.providerID,
-                modelID: ctx.model.id,
+                modelID: splitAccountModelID(ctx.model.id).baseModelID,
+                ...(ctx.routeAttribution?.routeKind === "account" && ctx.routeAttribution.accountID
+                  ? { accountID: ctx.routeAttribution.accountID }
+                  : splitAccountModelID(ctx.model.id).accountID
+                    ? { accountID: splitAccountModelID(ctx.model.id).accountID }
+                    : {}),
                 name: ctx.model.name,
                 ...(ctx.assistantMessage.variant === undefined ? {} : { variant: ctx.assistantMessage.variant }),
                 contextLimit: ctx.model.limit.context,
               },
             })
 
+            const probe = createProviderStreamProbe()
             const stream = llm.stream({
               ...streamInput,
               ...(ctx.routeAttribution ? { route: ctx.routeAttribution } : {}),
+              progress: probe,
             })
+            // 'finish' is the request's terminal protocol event. The SDK may
+            // delay underlying iterable EOF after delivering it; completing a
+            // logical request must not depend on that extra transport boundary.
+            let providerFinished = false
 
-            yield* consumeWithFlushDeadline(stream, {
+            yield* withProviderProgressDeadline((observeResponse, consumer) => consumeWithFlushDeadline(stream, {
               delayMs: DELTA_FLUSH_MS,
               pending: () => ctx.pendingTextDelta !== undefined || Object.keys(ctx.pendingReasoningDelta).length > 0,
-              flush: flushAllDeltas(),
+              // Flush alarms and final delta settlement also run inside the
+              // serial event consumer. If publication/SQLite stalls here,
+              // classify it as local work, never as provider silence.
+              flush: Effect.sync(() => {
+                consumer.begin("delta-flush")
+                consumer.phase("delta-publication")
+              }).pipe(
+                Effect.andThen(flushAllDeltas()),
+                Effect.ensuring(Effect.sync(() => consumer.end())),
+              ),
               consume: (event) =>
                 Effect.gen(function* () {
                   // Provider-event observation is the progress proof used by
                   // interactive preemption. Publish it before changing retry
                   // status or performing any event-specific side effect so a
                   // concurrent prompt can never abort an already-proven attempt.
-                  const accepted = yield* telemetry.observe({ sessionID: ctx.sessionID, event })
-                  if (!accepted) return yield* Effect.interrupt
-                  if (retryingWithoutProgress) {
+                    // Count provider ingress BEFORE asynchronous telemetry. An
+                    // overloaded telemetry observer must not falsely look like
+                    // silence from the upstream provider.
+                      // A lone terminal provider-error is a rejection, not
+                      // progress. Native adapters can deliver a structured
+                      // prompt compiler failure this way rather than throwing
+                      // an SDK error. An earlier step/tool/text event still
+                      // permanently closes the retry gate for this attempt.
+                      if (event.type !== "provider-error") providerEventsThisAttempt = true
+                      yield* observeResponse(event)
+                     consumer.begin(event.type)
+                     consumer.phase("telemetry-observe")
+                     const accepted = yield* telemetry.observe({ sessionID: ctx.sessionID, event })
+                    if (!accepted) return yield* Effect.interrupt
+                   if (retryingWithoutProgress) {
                     retryingWithoutProgress = false
                     yield* status.set(ctx.sessionID, { type: "busy" })
                   }
-                  yield* handleEvent(event)
-                }),
-              stop: () => ctx.needsCompaction || ctx.needsRecovery !== undefined || ctx.needsSpadAbort !== undefined,
-            })
+                     consumer.phase("event-handler")
+                     yield* handleEvent(event, consumer.phase)
+                     if (event.type === "finish") providerFinished = true
+                  }).pipe(Effect.ensuring(Effect.sync(() => consumer.end()))),
+                stop: () => providerFinished || ctx.needsCompaction || ctx.needsRecovery !== undefined || ctx.needsSpadAbort !== undefined,
+            }), undefined, (id) =>
+              executingHostTools.has(id)
+                ? "running"
+                : ctx.toolcalls[id] !== undefined
+                  ? "pending"
+                   : "settled", undefined, probe, undefined, {
+                   sessionID: ctx.sessionID,
+                   messageID: ctx.assistantMessage.id,
+                   providerID: ctx.model.providerID,
+                   modelID: splitAccountModelID(ctx.model.id).baseModelID,
+                   routeKind: ctx.routeAttribution?.routeKind,
+                 })
 
             // Response-body boundary for the throughput denominator: the
             // provider stream is exhausted here, before local tool settlement
@@ -1251,12 +1515,14 @@ const layer = Layer.effect(
               yield* session.updateMessage(ctx.assistantMessage)
               yield* telemetry.streamed(ctx.sessionID, ctx.assistantMessage.time.streamedAt)
             }
-          }).pipe(
+          })
+
+          const runWithRetry = () => runAttempt().pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
                 aborted = true
                 if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
+                  yield* halt(new DOMException("Aborted", "AbortError"), "interrupt")
                 }
               }),
             ),
@@ -1272,21 +1538,167 @@ const layer = Layer.effect(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
             ),
+            Effect.catchIf(
+              (error) =>
+                !ctx.recoveredStaleReasoning &&
+                !ctx.turnOutputStarted &&
+                isStaleReasoningFailure(error),
+              () =>
+                Effect.gen(function* () {
+                  ctx.recoveredStaleReasoning = true
+                  SessionStaleReasoning.stripRequest(streamInput.messages)
+                  // Repair durable replay handles from the exact history the
+                  // turn owner already held for this request. Callers that did
+                  // not supply a boundary only repair the in-flight request.
+                  if (input.durableHistory) yield* SessionStaleReasoning.persist(session, input.durableHistory)
+                  yield* Effect.logInfo("recovered stale encrypted reasoning", {
+                    "session.id": ctx.sessionID,
+                    messageID: ctx.assistantMessage.id,
+                  })
+                  // Retry exactly once with repaired history before ordinary
+                  // transient retry classification. The turn-scoped latch and
+                  // output guard prevent duplicate durable assistant output.
+                  return yield* runAttempt()
+                }),
+            ),
+            Effect.catchIf(
+              (error) =>
+                !recoveredPromptRendering &&
+                !providerEventsThisAttempt &&
+                !ctx.turnOutputStarted &&
+                SessionPromptRenderingRecovery.isPromptRenderingRejection(error),
+              (error) =>
+                Effect.gen(function* () {
+                  const repaired = SessionPromptRenderingRecovery.stripRejectedReasoning(
+                    streamInput.messages,
+                    ctx.model,
+                  )
+                  // The provider may have rejected a tool/role shape instead
+                  // of reasoning. Do not replay an identical failed payload.
+                  if (!repaired) return yield* Effect.fail(error)
+                  recoveredPromptRendering = true
+                  streamInput.messages = repaired.messages
+                  yield* Effect.logInfo("retrying hosted prompt with portable reasoning-free history", {
+                    "session.id": ctx.sessionID,
+                    messageID: ctx.assistantMessage.id,
+                    providerID: ctx.model.providerID,
+                    modelID: ctx.model.id,
+                    removedReasoningParts: repaired.removedReasoningParts,
+                    removedReasoningOnlyMessages: repaired.removedReasoningOnlyMessages,
+                  })
+                  // No durable transcript rewrite, no route change, no tool
+                  // replay, and no recurring physical retry on a second reject.
+                  return yield* runAttempt()
+                }),
+            ),
             Effect.retry(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 ...(ctx.routeAttribution ? { route: ctx.routeAttribution } : {}),
                 parse,
                 observe: ({ decision }) => {
-                  if (!healthLease || decision.routeEffect === "none") return Effect.void
-                  return routeHealth
-                    .observeFailure({
-                      lease: healthLease,
+                  const health =
+                    !healthLease || decision.routeEffect === "none"
+                      ? Effect.void
+                      : routeHealth
+                          .observeFailure({
+                            lease: healthLease,
+                            modelID: ctx.model.id,
+                            effect: decision.routeEffect,
+                            ...(decision.resetAt === undefined ? {} : { resetAt: decision.resetAt }),
+                          })
+                          .pipe(Effect.catch((error) => healthObservationWarning("failure", error)))
+                  if (
+                    !["account-quota", "public-quota", "account-rate-limit", "rate-limit"].includes(decision.class)
+                  )
+                    return health
+                  const failureClass = decision.class as
+                    | "account-quota"
+                    | "public-quota"
+                    | "account-rate-limit"
+                    | "rate-limit"
+                  const now = Date.now()
+                  const accountID = ctx.routeAttribution?.routeKind === "account" ? ctx.routeAttribution.accountID : undefined
+                  return Effect.gen(function* () {
+                    yield* health
+                    const latestUserSeq = yield* SessionInput.latestUserSeq(database.db, ctx.sessionID)
+                    const recoveryPolicy = (yield* config.getGlobal()).usage_limit_recovery
+                    // Goal execution is intrinsically autonomous while active or
+                    // verifying. A trusted provider reset is a temporary,
+                    // schedulable blocker, not a reason to make Goal progress
+                    // depend on the ordinary-session auto-resume preference.
+                    const focusedGoal = yield* goals.focusedLifecycle(ctx.sessionID)
+                    const goalAutoResume =
+                      focusedGoal?.status === "active" || focusedGoal?.status === "verifying"
+                    const autoResume = goalAutoResume || recoveryPolicy?.auto_resume === true
+                    const recovery = yield* SessionLimitRecovery.observeFailure(database.db, {
+                      sessionID: ctx.sessionID,
+                      sourceAssistantMessageID: ctx.assistantMessage.id,
+                      ...(ctx.assistantMessage.parentID ? { sourceUserMessageID: ctx.assistantMessage.parentID } : {}),
+                      providerID: ctx.model.providerID,
+                      ...(accountID ? { accountID } : {}),
                       modelID: ctx.model.id,
-                      effect: decision.routeEffect,
-                      ...(decision.resetAt === undefined ? {} : { resetAt: decision.resetAt }),
+                      failureClass,
+                      failureCode: ctx.assistantMessage.error?.name,
+                      ...(decision.resetAt === undefined ? {} : { resetAt: decision.resetAt, resetSource: "retry-after" as const }),
+                      resetObservedAt: now,
+                      expectedLatestUserSeq: latestUserSeq,
+                      autoResume,
+                      snoozeUntilReset: recoveryPolicy?.snooze_until_reset === true,
+                      now,
                     })
-                    .pipe(Effect.catch((error) => healthObservationWarning("failure", error)))
+                    if (recovery) {
+                      yield* events.publish(SessionLimitRecoveryContract.Updated, { recovery })
+                      if (decision.resetAt === undefined) {
+                        yield* Effect.gen(function* () {
+                          const observedAt = Date.now()
+                          const agenda = yield* quota.resetsForProvider({
+                            providerID: ctx.model.providerID,
+                            from: observedAt + 1,
+                            to: observedAt + 400 * 24 * 60 * 60 * 1000,
+                            generatedAt: observedAt,
+                          })
+                          const candidate = selectRecoveryQuotaReset(agenda, {
+                            ...(accountID ? { accountID } : {}),
+                            modelID: ctx.model.id,
+                            failureObservedAt: now,
+                          })
+                          if (!candidate) return
+                          const enriched = yield* SessionLimitRecovery.enrichReset(database.db, {
+                            sessionID: ctx.sessionID,
+                            generation: recovery.generation,
+                            resetAt: candidate.resetAt,
+                            resetSource: candidate.resetSource,
+                            resetObservedAt: candidate.resetObservedAt,
+                            autoResume,
+                            snoozeUntilReset: recoveryPolicy?.snooze_until_reset === true,
+                            now: Date.now(),
+                          })
+                          if (enriched) {
+                            yield* events.publish(SessionLimitRecoveryContract.Updated, { recovery: enriched })
+                          }
+                        }).pipe(
+                          Effect.catchCause((cause) =>
+                            Effect.logWarning("limit recovery quota enrichment failed", {
+                              providerID: ctx.model.providerID,
+                              cause: Cause.pretty(cause),
+                            }),
+                          ),
+                          Effect.forkIn(scope),
+                          Effect.asVoid,
+                        )
+                      }
+                    }
+                  }).pipe(
+                    // Recovery bookkeeping is auxiliary to settling the provider
+                    // failure. Database defects must be observable but must never
+                    // defect-kill the Session drain from inside retry policy.
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("limit recovery failure observation failed", {
+                        cause: Cause.pretty(cause),
+                      }),
+                    ),
+                  )
                 },
                 set: (info) =>
                   Effect.sync(() => {
@@ -1304,6 +1716,8 @@ const layer = Layer.effect(
                   ),
               }),
             ),
+          )
+          yield* runWithRetry().pipe(
             Effect.tap(() =>
               healthLease
                 ? routeHealth
@@ -1315,7 +1729,10 @@ const layer = Layer.effect(
                 : Effect.void,
             ),
             Effect.catch(halt),
-            Effect.ensuring(cleanup().pipe(Effect.ensuring(Effect.sync(releaseAllLiveParts)))),
+            Effect.ensuring(settleRemainingTools().pipe(
+              Effect.andThen(cleanup()),
+              Effect.ensuring(Effect.sync(releaseAllLiveParts)),
+            )),
           )
 
           if (ctx.needsCompaction) return "compact"
@@ -1339,10 +1756,19 @@ const layer = Layer.effect(
           return ctx.nonProviderToolCallIDs.size > 0
         },
         updateToolCall,
+        toolPartID: (toolCallID) => ctx.toolcalls[toolCallID]?.partID,
+        markWorkspaceMutation: () => Effect.sync(() => {
+          ctx.workspaceMutationObserved = true
+        }),
         completeToolCall,
+        failToolCall,
+        startToolCall,
         process,
         get recovery() {
           return ctx.needsRecovery
+        },
+        get providerTimedOut() {
+          return ctx.providerTimedOut
         },
       } satisfies Handle
     })
@@ -1372,6 +1798,8 @@ export const node = LayerNode.make({
     UsageRecord.node,
     ProviderRouteHealth.node,
     ForkCredentials.node,
+    Quota.node,
+    Goal.node,
   ],
 })
 

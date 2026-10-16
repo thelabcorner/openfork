@@ -30,6 +30,25 @@ Provider requests identify the client through headers owned by
   consume the same hosted identity helper independently rather than assuming
   this V1 adapter covers server/API-originated inference.
 
+## Hosted special-agent account-route safety
+
+The upstream OpenCode Public/free route is not a valid transport for OpenFork-owned
+special agents, even when the parent worker is legitimately using Public. Preserve
+upstream's wire contract; never spoof client identity or replace the Public bearer.
+The canonical classifier is `special-agent/hosted-route-policy.ts`, deriving
+built-ins from `@opencode-ai/schema/agent` and covering request-local Goal/SPAD
+agents. V1 Session admission and the LLM stream share that classifier: the former
+declares `executionPurpose: "special-agent"` to Provider, which owns Public eligibility, and the latter refuses hosted special-agent
+requests without account-backed route attribution, before auth/provider work.
+
+Same-provider maintenance inherits the exact committed **account** generation;
+a Public-routed parent instead permits a separate eligible **transient account**
+for that one maintenance request, without mutating the parent binding. No
+credential-backed candidate means a visible runtime failure, not an implicit
+Public fallback, unrelated-provider substitution, or a terminal Goal verdict.
+See `docs/architecture/hosted-special-agent-routing.md` for the full matrix,
+negative invariants and executable regression tests.
+
 ## File Structure
 
 ```txt

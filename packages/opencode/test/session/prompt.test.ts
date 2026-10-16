@@ -5,16 +5,18 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionLimitRecovery } from "@opencode-ai/core/session/limit-recovery"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, DateTime, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
-import { fileURLToPath } from "url"
+import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
@@ -69,11 +71,16 @@ import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
-import { LocationServiceMap, buildLocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import {
+  LocationServiceMap,
+  buildLocationServiceMap,
+  locationServiceMapLayer,
+} from "@opencode-ai/core/location-services"
 import { Goal } from "@opencode-ai/core/goal"
 import { GoalContext } from "@opencode-ai/core/goal/context"
 import { GoalProjection } from "@opencode-ai/core/goal/projection"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { GoalAutomationTable } from "@opencode-ai/core/goal/sql"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { Model } from "@opencode-ai/llm"
 import * as OpenAICompatibleChat from "@opencode-ai/llm/protocols/openai-compatible-chat"
@@ -168,6 +175,7 @@ const lsp = Layer.succeed(
     hasClients: () => Effect.succeed(false),
     touchFile: () => Effect.void,
     diagnostics: () => Effect.succeed({}),
+    diagnosticsFor: () => Effect.succeed({}),
     hover: () => Effect.succeed(undefined),
     definition: () => Effect.succeed([]),
     references: () => Effect.succeed([]),
@@ -203,7 +211,10 @@ const noCheckpoint = Layer.succeed(
   }),
 )
 
-function fixedProcessor(result: SessionProcessor.Result, options?: { capture?: boolean; finish?: SessionV1.Assistant["finish"] }) {
+function fixedProcessor(
+  result: SessionProcessor.Result,
+  options?: { capture?: boolean; finish?: SessionV1.Assistant["finish"] },
+) {
   return Layer.succeed(
     SessionProcessor.Service,
     SessionProcessor.Service.of({
@@ -213,6 +224,9 @@ function fixedProcessor(result: SessionProcessor.Result, options?: { capture?: b
             return input.assistantMessage
           },
           get hasNonProviderToolCalls() {
+            return false
+          },
+          get providerTimedOut() {
             return false
           },
           updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
@@ -280,6 +294,8 @@ const promptRoot = LayerNode.group([
   FSUtil.node,
   BackgroundJob.node,
   SessionStatus.node,
+  SessionTelemetry.node,
+  SessionExecutionOwner.node,
   SessionRunState.node,
   Database.node,
   EventV2Bridge.node,
@@ -315,7 +331,11 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking"; executionOwner?: boolean }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  executionOwner?: boolean
+}) {
   const root = input?.executionOwner
     ? LayerNode.group([promptRoot, testLLMServerNode, SessionExecutionOwner.node])
     : LayerNode.group([promptRoot, testLLMServerNode])
@@ -376,10 +396,21 @@ const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 
 const delegatedRouteInputs: Array<Record<string, unknown>> = []
+const delegatedAssignedModel = ProviderTest.model({
+  providerID: ref.providerID,
+  id: ref.modelID,
+})
+const delegatedSelectedModel = ProviderTest.model({
+  providerID: ref.providerID,
+  id: ModelV2.ID.make("selected-model"),
+})
 const delegatedRouteProvider = ProviderTest.fake({
-  model: ProviderTest.model({
-    providerID: ref.providerID,
-    id: ref.modelID,
+  model: delegatedAssignedModel,
+  getModel: Effect.fn("TestProvider.getModel.forDelegatedSelection")((providerID, modelID) => {
+    if (providerID !== ref.providerID) return Effect.die(new Error(`Unknown test provider: ${providerID}`))
+    if (modelID === delegatedAssignedModel.id) return Effect.succeed(delegatedAssignedModel)
+    if (modelID === delegatedSelectedModel.id) return Effect.succeed(delegatedSelectedModel)
+    return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))
   }),
   resolveRoutedModel: Effect.fn("TestProvider.resolveRoutedModel.capture")((input) =>
     Effect.sync(() => {
@@ -455,6 +486,24 @@ function providerCfg(url: string) {
         options: {
           ...cfg.provider.test.options,
           baseURL: url,
+        },
+      },
+    },
+  }
+}
+
+function modelSwitchProviderCfg(url: string) {
+  const base = providerCfg(url)
+  const provider = base.provider.test
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...provider,
+        models: {
+          ...provider.models,
+          "switch-model": { ...provider.models["test-model"], id: "switch-model", name: "Switch Model" },
         },
       },
     },
@@ -563,7 +612,10 @@ function providerSystemText(body: Record<string, unknown>) {
   const messages = body.messages
   if (!Array.isArray(messages)) return ""
   return messages
-    .filter((message): message is { role: string; content?: unknown } => !!message && typeof message === "object" && "role" in message)
+    .filter(
+      (message): message is { role: string; content?: unknown } =>
+        !!message && typeof message === "object" && "role" in message,
+    )
     .filter((message) => message.role === "system")
     .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")))
     .join("\n")
@@ -743,7 +795,8 @@ noLLMServer.instance(
         { source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "str_prompt_test" },
       )
       expect(admitted.info.role).toBe("user")
-      if (admitted.info.role !== "user") throw new Error("Expected scheduled host admission to produce a user-role turn")
+      if (admitted.info.role !== "user")
+        throw new Error("Expected scheduled host admission to produce a user-role turn")
       expect(admitted.info.provenance).toEqual({
         owner: "host",
         source: SessionTurnProvenance.Source.ScheduledTaskRun,
@@ -758,7 +811,8 @@ noLLMServer.instance(
         parts: [{ type: "text", text: "follow up on that scheduled work" }],
       })
       expect(user.info.role).toBe("user")
-      if (user.info.role !== "user") throw new Error("Expected direct scheduled-session prompt to produce a user-role turn")
+      if (user.info.role !== "user")
+        throw new Error("Expected direct scheduled-session prompt to produce a user-role turn")
       expect(user.info.provenance).toEqual({
         owner: "user",
         source: SessionTurnProvenance.Source.Prompt,
@@ -821,6 +875,182 @@ delegatedRouteIt.instance(
       expect(Object.prototype.hasOwnProperty.call(routed, "accountID")).toBe(false)
     }),
   { config: cfg },
+)
+
+delegatedRouteIt.instance(
+  "interactive delegated-worker conversation executes with the protected Public route and user provenance",
+  () =>
+    Effect.gen(function* () {
+      delegatedRouteInputs.length = 0
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:interactive-route",
+        invocationRef: "oxp-inv:interactive-route",
+        rootRef: "root-interactive-route",
+        agent: "build",
+        model: {
+          providerID: String(ref.providerID),
+          modelID: String(ref.modelID),
+          routeIntent: { kind: "public" as const },
+        },
+        nestedDelegation: false,
+      }
+      const chat = yield* sessions.create({
+        title: "Interactive worker route",
+        agent: "build",
+        model: { providerID: ref.providerID, id: ref.modelID },
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+      yield* prompt.assertInteractiveUserPromptable(chat.id)
+      const admitted = yield* prompt.interactivePrompt({
+        sessionID: chat.id,
+        noReply: true,
+        parts: [{ type: "text", text: "human follow-up" }],
+      })
+      expect(admitted.info).toMatchObject({
+        role: "user",
+        provenance: { owner: "user", source: SessionTurnProvenance.Source.Prompt },
+      })
+      yield* prompt.loop({ sessionID: chat.id })
+      expect(delegatedRouteInputs).toHaveLength(1)
+      expect(delegatedRouteInputs[0]).toMatchObject({
+        sessionID: chat.id,
+        providerID: ref.providerID,
+        modelID: ref.modelID,
+        routeIntent: { kind: "public" },
+      })
+      expect((yield* sessions.get(chat.id)).metadata).toEqual(chat.metadata)
+    }),
+  { config: cfg },
+  { timeout: 15000 },
+)
+
+delegatedRouteIt.instance(
+  "a human model selection overrides the delegated worker model for that turn without inheriting its route",
+  () =>
+    Effect.gen(function* () {
+      delegatedRouteInputs.length = 0
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const origin = {
+        producer: "oxp",
+        principalRef: "oxp:interactive-model-override",
+        invocationRef: "oxp-inv:interactive-model-override",
+        rootRef: "root-interactive-model-override",
+        agent: "build",
+        model: {
+          providerID: String(ref.providerID),
+          modelID: String(ref.modelID),
+          routeIntent: { kind: "public" as const },
+        },
+        nestedDelegation: false,
+      }
+      const chat = yield* sessions.create({
+        title: "Interactive worker model override",
+        agent: "build",
+        model: { providerID: ref.providerID, id: ref.modelID },
+        metadata: SessionMetadataOwnership.delegatedWorker(origin),
+      })
+
+      yield* prompt.interactivePrompt({
+        sessionID: chat.id,
+        noReply: true,
+        model: { providerID: ref.providerID, modelID: delegatedSelectedModel.id, accountID: "account-longcat" },
+        variant: "max",
+        parts: [{ type: "text", text: "use the model from the composer" }],
+      })
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(delegatedRouteInputs).toHaveLength(1)
+      expect(delegatedRouteInputs[0]).toMatchObject({
+        sessionID: chat.id,
+        providerID: ref.providerID,
+        modelID: delegatedSelectedModel.id,
+        accountID: "account-longcat",
+      })
+      expect(delegatedRouteInputs[0]?.routeIntent).toBeUndefined()
+      const userMessage = (yield* sessions.messages({ sessionID: chat.id })).find((message) => message.info.role === "user")
+      expect(userMessage?.info.role === "user" ? userMessage.info.model : undefined).toMatchObject({
+        modelID: delegatedSelectedModel.id,
+        accountID: "account-longcat",
+        variant: "max",
+      })
+      const unchanged = yield* sessions.get(chat.id)
+      expect(unchanged.model?.id).toBe(ref.modelID)
+      expect(unchanged.metadata).toEqual(chat.metadata)
+    }),
+  { config: cfg },
+  { timeout: 15000 },
+)
+
+noLLMServer.instance(
+  "human prompts reach delegated root and nested workers while paused or occupied without changing producer configuration",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const runState = yield* SessionRunState.Service
+      const parent = yield* sessions.create({ title: "Worker parent" })
+      for (const nested of [false, true]) {
+        const metadata = SessionMetadataOwnership.delegatedWorker({
+          producer: "oxp",
+          principalRef: "principal",
+          invocationRef: "invocation",
+          rootRef: "root",
+          agent: "build",
+          model: { providerID: String(ref.providerID), modelID: String(ref.modelID) },
+          nestedDelegation: false,
+          ...(nested ? { parentWorkerID: parent.id } : {}),
+        })
+        const chat = yield* sessions.create({
+          agent: "build",
+          model: { providerID: ref.providerID, id: ref.modelID },
+          metadata,
+          ...(nested ? { parentID: parent.id } : {}),
+        })
+        expect(chat.humanInterjection).toBe(true)
+        expect((yield* sessions.get(chat.id)).humanInterjection).toBe(true)
+        yield* sessions.setPaused({ sessionID: chat.id, pausedAt: Date.now() })
+        const paused = yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "paused human input" }],
+        })
+        expect(paused.info).toMatchObject({ role: "user", provenance: { owner: "user" } })
+        expect((yield* sessions.get(chat.id)).pausedAt).toBeUndefined()
+        const entered = yield* Deferred.make<void>()
+        const running = yield* runState
+          .ensureRunning(
+            chat.id,
+            Effect.succeed(paused),
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          )
+          .pipe(Effect.forkChild)
+        yield* awaitWithTimeout(Deferred.await(entered), "worker did not acquire execution")
+        // Same occupied owner represents a provider, tool or blocker wait. Human
+        // admission must not acquire its execution lock or wait for it to settle.
+        const followup = yield* awaitWithTimeout(
+          prompt.prompt({ sessionID: chat.id, noReply: true, parts: [{ type: "text", text: "occupied human input" }] }),
+          "human input waited on execution",
+          "2 seconds",
+        )
+        expect(followup.info).toMatchObject({ role: "user", provenance: { owner: "user" } })
+        expect(yield* sessions.messages({ sessionID: chat.id })).toHaveLength(2)
+        expect((yield* sessions.get(chat.id)).metadata).toEqual(metadata)
+        yield* runState.cancel(chat.id)
+        yield* Fiber.await(running)
+        const stopped = yield* prompt.prompt({
+          sessionID: chat.id,
+          noReply: true,
+          parts: [{ type: "text", text: "stopped human input" }],
+        })
+        expect(stopped.info).toMatchObject({ role: "user", provenance: { owner: "user" } })
+      }
+    }),
+  { config: cfg },
+  { timeout: 30000 },
 )
 
 noLLMServer.instance(
@@ -886,7 +1116,8 @@ noLLMServer.instance(
         },
       )
       expect(admitted.info.role).toBe("user")
-      if (admitted.info.role !== "user") throw new Error("Expected delegated host admission to produce a user-role turn")
+      if (admitted.info.role !== "user")
+        throw new Error("Expected delegated host admission to produce a user-role turn")
       expect(admitted.info.provenance).toEqual({
         owner: "host",
         source: SessionTurnProvenance.Source.OxpDelegation,
@@ -921,7 +1152,7 @@ noLLMServer.instance(
 )
 
 noLLMServer.instance(
-  "delegated-worker prompt admission fails closed for user prompts, wrong/missing principal or source, and malformed envelopes",
+  "delegated-worker prompt admission rejects selection takeover, wrong/missing principal or source, and malformed envelopes",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -950,17 +1181,19 @@ noLLMServer.instance(
 
       const chat = yield* sessions.create({
         title: "Delegated worker negatives",
+        agent: "build",
+        model: { providerID: ref.providerID, id: ref.modelID },
         metadata: SessionMetadataOwnership.delegatedWorker(origin),
       })
 
-      // Public user prompting must never convert a producer-owned delegated
-      // worker into an ordinary interactive Session.
+      // A user may choose a different model for a turn, but cannot change the
+      // producer-owned worker identity or its permissions.
       expectRefused(
         yield* prompt
           .prompt({
             sessionID: chat.id,
             noReply: true,
-            agent: "build",
+            agent: "other",
             model: ref,
             parts: [{ type: "text", text: "user takeover attempt" }],
           })
@@ -1446,7 +1679,10 @@ goalIt.instance(
       // before Goal auditing begins.
       yield* llm.pushMatch(
         (hit) => !isAuditorRequest(hit),
-        reply().tool("read", { filePath: fileURLToPath(import.meta.url) }).stop().item(),
+        reply()
+          .tool("read", { filePath: fileURLToPath(import.meta.url) })
+          .stop()
+          .item(),
       )
       yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("worker step 1 complete").stop().item())
       // Worker cycle 2 is the auditor-authorized continuation.
@@ -1581,10 +1817,7 @@ goalIt.instance(
           typeof message.info.provenance.ref === "string" &&
           message.info.provenance.ref.length > 0 &&
           message.parts.some(
-            (part) =>
-              part.type === "text" &&
-              part.synthetic === true &&
-              part.text.includes(CONTINUATION),
+            (part) => part.type === "text" && part.synthetic === true && part.text.includes(CONTINUATION),
           ),
       )
       expect(continuationTurns).toHaveLength(1)
@@ -1599,9 +1832,7 @@ goalIt.instance(
         (part) => part.type === "text" && part.synthetic === true && part.text.includes(CONTINUATION),
       )
       expect(continuationPart?.type).toBe("text")
-      const userAuthoredTurns = transcript.filter(
-        (message) => SessionTurnProvenance.isSemanticUserTurn(message),
-      )
+      const userAuthoredTurns = transcript.filter((message) => SessionTurnProvenance.isSemanticUserTurn(message))
       expect(userAuthoredTurns).toHaveLength(1)
       expect(continuationTurn.info.provenance.sourceMessageID).toBe(userAuthoredTurns[0]!.info.id)
       expect(
@@ -1616,6 +1847,115 @@ goalIt.instance(
     }),
   { config: cfg },
   30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a content-filtered worker delegates terminal state to the auditor instead of abandoning the Goal",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+      const chat = yield* sessions.create({ title: "Filtered Goal worker" })
+      const created = yield* goals.create({
+        projectID: chat.projectID,
+        title: "Filter recovery Goal",
+        objective: "Finish work even when one worker response is filtered",
+        criteria: ["The required work has been independently verified"],
+      }).pipe(Effect.orDie)
+      const active = yield* goals.transition({
+        id: created.goal.id, expectedRevision: created.goal.revision, action: "start",
+      }).pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      const criterionID = active.criteria[0]!.id
+      const isAuditor = (hit: { body: Record<string, unknown> }) => {
+        const tools = hit.body.tools
+        return Array.isArray(tools) && tools.some((tool) => {
+          if (typeof tool !== "object" || tool === null) return false
+          const candidate = tool as { name?: unknown; function?: { name?: unknown } }
+          return candidate.name === "audit_verdict" || candidate.function?.name === "audit_verdict"
+        })
+      }
+      yield* llm.pushMatch((hit) => !isAuditor(hit), reply().text("partial worker text").contentFilter().item())
+      yield* llm.pushMatch(isAuditor, reply().tool("audit_verdict", {
+        decision: "blocked",
+        rationale: "The current provider blocked the requested work and no autonomous recovery is available.",
+        blocker: "The provider content filter prevents this worker task without user intervention.",
+        progressMade: false,
+        criteria: [{ criterionID, status: "pending", evidence: "The required work was not verified." }],
+      }).item())
+      const run = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "Continue this Goal." }],
+      }).pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
+      expect(run._tag).not.toBe("None")
+      const hits = yield* llm.hits
+      expect(hits.filter(isAuditor)).toHaveLength(1)
+      expect((yield* goals.get(active.goal.id)).goal.status).toBe("blocked")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+goalIt.instance(
+  "Goal Mode: a Goal created by the agent mid-turn enters the independent auditor on its first worker cycle",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+      const chat = yield* sessions.create({
+        title: "Agent-created Goal first-cycle audit",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const isAuditor = (hit: { body: Record<string, unknown> }) => {
+        const tools = hit.body.tools
+        return Array.isArray(tools) && tools.some((tool) => {
+          if (typeof tool !== "object" || tool === null) return false
+          const candidate = tool as { name?: unknown; function?: { name?: unknown } }
+          return candidate.name === "audit_verdict" || candidate.function?.name === "audit_verdict"
+        })
+      }
+      yield* llm.pushMatch(
+        (hit) => !isAuditor(hit),
+        reply().tool("goal", {
+          action: "create",
+          objective: "Finish and verify the requested refactor",
+          criteria: ["The refactor is implemented and independently verified"],
+        }).stop().item(),
+      )
+      yield* llm.pushMatch((hit) => !isAuditor(hit), reply().text("Worker setup is complete").stop().item())
+      // Even a malformed auditor verdict proves the host handed the new
+      // Goal to its independent auditor. The shared protocol repairs/retries
+      // without manufacturing a completed or blocked Goal.
+      yield* llm.pushMatch(isAuditor, reply().text("Forgot audit_verdict").stop().item())
+      yield* llm.pushMatch(isAuditor, reply().text("Still missing the completion tool").stop().item())
+
+      const run = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "Create a Goal for the refactor and start working on it." }],
+      }).pipe(Effect.timeout(Duration.seconds(25)), Effect.option)
+      expect(run._tag).not.toBe("None")
+      const focus = yield* goals.focused(chat.id)
+      expect(focus?.detail.goal.objective).toBe("Finish and verify the requested refactor")
+      expect(focus?.detail.goal.status).toBe("active")
+      const hits = yield* llm.hits
+      expect(hits.some(isAuditor)).toBe(true)
+      const runtime = yield* automation.runtime(chat.id)
+      expect(runtime?.phase).toBe("audit_error")
+      if (runtime?.phase === "audit_error") expect(runtime.retryAt).toBeDefined()
+    }),
+  { config: cfg },
+  35_000,
 )
 
 goalIt.instance(
@@ -1872,9 +2212,7 @@ goalCompactionResetIt.instance(
         text: "compacted history; active Goal continuation must be restored from durable automation state",
       })
 
-      const run = yield* prompt
-        .loop({ sessionID: chat.id })
-        .pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
+      const run = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)), Effect.option)
 
       expect(capturedGoalWorkerInputs).toHaveLength(1)
       expect(JSON.stringify(capturedGoalWorkerInputs[0])).toContain(marker)
@@ -2003,9 +2341,7 @@ goalIt.instance(
               : [],
           )
           .sort(),
-      ).toEqual(
-        [SessionTurnProvenance.Source.GoalProgress, SessionTurnProvenance.Source.GoalSpecification].sort(),
-      )
+      ).toEqual([SessionTurnProvenance.Source.GoalProgress, SessionTurnProvenance.Source.GoalSpecification].sort())
 
       // A second reconciliation in the same reset epoch is a no-op.
       yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout(Duration.seconds(20)))
@@ -2102,7 +2438,7 @@ goalCompactionFailureIt.instance(
 )
 
 goalIt.instance(
-  "Goal Mode: an orphaned verifying Goal recovers through canonical verification ingress without another worker turn",
+  "Goal Mode: an orphaned verifying Goal recovers through non-destructive internal audit recovery without a worker turn",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -2182,9 +2518,9 @@ goalIt.instance(
           .item(),
       )
 
-      const before = (yield* llm.hits).length
-      yield* prompt.requestGoalAudit(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
-      const hits = (yield* llm.hits).slice(before)
+       const before = (yield* llm.hits).length
+       yield* prompt.recoverGoalAudit(chat.id).pipe(Effect.timeout(Duration.seconds(20)))
+       const hits = (yield* llm.hits).slice(before)
 
       expect(hits).toHaveLength(1)
       expect(JSON.stringify(hits[0]!.body.tools)).toContain("audit_verdict")
@@ -2194,6 +2530,93 @@ goalIt.instance(
     }),
   { config: cfg },
   30_000,
+)
+
+
+goalIt.instance(
+  "Goal Mode: restart audit recovery preserves the exact claimed continuation until auditor settlement",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const goals = yield* Goal.Service
+      const automation = yield* GoalAutomation.Service
+      const { db } = yield* Database.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      goalAuditorBaseURL = llm.url
+
+      const chat = yield* sessions.create({
+        title: "Durable Goal audit handoff",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.push(reply().text("worker made concrete progress").stop().item())
+      const worker = yield* prompt.prompt({
+        sessionID: chat.id, agent: "build", model: ref,
+        parts: [{ type: "text", text: "Complete the durable first worker cycle" }],
+      })
+      if (worker.info.role !== "assistant" || !worker.info.parentID) throw new Error("Missing original worker root")
+
+      const created = yield* goals.create({
+        projectID: chat.projectID, title: "Recover exact audit handoff",
+        objective: "Verify completed worker work without replay",
+        criteria: ["original completed worker result is independently verified"],
+        auditorPolicy: { maxAttempts: 1 },
+      }).pipe(Effect.orDie)
+      const active = yield* goals.transition({
+        id: created.goal.id, expectedRevision: created.goal.revision, action: "start",
+      }).pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID: chat.id }).pipe(Effect.orDie)
+      const criterionID = active.criteria[0]!.id
+
+       const first = yield* automation.afterTurn({
+         sessionID: chat.id, origin: "user", sourceMessageID: worker.info.parentID,
+         expectedLatestUserSeq: yield* SessionInput.latestUserSeq(db, chat.id),
+         audit: { ok: true, verdict: {
+          decision: "continue", rationale: "One independent check remains", progressMade: true,
+          criteria: [{ criterionID, status: "pending", evidence: "awaiting independent check" }],
+          continuationPrompt: "Keep the completed worker result; do not rerun it.",
+        } },
+      })
+      const claimed = yield* automation.claim(chat.id)
+      expect(claimed?.id).toBe(first.reservation?.id)
+      if (!claimed) throw new Error("Failed to claim initial reservation")
+      const auditorSessionID = yield* goals.auditorSession({
+        parentSessionID: chat.id, goalID: active.goal.id,
+      })
+      const interrupted = yield* automation.beginAudit({
+        sessionID: chat.id, auditorSessionID, reservationID: claimed.id,
+      })
+      expect(interrupted).toMatchObject({ phase: "auditing" })
+      if (interrupted?.phase !== "auditing") return
+      expect(yield* automation.deferAudit(chat.id, {
+        auditorSessionID, auditStartedAt: DateTime.toEpochMillis(interrupted.since),
+      })).toBe(true)
+
+      const gate = yield* Deferred.make<void>()
+      yield* llm.pushMatch(
+        (hit) => Array.isArray(hit.body.tools) && JSON.stringify(hit.body.tools).includes("audit_verdict"),
+        reply().wait(deferredAsPromise(gate)).tool("audit_verdict", {
+          decision: "complete", rationale: "The original worker result is independently verified.",
+          progressMade: true,
+          criteria: [{ criterionID, status: "passed", evidence: "worker output verified without replay" }],
+        }).item(),
+      )
+      const resume = yield* prompt.recoverGoalAudit(chat.id).pipe(Effect.forkChild)
+      yield* llm.wait(2)
+      const inflight = yield* db.select({
+        reservationID: GoalAutomationTable.reservation_id,
+        reservationOwner: GoalAutomationTable.reservation_owner,
+      }).from(GoalAutomationTable).where(eq(GoalAutomationTable.session_id, chat.id)).get().pipe(Effect.orDie)
+      expect(inflight?.reservationID).toBe(claimed.id)
+      expect(inflight?.reservationOwner).not.toBeNull()
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(resume).pipe(Effect.timeout("20 seconds"))
+      expect((yield* goals.focused(chat.id))?.detail.goal.status).toBe("completed")
+      expect(yield* automation.runtime(chat.id)).toBeUndefined()
+      expect((yield* llm.hits).length).toBe(2)
+    }),
+  { config: cfg },
+  40_000,
 )
 
 goalIt.instance(
@@ -2449,7 +2872,9 @@ goalIt.instance(
       // provider stream around it.
       yield* llm.pushMatch(
         (hit) => !isAuditorRequest(hit),
-        reply().tool("read", { filePath: fileURLToPath(import.meta.url) }).item(),
+        reply()
+          .tool("read", { filePath: fileURLToPath(import.meta.url) })
+          .item(),
       )
       yield* llm.pushMatch(
         isAuditorRequest,
@@ -2459,7 +2884,9 @@ goalIt.instance(
             decision: "complete",
             rationale: "The interrupted tool state is finalized and visible in the worker transcript.",
             progressMade: true,
-            criteria: [{ criterionID, status: "passed", evidence: "the read tool was durably marked interrupted before audit" }],
+            criteria: [
+              { criterionID, status: "passed", evidence: "the read tool was durably marked interrupted before audit" },
+            ],
           })
           .item(),
       )
@@ -2478,7 +2905,7 @@ goalIt.instance(
       const verify = yield* prompt.requestGoalAudit(chat.id).pipe(Effect.forkChild)
       yield* awaitWithTimeout(Deferred.await(toolAborted), "timed out waiting for worker tool abort", "10 seconds")
       yield* llm.wait(2)
-      yield* pollWithTimeout(
+       yield* pollWithTimeout(
         Effect.gen(function* () {
           const runtime = yield* automation.runtime(chat.id)
           const parentStatus = yield* status.get(chat.id)
@@ -2488,7 +2915,14 @@ goalIt.instance(
         "10 seconds",
       )
 
+      const { db: primaryProbe, readDb: readerProbe } = yield* Database.Service
+      console.error("[GOAL_HISTORY_DIAG] direct primary start")
+      yield* primaryProbe.get("SELECT 1 AS probe")
+      console.error("[GOAL_HISTORY_DIAG] direct primary completed")
+      yield* readerProbe.get("SELECT 1 AS probe")
+      console.error("[GOAL_HISTORY_DIAG] direct reader completed")
       const parentMessages = yield* sessions.messages({ sessionID: chat.id })
+      console.error("[GOAL_HISTORY_DIAG] history fetched", parentMessages.length)
       const interruptedTool = parentMessages
         .flatMap((message) => message.parts)
         .find(
@@ -2498,14 +2932,25 @@ goalIt.instance(
             part.state.status === "error" &&
             part.state.metadata?.interrupted === true,
         )
+      console.error("[GOAL_HISTORY_DIAG] interrupted tool state", JSON.stringify({
+        matching: Boolean(interruptedTool),
+        tools: parentMessages.flatMap((message) => message.parts).filter((p) => p.type === "tool")
+          .map((p) => ({status: p.state.status, metadata: p.state.metadata, error: p.state.error, tool: p.tool})),
+      }))
       expect(interruptedTool?.type).toBe("tool")
+      console.error("[GOAL_HISTORY_DIAG] tool settled")
       expect((yield* status.get(chat.id)).type).toBe("idle")
+      console.error("[GOAL_HISTORY_DIAG] status idle")
       const running = yield* automation.runtime(chat.id)
       expect(running?.phase).toBe("auditing")
+      console.error("[GOAL_HISTORY_DIAG] auditor live")
 
       yield* Deferred.succeed(auditorGate, void 0)
+      console.error("[GOAL_HISTORY_DIAG] gate released")
       expect(Exit.isSuccess(yield* Fiber.await(verify))).toBe(true)
+      console.error("[GOAL_HISTORY_DIAG] verify joined")
       expect(Exit.isSuccess(yield* Fiber.await(worker))).toBe(true)
+      console.error("[GOAL_HISTORY_DIAG] worker joined")
       expect((yield* goals.focused(chat.id))?.detail.goal).toMatchObject({ status: "completed", auditorRuns: 1 })
       expect(yield* automation.runtime(chat.id)).toBeUndefined()
     }),
@@ -2573,7 +3018,10 @@ goalIt.instance(
           .item(),
       )
       // The auditor-authorized continuation starts, then hangs in generation.
-      yield* llm.pushMatch((hit) => !isAuditorRequest(hit), reply().text("partial automatic continuation").hang().item())
+      yield* llm.pushMatch(
+        (hit) => !isAuditorRequest(hit),
+        reply().text("partial automatic continuation").hang().item(),
+      )
       // The user-requested replacement audit completes the Goal.
       yield* llm.pushMatch(
         isAuditorRequest,
@@ -2582,7 +3030,9 @@ goalIt.instance(
             decision: "complete",
             rationale: "The finalized transcript now satisfies the regression criterion.",
             progressMade: true,
-            criteria: [{ criterionID, status: "passed", evidence: "stale continuation was interrupted and did not resume" }],
+            criteria: [
+              { criterionID, status: "passed", evidence: "stale continuation was interrupted and did not resume" },
+            ],
           })
           .item(),
       )
@@ -2743,6 +3193,202 @@ withMcpInstructions.instance(
 )
 
 it.instance(
+  "auto-continues a provider progress timeout without replaying the original user turn",
+  () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+      process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = "90"
+      yield* Effect.addFinalizer(() => Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+        else process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = previous
+      }))
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "Provider progress watchdog recovery" })
+
+      yield* llm.push(reply().text("Before the connection stalled.").hang().item())
+      yield* llm.text("Resumed and completed.")
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "Finish the task" }],
+      })
+      expect(result.info.role).toBe("assistant")
+      const rows = yield* sessions.messages({ sessionID: chat.id })
+      const timeout = rows.find((row) =>
+        row.info.role === "assistant" && row.info.error &&
+        JSON.stringify(row.info.error).includes("Provider response timed out"))
+      expect(timeout?.info.role).toBe("assistant")
+      const continuation = rows.find((row) =>
+        row.info.role === "user" &&
+        row.info.provenance?.source === SessionTurnProvenance.Source.ProviderTimeoutContinuation)
+      expect(continuation?.info.role).toBe("user")
+      if (!continuation || continuation.info.role !== "user") throw new Error("missing timeout continuation")
+      expect(continuation.info.provenance?.owner).toBe("host")
+      expect(continuation.info.provenance?.ref).toContain("1:msg_")
+      const entry = yield* SessionInput.findEntry(db, SessionMessage.ID.make(continuation.info.id))
+      expect(entry).toMatchObject({ admissionClass: "automatic", userPreemptible: true, delivery: "queue" })
+      expect((yield* llm.hits).length).toBe(2)
+      expect(rows.some((row) => row.info.role === "assistant" &&
+        row.parts.some((part) => part.type === "text" && part.text.includes("Resumed and completed.")))).toBe(true)
+    }),
+  30_000,
+)
+
+it.instance(
+  "stops after two automatic provider-timeout continuations instead of looping indefinitely",
+  () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+      process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = "75"
+      yield* Effect.addFinalizer(() => Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+        else process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = previous
+      }))
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Provider timeout retry budget" })
+      yield* llm.push(reply().text("attempt 1").hang().item())
+      yield* llm.push(reply().text("attempt 2").hang().item())
+      yield* llm.push(reply().text("attempt 3").hang().item())
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "The user task is still valid" }],
+      })
+      const rows = yield* sessions.messages({ sessionID: chat.id })
+      const continuations = rows.filter((row) =>
+        row.info.role === "user" &&
+        row.info.provenance?.source === SessionTurnProvenance.Source.ProviderTimeoutContinuation)
+      expect(continuations).toHaveLength(2)
+      expect(continuations.map((row) => row.info.role === "user" && row.info.provenance?.ref?.slice(0, 2)))
+        .toEqual(["1:", "2:"])
+      expect((yield* llm.hits).length).toBe(3)
+      const last = rows.findLast((row) => row.info.role === "assistant")
+      expect(last?.info.role === "assistant" && last.info.error).toBeTruthy()
+    }),
+  30_000,
+)
+
+it.instance(
+  "does not resurrect a timed-out task after newer human input supersedes it",
+  () =>
+    Effect.gen(function* () {
+      const previous = process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+      process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = "100"
+      yield* Effect.addFinalizer(() => Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS
+        else process.env.OPENFORK_PROVIDER_IDLE_TIMEOUT_MS = previous
+      }))
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "User owns a stalled provider session" })
+      yield* llm.push(reply().text("stale partial output").hang().item())
+      yield* llm.text("This is the newer human-owned task.")
+
+      const first = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "Stalled original task" }],
+      }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "New human instruction supersedes the old work" }],
+      })
+      yield* Fiber.await(first)
+      const rows = yield* sessions.messages({ sessionID: chat.id })
+      expect(rows.filter((row) => row.info.role === "user" &&
+        row.info.provenance?.source === SessionTurnProvenance.Source.ProviderTimeoutContinuation)).toHaveLength(0)
+      expect(rows.filter((row) => row.info.role === "user" &&
+        row.parts.some((part) => part.type === "text" && part.text.includes("New human instruction")))).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "switches an unstarted provider attempt into a same-root durable continuation on the selected model",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(modelSwitchProviderCfg)
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, void 0).pipe(Effect.asVoid))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const telemetry = yield* SessionTelemetry.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "Model switch" })
+
+      yield* llm.push(raw({ head: [], wait: deferredAsPromise(gate), hang: true }))
+      yield* llm.text("continued-answer")
+
+      const run = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "continue this task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const attempt = yield* telemetry.providerAttempt(chat.id)
+      expect(attempt?.assistantMessageID).toBeDefined()
+      expect(attempt?.preempted).toBeUndefined()
+      if (!attempt?.assistantMessageID) throw new Error("expected live assistant attempt")
+      const assistant = yield* MessageV2.get({ sessionID: chat.id, messageID: MessageID.make(attempt.assistantMessageID) })
+      if (assistant.info.role !== "assistant") throw new Error("expected the active assistant message")
+      const rootMessageID = assistant.info.parentID
+      expect(rootMessageID).toBeDefined()
+      if (!rootMessageID) throw new Error("expected the worker root user message")
+
+      expect(
+        yield* prompt.switchModel({
+          sessionID: chat.id,
+          assistantMessageID: attempt.assistantMessageID,
+          requestSentAt: attempt.requestSentAt,
+          model: { providerID: "test", modelID: "switch-model" },
+        }),
+      ).toBe(true)
+      yield* llm.wait(2)
+      const result = yield* Fiber.await(run)
+      expect(Exit.isSuccess(result)).toBe(true)
+
+      const continuationID = SessionMessage.ID.make(
+        `msg_switch_${chat.id}_${attempt.assistantMessageID}_${attempt.requestSentAt}`,
+      )
+      const continuation = yield* SessionInput.findEntry(db, continuationID)
+      expect(continuation?.promotedSeq).toBeDefined()
+      expect(continuation?.item).toMatchObject({
+        type: "synthetic",
+        content: {
+          text: "Continue the same task as the newly selected model. Treat completed tool results as complete and do not repeat them.",
+        },
+        origin: {
+          producer: "model.switch",
+          cause: { sessionID: chat.id, messageID: rootMessageID },
+        },
+        execution: { model: { providerID: "test", id: "switch-model" } },
+      })
+      expect((yield* llm.inputs)[1]?.model).toBe("switch-model")
+    }),
+  30_000,
+)
+
+it.instance(
   "new user input preempts a first provider attempt that has not produced any event",
   () =>
     Effect.gen(function* () {
@@ -2794,9 +3440,7 @@ it.instance(
       expect(latest.at(-1)).toEqual({ role: "user", content: "superseding request" })
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
-      const stale = messages.find(
-        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
-      )
+      const stale = messages.find((message) => message.info.role === "assistant" && message.info.parentID !== secondID)
       expect(stale?.info.role).toBe("assistant")
       if (stale?.info.role === "assistant") {
         expect(stale.info.time.completed).toBeDefined()
@@ -2863,9 +3507,7 @@ it.instance(
       expect(latest.at(-1)).toEqual({ role: "user", content: "superseding supervised request" })
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
-      const stale = messages.find(
-        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
-      )
+      const stale = messages.find((message) => message.info.role === "assistant" && message.info.parentID !== secondID)
       expect(stale?.info.role).toBe("assistant")
       if (stale?.info.role === "assistant") {
         expect(stale.info.time.completed).toBeDefined()
@@ -2929,9 +3571,7 @@ it.instance(
       expect(latest.at(-1)).toEqual({ role: "user", content: "superseding request" })
 
       const messages = yield* sessions.messages({ sessionID: chat.id })
-      const stale = messages.find(
-        (message) => message.info.role === "assistant" && message.info.parentID !== secondID,
-      )
+      const stale = messages.find((message) => message.info.role === "assistant" && message.info.parentID !== secondID)
       expect(stale?.info.role).toBe("assistant")
       if (stale?.info.role === "assistant") {
         expect(stale.info.time.completed).toBeDefined()
@@ -3282,9 +3922,9 @@ it.instance("SPAD recovery truncates a repetitive tail and continues with a hidd
 
     const result = yield* prompt.loop({ sessionID: session.id })
     const messages = yield* sessions.messages({ sessionID: session.id })
-    const synthetic = messages.flatMap((message) => message.parts).find(
-      (part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"),
-    )
+    const synthetic = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"))
     const repetitive = messages
       .flatMap((message) => message.parts)
       .find((part) => part.type === "text" && part.text.includes(motif))
@@ -3297,84 +3937,86 @@ it.instance("SPAD recovery truncates a repetitive tail and continues with a hidd
   }),
 )
 
-it.instance("SPAD auditor persists host-owned synthetic provenance and a settled verdict", () =>
-  Effect.gen(function* () {
-    clearPersistedMotifs()
-    const { llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      small_model: "test/test-model",
-      experimental: { spad_recovery: false, spad_auditor: true },
-    }))
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const session = yield* sessions.create({
-      title: "SPAD auditor provenance",
-      permission: [{ permission: "*", pattern: "*", action: "allow" }],
-    })
-    const drift = canonicalSpadAuditDrift()
+it.instance(
+  "SPAD auditor persists host-owned synthetic provenance and a settled verdict",
+  () =>
+    Effect.gen(function* () {
+      clearPersistedMotifs()
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        small_model: "test/test-model",
+        experimental: { spad_recovery: false, spad_auditor: true },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "SPAD auditor provenance",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const drift = canonicalSpadAuditDrift()
 
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "Compare the approaches and keep useful changes." }],
-    })
-    yield* llm.toolMatch(
-      (hit) => JSON.stringify(hit.body).includes(SpadAuditor.VERDICT_TOOL),
-      SpadAuditor.VERDICT_TOOL,
-      { decision: "uncertain", confidence: 0.55, reason: "insufficient_evidence" },
-    )
-    yield* llm.text(drift)
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Compare the approaches and keep useful changes." }],
+      })
+      yield* llm.toolMatch(
+        (hit) => JSON.stringify(hit.body).includes(SpadAuditor.VERDICT_TOOL),
+        SpadAuditor.VERDICT_TOOL,
+        { decision: "uncertain", confidence: 0.55, reason: "insufficient_evidence" },
+      )
+      yield* llm.text(drift)
 
-    const result = yield* prompt.loop({ sessionID: session.id })
-    expect(result.info.role).toBe("assistant")
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
 
-    const transcriptID = SpecialAgentSession.sessionIDFor({
-      ownerKind: SpecialAgentSession.OWNER_SESSION,
-      ownerID: session.id,
-      agent: "spad_auditor",
-    })
-    const { readDb } = yield* Database.Service
-    const history = yield* pollWithTimeout(
-      Effect.gen(function* () {
-        const current = yield* SessionHistory.load(readDb, transcriptID)
-        const prompts = current.filter(
-          (message) =>
-            message.type === "synthetic" &&
-            message.provenance?.owner === "host" &&
-            message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
-        )
-        const tools = current.flatMap((message) =>
-          message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
-        )
-        const settled = tools.some(
-          (tool) => tool.name === SpadAuditor.VERDICT_TOOL && tool.state.status === "completed",
-        )
-        const dangling = tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")
-        return prompts.length === 1 && settled && !dangling ? current : undefined
-      }),
-      "SPAD auditor child transcript did not settle",
-      "10 seconds",
-    )
+      const transcriptID = SpecialAgentSession.sessionIDFor({
+        ownerKind: SpecialAgentSession.OWNER_SESSION,
+        ownerID: session.id,
+        agent: "spad_auditor",
+      })
+      const { readDb } = yield* Database.Service
+      const history = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* SessionHistory.load(readDb, transcriptID)
+          const prompts = current.filter(
+            (message) =>
+              message.type === "synthetic" &&
+              message.provenance?.owner === "host" &&
+              message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
+          )
+          const tools = current.flatMap((message) =>
+            message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+          )
+          const settled = tools.some(
+            (tool) => tool.name === SpadAuditor.VERDICT_TOOL && tool.state.status === "completed",
+          )
+          const dangling = tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")
+          return prompts.length === 1 && settled && !dangling ? current : undefined
+        }),
+        "SPAD auditor child transcript did not settle",
+        "10 seconds",
+      )
 
-    const prompts = history.filter(
-      (message) =>
-        message.type === "synthetic" &&
-        message.provenance?.owner === "host" &&
-        message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
-    )
-    expect(prompts).toHaveLength(1)
-    expect(prompts[0] && CurrentTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
-    expect(prompts[0] && CurrentTurnProvenance.isGoalAuthorizationTurn(prompts[0])).toBe(false)
-    const tools = history.flatMap((message) =>
-      message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
-    )
-    expect(tools.map((tool) => ({ name: tool.name, status: tool.state.status }))).toContainEqual({
-      name: SpadAuditor.VERDICT_TOOL,
-      status: "completed",
-    })
-    expect(tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")).toBe(false)
-  }),
+      const prompts = history.filter(
+        (message) =>
+          message.type === "synthetic" &&
+          message.provenance?.owner === "host" &&
+          message.provenance.source === CurrentTurnProvenance.Source.SpadAuditor,
+      )
+      expect(prompts).toHaveLength(1)
+      expect(prompts[0] && CurrentTurnProvenance.isWorkerPromptTurn(prompts[0])).toBe(false)
+      expect(prompts[0] && CurrentTurnProvenance.isGoalAuthorizationTurn(prompts[0])).toBe(false)
+      const tools = history.flatMap((message) =>
+        message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+      )
+      expect(tools.map((tool) => ({ name: tool.name, status: tool.state.status }))).toContainEqual({
+        name: SpadAuditor.VERDICT_TOOL,
+        status: "completed",
+      })
+      expect(tools.some((tool) => tool.state.status === "pending" || tool.state.status === "running")).toBe(false)
+    }),
   20_000,
 )
 
@@ -3470,7 +4112,9 @@ it.instance("SPAD observe-only mode preserves repetitive output without recovery
 
     const result = yield* prompt.loop({ sessionID: session.id })
     const messages = yield* sessions.messages({ sessionID: session.id })
-    const synthetic = messages.some((message) => message.parts.some((part) => part.type === "text" && part.synthetic === true))
+    const synthetic = messages.some((message) =>
+      message.parts.some((part) => part.type === "text" && part.synthetic === true),
+    )
     expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
     expect(synthetic).toBe(false)
     expect(yield* llm.hits).toHaveLength(1)
@@ -3494,13 +4138,7 @@ it.instance("SPAD truncation keeps the healthy prefix across chunked deltas", ()
       noReply: true,
       parts: [{ type: "text", text: "Continue implementing the feature." }],
     })
-    yield* llm.push(
-      reply()
-        .text(prefix)
-        .text(motif.repeat(6))
-        .text(motif.repeat(6))
-        .stop(),
-    )
+    yield* llm.push(reply().text(prefix).text(motif.repeat(6)).text(motif.repeat(6)).stop())
     yield* llm.text("The recovery succeeded and the task can continue.")
 
     const result = yield* prompt.loop({ sessionID: session.id })
@@ -3531,10 +4169,12 @@ it.instance("SPAD expansion lane recovers a growing restatement ledger", () =>
       experimental: { spad_recovery: true },
     }))
     const { prompt, sessions, session } = yield* spadSession("SPAD expansion")
-    const incidents = Array.from({ length: 16 }, (_, i) => `${i + 1}. sensor-${(i % 5) + 1} reported a transient read timeout`)
-    const ledger = Array.from(
+    const incidents = Array.from(
       { length: 16 },
-      (_, c) => [`=== INCIDENT LEDGER (after cycle ${c + 1}) ===`, ...incidents.slice(0, c + 1), ""].join("\n"),
+      (_, i) => `${i + 1}. sensor-${(i % 5) + 1} reported a transient read timeout`,
+    )
+    const ledger = Array.from({ length: 16 }, (_, c) =>
+      [`=== INCIDENT LEDGER (after cycle ${c + 1}) ===`, ...incidents.slice(0, c + 1), ""].join("\n"),
     ).join("\n")
 
     yield* prompt.prompt({
@@ -3558,7 +4198,9 @@ it.instance("SPAD expansion lane recovers a growing restatement ledger", () =>
     expect(synthetic).toBe(true)
     expect(truncated?.type).toBe("text")
     if (truncated?.type === "text") expect(truncated.text.length).toBeLessThan(ledger.length)
-    expect(result.parts.some((part) => part.type === "text" && part.text.includes("all incidents are recorded"))).toBe(true)
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("all incidents are recorded"))).toBe(
+      true,
+    )
     expect(yield* llm.hits).toHaveLength(2)
   }),
 )
@@ -3626,11 +4268,13 @@ it.instance("SPAD aborts after a second relapse of the same motif", () =>
     const result = yield* prompt.loop({ sessionID: session.id })
     const messages = yield* sessions.messages({ sessionID: session.id })
     const aborted = messages.find(
-      (message) => message.info.role === "assistant" && (JSON.stringify((message.info as { error?: unknown }).error) ?? "").includes("Repetitive"),
+      (message) =>
+        message.info.role === "assistant" &&
+        (JSON.stringify((message.info as { error?: unknown }).error) ?? "").includes("Repetitive"),
     )
 
     expect(aborted).toBeDefined()
-    expect((JSON.stringify((result.info as { error?: unknown }).error) ?? "")).toContain("Repetitive")
+    expect(JSON.stringify((result.info as { error?: unknown }).error) ?? "").toContain("Repetitive")
     expect(yield* llm.hits).toHaveLength(3)
     expect(yield* llm.pending).toBe(0)
   }),
@@ -3656,7 +4300,9 @@ it.instance("SPAD intent gate skips recovery when the user explicitly requests r
 
     const result = yield* prompt.loop({ sessionID: session.id })
     const messages = yield* sessions.messages({ sessionID: session.id })
-    const synthetic = messages.some((message) => message.parts.some((part) => part.type === "text" && part.synthetic === true))
+    const synthetic = messages.some((message) =>
+      message.parts.some((part) => part.type === "text" && part.synthetic === true),
+    )
 
     expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
     expect(synthetic).toBe(false)
@@ -3673,55 +4319,56 @@ it.instance("SPAD intent gate skips recovery when the user explicitly requests r
 // format round-trip is fixed.
 it.instance.skip("SPAD structured output stays observe-only under json_schema format", () => Effect.void)
 
-it.instance("SPAD thrash lane recovers cross-turn tool stagnation without truncation", () =>
-  Effect.gen(function* () {
-    clearPersistedMotifs()
-    const { llm } = yield* useServerConfig((url) => ({
-      ...providerCfg(url),
-      experimental: { spad_recovery: true },
-    }))
-    const { prompt, sessions, session } = yield* spadSession("SPAD thrash")
-    const narration = "Let me check the benchmark file again before deciding anything further. "
-    // Three distinct non-mutating reads per generation whose resource keys all
-    // collapse to the "benchmark.ts" basename, so the thrash lane sees pure
-    // re-access. Distinct paths avoid the doom-loop permission gate and the
-    // adapter merging identical calls.
-    const readInputs = ["alpha", "beta", "gamma"].map(
-      (dir) => ({ filePath: path.join(path.dirname(fileURLToPath(import.meta.url)), dir, "benchmark.ts") }),
-    )
+it.instance(
+  "SPAD thrash lane recovers cross-turn tool stagnation without truncation",
+  () =>
+    Effect.gen(function* () {
+      clearPersistedMotifs()
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        experimental: { spad_recovery: true },
+      }))
+      const { prompt, sessions, session } = yield* spadSession("SPAD thrash")
+      const narration = "Let me check the benchmark file again before deciding anything further. "
+      // Three distinct non-mutating reads per generation whose resource keys all
+      // collapse to the "benchmark.ts" basename, so the thrash lane sees pure
+      // re-access. Distinct paths avoid the doom-loop permission gate and the
+      // adapter merging identical calls.
+      const readInputs = ["alpha", "beta", "gamma"].map((dir) => ({
+        filePath: path.join(path.dirname(fileURLToPath(import.meta.url)), dir, "benchmark.ts"),
+      }))
 
-    yield* prompt.prompt({
-      sessionID: session.id,
-      agent: "build",
-      noReply: true,
-      parts: [{ type: "text", text: "Profile the benchmark and report findings." }],
-    })
-    for (let gen = 0; gen < 3; gen++) {
-      yield* llm.push(
-        reply()
-          .text(narration)
-          .tool("read", readInputs[0])
-          .tool("read", readInputs[1])
-          .tool("read", readInputs[2]),
-      )
-    }
-    yield* llm.text("Profiling is complete; the bottleneck is the matcher hot loop.")
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "Profile the benchmark and report findings." }],
+      })
+      for (let gen = 0; gen < 3; gen++) {
+        yield* llm.push(
+          reply().text(narration).tool("read", readInputs[0]).tool("read", readInputs[1]).tool("read", readInputs[2]),
+        )
+      }
+      yield* llm.text("Profiling is complete; the bottleneck is the matcher hot loop.")
 
-    const result = yield* prompt.loop({ sessionID: session.id })
-    const messages = yield* sessions.messages({ sessionID: session.id })
-    const synthetic = messages
-      .flatMap((message) => message.parts)
-      .some((part) => part.type === "text" && part.synthetic === true && part.text.includes("repeated the same exploration"))
-    const narrations = messages
-      .flatMap((message) => message.parts)
-      .filter((part) => part.type === "text" && part.text.includes(narration.trim()))
+      const result = yield* prompt.loop({ sessionID: session.id })
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const synthetic = messages
+        .flatMap((message) => message.parts)
+        .some(
+          (part) =>
+            part.type === "text" && part.synthetic === true && part.text.includes("repeated the same exploration"),
+        )
+      const narrations = messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "text" && part.text.includes(narration.trim()))
 
-    expect(synthetic).toBe(true)
-    expect(narrations.length).toBeGreaterThan(0)
-    for (const part of narrations) if (part.type === "text") expect(part.text).toContain(narration.trim())
-    expect(result.parts.some((part) => part.type === "text" && part.text.includes("bottleneck"))).toBe(true)
-    expect(yield* llm.hits).toHaveLength(4)
-  }),
+      expect(synthetic).toBe(true)
+      expect(narrations.length).toBeGreaterThan(0)
+      for (const part of narrations) if (part.type === "text") expect(part.text).toContain(narration.trim())
+      expect(result.parts.some((part) => part.type === "text" && part.text.includes("bottleneck"))).toBe(true)
+      expect(yield* llm.hits).toHaveLength(4)
+    }),
   { timeout: 30000 },
 )
 
@@ -3764,6 +4411,318 @@ it.instance("static loop consumes queued replies across turns", () =>
     expect(yield* llm.hits).toHaveLength(2)
     expect(yield* llm.pending).toBe(0)
   }),
+)
+
+it.instance(
+  "usage-limit recovery runs the interrupted continuation before pre-existing queued user input",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({
+        title: "Limit recovery queue ordering",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "original work" }],
+      })
+      yield* llm.text("work stopped here")
+      const stopped = yield* prompt.loop({ sessionID: session.id })
+      if (stopped.info.role !== "assistant") throw new Error("expected source assistant")
+
+      const queued = yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "queued before reset" }],
+      })
+      const queuedEntry = yield* SessionInput.findEntry(db, SessionMessage.ID.make(queued.info.id))
+      expect(queuedEntry?.promotedSeq).toBeUndefined()
+      const frontier = yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(session.id))
+
+      const recovery = yield* SessionLimitRecovery.observeFailure(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        sourceAssistantMessageID: SessionMessage.ID.make(stopped.info.id),
+        sourceUserMessageID: SessionMessage.ID.make(stopped.info.parentID),
+        providerID: "test",
+        modelID: "test-model",
+        failureClass: "rate-limit",
+        resetAt: 1,
+        resetSource: "provider",
+        expectedLatestUserSeq: frontier,
+        autoResume: true,
+        now: 0,
+      })
+      expect(recovery?.autoResume).toBe(true)
+      if (!recovery) throw new Error("expected durable recovery cursor")
+
+      yield* llm.text("continued after reset")
+      yield* llm.text("queued work complete")
+      const result = yield* prompt.loop({ sessionID: session.id })
+
+      expect(yield* llm.calls).toBe(3)
+      const inputs = yield* llm.inputs
+      const recoveryMessages = inputs[1]?.messages
+      if (!Array.isArray(recoveryMessages)) throw new Error("expected recovery provider input")
+      expect(JSON.stringify(recoveryMessages.findLast((message) => message.role === "user"))).toContain(
+        "Continue where you left off.",
+      )
+      const queuedMessages = inputs[2]?.messages
+      if (!Array.isArray(queuedMessages)) throw new Error("expected queued provider input")
+      expect(JSON.stringify(queuedMessages.findLast((message) => message.role === "user"))).toContain(
+        "queued before reset",
+      )
+
+      expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(queued.info.id)))?.promotedSeq).toBeDefined()
+      const recoveryInput = yield* SessionInput.findEntry(db, SessionMessage.ID.make(recovery.continuationID))
+      expect(recoveryInput).toMatchObject({
+        kind: "synthetic",
+        admissionClass: "automatic",
+        delivery: "queue",
+        userPreemptible: true,
+      })
+      expect(recoveryInput?.promotedSeq).toBeDefined()
+      expect(recoveryInput?.revokedSeq).toBeUndefined()
+      if (recoveryInput?.item.type !== "synthetic") throw new Error("expected recovery Synthetic input")
+      expect(recoveryInput.item.origin).toMatchObject({
+        producer: SessionTurnProvenance.Source.RecoveryContinuation,
+        ref: recovery.continuationID,
+        cause: {
+          sessionID: session.id,
+          messageID: stopped.info.parentID,
+        },
+      })
+      expect(yield* SessionLimitRecovery.get(db, SessionSchema.ID.make(session.id))).toBeUndefined()
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.parentID).toBe(queued.info.id)
+
+      const transcript = yield* sessions.messages({ sessionID: session.id })
+      const continuation = transcript.find(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.provenance?.owner === "host" &&
+          message.info.provenance.source === SessionTurnProvenance.Source.RecoveryContinuation,
+      )
+      if (!continuation || continuation.info.role !== "user") throw new Error("expected recovery continuation")
+      expect(continuation.info.provenance?.lifetime).toBe("historical")
+    }),
+  20_000,
+)
+
+it.instance(
+  "manual usage-limit resume runs without granting advisory reset evidence automatic authority",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({
+        title: "Manual limit recovery",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "original manual work" }],
+      })
+      yield* llm.text("stopped before manual resume")
+      const stopped = yield* prompt.loop({ sessionID: session.id })
+      if (stopped.info.role !== "assistant") throw new Error("expected source assistant")
+
+      const recovery = yield* SessionLimitRecovery.observeFailure(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        sourceAssistantMessageID: SessionMessage.ID.make(stopped.info.id),
+        sourceUserMessageID: SessionMessage.ID.make(stopped.info.parentID),
+        providerID: "test",
+        modelID: "test-model",
+        failureClass: "rate-limit",
+        resetAt: Date.now() + 60_000,
+        resetSource: "observed",
+        expectedLatestUserSeq: yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(session.id)),
+        autoResume: true,
+      })
+      expect(recovery).toMatchObject({ autoResume: false, manualResume: false, resetSource: "observed" })
+
+      const requested = yield* SessionLimitRecovery.requestManualResume(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        generation: recovery!.generation,
+      })
+      expect(requested).toMatchObject({ manualResume: true, autoResume: false })
+
+      yield* llm.text("continued by explicit user authority")
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(yield* llm.calls).toBe(2)
+      const inputs = yield* llm.inputs
+      expect(JSON.stringify(inputs[1]?.messages)).toContain("Continue where you left off.")
+      expect(yield* SessionLimitRecovery.get(db, SessionSchema.ID.make(session.id))).toBeUndefined()
+    }),
+  20_000,
+)
+
+it.instance(
+  "a new genuine user turn revokes pending usage-limit recovery",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({ title: "Limit recovery supersession" })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "original" }],
+      })
+      yield* llm.text("original response")
+      const stopped = yield* prompt.loop({ sessionID: session.id })
+      if (stopped.info.role !== "assistant") throw new Error("expected source assistant")
+
+      const recovery = yield* SessionLimitRecovery.observeFailure(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        sourceAssistantMessageID: SessionMessage.ID.make(stopped.info.id),
+        sourceUserMessageID: SessionMessage.ID.make(stopped.info.parentID),
+        providerID: "test",
+        modelID: "test-model",
+        failureClass: "rate-limit",
+        resetAt: Date.now() + 60_000,
+        resetSource: "provider",
+        expectedLatestUserSeq: yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(session.id)),
+        autoResume: true,
+      })
+      expect(recovery).toBeDefined()
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "user takes control" }],
+      })
+      expect(yield* SessionLimitRecovery.get(db, SessionSchema.ID.make(session.id))).toBeUndefined()
+    }),
+  20_000,
+)
+
+it.instance("cancel and pause retire active recovery continuations before clearing authority", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const { db } = yield* Database.Service
+
+    for (const operation of ["cancel", "pause"] as const) {
+      const session = yield* sessions.create({ title: `Recovery ${operation} retirement` })
+      const source = yield* seed(session.id)
+      const recovery = yield* SessionLimitRecovery.observeFailure(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        sourceAssistantMessageID: SessionMessage.ID.make(source.assistant.id),
+        sourceUserMessageID: SessionMessage.ID.make(source.user.id),
+        providerID: "test",
+        modelID: "test-model",
+        failureClass: "rate-limit",
+        resetAt: Date.now() + 60_000,
+        resetSource: "provider",
+        autoResume: true,
+      })
+      if (!recovery) throw new Error("expected durable recovery cursor")
+
+      const continuation = yield* sessions.updateMessage({
+        id: MessageID.make(recovery.continuationID),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() + 1_000 },
+        provenance: SessionTurnProvenance.hostDerived(SessionTurnProvenance.Source.RecoveryContinuation, source.user, {
+          ref: recovery.continuationID,
+        }),
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: continuation.id,
+        sessionID: session.id,
+        type: "text",
+        text: "Continue where you left off.",
+        synthetic: true,
+      })
+      expect(MessageV2.latest(yield* sessions.messages({ sessionID: session.id })).user?.id).toBe(continuation.id)
+
+      if (operation === "cancel") yield* prompt.cancel(session.id)
+      else yield* prompt.pause(session.id)
+
+      expect(yield* SessionLimitRecovery.get(db, SessionSchema.ID.make(session.id))).toBeUndefined()
+      const transcript = yield* sessions.messages({ sessionID: session.id })
+      const retired = transcript.find((message) => message.info.id === continuation.id)
+      if (!retired || retired.info.role !== "user") throw new Error("expected persisted recovery continuation")
+      expect(retired.info.provenance?.lifetime).toBe("historical")
+      expect(MessageV2.latest(transcript).user?.id).toBe(source.user.id)
+    }
+  }),
+)
+
+it.instance(
+  "usage-limit recovery retires before dispatch when the durable account route no longer matches",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const session = yield* sessions.create({
+        title: "Limit recovery account fence",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "original public route" }],
+      })
+      yield* llm.text("source response")
+      const stopped = yield* prompt.loop({ sessionID: session.id })
+      if (stopped.info.role !== "assistant") throw new Error("expected source assistant")
+      expect(yield* llm.calls).toBe(1)
+
+      const recovery = yield* SessionLimitRecovery.observeFailure(db, {
+        sessionID: SessionSchema.ID.make(session.id),
+        sourceAssistantMessageID: SessionMessage.ID.make(stopped.info.id),
+        sourceUserMessageID: SessionMessage.ID.make(stopped.info.parentID),
+        providerID: "test",
+        accountID: "account-that-did-not-own-the-source-turn",
+        modelID: "test-model",
+        failureClass: "account-rate-limit",
+        resetAt: 1,
+        resetSource: "provider",
+        expectedLatestUserSeq: yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(session.id)),
+        autoResume: true,
+        now: 0,
+      })
+      if (!recovery) throw new Error("expected durable recovery cursor")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.id).toBe(stopped.info.id)
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* SessionLimitRecovery.get(db, SessionSchema.ID.make(session.id))).toBeUndefined()
+      expect(yield* SessionInput.findEntry(db, SessionMessage.ID.make(recovery.continuationID))).toBeUndefined()
+    }),
+  20_000,
 )
 
 it.instance("loop continues when finish is tool-calls", () =>
@@ -3827,8 +4786,8 @@ it.instance("loop continues when finish is unknown", () =>
     const hits = yield* llm.hits
     const firstBody = JSON.stringify(hits[0]?.body)
     expect(firstBody).not.toContain("AUTOMATIC CONTINUATION")
-    const secondMessages = ((hits[1]?.body as { messages?: Array<{ role: string; content: unknown }> })
-      ?.messages ?? []) as Array<{ role: string; content: unknown }>
+    const secondMessages = ((hits[1]?.body as { messages?: Array<{ role: string; content: unknown }> })?.messages ??
+      []) as Array<{ role: string; content: unknown }>
     const lastUserTurn = secondMessages.findLast((m) => m.role === "user")
     expect(JSON.stringify(lastUserTurn?.content)).toContain("AUTOMATIC CONTINUATION")
     const finalMsgs = yield* sessions.messages({ sessionID: session.id })
@@ -3841,9 +4800,9 @@ it.instance("loop continues when finish is unknown", () =>
     expect(continuations).toHaveLength(1)
     const continuation = continuations[0]!
     expect(SessionTurnProvenance.semanticKind(continuation)).toBe("synthetic")
-    expect(continuation.parts.some((part) => part.type === "text" && part.text.includes("AUTOMATIC CONTINUATION"))).toBe(
-      true,
-    )
+    expect(
+      continuation.parts.some((part) => part.type === "text" && part.text.includes("AUTOMATIC CONTINUATION")),
+    ).toBe(true)
     if (continuation.info.role !== "user") throw new Error("expected synthetic provider-user turn")
     expect(continuation.info.provenance?.owner).toBe("host")
     if (continuation.info.provenance?.owner !== "host") throw new Error("expected host provenance")
@@ -4125,6 +5084,73 @@ it.instance(
   3_000,
 )
 
+it.instance(
+  "operator cancellation closes only the targeted provider transport among concurrent Sessions",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+
+      const chats = yield* Effect.forEach([1, 2, 3], () => sessions.create({}))
+      yield* Effect.forEach(chats, (chat) => user(chat.id, "hi"))
+      yield* Effect.forEach(chats, () => llm.hang)
+      // Fork under this *test's* scope, not inside Effect.forEach's transient
+      // child scopes (which would immediately interrupt those detached jobs).
+      const fibers: Fiber.Fiber<SessionV1.WithParts, Session.BusyError>[] = []
+      for (const chat of chats) {
+        fibers.push(yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild))
+      }
+      yield* llm.wait(chats.length).pipe(Effect.timeout("5 seconds"))
+      for (const chat of chats) expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      yield* prompt.cancel(chats[0]!.id)
+      yield* Fiber.await(fibers[0]!)
+      expect((yield* status.get(chats[0]!.id)).type).toBe("idle")
+      for (const chat of chats.slice(1)) {
+        expect((yield* status.get(chat.id)).type).toBe("busy")
+      }
+      yield* Effect.forEach(chats.slice(1), (chat) => prompt.cancel(chat.id))
+      yield* Effect.forEach(fibers.slice(1), (fiber) => Fiber.await(fiber))
+      for (const chat of chats) expect((yield* status.get(chat.id)).type).toBe("idle")
+    }),
+  10_000,
+)
+
+it.instance(
+  "six simultaneous hung providers cancel independently with all Session owners released",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chats = yield* Effect.forEach(Array.from({ length: 6 }), () => sessions.create({}))
+      yield* Effect.forEach(chats, (chat) => user(chat.id, "cancel isolation"))
+      yield* Effect.forEach(chats, () => llm.hang)
+
+      const fibers: Fiber.Fiber<SessionV1.WithParts, Session.BusyError>[] = []
+      for (const chat of chats) fibers.push(yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild))
+      yield* llm.wait(chats.length).pipe(Effect.timeout("10 seconds"))
+      for (const chat of chats) expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      // No shared abort signal: stopping the middle request must not affect
+      // any of the five in-flight neighbors on the same provider test server.
+      yield* prompt.cancel(chats[2]!.id)
+      yield* Fiber.await(fibers[2]!)
+      expect((yield* status.get(chats[2]!.id)).type).toBe("idle")
+      for (const [index, chat] of chats.entries()) {
+        if (index === 2) continue
+        expect((yield* status.get(chat.id)).type).toBe("busy")
+      }
+      yield* Effect.forEach(chats.filter((_, index) => index !== 2), (chat) => prompt.cancel(chat.id))
+      yield* Effect.forEach(fibers.filter((_, index) => index !== 2), (fiber) => Fiber.await(fiber))
+      for (const chat of chats) expect((yield* status.get(chat.id)).type).toBe("idle")
+    }),
+  20_000,
+)
+
 // Cancel semantics
 
 it.instance("cancel interrupts loop and resolves with an assistant message", () =>
@@ -4371,76 +5397,80 @@ it.instance("concurrent loop callers all receive same error result", () =>
   }),
 )
 
-it.instance("prompt submitted during an active run is included in the next LLM input", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const gate = yield* Deferred.make<void>()
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const { db } = yield* Database.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
+it.instance(
+  "prompt submitted during an active run is included in the next LLM input",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
 
-    yield* llm.hold("first", deferredAsPromise(gate))
-    yield* llm.text("second")
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
 
-    const a = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "first" }],
-      })
-      .pipe(Effect.forkChild)
+      const a = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first" }],
+        })
+        .pipe(Effect.forkChild)
 
-    yield* llm.wait(1)
-    yield* waitForBusy(chat.id)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
 
-    const id = MessageID.ascending()
-    const b = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        messageID: id,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "second" }],
-      })
-      .pipe(Effect.forkChild)
+      const id = MessageID.ascending()
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "second" }],
+        })
+        .pipe(Effect.forkChild)
 
-    yield* pollWithTimeout(
-      sessions
-        .messages({ sessionID: chat.id })
-        .pipe(
-          Effect.map((msgs) => (msgs.some((msg) => msg.info.role === "user" && msg.info.id === id) ? true : undefined)),
-        ),
-      "timed out waiting for second prompt to save",
-    )
-    const pending = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
-    expect(pending?.admissionClass).toBe("user")
-    expect(pending?.promotedSeq).toBeUndefined()
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === id) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for second prompt to save",
+      )
+      const pending = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
+      expect(pending?.admissionClass).toBe("user")
+      expect(pending?.promotedSeq).toBeUndefined()
 
-    yield* Deferred.succeed(gate, void 0)
+      yield* Deferred.succeed(gate, void 0)
 
-    const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
-    expect(Exit.isSuccess(ea)).toBe(true)
-    expect(Exit.isSuccess(eb)).toBe(true)
-    expect(yield* llm.calls).toBe(2)
-    const promoted = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
-    expect(promoted?.promotedSeq).toBeDefined()
+      const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(ea)).toBe(true)
+      expect(Exit.isSuccess(eb)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      const promoted = yield* SessionInput.findEntry(db, SessionMessage.ID.make(id))
+      expect(promoted?.promotedSeq).toBeDefined()
 
-    const msgs = yield* sessions.messages({ sessionID: chat.id })
-    const assistants = msgs.filter((msg) => msg.info.role === "assistant")
-    expect(assistants).toHaveLength(2)
-    const last = assistants.at(-1)
-    if (!last || last.info.role !== "assistant") throw new Error("expected second assistant")
-    expect(last.info.parentID).toBe(id)
-    expect(last.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const assistants = msgs.filter((msg) => msg.info.role === "assistant")
+      expect(assistants).toHaveLength(2)
+      const last = assistants.at(-1)
+      if (!last || last.info.role !== "assistant") throw new Error("expected second assistant")
+      expect(last.info.parentID).toBe(id)
+      expect(last.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
 
-    const inputs = yield* llm.inputs
-    expect(inputs).toHaveLength(2)
-    const messages = inputs.at(-1)?.messages
-    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
-  }),
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      const messages = inputs.at(-1)?.messages
+      if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+      expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    }),
   15_000,
 )
 
@@ -4448,75 +5478,75 @@ it.instance(
   "human prompt steers an active scheduled-task root at the next safe provider cycle",
   () =>
     Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const gate = yield* Deferred.make<void>()
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const { db } = yield* Database.Service
-    const chat = yield* sessions.create({
-      title: "Active Scheduled run",
-      metadata: { scheduledTaskID: "stk_active_steer", scheduledTaskRunID: "str_active_steer" },
-    })
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({
+        title: "Active Scheduled run",
+        metadata: { scheduledTaskID: "stk_active_steer", scheduledTaskRunID: "str_active_steer" },
+      })
 
-    yield* llm.hold("scheduled-first", deferredAsPromise(gate))
-    yield* llm.text("human-second")
+      yield* llm.hold("scheduled-first", deferredAsPromise(gate))
+      yield* llm.text("human-second")
 
-    const scheduled = yield* prompt
-      .hostPrompt(
-        {
+      const scheduled = yield* prompt
+        .hostPrompt(
+          {
+            sessionID: chat.id,
+            agent: "build",
+            model: ref,
+            parts: [{ type: "text", text: "scheduled objective" }],
+          },
+          { source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "str_active_steer" },
+        )
+        .pipe(Effect.forkChild)
+
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
+
+      const humanID = MessageID.ascending()
+      const human = yield* prompt
+        .prompt({
           sessionID: chat.id,
+          messageID: humanID,
           agent: "build",
           model: ref,
-          parts: [{ type: "text", text: "scheduled objective" }],
-        },
-        { source: SessionTurnProvenance.Source.ScheduledTaskRun, ref: "str_active_steer" },
+          parts: [{ type: "text", text: "human takes focus" }],
+        })
+        .pipe(Effect.forkChild)
+
+      yield* pollWithTimeout(
+        SessionInput.findEntry(db, SessionMessage.ID.make(humanID)).pipe(
+          Effect.map((entry) => (entry?.admissionClass === "user" ? entry : undefined)),
+        ),
+        "timed out waiting for Scheduled human focus frontier",
       )
-      .pipe(Effect.forkChild)
+      expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeUndefined()
+      expect(yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(chat.id))).toBe(
+        (yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.admittedSeq,
+      )
 
-    yield* llm.wait(1)
-    yield* waitForBusy(chat.id)
+      yield* Deferred.succeed(gate, void 0)
 
-    const humanID = MessageID.ascending()
-    const human = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        messageID: humanID,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "human takes focus" }],
-      })
-      .pipe(Effect.forkChild)
+      const [scheduledExit, humanExit] = yield* Effect.all([Fiber.await(scheduled), Fiber.await(human)])
+      expect(Exit.isSuccess(scheduledExit)).toBe(true)
+      expect(Exit.isSuccess(humanExit)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeDefined()
 
-    yield* pollWithTimeout(
-      SessionInput.findEntry(db, SessionMessage.ID.make(humanID)).pipe(
-        Effect.map((entry) => (entry?.admissionClass === "user" ? entry : undefined)),
-      ),
-      "timed out waiting for Scheduled human focus frontier",
-    )
-    expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeUndefined()
-    expect(yield* SessionInput.latestUserSeq(db, SessionSchema.ID.make(chat.id))).toBe(
-      (yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.admittedSeq,
-    )
+      const messages = yield* llm.inputs
+      expect(messages).toHaveLength(2)
+      const second = messages.at(-1)?.messages
+      if (!Array.isArray(second)) throw new Error("expected second LLM input")
+      expect(second.at(-1)).toEqual({ role: "user", content: "human takes focus" })
 
-    yield* Deferred.succeed(gate, void 0)
-
-    const [scheduledExit, humanExit] = yield* Effect.all([Fiber.await(scheduled), Fiber.await(human)])
-    expect(Exit.isSuccess(scheduledExit)).toBe(true)
-    expect(Exit.isSuccess(humanExit)).toBe(true)
-    expect(yield* llm.calls).toBe(2)
-    expect((yield* SessionInput.findEntry(db, SessionMessage.ID.make(humanID)))?.promotedSeq).toBeDefined()
-
-    const messages = yield* llm.inputs
-    expect(messages).toHaveLength(2)
-    const second = messages.at(-1)?.messages
-    if (!Array.isArray(second)) throw new Error("expected second LLM input")
-    expect(second.at(-1)).toEqual({ role: "user", content: "human takes focus" })
-
-    const transcript = yield* sessions.messages({ sessionID: chat.id })
-    const final = transcript.filter((message) => message.info.role === "assistant").at(-1)
-    if (!final || final.info.role !== "assistant") throw new Error("expected final Scheduled assistant")
-    expect(final.info.parentID).toBe(humanID)
-    expect(final.parts.some((part) => part.type === "text" && part.text === "human-second")).toBe(true)
+      const transcript = yield* sessions.messages({ sessionID: chat.id })
+      const final = transcript.filter((message) => message.info.role === "assistant").at(-1)
+      if (!final || final.info.role !== "assistant") throw new Error("expected final Scheduled assistant")
+      expect(final.info.parentID).toBe(humanID)
+      expect(final.parts.some((part) => part.type === "text" && part.text === "human-second")).toBe(true)
     }),
   15_000,
 )
@@ -4560,6 +5590,47 @@ noLLMServer.instance("assertNotBusy succeeds when idle", () =>
     const chat = yield* sessions.create({})
     const exit = yield* run.assertNotBusy(chat.id).pipe(Effect.exit)
     expect(Exit.isSuccess(exit)).toBe(true)
+  }),
+)
+
+orphanIt.instance("Synthetic admission keeps durable work pending when another local activation owns the Session", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const ownership = yield* SessionExecutionOwner.Service
+    const { db } = yield* Database.Service
+    const chat = yield* sessions.create({ title: "Synthetic wake contention" })
+    const sessionID = SessionSchema.ID.make(chat.id)
+
+    // Hold the exact process-local activation without creating a SessionRunState
+    // Runner. The wake fork must observe Busy and leave the already-committed
+    // Synthetic input for that owner rather than treating the contention as a
+    // failed admission.
+    const held = yield* ownership.tryAcquireLocal(sessionID)
+    expect(held.state).toBe("acquired")
+    if (held.state !== "acquired") return
+
+    const id = SessionMessage.ID.create()
+    const admitted = yield* prompt.admitSynthetic({
+      id,
+      sessionID,
+      content: { text: "peer wake" },
+      origin: SessionInput.SyntheticOrigin.make({
+        producer: SessionTurnProvenance.Source.HostPrompt,
+        actor: { type: "host" },
+      }),
+      admissionClass: "host",
+      delivery: "queue",
+    })
+
+    expect(admitted.id).toBe(id)
+    yield* Effect.sleep("25 millis")
+    const pending = yield* SessionInput.findEntry(db, id)
+    expect(pending?.promotedSeq).toBeUndefined()
+    expect(pending?.revokedSeq).toBeUndefined()
+    expect((yield* ownership.snapshot(sessionID)).generation).toBe(held.token.generation)
+
+    yield* ownership.release(held.token)
   }),
 )
 
@@ -4701,7 +5772,6 @@ if (process.platform === "win32") {
       ),
     30_000,
   )
-
 
   it.instance(
     "shell transports oversized Windows PowerShell source beyond the native argv boundary",
@@ -5505,6 +6575,62 @@ noLLMServer.instance(
       expect(text[1]?.includes("Read tool failed to read")).toBe(true)
       expect(text[2]).toBe("after-file")
 
+      yield* sessions.remove(session.id)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "disambiguates user-uploaded TypeScript .ts despite a false video/mp2t client MIME",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const code = "export const frames: number[] = [1, 2, 3]\n"
+      const msg = yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{
+          type: "file", filename: "renderer.ts", mime: "video/mp2t",
+          url: `data:video/mp2t;base64,${Buffer.from(code).toString("base64")}`,
+        }],
+      })
+      if (msg.info.role !== "user") throw new Error("expected user message")
+      const text = msg.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+      expect(text).toContain("TypeScript source candidate")
+      expect(text).toContain("export const frames")
+      const attachments = msg.parts.filter((part) => part.type === "file")
+      expect(attachments).toHaveLength(1)
+      expect(attachments[0]?.mime).toBe("text/plain")
+      expect(attachments[0]?.url).not.toContain("data:video/mp2t")
+      yield* sessions.remove(session.id)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "disambiguates workspace TypeScript file reference before model input",
+  () =>
+    Effect.gen(function* () {
+      const { directory: dir } = yield* TestInstance
+      const file = path.join(dir, "renderer.ts")
+      yield* writeText(file, "export interface Pixel { x: number }\n")
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+      const msg = yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "file", filename: "renderer.ts", mime: "video/mp2t", url: pathToFileURL(file).href }],
+      })
+      if (msg.info.role !== "user") throw new Error("expected user message")
+      const text = msg.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+      expect(text).toContain("TypeScript source candidate")
+      expect(text).toContain("export interface Pixel")
+      expect(msg.parts.some((part) => part.type === "file" && part.mime === "video/mp2t")).toBe(false)
       yield* sessions.remove(session.id)
     }),
   { config: cfg },

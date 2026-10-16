@@ -5,6 +5,8 @@ import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
+import { retryAfterAt } from "./limit-recovery-reset"
+import { isStaleReasoning } from "@opencode-ai/llm"
 
 export type Err = ReturnType<NamedError["toObject"]>
 
@@ -37,6 +39,7 @@ export type ProviderFailureClass =
   | "account-quota"
   | "account-rate-limit"
   | "public-quota"
+  | "rate-limit"
   | "request-admission"
   | "provider-transient"
   | "request-invalid"
@@ -65,6 +68,19 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
+// A 504 issued only after the upstream provider has already waited for an
+// entire idle-response window is substantially more expensive than an ordinary
+// transient 5xx. Stop rather than silently replaying another multi-minute wait;
+// the user can explicitly retry. Other gateway/network failures retain their budget.
+export const RETRY_MAX_UPSTREAM_IDLE_RETRIES = 0
+
+function upstreamIdleTimeout(error: Err) {
+  const body = SessionV1.APIError.isInstance(error) ? error.data.responseBody ?? "" : ""
+  const message = isRecord(error.data) && typeof error.data.message === "string" ? error.data.message : ""
+  const combined = `${message}\n${body}`
+  return /upstream idle timeout exceeded/i.test(combined) &&
+    ((SessionV1.APIError.isInstance(error) && error.data.statusCode === 504) || /\[504\]/.test(combined))
+}
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -77,6 +93,19 @@ const RETRYABLE_MESSAGE_PATTERNS = [
 ]
 
 const NON_RETRYABLE_MESSAGE_PATTERNS = [
+  // An upstream stream may already have published text or executed tools.
+  // EOF without a terminal disposition is not evidence that the request is
+  // safe to replay; recovery must be a new owned turn, not a physical retry.
+  /^Provider stream ended without a terminal finish event$/i,
+  /^OpenAI-compatible stream ended without a recognized finish_reason$/i,
+  /^OpenAI-compatible stream ended without a completed model step$/i,
+  // This is a local *already exhausted* progress deadline, not an upstream
+  // transient response. Replaying it up to five times would multiply the
+  // watchdog into a 25-minute busy/requesting Session.
+  /^Provider response timed out \((?:waiting for first content|provider stream idle), \d+ms\)/i,
+  // Local consumer/DB/snapshot stalls cannot be fixed by replaying the
+  // physical upstream request; doing so risks re-executing committed tools.
+  /^Local provider event processing stalled \(.+, \d+ms\)/i,
   /no allowed providers are available/i,
   /provider\.only.*permits only/i,
 ]
@@ -85,34 +114,11 @@ function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
 
-export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
+export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random(), now = Date.now()) {
   if (error) {
-    const headers = error.data.responseHeaders
-    if (headers) {
-      const retryAfterMs = headers["retry-after-ms"]
-      if (retryAfterMs) {
-        const parsedMs = Number.parseFloat(retryAfterMs)
-        if (!Number.isNaN(parsedMs)) {
-          return cap(parsedMs)
-        }
-      }
-
-      const retryAfter = headers["retry-after"]
-      if (retryAfter) {
-        const parsedSeconds = Number.parseFloat(retryAfter)
-        if (!Number.isNaN(parsedSeconds)) {
-          // convert seconds to milliseconds
-          return cap(Math.ceil(parsedSeconds * 1000))
-        }
-        // Try parsing as HTTP date format
-        const parsed = Date.parse(retryAfter) - Date.now()
-        if (!Number.isNaN(parsed) && parsed > 0) {
-          return cap(Math.ceil(parsed))
-        }
-      }
-
-      return cap(exponential(attempt, random))
-    }
+    const resetAt = retryResetAt(error, now)
+    if (resetAt !== undefined && resetAt >= now) return cap(resetAt - now)
+    if (error.data.responseHeaders) return cap(exponential(attempt, random))
   }
 
   return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
@@ -123,13 +129,6 @@ function exponential(attempt: number, random: number) {
   return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
 }
 
-function header(headers: Record<string, string> | undefined, name: string) {
-  if (!headers) return undefined
-  const direct = headers[name]
-  if (direct !== undefined) return direct
-  const match = Object.entries(headers).find(([key]) => key.toLowerCase() === name)
-  return match?.[1]
-}
 
 /**
  * Parse only standardized Retry-After evidence into an absolute deadline.
@@ -138,37 +137,15 @@ function header(headers: Record<string, string> | undefined, name: string) {
  */
 export function retryResetAt(error: SessionV1.APIError, now = Date.now()) {
   if (!Number.isSafeInteger(now) || now < 0) return undefined
-  const headers = error.data.responseHeaders
-  const decimal = /^(?:\d+(?:\.\d*)?|\.\d+)$/
-
-  const retryAfterMs = header(headers, "retry-after-ms")?.trim()
-  if (retryAfterMs !== undefined) {
-    if (!decimal.test(retryAfterMs)) return undefined
-    const milliseconds = Number(retryAfterMs)
-    const resetAt = now + Math.ceil(milliseconds)
-    return Number.isSafeInteger(resetAt) ? resetAt : undefined
-  }
-
-  const retryAfter = header(headers, "retry-after")?.trim()
-  if (!retryAfter) return undefined
-  if (decimal.test(retryAfter)) {
-    const seconds = Number(retryAfter)
-    const resetAt = now + Math.ceil(seconds * 1000)
-    return Number.isSafeInteger(resetAt) ? resetAt : undefined
-  }
-
-  // RFC HTTP-date forms begin with a weekday token. Do not feed malformed
-  // numeric-looking values (for example "-1" or "2seconds") into Date.parse,
-  // whose permissive legacy grammar can reinterpret them as unrelated dates.
-  if (!/^[A-Za-z]{3,}/.test(retryAfter)) return undefined
-  const absolute = Date.parse(retryAfter)
-  return Number.isSafeInteger(absolute) && absolute >= 0 ? absolute : undefined
+  return retryAfterAt(error.data.responseHeaders, now)
 }
 
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
+    if (promptRenderingFailure(error)) return undefined
+    if (isStaleReasoning([error.data.message, error.data.responseBody ?? ""].join("\n"))) return undefined
     // Client configuration errors like an invalid OpenRouter `provider.only`
     // must never be retried - the request will fail identically on every
     // attempt until the user clears the stale upstream-provider pin. The
@@ -208,7 +185,9 @@ export function retryable(error: Err, provider: string) {
       const body = parseJSON(error.data.responseBody)
       const workspace = str(body?.metadata?.workspace)
       const limitName = str(body?.metadata?.limitName)
-      const retryAfter = num(error.data.responseHeaders?.["retry-after"])
+      const now = Date.now()
+      const resetAt = retryResetAt(error, now)
+      const retryAfter = resetAt === undefined ? undefined : Math.max(0, (resetAt - now) / 1000)
       const resetIn = iife(() => {
         if (retryAfter === undefined) return ""
         const seconds = Math.max(0, Math.ceil(retryAfter))
@@ -242,6 +221,8 @@ export function retryable(error: Err, provider: string) {
 
   const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
+  if (matchesNonRetryableMessage(message)) return undefined
+  if (isStaleReasoning(message)) return undefined
   const lower = message.toLowerCase()
   if (lower.includes("too_many_requests")) return { message: "Too Many Requests" }
   if (lower.includes("exhausted") || lower.includes("unavailable")) return { message: "Provider is overloaded" }
@@ -266,6 +247,18 @@ export function classify(
 ): ProviderFailureDecision {
   const message = isRecord(error.data) && typeof error.data.message === "string" ? error.data.message : "Request failed"
   const resetAt = SessionV1.APIError.isInstance(error) ? retryResetAt(error, now) : undefined
+  const staleReasoningText = SessionV1.APIError.isInstance(error)
+    ? [error.data.message, error.data.responseBody ?? ""].join("\n")
+    : message
+
+  if (isStaleReasoning(staleReasoningText)) {
+    return {
+      class: "request-invalid",
+      retry: "none",
+      routeEffect: "none",
+      message,
+    }
+  }
 
   if (SessionV1.ContextOverflowError.isInstance(error)) {
     return {
@@ -358,6 +351,19 @@ export function classify(
         ...(resetAt === undefined ? {} : { resetAt }),
       }
     }
+
+    // A standardized Retry-After on an otherwise un-attributed 429 is a
+    // terminal, recoverable limit decision. It must settle this provider
+    // request immediately; durable recovery is a separate continuation.
+    if (status === 429 && resetAt !== undefined) {
+      return {
+        class: "rate-limit",
+        retry: "none",
+        routeEffect: "none",
+        message: error.data.message,
+        resetAt,
+      }
+    }
   }
 
   const legacy = retryable(error, provider)
@@ -392,12 +398,6 @@ function str(value: unknown) {
   return String(value)
 }
 
-function num(value: unknown) {
-  const parsed = Number.parseFloat(str(value))
-  if (Number.isNaN(parsed)) return undefined
-  return parsed
-}
-
 function parseJSON(value: unknown) {
   return iife(() => {
     try {
@@ -407,6 +407,14 @@ function parseJSON(value: unknown) {
       return undefined
     }
   })
+}
+
+function promptRenderingFailure(error: SessionV1.APIError) {
+  // Match the remote gateway's code, not an incidental mention of the token
+  // in a body containing echoed user input. A 5xx wrapper is not retry evidence.
+  if (/\[prompt_rendering_failed\]/i.test(error.data.message)) return true
+  const body = parseJSON(error.data.responseBody)
+  return body?.error?.code === "prompt_rendering_failed" || body?.code === "prompt_rendering_failed"
 }
 
 export function policy(opts: {
@@ -445,7 +453,8 @@ export function policy(opts: {
         })
       }
 
-      if (meta.attempt > RETRY_MAX_RETRIES) {
+      const maxRetries = upstreamIdleTimeout(error) ? RETRY_MAX_UPSTREAM_IDLE_RETRIES : RETRY_MAX_RETRIES
+      if (meta.attempt > maxRetries) {
         return Effect.gen(function* () {
           yield* observe
           return yield* Cause.done(meta.attempt)
@@ -453,8 +462,8 @@ export function policy(opts: {
       }
       return Effect.gen(function* () {
         yield* observe
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
+        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined, Math.random(), now)
         yield* opts.set({
           attempt: meta.attempt,
           message: decision.message,

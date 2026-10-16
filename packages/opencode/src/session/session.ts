@@ -8,6 +8,7 @@ import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provena
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import path from "path"
+import { createHash } from "node:crypto"
 import { BackgroundJob } from "@/background/job"
 import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
@@ -15,9 +16,13 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { EventV2 } from "@opencode-ai/core/event"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
+import { SessionShareTable, ShareCleanupTable } from "@opencode-ai/core/share/sql"
 
 import { NotFoundError } from "@/storage/storage"
 import { eq } from "drizzle-orm"
@@ -36,7 +41,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
-import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -55,6 +60,8 @@ import { SessionGroup } from "./group"
 import { Goal } from "@opencode-ai/core/goal"
 import { Plugin } from "@/plugin"
 import * as SessionContextProjector from "./context/projector"
+import { SessionSearch } from "@opencode-ai/core/session/search"
+import { snippet as searchSnippet } from "@opencode-ai/core/session/search-text"
 import { CHAT_PROJECT_ID } from "@opencode-ai/core/project/chat"
 import {
   chatSessionDirectoryKey,
@@ -110,6 +117,7 @@ export function fromRow(row: SessionRow): Info {
           providerID: ProviderV2.ID.make(row.model.providerID),
           ...(row.model.accountID ? { accountID: row.model.accountID } : {}),
           variant: row.model.variant,
+          ...(row.model.routeIntent ? { routeIntent: row.model.routeIntent } : {}),
         }
       : undefined,
     version: row.version,
@@ -126,6 +134,7 @@ export function fromRow(row: SessionRow): Info {
     },
     share,
     metadata: row.metadata ?? undefined,
+    humanInterjection: SessionMetadataOwnership.isHumanControllableWorker(row.metadata ?? undefined),
     revert,
     permission: row.permission ? [...row.permission] : undefined,
     pausedAt: row.paused_at ?? undefined,
@@ -240,6 +249,7 @@ const Model = Schema.Struct({
   providerID: ProviderV2.ID,
   accountID: optional(Schema.String),
   variant: optional(Schema.String),
+  routeIntent: optional(ProviderRouteIntent.Info),
 })
 
 export const Metadata = Schema.Record(Schema.String, Schema.Any)
@@ -261,6 +271,8 @@ export const Info = Schema.Struct({
   model: optional(Model),
   version: Schema.String,
   metadata: optional(Metadata),
+  /** Server-owned conversational/control capability; configuration stays producer-owned. */
+  humanInterjection: optional(Schema.Boolean),
   time: Time,
   pausedAt: optional(ArchivedTimestamp),
   permission: optional(PermissionV1.Ruleset),
@@ -280,6 +292,38 @@ export const GlobalInfo = Schema.Struct({
   project: Schema.NullOr(ProjectInfo),
 }).annotate({ identifier: "GlobalSession" })
 export type GlobalInfo = Types.DeepMutable<Schema.Schema.Type<typeof GlobalInfo>>
+
+export type PhysicalScope = {
+  readonly key: string
+  readonly projectID: ProjectV2.ID
+  readonly workspaceID?: WorkspaceV2.ID
+  readonly directory: string
+  readonly root: string
+}
+
+export type CodeToolPartRecord = {
+  readonly part: SessionV1.ToolPart
+  readonly scope: PhysicalScope
+}
+
+export type CodeRunSearchItem = {
+  readonly kind: "run"
+  readonly ref: string
+  readonly description: string
+  readonly sessionTitle: string
+  readonly createdAt: number
+  readonly sourceHash?: string
+  readonly replayOf?: string
+  readonly sourceRunID?: string
+}
+
+export type CodeRunSearchPage = {
+  readonly ok: true
+  readonly generation: string
+  readonly items: readonly CodeRunSearchItem[]
+  readonly remaining: number
+  readonly next: string | null
+}
 
 export const CreateInput = Schema.optional(
   Schema.Struct({
@@ -492,6 +536,24 @@ export interface Interface {
   }) => Effect.Effect<Info, NotFound>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
+  /**
+   * Index-only routing identity for server middleware. No large Session JSON,
+   * permissions, summary diffs, or mutable/runtime state crosses into JS.
+   * Missing IDs stay absent; the router retains its existing fallback policy.
+   */
+  readonly getRoutingLocation?: (
+    id: SessionID,
+  ) => Effect.Effect<Pick<Info, "directory" | "workspaceID"> | undefined>
+  /** Durable, instance-free addressed batch. Missing IDs stay missing. */
+  readonly getMany?: (ids: readonly SessionID[]) => Effect.Effect<ReadonlyMap<SessionID, Info>>
+  /** Producer-origin projection without hydrating large mutable Session data. */
+  readonly workerOriginsMany?: (
+    ids: readonly SessionID[],
+  ) => Effect.Effect<ReadonlyMap<SessionID, SessionMetadataOwnership.WorkerDelegationOrigin>>
+  /** Minimal immutable ancestry projection, addressed and bounded; no Instance startup. */
+  readonly parentIDsMany?: (ids: readonly SessionID[]) => Effect.Effect<ReadonlyMap<SessionID, SessionID | undefined>>
+  /** Bounded 64-level parent closure: ≤25 seeds per recursive SQLite statement. */
+  readonly ancestorParentIDsMany?: (ids: readonly SessionID[]) => Effect.Effect<ReadonlyMap<SessionID, SessionID | undefined>>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
   readonly setPaused: (input: { sessionID: SessionID; pausedAt?: number }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number | null }) => Effect.Effect<void>
@@ -538,6 +600,28 @@ export interface Interface {
     messageID: MessageID
     partID: PartID
   }) => Effect.Effect<SessionV1.Part | undefined>
+  /**
+   * Canonical physical execution scope for trust decisions such as CodeRun
+   * replay. Logical project identity is deliberately insufficient because one
+   * project may have multiple physical worktrees/workspaces.
+   */
+  readonly physicalScope: (sessionID: SessionID) => Effect.Effect<PhysicalScope, NotFound>
+  /**
+   * Resolve one persisted Code root by PartID without requiring callers to know
+   * its Session/Message IDs. The owner rehydrates projected ChunkDB data before
+   * exposing the ToolPart so consumers never interpret raw $cdbRef cells.
+   */
+  readonly getCodeToolPart: (partID: PartID) => Effect.Effect<CodeToolPartRecord | undefined, unknown>
+  /**
+   * Bounded, same-physical-scope CodeRun discovery over the source-free part
+   * search projection. Raw ToolPart source/input is never returned.
+   */
+  readonly searchCodeRuns: (input: {
+    readonly sessionID: SessionID
+    readonly query?: string
+    readonly limit?: number
+    readonly cursor?: string
+  }) => Effect.Effect<CodeRunSearchPage, NotFound | Error>
   readonly updatePart: <T extends SessionV1.Part>(part: T) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
@@ -742,6 +826,7 @@ const layer: Layer.Layer<
         agent: input.agent,
         model: input.model,
         metadata: input.metadata,
+        humanInterjection: SessionMetadataOwnership.isHumanControllableWorker(input.metadata),
         permission: input.permission ? [...input.permission] : undefined,
         cost: 0,
         tokens: EmptyTokens,
@@ -750,11 +835,42 @@ const layer: Layer.Layer<
           updated: Date.now(),
         },
       }
-      yield* Effect.logInfo("created", result)
+      // INFO is a hot-path operational signal, not a full Session snapshot.
+      // Flattening the entire Session here formats arbitrary-size permissions,
+      // metadata, and model selection for *every* concurrent worker creation.
+      // Emit bounded scalar identifiers; the authoritative row and creation
+      // event retain the complete Session object without any semantic change.
+      yield* Effect.logInfo("created", {
+        id: result.id,
+        projectID: result.projectID,
+        workspaceID: result.workspaceID,
+        parentID: result.parentID,
+        directory: result.directory,
+        agent: result.agent,
+        providerID: result.model?.providerID,
+        modelID: result.model?.id,
+        permissionCount: result.permission?.length ?? 0,
+      })
 
-      yield* publishCreated(result, input.worktree)
+      // Tier-1 creation deliberately skips InstanceContextMiddleware. Publish
+      // under the resolved physical + workspace location so directory/workspace
+      // scoped consumers never see a locationless or ambiguously-scoped event.
+      yield* publishCreated(result, input.worktree).pipe(
+        Effect.provideService(InstanceRef, {
+          directory: input.directory,
+          worktree: input.worktree,
+          project: input.project,
+        }),
+        Effect.provideService(WorkspaceRef, input.workspaceID),
+      )
       yield* groupSession(result)
-        .pipe(Effect.provideService(InstanceRef, { directory: input.directory, worktree: input.worktree, project: input.project }))
+        .pipe(
+          Effect.provideService(InstanceRef, {
+            directory: input.directory,
+            worktree: input.worktree,
+            project: input.project,
+          }),
+        )
         .pipe(Effect.forkIn(scope, { startImmediately: true }))
 
       return result
@@ -767,6 +883,94 @@ const layer: Layer.Layer<
       const row = yield* getFrom(readDb, id)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
       return fromRow(row)
+    })
+
+    const getRoutingLocation = Effect.fn("Session.getRoutingLocation")(function* (id: SessionID) {
+      const row = yield* readDb
+        .select({ directory: SessionTable.directory, workspaceID: SessionTable.workspace_id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, id))
+        .get()
+        .pipe(Effect.orDie)
+      return row
+        ? { directory: row.directory, workspaceID: row.workspaceID ?? undefined }
+        : undefined
+    })
+
+    const getMany = Effect.fn("Session.getMany")(function* (ids: readonly SessionID[]) {
+      const unique = [...new Set(ids)]
+      const result = new Map<SessionID, Info>()
+      // SQLite's parameter limit varies between shipped engines and versions.
+      // Keep bounded pages and use the authoritative V1 row decoder to ensure
+      // protected producer metadata has exactly the same semantics as get().
+      for (let offset = 0; offset < unique.length; offset += 400) {
+        const rows = yield* readDb.select().from(SessionTable)
+          .where(inArray(SessionTable.id, unique.slice(offset, offset + 400)))
+          .all().pipe(Effect.orDie)
+        for (const row of rows) result.set(SessionID.make(row.id), fromRow(row))
+      }
+      return result
+    })
+
+    const workerOriginsMany = Effect.fn("Session.workerOriginsMany")(function* (ids: readonly SessionID[]) {
+      const unique = [...new Set(ids)]
+      const result = new Map<SessionID, SessionMetadataOwnership.WorkerDelegationOrigin>()
+      // Producer identity is owned by the Session row. Two selected columns
+      // avoid hydrating summary_diffs, permission, model, revert, and other
+      // potentially huge/irrelevant fields for every delegated worker.
+      for (let offset = 0; offset < unique.length; offset += 400) {
+        const rows = yield* readDb.select({ id: SessionTable.id, metadata: SessionTable.metadata })
+          .from(SessionTable)
+          .where(inArray(SessionTable.id, unique.slice(offset, offset + 400)))
+          .all()
+          .pipe(Effect.orDie)
+        for (const row of rows) {
+          const origin = SessionMetadataOwnership.workerDelegation(row.metadata ?? undefined)
+          if (origin) result.set(SessionID.make(row.id), origin)
+        }
+      }
+      return result
+    })
+
+    const parentIDsMany = Effect.fn("Session.parentIDsMany")(function* (ids: readonly SessionID[]) {
+      const unique = [...new Set(ids)]
+      const parents = new Map<SessionID, SessionID | undefined>()
+      for (let offset = 0; offset < unique.length; offset += 400) {
+        const rows = yield* readDb
+          .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+          .from(SessionTable)
+          .where(inArray(SessionTable.id, unique.slice(offset, offset + 400)))
+          .all()
+          .pipe(Effect.orDie)
+        for (const row of rows) parents.set(SessionID.make(row.id), row.parentID ?? undefined)
+      }
+      return parents
+    })
+
+    const ancestorParentIDsMany = Effect.fn("Session.ancestorParentIDsMany")(function* (ids: readonly SessionID[]) {
+      const unique = [...new Set(ids)]
+      const parents = new Map<SessionID, SessionID | undefined>()
+      // UNION ALL is depth-fenced: cycles cannot turn an untrusted Session
+      // graph into an unbounded recursive query. Twenty-five roots keep the
+      // maximum intermediate row count at 25 * 64 per SQLite statement.
+      for (let offset = 0; offset < unique.length; offset += 25) {
+        const page = unique.slice(offset, offset + 25)
+        const rows = yield* readDb.all<{ id: string; parent_id: string | null }>(sql`
+          WITH RECURSIVE ancestry(id, parent_id, depth) AS (
+            SELECT id, parent_id, 0
+            FROM session
+            WHERE id IN (SELECT value FROM json_each(${JSON.stringify(page)}))
+            UNION ALL
+            SELECT parent.id, parent.parent_id, ancestry.depth + 1
+            FROM session AS parent
+            JOIN ancestry ON parent.id = ancestry.parent_id
+            WHERE ancestry.depth < 63
+          )
+          SELECT DISTINCT id, parent_id FROM ancestry
+        `).pipe(Effect.orDie)
+        for (const row of rows) parents.set(SessionID.make(row.id), row.parent_id ? SessionID.make(row.parent_id) : undefined)
+      }
+      return parents
     })
 
     const getForMutation = Effect.fn("Session.getForMutation")(function* (id: SessionID) {
@@ -871,11 +1075,61 @@ const layer: Layer.Layer<
         // always "a group has at least one live member".
         const groups = Option.getOrUndefined(yield* Effect.serviceOption(SessionGroup.Service))
         if (groups) {
-          yield* groups.detachDeletedSession(sessionID).pipe(
-            Effect.catchCause((cause) => Effect.logError("failed to detach deleted session from groups", { sessionID, cause })),
-          )
+          yield* groups
+            .detachDeletedSession(sessionID)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("failed to detach deleted session from groups", { sessionID, cause }),
+              ),
+            )
         }
 
+        // Preserve remote cleanup authority before SessionTable deletion
+        // cascades session_share. The share id is also the outbox idempotency
+        // key, so retries cannot create duplicate cleanup rows.
+        const share = yield* db
+          .select({
+            id: SessionShareTable.id,
+            secret: SessionShareTable.secret,
+            url: SessionShareTable.url,
+            baseUrl: SessionShareTable.delete_base_url,
+            apiFamily: SessionShareTable.delete_api_family,
+            accountID: SessionShareTable.delete_account_id,
+            orgID: SessionShareTable.delete_org_id,
+          })
+          .from(SessionShareTable)
+          .where(eq(SessionShareTable.session_id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (share) {
+          let legacyRoute: { baseUrl: string } | undefined
+          try {
+            const link = new URL(share.url)
+            // Historical legacy shares use the public `/share/<id>` path.
+            // Do not guess the Console route for other URL shapes: their
+            // account/org ownership cannot be reconstructed after the fact.
+            if (link.pathname.startsWith("/share/")) legacyRoute = { baseUrl: link.origin }
+          } catch {
+            // Retain an unresolved row below; cleanup must fail closed rather
+            // than route a malformed historical URL to the current account.
+          }
+          yield* db
+            .insert(ShareCleanupTable)
+            .values({
+              share_id: share.id,
+              session_id: sessionID,
+              secret: share.secret,
+              // Legacy rows predate route capture; their share URL origin is
+              // the only safe destination fallback available at deletion.
+              base_url: share.baseUrl ?? legacyRoute?.baseUrl,
+              api_family: share.apiFamily ?? (legacyRoute ? "share" : "unknown"),
+              account_id: share.accountID,
+              org_id: share.orgID,
+            })
+            .onConflictDoNothing({ target: ShareCleanupTable.share_id })
+            .run()
+            .pipe(Effect.orDie)
+        }
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
         // Session projectors commit synchronously with durable publication, so
         // by this point the deleted row is gone. Reclaim only managed Chat
@@ -925,6 +1179,242 @@ const layer: Layer.Layer<
         sessionID: row.session_id,
         messageID: row.message_id,
       } as SessionV1.Part
+    })
+
+    const physicalRoot = (input: {
+      projectID: ProjectV2.ID
+      workspaceID?: WorkspaceV2.ID | null
+      sessionDirectory: string
+      projectWorktree: string
+      workspaceDirectory?: string | null
+    }) => {
+      // A concrete workspace directory is the strongest physical identity.
+      // When a workspace exists but has no persisted directory, fail narrower
+      // by using the Session directory rather than conflating physical roots.
+      if (input.workspaceID) return FSUtil.resolve(input.workspaceDirectory ?? input.sessionDirectory)
+      // Chat sessions intentionally allocate independent physical directories
+      // beneath the shared chat project; do not let one chat root replay
+      // scratch CodeRuns from another merely because ProjectID is shared.
+      if (input.projectID === ProjectV2.ID.make(CHAT_PROJECT_ID)) return FSUtil.resolve(input.sessionDirectory)
+      return FSUtil.resolve(input.projectWorktree)
+    }
+
+    const scopeProjection = (sessionID: SessionID) =>
+      readDb
+        .select({
+          projectID: SessionTable.project_id,
+          workspaceID: SessionTable.workspace_id,
+          sessionDirectory: SessionTable.directory,
+          projectWorktree: ProjectTable.worktree,
+          workspaceDirectory: WorkspaceTable.directory,
+        })
+        .from(SessionTable)
+        .innerJoin(ProjectTable, eq(ProjectTable.id, SessionTable.project_id))
+        .leftJoin(WorkspaceTable, eq(WorkspaceTable.id, SessionTable.workspace_id))
+        .where(eq(SessionTable.id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+
+    const physicalScope: Interface["physicalScope"] = Effect.fn("Session.physicalScope")(function* (sessionID) {
+      const row = yield* scopeProjection(sessionID)
+      if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${sessionID}` }))
+      const root = physicalRoot(row)
+      return {
+        key: root,
+        projectID: row.projectID,
+        ...(row.workspaceID ? { workspaceID: row.workspaceID } : {}),
+        directory: row.sessionDirectory,
+        root,
+      }
+    })
+
+    const getCodeToolPart: Interface["getCodeToolPart"] = Effect.fn("Session.getCodeToolPart")(function* (partID) {
+      const row = yield* readDb
+        .select({
+          partID: PartTable.id,
+          messageID: PartTable.message_id,
+          sessionID: PartTable.session_id,
+          data: PartTable.data,
+          projectID: SessionTable.project_id,
+          workspaceID: SessionTable.workspace_id,
+          sessionDirectory: SessionTable.directory,
+          projectWorktree: ProjectTable.worktree,
+          workspaceDirectory: WorkspaceTable.directory,
+        })
+        .from(PartTable)
+        .innerJoin(SessionTable, eq(SessionTable.id, PartTable.session_id))
+        .innerJoin(ProjectTable, eq(ProjectTable.id, SessionTable.project_id))
+        .leftJoin(WorkspaceTable, eq(WorkspaceTable.id, SessionTable.workspace_id))
+        .where(eq(PartTable.id, partID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return
+
+      const data = yield* EventV2.resolveProjectionRef(readDb, row.sessionID, "part.data", row.data)
+      const part = (yield* Schema.decodeUnknownEffect(SessionV1.ToolPart)({
+        ...(data as Record<string, unknown>),
+        id: row.partID,
+        sessionID: row.sessionID,
+        messageID: row.messageID,
+      })) as SessionV1.ToolPart
+      if (part.tool !== "code") return
+
+      const root = physicalRoot(row)
+      return {
+        part,
+        scope: {
+          key: root,
+          projectID: row.projectID,
+          ...(row.workspaceID ? { workspaceID: row.workspaceID } : {}),
+          directory: row.sessionDirectory,
+          root,
+        },
+      }
+    })
+
+    const searchCodeRuns: Interface["searchCodeRuns"] = Effect.fn("Session.searchCodeRuns")(function* (input) {
+      const scope = yield* physicalScope(input.sessionID)
+      const limit = Math.max(1, Math.min(25, Math.floor(input.limit ?? 8)))
+      const query = input.query?.trim() ?? ""
+      const queryHash = createHash("sha256").update(query).digest("hex").slice(0, 16)
+
+      const scopeClauses: SQL[] = [sql`s.project_id = ${scope.projectID}`]
+      if (scope.projectID === ProjectV2.ID.make(CHAT_PROJECT_ID)) {
+        scopeClauses.push(sql`s.directory = ${scope.directory}`)
+      } else if (scope.workspaceID) {
+        scopeClauses.push(sql`s.workspace_id = ${scope.workspaceID}`)
+      } else {
+        scopeClauses.push(sql`s.workspace_id IS NULL`)
+        // Logical ProjectID can be shared by multiple physical clones. Replay
+        // authority is keyed by physical root, so run discovery must use the
+        // same boundary instead of leaking sibling-clone history.
+        const storageRoot = process.platform === "win32" ? scope.root.replaceAll("\\", "/") : scope.root
+        const prefix = storageRoot.endsWith("/") ? storageRoot : `${storageRoot}/`
+        scopeClauses.push(sql`(s.directory = ${storageRoot} OR substr(s.directory, 1, ${prefix.length}) = ${prefix})`)
+      }
+
+      const watermark = yield* readDb
+        .get<{ updated: number; count: number }>(
+          sql`
+          SELECT
+            COALESCE(MAX(s.time_updated), 0) AS updated,
+            COUNT(*) AS count
+          FROM session s
+          WHERE ${sql.join(scopeClauses, sql` AND `)}
+        `,
+        )
+        .pipe(Effect.orDie)
+      const generation = `runs:${createHash("sha256")
+        .update(`${scope.key}\0${watermark?.updated ?? 0}\0${watermark?.count ?? 0}`)
+        .digest("hex")
+        .slice(0, 16)}`
+
+      let offset = 0
+      if (input.cursor) {
+        try {
+          const decoded = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) as {
+            generation?: unknown
+            queryHash?: unknown
+            offset?: unknown
+          }
+          if (
+            decoded.generation !== generation ||
+            decoded.queryHash !== queryHash ||
+            !Number.isSafeInteger(decoded.offset) ||
+            (decoded.offset as number) < 0
+          ) {
+            throw new Error("stale")
+          }
+          offset = decoded.offset as number
+        } catch {
+          return yield* Effect.fail(new Error("The code.search runs cursor is invalid or stale."))
+        }
+      }
+
+      const match = SessionSearch.matchQuery(`tool code action run ${query}`)
+      if (!match) {
+        return {
+          ok: true,
+          generation,
+          items: [],
+          remaining: 0,
+          next: null,
+        }
+      }
+
+      type Row = {
+        readonly part_id: string
+        readonly session_title: string
+        readonly time_created: number
+        readonly search_text: string
+        readonly total: number
+        readonly score: number
+      }
+
+      const rows = yield* readDb
+        .all<Row>(
+          sql`
+          WITH ranked AS (
+            SELECT part_fts.rowid AS rowid, rank AS score
+            FROM (
+              SELECT p.rowid
+              FROM session s
+              JOIN part p ON p.session_id = s.id
+              WHERE ${sql.join(scopeClauses, sql` AND `)}
+                AND p.search_text LIKE 'tool:code action:run%'
+            ) scoped
+            CROSS JOIN part_fts
+            WHERE part_fts.rowid = scoped.rowid
+              AND part_fts MATCH ${match}
+          )
+          SELECT
+            p.id AS part_id,
+            s.title AS session_title,
+            p.time_created,
+            p.search_text,
+            ranked.score,
+            COUNT(*) OVER() AS total
+          FROM ranked
+          JOIN part p ON p.rowid = ranked.rowid
+          JOIN session s ON s.id = p.session_id
+          ORDER BY ranked.score, p.time_created DESC, p.id DESC
+          LIMIT ${limit}
+          OFFSET ${offset}
+        `,
+        )
+        .pipe(Effect.mapError(() => new Error("Code run history search could not be executed.")))
+
+      const total = rows[0]?.total ?? 0
+      const nextOffset = offset + rows.length
+      const terms = SessionSearch.matchTerms(query)
+      const field = (text: string, label: string) => {
+        const match = text.match(new RegExp(`(?:^| )${label}:([^ ]+)`))
+        return match?.[1]
+      }
+      const items = rows.map((row) => {
+        const description = searchSnippet(row.search_text, terms)
+        return {
+          kind: "run" as const,
+          ref: `run:${row.part_id}`,
+          description,
+          sessionTitle: row.session_title,
+          createdAt: row.time_created,
+          ...(field(row.search_text, "source") ? { sourceHash: field(row.search_text, "source") } : {}),
+          ...(field(row.search_text, "replay") ? { replayOf: field(row.search_text, "replay") } : {}),
+          ...(field(row.search_text, "sourceRun") ? { sourceRunID: field(row.search_text, "sourceRun") } : {}),
+        }
+      })
+
+      return {
+        ok: true,
+        generation,
+        items,
+        remaining: Math.max(0, total - nextOffset),
+        next:
+          nextOffset < total
+            ? Buffer.from(JSON.stringify({ generation, queryHash, offset: nextOffset }), "utf8").toString("base64url")
+            : null,
+      }
     })
 
     const createForLocation = Effect.fn("Session.createForLocation")(function* (
@@ -979,10 +1469,10 @@ const layer: Layer.Layer<
             }
           : undefined,
         {
-        project: ctx.project,
-        directory: ctx.directory,
-        worktree: ctx.worktree,
-        workspaceID: input?.workspaceID ?? workspace,
+          project: ctx.project,
+          directory: ctx.directory,
+          worktree: ctx.worktree,
+          workspaceID: input?.workspaceID ?? workspace,
         },
       )
     })
@@ -1038,9 +1528,7 @@ const layer: Layer.Layer<
       }).pipe(
         Effect.catchDefect((defect) => {
           if (!(defect instanceof SessionProjector.SessionAlreadyProjected)) return Effect.die(defect)
-          return getFrom(db, input.id).pipe(
-            Effect.flatMap((row) => (row ? accept(fromRow(row)) : Effect.die(defect))),
-          )
+          return getFrom(db, input.id).pipe(Effect.flatMap((row) => (row ? accept(fromRow(row)) : Effect.die(defect))))
         }),
       )
     })
@@ -1165,8 +1653,7 @@ const layer: Layer.Layer<
           if (!includedIDs.has(msg.info.parentID)) continue
         } else if (msg.info.role === "user") {
           const provenance = SessionTurnProvenance.resolve(msg)
-          const causalRoot =
-            provenance?.owner === "host" ? SessionTurnProvenance.causalRootMessageID(msg) : undefined
+          const causalRoot = provenance?.owner === "host" ? SessionTurnProvenance.causalRootMessageID(msg) : undefined
           // Host continuations carry capabilities/checkpoint identity from their
           // causal root. If that root is not in the fork, the continuation and
           // its descendants must not survive as a dangling synthetic turn.
@@ -1177,20 +1664,23 @@ const layer: Layer.Layer<
       }
 
       const idMap = new Map<string, MessageID>()
+      // Compaction markers refer forward to the assistant checkpoint selected
+      // by promotion. Allocate the entire fork identity map before cloning
+      // parts so both forward and backward pointers stay in the child session.
+      for (const msg of prefix) {
+        if (includedIDs.has(msg.info.id)) idMap.set(msg.info.id, MessageID.ascending())
+      }
 
       for (const msg of prefix) {
         // Forks materialize a causally closed effective history, not isolated
         // rows whose parent/provenance pointers still target the source session.
         if (!includedIDs.has(msg.info.id)) continue
 
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
+        const newID = idMap.get(msg.info.id)!
 
         const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
         const provenance =
-          msg.info.role === "user" &&
-          msg.info.provenance?.owner === "host" &&
-          msg.info.provenance.sourceMessageID
+          msg.info.role === "user" && msg.info.provenance?.owner === "host" && msg.info.provenance.sourceMessageID
             ? {
                 ...msg.info.provenance,
                 sourceMessageID: idMap.get(msg.info.provenance.sourceMessageID)!,
@@ -1227,8 +1717,17 @@ const layer: Layer.Layer<
             // Collapsed tool output is already handled via compacted flag at compile time,
             // but also materialize as truncated here for fork hygiene.
           }
-          if (partToWrite.type === "compaction" && (partToWrite as any).tail_start_id) {
-            ;(partToWrite as any).tail_start_id = idMap.get((partToWrite as any).tail_start_id)
+          if (partToWrite.type === "compaction") {
+            if (partToWrite.tail_start_id) {
+              const mapped = idMap.get(partToWrite.tail_start_id)
+              if (!mapped) partToWrite.pending = true
+              partToWrite.tail_start_id = mapped
+            }
+            if (partToWrite.checkpoint_message_id) {
+              const mapped = idMap.get(partToWrite.checkpoint_message_id)
+              if (!mapped) partToWrite.pending = true
+              partToWrite.checkpoint_message_id = mapped
+            }
           }
           // Preserve callID verbatim (provider-visible identity) — regenerate id only
           yield* updatePart(partToWrite)
@@ -1283,6 +1782,7 @@ const layer: Layer.Layer<
           ...current,
           ...info,
           metadata,
+          humanInterjection: SessionMetadataOwnership.isHumanControllableWorker(metadata),
           time: info.time ? { ...current.time, ...info.time } : current.time,
           share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
           summary: info.summary === null ? undefined : (info.summary ?? current.summary),
@@ -1359,10 +1859,7 @@ const layer: Layer.Layer<
             })
           }
 
-          const metadata = SessionMetadataOwnership.rebindDelegatedWorkerModel(
-            current.metadata,
-            input.delegationModel,
-          )
+          const metadata = SessionMetadataOwnership.rebindDelegatedWorkerModel(current.metadata, input.delegationModel)
           if (!metadata) {
             return yield* new DelegatedWorkerSelectionConflictError({
               sessionID: input.sessionID,
@@ -1522,6 +2019,11 @@ const layer: Layer.Layer<
       fork: fork as Interface["fork"],
       touch,
       get,
+      getRoutingLocation,
+      getMany,
+      workerOriginsMany,
+      parentIDsMany,
+      ancestorParentIDsMany,
       setTitle,
       setPaused,
       setArchived,
@@ -1543,6 +2045,9 @@ const layer: Layer.Layer<
       removePart,
       updatePart,
       getPart,
+      physicalScope,
+      getCodeToolPart,
+      searchCodeRuns,
       updatePartDelta,
       findMessage,
     })
@@ -1620,7 +2125,7 @@ function listByProject(
     .select()
     .from(SessionTable)
     .where(and(...conditions))
-    .orderBy(desc(SessionTable.time_updated))
+    .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
     .limit(limit)
     .all()
     .pipe(

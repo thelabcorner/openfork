@@ -5,6 +5,7 @@ import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
 import { SessionTurnProvenance as SharedTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import {
@@ -25,6 +26,7 @@ import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
 import { TurnCheckpoint } from "./checkpoint"
 import { Session } from "./session"
+import { SwarmV2 } from "@opencode-ai/core/swarm"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
@@ -56,6 +58,7 @@ import { Permission } from "@/permission"
 import { BackgroundJob } from "@/background/job"
 import { SessionStatus } from "./status"
 import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { SessionExecutionOwner } from "@opencode-ai/core/session/execution-owner"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
@@ -66,6 +69,8 @@ import { Image } from "@/image/image"
 import { SessionIngress, formatMonitorEvents, interactionGate } from "./ingress"
 import { Question } from "@/question"
 import { decodeDataUrl } from "@/util/data-url"
+import { isAmbiguousTsPath, resolveAttachmentMime } from "@/util/media"
+import { remuxMpegTransportStream } from "@/exchange/media-preview"
 import {
   Cause,
   DateTime,
@@ -84,6 +89,9 @@ import {
 import { InstanceState } from "@/effect/instance-state"
 import * as SubagentDelegation from "./subagent-delegation"
 import { SessionRunState } from "./run-state"
+import { SessionOperatorRecovery } from "./operator-stop"
+import { requireResumeReady } from "./resume-recovery"
+import { DelegatedWorkerPolicy } from "./delegated-worker-policy"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { userChildEnvironment } from "@/util/javascript-runtime"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -92,10 +100,17 @@ import { Database } from "@opencode-ai/core/database/database"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import type { ProviderRouteResolution } from "@opencode-ai/core/provider-route-resolution"
+import { ProviderRoute } from "@opencode-ai/core/provider-route"
+import { MaintenanceRoute } from "./maintenance-route"
 import type { UsageRouteAttribution } from "@opencode-ai/core/usage/route-attribution"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionLimitRecovery } from "@opencode-ai/core/session/limit-recovery"
+import { SessionAttachment } from "@opencode-ai/core/session/attachment"
+import type { SessionAttachment as SessionAttachmentContract } from "@opencode-ai/schema/session-attachment"
+type SessionAttachmentOrigin = SessionAttachmentContract.Origin
+import { SessionLimitRecovery as SessionLimitRecoveryContract } from "@opencode-ai/schema/session-limit-recovery"
 import { SessionMessage as CurrentSessionMessage } from "@opencode-ai/core/session/message"
 import { SessionSchema as CoreSessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTitle } from "@opencode-ai/core/session/title"
@@ -129,7 +144,12 @@ import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
 import { SessionMetadataOwnership } from "@opencode-ai/core/session/metadata-ownership"
 import { ScheduledTaskProvenance } from "@opencode-ai/core/scheduled-task/provenance"
 import { makeV1SpecialAgentAnchor } from "@/special-agent/v1-anchor"
+import { requiresAccountBackedHostedRoute } from "@/special-agent/hosted-route-policy"
 import * as GoalAuditContext from "./goal-audit-context"
+import {
+  nextProviderTimeoutContinuationAttempt,
+  PROVIDER_TIMEOUT_CONTINUATION_PROMPT,
+} from "./provider-timeout-continuation"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -284,6 +304,31 @@ function formatMcpResourceBytes(value: number) {
   return `${Math.ceil(value / (1024 * 1024))} MB`
 }
 
+/**
+ * Classify the semantic origin of a durable V1 file part at the trusted
+ * admission boundary. Only an inline `data:` payload with a non-resource source
+ * is a genuine user upload; `file://` references, MCP resources, and
+ * Read-tool-derived output are never handoff-eligible.
+ */
+function classifyUploadOrigin(part: SessionV1.FilePartInput): SessionAttachmentOrigin {
+  if (part.source?.type === "resource") return "mcp-resource"
+  if (part.source?.type === "file" || part.source?.type === "symbol") return "workspace-file"
+  if (part.url.startsWith("data:")) return "user-upload"
+  if (part.url.startsWith("file:")) return "workspace-file"
+  return "legacy-unknown"
+}
+
+/** Extract raw bytes from an inline data URL, or undefined when not inline bytes. */
+function inlineUploadBytes(url: string): Uint8Array | undefined {
+  if (!url.startsWith("data:")) return undefined
+  const idx = url.indexOf(",")
+  if (idx === -1) return undefined
+  const head = url.slice(0, idx)
+  const body = url.slice(idx + 1)
+  if (head.includes(";base64")) return Uint8Array.from(Buffer.from(body, "base64"))
+  return Uint8Array.from(Buffer.from(decodeURIComponent(body), "utf8"))
+}
+
 function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
@@ -303,18 +348,32 @@ export interface Interface {
    */
   readonly pause: (sessionID: SessionID) => Effect.Effect<void>
   /**
-   * Synchronous public-user admission preflight. HTTP async prompt routes use
-   * this before forking so producer-owned-but-user-drivable roots never return
-   * a false 204 while opaque worker/special-agent Sessions remain fenced.
+   * Strict preflight for operations such as command expansion and shell input
+   * that have authority beyond admitting a conversational turn.
    */
   readonly assertUserPromptable: (sessionID: SessionID) => Effect.Effect<Session.Info, HostOwnedSessionError>
+  /**
+   * Ordinary interactive prompt preflight. Unlike assertUserPromptable, this
+   * admits well-formed root and nested delegated workers for conversational user turns
+   * while preserving the producer-owned aggregate boundary.
+   */
+  readonly assertInteractiveUserPromptable: (sessionID: SessionID) => Effect.Effect<Session.Info, HostOwnedSessionError>
   /**
    * Canonical Goal verification ingress. Durably records the audit request,
    * interrupts active worker/tool execution to a finalized idle state, then
    * launches the independent auditor immediately.
    */
   readonly requestGoalAudit: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Startup/periodic recovery of an already-durable audit request. Unlike
+   * explicit user verification, this MUST NOT reset its reservation/lineage.
+   */
+  readonly recoverGoalAudit: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
+  /** Alias of canonical prompt ingress; delegated workers retain their protected selection. */
+  readonly interactivePrompt: (
+    input: PromptInput,
+  ) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
   /**
    * Trusted first-party user action. Public clients cannot choose provenance;
    * domain handlers use this seam for durable user-owned actions whose semantic
@@ -359,7 +418,19 @@ export interface Interface {
     },
     provenance?: HostPromptProvenance,
   ) => Effect.Effect<SessionV1.WithParts, HostOwnedSessionError>
+  /**
+   * Switch an exact live provider attempt to a new model. This admits a durable
+   * host Synthetic continuation before generation-fenced cancellation; tools
+   * and compaction are rejected by the telemetry owner.
+   */
+  readonly switchModel: (input: {
+    sessionID: SessionID
+    assistantMessageID: string
+    requestSentAt: number
+    model: { providerID: string; modelID: string; accountID?: string; variant?: string }
+  }) => Effect.Effect<boolean>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
+  readonly retireLimitRecoveryContinuations: (sessionID: SessionID) => Effect.Effect<void>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | HostOwnedSessionError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
@@ -394,8 +465,10 @@ const layer = Layer.effect(
     const status = yield* SessionStatus.Service
     const telemetry = yield* SessionTelemetry.Service
     const sessions = yield* Session.Service
+    const swarms = yield* SwarmV2.Service
     const agents = yield* Agent.Service
     const provider = yield* Provider.Service
+    const providerRoutes = yield* ProviderRoute.Service
     const processor = yield* SessionProcessor.Service
     const compaction = yield* SessionCompaction.Service
     const plugin = yield* Plugin.Service
@@ -421,6 +494,8 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
+    const executionOwner = yield* SessionExecutionOwner.Service
+    const operatorRecovery = yield* SessionOperatorRecovery.Service
     const revert = yield* SessionRevert.Service
     const turnCheckpoint = yield* TurnCheckpoint.Service
     const summary = yield* SessionSummary.Service
@@ -440,6 +515,59 @@ const layer = Layer.effect(
     const specialAgents = yield* SpecialAgentSession.Service
     const { db } = database
     const titleLocks = KeyedMutex.makeUnsafe<SessionID>()
+    const clearLimitRecovery = Effect.fn("SessionPrompt.clearLimitRecovery")(function* (
+      sessionID: SessionID,
+      generation: number,
+    ) {
+      const cleared = yield* SessionLimitRecovery.cancel(db, { sessionID, generation })
+      if (cleared) yield* events.publish(SessionLimitRecoveryContract.Cleared, { sessionID, generation })
+      return cleared
+    })
+
+    const retireLimitRecoveryContinuations = Effect.fn("SessionPrompt.retireLimitRecoveryContinuations")(function* (
+      messages: readonly SessionV1.WithParts[],
+    ) {
+      yield* Effect.forEach(
+        messages,
+        (message) => {
+          if (message.info.role !== "user") return Effect.void
+          const provenance = message.info.provenance
+          if (
+            provenance?.owner !== "host" ||
+            provenance.source !== SessionTurnProvenance.Source.RecoveryContinuation ||
+            provenance.lifetime === "historical"
+          )
+            return Effect.void
+          // Recovery continuations are structural provider-user boundaries only
+          // while their retry chain is active. Once the chain settles, keeping
+          // them active would permanently outrank user messages that were
+          // already queued before the original limit stop (their timestamps are
+          // necessarily older). Historical lifetime preserves transcript/model
+          // context while removing those turns from active-user selection.
+          return sessions.updateMessage({
+            ...message.info,
+            provenance: { ...provenance, lifetime: "historical" as const },
+          })
+        },
+        { concurrency: 4, discard: true },
+      )
+    })
+
+    const retireCurrentLimitRecoveryContinuations = Effect.fn("SessionPrompt.retireCurrentLimitRecoveryContinuations")(
+      function* (sessionID: SessionID) {
+        yield* retireLimitRecoveryContinuations(yield* sessions.messages({ sessionID }).pipe(Effect.orDie))
+      },
+    )
+
+    const clearCurrentLimitRecovery = Effect.fn("SessionPrompt.clearCurrentLimitRecovery")(function* (
+      sessionID: SessionID,
+    ) {
+      const recovery = yield* SessionLimitRecovery.get(db, sessionID)
+      if (!recovery) return false
+      yield* retireCurrentLimitRecoveryContinuations(sessionID)
+      return yield* clearLimitRecovery(sessionID, recovery.generation)
+    })
+
     const usageRoute = (
       route?: ProviderRouteResolution.RouteAttribution,
     ): UsageRouteAttribution.Committed | undefined => {
@@ -451,8 +579,23 @@ const layer = Layer.effect(
 
     type MaintenanceModelResolution = {
       readonly model: Provider.Model
-      readonly route?: ProviderRouteResolution.RouteAttribution
+      readonly route?: UsageRouteAttribution.Committed
     }
+
+    /**
+     * Recover the parent Session's committed route attribution for one provider.
+     *
+     * Maintenance and recovery entry points (manual retitle, Goal audit
+     * recovery) restart outside the primary turn and therefore have no in-flight
+     * routed result. They must inherit the exact committed route generation
+     * rather than resolving a transient route or falling back to ambient
+     * provider auth, which is how a hosted Session ends up on the Public free
+     * tier it does not own.
+     */
+    const committedRouteAttribution = (input: {
+      sessionID: CoreSessionSchema.ID
+      providerID: ProviderV2.ID
+    }) => MaintenanceRoute.accountAttributionFromBinding(providerRoutes, input)
 
     const resolveMaintenanceModel = Effect.fn("SessionPrompt.resolveMaintenanceModel")(function* (input: {
       sessionID: SessionID
@@ -467,74 +610,15 @@ const layer = Layer.effect(
       explicitOverride?: boolean
       route?: ProviderRouteResolution.RouteAttribution
     }) {
-      if (input.route?.providerID === input.providerID) {
-        if (
-          input.explicitAccount &&
-          input.accountID &&
-          (input.route.routeKind !== "account" || input.route.accountID !== input.accountID)
-        ) {
-          yield* Effect.logWarning("maintenance model account conflicts with committed route", {
-            sessionID: input.sessionID,
-            providerID: input.providerID,
-            modelID: input.modelID,
-            requestedAccountID: input.accountID,
-            routeKind: input.route.routeKind,
-            routeAccountID: input.route.accountID ?? null,
-          })
-          return undefined
-        }
-        const inherited = yield* provider
-          .resolveInheritedRoutedModel({
-            sessionID: CoreSessionSchema.ID.make(input.sessionID),
-            providerID: input.providerID,
-            modelID: input.modelID,
-            route: input.route,
-          })
-          .pipe(Effect.option)
-        return Option.isSome(inherited)
-          ? { model: inherited.value.model, route: inherited.value.route.attribution }
-          : undefined
-      }
-
-      if (input.route && !input.explicitOverride) {
-        yield* Effect.logDebug("maintenance model skipped: provider differs from committed route", {
-          sessionID: input.sessionID,
-          providerID: input.providerID,
-          modelID: input.modelID,
-          routeProviderID: input.route.providerID,
-        })
-        return undefined
-      }
-
-      if (input.explicitOverride) {
-        // A true maintenance override owns its provider-specific affinity
-        // domain. Resolve that route once for this Session/provider; never
-        // report the parent route as the override's attribution.
-        const routed = yield* provider
-          .resolveRoutedModel({
-            sessionID: CoreSessionSchema.ID.make(input.sessionID),
-            providerID: input.providerID,
-            modelID: input.modelID,
-            ...(input.accountID ? { accountID: input.accountID } : {}),
-          })
-          .pipe(Effect.option)
-        if (Option.isNone(routed)) {
-          yield* Effect.logWarning("maintenance override route unavailable", {
-            sessionID: input.sessionID,
-            providerID: input.providerID,
-            modelID: input.modelID,
-          })
-          return undefined
-        }
-        if (routed.value) {
-          return { model: routed.value.model, route: routed.value.route.attribution }
-        }
-      }
-
-      // Legacy/unrouted direct providers remain valid only when the route owner
-      // explicitly reports that this provider/model is outside its domain.
-      const direct = yield* provider.getModel(input.providerID, input.modelID, input.accountID).pipe(Effect.option)
-      return Option.isSome(direct) ? { model: direct.value } : undefined
+      return yield* MaintenanceRoute.resolveMaintenanceModel(provider, Provider.isHostedZenProvider, {
+        sessionID: CoreSessionSchema.ID.make(input.sessionID),
+        providerID: input.providerID,
+        modelID: input.modelID,
+        ...(input.accountID ? { accountID: input.accountID } : {}),
+        ...(input.explicitAccount ? { explicitAccount: true } : {}),
+        ...(input.explicitOverride ? { explicitOverride: true } : {}),
+        ...(input.route ? { route: input.route } : {}),
+      })
     })
     // Throttle for the end-of-turn compaction.prune maintenance fork below.
     // prune re-scans the session's full message history on every turn; with
@@ -595,12 +679,16 @@ const layer = Layer.effect(
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
       yield* goalAutomation.cancel(sessionID)
+      yield* clearCurrentLimitRecovery(sessionID)
     })
 
     const pause = Effect.fn("SessionPrompt.pause")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("pause", { "session.id": sessionID })
       yield* state.cancel(sessionID)
       yield* goalAutomation.requeueClaim(sessionID)
+      // OpenFork treats an explicit pause as revocation of unattended recovery
+      // authority. The user can still resume the Session and submit new work.
+      yield* clearCurrentLimitRecovery(sessionID)
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -676,10 +764,9 @@ const layer = Layer.effect(
         apiURL: model.api?.url,
         apiID: model.api?.id,
       })
-      // Candidate cascade: explicit picker choice ΓåÆ agent.title.model ΓåÆ
-      // config/plugin small model ΓåÆ session/default model. Runtime failures on
-      // one candidate should not make manual retitle fail while another usable
-      // model is available.
+      // Model selection is user-owned. Choose one configured preference, or
+      // exactly the model explicitly requested by the user for this operation.
+      // Do not silently try another model after a failure or invalid capability.
       const resolve = (
         providerID: ProviderV2.ID,
         modelID: ModelV2.ID,
@@ -696,18 +783,30 @@ const layer = Layer.effect(
           ...(explicitOverride ? { explicitOverride: true } : {}),
           ...(input.route ? { route: input.route } : {}),
         })
-      const small = yield* provider.getSmallModel(input.providerID)
-      const candidates = [
-        input.model
-          ? yield* resolve(
-              input.model.providerID,
-              input.model.id,
-              input.model.accountID,
-              input.model.accountID !== undefined,
-              true,
-            )
-          : undefined,
-        ag.model
+      // A configured `small_model` (Settings → Title model) is an explicit
+      // user preference, not an automatic same-provider fallback: it may name
+      // a different provider than the chat and must resolve through a
+      // transient one-call route. Without `explicitOverride` the shared
+      // maintenance owner skips any cross-provider candidate against the
+      // parent's committed route and manual retitle always fails with
+      // "unavailable" even though the model itself is fine.
+      const configuredSmallRef =
+        !input.model && !ag.model && cfg.small_model?.trim() && cfg.small_model.includes("/")
+          ? Provider.parseModel(cfg.small_model.trim())
+          : undefined
+      const small =
+        input.model || ag.model || configuredSmallRef
+          ? undefined
+          : yield* provider.getSmallModel(input.providerID)
+      const chosen = input.model
+        ? yield* resolve(
+            input.model.providerID,
+            input.model.id,
+            input.model.accountID,
+            input.model.accountID !== undefined,
+            true,
+          )
+        : ag.model
           ? yield* resolve(
               ag.model.providerID,
               ag.model.modelID,
@@ -715,29 +814,25 @@ const layer = Layer.effect(
               ag.model.accountID !== undefined,
               true,
             )
-          : undefined,
-        small ? yield* resolve(small.providerID, small.id) : undefined,
-        yield* resolve(input.providerID, input.modelID),
-      ].filter((item): item is MaintenanceModelResolution => item !== undefined)
-      const seen = new Set<string>()
-      const uniqueCandidates = candidates.filter((item) => {
-        const key = [
-          item.model.providerID,
-          item.model.id,
-          item.route?.routeKind ?? "legacy",
-          item.route?.accountID ?? "",
-        ].join("/")
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
-      const toolCandidates = uniqueCandidates.filter((item) => item.model.capabilities.toolcall)
+          : configuredSmallRef
+            ? yield* resolve(
+                configuredSmallRef.providerID,
+                configuredSmallRef.modelID,
+                configuredSmallRef.accountID,
+                configuredSmallRef.accountID !== undefined,
+                true,
+              )
+            : small
+              ? yield* resolve(small.providerID, small.id)
+              : yield* resolve(input.providerID, input.modelID)
+      const toolCandidates = chosen?.model.capabilities.toolcall ? [chosen] : []
       yield* Effect.logInfo("title generation candidates", {
         sessionID: input.sessionID,
         candidates: toolCandidates.map((item) => `${item.model.providerID}/${item.model.id}`),
-        skippedWithoutToolCalls: uniqueCandidates
-          .filter((item) => !item.model.capabilities.toolcall)
-          .map((item) => `${item.model.providerID}/${item.model.id}`),
+        skippedWithoutToolCalls: chosen && !chosen.model.capabilities.toolcall
+          ? [`${chosen.model.providerID}/${chosen.model.id}`]
+          : [],
+        userSelected: input.model !== undefined,
       })
       const titleTranscriptID =
         toolCandidates.length === 0
@@ -776,7 +871,9 @@ const layer = Layer.effect(
       for (const candidate of toolCandidates) {
         const mdl = candidate.model
         const candidateRoute = candidate.route
-        const candidateUsageRoute = usageRoute(candidateRoute)
+        // resolveMaintenanceModel already projects the secret-free committed
+        // settlement attribution; do not re-project it.
+        const candidateUsageRoute = candidateRoute
         const title = yield* Effect.gen(function* () {
           yield* Effect.logInfo("title model candidate starting", {
             sessionID: input.sessionID,
@@ -1045,19 +1142,45 @@ const layer = Layer.effect(
                 error: String(Cause.squash(cause)),
                 cause: Cause.pretty(cause),
               })
+              if (input.purpose === "regenerate") return yield* Effect.failCause(cause)
               return undefined
             }),
           ),
         )
         if (title) return title
       }
-      yield* Effect.logWarning("all title model candidates failed", {
+      const preferredTitleModel = input.model
+        ? `${input.model.providerID}/${input.model.id}`
+        : ag.model
+          ? `${ag.model.providerID}/${ag.model.modelID}`
+          : configuredSmallRef
+            ? `${configuredSmallRef.providerID}/${configuredSmallRef.modelID}`
+            : small
+              ? `${small.providerID}/${small.id}`
+              : `${input.providerID}/${input.modelID}`
+      yield* Effect.logWarning("title generation requires user-selected alternative model", {
         sessionID: input.sessionID,
-        candidates: toolCandidates.map((item) => `${item.model.providerID}/${item.model.id}`),
-        skippedWithoutToolCalls: uniqueCandidates
-          .filter((item) => !item.model.capabilities.toolcall)
-          .map((item) => `${item.model.providerID}/${item.model.id}`),
+        preferredTitleModel,
+        attemptedModels: toolCandidates.map((item) => `${item.model.providerID}/${item.model.id}`),
+        skippedWithoutToolCalls: chosen && !chosen.model.capabilities.toolcall
+          ? [`${chosen.model.providerID}/${chosen.model.id}`]
+          : [],
+        userSelected: input.model !== undefined,
+        routeProviderID: input.route?.providerID ?? null,
+        routeKind: input.route?.routeKind ?? null,
       })
+      // Auto-title remains best effort, but a manual retitle must surface why
+      // no provider request was sent instead of silently returning undefined.
+      // The preferred model id is safe to surface (provider/model identity,
+      // never credentials) so the toast can name the failing model.
+      if (input.purpose === "regenerate")
+        return yield* Effect.fail(
+          new Error(
+            chosen && !chosen.model.capabilities.toolcall
+              ? `Selected title model ${preferredTitleModel} does not support the required tool calls`
+              : `Selected title model ${preferredTitleModel} is unavailable for the current provider/account route`,
+          ),
+        )
     })
 
     const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (
@@ -1128,7 +1251,7 @@ const layer = Layer.effect(
 
       const model = selected.model
       const selectedRoute = selected.route
-      const selectedUsageRoute = usageRoute(selectedRoute)
+      const selectedUsageRoute = selectedRoute
       const auditPrompt = `${SpadAuditor.DEFAULT_PROMPT}\n\n${SpadAuditor.PROTOCOL_PROMPT}`
       const auditAgent: Agent.Info = {
         name: "spad-auditor",
@@ -1435,9 +1558,8 @@ const layer = Layer.effect(
       }
     })
 
-    // One wall-clock budget for the entire title operation, including model
-    // fallback candidates and protocol-repair retries. A per-candidate timeout
-    // could otherwise multiply the intended five-minute ceiling.
+    // One wall-clock budget for the selected model's title operation, including
+    // protocol-repair retries. No alternate model may be attempted implicitly.
     const timedGenerateTitle = (input: Parameters<typeof generateTitle>[0]) =>
       withSpecialAgentTimeout(generateTitle(input), () =>
         Effect.fail(new Error("Title generation timed out after 5 minutes")),
@@ -1507,17 +1629,27 @@ const layer = Layer.effect(
       // Prefer the opening message model, then the session row, then the
       // configured/default model. Legacy V1 sessions can be missing either
       // message or session model metadata; manual retitle should still work.
-      const fallbackModel = yield* provider.defaultModel().pipe(Effect.option)
-      const baseModel =
-        firstUser.info.model ??
-        (session.model
+       // Explicit retitle must not depend on a different/default chat model
+       // existing. Resolve that preference only when we actually need it.
+       const fallbackModel =
+         input.model === undefined ? yield* provider.defaultModel().pipe(Effect.option) : Option.none()
+       const baseModel =
+         firstUser.info.model ??
+         (session.model
           ? {
               providerID: session.model.providerID,
               modelID: session.model.id,
               ...(session.model.accountID ? { accountID: session.model.accountID } : {}),
             }
-          : undefined) ??
-        Option.getOrUndefined(fallbackModel)
+           : undefined) ??
+         Option.getOrUndefined(fallbackModel) ??
+         (input.model
+           ? {
+               providerID: input.model.providerID,
+               modelID: input.model.id,
+               ...(input.model.accountID ? { accountID: input.model.accountID } : {}),
+             }
+           : undefined)
       if (!baseModel) {
         yield* Effect.logWarning("regenerate title has no model fallback", {
           sessionID: input.sessionID,
@@ -1537,6 +1669,16 @@ const layer = Layer.effect(
         explicitProviderID: input.model?.providerID,
         explicitModelID: input.model?.id,
       })
+      // Manual retitle restarts outside the primary turn, so it has no in-flight
+      // routed result. Recover the parent Session's committed route for the
+      // provider actually being used; otherwise non-explicit title candidates
+      // fall through to a bare getModel + llm.stream with no route, which the
+      // LLM layer satisfies from ambient auth (the hosted free-tier regression).
+      const titleProviderID = input.model?.providerID ?? baseModel.providerID
+      const titleRoute = yield* committedRouteAttribution({
+        sessionID: CoreSessionSchema.ID.make(input.sessionID),
+        providerID: ProviderV2.ID.make(titleProviderID),
+      })
       // The first real user message stays pinned at the front of the context and
       // everything newer follows chronologically, so the opening intent always
       // reaches the title model (retitle ┬º3.5).
@@ -1548,6 +1690,7 @@ const layer = Layer.effect(
         providerID: baseModel.providerID,
         modelID: baseModel.modelID,
         accountID: baseModel.accountID,
+        ...(titleRoute ? { route: titleRoute } : {}),
         model: input.model,
         previousTitle: session.title,
         prompt: input.prompt,
@@ -1791,7 +1934,13 @@ const layer = Layer.effect(
               role: "user",
               provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Shell),
               agent: input.agent,
-              model: { providerID: model.providerID, modelID: model.modelID },
+              model: {
+                providerID: model.providerID,
+                modelID: model.modelID,
+                ...("accountID" in model && model.accountID ? { accountID: model.accountID } : {}),
+                ...("variant" in model && typeof model.variant === "string" ? { variant: model.variant } : {}),
+                ...("routeIntent" in model && model.routeIntent ? { routeIntent: model.routeIntent } : {}),
+              },
             }
             yield* sessions.updateMessage(userMsg)
             const userPart: SessionV1.Part = {
@@ -1978,6 +2127,7 @@ const layer = Layer.effect(
           modelID: ModelV2.ID.make(current.model.id),
           ...(current.model.accountID ? { accountID: current.model.accountID } : {}),
           ...(current.model.variant && current.model.variant !== "default" ? { variant: current.model.variant } : {}),
+          ...(current.model.routeIntent ? { routeIntent: current.model.routeIntent } : {}),
         }
       }
       const match = yield* sessions
@@ -1990,9 +2140,105 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
+    const delegatedWorkerError = (session: Session.Info) =>
+      new HostOwnedSessionError({
+        sessionID: session.id,
+        parentID: session.parentID ?? session.id,
+        kind: "delegated_worker",
+      })
+
+    const normalizedDelegatedVariant = (variant: string | undefined) =>
+      variant && variant !== "default" ? variant : undefined
+
+    const sameRouteIntent = (
+      left: SessionV1.User["model"]["routeIntent"],
+      right: SessionV1.User["model"]["routeIntent"],
+    ) => {
+      if (left?.kind !== right?.kind) return false
+      if (left?.kind === "auto" && right?.kind === "auto") return left.strategy === right.strategy
+      if (left?.kind === "account" && right?.kind === "account")
+        return left.accountID === right.accountID && left.pin === right.pin
+      return true
+    }
+
+    const sameDelegatedOrigin = (
+      left: SessionMetadataOwnership.WorkerDelegationOrigin,
+      right: SessionMetadataOwnership.WorkerDelegationOrigin,
+    ) =>
+      left.producer === right.producer &&
+      left.principalRef === right.principalRef &&
+      left.invocationRef === right.invocationRef &&
+      left.rootRef === right.rootRef &&
+      left.agent === right.agent &&
+      left.nestedDelegation === right.nestedDelegation &&
+      left.parentWorkerID === right.parentWorkerID &&
+      SessionMetadataOwnership.sameWorkerDelegationModel(left.model, right.model)
+
+    const assertDelegatedWorkerSelection = Effect.fn("SessionPrompt.assertDelegatedWorkerSelection")(function* (
+      sessionID: SessionID,
+      expected: SessionMetadataOwnership.WorkerDelegationOrigin,
+    ) {
+      const current = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      const actual = SessionMetadataOwnership.workerDelegation(current.metadata ?? undefined)
+      if (!actual || !sameDelegatedOrigin(actual, expected)) {
+        return yield* delegatedWorkerError(current)
+      }
+      if (
+        current.agent !== expected.agent ||
+        current.model?.providerID !== expected.model.providerID ||
+        current.model?.id !== expected.model.modelID ||
+        current.model?.accountID !== expected.model.accountID ||
+        normalizedDelegatedVariant(current.model?.variant) !== normalizedDelegatedVariant(expected.model.variant)
+      ) {
+        return yield* delegatedWorkerError(current)
+      }
+      return current
+    })
+
+    const bindDelegatedWorkerUserPrompt = Effect.fn("SessionPrompt.bindDelegatedWorkerUserPrompt")(function* (
+      session: Session.Info,
+      input: PromptInput,
+    ) {
+      const delegation = SessionMetadataOwnership.workerDelegation(session.metadata ?? undefined)
+      if (!delegation) return yield* delegatedWorkerError(session)
+
+      const protectedVariant = normalizedDelegatedVariant(delegation.model.variant)
+      if (
+        (input.agent !== undefined && input.agent !== delegation.agent) ||
+        Object.keys(input.tools ?? {}).length > 0
+      ) {
+        return yield* delegatedWorkerError(session)
+      }
+
+      yield* assertDelegatedWorkerSelection(session.id, delegation)
+
+      return {
+        delegation,
+        input: {
+          ...input,
+          agent: delegation.agent,
+          model: input.model ?? {
+            providerID: ProviderV2.ID.make(delegation.model.providerID),
+            modelID: ModelV2.ID.make(delegation.model.modelID),
+            ...(delegation.model.accountID ? { accountID: delegation.model.accountID } : {}),
+            // An interactive human turn in a delegated Session uses the
+            // producer's protected route when no model was explicitly chosen.
+            // Bind that route onto THIS trusted turn before V1 lowering: the
+            // resolver correctly trusts user-turn selection over metadata.
+            // Explicit composer model choices must NOT inherit the route.
+            ...(delegation.model.routeIntent ? { routeIntent: delegation.model.routeIntent } : {}),
+          },
+          variant: input.model ? input.variant : (input.variant ?? protectedVariant),
+          tools: undefined,
+          subProvider: input.subProvider,
+        } satisfies PromptInput,
+      }
+    })
+
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
       input: PromptInput,
       provenance: SessionV1.UserTurnProvenance,
+      protectedDelegation?: SessionMetadataOwnership.WorkerDelegationOrigin,
     ) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
@@ -2006,14 +2252,24 @@ const layer = Layer.effect(
 
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const accountID = "accountID" in model && typeof model.accountID === "string" ? model.accountID : undefined
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const routeIntent =
+        ("routeIntent" in model ? model.routeIntent : undefined) ??
+        (current.model?.providerID === model.providerID &&
+        current.model.id === model.modelID &&
+        current.model.accountID === accountID
+          ? current.model.routeIntent
+          : undefined)
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !protectedDelegation && !input.variant && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID, accountID)
               .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
           : undefined
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      const variant = protectedDelegation
+        ? input.variant
+        : (input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined))
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -2029,19 +2285,25 @@ const layer = Layer.effect(
           ...(accountID ? { accountID } : {}),
           variant,
           ...(input.subProvider ? { subProvider: input.subProvider } : {}),
+          ...(routeIntent ? { routeIntent } : {}),
         },
         system: input.system,
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
+      const selectionChanged =
         current.agent !== info.agent ||
         current.model?.providerID !== info.model.providerID ||
         current.model?.id !== info.model.modelID ||
         current.model?.accountID !== info.model.accountID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
+        normalizedDelegatedVariant(current.model?.variant) !== normalizedDelegatedVariant(info.model.variant) ||
+        !sameRouteIntent(current.model?.routeIntent, info.model.routeIntent)
+      if (protectedDelegation) {
+        // The Session remains bound to the producer's assigned worker model,
+        // but a human-authored turn can explicitly choose another model. Keep
+        // that per-turn choice out of delegation metadata and session defaults.
+        yield* assertDelegatedWorkerSelection(input.sessionID, protectedDelegation)
+      } else if (selectionChanged) {
         yield* sessions.setAgentModel({
           sessionID: input.sessionID,
           agent: info.agent,
@@ -2050,6 +2312,7 @@ const layer = Layer.effect(
             providerID: info.model.providerID,
             ...(info.model.accountID ? { accountID: info.model.accountID } : {}),
             variant: info.model.variant ?? "default",
+            ...(info.model.routeIntent ? { routeIntent: info.model.routeIntent } : {}),
           },
           time: info.time.created,
         })
@@ -2061,6 +2324,30 @@ const layer = Layer.effect(
       const assign = (part: Draft<SessionV1.Part>): SessionV1.Part => ({
         ...part,
         id: part.id ? PartID.make(part.id) : PartID.ascending(),
+      })
+
+      // Trusted upload-origin stamp. Only a genuine user upload reaches here as
+      // an inline `data:` payload; the semantic origin is derived here, never
+      // trusted from the wire. `file://`, MCP resources, and tool output are
+      // recorded but never handoff-eligible. Registration is idempotent per
+      // source part and owns the durable logical upload identity.
+      const stampUploadOrigin = Effect.fn("SessionPrompt.stampUploadOrigin")(function* (
+        partId: string,
+        draft: SessionV1.FilePart,
+      ) {
+        const origin = classifyUploadOrigin(draft)
+        if (origin === "tool-output" || origin === "mcp-resource") return
+        const bytes = inlineUploadBytes(draft.url)
+        if (!bytes) return
+        yield* SessionAttachment.registerUpload(db, {
+          sessionID: input.sessionID,
+          messageID: info.id,
+          partID: partId,
+          origin,
+          mime: draft.mime,
+          ...(draft.filename ? { filename: draft.filename } : {}),
+          bytes,
+        }).pipe(Effect.catchCause(() => Effect.void))
       })
 
       const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<SessionV1.Part>[]> = Effect.fn(
@@ -2152,6 +2439,67 @@ const layer = Layer.effect(
           const url = new URL(part.url)
           switch (url.protocol) {
             case "data:":
+              if ((part.filename && isAmbiguousTsPath(part.filename)) || part.mime.toLowerCase() === "video/mp2t") {
+                // A client-supplied Content-Type is only a hint. In particular,
+                // .ts can be UTF-8 TypeScript or MPEG-TS; inspect bounded bytes
+                // before any file part reaches the model or durable replay.
+                if (part.url.length > 28 * 1024 * 1024) {
+                  return [{
+                    messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                    text: "Ambiguous .ts/.mts upload exceeds the 20 MiB media inspection limit. Use Read with a smaller source file or remux video to MP4.",
+                  }]
+                }
+                const bytes = inlineUploadBytes(part.url)
+                const kind = bytes
+                  ? resolveAttachmentMime(bytes.subarray(0, 4096), part.filename ?? "upload.ts", part.mime)
+                  : "application/octet-stream"
+                if (kind === "application/octet-stream") {
+                  return [{
+                    messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                    text: "Ambiguous .ts/.mts upload: neither verified UTF-8 text nor valid MPEG transport-stream packets. No media/source bytes were delivered to the model.",
+                  }]
+                }
+                if (kind === "video/mp2t") {
+                  const remuxed = bytes ? yield* Effect.promise(() => remuxMpegTransportStream(bytes)) : undefined
+                  if (!remuxed) return [{
+                    messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                    text: "MPEG transport-stream video detected (not TypeScript), but lossless FFmpeg remux to model-compatible MP4 failed. Remux the file to MP4 before attaching; renaming it is insufficient.",
+                  }]
+                  return [
+                    {
+                      messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                      text: "Verified MPEG-TS video; losslessly remuxed to MP4 before model input. Frame sampling may miss transient events.",
+                    },
+                    {
+                      ...part, messageID: info.id, sessionID: input.sessionID,
+                      mime: "video/mp4",
+                      url: `data:video/mp4;base64,${Buffer.from(remuxed).toString("base64")}`,
+                    },
+                  ]
+                }
+                if (kind === "text/plain" || kind === "application/xml") {
+                  const name = kind === "application/xml" ? "Qt Linguist XML translation" : "UTF-8 TypeScript source candidate"
+                  return [
+                    {
+                      messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                      text: `Verified ${name} from .ts/.mts content (not MPEG-TS video; syntax not compiled): ${part.filename ?? "upload.ts"}`,
+                    },
+                    {
+                      messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                      text: new TextDecoder().decode(bytes),
+                    },
+                    {
+                      ...part, mime: "text/plain", messageID: info.id, sessionID: input.sessionID,
+                      url: `data:text/plain;base64,${Buffer.from(bytes!).toString("base64")}`,
+                    },
+                  ]
+                }
+                return [{
+                  ...part, messageID: info.id, sessionID: input.sessionID,
+                  mime: kind,
+                  url: `data:${kind};base64,${Buffer.from(bytes!).toString("base64")}`,
+                }]
+              }
               if (part.mime === "text/plain") {
                 return [
                   {
@@ -2186,12 +2534,40 @@ const layer = Layer.effect(
                     abort: controller.signal,
                     agent: input.agent!,
                     messageID: info.id,
+                    retention: "none",
                     extra: { bypassCwdCheck: true, ...extra },
                     messages: [],
                     metadata: () => Effect.void,
                     ask: () => Effect.void,
                   })
                   .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
+              }
+
+              if (isAmbiguousTsPath(filepath) && mime !== "text/plain" && mime !== "application/x-directory") {
+                // File URL MIME is also untrusted. Reuse the real, Session-owned
+                // Read dispatcher (and its packet/text guard) rather than
+                // blindly serializing this pathname as video/mp2t.
+                const args = { filePath: filepath }
+                const exit = yield* execRead(args).pipe(Effect.exit)
+                if (Exit.isFailure(exit)) {
+                  const cause = Cause.squash(exit.cause)
+                  return [{
+                    messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                    text: `Read could not classify/deliver .ts/.mts file ${part.filename ?? filepath}: ${cause instanceof Error ? cause.message : String(cause)}`,
+                  }]
+                }
+                return [
+                  {
+                    messageID: info.id, sessionID: input.sessionID, type: "text", synthetic: true,
+                    text: `Read verified ambiguous .ts/.mts file before model input: ${part.filename ?? filepath}\n${exit.value.output}`,
+                  },
+                  ...(exit.value.attachments ?? []).map((attachment) => ({
+                    ...attachment,
+                    messageID: info.id, sessionID: input.sessionID,
+                    filename: attachment.filename ?? part.filename,
+                    synthetic: true,
+                  })),
+                ]
               }
 
               if (mime === "text/plain") {
@@ -2365,6 +2741,36 @@ const layer = Layer.effect(
         Effect.map((x) => x.flat().map(assign)),
       )
 
+      // Stamp durable upload origin after part IDs are assigned, so the logical
+      // upload identity is stably keyed by the exact durable source part.
+      yield* Effect.forEach(
+        resolvedParts.filter((part): part is SessionV1.FilePart => part.type === "file"),
+        (part) => stampUploadOrigin(part.id, part),
+        { concurrency: 4, discard: true },
+      )
+
+      // Surface a bounded manifest of eligible uploads for this exact user turn
+      // (plus any grants this worker already holds) so the orchestrator can
+      // select symbolic handles. This is orchestration context only; it never
+      // inlines bytes and is not instruction authority.
+      const manifestPart = yield* Effect.gen(function* () {
+        const manifest = yield* SessionAttachment.buildManifest(db, {
+          sessionID: input.sessionID,
+          currentTurnMessageID: info.id,
+          workerSessionID: input.sessionID,
+        })
+        const rendered = SessionAttachment.renderManifest(manifest)
+        if (!rendered) return undefined
+        return {
+          messageID: info.id,
+          sessionID: input.sessionID,
+          type: "text" as const,
+          synthetic: true,
+          text: rendered,
+        } satisfies Draft<SessionV1.TextPart>
+      }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+      if (manifestPart) resolvedParts.push(assign(manifestPart))
+
       yield* plugin.trigger(
         "chat.message",
         {
@@ -2387,6 +2793,29 @@ const layer = Layer.effect(
             )
           : Effect.succeed(part),
       )
+
+      if (protectedDelegation) {
+        // The admission owner stamps the bounded grant snapshot after hooks.
+        // Fragment metadata cannot widen the producer-owned delegation policy.
+        const metadata = DelegatedWorkerPolicy.turnMetadata({ nestedDelegation: protectedDelegation.nestedDelegation })
+        let stamped = false
+        for (const part of parts) {
+          if (part.type !== "text") continue
+          part.metadata = { ...part.metadata, ...metadata }
+          stamped = true
+        }
+        if (!stamped)
+          parts.push(
+            assign({
+              type: "text",
+              sessionID: input.sessionID,
+              messageID: info.id,
+              text: "",
+              synthetic: true,
+              metadata,
+            }),
+          )
+      }
 
       const parsed = decodeMessageInfo(info, { errors: "all", propertyOrder: "original" })
       if (Exit.isFailure(parsed)) {
@@ -2412,6 +2841,13 @@ const layer = Layer.effect(
         })
       }
 
+      // Part resolution may involve filesystem/MCP work. Recheck the protected
+      // aggregate immediately before persistence so a concurrent OXP selection
+      // rebind cannot turn a stale interactive prompt into a contract takeover.
+      if (protectedDelegation) {
+        yield* assertDelegatedWorkerSelection(input.sessionID, protectedDelegation)
+        if (info.agent !== protectedDelegation.agent) return yield* delegatedWorkerError(current)
+      }
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
 
@@ -2421,6 +2857,7 @@ const layer = Layer.effect(
     const requirePromptable = Effect.fn("SessionPrompt.requirePromptable")(function* (
       sessionID: SessionID,
       origin: "user" | "host",
+      options?: { allowDelegatedWorkerUser?: boolean },
     ) {
       const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
       const rawSpecialAgent = SessionMetadataOwnership.specialAgentKind(session.metadata ?? undefined)
@@ -2457,18 +2894,30 @@ const layer = Layer.effect(
       // producer-owned metadata constrains trusted scheduler admission below,
       // not ordinary human interaction.
       // OXP-delegated workers are producer-owned root Sessions. Their durable
-      // model/account/nested-delegation contract may only be driven through the
-      // trusted host delegation seam; a public user prompt must not silently
-      // convert the worker into an ordinary interactive Session.
+      // model/account/nested-delegation contract remains producer-owned. The
+      // interactive seam admits conversational turns with that contract bound;
+      // generic prompt admission must not silently take over the worker.
       if (SessionMetadataOwnership.hasWorkerDelegationOrigin(session.metadata ?? undefined) && origin === "user") {
-        return yield* new HostOwnedSessionError({
-          sessionID,
-          parentID: session.parentID ?? session.id,
-          kind: "delegated_worker",
-        })
+        const delegation = SessionMetadataOwnership.workerDelegation(session.metadata ?? undefined)
+        if (
+          !options?.allowDelegatedWorkerUser ||
+          !delegation ||
+          !SessionMetadataOwnership.isHumanControllableWorker(session.metadata ?? undefined)
+        ) {
+          return yield* new HostOwnedSessionError({
+            sessionID,
+            parentID: session.parentID ?? session.id,
+            kind: "delegated_worker",
+          })
+        }
       }
       if (!session.parentID) return session
       if (origin === "host") return session
+      if (
+        options?.allowDelegatedWorkerUser &&
+        SessionMetadataOwnership.isHumanControllableWorker(session.metadata ?? undefined)
+      )
+        return session
       return yield* new HostOwnedSessionError({
         sessionID,
         parentID: session.parentID,
@@ -2478,6 +2927,10 @@ const layer = Layer.effect(
 
     const assertUserPromptable = Effect.fn("SessionPrompt.assertUserPromptable")((sessionID: SessionID) =>
       requirePromptable(sessionID, "user"),
+    )
+
+    const assertInteractiveUserPromptable = Effect.fn("SessionPrompt.assertInteractiveUserPromptable")(
+      (sessionID: SessionID) => requirePromptable(sessionID, "user", { allowDelegatedWorkerUser: true }),
     )
 
     /**
@@ -2562,13 +3015,52 @@ const layer = Layer.effect(
       return true
     })
 
+    // A human submission is also an explicit Resume action. The message must be
+    // durable before lifting the gate, or an old interrupted turn could run in
+    // the gap before the new input exists. Never wake unresolved external effects.
+    const resumeOnUserSubmission = Effect.fn("SessionPrompt.resumeOnUserSubmission")(function* (
+      sessionID: SessionID,
+      observedPausedAt: number | undefined,
+    ) {
+      if (observedPausedAt === undefined) return
+      const ready = yield* requireResumeReady(sessionID).pipe(
+        Effect.provideService(SessionExecutionOwner.Service, executionOwner),
+        Effect.provideService(SessionOperatorRecovery.Service, operatorRecovery),
+        Effect.as(true),
+        Effect.catch((error) =>
+          Effect.logWarning("submitted prompt remains queued until interrupted execution is contained", {
+            sessionID,
+            error: error.message,
+          }).pipe(Effect.as(false)),
+        ),
+      )
+      if (!ready) return
+      // A newer Pause takes precedence over this submission. In particular,
+      // do not clear a pause issued while interrupted-tool containment ran.
+      const current = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      if (current.pausedAt !== observedPausedAt) return
+      yield* sessions.setPaused({ sessionID, pausedAt: undefined })
+    })
+
     const promptInternal = Effect.fn("SessionPrompt.promptInternal")(function* (
       input: PromptInput,
       origin: "user" | "host",
       provenance: SessionV1.UserTurnProvenance,
       hostPrincipalRef?: string,
+      options?: { allowDelegatedWorkerUser?: boolean },
     ) {
-      const session = yield* requirePromptable(input.sessionID, origin)
+      const session = yield* requirePromptable(input.sessionID, origin, options)
+      let effectiveInput = input
+      let protectedDelegation: SessionMetadataOwnership.WorkerDelegationOrigin | undefined
+      if (
+        origin === "user" &&
+        options?.allowDelegatedWorkerUser &&
+        SessionMetadataOwnership.hasWorkerDelegationOrigin(session.metadata ?? undefined)
+      ) {
+        const bound = yield* bindDelegatedWorkerUserPrompt(session, input)
+        effectiveInput = bound.input
+        protectedDelegation = bound.delegation
+      }
       if (origin === "host" && SessionMetadataOwnership.hasScheduledTaskOrigin(session.metadata ?? undefined)) {
         const scheduled = ScheduledTaskProvenance.parseSessionMetadata(session.metadata)
         if (
@@ -2607,8 +3099,15 @@ const layer = Layer.effect(
       // settlement observes the missing reservation and cannot resurrect it.
       if (origin === "user") yield* goalAutomation.cancel(input.sessionID)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input, provenance)
-      if (origin === "user") yield* goals.reactivateBlockedForSession(input.sessionID)
+      const message = yield* createUserMessage(effectiveInput, provenance, protectedDelegation)
+      if (origin === "user") {
+        // The user has taken control after any prior provider-limit stop. Clear
+        // the old generation immediately so the UI and deadline owner cannot
+        // resurrect it; the frozen user-sequence check in runLoop is the
+        // durable fallback for admission-vs-wake races.
+        yield* clearCurrentLimitRecovery(input.sessionID)
+        yield* goals.reactivateBlockedForSession(input.sessionID)
+      }
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -2620,23 +3119,31 @@ const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
+      if (origin === "user") yield* resumeOnUserSubmission(input.sessionID, session.pausedAt)
       if (input.noReply === true) return message
-      // Paused: admit the message durably but do not run (mirror V2 admit-only;
-      // delivery is never overwritten). The admitted message drains on resume.
-      if (session.pausedAt !== undefined) return message
+      // Recovery may still be fenced, or another Pause may have won the race.
+      // Normal unpaused sends need no extra Session read; runBody owns the
+      // authoritative hard pause gate for a concurrently issued Pause.
+      if (
+        session.pausedAt !== undefined &&
+        (yield* sessions.get(input.sessionID).pipe(Effect.orDie)).pausedAt !== undefined
+      ) return message
       // loop() owns execution-boundary supersession so direct
       // prompt() and hostPrompt(noReply)+loop() share the same authority rule.
       return yield* loop({ sessionID: input.sessionID })
     })
 
     const prompt = Effect.fn("SessionPrompt.prompt")((input: PromptInput) =>
-      promptInternal(input, "user", SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt)),
+      promptInternal(input, "user", SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt), undefined, {
+        allowDelegatedWorkerUser: true,
+      }),
     )
+    const interactivePrompt = prompt
     const userActionPrompt = Effect.fn("SessionPrompt.userActionPrompt")(function* (
       input: PromptInput,
       provenance: UserActionPromptProvenance,
     ) {
-      yield* requirePromptable(input.sessionID, "user")
+      yield* requirePromptable(input.sessionID, "user", { allowDelegatedWorkerUser: true })
       if (input.messageID) {
         const existing = yield* MessageV2.get({ sessionID: input.sessionID, messageID: input.messageID }).pipe(
           Effect.provideService(Database.Service, database),
@@ -2662,14 +3169,17 @@ const layer = Layer.effect(
           }
           if (input.noReply === true) return message
           const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-          if (session.pausedAt !== undefined) return message
+          yield* resumeOnUserSubmission(input.sessionID, session.pausedAt)
+          if ((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).pausedAt !== undefined) return message
           // Do not cancel/reactivate Goal state again on an idempotent retry.
           // The existing message is not a new human intervention and therefore
           // must not acquire fresh authority over newer Goal lifecycle state.
           return yield* loop({ sessionID: input.sessionID })
         }
       }
-      return yield* promptInternal(input, "user", SessionTurnProvenance.user(provenance.source))
+      return yield* promptInternal(input, "user", SessionTurnProvenance.user(provenance.source), undefined, {
+        allowDelegatedWorkerUser: true,
+      })
     })
     const hostPrompt = Effect.fn("SessionPrompt.hostPrompt")(function* (
       input: PromptInput,
@@ -2750,6 +3260,12 @@ const layer = Layer.effect(
       route?: ProviderRouteResolution.RouteAttribution
       latestWork: string
     }) {
+      // A returned verdict is only a proposal until afterTurn reconciles the
+      // Goal and persists its next reservation. If this parent fiber dies in
+      // that interval, requeue the exact live audit instead of stranding a
+      // completed worker cycle behind an eternal AUDITING marker.
+      let lease: { auditorSessionID: CoreSessionSchema.ID; auditStartedAt: number } | undefined
+      return yield* Effect.gen(function* () {
       const ctx = yield* InstanceState.context
       const audit = yield* Effect.gen(function* () {
         const goalAuditor = yield* GoalAuditor.Service
@@ -2768,9 +3284,11 @@ const layer = Layer.effect(
           ),
         )
       }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+      if (audit.auditorSessionID && audit.auditStartedAt !== undefined) {
+        lease = { auditorSessionID: audit.auditorSessionID, auditStartedAt: audit.auditStartedAt }
+      }
 
-      const supersededByUser =
-        (yield* SessionInput.latestUserSeq(db, input.sessionID)) !== input.expectedLatestUserSeq
+      const supersededByUser = (yield* SessionInput.latestUserSeq(db, input.sessionID)) !== input.expectedLatestUserSeq
 
       return yield* goalAutomation.afterTurn({
         sessionID: input.sessionID,
@@ -2782,6 +3300,11 @@ const layer = Layer.effect(
         audit,
         requireAuditCursor: audit.auditorSessionID !== undefined,
       })
+      }).pipe(Effect.onExit((exit) =>
+        Exit.isFailure(exit) && lease
+          ? goalAutomation.deferAudit(input.sessionID, lease).pipe(Effect.asVoid)
+          : Effect.void,
+      ))
     })
 
     const isAfterV1 = (left: SessionV1.Info, right: SessionV1.Info) =>
@@ -3110,7 +3633,12 @@ const layer = Layer.effect(
       return repaired
     })
 
-    const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
+    const runLoopBody = Effect.fn("SessionPrompt.runBody")(function* (
+      sessionID: SessionID,
+      historyProjection: ReturnType<typeof MessageV2.makeDrainHistory> extends Effect.Effect<infer A, any, any>
+        ? A
+        : never,
+    ) {
       const ctx = yield* InstanceState.context
       let structured: unknown
       let step = 0
@@ -3123,6 +3651,7 @@ const layer = Layer.effect(
       let materializedGoalReservationID: string | undefined
       let goalCycleUserFence: number | undefined
       let goalCycleUserFenceCaptured = false
+      let recoveryGenerationPending: number | undefined
       const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
       // Hard pause gate (V1): a paused session must not start any provider
       // work. Prompt admission already gates, but direct loop callers (resume,
@@ -3131,10 +3660,195 @@ const layer = Layer.effect(
         yield* state.deferPending(sessionID)
         return yield* lastAssistant(sessionID)
       }
+      // Capture genuine-user authority before provider work, not after the
+      // timeout; a concurrent user must fence obsolete autonomous recovery.
+      let providerTimeoutUserFence = yield* SessionInput.latestUserSeq(db, sessionID)
 
       while (true) {
         yield* status.set(sessionID, { type: "busy" })
         yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+
+        // Recovery is an activation-boundary concern. Once an ordinary drain is
+        // running, inner tool/provider cycles must not pay another SQLite point
+        // lookup on every step. A renewed limit always stops this drain and the
+        // next activation starts again at step zero.
+        if (step === 0) {
+          // A recovery cursor is an execution fence, not merely a notification.
+          // Pre-existing queued user messages must remain durable but blocked
+          // until the interrupted turn is continued. A genuinely newer user
+          // admission advances latestUserSeq and revokes that authority.
+          const recovery = yield* SessionLimitRecovery.get(db, sessionID)
+          if (recovery) {
+            const recoveryHistory = yield* historyProjection.history()
+            const continuationID = MessageID.make(recovery.continuationID)
+            const completedContinuation = recoveryHistory.some(
+              (message) =>
+                message.info.role === "assistant" &&
+                message.info.parentID === continuationID &&
+                message.info.time.completed !== undefined,
+            )
+            if (completedContinuation) {
+              // Crash-safe completion repair: the provider cycle already reached
+              // its durable assistant commit marker but the process died before
+              // retiring/clearing the cursor. Never replay that completed turn.
+              yield* retireLimitRecoveryContinuations(recoveryHistory)
+              yield* clearLimitRecovery(sessionID, recovery.generation)
+            } else {
+              const latestUserSeq = yield* SessionInput.latestUserSeq(db, sessionID)
+              const superseded =
+                recovery.expectedLatestUserSeq !== undefined
+                  ? (latestUserSeq ?? -1) > recovery.expectedLatestUserSeq
+                  : latestUserSeq !== undefined
+              if (superseded) {
+                yield* clearLimitRecovery(sessionID, recovery.generation)
+              } else {
+                const resetAt = recovery.resetAt === undefined ? undefined : DateTime.toEpochMillis(recovery.resetAt)
+                const trustedReset = recovery.resetSource === "retry-after" || recovery.resetSource === "provider"
+                const due =
+                  recovery.manualResume ||
+                  (recovery.autoResume && trustedReset && resetAt !== undefined && resetAt <= Date.now())
+
+                if (!due) {
+                  // releaseIfDrained normally keeps the same execution generation
+                  // alive whenever SessionInput is pending. Limit recovery is the
+                  // exception: queued work is intentionally held behind this cursor
+                  // and must not hammer the exhausted provider before reset.
+                  yield* state.deferPending(sessionID)
+                  return yield* lastAssistant(sessionID)
+                }
+
+                const gate = yield* interactionGate({
+                  sessionID,
+                  questions: () => question.list(),
+                  permissions: () => permission.list(),
+                })
+                if (gate.blocked) {
+                  // Never bypass a human interaction gate just because a provider
+                  // budget reset. Keep both the recovery cursor and queued input
+                  // durable; the next explicit interaction/wake re-evaluates them.
+                  yield* state.deferPending(sessionID)
+                  return yield* lastAssistant(sessionID)
+                }
+
+                const stopped = Option.getOrUndefined(
+                  yield* MessageV2.get({
+                    sessionID,
+                    messageID: MessageID.make(String(recovery.sourceAssistantMessageID)),
+                  }).pipe(Effect.option),
+                )
+                const stoppedAssistant = stopped?.info.role === "assistant" ? stopped.info : undefined
+                const parent = stoppedAssistant?.parentID
+                  ? Option.getOrUndefined(
+                      yield* MessageV2.get({ sessionID, messageID: MessageID.make(stoppedAssistant.parentID) }).pipe(
+                        Effect.option,
+                      ),
+                    )
+                  : undefined
+                const selectedModelChanged =
+                  !recovery.manualResume &&
+                  session.model !== undefined &&
+                  (session.model.providerID !== recovery.providerID ||
+                    session.model.id !== recovery.modelID ||
+                    (session.model.accountID ?? undefined) !== recovery.accountID)
+                if (
+                  !stoppedAssistant ||
+                  stoppedAssistant.time.completed === undefined ||
+                  stoppedAssistant.providerID !== recovery.providerID ||
+                  stoppedAssistant.modelID !== recovery.modelID ||
+                  parent?.info.role !== "user" ||
+                  parent.info.model.providerID !== recovery.providerID ||
+                  parent.info.model.modelID !== recovery.modelID ||
+                  (parent.info.model.accountID ?? undefined) !== recovery.accountID ||
+                  session.pausedAt !== undefined ||
+                  session.time.archived !== undefined ||
+                  selectedModelChanged
+                ) {
+                  yield* clearLimitRecovery(sessionID, recovery.generation)
+                } else {
+                  const parentInfo = parent.info
+                  const executionModel =
+                    recovery.manualResume && session.model
+                      ? {
+                          providerID: ProviderV2.ID.make(session.model.providerID),
+                          id: ModelV2.ID.make(session.model.id),
+                          ...(session.model.accountID === undefined ? {} : { accountID: session.model.accountID }),
+                          ...(session.model.variant ? { variant: ModelV2.VariantID.make(session.model.variant) } : {}),
+                        }
+                      : {
+                          providerID: ProviderV2.ID.make(recovery.providerID),
+                          id: ModelV2.ID.make(recovery.modelID),
+                          ...(recovery.accountID === undefined ? {} : { accountID: recovery.accountID }),
+                          ...(parentInfo.model.variant
+                            ? { variant: ModelV2.VariantID.make(parentInfo.model.variant) }
+                            : {}),
+                        }
+                  const inputID = CurrentSessionMessage.ID.make(recovery.continuationID)
+                  const admitted = yield* SessionInput.admitSynthetic(db, events, {
+                    id: inputID,
+                    sessionID: CoreSessionSchema.ID.make(sessionID),
+                    content: { text: "Continue where you left off." },
+                    origin: SessionInput.SyntheticOrigin.make({
+                      producer: SharedTurnProvenance.Source.RecoveryContinuation,
+                      actor: { type: "host" },
+                      ref: recovery.continuationID,
+                      cause: {
+                        sessionID: CoreSessionSchema.ID.make(sessionID),
+                        messageID: CurrentSessionMessage.ID.make(parentInfo.id),
+                      },
+                    }),
+                    execution: {
+                      agent: parentInfo.agent,
+                      model: executionModel,
+                    },
+                    admissionClass: "automatic",
+                    delivery: "queue",
+                    userPreemptible: true,
+                    expectedLatestUserSeq: recovery.expectedLatestUserSeq,
+                  }).pipe(
+                    Effect.map((entry) => ({ state: "admitted" as const, entry })),
+                    Effect.catchDefect((defect) =>
+                      defect instanceof SessionInput.AdmissionFenceConflict
+                        ? Effect.succeed({ state: "superseded" as const })
+                        : Effect.die(defect),
+                    ),
+                  )
+
+                  if (admitted.state === "superseded") {
+                    // The human-focus fence is checked in the same durable event
+                    // transaction as admission. A User that wins that race owns
+                    // the Session; retire this stale recovery generation.
+                    yield* clearLimitRecovery(sessionID, recovery.generation)
+                  } else {
+                    let entry = admitted.entry
+                    if (entry.promotedSeq === undefined && entry.revokedSeq === undefined) {
+                      yield* SessionInput.promoteSyntheticByID(db, events, {
+                        sessionID: CoreSessionSchema.ID.make(sessionID),
+                        id: inputID,
+                        admissionClass: "automatic",
+                        delivery: "queue",
+                      })
+                      entry = (yield* SessionInput.findEntry(db, inputID)) ?? entry
+                    }
+
+                    if (entry.promotedSeq === undefined || entry.revokedSeq !== undefined) {
+                      // A concurrent User admission can revoke the preemptible
+                      // recovery after admission but before promotion. Never
+                      // reconstruct or directly append the continuation.
+                      yield* clearLimitRecovery(sessionID, recovery.generation)
+                    } else {
+                      yield* telemetry.startTurn(sessionID)
+                      // Do not delete the cursor at materialization. It is the
+                      // crash-recovery authority until this provider cycle
+                      // actually returns. Re-entry sees the same deterministic
+                      // promoted SessionInput and cannot duplicate dispatch.
+                      recoveryGenerationPending = recovery.generation
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
 
         // Admission and execution are separate decisions. At each provider-cycle
         // boundary choose exactly one canonical SessionInput lane and snapshot
@@ -3144,7 +3858,7 @@ const layer = Layer.effect(
         // Do this BEFORE Goal reservation claiming or history loading so a
         // genuine User/host arrival cannot be overtaken by autonomous work.
         let promotedClass: SessionInput.AdmissionClass | undefined
-        while (true) {
+        while (recoveryGenerationPending === undefined) {
           const lane = yield* SessionInput.nextPendingLane(db, sessionID)
           if (!lane) break
           const cutoff = yield* EventV2.latestSequence(db, sessionID)
@@ -3161,8 +3875,12 @@ const layer = Layer.effect(
           // fixed priority lanes rather than manufacturing an empty provider
           // cycle or falling through to autonomous Goal work.
         }
+        const recoveryGenerationForCycle = recoveryGenerationPending
+        const recoveryWasMaterialized = recoveryGenerationForCycle !== undefined
+        recoveryGenerationPending = undefined
 
         if (promotedClass === "user") {
+          providerTimeoutUserFence = yield* SessionInput.latestUserSeq(db, sessionID)
           // Human input supersedes autonomous Goal continuation authority.
           yield* goalAutomation.cancel(sessionID)
           goalReservation = undefined
@@ -3177,7 +3895,7 @@ const layer = Layer.effect(
           goalReservation = undefined
           materializedGoalReservationID = undefined
         }
-        if (promotedClass === undefined && !goalReservation) {
+        if (promotedClass === undefined && !goalReservation && !recoveryWasMaterialized) {
           goalReservation = yield* goalAutomation.claim(sessionID)
         }
         if (goalReservation) {
@@ -3185,20 +3903,14 @@ const layer = Layer.effect(
           goalCycleUserFenceCaptured = true
         }
 
-        let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-          Effect.provideService(Database.Service, database),
-        )
+        let msgs = yield* historyProjection.history()
         if (step === 0 && (yield* settleAbandonedAssistants(sessionID, msgs)) > 0) {
-          msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          msgs = yield* historyProjection.history()
         }
         if ((yield* reconcileGoalState(sessionID, msgs)) > 0) {
-          msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          msgs = yield* historyProjection.history()
         }
-        if (goalReservation && materializedGoalReservationID !== goalReservation.id) {
+        if (goalReservation && materializedGoalReservationID !== goalReservation.id && !recoveryWasMaterialized) {
           const changed = yield* materializeGoalContinuation(goalReservation, msgs).pipe(
             Effect.onError(() => goalAutomation.release({ sessionID, reservationID: goalReservation!.id })),
           )
@@ -3206,9 +3918,7 @@ const layer = Layer.effect(
             // A materialized Goal continuation is a fresh semantic turn even
             // though the same Session drain stays busy across the handoff.
             yield* telemetry.startTurn(sessionID)
-            msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
+            msgs = yield* historyProjection.history()
           }
           materializedGoalReservationID = goalReservation.id
         }
@@ -3222,7 +3932,12 @@ const layer = Layer.effect(
               messages: msgs,
               sessionID,
             }).pipe(Effect.provideService(Database.Service, database))
-            const issues = EffectiveContextCompiler.validateEffectiveHistory(compiled.effective)
+            // A zero-overlay compile returns the exact canonical messages.
+            // Validation would only scan the full transcript and then fall
+            // back to those same bytes; validate when overlays can change it.
+            const issues = compiled.hadOverlays
+              ? EffectiveContextCompiler.validateEffectiveHistory(compiled.effective)
+              : []
             if (issues.length > 0) {
               yield* Effect.logWarning("effective context validation warnings", {
                 sessionID,
@@ -3254,7 +3969,7 @@ const layer = Layer.effect(
           if (maybeCompiled) msgs = (maybeCompiled as any).effective as any
         }
 
-        const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+        const { user: lastUser, assistant: previousAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
         if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -3279,14 +3994,14 @@ const layer = Layer.effect(
         // request-only provider message. The next loop iteration will parent the
         // assistant to this turn while inherited worker capabilities come from
         // the explicit causal root above.
-        if (lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id) {
+        if (previousAssistant?.finish === "unknown" && previousAssistant.parentID === lastUser.id) {
           const continuation: SessionV1.User = {
             ...lastUser,
             id: MessageID.ascending(),
             provenance: SessionTurnProvenance.hostDerived(
               SessionTurnProvenance.Source.UnknownFinishContinuation,
               lastUser,
-              { ref: lastAssistant.id },
+              { ref: previousAssistant.id },
             ),
             time: { created: Date.now() },
           }
@@ -3322,7 +4037,7 @@ const layer = Layer.effect(
         }
 
         const lastAssistantMsg = msgs.findLast(
-          (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
+          (msg) => msg.info.role === "assistant" && msg.info.id === previousAssistant?.id,
         )
         // Some providers return "stop" even when the assistant message contains
         // tool calls. Keep the loop running so tool results can be sent back to
@@ -3333,10 +4048,10 @@ const layer = Layer.effect(
           ) ?? false
 
         if (
-          lastAssistant?.finish &&
-          !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+          previousAssistant?.finish &&
+          !["tool-calls", "unknown"].includes(previousAssistant.finish) &&
           !hasToolCalls &&
-          lastAssistant.parentID === lastUser.id &&
+          previousAssistant.parentID === lastUser.id &&
           !goalReservation
         ) {
           const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
@@ -3361,7 +4076,7 @@ const layer = Layer.effect(
             if (orphan) {
               yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
                 "session.id": sessionID,
-                messageID: lastAssistant.id,
+                messageID: previousAssistant.id,
                 tool: orphan.tool,
                 callID: orphan.callID,
               })
@@ -3397,10 +4112,43 @@ const layer = Layer.effect(
         const routeInput = workerRootMsg
           ? yield* SessionInput.findEntry(db, CurrentSessionMessage.ID.make(workerRootMsg.info.id))
           : undefined
-        const workerRouteIntent = SessionMetadataOwnership.workerDelegation(session.metadata)?.model.routeIntent
-        const routeIntent =
-          (routeInput?.item.type === "synthetic" ? routeInput.item.execution?.routeIntent : undefined) ??
-          workerRouteIntent
+        const matchesSelectedModel = (model: { providerID: string; modelID: string; accountID?: string } | undefined) =>
+          !!model &&
+          model.providerID === String(lastUser.model.providerID) &&
+          model.modelID === String(lastUser.model.modelID) &&
+          // A protected worker origin may carry a hard-pinned account while
+          // the legacy V1 host prompt names only provider/model. An omitted
+          // account on the turn must inherit that protected selection; only
+          // an explicit, different turn account invalidates the match.
+          (lastUser.model.accountID === undefined || model.accountID === lastUser.model.accountID)
+        const rootExecution = routeInput?.item.type === "synthetic" ? routeInput.item.execution : undefined
+        const rootRouteIntent = matchesSelectedModel(
+          rootExecution?.model
+            ? {
+                providerID: String(rootExecution.model.providerID),
+                modelID: String(rootExecution.model.id),
+                accountID: rootExecution.model.accountID,
+              }
+            : undefined,
+        )
+          ? rootExecution?.routeIntent
+          : undefined
+        const delegationModel = SessionMetadataOwnership.workerDelegation(session.metadata)?.model
+        const workerRouteIntent = matchesSelectedModel(
+          delegationModel
+            ? {
+                providerID: delegationModel.providerID,
+                modelID: delegationModel.modelID,
+                accountID: delegationModel.accountID,
+              }
+            : undefined,
+        )
+          ? delegationModel?.routeIntent
+          : undefined
+        const userOwnedTurn = SessionTurnProvenance.resolveInfo(lastUser)?.owner === "user"
+        const routeIntent = userOwnedTurn
+          ? lastUser.model.routeIntent
+          : rootRouteIntent ?? workerRouteIntent ?? lastUser.model.routeIntent
         const routed = yield* provider
           .resolveRoutedModel({
             sessionID: CoreSessionSchema.ID.make(sessionID),
@@ -3408,6 +4156,13 @@ const layer = Layer.effect(
             modelID: lastUser.model.modelID,
             ...(lastUser.model.accountID ? { accountID: lastUser.model.accountID } : {}),
             ...(routeIntent ? { routeIntent } : {}),
+            ...(requiresAccountBackedHostedRoute({
+              hostedProvider: Provider.isHostedZenProvider(lastUser.model.providerID),
+              agent: lastUser.agent,
+              sessionAgent: session.agent,
+            })
+              ? { executionPurpose: "special-agent" as const }
+              : {}),
           })
           .pipe(
             Effect.catchIf(Provider.ModelNotFoundError.isInstance, (err) =>
@@ -3529,11 +4284,16 @@ const layer = Layer.effect(
           continue
         }
 
-        const agent = yield* agents.get(lastUser.agent)
+        // Swarm agent mode comes from the Core projection over durable
+        // membership, never from caller-supplied prompt input. The provider/
+        // model tuple remains independently selected on lastUser.
+        const swarmAgent = yield* swarms.executionAgentForSession(CoreSessionSchema.ID.make(sessionID))
+        const agentName = swarmAgent ?? lastUser.agent
+        const agent = yield* agents.get(agentName)
         if (!agent) {
           const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
           const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-          const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+          const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
           yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
           throw error
         }
@@ -3581,6 +4341,8 @@ const layer = Layer.effect(
             assistantMessage: msg,
             sessionID,
             model,
+            projectID: session.projectID,
+            durableHistory: msgs,
             ...(routeAttribution ? { routeAttribution } : {}),
             ...(routed?.route.lease ? { routeLease: routed.route.lease } : {}),
             spad,
@@ -3588,8 +4350,8 @@ const layer = Layer.effect(
           })
         }).pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
-
         const outcome: "break" | "continue" | "goal-audit" = yield* Effect.gen(function* () {
+          let recoverySettledWithoutPending = false
           const canonicalWorkerInput = workerRootMsg
             ? yield* SessionInput.findEntry(db, CurrentSessionMessage.ID.make(workerRootMsg.info.id))
             : undefined
@@ -3618,7 +4380,6 @@ const layer = Layer.effect(
             Effect.provideService(Snapshot.Service, snapshot),
           )
 
-
           if (lastUser.format?.type === "json_schema") {
             tools["StructuredOutput"] = createStructuredOutputTool({
               schema: lastUser.format.schema,
@@ -3636,7 +4397,6 @@ const layer = Layer.effect(
           // same turn still consumes `msgs` for Goal reconciliation and
           // provenance-sensitive continuation decisions.
           const providerHistory = yield* plugin.transformChatMessages(msgs)
-
 
           // Drain monitor ingress at safe boundary — respecting Question/Permission gates (§48-49)
           let monitorContext: string | undefined
@@ -3668,14 +4428,20 @@ const layer = Layer.effect(
             MessageV2.toModelMessagesEffect(providerHistory, model),
           ])
 
-          const explicitToolContext = yield* SessionTools.explicitLazyToolContext({
+          const explicitToolContext = yield* SessionTools.explicitToolMentionContext({
             agent,
             text: visibleWorkerPromptText(workerRootMsg),
             permission: session.permission,
+            providerTools: tools,
+            excludedMentions: (workerRootMsg?.parts ?? []).flatMap((part) => {
+              if (part.type === "agent" && part.source) return [part.source]
+              if (part.type === "file" && part.source?.text) return [part.source.text]
+              return []
+            }),
           }).pipe(
             Effect.provideService(ToolRegistry.Service, registry),
             Effect.catch((error) =>
-              Effect.logWarning("explicit lazy tool context failed", {
+              Effect.logWarning("explicit tool mention context failed", {
                 sessionID,
                 error: String(error),
               }).pipe(Effect.as(undefined)),
@@ -3718,6 +4484,20 @@ const layer = Layer.effect(
               ),
             )
 
+          if (recoveryGenerationForCycle !== undefined) {
+            const currentRecovery = yield* SessionLimitRecovery.get(db, sessionID)
+            if (!currentRecovery || currentRecovery.generation === recoveryGenerationForCycle) {
+              // No renewed limit generation replaced this one, so the recovery
+              // chain is settled. Retire its structural continuation turns
+              // before releasing queued user work; this survives restart and
+              // prevents their newer timestamps from stealing active-user
+              // selection from messages that were queued before the stop.
+              yield* retireLimitRecoveryContinuations(yield* historyProjection.history())
+              yield* clearLimitRecovery(sessionID, recoveryGenerationForCycle)
+              recoverySettledWithoutPending = (yield* SessionInput.nextPendingLane(db, sessionID)) === undefined
+            }
+          }
+
           if (spad) {
             const selected = spad.takeAuditCases(Math.max(0, spadAuditRemaining))
             spadAuditRemaining -= selected.length
@@ -3738,7 +4518,10 @@ const layer = Layer.effect(
             handle.message.structured = structured
             handle.message.finish = handle.message.finish ?? "stop"
             yield* sessions.updateMessage(handle.message)
-            return "break" as const
+            // Structured worker completion is still a worker turn, not an
+            // independent Goal verdict. Keep the host-owned audit handoff.
+            return (yield* goalAutomation.shouldAudit(sessionID))
+              ? "goal-audit" as const : "break" as const
           }
 
           if (handle.recovery) {
@@ -3775,7 +4558,9 @@ const layer = Layer.effect(
               }).toObject()
               yield* sessions.updateMessage(handle.message)
               yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-              return "break" as const
+              return !handle.hasNonProviderToolCalls &&
+                (yield* goalAutomation.shouldAudit(sessionID))
+                ? "goal-audit" as const : "break" as const
             }
             if (format.type === "json_schema") {
               handle.message.error = new SessionV1.StructuredOutputError({
@@ -3783,7 +4568,9 @@ const layer = Layer.effect(
                 retries: 0,
               }).toObject()
               yield* sessions.updateMessage(handle.message)
-              return "break" as const
+              return !handle.hasNonProviderToolCalls &&
+                (yield* goalAutomation.shouldAudit(sessionID))
+                ? "goal-audit" as const : "break" as const
             }
           }
 
@@ -3799,7 +4586,81 @@ const layer = Layer.effect(
               overflow: !handle.message.finish,
             })
           }
-          if (result === "stop") return "break" as const
+          if (result === "stop") {
+            if (
+               handle.providerTimedOut &&
+               workerRootMsg &&
+               lastUserMsg &&
+               lastUserMsg.info.role === "user" &&
+               format.type !== "json_schema" &&
+              !goalReservation &&
+              !(yield* goalAutomation.shouldAudit(sessionID))
+            ) {
+              const attempt = nextProviderTimeoutContinuationAttempt(lastUserMsg.info)
+              if (attempt !== undefined) {
+                const id = CurrentSessionMessage.ID.make(`msg_provider_timeout_${handle.message.id}`)
+                const admitted = yield* SessionInput.admitSynthetic(db, events, {
+                  id,
+                  sessionID: CoreSessionSchema.ID.make(sessionID),
+                  content: { text: PROVIDER_TIMEOUT_CONTINUATION_PROMPT },
+                  origin: SessionInput.SyntheticOrigin.make({
+                    producer: SharedTurnProvenance.Source.ProviderTimeoutContinuation,
+                    actor: { type: "host" },
+                    ref: `${attempt}:${handle.message.id}`,
+                    cause: {
+                      sessionID: CoreSessionSchema.ID.make(sessionID),
+                      messageID: CurrentSessionMessage.ID.make(workerRootMsg.info.id),
+                    },
+                  }),
+                  admissionClass: "automatic",
+                  delivery: "queue",
+                  userPreemptible: true,
+                  expectedLatestUserSeq: providerTimeoutUserFence,
+                  execution: {
+                    agent: lastUser.agent,
+                    model: {
+                      providerID: ProviderV2.ID.make(lastUser.model.providerID),
+                      id: ModelV2.ID.make(lastUser.model.modelID),
+                      ...(lastUser.model.accountID ? { accountID: lastUser.model.accountID } : {}),
+                      ...(lastUser.model.variant
+                        ? { variant: ModelV2.VariantID.make(lastUser.model.variant) }
+                        : {}),
+                    },
+                    ...(lastUser.model.routeIntent ? { routeIntent: lastUser.model.routeIntent } : {}),
+                  },
+                }).pipe(
+                  Effect.map((entry) => ({ state: "admitted" as const, entry })),
+                  Effect.catchDefect((defect) =>
+                    defect instanceof SessionInput.AdmissionFenceConflict || defect instanceof SessionInput.LifecycleConflict
+                      ? Effect.succeed({ state: "superseded" as const })
+                      : Effect.die(defect),
+                  ),
+                )
+                if (admitted.state === "admitted" && admitted.entry.revokedSeq === undefined) {
+                  yield* Effect.logWarning("queued bounded provider timeout continuation", {
+                    sessionID,
+                    assistantMessageID: handle.message.id,
+                    attempt,
+                  })
+                  // Return through the canonical input arbiter. Never replay
+                  // individual tool calls or bypass human-input priority.
+                  step = 0
+                  return "continue" as const
+                }
+              }
+            }
+            // Worker/provider failure is not a Goal lifecycle decision.
+            // Inspect partial work via the independent read-only auditor;
+            // never cancel the durable worker cursor merely because a
+            // provider or processor returned its terminal stop signal.
+            // All tool settlements have already completed by this terminal
+            // processor result. Unlike a successful worker step, a stopped
+            // worker cannot consume those results in another step; the
+            // independent auditor must now decide continuation/blocking.
+            if (yield* goalAutomation.shouldAudit(sessionID))
+              return "goal-audit" as const
+            return "break" as const
+          }
           // SessionProcessor returns "continue" after an ordinary successful
           // model completion; "stop" is reserved for blocked/error/SPAD-abort
           // paths. Goal verification must therefore key off the authoritative
@@ -3809,13 +4670,20 @@ const layer = Layer.effect(
           // through the worker loop.
           if (
             result === "continue" &&
-            goalSystem &&
             finished &&
             !handle.message.error &&
             !handle.hasNonProviderToolCalls &&
             (yield* goalAutomation.shouldAudit(sessionID))
           )
             return "goal-audit" as const
+          if (
+            recoverySettledWithoutPending &&
+            !goalSystem &&
+            finished &&
+            !handle.message.error &&
+            !handle.hasNonProviderToolCalls
+          )
+            return "break" as const
           return "continue" as const
         }).pipe(
           Effect.ensuring(instruction.clear(handle.message.id)),
@@ -3824,18 +4692,26 @@ const layer = Layer.effect(
         if (outcome === "goal-audit") {
           const completedReservation = goalReservation
           if (!workerRootMsg || workerRootMsg.info.role !== "user") {
-            yield* goalAutomation.failAudit({
+            // The worker cycle has already executed. History compaction or a
+            // transient projection gap must not destroy its durable
+            // continuation reservation; reconstruct the causal root on the
+            // next scheduled audit attempt instead of replaying worker work.
+            yield* goalAutomation.afterTurn({
               sessionID,
-              error: "Goal auditor cannot reserve a continuation because the causal worker prompt is unavailable.",
+              origin: completedReservation ? "automatic" : "user",
+              ...(completedReservation ? { reservationID: completedReservation.id } : {}),
+              audit: {
+                ok: false,
+                retryable: true,
+                error: "Goal auditor cannot resolve the causal worker prompt for the completed cycle.",
+              },
             })
             break
           }
           const auditHistory = yield* goalAuditCycleHistory(sessionID, workerRootMsg.info.id)
           const cycleUserFence =
             completedReservation?.expectedLatestUserSeq ??
-            (goalCycleUserFenceCaptured
-              ? goalCycleUserFence
-              : yield* SessionInput.latestPromotedUserSeq(db, sessionID))
+            (goalCycleUserFenceCaptured ? goalCycleUserFence : yield* SessionInput.latestPromotedUserSeq(db, sessionID))
           const decision = yield* executeGoalAudit({
             sessionID,
             origin: completedReservation ? "automatic" : "user",
@@ -3872,10 +4748,31 @@ const layer = Layer.effect(
           break
         }
         if (outcome === "break") {
-          if (goalReservation) {
+          // "break" is the V1 processor's terminal/error signal, NOT a
+          // durable Goal cancellation. A worker can stop after a rejected
+          // permission, provider failure, content filter, or SPAD abort. If
+          // the Goal remains runnable, let recovery re-audit the partial work
+          // rather than deleting the only cursor and leaving an active Goal
+          // permanently idle. This also catches break paths reached before
+          // the Goal context provider finished injecting its instructions.
+          if (yield* goalAutomation.shouldAudit(sessionID)) {
+            yield* goalAutomation.afterTurn({
+              sessionID,
+              origin: goalReservation ? "automatic" : "user",
+              ...(goalReservation ? { reservationID: goalReservation.id } : {}),
+              ...(workerRootMsg ? { sourceMessageID: workerRootMsg.info.id } : {}),
+              expectedLatestUserSeq: goalReservation?.expectedLatestUserSeq ??
+                (goalCycleUserFenceCaptured ? goalCycleUserFence : yield* SessionInput.latestPromotedUserSeq(db, sessionID)),
+              audit: {
+                ok: false,
+                retryable: true,
+                error: "Goal worker ended before independent audit; recover by auditing its settled work, not replaying worker tools.",
+              },
+            })
+          } else if (goalReservation) {
             yield* goalAutomation.cancel(sessionID)
-            goalReservation = undefined
           }
+          goalReservation = undefined
           break
         }
         continue
@@ -3889,6 +4786,15 @@ const layer = Layer.effect(
 
       yield* maybePrune(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
       return yield* lastAssistant(sessionID)
+    })
+
+    const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
+      const historyProjection = yield* MessageV2.makeDrainHistory({
+        sessionID,
+        db: database.readDb,
+        events,
+      })
+      return yield* runLoopBody(sessionID, historyProjection).pipe(Effect.ensuring(historyProjection.close))
     })
 
     // SessionRunState owns process-local activation; SessionInput owns durable
@@ -3937,6 +4843,158 @@ const layer = Layer.effect(
       },
     )
 
+    const switchModel = Effect.fn("SessionPrompt.switchModel")(function* (input: {
+      sessionID: SessionID
+      assistantMessageID: string
+      requestSentAt: number
+      model: { providerID: string; modelID: string; accountID?: string; variant?: string }
+    }) {
+      const current = yield* requirePromptable(input.sessionID, "user")
+      if (current.pausedAt !== undefined || current.time.archived !== undefined) return false
+
+      // Validate the exact requested model before claiming or cancelling the
+      // provider attempt. The HTTP boundary performs the same catalog/variant
+      // validation to return a client error instead of a runtime defect.
+      const model = yield* getModel(
+        ProviderV2.ID.make(input.model.providerID),
+        ModelV2.ID.make(input.model.modelID),
+        input.sessionID,
+        input.model.accountID,
+      )
+      const variant = input.model.variant
+      if (variant && variant !== "default" && Object.keys(model.variants ?? {}).length > 0 && !model.variants?.[variant])
+        return false
+
+      const owner = yield* executionOwner.snapshot(input.sessionID)
+      if (!owner.ownerID) return false
+      const live = yield* telemetry.providerAttempt(input.sessionID)
+      if (
+        !live ||
+        live.assistantMessageID !== input.assistantMessageID ||
+        live.requestSentAt !== input.requestSentAt ||
+        live.preempted === true ||
+        live.streamedAt !== undefined ||
+        live.completedAt !== undefined
+      )
+        return false
+
+      const assistant = Option.getOrUndefined(
+        yield* MessageV2.get({
+          sessionID: CoreSessionSchema.ID.make(input.sessionID),
+          messageID: MessageID.make(input.assistantMessageID),
+        }).pipe(Effect.option),
+      )
+      if (!assistant || assistant.info.role !== "assistant" || assistant.info.summary) return false
+      const parent = assistant.info.parentID
+        ? Option.getOrUndefined(
+            yield* MessageV2.get({
+              sessionID: CoreSessionSchema.ID.make(input.sessionID),
+              messageID: assistant.info.parentID,
+            }).pipe(Effect.option),
+          )
+        : undefined
+      if (!parent || parent.info.role !== "user") return false
+      const causalRoot = SessionTurnProvenance.causalRootMessageID(parent) ?? parent.info.id
+      const rootMessage =
+        causalRoot === parent.info.id
+          ? parent
+          : Option.getOrUndefined(
+              yield* MessageV2.get({
+                sessionID: CoreSessionSchema.ID.make(input.sessionID),
+                messageID: MessageID.make(causalRoot),
+              }).pipe(Effect.option),
+            )
+      if (!rootMessage || rootMessage.info.role !== "user" || !SessionTurnProvenance.isWorkerPromptTurn(rootMessage))
+        return false
+
+      const agent = rootMessage.info.agent ?? (yield* agents.defaultInfo()).name
+      // The observed provider attempt is the idempotency key. Concurrent
+      // runtimes and rapid selector requests therefore race for one durable
+      // continuation; an existing row with a different target is a conflict,
+      // never a second queued continuation.
+      const id = CurrentSessionMessage.ID.make(
+        `msg_switch_${input.sessionID}_${input.assistantMessageID}_${input.requestSentAt}`,
+      )
+      const admitted = yield* SessionInput.admitSynthetic(db, events, {
+        id,
+        sessionID: CoreSessionSchema.ID.make(input.sessionID),
+        content: {
+          text: "Continue the same task as the newly selected model. Treat completed tool results as complete and do not repeat them.",
+        },
+        origin: SessionInput.SyntheticOrigin.make({
+          producer: SharedTurnProvenance.Source.ModelSwitch,
+          actor: { type: "host" },
+          ref: id,
+          cause: {
+            sessionID: CoreSessionSchema.ID.make(input.sessionID),
+            messageID: CurrentSessionMessage.ID.make(causalRoot),
+          },
+        }),
+        admissionClass: "host",
+        delivery: "steer",
+        userPreemptible: true,
+        rejectExisting: true,
+        expectedLatestUserSeq: yield* SessionInput.latestUserSeq(db, CoreSessionSchema.ID.make(input.sessionID)),
+        execution: {
+          agent,
+          model: {
+            providerID: ProviderV2.ID.make(input.model.providerID),
+            id: ModelV2.ID.make(input.model.modelID),
+            ...(input.model.accountID ? { accountID: input.model.accountID } : {}),
+            ...(variant && variant !== "default" ? { variant: ModelV2.VariantID.make(variant) } : {}),
+          },
+        },
+      }).pipe(
+        Effect.catchDefect((defect) =>
+          defect instanceof SessionInput.AdmissionFenceConflict || defect instanceof SessionInput.LifecycleConflict
+            ? Effect.succeed(undefined)
+            : Effect.die(defect),
+        ),
+      )
+      if (!admitted) return false
+
+      const interrupted = yield* state.switchProviderAttempt({
+        sessionID: input.sessionID,
+        generation: owner.generation,
+        assistantMessageID: input.assistantMessageID,
+        requestSentAt: input.requestSentAt,
+      })
+      if (!interrupted) {
+        const revoked = yield* SessionInput.revokeSynthetic(db, events, {
+          sessionID: CoreSessionSchema.ID.make(input.sessionID),
+          id,
+          reason: "policy",
+        })
+        // Promotion is the durable point of no return. If it wins against
+        // revocation, report the committed continuation as accepted instead
+        // of returning Conflict while the selected model is already queued.
+        if (revoked.state !== "too-late") return false
+      }
+
+      // The durable continuation is the restart-safe wake source. A fresh
+      // loop starts only after exact-generation cancellation; a concurrent User
+      // admission can revoke this preemptible host row and will win normal lane
+      // arbitration when this wake runs.
+      yield* loop({ sessionID: input.sessionID }).pipe(
+        Effect.catchCause((cause) => {
+          const error = Cause.squash(cause)
+          if (error instanceof Session.BusyError)
+            return Effect.logDebug("model switch wake already owned by Session runtime", {
+              sessionID: input.sessionID,
+              generation: owner.generation,
+            }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts))
+          return Effect.logWarning("model switch continuation wake failed", {
+            sessionID: input.sessionID,
+            generation: owner.generation,
+            cause: Cause.pretty(cause),
+          }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts))
+        }),
+        Effect.forkIn(scope, { startImmediately: true }),
+        Effect.asVoid,
+      )
+      return true
+    })
+
     const admitSynthetic = Effect.fn("SessionPrompt.admitSynthetic")(function* (
       input: SessionInput.SyntheticAdmission & { readonly resume?: boolean },
     ) {
@@ -3950,12 +5008,23 @@ const layer = Layer.effect(
       // this row and continues. Local activation failures are logged but cannot
       // roll back or duplicate the admitted intent.
       yield* loop({ sessionID: input.sessionID }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("trusted Synthetic wake did not acquire/run locally", {
+        Effect.catchCause((cause) => {
+          const error = Cause.squash(cause)
+          // A busy durable owner is the normal cross-runtime handoff path: the
+          // Synthetic row is already committed and that owner's
+          // releaseIfDrained() transaction will observe it before releasing.
+          // Treating this as a warning makes healthy concurrent wake delivery
+          // look like lost work and floods logs for active Swarm workers.
+          if (error instanceof Session.BusyError) {
+            return Effect.logDebug("trusted Synthetic wake already owned by another runtime", {
+              sessionID: input.sessionID,
+            }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts))
+          }
+          return Effect.logWarning("trusted Synthetic wake did not acquire/run locally", {
             sessionID: input.sessionID,
             cause: Cause.pretty(cause),
-          }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts)),
-        ),
+          }).pipe(Effect.as(undefined as unknown as SessionV1.WithParts))
+        }),
         Effect.forkIn(scope, { startImmediately: true }),
         Effect.asVoid,
       )
@@ -3978,28 +5047,36 @@ const layer = Layer.effect(
       if (runtime?.phase === "auditing" || runtime?.phase === "working" || runtime?.phase === "continuation_pending")
         return
       if (!(yield* goalAutomation.shouldAudit(sessionID))) return
-      const auditRecovery =
-        runtime?.phase === "audit_requested" ? yield* goalAutomation.claimAuditRecovery(sessionID) : undefined
-      // An audit request with an attached reservation is claimed atomically.
-      // Losing that claim means another recovery path already owns it; do not
-      // fall through and start a reservation-less auditor against the same row.
-      if (runtime?.phase === "audit_requested" && !auditRecovery) return
+      const isRecovery = runtime?.phase === "audit_requested" ||
+        (runtime?.phase === "audit_error" && runtime.retryAt !== undefined)
+      if (runtime?.phase === "audit_error" && !isRecovery) return
+      const auditRecovery = isRecovery ? yield* goalAutomation.claimAuditRecovery(sessionID) : undefined
+      // A retryable audit error is deliberately scheduled in the future. No
+      // caller—not even startup recovery—may run it before the durable due
+      // time, and no caller may drop a claimed worker's reservation on retry.
+      if (isRecovery && !auditRecovery) return
+
+      // The claimed reservation is the completed worker's causal history,
+      // never authorization to replay worker effects. Release it on failures
+      // before auditor lease acquisition without erasing pending audit work.
+      yield* Effect.gen(function* () {
 
       const lastUserMatch = yield* sessions
         .findMessage(sessionID, SessionTurnProvenance.isWorkerPromptTurn)
         .pipe(Effect.orDie)
-      if (Option.isNone(lastUserMatch)) {
-        yield* goalAutomation.failAudit({
+      const lastUser = Option.getOrUndefined(lastUserMatch)
+      if (!lastUser || lastUser.info.role !== "user") {
+        // Missing causal history is a retryable recovery fault, not a reason
+        // to permanently strand this runnable Goal or discard its worker.
+        yield* goalAutomation.afterTurn({
           sessionID,
-          error: "Goal auditor cannot start because the Session has no worker prompt.",
-        })
-        return
-      }
-      const lastUser = lastUserMatch.value
-      if (lastUser.info.role !== "user") {
-        yield* goalAutomation.failAudit({
-          sessionID,
-          error: "Goal auditor cannot start because the Session has no worker prompt.",
+          origin: auditRecovery?.reservation ? "automatic" : "user",
+          ...(auditRecovery?.reservation ? { reservationID: auditRecovery.reservation.id } : {}),
+          audit: {
+            ok: false,
+            retryable: true,
+            error: "Goal auditor cannot recover the worker prompt from Session history.",
+          },
         })
         return
       }
@@ -4013,6 +5090,14 @@ const layer = Layer.effect(
         id: ModelV2.ID.make(lastUser.info.model.modelID),
         ...(lastUser.info.model.variant ? { variant: ModelV2.VariantID.make(lastUser.info.model.variant) } : {}),
       }
+      // Recovery restarts outside the primary turn, so it has no in-flight
+      // routed result. Inherit the parent Session's committed route instead:
+      // the auditor must never become the route owner or fall back to ambient
+      // hosted auth mid-cycle.
+      const recoveryRoute = yield* committedRouteAttribution({
+        sessionID: CoreSessionSchema.ID.make(sessionID),
+        providerID: workerModel.providerID,
+      })
 
       const decision = yield* executeGoalAudit({
         sessionID,
@@ -4025,6 +5110,7 @@ const layer = Layer.effect(
           auditRecovery?.reservation?.expectedLatestUserSeq ??
           (yield* SessionInput.latestPromotedUserSeq(db, sessionID)),
         workerModel,
+        ...(recoveryRoute ? { route: recoveryRoute } : {}),
         latestWork: GoalAuditContext.latestWork(history, lastUser.info.id),
       }).pipe(
         Effect.catchCause((cause) =>
@@ -4037,10 +5123,32 @@ const layer = Layer.effect(
               yield* Effect.logInfo("Goal audit interrupted; durable audit recovery retained", { sessionID })
               return undefined
             }
-            const error = Cause.squash(cause)
-            const message = error instanceof Error ? error.message : String(error)
-            yield* goalAutomation.failAudit({ sessionID, error: message })
-            yield* Effect.logError("Goal audit failed", { sessionID, cause: Cause.pretty(cause) })
+            // The auditor and the audit-settlement adapter each have scoped
+            // finalizers that preserve the exact unfinished audit lease. An
+            // outer failure must not overwrite that durable recovery cursor
+            // with a terminal audit_error (or discard the completed worker's
+            // claimed reservation). Inspect the server owner, never a UI/status
+            // projection, before deciding whether recovery needs repair.
+            const runtime = yield* goalAutomation.runtime(sessionID)
+            if (runtime?.phase === "audit_requested" ||
+                (runtime?.phase === "audit_error" && runtime.retryAt !== undefined) ||
+                runtime?.phase === "auditing" || runtime?.phase === "working" ||
+                runtime?.phase === "continuation_pending") {
+              yield* Effect.logWarning("Goal audit exception retained durable recovery state", {
+                sessionID, phase: runtime.phase, cause: Cause.pretty(cause),
+              })
+              return undefined
+            }
+            if (!runtime && (yield* goalAutomation.shouldAudit(sessionID))) {
+              yield* goalAutomation.requestAudit(sessionID)
+              yield* Effect.logWarning("Goal audit exception repaired missing recovery cursor", {
+                sessionID, cause: Cause.pretty(cause),
+              })
+              return undefined
+            }
+            yield* Effect.logError("Goal audit failed without a recoverable active cursor", {
+              sessionID, phase: runtime?.phase, cause: Cause.pretty(cause),
+            })
             return undefined
           }),
         ),
@@ -4055,27 +5163,55 @@ const layer = Layer.effect(
       )
       yield* reconcileGoalState(sessionID, effective)
 
-      // Only an actual continuation reservation authorizes another worker cycle.
-      // The loop claims/materializes that reservation at its own admission seam.
-      if (decision.reservation) {
-        yield* loop({ sessionID }).pipe(
-          Effect.asVoid,
-          Effect.catchCause((cause) => {
-            const error = Cause.squash(cause)
-            if (
-              error instanceof Session.BusyError ||
-              (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
-            ) {
-              // A concurrent genuine user turn may acquire the parent Session
-              // after the independent audit settles. User admission cancels the
-              // autonomous reservation, so a busy continuation wake is benign
-              // contention, not an auditor failure.
-              return Effect.logInfo("Goal continuation wake coalesced with existing Session owner", { sessionID })
-            }
-            return Effect.failCause(cause)
-          }),
-        )
+       // Only the persisted reservation authorizes the next worker cycle.
+       // Never await an unbounded Goal continuation from the audit control
+       // command: the Session's worker may run for days. Doing so previously
+       // pinned the audit-recovery dispatcher at concurrency=2 indefinitely,
+       // preventing every subsequent orphaned Goal from being recovered.
+       // Fork in the owning service Scope so shutdown still interrupts the
+       // child and exact-generation Session ownership owns its lifecycle.
+       if (decision.reservation) {
+         yield* loop({ sessionID }).pipe(
+           Effect.asVoid,
+           Effect.catchCause((cause) => {
+             const error = Cause.squash(cause)
+             if (
+               error instanceof Session.BusyError ||
+               (typeof error === "object" && error !== null && "_tag" in error && error._tag === "SessionBusyError")
+             ) {
+               return Effect.logInfo("Goal continuation wake coalesced with existing Session owner", { sessionID })
+             }
+             return Effect.logError("Goal continuation wake failed; durable reservation retained for recovery", {
+               sessionID, cause: Cause.pretty(cause),
+             })
+           }),
+           Effect.forkIn(scope, { startImmediately: true }),
+           Effect.asVoid,
+         )
+       }
+      }).pipe(Effect.ensuring(
+        auditRecovery?.reservation
+          ? goalAutomation.releaseAuditRecovery({
+              sessionID,
+              reservationID: auditRecovery.reservation.id,
+            })
+          : Effect.void,
+      ))
+    })
+
+    const recoverGoalAudit = Effect.fn("SessionPrompt.recoverGoalAudit")(function* (sessionID: SessionID) {
+      const runtime = yield* goalAutomation.runtime(sessionID)
+      if (runtime && runtime.phase !== "audit_requested" &&
+          !(runtime.phase === "audit_error" && runtime.retryAt !== undefined)) return
+      // A legacy verifying Goal can have no runtime cursor. Only that case
+      // needs a new request. Existing audit_requested rows MUST be preserved:
+      // requestAudit() intentionally clears a reservation for explicit user
+      // preemption, which would destroy the crash-recovery causal handoff.
+      if (!runtime) {
+        const requested = yield* goalAutomation.requestAudit(sessionID)
+        if (!requested || requested.phase !== "audit_requested") return
       }
+      yield* auditGoal(sessionID)
     })
 
     const requestGoalAudit = Effect.fn("SessionPrompt.requestGoalAudit")(function* (sessionID: SessionID) {
@@ -4404,9 +5540,13 @@ const layer = Layer.effect(
       template = template.trim()
 
       const selectedInputModel = input.model
-        ? (() => {
+          ? (() => {
             const parsed = Provider.parseModel(input.model)
-            return input.accountID ? { ...parsed, accountID: input.accountID } : parsed
+            return {
+              ...parsed,
+              ...(input.accountID ? { accountID: input.accountID } : {}),
+              ...(input.routeIntent ? { routeIntent: input.routeIntent } : {}),
+            }
           })()
         : undefined
       const taskModel = yield* Effect.gen(function* () {
@@ -4420,6 +5560,18 @@ const layer = Layer.effect(
       })
       const taskAccountID =
         "accountID" in taskModel && typeof taskModel.accountID === "string" ? taskModel.accountID : undefined
+      const taskRouteIntent = "routeIntent" in taskModel ? taskModel.routeIntent : undefined
+      const inheritedAutoIntent =
+        !taskRouteIntent &&
+        !taskAccountID &&
+        selectedInputModel?.providerID === taskModel.providerID &&
+        selectedInputModel.routeIntent?.kind === "auto"
+          ? selectedInputModel.routeIntent
+          : undefined
+      const routedTaskModel =
+        taskRouteIntent || inheritedAutoIntent
+          ? { ...taskModel, routeIntent: taskRouteIntent ?? inheritedAutoIntent }
+          : taskModel
 
       // Explicit account models are validated authoritatively by
       // resolveRoutedModel during the admitted prompt. A generic Console
@@ -4464,7 +5616,7 @@ const layer = Layer.effect(
         ? selectedInputModel
           ? selectedInputModel
           : yield* currentModel(input.sessionID)
-        : taskModel
+        : routedTaskModel
 
       yield* plugin.trigger(
         "command.execute.before",
@@ -4497,13 +5649,20 @@ const layer = Layer.effect(
       cancel: cancel as unknown as Interface["cancel"],
       pause: pause as unknown as Interface["pause"],
       assertUserPromptable: assertUserPromptable as unknown as Interface["assertUserPromptable"],
+      assertInteractiveUserPromptable:
+        assertInteractiveUserPromptable as unknown as Interface["assertInteractiveUserPromptable"],
       requestGoalAudit: requestGoalAudit as unknown as Interface["requestGoalAudit"],
+      recoverGoalAudit: recoverGoalAudit as unknown as Interface["recoverGoalAudit"],
       prompt: prompt as unknown as Interface["prompt"],
+      interactivePrompt: interactivePrompt as unknown as Interface["interactivePrompt"],
       userActionPrompt: userActionPrompt as unknown as Interface["userActionPrompt"],
       hostPrompt: hostPrompt as unknown as Interface["hostPrompt"],
+      switchModel: switchModel as unknown as Interface["switchModel"],
       admitSynthetic: admitSynthetic as unknown as Interface["admitSynthetic"],
       steer: steerFn as unknown as Interface["steer"],
       loop: loop as unknown as Interface["loop"],
+      retireLimitRecoveryContinuations:
+        retireCurrentLimitRecoveryContinuations as unknown as Interface["retireLimitRecoveryContinuations"],
       shell: shell as unknown as Interface["shell"],
       command: command as unknown as Interface["command"],
       resolvePromptParts: resolvePromptParts as unknown as Interface["resolvePromptParts"],
@@ -4531,6 +5690,7 @@ export const CommandInput = Schema.Struct({
   agent: Schema.optional(Schema.String),
   model: Schema.optional(Schema.String),
   accountID: Schema.optional(Schema.String),
+  routeIntent: Schema.optional(ProviderRouteIntent.Info),
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
@@ -4600,10 +5760,13 @@ export const node = LayerNode.make({
   deps: [
     SessionStatus.node,
     SessionTelemetry.node,
+    SessionExecutionOwner.node,
     Session.node,
+    SwarmV2.node,
     BackgroundJob.node,
     Agent.node,
     Provider.node,
+    ProviderRoute.node,
     SessionProcessor.node,
     SessionCompaction.node,
     Plugin.node,
@@ -4626,6 +5789,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    SessionOperatorRecovery.node,
     SessionRevert.node,
     TurnCheckpoint.node,
     SessionSummary.node,

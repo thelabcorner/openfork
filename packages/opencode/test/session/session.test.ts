@@ -54,6 +54,32 @@ const exists = (target: string) => fs.stat(target).then(
 )
 
 describe("session.created event", () => {
+  it.instance("batches addressed V1 Session reads with identical decoding and no fabricated missing rows", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const first = yield* session.create({ title: "batched-session-first" })
+      const second = yield* session.create({ title: "batched-session-second" })
+      return yield* Effect.ensuring(
+        Effect.gen(function* () {
+          if (!session.getMany) return yield* Effect.die("Production Session.getMany is unavailable")
+          const unknown = SessionID.make("ses_batched_session_unknown")
+          const batched = yield* session.getMany([first.id, second.id, first.id, unknown])
+          expect(batched.size).toBe(2)
+          expect(batched.get(first.id)).toEqual(yield* session.get(first.id))
+          expect(batched.get(second.id)).toEqual(yield* session.get(second.id))
+          expect(batched.has(unknown)).toBe(false)
+          expect(yield* session.getMany([])).toEqual(new Map())
+          if (!session.workerOriginsMany) return yield* Effect.die("Production Session.workerOriginsMany is unavailable")
+          // Ordinary human-owned Sessions must not become delegated workers
+          // merely because a caller asks for their ID in an origin batch.
+          expect(yield* session.workerOriginsMany([first.id, second.id, unknown, first.id])).toEqual(new Map())
+          expect(yield* session.workerOriginsMany([])).toEqual(new Map())
+        }),
+        Effect.all([session.remove(second.id), session.remove(first.id)], { discard: true }).pipe(Effect.ignore),
+      )
+    }),
+  )
+
   it.instance("should emit session.created event when session is created", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -294,6 +320,159 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session", () => {
+  it.instance("resolves persisted code ToolParts by PartID with their physical replay scope", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({ title: "code-run-owner" })
+      const messageID = MessageID.ascending()
+      const partID = PartID.ascending()
+
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+        tools: {},
+        mode: "",
+      } as unknown as SessionV1.Info)
+      yield* session.updatePart({
+        id: partID,
+        messageID,
+        sessionID: info.id,
+        type: "tool",
+        callID: "call_code_run_owner",
+        tool: "code",
+        state: {
+          status: "completed",
+          input: { action: "run", code: "return 42", input: {} },
+          output: '{"ok":true}',
+          title: "code",
+          metadata: { sourceRunID: `run:${partID}`, inputRunID: `run:${partID}` },
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+
+      const scope = yield* session.physicalScope(info.id)
+      const resolved = yield* session.getCodeToolPart(partID)
+      expect(resolved?.part.id).toBe(partID)
+      expect(resolved?.part.tool).toBe("code")
+      expect(resolved?.part.state.input).toEqual({ action: "run", code: "return 42", input: {} })
+      expect(resolved?.scope.key).toBe(scope.key)
+
+      yield* session.remove(info.id)
+    }),
+  )
+
+  it.instance("searches CodeRun history from the source-free FTS projection with bounded pagination", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const info = yield* session.create({ title: "code run history" })
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+        tools: {},
+        mode: "",
+      } as unknown as SessionV1.Info)
+
+      const makeCodePart = (
+        id: string,
+        input: Record<string, unknown>,
+        metadata: Record<string, unknown>,
+      ): SessionV1.ToolPart =>
+        SessionV1.ToolPart.make({
+          id: PartID.make(id),
+          messageID,
+          sessionID: info.id,
+          type: "tool",
+          callID: `call_${id}`,
+          tool: "code",
+          state: {
+            status: "completed",
+            input,
+            output: "{}",
+            title: "code",
+            metadata,
+            time: { start: Date.now(), end: Date.now() },
+          },
+        }) as SessionV1.ToolPart
+
+      yield* session.updatePart(
+        makeCodePart(
+          "prt_code_history_a",
+          {
+            action: "run",
+            code: "return 'private_source_history_needle'",
+            input: { token: "private_runtime_input_needle" },
+          },
+          {
+            sourceHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            sourceRunID: "run:prt_code_history_a",
+            dependencies: { literalRefs: ["native:find"], dynamicCallTarget: false },
+          },
+        ),
+      )
+      yield* session.updatePart(
+        makeCodePart(
+          "prt_code_history_b",
+          { action: "run", runID: "run:prt_code_history_a" },
+          {
+            sourceHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            replayOf: "run:prt_code_history_a",
+            sourceRunID: "run:prt_code_history_a",
+            dependencies: { literalRefs: ["mcp:github/list_issues"], dynamicCallTarget: false },
+          },
+        ),
+      )
+      yield* session.updatePart(
+        makeCodePart(
+          "prt_code_history_search",
+          { action: "search", query: "private_source_history_needle" },
+          {},
+        ),
+      )
+
+      const dependency = yield* session.searchCodeRuns({
+        sessionID: info.id,
+        query: "native find",
+      })
+      expect(dependency.items.map((item) => item.ref)).toEqual(["run:prt_code_history_a"])
+
+      const secretSource = yield* session.searchCodeRuns({
+        sessionID: info.id,
+        query: "private_source_history_needle",
+      })
+      expect(secretSource.items).toEqual([])
+      const secretInput = yield* session.searchCodeRuns({
+        sessionID: info.id,
+        query: "private_runtime_input_needle",
+      })
+      expect(secretInput.items).toEqual([])
+
+      const first = yield* session.searchCodeRuns({ sessionID: info.id, limit: 1 })
+      expect(first.items).toHaveLength(1)
+      expect(first.next).not.toBeNull()
+      expect(first.remaining).toBe(1)
+      const second = yield* session.searchCodeRuns({
+        sessionID: info.id,
+        limit: 1,
+        cursor: first.next!,
+      })
+      expect(second.items).toHaveLength(1)
+      expect(second.items[0]?.ref).not.toBe(first.items[0]?.ref)
+      expect(second.remaining).toBe(0)
+      expect(second.next).toBeNull()
+
+      yield* session.remove(info.id)
+    }),
+  )
+
   it.live("isolates root Chat sessions and reclaims scratch directories after the final reference", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -308,6 +487,7 @@ describe("Session", () => {
       expect(first.directory).not.toBe(root)
       expect(second.directory).not.toBe(root)
       expect(first.directory).not.toBe(second.directory)
+      expect((yield* session.physicalScope(first.id)).key).not.toBe((yield* session.physicalScope(second.id)).key)
       expect(yield* Effect.promise(() => exists(first.directory))).toBe(true)
       expect(yield* Effect.promise(() => exists(second.directory))).toBe(true)
 
@@ -320,6 +500,7 @@ describe("Session", () => {
       const fork = yield* provideInstance(first.directory)(session.fork({ sessionID: first.id }))
       expect(child.directory).toBe(first.directory)
       expect(fork.directory).toBe(first.directory)
+      expect((yield* session.physicalScope(fork.id)).key).toBe((yield* session.physicalScope(first.id)).key)
 
       yield* session.remove(first.id)
       expect(yield* Effect.promise(() => exists(first.directory))).toBe(true)

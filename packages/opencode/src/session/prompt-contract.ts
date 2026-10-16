@@ -4,6 +4,7 @@ import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provena
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { MessageID, SessionID } from "./schema"
+import { ProviderRouteIntent } from "@opencode-ai/schema/model-select/provider-route-intent"
 
 /**
  * Protocol-neutral Session prompt contract shared by trusted host producers.
@@ -16,6 +17,7 @@ export const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
   accountID: Schema.optional(Schema.String),
+  routeIntent: Schema.optional(ProviderRouteIntent.Info),
 })
 export type ModelRef = Schema.Schema.Type<typeof ModelRef>
 

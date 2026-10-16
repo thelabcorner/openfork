@@ -18,7 +18,9 @@ import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Snapshot } from "@/snapshot"
 import { isCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
-import { Deferred, Effect, Layer, Schema } from "effect"
+import * as Capability from "@/tool/capability"
+import * as CodeService from "@/code/service"
+import { Cause, Deferred, Effect, Exit, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
 
 const callID = "call-test"
@@ -86,6 +88,7 @@ const fakePermission = Permission.Service.of({
   ask: () => Effect.void,
   reply: () => Effect.void,
   list: () => Effect.succeed([]),
+  releaseExecution: () => Effect.void,
 } satisfies Permission.Interface)
 
 const fakeTruncate = Truncate.Service.of({
@@ -97,8 +100,10 @@ const fakeTruncate = Truncate.Service.of({
       write: () => Effect.void,
       close: Effect.void,
       healthy: () => true,
+      timelineHealthy: () => false,
     }),
   output: (text: string) => Effect.succeed({ content: text, truncated: false }),
+  retainTimeline: () => Effect.succeed(false),
   limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
 } satisfies Truncate.Interface)
 
@@ -147,6 +152,7 @@ const layer = Layer.mergeAll(
       all: () => Effect.succeed([lazySqlite, lazyRefactor]),
       named: () =>
         Effect.succeed({} as unknown as Effect.Success<ReturnType<ToolRegistry.Interface["named"]>>),
+      capabilities: () => Effect.succeed({ generation: "test", entries: [] }),
       tools: (_model: Parameters<ToolRegistry.Interface["tools"]>[0]) =>
         Effect.succeed([
           toolBroker,
@@ -187,6 +193,30 @@ const layer = Layer.mergeAll(
 
 const it = testEffect(layer)
 
+it.effect("provider tool execution fails closed without a tool-call ID", () =>
+  Effect.gen(function* () {
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: processorStub(),
+      authorizedAgentNames: new Set(),
+      messages: [],
+      promptOps: {} as never,
+    })
+    const execute = tools.timing?.execute
+    if (!execute) throw new Error("timing tool is missing execute")
+    const exit = yield* Effect.exit(
+      Effect.promise(() =>
+        execute({}, { toolCallId: "", messages: [], abortSignal: new AbortController().signal }),
+      ),
+    )
+    expect(Exit.isFailure(exit)).toBe(true)
+    const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+    expect(error instanceof Error ? error.message : String(error)).toContain("provider tool-call ID")
+  }),
+)
+
 function findDef(label: string): Tool.Def {
   return {
     id: "find",
@@ -218,6 +248,7 @@ function findLayer(
         ids: () => Effect.succeed(defs.map((item) => item.id)),
         all: () => Effect.succeed(defs),
         named: () => Effect.succeed({} as unknown as Effect.Success<ReturnType<ToolRegistry.Interface["named"]>>),
+        capabilities: () => Effect.succeed({ generation: "test", entries: [] }),
         tools: () => Effect.succeed(defs),
         refreshCustom: () => Effect.succeed({ added: [], updated: [], removed: [] }),
       }),
@@ -266,6 +297,99 @@ function processorStub(): Pick<SessionProcessor.Handle, "message" | "updateToolC
 const canonicalFindDef = findDef("canonical find")
 const canonicalFindIt = testEffect(findLayer([canonicalFindDef]))
 const shadowedFindIt = testEffect(findLayer([canonicalFindDef, findDef("custom find")]))
+
+const fanoutLeaf: Capability.Registration = {
+  identity: Capability.nativeIdentity("fanout_leaf"),
+  kind: "native",
+  description: "Return the requested fan-out index.",
+  inputSchema: {
+    type: "object",
+    properties: { index: { type: "number" } },
+    required: ["index"],
+    additionalProperties: false,
+  },
+  invokeSemantic: (args) =>
+    Effect.succeed({
+      title: "fanout_leaf",
+      metadata: {},
+      output: JSON.stringify(args),
+      data: args,
+    }),
+  authorize: () => Effect.void,
+  authorityBinding: "native:fanout_leaf:v1",
+  classifyWorkspaceMutation: () => false,
+  codeCallable: true,
+  lifetime: "inline",
+}
+
+const codeFanoutDef = {
+  id: "code",
+  description: "Test-only Code root using the production CodeService gateway.",
+  parameters: Schema.Struct({ count: Schema.Number }),
+  jsonSchema: {
+    type: "object",
+    properties: { count: { type: "number" } },
+    required: ["count"],
+    additionalProperties: false,
+  },
+  execute: (args, ctx) =>
+    Effect.gen(function* () {
+      if (!ctx.captureCapabilities) return yield* Effect.die("missing capability capture")
+      const inventory = yield* ctx.captureCapabilities()
+      const result = yield* CodeService.runInline({
+        code: [
+          "const pending = []",
+          "for (let index = 0; index < input.count; index++) {",
+          '  pending.push(call("native:fanout_leaf", { index }))',
+          "}",
+          "return await Promise.all(pending)",
+        ].join("\n"),
+        value: args,
+        ctx,
+        inventory,
+        services: {
+          permission: fakePermission,
+          plugin: fakePlugin,
+          snapshot: fakeSnapshot,
+          interrupt: fakeInterrupt,
+        },
+      })
+      return {
+        title: "code",
+        metadata: { trace: result.trace },
+        output: JSON.stringify(result.envelope),
+        data: result.envelope,
+      }
+    }),
+} satisfies Tool.Def
+
+const codePersistenceLayer = Layer.mergeAll(
+  Layer.succeed(Plugin.Service, fakePlugin),
+  Layer.succeed(Permission.Service, fakePermission),
+  Layer.succeed(MCP.Service, fakeMcp()),
+  Layer.succeed(Truncate.Service, fakeTruncate),
+  Layer.succeed(ToolInterrupt.Service, fakeInterrupt),
+  Layer.succeed(Snapshot.Service, fakeSnapshot),
+  RuntimeFlags.layer(),
+  Layer.succeed(
+    ToolRegistry.Service,
+    ToolRegistry.Service.of({
+      ids: () => Effect.succeed(["code"]),
+      all: () => Effect.succeed([codeFanoutDef]),
+      named: () => Effect.succeed({} as unknown as Effect.Success<ReturnType<ToolRegistry.Interface["named"]>>),
+      capabilities: () =>
+        Effect.succeed({
+          generation: "fanout-test",
+          entries: [fanoutLeaf],
+          byRef: new Map([[fanoutLeaf.identity.ref, fanoutLeaf]]),
+        }),
+      tools: () => Effect.succeed([codeFanoutDef]),
+      refreshCustom: () => Effect.succeed({ added: [], updated: [], removed: [] }),
+    }),
+  ),
+)
+
+const codePersistenceIt = testEffect(codePersistenceLayer)
 
 it.effect("extracts intentional tool mentions without treating email or npm scopes as capabilities", () =>
   Effect.sync(() => {
@@ -346,6 +470,70 @@ shadowedFindIt.effect("does not mark SessionTools output when a custom find shad
   }),
 )
 
+codePersistenceIt.effect("keeps 1-leaf and 100-leaf Code roots on one durable ToolPart identity", () =>
+  Effect.gen(function* () {
+    for (const count of [1, 100]) {
+      const rootCallID = `call-code-root-${count}`
+      const rootPartID = PartID.ascending()
+      let state: SessionV1.ToolPart = {
+        id: rootPartID,
+        sessionID,
+        messageID,
+        type: "tool",
+        tool: "code",
+        callID: rootCallID,
+        state: { status: "running", input: { count }, time: { start: 100 } },
+      }
+      const persistedCallIDs: string[] = []
+      const persistedPartIDs: string[] = []
+
+      const processor = {
+        ...processorStub(),
+        message: { ...processorStub().message, id: messageID, sessionID },
+        toolPartID: (toolCallID: string) => (toolCallID === rootCallID ? rootPartID : undefined),
+        updateToolCall: (toolCallID: string, update: (part: SessionV1.ToolPart) => SessionV1.ToolPart) =>
+          Effect.sync(() => {
+            persistedCallIDs.push(toolCallID)
+            state = update(state)
+            persistedPartIDs.push(state.id)
+            return state
+          }),
+      } satisfies Pick<
+        SessionProcessor.Handle,
+        "message" | "updateToolCall" | "completeToolCall" | "toolPartID"
+      >
+
+      const tools = yield* SessionTools.resolve({
+        agent,
+        model,
+        session: { id: sessionID, permission: [] } as unknown as Session.Info,
+        processor,
+        authorizedAgentNames: new Set(),
+        messages: [],
+        promptOps: {} as never,
+      })
+      const execute = tools.code.execute
+      if (!execute) throw new Error("code tool is missing execute")
+
+      const result = (yield* Effect.promise(() =>
+        execute(
+          { count },
+          {
+            toolCallId: rootCallID,
+            abortSignal: new AbortController().signal,
+            messages: [],
+          },
+        ),
+      )) as { data?: unknown }
+
+      expect((result.data as { ok?: boolean }).ok).toBe(true)
+      expect(persistedCallIDs.length).toBeGreaterThan(0)
+      expect(new Set(persistedCallIDs)).toEqual(new Set([rootCallID]))
+      expect(new Set(persistedPartIDs)).toEqual(new Set([rootPartID]))
+    }
+  }),
+)
+
 it.effect("pre-seeds an explicitly mentioned lazy tool schema for direct broker invocation", () =>
   Effect.gen(function* () {
     const context = yield* SessionTools.explicitLazyToolContext({
@@ -361,6 +549,170 @@ it.effect("pre-seeds an explicitly mentioned lazy tool schema for direct broker 
     expect(context).toContain('"contract":"broker-v1:')
     expect(context).not.toContain("@missing")
     expect(context).not.toContain("Tool: @refactor")
+  }),
+)
+
+it.effect("provides compact routing for direct @tool mentions without duplicating schemas", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Use @timing and @sqlite; user@example.com is an email, not a mention.",
+      providerTools: { timing: { description: "Read timing metadata.\nAdditional internal instructions." }, tool: {} },
+    })
+    expect(context).toContain("Tool: @timing")
+    expect(context).toContain("Description: Read timing metadata.")
+    expect(context).toContain("provider-visible `timing` tool directly")
+    expect(context).toContain("Tool: @sqlite")
+    expect(context).toContain('"contract":"broker-v1:')
+    expect(context).not.toContain("Additional internal instructions")
+    expect(context).not.toContain("user@example.com")
+    expect(context?.match(/Tool: @timing/g)).toHaveLength(1)
+  }),
+)
+
+it.effect("resolves mentions against the actual native Session provider tool map", () =>
+  Effect.gen(function* () {
+    const providerTools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: processorStub(),
+      authorizedAgentNames: new Set(),
+      messages: [],
+      promptOps: {} as never,
+    })
+    const context = yield* SessionTools.explicitToolMentionContext({
+      agent,
+      text: "Use @timing. Do not call @not_registered.",
+      providerTools,
+    })
+    expect(context).toContain("Tool: @timing")
+    expect(context).toContain("provider-visible `timing` tool directly")
+    expect(context).not.toContain("Tool: @not_registered")
+  }),
+)
+
+it.effect("does not advertise absent or permission-denied direct tools", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Use @timing @sqlite @general @missing",
+      permission: [{ permission: "timing", pattern: "*", action: "deny" }],
+      providerTools: { timing: { description: "Read timing metadata" } },
+    })
+    expect(context).not.toContain("Tool: @timing")
+    expect(context).not.toContain("Tool: @general")
+    expect(context).not.toContain("Tool: @missing")
+    expect(context).toContain("Tool: @sqlite")
+  }),
+)
+
+it.effect("does not mistake prototype keys for registered tools", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Do not invoke @constructor, @__proto__, or @toString.",
+      providerTools: { timing: { description: "Read timing metadata." } },
+    })
+    expect(context).toBeUndefined()
+  }),
+)
+
+it.effect("handles trailing punctuation while preserving registered dotted tool ids", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Use @sqlite. Then @vendor.inspect. Finally @vendor.inspect.",
+      providerTools: { "vendor.inspect": { description: "Inspect a remote provider." } },
+    })
+    expect(context).toContain("Tool: @sqlite")
+    expect(context).toContain("Tool: @vendor.inspect")
+    expect(context?.match(/Tool: @vendor\.inspect/g)).toHaveLength(1)
+    expect(context).not.toContain("Tool: @vendor.inspect.")
+  }),
+)
+
+it.effect("excludes exactly structured file/agent mentions, not an identically named typed tool", () =>
+  Effect.gen(function* () {
+    const text = "Review @timing and ask @general; then use @timing."
+    const fileStart = text.indexOf("@timing")
+    const agentStart = text.indexOf("@general")
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text,
+      providerTools: { timing: { description: "Read timing metadata." } },
+      excludedMentions: [
+        { value: "@timing", start: fileStart, end: fileStart + 7 },
+        { value: "@general", start: agentStart, end: agentStart + 8 },
+        { value: "@timing", start: 0, end: 7 }, // mismatched span must not exclude anything
+      ],
+    })
+    expect(context).toContain("Tool: @timing")
+    expect(context?.match(/Tool: @timing/g)).toHaveLength(1)
+    expect(context).not.toContain("Tool: @general")
+    const suppressed = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Review @timing",
+      providerTools: { timing: { description: "Read timing metadata." } },
+      excludedMentions: [{ value: "@timing", start: 7, end: 14 }],
+    })
+    expect(suppressed).toBeUndefined()
+  }),
+)
+
+it.effect("keeps direct tool routing even when the lazy broker itself is denied", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Use @timing and @sqlite.",
+      permission: [{ permission: "tool", pattern: "*", action: "deny" }],
+      providerTools: { timing: { description: "Read timing metadata." } },
+    })
+    expect(context).toContain("Tool: @timing")
+    expect(context).not.toContain("Tool: @sqlite")
+  }),
+)
+
+it.effect("falls back to lazy describe when a descriptor exceeds the request context budget", () =>
+  Effect.gen(function* () {
+    const original = yield* ToolRegistry.Service
+    const oversized = {
+      ...lazySqlite,
+      id: "oversized",
+      description: "Inspect large datasets. " + "a".repeat(49_000),
+    } satisfies Tool.Def
+    const registry = ToolRegistry.Service.of({
+      ...original,
+      all: () => Effect.succeed([oversized]),
+    })
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Please inspect with @oversized.",
+      providerTools: { tool: {} },
+    }).pipe(Effect.provideService(ToolRegistry.Service, registry))
+    expect(context).toContain("Tool: @oversized")
+    expect(context).toContain('"action":"describe","tool":"oversized"')
+    expect(context).toContain("The descriptor was not pre-seeded")
+    expect(context).not.toContain("Contract: broker-v1:")
+    expect(context!.length).toBeLessThan(3_000)
+  }),
+)
+
+it.effect("does not hydrate the tool registry on turns without valid tool tokens", () =>
+  Effect.gen(function* () {
+    const current = yield* ToolRegistry.Service
+    const guarded = ToolRegistry.Service.of({
+      ...current,
+      all: () => Effect.die(new Error("unused registry enumeration")),
+    })
+    for (const text of ["Review this code.", "Email user@example.com about it.", "See /home/@sqlite/config"]) {
+      const context = yield* SessionTools.explicitLazyToolContext({
+        agent,
+        text,
+        providerTools: { timing: {} },
+      }).pipe(Effect.provideService(ToolRegistry.Service, guarded))
+      expect(context).toBeUndefined()
+    }
   }),
 )
 
@@ -624,6 +976,7 @@ it.effect("per-tool kill interrupts a pending permission wait without aborting t
         ),
       reply: () => Effect.void,
       list: () => Effect.succeed([]),
+      releaseExecution: () => Effect.void,
     } satisfies Permission.Interface)
     const interrupt = ToolInterrupt.Service.of({
       track: () => Effect.succeed(child.signal),

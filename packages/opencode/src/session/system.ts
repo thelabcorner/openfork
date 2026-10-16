@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Effect, Layer } from "effect"
 
 import { InstanceState } from "@/effect/instance-state"
+import { Config } from "@/config/config"
 
 import PROMPT_ANTHROPIC from "./prompt/anthropic.txt"
 import PROMPT_DEFAULT from "./prompt/default.txt"
@@ -58,19 +59,30 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
 
+/** No configured references means no location graph may be started simply to
+ * render an environment prompt. This is the same admission rule used by Agent. */
+export function hasConfiguredReferences(config: { references?: unknown; reference?: unknown }): boolean {
+  const references = config.references ?? config.reference
+  return references !== null && typeof references === "object" && Object.keys(references).length > 0
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const skill = yield* Skill.Service
     const mcp = yield* MCP.Service
+    const config = yield* Config.Service
     const locations = yield* LocationServiceMap.Service
 
     return Service.of({
       environment: Effect.fn("SystemPrompt.environment")(function* (model: Provider.Model) {
         const ctx = yield* InstanceState.context
-        const references = yield* Effect.gen(function* () {
-          return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
-        }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+        const cfg = yield* config.get()
+        const references = hasConfiguredReferences(cfg)
+          ? yield* Effect.gen(function* () {
+              return (yield* (yield* Reference.Service).list()).filter((reference) => reference.description !== undefined)
+            }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+          : []
         return [
           [
             `You are powered by the model named ${model.api.id}. The exact model ID is ${model.providerID}/${model.api.id}`,
@@ -148,7 +160,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Skill.node, MCP.node, locationServiceMapNode],
+  deps: [Skill.node, MCP.node, Config.node, locationServiceMapNode],
 })
 
 export * as SystemPrompt from "./system"

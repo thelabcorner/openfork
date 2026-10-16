@@ -111,6 +111,14 @@ describe("session.system", () => {
     }
   })
 
+  test("empty reference config skips reference location admission regardless of legacy key shape", () => {
+    expect(SystemPrompt.hasConfiguredReferences({})).toBe(false)
+    expect(SystemPrompt.hasConfiguredReferences({ references: {} })).toBe(false)
+    expect(SystemPrompt.hasConfiguredReferences({ reference: {} })).toBe(false)
+    expect(SystemPrompt.hasConfiguredReferences({ references: { docs: { path: "/tmp/docs" } } })).toBe(true)
+    expect(SystemPrompt.hasConfiguredReferences({ reference: { shared: "/tmp/shared" } })).toBe(true)
+  })
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service

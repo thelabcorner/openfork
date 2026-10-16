@@ -100,7 +100,7 @@ test("V1 compaction tool projection preserves beginning and terminal failure con
   expect(Buffer.byteLength(projected, "utf-8")).toBeLessThanOrEqual(2_000)
 })
 
-function createUserMessage(sessionID: SessionID, text: string) {
+function createUserMessage(sessionID: SessionID, text: string, model: typeof ref = ref) {
   return Effect.gen(function* () {
     const ssn = yield* SessionNs.Service
     const msg = yield* ssn.updateMessage({
@@ -108,7 +108,7 @@ function createUserMessage(sessionID: SessionID, text: string) {
       role: "user",
       sessionID,
       agent: "build",
-      model: ref,
+      model,
       time: { created: Date.now() },
     })
     yield* ssn.updatePart({
@@ -244,9 +244,37 @@ function fake(
     get hasNonProviderToolCalls() {
       return false
     },
+    // The fixture never models a provider timeout. Keep its shape in sync
+    // with the production SessionProcessor.Handle contract.
+    get providerTimedOut() {
+      return false
+    },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
-    process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
+    // The test app already provides SessionNs.Service to its process effect.
+    // Test-only assertion: the mock's persistence dependency is supplied by
+    // that harness, although the production Handle interface is context-free.
+    process: Effect.fn("TestSessionProcessor.process")(() =>
+      SessionNs.Service.use((ssn) =>
+        Effect.gen(function* () {
+          if (result === "continue") {
+            // The old mock reported a successful provider turn without
+            // persisting a checkpoint. Simulate the actual processor contract
+            // so promotion validation exercises the same storage boundary.
+            msg.finish = "end_turn"
+            yield* ssn.updateMessage(msg)
+            yield* ssn.updatePart({
+              id: PartID.ascending(),
+              messageID: msg.id,
+              sessionID: msg.sessionID,
+              type: "text",
+              text: "Verified test checkpoint.",
+            })
+          }
+          return result
+        }),
+      ),
+    ) as unknown as SessionProcessorModule.SessionProcessor.Handle["process"],
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
 
@@ -775,6 +803,40 @@ describe("session.compaction.prune", () => {
               time: { start: Date.now(), end: Date.now() },
             },
           })
+          // A provider-length error may have emitted a summary candidate.
+          // It is not a committed pruning boundary: the old tool output
+          // must remain eligible for reversible reduction.
+          const marker = yield* ssn.updateMessage({
+            id: MessageID.ascending(),
+            role: "user",
+            sessionID: info.id,
+            agent: "build",
+            model: ref,
+            time: { created: Date.now() },
+          })
+          yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: marker.id,
+            sessionID: info.id,
+            type: "compaction",
+            auto: true,
+            pending: true,
+          })
+          const partial: SessionV1.Assistant = {
+            ...b,
+            id: MessageID.ascending(),
+            parentID: marker.id,
+            summary: true,
+            finish: "length",
+          }
+          yield* ssn.updateMessage(partial)
+          yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: partial.id,
+            sessionID: info.id,
+            type: "text",
+            text: "Partial summary should not authorize pruning barrier.",
+          })
           for (const text of ["second", "third"]) {
             const msg = yield* ssn.updateMessage({
               id: MessageID.ascending(),
@@ -1255,7 +1317,74 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "settles an explicit cross-provider compaction override under its own route",
+    "compacts with a transient account without inheriting a hosted Public parent binding",
+    () => {
+      const providerID = ProviderV2.ID.make("opencode")
+      const modelID = ModelV2.ID.make("hosted-compaction-test")
+      const hostedModel: Provider.Model = {
+        ...createModel({ context: 100_000, output: 32_000 }),
+        providerID,
+        id: modelID,
+      }
+       const attempts: Array<{ providerID: string; modelID: string; executionPurpose?: Provider.RoutedExecutionPurpose }> = []
+      const routedProvider = ProviderTest.fake({
+        model: hostedModel,
+        getModel: () => Effect.die("hosted compaction cannot use ambient auth"),
+        resolveInheritedRoutedModel: () => Effect.die("hosted Public parent must not be inherited"),
+        resolveRoutedModel: () => Effect.die("compaction cannot bind or rebind the parent"),
+        resolveTransientRoutedModel: (input) => Effect.sync(() => {
+          attempts.push({ providerID: input.providerID, modelID: input.modelID, executionPurpose: input.executionPurpose })
+          return {
+            model: hostedModel,
+            route: { route: { kind: "account", providerID, accountID: "compaction-account" } },
+            transport: { baseURL: "https://example.test", apiKey: "opaque-transport", headers: {} },
+          } as unknown as Provider.TransientRoutedModel
+        }),
+      })
+      let selected: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeAttribution"]
+      let lease: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeLease"]
+      const processor = Layer.succeed(
+        SessionProcessorModule.SessionProcessor.Service,
+        SessionProcessorModule.SessionProcessor.Service.of({
+          create: Effect.fn("TestSessionProcessor.captureTransientHostedCompaction")((input) => {
+            selected = input.routeAttribution
+            lease = input.routeLease
+            return Effect.succeed(fake(input, "continue"))
+          }),
+        }),
+      )
+      return Effect.gen(function* () {
+        const sessions = yield* SessionNs.Service
+        const session = yield* sessions.create({})
+        const parent = yield* createUserMessage(session.id, "hello", { providerID, modelID })
+        const messages = yield* sessions.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+          route: {
+            sessionID: session.id,
+            affinityDomain: "opencode-provider/opencode",
+            providerID,
+            routeRevision: 7,
+            routeKind: "public",
+          },
+        })
+        expect(result).toBe("continue")
+        expect(attempts).toContainEqual({ providerID: "opencode", modelID: "hosted-compaction-test", executionPurpose: "special-agent" })
+        expect(selected).toEqual({ routeKind: "account", accountID: "compaction-account" })
+        expect(lease).toBeUndefined()
+      }).pipe(withCompaction({
+        provider: routedProvider,
+        processor,
+        config: cfg({ models: {} }),
+      }))
+    },
+  )
+
+  itCompaction.instance(
+    "settles an explicit cross-provider compaction override under its own transient route",
     () => {
       const parentModel = createModel({ context: 100_000, output: 32_000 })
       const overrideModel = {
@@ -1265,7 +1394,7 @@ describe("session.compaction.process", () => {
         api: { ...parentModel.api, id: "other-model" },
         limit: { ...parentModel.limit, context: 50_000 },
       } satisfies Provider.Model
-      const routed: Array<{ providerID: string; modelID: string }> = []
+      const transient: Array<{ providerID: string; modelID: string }> = []
       let processorRoute: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeAttribution"]
       let processorLease: Parameters<SessionProcessorModule.SessionProcessor.Interface["create"]>[0]["routeLease"]
       const routedProvider = ProviderTest.fake({
@@ -1284,28 +1413,26 @@ describe("session.compaction.process", () => {
           } satisfies ProviderRouteResolution.RouteAttribution
           return Effect.succeed({ model: parentModel, route: { attribution } as never })
         }),
-        resolveRoutedModel: (input) =>
+        // An explicit cross-provider compaction override may use a distinct
+        // provider/account, but it must not create or rebind a durable
+        // ProviderRoute row on the parent Session. Only a one-call route is legal.
+        resolveRoutedModel: () =>
+          Effect.die("compaction maintenance must not resolve a durable Session route"),
+        resolveTransientRoutedModel: (input) =>
           Effect.sync(() => {
-            routed.push({ providerID: input.providerID, modelID: input.modelID })
+            transient.push({ providerID: input.providerID, modelID: input.modelID })
             if (input.providerID !== "other" || input.modelID !== "other-model") return undefined
-            const attribution = {
-              sessionID: input.sessionID,
-              affinityDomain: "opencode-provider/other",
-              providerID: input.providerID,
-              routeRevision: 1,
-              routeKind: "public" as const,
-            } satisfies ProviderRouteResolution.RouteAttribution
-            const lease = {
-              sessionID: input.sessionID,
-              affinityDomain: attribution.affinityDomain,
-              routeRevision: attribution.routeRevision,
+            return {
+              model: overrideModel,
               route: {
-                kind: "public" as const,
-                providerID: input.providerID,
-                routeID: "other:public",
+                route: {
+                  kind: "public" as const,
+                  providerID: input.providerID,
+                  routeID: "other:public",
+                },
               },
-            } satisfies ProviderRouteResolution.ProviderRouteLease
-            return { model: overrideModel, route: { attribution, lease } as never }
+              transport: { baseURL: "https://example.com", apiKey: "public", headers: {} },
+            } as never
           }),
       })
       const processor = Layer.succeed(
@@ -1342,18 +1469,10 @@ describe("session.compaction.process", () => {
         })
 
         expect(result).toBe("continue")
-        expect(routed).toContainEqual({ providerID: "other", modelID: "other-model" })
+        expect(transient).toContainEqual({ providerID: "other", modelID: "other-model" })
         expect(processorRoute).toEqual({ routeKind: "public" })
-        expect(processorLease).toMatchObject({
-          sessionID: session.id,
-          affinityDomain: "opencode-provider/other",
-          routeRevision: 1,
-          route: {
-            kind: "public",
-            providerID: "other",
-            routeID: "other:public",
-          },
-        })
+        // A one-call route has no durable lease to forward.
+        expect(processorLease).toBeUndefined()
       }).pipe(
         withCompaction({
           provider: routedProvider,
@@ -1361,6 +1480,77 @@ describe("session.compaction.process", () => {
           config: cfg({ models: { small: "other/other-model" } }),
         }),
       )
+    },
+  )
+
+  itCompaction.instance(
+    "rejects an empty provider checkpoint before promotion and auto-continuation",
+    () => {
+      const stub = llm()
+      stub.push(reply(""))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const original = yield* createUserMessage(session.id, "Keep authorization policy unchanged.")
+        yield* createSummaryCompaction(session.id)
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const parentID = messages.at(-1)!.info.id
+
+        const result = yield* SessionCompaction.use.process({
+          parentID,
+          messages,
+          sessionID: session.id,
+          auto: true,
+        })
+        const marker = yield* readCompactionPart(session.id)
+        expect(marker?.type === "compaction" ? marker.pending : undefined).toBe(true)
+        const updated = yield* ssn.messages({ sessionID: session.id })
+        const checkpoint = updated.find((item) => item.info.role === "assistant" && item.info.summary)
+        expect(result).toBe("stop")
+        expect(checkpoint?.info.role).toBe("assistant")
+        if (checkpoint?.info.role === "assistant") {
+          expect(checkpoint.info.finish).toBe("error")
+          expect(JSON.stringify(checkpoint.info.error)).toContain("no complete usable text checkpoint")
+        }
+        const effective = MessageV2.filterCompacted([...updated].reverse())
+        expect(effective.some((item) => item.info.id === original.id)).toBe(true)
+        expect(updated.some((item) => item.info.role === "user" && item.parts.some(
+          (part) => part.type === "text" && part.metadata?.compaction_continue === true,
+        ))).toBe(false)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+  )
+
+  itCompaction.instance(
+    "promotes a finished valid provider checkpoint with one durable marker update",
+    () => {
+      const stub = llm()
+      stub.push(reply("Maintain the explicit authorization boundary."))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const original = yield* createUserMessage(session.id, "Maintain the explicit authorization boundary.")
+        yield* createSummaryCompaction(session.id)
+        const messages = yield* ssn.messages({ sessionID: session.id })
+        const result = yield* SessionCompaction.use.process({
+          parentID: messages.at(-1)!.info.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+        })
+        const marker = yield* readCompactionPart(session.id)
+        const updated = yield* ssn.messages({ sessionID: session.id })
+        const effective = MessageV2.filterCompacted([...updated].reverse())
+        expect(result).toBe("continue")
+        expect(marker?.type === "compaction" ? marker.pending : undefined).toBe(false)
+        expect(marker?.type === "compaction" ? marker.checkpoint_message_id : undefined).toBe(
+          updated.find((item) => item.info.role === "assistant" && item.info.summary)?.info.id,
+        )
+        expect(effective.some((item) => item.info.id === original.id)).toBe(false)
+        expect(effective.some((item) =>
+          item.parts.some((part) => part.type === "text" && part.text.includes("authorization boundary")),
+        )).toBe(true)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
     },
   )
 

@@ -7,6 +7,7 @@ import { and, eq, lt, desc, inArray } from "drizzle-orm"
 import { randomUUID } from "crypto"
 import { CodingActivity } from "@opencode-ai/core/coding-activity"
 import { Database } from "@opencode-ai/core/database/database"
+import { retrySqliteBusyCause } from "@opencode-ai/core/database/sqlite-busy"
 import { Global } from "@opencode-ai/core/global"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { SessionCheckpointTable } from "@opencode-ai/core/session/sql"
@@ -448,7 +449,12 @@ const layer = Layer.effect(
       const now = yield* Clock.currentTimeMillis
       const ep = yield* epoch()
       const ordinal = (last?.ordinal ?? 0) + 1
-      yield* db
+      // Starting concurrent Sessions creates unrelated checkpoint rows but
+      // still contends for SQLite's global WAL writer slot. A transient BUSY
+      // must not turn a valid Session into a failed delegated worker before its
+      // first provider request. Retry only the atomic INSERT with the SAME id,
+      // ordinal and immutable payload; preserve unique constraint failures.
+      yield* retrySqliteBusyCause(() => db
         .insert(SessionCheckpointTable)
         .values({
           id,
@@ -473,7 +479,7 @@ const layer = Layer.effect(
           created_at: now,
           finalized_at: null,
         })
-        .run()
+        .run(), { maxElapsedMs: 10_000, delayMs: 25, maxDelayMs: 150 })
         .pipe(Effect.orDie)
 
       // Fire-and-forget: created event never delays turn start.
@@ -518,21 +524,33 @@ const layer = Layer.effect(
       // per turn. Only rows older than STALE_MS are touched (t3 §36: never
       // clobber a legitimately in-flight capture).
       if (!healed.has(input.sessionID)) {
-        healed.add(input.sessionID)
         const cutoff = (yield* Clock.currentTimeMillis) - STALE_MS
-        yield* db
-          .update(SessionCheckpointTable)
-          .set({ status: "error", error: { code: "stuck", message: "turn never finalized" } })
-          .where(
-            and(
-              eq(SessionCheckpointTable.session_id, input.sessionID),
-              eq(SessionCheckpointTable.status, "capturing"),
-              // Strictly older than the threshold.
-              lt(SessionCheckpointTable.created_at, cutoff),
-            ),
-          )
-          .run()
+        const stale = and(
+          eq(SessionCheckpointTable.session_id, input.sessionID),
+          eq(SessionCheckpointTable.status, "capturing"),
+          lt(SessionCheckpointTable.created_at, cutoff),
+        )
+        // begin() runs for every normal Session, even if that Session has
+        // never written a checkpoint. The old unconditional zero-row UPDATE
+        // requested a WAL writer lock for every new Session. Five concurrent
+        // worker starts could all fail before ever contacting the provider.
+        // This indexed read does not acquire a writer lock. The guarded update
+        // remains authoritative and retries only genuine busy contention.
+        const candidate = yield* db.select({ id: SessionCheckpointTable.id })
+          .from(SessionCheckpointTable)
+          .where(stale)
+          .limit(1)
+          .get()
           .pipe(Effect.orDie)
+        if (candidate) {
+          yield* retrySqliteBusyCause(() => db.update(SessionCheckpointTable)
+            .set({ status: "error", error: { code: "stuck", message: "turn never finalized" } })
+            .where(stale)
+            .run(), { maxElapsedMs: 5_000, delayMs: 25, maxDelayMs: 100 }).pipe(Effect.orDie)
+        }
+        // Mark as healed only after the migration check succeeds. A transient
+        // lock failure must not permanently suppress the stale-row recovery.
+        healed.add(input.sessionID)
       }
 
       // Serialize ordinal allocation + insert per session (in-memory mutex;

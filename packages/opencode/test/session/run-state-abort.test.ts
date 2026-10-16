@@ -14,11 +14,13 @@ import { SessionInputTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Deferred, Effect, Fiber, Ref } from "effect"
+import { Deferred, Effect, Exit, Fiber, Ref } from "effect"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionID } from "../../src/session/schema"
 import { SessionRunState } from "../../src/session/run-state"
+import { registerProviderTransport } from "../../src/session/llm/provider-transport"
+import { SessionOperatorRecovery } from "../../src/session/operator-stop"
 import { Session } from "../../src/session/session"
 import { Runner } from "../../src/effect/runner"
 import { requireInstance } from "../fixture/fixture"
@@ -42,6 +44,7 @@ const it = testEffect(
       SessionExecutionOwner.node,
       DirectoryMaintenanceGuard.node,
       SessionRunState.node,
+      SessionOperatorRecovery.node,
       EventV2Bridge.node,
     ]),
   ),
@@ -145,6 +148,53 @@ it.instance("process control handle cancels the exact active generation without 
   }).pipe(Effect.timeout("5 seconds")),
 )
 
+it.instance("active generations are discoverable through the process-global control registry", () =>
+  Effect.gen(function* () {
+    const runState = yield* SessionRunState.Service
+    const owner = yield* SessionExecutionOwner.Service
+    const sessionID = SessionID.make("session-process-global-control-index")
+    yield* seedSession(sessionID)
+    const running = yield* runState.ensureRunning(sessionID, work, Effect.never).pipe(Effect.forkChild)
+    yield* Effect.sleep("50 millis")
+    const snapshot = yield* owner.snapshot(sessionID)
+    const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("openfork.session-run-state.active-handles.v1")] as
+      | Map<string, { generation: number }>
+      | undefined
+    expect(registry?.get(sessionID)?.generation).toBe(snapshot.generation)
+    const requested = yield* owner.requestInterrupt(sessionID, "operator", snapshot.generation)
+    expect(requested.state).toBe("requested")
+    expect(yield* SessionRunState.cancelActiveHandle(sessionID, snapshot.generation)).toBe("cancelled")
+    yield* Fiber.await(running)
+    expect(registry?.has(sessionID)).toBe(false)
+  }).pipe(Effect.timeout("5 seconds")),
+)
+
+it.instance("operator cancel never claims success for a live orphaned owner", () =>
+  Effect.gen(function* () {
+    const runState = yield* SessionRunState.Service
+    const owner = yield* SessionExecutionOwner.Service
+    const operatorRecovery = yield* SessionOperatorRecovery.Service
+    const sessionID = SessionID.make("session-live-owner-stop-fail-closed")
+    yield* seedSession(sessionID)
+
+    // The owner is live and durable, but no InstanceState Runner/activation
+    // handle exists. This reproduces Stop returning success while a Session
+    // remains permanently busy; the ownership fence must not be stolen.
+    const acquired = yield* owner.tryAcquire(sessionID)
+    if (acquired.state !== "acquired") return yield* Effect.die("Expected live owner acquisition")
+    // Simulate an independently live executor for which this service has no
+    // local cancel handle. The operator recovery owner must refuse takeover.
+    const recoverSpy = spyOn(operatorRecovery, "recover").mockImplementation(() => Effect.succeed("live"))
+    yield* Effect.addFinalizer(() => Effect.sync(() => recoverSpy.mockRestore()))
+    const result = yield* Effect.exit(runState.cancel(sessionID))
+    expect(Exit.isFailure(result)).toBe(true)
+    const after = yield* owner.snapshot(sessionID)
+    expect(after.ownerID).toBe(acquired.token.ownerID)
+    expect(after.generation).toBe(acquired.token.generation)
+    yield* owner.release(acquired.token)
+  }).pipe(Effect.timeout("5 seconds")),
+)
+
 it.instance("local cancel fences its durable interrupt to the registered generation", () =>
   Effect.gen(function* () {
     const runState = yield* SessionRunState.Service
@@ -161,8 +211,16 @@ it.instance("local cancel fences its durable interrupt to the registered generat
     expect(next.state).toBe("acquired")
     if (next.state !== "acquired") return
 
+    // A newer generation can have its own physical provider request while a
+    // stale local Runner still finishes cleanup. Cancelling the stale Runner
+    // must NOT abort this successor's transport by shared Session ID.
+    const successor = new AbortController()
+    const releaseSuccessor = registerProviderTransport(sessionID, successor)
+    yield* Effect.addFinalizer(() => Effect.sync(releaseSuccessor))
+
     yield* runState.cancel(sessionID)
     yield* Fiber.await(running)
+    expect(successor.signal.aborted).toBe(false)
     const current = yield* owner.snapshot(sessionID)
     expect(current.ownerID).toBe(next.token.ownerID)
     expect(current.generation).toBe(next.token.generation)
@@ -330,11 +388,18 @@ it.instance("recovers a same-runtime durable owner with no canonical local runne
     const sessionID = SessionID.make("session-run-state-local-orphan")
     yield* seedSession(sessionID)
 
-    // Reproduce the brick directly: durable ownership was published by this
-    // runtime, but SessionRunState has no runner entry that can ever release it.
+    // Reproduce an abnormal module/scope retirement: durable ownership was
+    // committed, but the exact process activation was lost. A plain
+    // tryAcquire is deliberately registered as ACTIVE until then; stealing
+    // that live token would allow concurrent mutation.
     const orphan = yield* owner.tryAcquire(sessionID)
     if (orphan.state !== "acquired") return yield* Effect.die("Expected synthetic local orphan acquisition")
     const orphanGeneration = orphan.token.generation
+    const registry = (globalThis as typeof globalThis & { [key: symbol]: unknown })[
+      Symbol.for("openfork.session-execution-owner.activations.v1")
+    ] as { activations: Map<string, unknown> } | undefined
+    if (!registry) return yield* Effect.die("Missing process-global activation registry")
+    registry.activations.delete(sessionID)
 
     let runs = 0
     const localWork = Effect.sync(() => {

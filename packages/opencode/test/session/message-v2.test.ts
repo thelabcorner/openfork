@@ -353,6 +353,10 @@ describe("session.message-v2.toModelMessage", () => {
   test("converts assistant tool completion into tool-call + tool-result messages with attachments", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
+    const imageModel: Provider.Model = {
+      ...model,
+      capabilities: { ...model.capabilities, input: { ...model.capabilities.input, image: true } },
+    }
 
     const input: SessionV1.WithParts[] = [
       {
@@ -402,7 +406,7 @@ describe("session.message-v2.toModelMessage", () => {
       },
     ]
 
-    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+    expect(await MessageV2.toModelMessages(input, imageModel)).toStrictEqual([
       {
         role: "user",
         content: [{ type: "text", text: "run tool" }],
@@ -440,6 +444,44 @@ describe("session.message-v2.toModelMessage", () => {
         ],
       },
     ])
+  })
+
+  test("does not replay unsupported tool media as binary content on text-only models", async () => {
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("m-no-image"),
+        parts: [{ ...basePart("m-no-image", "u-no-image"), type: "text", text: "read a file" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("m-no-image-assistant", "m-no-image"),
+        parts: [{
+          ...basePart("m-no-image-assistant", "a-no-image"),
+          type: "tool",
+          callID: "call-no-image",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "capture.png" },
+            title: "Read",
+            output: "Image read successfully",
+            metadata: {},
+            time: { start: 0, end: 1 },
+            attachments: [{
+              ...basePart("m-no-image-assistant", "f-no-image"),
+              type: "file",
+              mime: "image/png",
+              filename: "capture.png",
+              url: "data:image/png;base64,Zm9v",
+            }],
+          },
+        }] as SessionV1.Part[],
+      },
+    ]
+    const messages = await MessageV2.toModelMessages(input, model)
+    expect(messages.at(-1)?.role).toBe("user")
+    const lowered = ProviderTransform.message(messages, model, {})
+    expect(JSON.stringify(lowered)).not.toContain("data:image/png;base64")
+    expect(JSON.stringify(lowered)).toContain("does not support image input")
   })
 
   test("preserves jpeg tool-result media for anthropic models", async () => {
@@ -713,6 +755,40 @@ describe("session.message-v2.toModelMessage", () => {
         ],
       },
     ])
+  })
+
+  test("does not promote unavailable provider reasoning to assistant text on model switch", async () => {
+    const userID = "m-reasoning-unavailable-user"
+    const assistantID = "m-reasoning-unavailable-assistant"
+    const user: SessionV1.WithParts = {
+      info: userInfo(userID),
+      parts: [{ ...basePart(userID, "u1"), type: "text", text: "Continue work" }] as SessionV1.Part[],
+    }
+    const reasoningParts: SessionV1.Part[] = [
+      { ...basePart(assistantID, "r1"), type: "reasoning", text: "No reasoning available.", time: { start: 0 } },
+      { ...basePart(assistantID, "r2"), type: "reasoning", text: "No reasoning available.<|start|>", time: { start: 1 } },
+      { ...basePart(assistantID, "r3"), type: "reasoning", text: "Real explanation", time: { start: 2 } },
+      { ...basePart(assistantID, "a1"), type: "text", text: "Completed safely." },
+    ]
+    const different: SessionV1.WithParts = {
+      info: assistantInfo(assistantID, userID, undefined, { providerID: "other", modelID: "other" }),
+      parts: reasoningParts,
+    }
+    const switched = await MessageV2.toModelMessages([user, different], model)
+    const payload = JSON.stringify(switched)
+    expect(payload).not.toContain("No reasoning available.")
+    expect(payload).toContain("Real explanation")
+    expect(payload).toContain("Completed safely.")
+
+    // Same-model replay stays byte-faithful, including provider continuation
+    // fields, because a presentation sentinel is not license to rewrite
+    // provider-native reasoning structure.
+    const same: SessionV1.WithParts = {
+      info: assistantInfo(assistantID, userID),
+      parts: reasoningParts,
+    }
+    const native = await MessageV2.toModelMessages([user, same], model)
+    expect(JSON.stringify(native)).toContain("No reasoning available.")
   })
 
   test("replaces compacted tool output with placeholder", async () => {
@@ -1801,6 +1877,47 @@ describe("session.message-v2.latest", () => {
     ])
   })
 
+  test("projects a completed historical recovery exchange before an older queued active user", () => {
+    const queued: SessionV1.WithParts = {
+      info: {
+        ...userInfo("msg_recovery_queued_user"),
+        time: { created: 100 },
+        provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+      },
+      parts: [],
+    }
+    const recoveryID = MessageID.make("msg_limit_recovery_projection")
+    const recovery: SessionV1.WithParts = {
+      info: {
+        ...userInfo(recoveryID),
+        time: { created: 200 },
+        provenance: {
+          ...SessionTurnProvenance.host(SessionTurnProvenance.Source.RecoveryContinuation, {
+            sourceMessageID: MessageID.make("msg_recovery_projection_root"),
+            ref: "recovery-projection",
+          }),
+          lifetime: "historical",
+        },
+      },
+      parts: [],
+    }
+    const response: SessionV1.WithParts = {
+      info: {
+        ...assistantInfo("msg_recovery_projection_assistant", recoveryID),
+        time: { created: 210, completed: 220 },
+        finish: "stop",
+      } as SessionV1.Assistant,
+      parts: [],
+    }
+
+    expect(MessageV2.latest([queued, recovery, response]).user?.id).toBe(queued.info.id)
+    expect(MessageV2.projectStateForModel([queued, recovery, response]).map((message) => message.info.id)).toEqual([
+      recovery.info.id,
+      response.info.id,
+      queued.info.id,
+    ])
+  })
+
   test("historical compaction cannot become the live STATE reset boundary", () => {
     const compactionID = MessageID.make("msg_historical_compaction")
     const compaction: SessionV1.WithParts = {
@@ -1854,7 +1971,7 @@ describe("session.message-v2.latest", () => {
         summary: true,
         finish: "stop",
       } as SessionV1.Assistant,
-      parts: [],
+      parts: [{ ...basePart("msg_state_summary", "summary-text"), type: "text", text: "Updated goal state." }] as SessionV1.Part[],
     }
     const newProgress = stateMessage(
       "msg_progress_after_compaction",
@@ -1888,6 +2005,19 @@ describe("session.message-v2.latest", () => {
       newProgress.info.id,
       continuation.info.id,
     ])
+    const pending: SessionV1.WithParts = {
+      ...compaction,
+      parts: [{ ...basePart(compactionID, "pending-state-compaction"), type: "compaction", auto: true, pending: true }] as SessionV1.Part[],
+    }
+    const unpromoted = MessageV2.projectStateForModel([oldSpec, pending, summary, newProgress, continuation])
+    expect(unpromoted.some((message) => message.info.id === oldSpec.info.id)).toBe(true)
+    const missing: SessionV1.WithParts = {
+      ...compaction,
+      parts: [{ ...basePart(compactionID, "wrong-checkpoint"), type: "compaction", auto: true, pending: false,
+        checkpoint_message_id: MessageID.make("msg_missing_summary") }] as SessionV1.Part[],
+    }
+    expect(MessageV2.projectStateForModel([oldSpec, missing, summary, newProgress, continuation])
+      .some((message) => message.info.id === oldSpec.info.id)).toBe(true)
   })
 
   test("selects latest messages by creation time when IDs are nonmonotonic", () => {

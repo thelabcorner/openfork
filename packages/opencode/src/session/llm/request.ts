@@ -15,6 +15,7 @@ import { jsonSchema, tool as aiTool, type ModelMessage, type Tool } from "ai"
 import type { Plugin } from "@/plugin"
 import { mergeDeep } from "remeda"
 import { preserveCanonicalFindToolMap } from "./tool-call-heal"
+import { normalizeMuseToolNames } from "./muse-tool-names"
 
 type PrepareInput = {
   readonly user: SessionV1.User
@@ -39,6 +40,7 @@ export type Prepared = {
   readonly system: string[]
   readonly messages: ModelMessage[]
   readonly tools: Record<string, Tool>
+  readonly canonicalByAlias: Readonly<Record<string, string>>
   readonly params: {
     readonly temperature?: number
     readonly topP?: number
@@ -215,11 +217,13 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     tools,
     Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
   )
+  const museWire = normalizeMuseToolNames(input.model, sortedTools, messages)
 
   return {
     system,
-    messages,
-    tools: sortedTools,
+    messages: museWire.messages,
+    tools: preserveCanonicalFindToolMap(sortedTools, museWire.tools),
+    canonicalByAlias: museWire.canonicalByAlias,
     params,
     messageTransformOptions: options,
     headers: {
