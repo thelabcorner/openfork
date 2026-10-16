@@ -9,6 +9,7 @@ import {
   resizeFromEndRail,
   resizeFromStartRail,
   resolveBrowserDeviceViewportArea,
+  resolveBrowserCanvasCenterScroll,
   resolveResponsiveBrowserViewportSize,
   resolveViewportLayout,
   resolveWebviewElementSize,
@@ -16,6 +17,52 @@ import {
 import { VIEWPORT_MAX_SIZE, VIEWPORT_MIN_SIZE } from "./types"
 
 describe("resolveViewportLayout", () => {
+  test("freeform and preset remain horizontally centered across fit scales", () => {
+    const panel = { x: 18, y: 34, width: 1280, height: 900 }
+    for (const mode of ["freeform", "preset"] as const) {
+      for (const [width, height] of [[400, 500], [1003, 1369], [1920, 1080]]) {
+        const layout = resolveViewportLayout(panel, { mode, width, height, presetId: mode === "preset" ? "test" : null, orientation: "portrait" }, 1, "fit")
+        expect(layout.viewportX + layout.viewportWidth / 2).toBeCloseTo(panel.x + panel.width / 2, 0)
+        expect(resolveBrowserCanvasCenterScroll(panel, layout)).toEqual({ left: 0, top: 0 })
+      }
+    }
+  })
+
+  test("manual magnification centers the scrollable virtual device", () => {
+    const panel = { x: 0, y: 0, width: 600, height: 450 }
+    const fixed = { mode: "preset" as const, width: 1003, height: 1369, presetId: "test", orientation: "portrait" as const }
+    const layout = resolveViewportLayout(panel, fixed, 1, 1)
+    const scroll = resolveBrowserCanvasCenterScroll(panel, layout)
+    expect(scroll.left).toBeGreaterThan(0)
+    expect(scroll.top).toBeGreaterThan(0)
+    expect(layout.viewportX + layout.viewportWidth / 2 - scroll.left).toBeCloseTo(panel.width / 2, 1)
+  })
+  test("100% manual scale overflows its panel instead of changing the CSS viewport", () => {
+    const panel = { x: 0, y: 0, width: 600, height: 700 }
+    const fixed = { mode: "freeform" as const, width: 1440, height: 900, presetId: null, orientation: "portrait" as const }
+    const layout = resolveViewportLayout(panel, fixed, 1, 1)
+    expect(layout.viewportScale).toBe(1)
+    expect(layout.viewportWidth).toBe(1440)
+    expect(layout.canvasWidth).toBeGreaterThan(panel.width)
+    expect(resolveWebviewElementSize(layout)).toEqual({ width: 1440, height: 900 })
+  })
+
+  test("preview zoom controls magnification without changing the webview's CSS dimensions", () => {
+    const panel = { x: 0, y: 0, width: 800, height: 600 }
+    const fixed = { mode: "preset" as const, width: 400, height: 600, presetId: "test", orientation: "portrait" as const }
+    const smaller = resolveViewportLayout(panel, fixed, 1, 0.5)
+    const larger = resolveViewportLayout(panel, fixed, 1, 1.5)
+    expect(smaller.viewportWidth).toBe(200)
+    expect(larger.viewportWidth).toBe(600)
+    expect(resolveWebviewElementSize(smaller)).toEqual(resolveWebviewElementSize(larger))
+    expect(resolveWebviewElementSize(smaller)).toEqual({ width: 400, height: 600 })
+  })
+
+  test("fill mode continues filling the panel even if a fixed-scale selection is saved", () => {
+    const panel = { x: 0, y: 0, width: 800, height: 600 }
+    const fill = { mode: "fill" as const, width: null, height: null, presetId: null, orientation: "portrait" as const }
+    expect(resolveViewportLayout(panel, fill, 1, 2)).toEqual(resolveViewportLayout(panel, fill, 1, "fit"))
+  })
   test("fill mode occupies the full surface with no rail reservation", () => {
     const layout = resolveViewportLayout({ x: 0, y: 0, width: 900, height: 700 }, { mode: "fill", width: null, height: null, presetId: null, orientation: "portrait" }, 1)
     expect(layout).toMatchObject({ viewportX: 0, viewportY: 0, viewportWidth: 900, viewportHeight: 700, viewportScale: 1, fillsPanel: true })

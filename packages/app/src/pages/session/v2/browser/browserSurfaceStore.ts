@@ -13,6 +13,8 @@ export interface BrowserSurfaceEntry {
   visible: boolean
   cornerRadius: number
   viewport: ViewportSetting
+  /** Presentation scale, separate from the guest's page zoom. */
+  previewZoom: "fit" | number
   /** True while the user drags a resize handle. */
   dragging: boolean
 }
@@ -36,6 +38,7 @@ function entry(): BrowserSurfaceEntry {
     visible: false,
     cornerRadius: 0,
     viewport: { ...DEFAULT_VIEWPORT },
+    previewZoom: "fit",
     dragging: false,
   }
 }
@@ -111,6 +114,13 @@ export const browserSurfaceStore = {
     if (sameViewport(current?.viewport, viewport)) return
     if (!current) return createEntry(tabId, { viewport })
     setState("byTabId", tabId, "viewport", viewport)
+  },
+  setPreviewZoom(tabId: string, zoom: "fit" | number) {
+    if (zoom !== "fit" && (!Number.isFinite(zoom) || zoom < 0.1 || zoom > 3)) return
+    const current = state.byTabId[tabId]
+    if (current?.previewZoom === zoom) return
+    if (!current) return createEntry(tabId, { previewZoom: zoom })
+    setState("byTabId", tabId, "previewZoom", zoom)
   },
   setDragging(tabId: string, dragging: boolean) {
     const current = state.byTabId[tabId]

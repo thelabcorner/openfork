@@ -105,11 +105,11 @@ export function BrowserPanelV2(props: {
   return (
     <div
       id="browser-panel"
-      class="my-2 me-2 flex min-h-0 shrink-0 self-stretch flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
+      class="my-2 me-2 flex min-h-0 shrink-0 self-stretch flex-col overflow-hidden rounded-[9px] border border-v2-border-border-base bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
       style={{ width: `${props.state.sidebarWidth()}px` }}
       data-browser-panel
     >
-      <div class="flex h-8 shrink-0 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base px-1.5">
+      <div class="flex h-8 shrink-0 items-center gap-1.5 border-b border-v2-border-border-base bg-v2-background-bg-layer-01 px-1.5">
         <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden" data-browser-tabs>
           <Show
             when={tabIds().length > 0}
@@ -144,15 +144,18 @@ export function BrowserPanelV2(props: {
           />
         </TooltipV2>
         <TooltipV2 value={language.t("browser.visual.title")}>
-          <IconButtonV2
+          <button
             type="button"
-            variant={visualOpen() ? "ghost" : "ghost-muted"}
-            size="small"
+            class="flex h-6 shrink-0 items-center gap-1.5 rounded-[4px] border border-transparent px-2 text-[11px] font-medium text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:border-v2-border-border-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
+            data-active={visualOpen() || undefined}
             onClick={() => setVisualOpen((open) => !open)}
             aria-label={language.t("browser.visual.title")}
             aria-pressed={visualOpen()}
-            icon={<IconV2 name="compare" />}
-          />
+            data-testid="browser-visual-inspector"
+          >
+            <IconV2 name="compare" />
+            <span>{language.t("browser.visual.short")}</span>
+          </button>
         </TooltipV2>
         <BrowserPanelV2SidebarToggle opened={props.opened} onToggle={props.onClose} />
       </div>
@@ -208,7 +211,7 @@ function BrowserTabPill(props: {
   const pill = (
     <div
       data-active={props.active || undefined}
-      class="group/tab flex h-6 min-w-0 max-w-[170px] flex-1 items-center rounded-[5px] text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
+       class="group/tab flex h-6 min-w-0 max-w-[192px] flex-1 items-center rounded-[5px] border border-transparent text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:border-v2-border-border-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
     >
       <button
         type="button"

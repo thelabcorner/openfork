@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "so
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { useLanguage } from "@/context/language"
 import { showToast } from "@/utils/toast"
 import {
@@ -159,7 +160,15 @@ export function VisualInspector(props: { onClose: () => void }) {
       setSelection(chooseDefault(next, previous))
     } catch (error) {
       if (generation !== historyGeneration) return
-      setHistoryError(error instanceof Error ? error.message : String(error))
+      const message = error instanceof Error ? error.message : String(error)
+      // Never surface an Electron invoke stack or a broker-internal capability
+      // error in the user's visual review panel. The local renderer may remain
+      // mounted while its project/session is changing.
+      setHistoryError(
+        /VISUAL_CONTEXT_REQUIRED|trusted project broker context|active project session/i.test(message)
+          ? language.t("browser.visual.requiresSession")
+          : language.t("browser.visual.loadFailed"),
+      )
     } finally {
       if (generation === historyGeneration) setLoadingHistory(false)
     }
@@ -290,7 +299,7 @@ export function VisualInspector(props: { onClose: () => void }) {
   }
 
   return (
-    <section class="flex h-[46%] min-h-[240px] max-h-[520px] shrink-0 flex-col border-t border-v2-border-border-base bg-v2-background-bg-base" data-browser-visual-inspector>
+    <section class="flex h-[36%] min-h-[220px] max-h-[460px] shrink-0 flex-col border-t border-v2-border-border-base bg-v2-background-bg-base" data-browser-visual-inspector>
       <div class="flex h-8 shrink-0 items-center gap-1 border-b border-v2-border-border-base px-2">
         <IconV2 name="compare" class="size-3.5 text-v2-icon-icon-muted" />
         <span class="text-[11px] font-medium text-v2-text-text-base">{language.t("browser.visual.title")}</span>
@@ -326,13 +335,19 @@ export function VisualInspector(props: { onClose: () => void }) {
       <Show
         when={projectAvailable()}
         fallback={
-          <div class="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-[11px] leading-relaxed text-v2-text-text-muted">
-            {language.t("browser.visual.requiresSession")}
+          <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+            <div class="flex size-8 items-center justify-center rounded-[6px] border border-v2-border-border-base bg-v2-background-bg-layer-01 text-v2-icon-icon-muted">
+              <IconV2 name="compare" class="size-4" />
+            </div>
+            <p class="text-[11px] font-medium text-v2-text-text-base">{language.t("browser.visual.title")}</p>
+            <p class="max-w-[280px] text-[11px] leading-relaxed text-v2-text-text-muted">{language.t("browser.visual.requiresSession")}</p>
           </div>
         }
       >
         <div class="grid min-h-0 flex-1 grid-cols-[138px_minmax(0,1fr)]">
-          <aside class="min-h-0 overflow-y-auto border-r border-v2-border-border-base p-1.5">
+          <aside class="min-h-0 overflow-hidden border-r border-v2-border-border-base">
+            <ScrollView class="h-full" thumbVisibility="hover">
+            <div class="p-1.5">
             <div class="mb-1 px-1 text-[9px] font-medium uppercase tracking-[0.08em] text-v2-text-text-muted">
               {language.t("browser.visual.baselines")}
             </div>
@@ -365,12 +380,26 @@ export function VisualInspector(props: { onClose: () => void }) {
                 )}
               </For>
             </Show>
+            </div>
+            </ScrollView>
           </aside>
 
-          <main class="min-h-0 overflow-y-auto">
+          <main class="min-h-0 overflow-hidden">
+            <ScrollView class="h-full" thumbVisibility="hover">
             <Show when={!loadingHistory()} fallback={<CenteredStatus text={language.t("browser.visual.loading")} />}>
               <Show when={!historyError()} fallback={<CenteredStatus text={historyError() ?? ""} danger />}>
-                <Show when={selection()} fallback={<CenteredStatus text={language.t("browser.visual.none")} />}>
+                <Show
+                  when={selection()}
+                  fallback={
+                    <div class="flex min-h-full flex-col items-center justify-center gap-1.5 px-6 text-center">
+                      <IconV2 name="compare" class="size-5 text-v2-icon-icon-muted" />
+                      <span class="text-[11px] font-medium text-v2-text-text-base">{language.t("browser.visual.none")}</span>
+                      <span class="max-w-[270px] text-[10px] leading-relaxed text-v2-text-text-muted">
+                        {language.t("browser.visual.emptyDetail")}
+                      </span>
+                    </div>
+                  }
+                >
                   <VisualDetail
                     selection={selection()!}
                     detail={detail()}
@@ -382,6 +411,7 @@ export function VisualInspector(props: { onClose: () => void }) {
                 </Show>
               </Show>
             </Show>
+            </ScrollView>
           </main>
         </div>
       </Show>
